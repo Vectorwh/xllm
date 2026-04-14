@@ -14,10 +14,11 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <torch/torch.h>
-#include "torch_npu/csrc/aten/CustomFunctions.h"
 
 #include <tuple>
 
+#include "torch_npu/csrc/aten/CustomFunctions.h"
+#include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "xllm/core/kernels/ops_api.h"
 
 namespace xllm {
@@ -342,7 +343,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   fused_params.num_heads_v = static_cast<int32_t>(num_v_heads_ / tp_size_);
   fused_params.head_qk = static_cast<int32_t>(head_k_dim_);
   fused_params.head_v = static_cast<int32_t>(head_v_dim_);
-  
+
   torch::Tensor mixed_qkv, z, b, a;
   std::tie(mixed_qkv, z, b, a) = xllm::kernel::fused_qkvzba_split_reshape_cat(fused_params);
 
@@ -356,7 +357,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   torch::Tensor g, beta, core_attn_out, last_recurrent_state;
   auto device = mixed_qkv.device();
   auto conv_weight = conv1d_->weight();
-
+  
   mixed_qkv = mixed_qkv.transpose(1, 2);
   if (attn_metadata.is_prefill) {
     torch::Tensor conv_state =
@@ -380,13 +381,20 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     mixed_qkv = torch::silu(conv_output.slice(2, 0, seq_len));
 
   } else {
-    xllm::kernel::CausalConv1dUpdateParams params;
-    params.x = mixed_qkv;
-    params.conv_state = conv_cache;
-    params.weight = conv_weight;
-    params.conv_state_indices =
-        attn_metadata.block_table.select(1, 0).contiguous();
-    mixed_qkv = xllm::kernel::causal_conv1d_update(params);
+    const auto state_indices = attn_metadata.block_table.select(1, 0);
+    xllm::kernel::CausalConv1dUpdateV2Params conv1dV2Params;
+    conv1dV2Params.x = mixed_qkv;
+    conv1dV2Params.conv_state = conv_cache;
+    conv1dV2Params.weight = conv_weight;
+    conv1dV2Params.conv_state_indices = state_indices;
+    conv1dV2Params.block_idx_last_scheduled_token =
+        std::optional<torch::Tensor>();
+    conv1dV2Params.initial_state_idx = std::optional<torch::Tensor>();
+    conv1dV2Params.query_start_loc = attn_metadata.q_cu_seq_lens;
+    conv1dV2Params.max_query_len = attn_metadata.max_query_len;
+    mixed_qkv = xllm::kernel::causal_conv1d_update_v2(conv1dV2Params);
+    mixed_qkv = mixed_qkv.view({batch, -1, mixed_qkv.size(-1)}).contiguous();
+    mixed_qkv = mixed_qkv.transpose(1, 2);
   }
 
   // Compute gated delta net decay and beta terms.
@@ -433,13 +441,13 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     std::tie(core_attn_out, last_recurrent_state) =
         xllm::kernel::chunk_gated_delta_rule(chunk_gated_delta_params);
     ssm_cache.index_put_({input_params.block_tables.select(1, 0)},
-                         last_recurrent_state.transpose(-1, -2).to(ssm_cache.dtype()));
+        last_recurrent_state.transpose(-1, -2).to(ssm_cache.dtype()));
   } else {
     processed_q = l2norm(processed_q, -1, 1e-6);
     processed_k = l2norm(processed_k, -1, 1e-6);
-    torch::Tensor ssm_state_indices = 
+    torch::Tensor ssm_state_indices =
         attn_metadata.block_table.select(1, 0).contiguous();
-    
+
     torch::Tensor actual_seq_lengths = attn_metadata.q_seq_lens.clone();
     double scale = 1.0 / std::sqrt(static_cast<float>(processed_q.size(-1)));
     core_attn_out = 
@@ -447,13 +455,13 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
               processed_q.reshape({-1,processed_q.size(-2),processed_q.size(-1)}), 
               processed_k.reshape({-1,processed_k.size(-2),processed_k.size(-1)}), 
               processed_v.reshape({-1,processed_v.size(-2),processed_v.size(-1)}), 
-              ssm_cache,
-              beta.squeeze(0).contiguous(),
-              scale,
-              actual_seq_lengths,
-              ssm_state_indices,
-              c10::nullopt,
-              g.squeeze(0).contiguous(),
+                        ssm_cache,
+                        beta.squeeze(0).contiguous(),
+                        scale,
+                        actual_seq_lengths,
+                        ssm_state_indices,
+                        c10::nullopt,
+                        g.squeeze(0).contiguous(),
               c10::nullopt).unsqueeze(0).contiguous();
   }
 
