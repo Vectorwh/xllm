@@ -1406,6 +1406,7 @@ struct FusedQkvzbaSplitReshapeParams {
   int32_t num_heads_v;
   int32_t head_qk;
   int32_t head_v;
+};  // namespace xllm::kernel
 struct ChunkGatedDeltaRuleParams {
   // Query tensor. Shape: [B, T, Hqk, K]. Dtype: bfloat16.
   torch::Tensor q;
@@ -1425,7 +1426,8 @@ struct ChunkGatedDeltaRuleParams {
   bool output_final_state = false;
   // Chunk size for processing. Default: 64.
   int64_t chunk_size = 64;
-  // Optional cumulative sequence lengths. Shape: [num_sequences + 1]. Dtype: int32.
+  // Optional cumulative sequence lengths. Shape: [num_sequences + 1]. Dtype:
+  // int32.
   std::optional<torch::Tensor> cu_seqlens = std::nullopt;
   // Whether input is head-first format. Default: false (batch-first).
   bool head_first = false;

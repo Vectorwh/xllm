@@ -935,17 +935,17 @@ torch::Tensor causal_conv1d_update(CausalConv1dUpdateParams& params) {
 torch::Tensor causal_conv1d_update_v2(CausalConv1dUpdateV2Params& params) {
 #if defined(USE_NPU)
   return npu::npu_causal_conv1d_update_v2(params.x,
-                                       params.conv_state,
-                                       params.weight,
-                                       params.activation,
-                                       params.bias,
-                                       params.conv_state_indices,
-                                       params.query_start_loc,
-                                       params.max_query_len,
-                                       params.pad_slot_id,
-                                       params.block_idx_last_scheduled_token,
-                                       params.initial_state_idx,
-                                       params.validate_data);
+                                          params.conv_state,
+                                          params.weight,
+                                          params.activation,
+                                          params.bias,
+                                          params.conv_state_indices,
+                                          params.query_start_loc,
+                                          params.max_query_len,
+                                          params.pad_slot_id,
+                                          params.block_idx_last_scheduled_token,
+                                          params.initial_state_idx,
+                                          params.validate_data);
 
 #else
   NOT_IMPLEMENTED();
@@ -991,6 +991,11 @@ fused_qkvzba_split_reshape_cat(FusedQkvzbaSplitReshapeParams& params) {
                                                  params.num_heads_v,
                                                  params.head_qk,
                                                  params.head_v);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 std::pair<torch::Tensor, torch::Tensor> chunk_gated_delta_rule(
     ChunkGatedDeltaRuleParams& params) {
 #if defined(USE_NPU)
