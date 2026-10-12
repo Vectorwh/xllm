@@ -20,6 +20,7 @@ graph can replay them without re-planning.
 
 from __future__ import annotations
 
+from importlib.util import find_spec
 from typing import List
 
 import torch
@@ -29,6 +30,13 @@ _FULL_ATTENTION_WINDOW = 2147483647
 
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
+
+_HAS_MINDIESD = find_spec("mindiesd") is not None
+_TRANSPOSE_BATCHMATMUL = getattr(
+    torch.ops.npu,
+    "npu_transpose_batchmatmul",
+    None,
+)
 
 
 def vision_fusion_attention(
@@ -116,10 +124,96 @@ def batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     )
 
 
+def joint_diffusion_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Non-causal joint attention for diffusion, via the best NPU kernel.
+
+    The DiT ``joint_attention`` passes a boolean keep-mask (``True`` = attend).
+    ``npu_fusion_attention`` uses the opposite convention (``1`` = masked out),
+    so the mask is inverted on the NPU fast path. Falls back to
+    ``scaled_dot_product_attention`` for non-NPU devices or non-boolean masks.
+
+    Args:
+        query, key, value: ``[B, S, H, D]`` activations.
+        attn_mask: ``[B, 1, S, S]`` boolean keep-mask, or ``None``.
+        scale: Attention scaling factor; defaults to ``head_dim ** -0.5``.
+
+    Returns:
+        Attention output ``[B, S, H, D]``.
+    """
+    head_dim = query.size(-1)
+    if scale is None:
+        scale = head_dim**-0.5
+    num_heads = query.size(2)
+    mask_is_bool = attn_mask is None or attn_mask.dtype == torch.bool
+
+    if query.device.type == "npu" and mask_is_bool:
+        if _HAS_MINDIESD:
+            try:
+                from mindiesd import attention_forward
+
+                # mindiesd's ``fused_attn_score`` (BSND) is the same
+                # ``npu_fusion_attention`` call the direct path makes, and it
+                # inverts the boolean keep-mask internally, so the raw
+                # ``attn_mask`` is passed through untouched.
+                return attention_forward(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    scale=scale,
+                    fused=True,
+                    head_first=False,
+                    opt_mode="manual",
+                    op_type="fused_attn_score",
+                    layout="BSND",
+                )
+            except ImportError:
+                pass
+
+        import torch_npu
+
+        # npu_fusion_attention accepts the native [B, S, H, D] BSND layout
+        # directly (matching the C++ joyimage_joint_attention), so no
+        # transpose/contiguous is needed on the way in or out.
+        drop_mask = None if attn_mask is None else ~attn_mask
+        out = torch_npu.npu_fusion_attention(
+            query,
+            key,
+            value,
+            head_num=num_heads,
+            input_layout="BSND",
+            scale=scale,
+            atten_mask=drop_mask,
+        )[0]
+        return out  # [B, S, H, D]
+
+    import torch.nn.functional as F
+
+    q = query.transpose(1, 2)
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
+    output = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    return output.transpose(1, 2).contiguous()
+
+
 __all__ = [
     "reshape_paged_cache",
     "update_decode_graph_metadata",
     "vision_fusion_attention",
     "packed_infer_attention",
+    "joint_diffusion_attention",
     "batch_matmul_transpose",
 ]

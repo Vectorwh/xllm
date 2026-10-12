@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import torch
 import torch_npu
 
@@ -29,6 +31,23 @@ _FUSED_ADD_RMS_NORM_DYNAMIC_QUANT = torch_npu.npu_add_rms_norm_dynamic_quant
 # RMSNorm result cast back to the input dtype and ``y_fp32`` is the widened
 # ROUNDED result (``y.float()``), i.e. ``RMSNorm`` + ``Tensor.float()``.
 rms_norm_cast_va = torch.ops.xllm_ops.rms_norm_cast_va
+_HAS_MINDIESD = find_spec("mindiesd") is not None
+
+# ``mindiesd.layernorm_scale_shift`` needs an ``nn.LayerNorm`` descriptor. The
+# DiT AdaLayerNorm has no affine parameters (weight/bias are ``None``), so a
+# single cached, parameter-less ``nn.LayerNorm`` per (hidden, eps) key suffices;
+# its forward is never called on the fused path (only eps/normalized_shape are
+# read), so it stays on the CPU.
+_ADA_LAYER_NORM_HOLDERS: dict[tuple[int, float], torch.nn.LayerNorm] = {}
+
+
+def _ada_layer_norm_holder(hidden_size: int, eps: float) -> torch.nn.LayerNorm:
+    key = (hidden_size, eps)
+    holder = _ADA_LAYER_NORM_HOLDERS.get(key)
+    if holder is None:
+        holder = torch.nn.LayerNorm(hidden_size, elementwise_affine=False, eps=eps)
+        _ADA_LAYER_NORM_HOLDERS[key] = holder
+    return holder
 
 
 def gemma_rms_norm(
@@ -39,6 +58,74 @@ def gemma_rms_norm(
     """Apply Gemma RMSNorm with the checkpoint's additive gamma."""
     output, _ = torch_npu.npu_gemma_rms_norm(value, weight, eps)
     return output
+
+
+def rms_norm_fp32(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """RMSNorm over the last dim computed in float32 (Wan DiT per-head norm).
+
+    ``torch_npu.npu_rms_norm`` accumulates in fp32 and, when ``weight`` is kept
+    in fp32, is bit-exact with the eager fp32 reference used by the DiT
+    ``RMSNorm`` layers. Casting ``weight`` to the activation dtype would round
+    it and drift the result, so the weight is passed through untouched.
+
+    Args:
+        value: ``[..., D]`` tensor (2-8 dims).
+        weight: ``[D]`` RMSNorm scale, typically fp32.
+        eps: Epsilon added before the reciprocal square root.
+
+    Returns:
+        A tensor with the shape and dtype of ``value``.
+    """
+    if value.device.type == "npu" and value.dim() >= 2:
+        return torch_npu.npu_rms_norm(value.contiguous(), weight, epsilon=eps)[0]
+
+    # Eager fp32 reference (matches models/dit/transformers/common.py RMSNorm).
+    x_float = value.to(torch.float32)
+    normed = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + eps)
+    return (normed * weight.to(torch.float32)).to(value.dtype)
+
+
+def ada_layer_norm(
+    value: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused adaptive LayerNorm: ``LayerNorm(value) * (1 + scale) + shift``.
+
+    Wraps the ``xllm_ops::ada_layer_norm`` custom op, which calls
+    ``aclnnAdaLayerNorm`` under the hood. The modulation ``(1 + scale)`` is
+    applied inside the kernel, so the raw ``scale`` is passed through untouched
+    (matching the C++ ``AdaLayerNorm`` layer). ``value`` is ``[B, S, H]`` and
+    ``scale``/``shift`` are ``[B, H]`` (broadcast over the sequence dim).
+
+    Args:
+        value: ``[B, S, H]`` input tensor.
+        scale: ``[B, H]`` raw scale modulation factor.
+        shift: ``[B, H]`` shift modulation factor.
+        eps: Epsilon added before the reciprocal square root.
+
+    Returns:
+        A tensor with the shape and dtype of ``value``.
+    """
+    if value.device.type == "npu" and _HAS_MINDIESD:
+        try:
+            from mindiesd import layernorm_scale_shift
+
+            # mindiesd's ``ops.adaln`` is the same ``aclnnAdaLayerNorm`` the
+            # ``xllm_ops::ada_layer_norm`` fallback wraps, so the result is
+            # bit-identical; routing here keeps all Python DiT models on the
+            # mindiesd operator layer.
+            holder = _ada_layer_norm_holder(value.size(-1), eps)
+            return layernorm_scale_shift(holder, value.contiguous(), scale, shift, fused=True)
+        except ImportError:
+            pass
+
+    return torch.ops.xllm_ops.ada_layer_norm(value.contiguous(), scale, shift, None, None, eps)
 
 
 def fused_add_rms_norm_dynamic_quant(
@@ -151,6 +238,8 @@ def fused_eh_norm(
 __all__ = [
     "rms_norm",
     "gemma_rms_norm",
+    "rms_norm_fp32",
+    "ada_layer_norm",
     "fused_add_rms_norm",
     "fused_add_gemma_rms_norm",
     "fused_add_rms_norm_dynamic_quant",

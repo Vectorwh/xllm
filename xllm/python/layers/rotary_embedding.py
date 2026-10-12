@@ -21,6 +21,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from xllm.python import kernels
+
 
 class RotaryEmbedding(nn.Module):
     """Holds the NEOX-style RoPE cos/sin cache in the exact layout the fused
@@ -92,3 +94,16 @@ def apply_rotary_half(x: torch.Tensor, half_cos: torch.Tensor, half_sin: torch.T
     x1 = x[..., :half]
     x2 = x[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+class WanRotaryEmbedding(nn.Module):
+    """Interleaved (GPT-J) RoPE for Wan-style DiT, delegating to the fused
+    ``wan_interleaved_rope`` kernel.
+
+    Wan keeps full-width ``cos``/``sin`` tables whose adjacent pairs are
+    duplicated. On NPU this maps to ``npu_rotary_mul`` in interleave mode;
+    multi-batch or non-NPU inputs use the eager fp32 reference.
+    """
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return kernels.wan_interleaved_rope(x, cos, sin)

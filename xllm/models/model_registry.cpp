@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/platform/platform.h"
 #include "core/util/dit_model_discovery.h"
+#include "dit/py_dit_model.h"
 #include "llm/py_causal_lm.h"
 #include "models.h"
 
@@ -659,6 +660,14 @@ std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
 }
 
 std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context) {
+  // Python backend routing: --model_impl python drives the DiT pipeline from
+  // the embedded interpreter while the native pipelines stay registered as
+  // the default (and precision-golden) path.
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    return std::make_unique<PyDiTModel>(context);
+  }
+
   // get the factory function for the model type from model registry
   auto factory = ModelRegistry::get_dit_model_factory(context.model_type());
   if (factory) {

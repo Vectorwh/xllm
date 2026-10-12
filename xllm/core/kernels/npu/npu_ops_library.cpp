@@ -450,6 +450,16 @@ std::tuple<torch::Tensor, torch::Tensor> fused_add_rms_norm_npu(
   return std::make_tuple(normed, residual_sum);
 }
 
+torch::Tensor ada_layer_norm_npu(const torch::Tensor& input,
+                                 const torch::Tensor& scale,
+                                 const torch::Tensor& shift,
+                                 std::optional<torch::Tensor> weight,
+                                 std::optional<torch::Tensor> bias,
+                                 double eps) {
+  return xllm::kernel::npu::fused_adalayer_norm(
+      input, scale, shift, weight, bias, eps);
+}
+
 torch::Tensor silu_and_mul_npu(const torch::Tensor& input) {
   return xllm::kernel::npu::active(input, "swiglu");
 }
@@ -956,6 +966,9 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "npu_inplace_partial_rotary_mul(Tensor(a!) x, Tensor r1, Tensor r2, "
       "str rotary_mode, int[] partial_slice) -> ()");
+  m.def(
+      "ada_layer_norm(Tensor input, Tensor scale, Tensor shift, Tensor? "
+      "weight, Tensor? bias, float eps) -> Tensor");
   m.def("silu_and_mul(Tensor input) -> Tensor");
   m.def("has_dispatch_ffn_combine() -> bool");
   m.def(
@@ -1190,6 +1203,11 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "engram_int8_lookup_cpu(Tensor weight, Tensor scale, Tensor ids, "
       "Tensor(a!) output) -> ()");
+  // MindIE-SD laser attention (aclnnLaserAttention), dense non-causal flash
+  // attention tuned for Wan-style DiT. q/k/v in BNSD layout, equal seq len.
+  m.def(
+      "laser_attention(Tensor q, Tensor k, Tensor v, float scale, int "
+      "head_num) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -1229,6 +1247,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::rms_norm_dynamic_quant));
   m.impl("npu_inplace_partial_rotary_mul",
          TORCH_FN(xllm::kernel::npu::npu_inplace_partial_rotary_mul));
+  m.impl("ada_layer_norm", TORCH_FN(xllm::ada_layer_norm_npu));
   m.impl("silu_and_mul", TORCH_FN(xllm::silu_and_mul_npu));
   m.impl("dispatch_ffn_combine", TORCH_FN(xllm::dispatch_ffn_combine_npu));
   m.impl("mega_moe", TORCH_FN(xllm::mega_moe_npu));
@@ -1274,6 +1293,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("sparse_flash_attention_lse",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention_lse));
   m.impl("sfa_dcp_remap_out", TORCH_FN(xllm::sfa_dcp_remap_out_npu));
+  m.impl("laser_attention", TORCH_FN(xllm::kernel::npu::laser_attention));
 }
 
 // build_cp_context is pure host index math with no Tensor input, so the

@@ -306,6 +306,18 @@ def _fused_sigmoid_gating_delta_rule_decode_fake(
     return torch.empty_like(v)
 
 
+def _ada_layer_norm_fake(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    del scale, shift, weight, bias, eps
+    return torch.empty_like(input)
+
+
 def _fused_add_rms_norm_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -1433,6 +1445,7 @@ register_fake(
     "xllm_ops::fused_sigmoid_gating_delta_rule_decode",
     _fused_sigmoid_gating_delta_rule_decode_fake,
 )
+register_fake("xllm_ops::ada_layer_norm", _ada_layer_norm_fake)
 register_fake("xllm_ops::fused_add_rms_norm", _fused_add_rms_norm_fake)
 register_fake("xllm_ops::silu_and_mul", _silu_and_mul_fake)
 register_fake("xllm_ops::mega_moe", _mega_moe_fake)

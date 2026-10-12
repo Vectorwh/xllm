@@ -276,6 +276,15 @@ struct ParallelArgs {
   ProcessGroup* dit_dp_group_ = nullptr;
   ProcessGroup* dit_vae_group_ = nullptr;
   ProcessGroup* dit_text_encoder_tp_group_ = nullptr;
+
+  // Global rank layout of every DiT subgroup, keyed by the python group name
+  // (e.g. "dit_cfg" -> the member ranks of each cfg group in a deterministic
+  // order). Populated by DiTCollectiveCommunicator when the group spans more
+  // than one rank; consumed by the python DiT backend to register the SAME
+  // subgroups through torch.distributed (new_group is world-collective, so
+  // every rank needs the full layout, not just its own group's members).
+  std::unordered_map<std::string, std::vector<std::vector<int32_t>>>
+      python_group_layouts_;
 };
 
 }  // namespace xllm

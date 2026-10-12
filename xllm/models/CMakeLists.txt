@@ -21,6 +21,7 @@ cc_library(
   SRCS
     model_registry.cpp
     $<$<BOOL:${USE_MLU}>:llm/mlu/deepseek_v41_dspark_quant_args.cpp>
+    dit/py_dit_model.cpp
     dit/utils/lanczos_resample.cpp
     $<$<BOOL:${USE_NPU}>:dit/utils/dit_block_weight_manager.cpp>
     vlm/utils/multimodal_utils.cpp
@@ -37,6 +38,7 @@ cc_library(
     util
     $<$<BOOL:${USE_NPU}>:npu_layers>
     $<$<BOOL:${USE_CUDA}>:cuda_kernels>
+    nlohmann_json::nlohmann_json
     torch_python
     Python::Python
 )

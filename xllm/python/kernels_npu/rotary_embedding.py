@@ -16,8 +16,12 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import torch
 import torch_npu
+
+_HAS_MINDIESD = find_spec("mindiesd") is not None
 
 
 def has_fused_qk_rotary(head_dim: int) -> bool:
@@ -351,16 +355,178 @@ def rope_siso(
     )
 
 
+def _eager_wan_interleaved_rope(
+    value: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Eager interleaved (GPT-J) RoPE in fp32, matching Wan DiT semantics."""
+    cos_b = (cos.unsqueeze(2) if cos.dim() == 3 else cos).to(torch.float32)
+    sin_b = (sin.unsqueeze(2) if sin.dim() == 3 else sin).to(torch.float32)
+    x_float = value.to(torch.float32)
+    x_pairs = x_float.reshape(x_float.size(0), x_float.size(1), x_float.size(2), -1, 2)
+    x_real = x_pairs.select(-1, 0)
+    x_imag = x_pairs.select(-1, 1)
+    rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+    return (x_float * cos_b + rotated * sin_b).to(value.dtype)
+
+
+def wan_interleaved_rope(
+    value: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Interleaved (GPT-J) RoPE for Wan-style DiT, via ``npu_rotary_mul``.
+
+    The Wan model keeps full-width ``cos``/``sin`` tables whose adjacent pairs
+    are duplicated (``repeat_interleave(2)``). ``npu_rotary_mul`` in
+    ``rotary_mode="interleave"`` reproduces ``x * cos + rotate_half(x) * sin``
+    exactly, but only accepts ``BSND`` activations with ``1S1D`` cos/sin tables
+    (single-batch). Multi-batch inputs fall back to the eager fp32 reference.
+
+    Args:
+        value: ``[B, S, H, D]`` activation.
+        cos: ``[S, D]``, ``[1, S, D]`` or ``[B, S, D]`` full-width cosine table.
+        sin: matching sine table.
+
+    Returns:
+        Rotated tensor with the shape and dtype of ``value``.
+    """
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    if value.device.type == "npu" and value.size(0) == 1:
+        seq = cos.size(1)
+        value_bsnd = value.transpose(1, 2).contiguous()  # [1, H, S, D]
+        cos_1s1d = cos[0].reshape(1, 1, seq, cos.size(2)).contiguous()
+        sin_1s1d = sin[0].reshape(1, 1, seq, sin.size(2)).contiguous()
+        out = torch_npu.npu_rotary_mul(value_bsnd, cos_1s1d, sin_1s1d, rotary_mode="interleave")
+        return out.transpose(1, 2)
+    return _eager_wan_interleaved_rope(value, cos, sin)
+
+
+def _cpp_style_wan_interleaved_rope(
+    value: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Interleaved (GPT-J) RoPE in fp32, matching C++ ``apply_rotary_emb_batched``.
+
+    Unlike :func:`wan_interleaved_rope`, which runs ``npu_rotary_mul`` in bf16
+    with a ``BNSD``/``11SD`` layout, this variant keeps the activations in fp32
+    and passes the ``BSND``/``1S1D`` layout the native C++ transformer uses, so
+    the two sides are bit-exact. Only the JoyImageEditPlus img stream routes
+    here (the text stream is RoPE-free); other callers keep the bf16 path.
+    """
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    cos_b = (cos.unsqueeze(2) if cos.dim() == 3 else cos).to(torch.float32)  # [B|1, S, 1, D]
+    sin_b = (sin.unsqueeze(2) if sin.dim() == 3 else sin).to(torch.float32)
+    x_float = value.to(torch.float32)
+
+    if value.device.type == "npu":
+        if _HAS_MINDIESD:
+            try:
+                from mindiesd import rotary_position_embedding
+
+                # ``rotated_mode="rotated_interleaved"`` maps to the same
+                # ``npu_rotary_mul(mode="interleave")`` call below; mindiesd
+                # upcasts ``x`` to the fp32 cos/sin dtype and casts the output
+                # back to ``x``'s dtype, matching this path exactly.
+                if cos_b.size(0) == 1:
+                    out = rotary_position_embedding(
+                        x_float,
+                        cos_b,
+                        sin_b,
+                        rotated_mode="rotated_interleaved",
+                        head_first=False,
+                        fused=True,
+                    )
+                    return out.to(value.dtype)
+                outputs = [
+                    rotary_position_embedding(
+                        x_float[i : i + 1],
+                        cos_b[i : i + 1],
+                        sin_b[i : i + 1],
+                        rotated_mode="rotated_interleaved",
+                        head_first=False,
+                        fused=True,
+                    )
+                    for i in range(value.size(0))
+                ]
+                return torch.cat(outputs, 0).to(value.dtype)
+            except ImportError:
+                pass
+
+        if cos_b.size(0) == 1:
+            out = torch_npu.npu_rotary_mul(x_float, cos_b, sin_b, rotary_mode="interleave")
+            return out.to(value.dtype)
+        outputs = [
+            torch_npu.npu_rotary_mul(
+                x_float[i : i + 1],
+                cos_b[i : i + 1],
+                sin_b[i : i + 1],
+                rotary_mode="interleave",
+            )
+            for i in range(value.size(0))
+        ]
+        return torch.cat(outputs, 0).to(value.dtype)
+
+    x_pairs = x_float.reshape(x_float.size(0), x_float.size(1), x_float.size(2), -1, 2)
+    x_real = x_pairs.select(-1, 0)
+    x_imag = x_pairs.select(-1, 1)
+    rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+    return (x_float * cos_b + rotated * sin_b).to(value.dtype)
+
+
+def fused_qk_norm_rope_wan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-head Q/K RMSNorm followed by interleaved RoPE (Wan img stream).
+
+    Composes ``npu_rms_norm`` (fp32 accumulate) with the C++-matching fp32
+    interleaved RoPE (see :func:`_cpp_style_wan_interleaved_rope`) so the img
+    stream is bit-exact with the native C++ transformer, and falls back to the
+    eager fp32 reference on non-NPU devices.
+
+    Args:
+        q: ``[B, S, H, D]`` query.
+        k: ``[B, S, H, D]`` key.
+        q_weight: ``[D]`` query RMSNorm scale.
+        k_weight: ``[D]`` key RMSNorm scale.
+        cos: full-width cosine table (see :func:`wan_interleaved_rope`).
+        sin: matching sine table.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        ``(q, k)`` with RMSNorm and RoPE applied.
+    """
+    from .normalization import rms_norm_fp32
+
+    q_norm = rms_norm_fp32(q, q_weight, eps)
+    k_norm = rms_norm_fp32(k, k_weight, eps)
+    return _cpp_style_wan_interleaved_rope(q_norm, cos, sin), _cpp_style_wan_interleaved_rope(k_norm, cos, sin)
+
+
 __all__ = [
     "apply_qk_rotary",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
     "fused_qk_norm_rope",
     "has_split_qkv_rmsnorm_mrope_specialization",
     "inplace_partial_rotary_mul",
+    "fused_qk_norm_rope_wan",
     "interleaved_rotary_embedding",
     "mrope",
     "npu_inplace_partial_rotary_mul",
     "rope_siso",
     "split_qkv_rmsnorm_mrope",
     "vision_rotary_mul",
+    "wan_interleaved_rope",
 ]

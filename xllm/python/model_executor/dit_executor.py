@@ -1,0 +1,141 @@
+# Copyright 2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""DiT pipeline executor: the Python side of the C++ ``PyDiTModel`` shell.
+
+One instance per worker. ``create`` assembles the pipeline from the config
+dict the C++ shell builds (component configs + StateDict wrappers + parallel
+group names); ``execute`` runs one full request (text encode, denoise loop,
+VAE decode) and returns one image tensor per batch sample. Everything between
+the two calls stays in Python, so a request crosses the language boundary
+once for the pipeline call plus at most once for a form-B text encoder.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from xllm.python.model_executor.dit_cache import create_cache_hooks
+from xllm.python.models.dit import get_component_class
+from xllm.python.models.dit.pipelines import get_pipeline_class
+
+# Components constructed from their config dict; the executor passes the
+# global dtype and the matching parallel group name.
+_PARALLEL_GROUP_KEY = {
+    "transformer": "dit_sp_group",
+    "vae": "dit_vae_group",
+}
+_NEEDS_DTYPE = frozenset(("transformer", "vae"))
+
+
+class DiTPipelineExecutor:
+    """Assemble, load and run a Python DiT pipeline."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+        self.device = torch.device(config["device"])
+        self.dtype = self._resolve_dtype(config.get("dtype"))
+        self.cache_hooks = create_cache_hooks(
+            config.get("dit_cache_policy"),
+            sp_group=config.get("dit_sp_group"),
+            options=config.get("dit_cache_options"),
+        )
+        # Publish the resolved values so components and the pipeline read the
+        # same device/dtype without re-parsing the C++ strings.
+        config["device"] = self.device
+        config["dtype"] = self.dtype
+
+        specs = config["components"]
+        # Pipeline-level views of the component configs (latent stats, patch
+        # size, ...) — the pipeline reads these instead of reaching into
+        # component instances.
+        config.setdefault("transformer_config", specs["transformer"]["config"])
+        config.setdefault("vae_config", specs["vae"]["config"])
+
+        components: dict[str, object] = {}
+        for name, spec in specs.items():
+            components[name] = self._build_component(name, spec)
+        self._build_image_processor(components, specs)
+
+        self.pipeline = get_pipeline_class(config["pipeline"])(components, config)
+        self.pipeline.to(device=self.device, dtype=self.dtype)
+        # Component conventions applied after the move, mirroring the C++
+        # pipelines' load_model: fp32-sensitive modules are re-cast.
+        for component in components.values():
+            keep_fp32 = getattr(component, "keep_fp32_modules", None)
+            if callable(keep_fp32):
+                keep_fp32()
+
+    @classmethod
+    def create(cls, config: dict) -> DiTPipelineExecutor:
+        return cls(config)
+
+    @torch.inference_mode()
+    def execute(self, request: dict) -> list[torch.Tensor]:
+        """Run one request; returns one image tensor per batch sample."""
+        return self.pipeline(request, cache_hooks=self.cache_hooks)
+
+    # ---- internals ----------------------------------------------------------
+
+    def _build_component(self, name: str, spec: dict) -> object:
+        if spec.get("kind") == "external":
+            # Form-B component owned by C++ (e.g. the Qwen3-VL text encoder
+            # proxy); already fully constructed and loaded.
+            proxy = spec["proxy"]
+            if proxy is None:
+                raise ValueError(f"external component '{name}' carries no proxy object")
+            return proxy
+
+        component_cls = get_component_class(spec["class_name"])
+        kwargs: dict = {}
+        if name in _NEEDS_DTYPE:
+            kwargs["dtype"] = self.dtype
+        group_key = _PARALLEL_GROUP_KEY.get(name)
+        if group_key is not None and group_key in self.config:
+            kwargs["sp_group" if name == "transformer" else "vae_group"] = self.config[group_key]
+        component = component_cls(spec["config"], **kwargs)
+
+        state_dicts = spec.get("state_dicts")
+        if state_dicts is not None:
+            # Call even on an empty list: components verify required weights
+            # and fail loudly instead of silently running on random ones.
+            component.load_weights(state_dicts)
+        return component
+
+    def _build_image_processor(self, components: dict[str, object], specs: dict) -> None:
+        """Build the VAE image processor from the VAE component's config.
+
+        The processor is not a model folder, so the C++ shell does not pass a
+        component spec for it; the pipelines still require it for VAE reference
+        pre-processing and output post-processing.
+        """
+        if "vae_image_processor" in components or "vae" not in specs:
+            return
+        vae_config = specs["vae"]["config"]
+        processor_cls = get_component_class("VAEImageProcessor")
+        components["vae_image_processor"] = processor_cls(
+            vae_config,
+            latent_channels=int(vae_config.get("z_dim", 4)),
+            scale_factor=int(vae_config.get("scale_factor_spatial", 8)),
+        )
+
+    @staticmethod
+    def _resolve_dtype(dtype: object) -> torch.dtype:
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        name = dtype if dtype else "bfloat16"
+        resolved = getattr(torch, str(name), None)
+        if not isinstance(resolved, torch.dtype):
+            raise ValueError(f"Unknown dtype: {dtype!r}")
+        return resolved

@@ -27,6 +27,7 @@ import math
 import socket
 from collections.abc import Sequence
 from datetime import timedelta
+from typing import Callable
 
 import torch
 import torch.distributed as dist
@@ -47,6 +48,11 @@ _CONTIGUOUS_GROUPS = frozenset(("tp", "moe_tp", "layerwise"))
 
 _groups = {}
 _group_ranks = {}
+# Global ranks of every member of each named group, keyed like _groups. Only
+# groups registered through ``init_group`` (explicit membership, e.g. the DiT
+# cfg/sp/vae subgroups) land here; the derived groups above know their layout
+# from ``_group_memberships`` instead.
+_group_members = {}
 _stores = {}
 _world_topology = None
 _world_rank = None
@@ -329,6 +335,60 @@ def init_tp_group(
         global_world_size,
         group_index,
     )
+
+
+def init_group(
+    group_name: str,
+    host: str,
+    port: int,
+    group_ranks: list[list[int]],
+    rank: int,
+    device: str,
+    global_rank: int,
+    global_world_size: int,
+) -> ProcessGroup:
+    """Register named subgroups with an explicit rank layout.
+
+    Unlike ``init_process_group`` the membership is not derived from sizes: the
+    caller passes every group of this kind in an order all ranks agree on
+    (mirroring the C++ ``ParallelArgs`` layout computed by the DiT rank
+    generator). ``new_group`` is collective over the whole world, so every rank
+    creates all of them and only its own group is kept under ``group_name``.
+    """
+    device_obj = torch.device(device)
+    group_key = (group_name, str(device_obj))
+    group = _groups.get(group_key)
+    if group is not None:
+        if group.rank() != rank or group.size() != len(_group_members.get(group_key, [])):
+            raise RuntimeError(
+                f"{group_name} group for {group_key[1]} is already initialized as rank {group.rank()}/{group.size()}"
+            )
+        return group
+
+    _ensure_world(host, port, device_obj, global_rank, global_world_size)
+    backend = _backend_for(device_obj)
+
+    own = None
+    own_ranks = None
+    for ranks in group_ranks:
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
+        if global_rank in ranks:
+            if own is not None:
+                raise RuntimeError(f"{group_name} layouts overlap: {global_rank} appears in more than one group")
+            own = candidate
+            own_ranks = ranks
+    if own is None:
+        raise RuntimeError(f"{group_name} layout does not contain global rank {global_rank}")
+    if own.rank() != rank:
+        raise RuntimeError(
+            f"derived {group_name} membership disagrees with the caller: global "
+            f"rank {global_rank} of {global_world_size} expected rank {rank} of "
+            f"{own.size()}, got {own.rank()}"
+        )
+
+    _groups[group_key] = own
+    _group_members[group_key] = list(own_ranks)
+    return own
 
 
 def _require_group(x: torch.Tensor, group_name: str) -> ProcessGroup:
@@ -1022,6 +1082,242 @@ def gather_dp_execution_tokens(
     return dp_all_gather(x, counts, rank), sum(counts[:rank])
 
 
+def named_group(group_name: str, device: torch.device | str) -> ProcessGroup | None:
+    """The named group for ``device``, or None when it was never registered."""
+    return _groups.get((group_name, str(torch.device(device))))
+
+
+def named_group_rank(group_name: str, device: torch.device | str) -> int:
+    """Rank inside the named group for ``device`` (0 when the group is absent)."""
+    group = named_group(group_name, device)
+    return group.rank() if group is not None else 0
+
+
+def named_group_size(group_name: str, device: torch.device | str) -> int:
+    """Size of the named group for ``device`` (1 when the group is absent)."""
+    group = named_group(group_name, device)
+    return group.size() if group is not None else 1
+
+
+@torch.library.custom_op("xllm_ops::gather", mutates_args=())
+def gather(x: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+    """All-gather ``x`` from a named group and concatenate along ``dim``."""
+    group = _require_group(x, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    chunks = [torch.empty_like(x) for _ in range(world_size)]
+    dist.all_gather(chunks, x.contiguous(), group=group)
+    return torch.cat(chunks, dim=dim)
+
+
+@gather.register_fake
+def _(x: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+    del group_name
+    shape = list(x.shape)
+    shape[dim] *= world_size
+    return x.new_empty(shape)
+
+
+@torch.library.custom_op("xllm_ops::scatter", mutates_args=())
+def scatter(x: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+    """Split ``x`` along ``dim`` into one equal chunk per rank; keep this rank's."""
+    group = _require_group(x, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    if x.size(dim) % world_size:
+        raise RuntimeError(
+            f"{group_name} scatter size mismatch: dim {dim} of size {x.size(dim)} "
+            f"does not divide evenly across {world_size} ranks (pad first)"
+        )
+    return x.chunk(world_size, dim=dim)[group.rank()].clone()
+
+
+@scatter.register_fake
+def _(x: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+    del group_name
+    shape = list(x.shape)
+    shape[dim] //= world_size
+    return x.new_empty(shape)
+
+
+def _to_global_rank(group: ProcessGroup, group_key: tuple[str, str], local_rank: int) -> int:
+    ranks = _group_members.get(group_key)
+    if ranks is None:
+        raise RuntimeError(f"group '{group_key[0]}' has no recorded membership; register it with init_group")
+    if not 0 <= local_rank < len(ranks):
+        raise RuntimeError(f"invalid {group_key[0]} rank {local_rank} of {len(ranks)}")
+    return ranks[local_rank]
+
+
+@torch.library.custom_op("xllm_ops::send", mutates_args=())
+def send(x: torch.Tensor, dst: int, group_name: str) -> None:
+    """Blocking point-to-point send to group-local rank ``dst``."""
+    group = _require_group(x, group_name)
+    global_dst = _to_global_rank(group, (group_name, str(x.device)), dst)
+    dist.send(x.contiguous(), global_dst, group=group)
+
+
+@send.register_fake
+def _(x: torch.Tensor, dst: int, group_name: str) -> None:
+    return None
+
+
+@torch.library.custom_op("xllm_ops::recv", mutates_args=())
+def recv(x: torch.Tensor, src: int, group_name: str) -> torch.Tensor:
+    """Blocking point-to-point receive from group-local rank ``src``."""
+    group = _require_group(x, group_name)
+    global_src = _to_global_rank(group, (group_name, str(x.device)), src)
+    buffer = torch.empty_like(x)
+    dist.recv(buffer, global_src, group=group)
+    return buffer
+
+
+@recv.register_fake
+def _(x: torch.Tensor, src: int, group_name: str) -> torch.Tensor:
+    return x
+
+
+@torch.library.custom_op("xllm_ops::all_to_all_4D", mutates_args=())
+def all_to_all_4D(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str) -> torch.Tensor:
+    """Reshard a 4D [B, S, H, D] tensor across a named group.
+
+    ``scatter_idx=2, gather_idx=1`` converts a sequence shard into a head
+    shard; ``scatter_idx=1, gather_idx=2`` converts back. Mirrors the C++
+    ``parallel_state::all_to_all_4D`` layout so both stacks shard identically.
+    Identity when the group was never registered (single-rank execution).
+    """
+    if (group_name, str(x.device)) not in _groups:
+        return x
+    group = _require_group(x, group_name)
+    if x.dim() != 4:
+        raise RuntimeError(f"all_to_all_4D: input must be 4D, got dim={x.dim()}")
+    sp_size = group.size()
+    if sp_size == 1:
+        return x
+
+    if scatter_idx == 2 and gather_idx == 1:
+        # Sequence shard -> head shard:
+        #   [B, S/sp, H, D] -> [B, S, H/sp, D]
+        bs, shard_seqlen, head_num, head_size = x.shape
+        if head_num % sp_size:
+            raise RuntimeError(f"all_to_all_4D(A): head_num {head_num} not divisible by {sp_size}")
+        shard_head_num = head_num // sp_size
+        seqlen = shard_seqlen * sp_size
+        input_t = x.reshape(bs, shard_seqlen, sp_size, shard_head_num, head_size).transpose(0, 2).contiguous()
+        output = torch.empty_like(input_t)
+        dist.all_to_all_single(output, input_t, group=group)
+        return (
+            output.reshape(seqlen, bs, shard_head_num, head_size)
+            .transpose(0, 1)
+            .contiguous()
+            .reshape(bs, seqlen, shard_head_num, head_size)
+        )
+    if scatter_idx == 1 and gather_idx == 2:
+        # Head shard -> sequence shard:
+        #   [B, S, H/sp, D] -> [B, S/sp, H, D]
+        bs, seqlen, shard_head_num, head_size = x.shape
+        if seqlen % sp_size:
+            raise RuntimeError(f"all_to_all_4D(B): seqlen {seqlen} not divisible by {sp_size}")
+        shard_seqlen = seqlen // sp_size
+        head_num = shard_head_num * sp_size
+        input_t = (
+            x.reshape(bs, sp_size, shard_seqlen, shard_head_num, head_size)
+            .transpose(0, 3)  # (shard_head, sp, shard_seqlen, bs, head)
+            .transpose(0, 1)  # (sp, shard_head, shard_seqlen, bs, head)
+            .contiguous()
+        )
+        output = torch.empty_like(input_t)
+        dist.all_to_all_single(output, input_t, group=group)
+        return (
+            output.reshape(head_num, shard_seqlen, bs, head_size)
+            .transpose(0, 2)
+            .contiguous()
+            .reshape(bs, shard_seqlen, head_num, head_size)
+        )
+    raise RuntimeError(f"all_to_all_4D: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
+
+
+@all_to_all_4D.register_fake
+def _(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str) -> torch.Tensor:
+    return x
+
+
+def all_to_all_4D_async(
+    x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str
+) -> Callable[[], torch.Tensor]:
+    """Async variant of :func:`all_to_all_4D`, mirroring the C++
+    ``parallel_state::all_to_all_4D(async_ops=true)`` path.
+
+    The collective is launched with ``async_op=True`` so the host does not
+    block on ``dist.all_to_all_single``; the returned zero-arg callable performs
+    the deferred ``work.wait()`` and output reshape/transpose. Callers overlap
+    later computation with the in-flight communication (e.g. norm+RoPE overlaps
+    the V all-to-all), exactly as the native ``JoyAttention`` does. Identity
+    when the group was never registered or has a single rank.
+    """
+    if (group_name, str(x.device)) not in _groups:
+        return lambda: x
+    group = _require_group(x, group_name)
+    if x.dim() != 4:
+        raise RuntimeError(f"all_to_all_4D_async: input must be 4D, got dim={x.dim()}")
+    sp_size = group.size()
+    if sp_size == 1:
+        return lambda: x
+
+    if scatter_idx == 2 and gather_idx == 1:
+        # Sequence shard -> head shard:
+        #   [B, S/sp, H, D] -> [B, S, H/sp, D]
+        bs, shard_seqlen, head_num, head_size = x.shape
+        if head_num % sp_size:
+            raise RuntimeError(f"all_to_all_4D_async(A): head_num {head_num} not divisible by {sp_size}")
+        shard_head_num = head_num // sp_size
+        seqlen = shard_seqlen * sp_size
+        input_t = x.reshape(bs, shard_seqlen, sp_size, shard_head_num, head_size).transpose(0, 2).contiguous()
+        output = torch.empty_like(input_t)
+        work = dist.all_to_all_single(output, input_t, group=group, async_op=True)
+
+        def wait() -> torch.Tensor:
+            work.wait()
+            return (
+                output.reshape(seqlen, bs, shard_head_num, head_size)
+                .transpose(0, 1)
+                .contiguous()
+                .reshape(bs, seqlen, shard_head_num, head_size)
+            )
+
+        return wait
+
+    if scatter_idx == 1 and gather_idx == 2:
+        # Head shard -> sequence shard:
+        #   [B, S, H/sp, D] -> [B, S/sp, H, D]
+        bs, seqlen, shard_head_num, head_size = x.shape
+        if seqlen % sp_size:
+            raise RuntimeError(f"all_to_all_4D_async(B): seqlen {seqlen} not divisible by {sp_size}")
+        shard_seqlen = seqlen // sp_size
+        head_num = shard_head_num * sp_size
+        input_t = (
+            x.reshape(bs, sp_size, shard_seqlen, shard_head_num, head_size)
+            .transpose(0, 3)  # (shard_head, sp, shard_seqlen, bs, head)
+            .transpose(0, 1)  # (sp, shard_head, shard_seqlen, bs, head)
+            .contiguous()
+        )
+        output = torch.empty_like(input_t)
+        work = dist.all_to_all_single(output, input_t, group=group, async_op=True)
+
+        def wait() -> torch.Tensor:
+            work.wait()
+            return (
+                output.reshape(head_num, shard_seqlen, bs, head_size)
+                .transpose(0, 2)
+                .contiguous()
+                .reshape(bs, shard_seqlen, head_num, head_size)
+            )
+
+        return wait
+
+    raise RuntimeError(f"all_to_all_4D_async: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
+
+
 __all__ = [
     "init_process_group",
     "init_tp_group",
@@ -1033,6 +1329,7 @@ __all__ = [
     "engram_all_gather_object",
     "engram_barrier",
     "tp_group",
+    "init_group",
     "tp_rank",
     "cp_rank",
     "cp_world_size",
@@ -1046,4 +1343,13 @@ __all__ = [
     "dp_all_gather",
     "dp_all_true",
     "gather_dp_execution_tokens",
+    "named_group",
+    "named_group_rank",
+    "named_group_size",
+    "gather",
+    "scatter",
+    "send",
+    "recv",
+    "all_to_all_4D",
+    "all_to_all_4D_async",
 ]
