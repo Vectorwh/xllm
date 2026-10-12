@@ -865,7 +865,9 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
         self.latent_channels = int(config.get("latent_channels", 128))
         self.text_dim = int(config.get("text_dim", 5120))
         self.rope_theta = float(config.get("rope_theta", 10000.0))
-        self.mrope_section = [int(v) for v in config.get("mrope_section", [16, 24, 24])]
+        # The checkpoint stores null for unset optionals (diffusers
+        # convention); ModelArgs on the C++ side heals null the same way.
+        self.mrope_section = [int(v) for v in (config.get("mrope_section") or [16, 24, 24])]
         self.norm_eps = float(config.get("norm_eps", 1e-6))
         self.sandwich_norm = bool(config.get("sandwich_norm", True))
         self.top_p = float(config.get("top_p", 0.125))

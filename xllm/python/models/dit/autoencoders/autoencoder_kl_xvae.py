@@ -416,17 +416,19 @@ class AutoencoderKLXVAE(DiTComponentBase, VaeParallelMixin):
         )
         self.patch_size = int(config.get("patch_size", 0) or config.get("vae_patch_size", 0) or 2)
         self.num_res_blocks = int(config.get("num_res_blocks", 2))
-        block_in_channels = [int(v) for v in config.get("block_in_channels", [])]
+        # The checkpoint stores null for unset optionals (diffusers
+        # convention); ``or []`` mirrors the C++ empty-vector fallback.
+        block_in_channels = [int(v) for v in (config.get("block_in_channels") or [])]
         if not block_in_channels:
             # Checkpoint stores null → SGLang/diffusers defaults.
             block_in_channels = [160, 320, 640, 1280, 1280]
-        temporal_upsample = [bool(v) for v in config.get("temporal_downsample", [])]
+        temporal_upsample = [bool(v) for v in (config.get("temporal_downsample") or [])]
         if not temporal_upsample:
             temporal_upsample = [False, True, True, False, False]
         if len(temporal_upsample) != len(block_in_channels):
             raise ValueError("temporal_downsample length mismatch")
-        self.latents_mean = [float(v) for v in config.get("latents_mean", [])]
-        self.latents_std = [float(v) for v in config.get("latents_std", [])]
+        self.latents_mean = [float(v) for v in (config.get("latents_mean") or [])]
+        self.latents_std = [float(v) for v in (config.get("latents_std") or [])]
 
         # Decoder consumes reversed block channels (config order = encoder).
         decoder_block_in_channels = list(reversed(block_in_channels))

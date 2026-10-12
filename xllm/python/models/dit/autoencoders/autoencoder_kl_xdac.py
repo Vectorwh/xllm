@@ -264,8 +264,8 @@ class AutoencoderKLXDAC(DiTComponentBase):
         self.decoder_dim = int(config.get("decoder_dim", 2048))
         self.encoder_rates = [int(v) for v in (config.get("encoder_rates") or [2, 4, 4, 8, 8])]
         self.decoder_rates = [int(v) for v in (config.get("decoder_rates") or [8, 8, 4, 4, 2])]
-        self.latents_mean = [float(v) for v in config.get("latents_mean", [])]
-        self.latents_std = [float(v) for v in config.get("latents_std", [])]
+        self.latents_mean = [float(v) for v in (config.get("latents_mean") or [])]
+        self.latents_std = [float(v) for v in (config.get("latents_std") or [])]
 
         self.post_quant_conv = nn.Conv1d(self.latent_channels, self.latent_channels, kernel_size=1)
         self.decoder = XDACDecoder(self.latent_channels, self.decoder_dim, self.decoder_rates, self.out_channels)
