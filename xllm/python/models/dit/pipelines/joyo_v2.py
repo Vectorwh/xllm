@@ -19,13 +19,13 @@ three refiner streams (text / pixel noise / audio) and the packed mix MoE
 layers per denoise step, then decodes video through XVAE and audio through
 XDAC.
 
-Text path: the Python request carries plain tensors only, so requests MUST
-supply ``prompt_embeds`` (``[T, D]`` or ``[1, T, D]``). The C++-only paths —
-the in-process Qwen3-VL encoder (``--dit_enable_joyo_text_encoder``) and the
-``joyo_text_seqlens`` side-channel on ``Tensor.parameters`` — are not
-reachable here; encode client-side instead. Without
-``negative_prompt_embeds``, a CFG request splits ``prompt_embeds`` into
-``n_cfg`` equal parts (H3 convention).
+Text path: requests supply ``prompt_embeds`` (``[T, D]`` or ``[1, T, D]``)
+or plain ``prompts`` — when the C++ shell loaded the in-process Qwen3-VL
+encoder (``--dit_enable_joyo_text_encoder``), the external proxy
+(``text_encoder`` component) encodes them via ``encode_joyo_prompts``
+(bare user-turn chat wrap, full pre-norm residual, unpadded). Without
+``negative_prompt_embeds`` or ``negative_prompts``, a CFG request splits
+the packed ``prompt_embeds`` into ``n_cfg`` equal parts (H3 convention).
 """
 
 from __future__ import annotations
@@ -215,6 +215,9 @@ class JoyOV2Pipeline(DiffusionPipeline):
             raise KeyError(f"JoyOV2Pipeline missing components: {missing}")
         self.audio_vae = self.components.get("audio_vae")
         self.generate_audio = self.audio_vae is not None
+        # External C++ proxy (VlmTextEncoderProxy) when the shell loaded the
+        # in-process Qwen3-VL encoder; None otherwise.
+        self.text_encoder = self.components.get("text_encoder")
 
         self.latent_channels = int(self.transformer.latent_channels)
         self.text_dim = int(self.transformer.text_dim)
@@ -399,16 +402,46 @@ class JoyOV2Pipeline(DiffusionPipeline):
             raise ValueError("JoyOV2 prompt_embed must not contain NaN or Inf")
         return t
 
+    def _encode_prompts_in_process(
+        self, request: dict, do_cfg: bool, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """In-process Qwen3-VL encode via the external proxy.
+
+        Mirrors the C++ ``resolve_prompt_embeds`` in-process branch: one
+        unpadded [T, D] pre-norm residual per prompt, seqlens derived per
+        prompt (no padding, no prefix slice).
+        """
+        if self.text_encoder is None:
+            raise ValueError(
+                "JoyOV2 requires `prompt_embeds` (client-side encoded) or "
+                "the in-process text encoder (--dit_enable_joyo_text_encoder "
+                "+ text_encoder component)"
+            )
+        prompts = request.get("prompts") or []
+        if not prompts:
+            raise ValueError("JoyOV2 in-process encode requires input prompts")
+        text_embeddings = self._normalize_text_emb(self.text_encoder.encode_joyo_prompts([str(prompts[0])])[0])
+        if do_cfg:
+            negative_prompts = request.get("negative_prompts") or []
+            if not negative_prompts:
+                raise ValueError("JoyOV2 CFG with in-process encoder requires negative_prompt")
+            neg_emb = self._normalize_text_emb(self.text_encoder.encode_joyo_prompts([str(negative_prompts[0])])[0])
+            text_seqlens = torch.tensor(
+                [text_embeddings.size(0), neg_emb.size(0)],
+                dtype=torch.int32,
+                device=device,
+            )
+            text_embeddings = torch.cat([text_embeddings, neg_emb], dim=0)
+        else:
+            text_seqlens = torch.tensor([text_embeddings.size(0)], dtype=torch.int32, device=device)
+        return text_embeddings, text_seqlens
+
     def _resolve_prompt_embeds(
         self, request: dict, do_cfg: bool, n_cfg: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prompt_embeds = request.get("prompt_embeds")
         if prompt_embeds is None:
-            raise ValueError(
-                "JoyOV2 requires `prompt_embeds` (client-side encoded); the "
-                "in-process Qwen3-VL encoder and the joyo_text_seqlens "
-                "side-channel are C++-only"
-            )
+            return self._encode_prompts_in_process(request, do_cfg, device)
         text_embeddings = self._normalize_text_emb(prompt_embeds)
 
         negative_prompt_embeds = request.get("negative_prompt_embeds")

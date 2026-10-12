@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/parallel_state/parallel_args.h"
+#include "models/dit/transformers/transformer_joyo_v2.h"
 #include "models/dit/vlm_encoder_proxy.h"
 #include "models/py_model_helper.h"
 #include "models/vlm/mposition/mposition.h"
@@ -117,7 +118,10 @@ PYBIND11_EMBEDDED_MODULE(xllm_dit, m) {
       .def("encode_prompts",
            &VlmTextEncoderProxy::encode_prompts,
            py::arg("prompts"),
-           py::arg("images"));
+           py::arg("images"))
+      .def("encode_joyo_prompts",
+           &VlmTextEncoderProxy::encode_joyo_prompts,
+           py::arg("prompts"));
 }
 
 PyDiTModel::PyDiTModel(const DiTModelContext& context)
@@ -202,10 +206,21 @@ void PyDiTModel::build_text_encoder_proxy() {
       tp_group->rank(), tp_group->world_size(), tp_group);
   vlm_parallel_args.tp_size(tp_group->world_size());
   vlm_parallel_args.tp_group_ = tp_group;
+  // Joy-only dtype override: the worker-wide options_ seed comes from
+  // get_torch_dtype()'s first-hit component (often the fp32 VAE); an fp32
+  // Qwen3-VL feeds fp32 QKV into aclnnFusedInferAttentionScoreV3, which
+  // only supports fp16/bf16/int8. Re-bind to the text encoder's own
+  // config.json dtype, exactly like JoyOV2Pipeline does.
+  const ModelContext source_vlm_context =
+      context_.get_model_context("text_encoder");
+  const torch::TensorOptions te_options =
+      joyo_v2::resolve_component_tensor_options(
+          source_vlm_context.get_tensor_options(),
+          source_vlm_context.get_model_args().dtype());
   ModelContext vlm_context(vlm_parallel_args,
-                           text_encoder_model_args,
-                           context_.get_quant_args("text_encoder"),
-                           options_);
+                           source_vlm_context.get_model_args(),
+                           source_vlm_context.get_quant_args(),
+                           te_options);
 
   const std::string encoder_type = text_encoder_model_args.model_type();
   auto factory = ModelRegistry::get_causalvlm_factory(encoder_type);
@@ -217,7 +232,7 @@ void PyDiTModel::build_text_encoder_proxy() {
       << "Failed to create the JoyImageEditPlus text encoder: " << encoder_type;
 
   text_encoder_proxy_ = std::make_shared<VlmTextEncoderProxy>(
-      std::move(encoder), text_encoder_model_args, options_);
+      std::move(encoder), text_encoder_model_args, te_options);
   text_encoder_proxy_->set_mposition_generator(
       MPositionGeneratorFactory::get_instance().create_mposition_generator(
           "qwen3_vl"));
@@ -333,15 +348,28 @@ void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
     // before py::cast registers it into the config dict.
     py::module_::import("xllm_dit");
     text_encoder_loader_ = loader->take_component_loader("text_encoder");
-    std::shared_ptr<Tokenizer> tokenizer = text_encoder_loader_->tokenizer();
+    // The tokenizer lives in either layout: JoyImageEditPlus ships it inside
+    // text_encoder/, while JoyOV2 ships a top-level tokenizer/ component (HF
+    // fast tokenizer) and text_encoder/ holds weights only — its loader's
+    // tokenizer() would fall back to SentencePiece tokenizer.model and abort.
+    // Prefer the tokenizer component exactly like JoyOV2Pipeline::load_model.
+    std::shared_ptr<Tokenizer> tokenizer;
+    TokenizerArgs tokenizer_args = text_encoder_loader_->tokenizer_args();
+    if (loader->has_component("tokenizer")) {
+      auto tokenizer_loader = loader->take_component_loader("tokenizer");
+      tokenizer = tokenizer_loader->tokenizer();
+      tokenizer_args = tokenizer_loader->tokenizer_args();
+    } else {
+      tokenizer = text_encoder_loader_->tokenizer();
+    }
     CHECK(tokenizer != nullptr)
-        << "Failed to load JoyImageEditPlus Qwen3-VL tokenizer";
+        << "Failed to load text encoder Qwen3-VL tokenizer";
     text_encoder_proxy_->set_tokenizer(tokenizer);
     text_encoder_proxy_->set_multimodal_processor(
         create_multimodal_processor(context_.get_model_args("text_encoder"),
                                     tokenizer,
                                     /*max_cache_items=*/0,
-                                    text_encoder_loader_->tokenizer_args()));
+                                    tokenizer_args));
     // Load the VLM weights on the C++ side (KV cache / TP reuse).
     text_encoder_proxy_->encoder()->load_model(std::move(text_encoder_loader_));
     text_encoder_loader_.reset();

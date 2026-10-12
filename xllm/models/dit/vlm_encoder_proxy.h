@@ -114,6 +114,50 @@ class VlmTextEncoderProxy {
     return {torch::cat(embeddings, /*dim=*/0), torch::cat(masks, /*dim=*/0)};
   }
 
+  // JoyOV2 T2VA text path: plain chat wrap, no images, no multimodal
+  // processor — mirrors JoyOV2Pipeline::encode_one_prompt. Returns ONE
+  // unpadded [T, D] pre-norm residual per prompt (cast to the pipeline
+  // options); the caller derives joyo_text_seqlens from the per-prompt
+  // lengths and applies normalize_text_emb.
+  std::vector<torch::Tensor> encode_joyo_prompts(
+      const std::vector<std::string>& prompts) {
+    CHECK(tokenizer_ != nullptr) << "Qwen3-VL tokenizer is not loaded";
+    std::vector<torch::Tensor> embeds;
+    embeds.reserve(prompts.size());
+    for (const std::string& prompt : prompts) {
+      const std::string wrapped =
+          std::string(kJoyoChatPrefix) + prompt + kJoyoChatSuffix;
+      std::vector<int32_t> token_ids;
+      CHECK(tokenizer_->encode(wrapped,
+                               &token_ids,
+                               /*add_special_tokens=*/false))
+          << "JoyOV2 Qwen3-VL tokenizer encode failed";
+      CHECK(!token_ids.empty()) << "JoyOV2 Qwen3-VL encoded empty prompt";
+
+      torch::Tensor tokens =
+          torch::tensor(token_ids, torch::TensorOptions().dtype(torch::kInt32))
+              .to(device_);
+      torch::Tensor positions = torch::arange(
+          tokens.numel(),
+          torch::TensorOptions().dtype(torch::kInt).device(device_));
+      ModelInputParams input_params = build_plain_text_input(tokens);
+      input_params.embedding.input_embedding =
+          encoder_->get_input_embeddings(tokens, input_params);
+      ModelOutput model_output = encoder_->forward(
+          tokens, positions, text_encoder_empty_kv_caches_, input_params);
+      CHECK(model_output.residual.defined())
+          << "JoyOV2 requires Qwen3-VL pre-norm residual (TORCH backend)";
+      torch::Tensor residual = model_output.residual;
+      if (residual.dim() == 3 && residual.size(0) == 1) {
+        residual = residual.squeeze(0);
+      }
+      CHECK_EQ(residual.dim(), 2)
+          << "JoyOV2 encoder residual must be [T,D], got " << residual.sizes();
+      embeds.emplace_back(residual.to(options_));
+    }
+    return embeds;
+  }
+
  private:
   std::pair<torch::Tensor, torch::Tensor> encode_single_prompt(
       const std::string& prompt,
@@ -173,6 +217,42 @@ class VlmTextEncoderProxy {
         torch::ones({1, prompt_embeddings.size(1)},
                     torch::TensorOptions().device(device_).dtype(torch::kLong));
     return {prompt_embeddings, prompt_mask};
+  }
+
+  // Plain-text prefill params, no multimodal inputs — the input layout
+  // JoyOV2Pipeline::build_text_encoder_input uses for its T2VA text path.
+  ModelInputParams build_plain_text_input(const torch::Tensor& tokens) const {
+    CHECK_LE(tokens.numel(), std::numeric_limits<int32_t>::max())
+        << "JoyOV2 Qwen3-VL prompt is too long";
+    const int32_t sequence_length = static_cast<int32_t>(tokens.numel());
+    CHECK_GT(sequence_length, 0) << "JoyOV2 Qwen3-VL prompt must not be empty";
+
+    ModelInputParams params;
+    params.meta.num_sequences = 1;
+    params.meta.actual_num_sequences = 1;
+    params.meta.q_max_seq_len = sequence_length;
+    params.meta.kv_max_seq_len = sequence_length;
+    params.meta.batch_forward_type = BatchForwardType::PREFILL;
+    params.prefill_without_cache = true;
+    params.attention.host.q_seq_lens = {sequence_length};
+    params.attention.host.kv_seq_lens = {sequence_length};
+#if defined(USE_NPU)
+    params.attention.host.q_cu_seq_lens = {sequence_length};
+#else
+    params.attention.host.q_cu_seq_lens = {0, sequence_length};
+#endif
+    params.attention.device.q_seq_lens =
+        torch::tensor({sequence_length}, torch::kInt).to(tokens.device());
+    params.attention.device.kv_seq_lens =
+        torch::tensor({sequence_length}, torch::kInt).to(tokens.device());
+#if defined(USE_NPU)
+    params.attention.device.q_cu_seq_lens =
+        torch::tensor({sequence_length}, torch::kInt).to(tokens.device());
+#else
+    params.attention.device.q_cu_seq_lens =
+        torch::tensor({0, sequence_length}, torch::kInt).to(tokens.device());
+#endif
+    return params;
   }
 
   ModelInputParams build_text_encoder_input(const torch::Tensor& tokens,
@@ -291,6 +371,13 @@ class VlmTextEncoderProxy {
     auto zeros = torch::zeros(shape, x.options());
     return torch::cat({x, zeros}, 1);
   }
+
+  // JoyOV2 Qwen3-VL chat wrap (JoyOV2Pipeline kJoyoChatPrefix/Suffix): the
+  // T2VA caption path uses a bare user turn — no system prompt, no vision
+  // tokens — and consumes the FULL pre-norm residual (no prefix slice).
+  static constexpr const char* kJoyoChatPrefix = "<|im_start|>user\n";
+  static constexpr const char* kJoyoChatSuffix =
+      "<|im_end|>\n<|im_start|>assistant\n";
 
   std::unique_ptr<CausalVLM> encoder_;
   ModelArgs text_encoder_model_args_;

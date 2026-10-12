@@ -84,7 +84,7 @@ def _shared_store(host: str, port: int, global_rank: int, global_world_size: int
             port,
             global_world_size,
             global_rank == 0,
-            timedelta(minutes=5),
+            timedelta(minutes=30),
             wait_for_workers=False,
             multi_tenant=True,
         )
@@ -129,7 +129,7 @@ def _ensure_world(
         store=store,
         rank=global_rank,
         world_size=global_world_size,
-        timeout=timedelta(minutes=5),
+        timeout=timedelta(minutes=30),
     )
     _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
     _world_rank = global_rank
@@ -293,7 +293,7 @@ def init_process_group(
     own = None
     own_ranks = None
     for index, ranks in enumerate(memberships):
-        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=effective_backend)
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=30), backend=effective_backend)
         if global_rank in ranks:
             own = candidate
             own_index = index
@@ -371,7 +371,7 @@ def init_group(
     own = None
     own_ranks = None
     for ranks in group_ranks:
-        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=5), backend=backend)
+        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=30), backend=backend)
         if global_rank in ranks:
             if own is not None:
                 raise RuntimeError(f"{group_name} layouts overlap: {global_rank} appears in more than one group")
