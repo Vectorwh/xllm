@@ -355,6 +355,13 @@ class JoyOV2Pipeline(DiffusionPipeline):
                 audio_hidden_states = audio_hidden_states[0 : batch_size * audio_latent_t]
 
         # ---- decode ----
+        # Mirror the native pipeline's rolling stage switch (activate_stage):
+        # the transformer is idle during the fp32 XVAE/XDAC decode, so park
+        # it on the host and flush the allocator — that frees ~24 GiB per
+        # rank and is what lets the native pipeline fit the decode peak.
+        self.transformer.to("cpu")
+        if device.type == "npu":
+            torch.npu.empty_cache()
         video_latents = (
             hidden_states.to(torch.float32)
             .view(batch_size, latent_t, latent_h, latent_w, self.latent_channels)
@@ -377,6 +384,9 @@ class JoyOV2Pipeline(DiffusionPipeline):
             audio_latents = self.audio_vae.denormalize_latents(audio_latents)
             audio = self.audio_vae.decode(audio_latents).to(torch.float32)
             result["audio_tensors"] = [audio.cpu()]
+        # Bring the transformer back for the next request (the native rolling
+        # load restores the denoise stage the same way).
+        self.transformer.to(device)
         return result
 
     # ---- text embeds ---------------------------------------------------------
@@ -420,12 +430,26 @@ class JoyOV2Pipeline(DiffusionPipeline):
         prompts = request.get("prompts") or []
         if not prompts:
             raise ValueError("JoyOV2 in-process encode requires input prompts")
-        text_embeddings = self._normalize_text_emb(self.text_encoder.encode_joyo_prompts([str(prompts[0])])[0])
+        # Mirror JoyOV2Pipeline: the text encoder rides the device only for
+        # the encode window; offloading it right after (plus an allocator
+        # flush) frees ~0.5 GiB per rank so the fp32 XVAE decode fits the
+        # device budget.
+        proxy = self.text_encoder
+        proxy.set_on_device(True)
+        try:
+            residuals = proxy.encode_joyo_prompts([str(prompts[0])])
+            if do_cfg:
+                negative_prompts = request.get("negative_prompts") or []
+                if not negative_prompts:
+                    raise ValueError("JoyOV2 CFG with in-process encoder requires negative_prompt")
+                residuals.extend(proxy.encode_joyo_prompts([str(negative_prompts[0])]))
+        finally:
+            proxy.set_on_device(False)
+        if device.type == "npu":
+            torch.npu.empty_cache()
+        text_embeddings = self._normalize_text_emb(residuals[0])
         if do_cfg:
-            negative_prompts = request.get("negative_prompts") or []
-            if not negative_prompts:
-                raise ValueError("JoyOV2 CFG with in-process encoder requires negative_prompt")
-            neg_emb = self._normalize_text_emb(self.text_encoder.encode_joyo_prompts([str(negative_prompts[0])])[0])
+            neg_emb = self._normalize_text_emb(residuals[1])
             text_seqlens = torch.tensor(
                 [text_embeddings.size(0), neg_emb.size(0)],
                 dtype=torch.int32,

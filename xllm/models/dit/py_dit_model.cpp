@@ -121,7 +121,10 @@ PYBIND11_EMBEDDED_MODULE(xllm_dit, m) {
            py::arg("images"))
       .def("encode_joyo_prompts",
            &VlmTextEncoderProxy::encode_joyo_prompts,
-           py::arg("prompts"));
+           py::arg("prompts"))
+      .def("set_on_device",
+           &VlmTextEncoderProxy::set_on_device,
+           py::arg("on_device"));
 }
 
 PyDiTModel::PyDiTModel(const DiTModelContext& context)
@@ -373,6 +376,12 @@ void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
     // Load the VLM weights on the C++ side (KV cache / TP reuse).
     text_encoder_proxy_->encoder()->load_model(std::move(text_encoder_loader_));
     text_encoder_loader_.reset();
+    // Mirror JoyOV2Pipeline: the text encoder lives on the HOST between
+    // encodes (the python pipeline toggles it on per encode). Offloading
+    // right after the load keeps the steady-state footprint lower so the
+    // fp32 XVAE decode fits — requests that carry prompt_embeds never touch
+    // the encode path, so the offload must not depend on it.
+    text_encoder_proxy_->set_on_device(false);
 
     py::dict text_encoder_spec;
     text_encoder_spec["kind"] = py::str("external");

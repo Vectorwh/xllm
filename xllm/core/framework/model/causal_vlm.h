@@ -36,6 +36,13 @@ class CausalVLM : public CausalLM {
   virtual torch::Tensor get_input_embeddings(
       const torch::Tensor& input_ids,
       const ModelInputParams& input_params) = 0;
+
+  // Move the underlying concrete model across devices. CausalVLMImpl holds
+  // the model as a plain (unregistered) member, so nn::Module::to() on the
+  // wrapper is a no-op for its weights; holders that offload the encoder
+  // between encode windows (e.g. VlmTextEncoderProxy for JoyOV2) must go
+  // through this hook instead. Default no-op keeps other impls unchanged.
+  virtual void move_model_to(const torch::Device& /*device*/) {}
 };
 
 template <typename Model>
@@ -43,6 +50,28 @@ class CausalVLMImpl : public CausalVLM {
  public:
   CausalVLMImpl(Model model, const torch::TensorOptions& options)
       : model_(std::move(model)), options_(options) {}
+
+  void move_model_to(const torch::Device& device) override {
+    torch::NoGradGuard no_grad;
+    model_->to(device);
+    if (device.is_cpu()) {
+      // Rewrite parameter/buffer storage so the device blocks are released
+      // instead of lingering in the caching allocator (same trick as
+      // joyo_v2::force_module_storage_to_cpu in pipeline_joyo_v2.h).
+      auto move_one = [](torch::Tensor& tensor) {
+        if (!tensor.defined() || tensor.device().is_cpu()) {
+          return;
+        }
+        tensor.set_data(tensor.to(torch::kCPU).contiguous());
+      };
+      for (auto& kv : model_->named_parameters(/*recurse=*/true)) {
+        move_one(kv.value());
+      }
+      for (auto& kv : model_->named_buffers(/*recurse=*/true)) {
+        move_one(kv.value());
+      }
+    }
+  }
 
   MMDict encode(const ModelInputParams& parameters) override {
     return model_->get_multimodal_embeddings(parameters);

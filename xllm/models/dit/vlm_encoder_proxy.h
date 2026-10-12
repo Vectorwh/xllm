@@ -158,6 +158,21 @@ class VlmTextEncoderProxy {
     return embeds;
   }
 
+  // JoyOV2 streams: mirror JoyOV2Pipeline::set_text_encoder_on_device. The
+  // text encoder is only needed inside the encode window; the python
+  // pipeline offloads it right after (and flushes the NPU allocator) so the
+  // fp32 XVAE decode fits — the full-depth model sits within ~0.1 GiB of
+  // the device budget otherwise. NOTE: the weights live in CausalVLMImpl's
+  // UNREGISTERED model_ member, so nn::Module::to() on the wrapper would be
+  // a no-op — move_model_to is the hook that actually relocates them.
+  void set_on_device(bool on_device) {
+    if (on_device == encoder_on_device_) {
+      return;
+    }
+    encoder_->move_model_to(on_device ? device_ : torch::Device(torch::kCPU));
+    encoder_on_device_ = on_device;
+  }
+
  private:
   std::pair<torch::Tensor, torch::Tensor> encode_single_prompt(
       const std::string& prompt,
@@ -383,6 +398,10 @@ class VlmTextEncoderProxy {
   ModelArgs text_encoder_model_args_;
   torch::TensorOptions options_;
   torch::Device device_ = torch::kCPU;
+
+  // Whether encoder_ currently lives on device_ (it loads on-device and is
+  // toggled around the encode window; see set_on_device).
+  bool encoder_on_device_ = true;
   std::shared_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<MultimodalProcessorBase> multimodal_processor_;
   std::unique_ptr<MPositionGenerator> mposition_generator_;
