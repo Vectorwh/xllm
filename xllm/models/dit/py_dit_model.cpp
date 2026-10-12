@@ -374,7 +374,7 @@ DiTForwardOutput PyDiTModel::forward(const DiTForwardInput& input) {
   request["batch_size"] = input.batch_size;
   request["images"] = py::none();
   py::list images_list;
-  for (const auto& entry : input.image_sources.entries()) {
+  for (const auto& entry : input.media_sources.entries()) {
     images_list.append(py::cast(entry.tensor));
   }
   request["images_list"] = images_list;
