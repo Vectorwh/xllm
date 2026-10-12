@@ -24,6 +24,8 @@ once for the pipeline call plus at most once for a form-B text encoder.
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 
 from xllm.python.model_executor.dit_cache import create_cache_hooks
@@ -40,6 +42,10 @@ _PARALLEL_GROUP_KEY = {
     "audio_vae": "dit_vae_group",
 }
 _NEEDS_DTYPE = frozenset(("transformer", "vae", "audio_vae"))
+# The JoyOV2 transformer resolves its TP shard shapes at construction time
+# (200B weights only fit sharded), so it needs the device to look up the
+# ``dit_tp`` named group before any tensor exists.
+_NEEDS_DEVICE = frozenset(("transformer",))
 
 
 class DiTPipelineExecutor:
@@ -112,6 +118,10 @@ class DiTPipelineExecutor:
         kwargs: dict = {}
         if name in _NEEDS_DTYPE:
             kwargs["dtype"] = self.dtype
+        if name in _NEEDS_DEVICE and "device" in inspect.signature(component_cls.__init__).parameters:
+            # Components that shard at construction time look up their named
+            # group by device; the JoyImage transformer predates this hook.
+            kwargs["device"] = self.device
         group_key = _PARALLEL_GROUP_KEY.get(name)
         if group_key is not None and group_key in self.config:
             kwargs["sp_group" if name == "transformer" else "vae_group"] = self.config[group_key]
