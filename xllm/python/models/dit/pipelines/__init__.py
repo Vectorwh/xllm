@@ -31,6 +31,10 @@ _PIPELINES: dict[str, tuple[str, str]] = {
         "xllm.python.models.dit.pipelines.joyimage_edit_plus",
         "JoyImageEditPlusPipeline",
     ),
+    "JoyOV2Pipeline": (
+        "xllm.python.models.dit.pipelines.joyo_v2",
+        "JoyOV2Pipeline",
+    ),
 }
 
 

@@ -38,6 +38,18 @@ _COMPONENTS: dict[str, tuple[str, str]] = {
         "xllm.python.models.dit.transformers.joyimage_edit_plus",
         "JoyImageEditPlusTransformer3DModel",
     ),
+    "JoyOV2Transformer3DModel": (
+        "xllm.python.models.dit.transformers.joyo_v2",
+        "JoyOV2Transformer3DModel",
+    ),
+    "AutoencoderKLXVAE": (
+        "xllm.python.models.dit.autoencoders.autoencoder_kl_xvae",
+        "AutoencoderKLXVAE",
+    ),
+    "AutoencoderKLXDAC": (
+        "xllm.python.models.dit.autoencoders.autoencoder_kl_xdac",
+        "AutoencoderKLXDAC",
+    ),
     "FlowMatchEulerDiscreteScheduler": (
         "xllm.python.models.dit.schedulers.flowmatch_euler",
         "FlowMatchEulerDiscreteScheduler",
