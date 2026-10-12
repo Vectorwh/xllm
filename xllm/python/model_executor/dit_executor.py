@@ -35,8 +35,11 @@ from xllm.python.models.dit.pipelines import get_pipeline_class
 _PARALLEL_GROUP_KEY = {
     "transformer": "dit_sp_group",
     "vae": "dit_vae_group",
+    # The audio VAE reuses the image-VAE group slot; the XDAC decoder has no
+    # spatial-parallel path, so it accepts and ignores the group.
+    "audio_vae": "dit_vae_group",
 }
-_NEEDS_DTYPE = frozenset(("transformer", "vae"))
+_NEEDS_DTYPE = frozenset(("transformer", "vae", "audio_vae"))
 
 
 class DiTPipelineExecutor:
@@ -62,6 +65,8 @@ class DiTPipelineExecutor:
         # component instances.
         config.setdefault("transformer_config", specs["transformer"]["config"])
         config.setdefault("vae_config", specs["vae"]["config"])
+        if "audio_vae" in specs:
+            config.setdefault("audio_vae_config", specs["audio_vae"]["config"])
 
         components: dict[str, object] = {}
         for name, spec in specs.items():
@@ -82,8 +87,14 @@ class DiTPipelineExecutor:
         return cls(config)
 
     @torch.inference_mode()
-    def execute(self, request: dict) -> list[torch.Tensor]:
-        """Run one request; returns one image tensor per batch sample."""
+    def execute(self, request: dict) -> list[torch.Tensor] | dict:
+        """Run one request.
+
+        Most pipelines return one image tensor per batch sample. Pipelines
+        with secondary outputs (JoyOV2 video+audio) return
+        ``{"tensors": [...], "audio_tensors": [...]}``; the C++ shell accepts
+        both shapes.
+        """
         return self.pipeline(request, cache_hooks=self.cache_hooks)
 
     # ---- internals ----------------------------------------------------------

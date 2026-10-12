@@ -44,11 +44,20 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
-constexpr const char* kPythonComponents[] = {"transformer", "vae", "scheduler"};
+constexpr const char* kPythonComponents[] = {"transformer",
+                                             "vae",
+                                             "audio_vae",
+                                             "scheduler"};
 
 // Ordered kinds the python backend registers as named subgroups; must match
-// the python side's expectations and be identical on every rank.
-constexpr const char* kGroupKinds[] = {"sp", "cfg", "vae", "text_encoder_tp"};
+// the python side's expectations and be identical on every rank. "tp" records
+// the dit_tp layout so TP-sharded components (JoyOV2 MoE / attention) can
+// mirror the C++ Column/RowParallelLinear shard+reduce semantics.
+constexpr const char* kGroupKinds[] = {"tp",
+                                       "sp",
+                                       "cfg",
+                                       "vae",
+                                       "text_encoder_tp"};
 
 py::object read_component_config(const std::string& component_dir) {
   // Component configs are not named uniformly: transformer/vae use config.json
@@ -312,7 +321,7 @@ void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
     }
     return state_dicts;
   };
-  for (const char* component : {"transformer", "vae"}) {
+  for (const char* component : {"transformer", "vae", "audio_vae"}) {
     if (!components.contains(component)) {
       continue;
     }
@@ -390,14 +399,31 @@ DiTForwardOutput PyDiTModel::forward(const DiTForwardInput& input) {
   gp_dict["seed"] = gp.seed;
   gp_dict["max_sequence_length"] = gp.max_sequence_length;
   gp_dict["strength"] = gp.strength;
+  // Video / audio generation params consumed by video pipelines (JoyOV2
+  // T2VA). Image pipelines ignore them.
+  gp_dict["num_frames"] = gp.num_frames;
+  gp_dict["video_fps"] = gp.video_fps;
+  gp_dict["flow_shift"] = gp.flow_shift;
+  gp_dict["audio_sampling_rate"] = gp.audio_sampling_rate;
   request["generation_params"] = gp_dict;
 
   py::object result = py_executor_.attr("execute")(request);
-  std::vector<torch::Tensor> tensors =
-      result.cast<std::vector<torch::Tensor>>();
 
   DiTForwardOutput output;
-  output.tensors = std::move(tensors);
+  if (py::isinstance<py::dict>(result)) {
+    // Pipelines with secondary outputs (JoyOV2 video+audio) return
+    // {"tensors": [...], "audio_tensors": [...]}; plain tensor lists keep the
+    // original single-output contract.
+    if (result.contains("tensors")) {
+      output.tensors = result["tensors"].cast<std::vector<torch::Tensor>>();
+    }
+    if (result.contains("audio_tensors")) {
+      output.audio_tensors =
+          result["audio_tensors"].cast<std::vector<torch::Tensor>>();
+    }
+  } else {
+    output.tensors = result.cast<std::vector<torch::Tensor>>();
+  }
   return output;
 }
 
