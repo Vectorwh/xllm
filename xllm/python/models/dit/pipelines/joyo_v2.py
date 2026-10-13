@@ -420,10 +420,9 @@ class JoyOV2Pipeline(DiffusionPipeline):
     # ---- text embeds ---------------------------------------------------------
 
     def _resolve_guidance(self, gp: dict) -> float:
-        true_cfg = float(gp.get("true_cfg_scale") or 0)
+        # Match the native JoyOV2 pipeline; true_cfg_scale belongs to other pipelines.
         guidance = float(gp.get("guidance_scale") or 0)
-        scale = true_cfg if true_cfg > 0 else guidance
-        return scale if scale > 0 else 4.0
+        return guidance if guidance > 0 else 4.0
 
     def _normalize_text_emb(self, t: torch.Tensor) -> torch.Tensor:
         # H3 uses [1, T, D]; the JoyO DiT consumes packed [T, D].
