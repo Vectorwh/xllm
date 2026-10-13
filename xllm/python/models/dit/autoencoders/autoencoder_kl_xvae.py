@@ -39,6 +39,15 @@ def _swish(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
+# Temporal-upsample blocks slice over the input T above this size (exact
+# with a 2-frame causal context; see UpsampleBlock._forward_temporal_sliced).
+# The exactness test raises both to build a full-sequence reference.
+TEMPORAL_SLICE_FRAMES = 16
+# Frame-local (spatial-only) upsample blocks always slice; this caps the
+# fp32 transients of the deepest scales.
+SPATIAL_SLICE_FRAMES = 8
+
+
 class CausalConv3d(nn.Module, VaeParallelMixin):
     """Causal 3D conv: temporal front pad 2*pad_t, H/W pad inside the conv.
 
@@ -268,34 +277,122 @@ class UpsampleBlock(nn.Module, VaeParallelMixin):
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.temporal is None:
+            return self._forward_spatial_sliced(x)
+        if x.size(2) > TEMPORAL_SLICE_FRAMES:
+            return self._forward_temporal_sliced(x)
+        return self._forward_temporal_full(x)
+
+    def _forward_temporal_full(self, x: torch.Tensor) -> torch.Tensor:
         # Full-sequence path: shortcut first_chunk=True always.
         sc = self.shortcut(x, first_chunk=True)
 
         hidden = x
-        if self.temporal is not None:
-            b, c, t, height, width = hidden.shape
-            x0 = hidden[:, :, 0:1]
-            if t > 1:
-                x_t = self.temporal(hidden)[:, :, 1:t]
-                # b (r c) t h w -> b c (t r) h w
-                t2 = x_t.size(2)
-                x_t = x_t.view(b, 2, c, t2, height, width)
-                x_t = x_t.permute(0, 2, 3, 1, 4, 5).contiguous()
-                x_t = x_t.view(b, c, t2 * 2, height, width)
-                hidden = torch.cat([x0, x_t], dim=2)
-            else:
-                dummy = self.temporal(hidden)
-                t_dummy = dummy.size(2)
-                dummy = dummy.view(b, 2, c, t_dummy, height, width)
-                dummy = dummy.permute(0, 2, 3, 1, 4, 5).contiguous()
-                dummy = dummy.view(b, c, t_dummy * 2, height, width)
-                dummy = dummy[:, :, 0:1]
-                hidden = x0 + 0.0 * dummy
+        b, c, t, height, width = hidden.shape
+        x0 = hidden[:, :, 0:1]
+        if t > 1:
+            x_t = self.temporal(hidden)[:, :, 1:t]
+            # b (r c) t h w -> b c (t r) h w
+            t2 = x_t.size(2)
+            x_t = x_t.view(b, 2, c, t2, height, width)
+            x_t = x_t.permute(0, 2, 3, 1, 4, 5).contiguous()
+            x_t = x_t.view(b, c, t2 * 2, height, width)
+            hidden = torch.cat([x0, x_t], dim=2)
+        else:
+            dummy = self.temporal(hidden)
+            t_dummy = dummy.size(2)
+            dummy = dummy.view(b, 2, c, t_dummy, height, width)
+            dummy = dummy.permute(0, 2, 3, 1, 4, 5).contiguous()
+            dummy = dummy.view(b, c, t_dummy * 2, height, width)
+            dummy = dummy[:, :, 0:1]
+            hidden = x0 + 0.0 * dummy
 
         hidden = self.exchange(hidden, pad=False)
         hidden = self.spatial(hidden)
         hidden = self.trim_halo(hidden, per_side=2)
         return hidden + sc
+
+    def _forward_temporal_sliced(self, x: torch.Tensor) -> torch.Tensor:
+        # Temporal-upsample path sliced over the INPUT T with a 2-frame
+        # causal context: the temporal conv is k3 causal (kept frames never
+        # touch the zero pad), and the spatial section plus the shortcut are
+        # frame-local, so this is exact vs _forward_temporal_full — the CPU
+        # exactness test pins it. Caps the fp32 transients of the deepest
+        # head scales (L2's interpolate output alone is ~3.5 GiB full-video).
+        b, c, t, height, width = x.shape
+        out_channels = self.spatial[1].out_channels
+        out = torch.empty(b, out_channels, 2 * t - 1, height * 2, width * 2, dtype=x.dtype, device=x.device)
+        ctx = 2
+        p = 0
+        while p < t:
+            q = min(p + TEMPORAL_SLICE_FRAMES, t)
+            lo = max(0, p - ctx) if p > 0 else 0
+            seg = x[:, :, lo:q]
+            if lo == 0:
+                hidden = self._temporal_first(seg)
+                sc = self.shortcut(seg, first_chunk=True)
+                hid = self.exchange(hidden, pad=False)
+                hid = self.spatial(hid)
+                hid = self.trim_halo(hid, per_side=2)
+                out[:, :, 0 : 2 * q - 1] = hid + sc
+            else:
+                # Context frames are real history (not the sequence start),
+                # so the conv runs over the whole slice — no x0 special case —
+                # and every slice frame yields two output frames, matching the
+                # shortcut's uniform interleave (first_chunk=False).
+                x_t = self.temporal(seg)
+                ln = x_t.size(2)
+                x_t = x_t.view(b, 2, c, ln, height, width)
+                x_t = x_t.permute(0, 2, 3, 1, 4, 5).contiguous()
+                hidden = x_t.view(b, c, ln * 2, height, width)
+                sc = self.shortcut(seg, first_chunk=False)
+                hid = self.exchange(hidden, pad=False)
+                hid = self.spatial(hid)
+                hid = self.trim_halo(hid, per_side=2)
+                seg_out = hid + sc
+                drop = 2 * (p - lo)
+                out[:, :, 2 * p - 1 : 2 * q - 1] = seg_out[:, :, drop:]
+            p = q
+        return out
+
+    def _temporal_first(self, seg: torch.Tensor) -> torch.Tensor:
+        # The x0-special-cased temporal upsample for a slice that starts at
+        # the true sequence head (verbatim from the full-sequence path).
+        b, c, t, height, width = seg.shape
+        x0 = seg[:, :, 0:1]
+        if t > 1:
+            x_t = self.temporal(seg)[:, :, 1:t]
+            t2 = x_t.size(2)
+            x_t = x_t.view(b, 2, c, t2, height, width)
+            x_t = x_t.permute(0, 2, 3, 1, 4, 5).contiguous()
+            x_t = x_t.view(b, c, t2 * 2, height, width)
+            return torch.cat([x0, x_t], dim=2)
+        dummy = self.temporal(seg)
+        t_dummy = dummy.size(2)
+        dummy = dummy.view(b, 2, c, t_dummy, height, width)
+        dummy = dummy.permute(0, 2, 3, 1, 4, 5).contiguous()
+        dummy = dummy.view(b, c, t_dummy * 2, height, width)
+        dummy = dummy[:, :, 0:1]
+        return x0 + 0.0 * dummy
+
+    def _forward_spatial_sliced(self, x: torch.Tensor) -> torch.Tensor:
+        # Spatial-only upsample (temporal_upsample=False): every op here is
+        # frame-local — interpolate (1,2,2), conv (1,3,3), shortcut repeat/
+        # reshape — so slice over T to cap the fp32 transients. The
+        # full-video staging of the shortcut alone is ~4x the block output
+        # (repeat_interleave on channels), which is what OOMs the decode.
+        b, _, t, h, w = x.shape
+        out_channels = self.spatial[1].out_channels
+        out = torch.empty(b, out_channels, t, h * 2, w * 2, dtype=x.dtype, device=x.device)
+        for s0 in range(0, t, SPATIAL_SLICE_FRAMES):
+            s1 = min(s0 + SPATIAL_SLICE_FRAMES, t)
+            seg = x[:, :, s0:s1]
+            sc = self.shortcut(seg, first_chunk=True)
+            hid = self.exchange(seg, pad=False)
+            hid = self.spatial(hid)
+            hid = self.trim_halo(hid, per_side=2)
+            out[:, :, s0:s1] = hid + sc
+        return out
 
     def load_weights(self, state_dicts: list) -> None:
         if self.temporal is not None:
@@ -352,6 +449,22 @@ class XVAEDecoder(nn.Module):
         if len(up_is_upsample) != len(up):
             raise RuntimeError("upsample bookkeeping mismatch")
 
+        # Head/tail split for sliced decoding: everything AFTER the last
+        # temporal-upsample block is T-preserving with a bounded causal
+        # receptive field, so it can run in temporal slices with a small
+        # context prefix (frames whose outputs are recomputed and dropped).
+        self.tail_start = None
+        for i, block in enumerate(up):
+            if isinstance(block, UpsampleBlock) and block.temporal_upsample:
+                self.tail_start = i + 1
+        if self.tail_start is not None:
+            tail_rf = 0
+            for block in up[self.tail_start :]:
+                if isinstance(block, ResidualBlock):
+                    tail_rf += 4  # conv1 + conv2, k3 causal each
+            tail_rf += 2  # conv_out (k3 causal)
+            self.tail_receptive_field = tail_rf
+
         block_in_last = block_in_channels[-1]
         self.norm_out = XVAERMSNorm(block_in_last)
         self.conv_out = CausalConv3d(block_in_last, out_channels, (3, 3, 3), (1, 1, 1), (1, 1, 1), vae_group)
@@ -363,6 +476,27 @@ class XVAEDecoder(nn.Module):
         for block in self.mid_blocks:
             x = block(x)
         for block in self.up_blocks:
+            x = block(x)
+        x = _swish(self.norm_out(x))
+        return self.conv_out(x)
+
+    def forward_head(self, z: torch.Tensor) -> torch.Tensor:
+        """conv_in → mid → up_blocks[:tail_start] (ends at the last temporal
+        upsample). Must run full-sequence: the head's causal receptive field
+        spans the whole latent sequence."""
+        x = self.conv_in(z)
+        for block in self.mid_blocks:
+            x = block(x)
+        for block in self.up_blocks[: self.tail_start]:
+            x = block(x)
+        return x
+
+    def forward_tail(self, h: torch.Tensor) -> torch.Tensor:
+        """up_blocks[tail_start:] → norm → conv_out. T-preserving; exact for a
+        slice whose first tail_receptive_field frames are context (outputs
+        for the context frames are recomputed and dropped by the caller)."""
+        x = h
+        for block in self.up_blocks[self.tail_start :]:
             x = block(x)
         x = _swish(self.norm_out(x))
         return self.conv_out(x)
@@ -468,7 +602,7 @@ class AutoencoderKLXVAE(DiTComponentBase, VaeParallelMixin):
         std = torch.tensor(self.latents_std, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
         return latents.to(torch.float32) * std + mean
 
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+    def decode(self, latent: torch.Tensor, slice_frames: int = 16) -> torch.Tensor:
         if latent.dim() != 5:
             raise ValueError(f"XVAE decode expects [B,C,T,H,W], got {latent.shape}")
         if latent.size(1) != self.latent_channels:
@@ -477,6 +611,30 @@ class AutoencoderKLXVAE(DiTComponentBase, VaeParallelMixin):
         # to CPU aten kernels.
         z = latent.to(torch.float32)
         z = self.split(z)
-        decoded = self.decoder(z)
+        decoder = self.decoder
+        if decoder.tail_start is None:
+            decoded = decoder(z)
+        else:
+            # The head (through the last temporal upsample) must run
+            # full-sequence; the tail is T-preserving with a bounded causal
+            # receptive field, so it runs in temporal slices with a context
+            # prefix (context outputs are recomputed and dropped). This keeps
+            # the deepest-scale fp32 transients to a slice instead of the
+            # whole video.
+            h = decoder.forward_head(z)
+            t = h.size(2)
+            ctx = decoder.tail_receptive_field
+            if t <= slice_frames + ctx:
+                decoded = decoder.forward_tail(h)
+            else:
+                outs = []
+                p = 0
+                while p < t:
+                    q = min(p + slice_frames, t)
+                    lo = max(0, p - ctx) if p > 0 else 0
+                    seg = decoder.forward_tail(h[:, :, lo:q])
+                    outs.append(seg if p == 0 else seg[:, :, p - lo :])
+                    p = q
+                decoded = torch.cat(outs, dim=2)
         decoded = self.merge(decoded)
         return unpatchify(decoded, self.patch_size)

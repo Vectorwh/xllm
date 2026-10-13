@@ -31,6 +31,7 @@ the packed ``prompt_embeds`` into ``n_cfg`` equal parts (H3 convention).
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 
@@ -274,7 +275,9 @@ class JoyOV2Pipeline(DiffusionPipeline):
         dtype = self._dtype
 
         # ---- text embeds ----
+        t_start = time.perf_counter()
         text_embeddings, text_seqlens = self._resolve_prompt_embeds(request, do_cfg, n_cfg, device)
+        t_encode = time.perf_counter()
 
         # ---- initial noise (private CPU generators; see _randn_tensor) ----
         latents = self._randn_tensor((batch_size, self.latent_channels, latent_t, latent_h, latent_w), seed)
@@ -315,6 +318,7 @@ class JoyOV2Pipeline(DiffusionPipeline):
         sigmas = sd3_timeshift(t_lin, timeshift)
 
         # ---- denoise ----
+        t_denoise0 = time.perf_counter()
         for step_idx in range(num_steps):
             timestep = sigmas[step_idx].reshape(1).expand(num_samples)
             noise_pred, audio_pred = self.transformer(
@@ -355,13 +359,22 @@ class JoyOV2Pipeline(DiffusionPipeline):
                 audio_hidden_states = audio_hidden_states[0 : batch_size * audio_latent_t]
 
         # ---- decode ----
-        # Mirror the native pipeline's rolling stage switch (activate_stage):
-        # the transformer is idle during the fp32 XVAE/XDAC decode, so park
-        # it on the host and flush the allocator — that frees ~24 GiB per
-        # rank and is what lets the native pipeline fit the decode peak.
-        self.transformer.to("cpu")
+        t_denoise1 = time.perf_counter()
+        # The sliced XVAE tail still peaks a few GiB above the post-denoise
+        # baseline, so park the LAST few MoE blocks (~0.5 GiB each) on the
+        # host for the decode window — a ~8 GiB round trip per rank (~2-4 s),
+        # versus the ~48 GiB full-transformer rolling this replaces — plus the
+        # audio VAE (~0.8 GiB).
+        park = list(self.transformer.transformer_blocks[-8:])
+        park_modules = [b for b in park if isinstance(b, torch.nn.Module)]
+        for m in park_modules:
+            m.to("cpu")
+        if self.generate_audio:
+            self.audio_vae.to("cpu")
+        t_av_offload = time.perf_counter()
         if device.type == "npu":
             torch.npu.empty_cache()
+        t_roll_cache = time.perf_counter()
         video_latents = (
             hidden_states.to(torch.float32)
             .view(batch_size, latent_t, latent_h, latent_w, self.latent_channels)
@@ -372,9 +385,11 @@ class JoyOV2Pipeline(DiffusionPipeline):
         video = self.vae.decode(video_latents).to(torch.float32)
         video = (video / 2.0 + 0.5).clamp(0.0, 1.0)
         video = video.permute(0, 2, 1, 3, 4).contiguous()
+        t_video = time.perf_counter()
 
         result: dict = {"tensors": [video.cpu()]}
         if audio_hidden_states is not None:
+            self.audio_vae.to(device)
             audio_latents = (
                 audio_hidden_states.to(torch.float32)
                 .view(batch_size, audio_latent_t, self.latent_channels)
@@ -384,9 +399,22 @@ class JoyOV2Pipeline(DiffusionPipeline):
             audio_latents = self.audio_vae.denormalize_latents(audio_latents)
             audio = self.audio_vae.decode(audio_latents).to(torch.float32)
             result["audio_tensors"] = [audio.cpu()]
-        # Bring the transformer back for the next request (the native rolling
-        # load restores the denoise stage the same way).
-        self.transformer.to(device)
+        # Bring the parked MoE blocks back for the next request.
+        for m in park_modules:
+            m.to(device)
+        t_audio = time.perf_counter()
+        print(
+            f"[joyo-timing {time.strftime('%H:%M:%S')}] "
+            f"encode={t_encode - t_start:.2f}s "
+            f"setup={t_denoise0 - t_encode:.2f}s "
+            f"denoise={t_denoise1 - t_denoise0:.2f}s "
+            f"av_offload={t_av_offload - t_denoise1:.2f}s "
+            f"empty_cache={t_roll_cache - t_av_offload:.2f}s "
+            f"video_decode={t_video - t_roll_cache:.2f}s "
+            f"audio_decode={t_audio - t_video:.2f}s "
+            f"total={t_audio - t_start:.2f}s",
+            flush=True,
+        )
         return result
 
     # ---- text embeds ---------------------------------------------------------
@@ -435,9 +463,12 @@ class JoyOV2Pipeline(DiffusionPipeline):
         # flush) frees ~0.5 GiB per rank so the fp32 XVAE decode fits the
         # device budget.
         proxy = self.text_encoder
+        t_te0 = time.perf_counter()
         proxy.set_on_device(True)
+        t_te_reload = time.perf_counter()
         try:
             residuals = proxy.encode_joyo_prompts([str(prompts[0])])
+            t_te_fwd = time.perf_counter()
             if do_cfg:
                 negative_prompts = request.get("negative_prompts") or []
                 if not negative_prompts:
@@ -445,8 +476,16 @@ class JoyOV2Pipeline(DiffusionPipeline):
                 residuals.extend(proxy.encode_joyo_prompts([str(negative_prompts[0])]))
         finally:
             proxy.set_on_device(False)
+        t_te_off = time.perf_counter()
         if device.type == "npu":
             torch.npu.empty_cache()
+        t_te_cache = time.perf_counter()
+        print(
+            f"[joyo-timing-te {time.strftime('%H:%M:%S')}] "
+            f"reload={t_te_reload - t_te0:.2f}s fwd_pos={t_te_fwd - t_te_reload:.2f}s "
+            f"fwd_neg_offload={t_te_off - t_te_fwd:.2f}s cache={t_te_cache - t_te_off:.2f}s",
+            flush=True,
+        )
         text_embeddings = self._normalize_text_emb(residuals[0])
         if do_cfg:
             neg_emb = self._normalize_text_emb(residuals[1])
