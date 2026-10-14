@@ -33,7 +33,7 @@ from xllm.python.models.dit import get_component_class
 from xllm.python.models.dit.pipelines import get_pipeline_class
 
 # Components constructed from their config dict; the executor passes the
-# global dtype and the matching parallel group name.
+# component dtype and the matching parallel group name.
 _PARALLEL_GROUP_KEY = {
     "transformer": "dit_sp_group",
     "vae": "dit_vae_group",
@@ -66,6 +66,14 @@ class DiTPipelineExecutor:
         config["dtype"] = self.dtype
 
         specs = config["components"]
+        self.component_dtypes = {
+            name: self._resolve_component_dtype(spec)
+            for name, spec in specs.items()
+            if name in _NEEDS_DTYPE and spec.get("kind") != "external"
+        }
+        # Latents and timestep inputs follow the transformer, not the VAE.
+        self.dtype = self.component_dtypes.get("transformer", self.dtype)
+        config["dtype"] = self.dtype
         # Pipeline-level views of the component configs (latent stats, patch
         # size, ...) — the pipeline reads these instead of reaching into
         # component instances.
@@ -80,7 +88,11 @@ class DiTPipelineExecutor:
         self._build_image_processor(components, specs)
 
         self.pipeline = get_pipeline_class(config["pipeline"])(components, config)
-        self.pipeline.to(device=self.device, dtype=self.dtype)
+        self.pipeline.to(
+            device=self.device,
+            dtype=self.dtype,
+            component_dtypes=self.component_dtypes,
+        )
         # Component conventions applied after the move, mirroring the C++
         # pipelines' load_model: fp32-sensitive modules are re-cast.
         for component in components.values():
@@ -105,6 +117,22 @@ class DiTPipelineExecutor:
 
     # ---- internals ----------------------------------------------------------
 
+    def _resolve_component_dtype(self, spec: dict) -> torch.dtype:
+        """Resolve component precision before construction and weight loading."""
+        class_name = spec["class_name"]
+        # Both decoders require FP32 weights throughout loading and execution.
+        # Casting back after a pipeline-wide BF16 move loses weight precision.
+        if class_name in ("AutoencoderKLXVAE", "AutoencoderKLXDAC"):
+            return torch.float32
+        component_config = spec["config"]
+        configured = component_config.get("dtype") or component_config.get("torch_dtype")
+        if configured:
+            return self._resolve_dtype(configured)
+        if class_name == "JoyOV2Transformer3DModel":
+            # Match the native component default when config.json omits dtype.
+            return torch.bfloat16
+        return self.dtype
+
     def _build_component(self, name: str, spec: dict) -> object:
         if spec.get("kind") == "external":
             # Form-B component owned by C++ (e.g. the Qwen3-VL text encoder
@@ -117,7 +145,7 @@ class DiTPipelineExecutor:
         component_cls = get_component_class(spec["class_name"])
         kwargs: dict = {}
         if name in _NEEDS_DTYPE:
-            kwargs["dtype"] = self.dtype
+            kwargs["dtype"] = self.component_dtypes[name]
         if name in _NEEDS_DEVICE and "device" in inspect.signature(component_cls.__init__).parameters:
             # Components that shard at construction time look up their named
             # group by device; the JoyImage transformer predates this hook.

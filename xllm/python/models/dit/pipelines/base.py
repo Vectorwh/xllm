@@ -60,16 +60,19 @@ class DiffusionPipeline(nn.Module):
         self,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        component_dtypes: dict[str, torch.dtype] | None = None,
     ) -> DiffusionPipeline:
         """Move every registered module to ``device``/``dtype``.
 
         Mirrors the C++ pipelines' explicit ``to(options_)`` calls after
-        construction. Non-module components are left alone; they receive the
+        construction. Per-component dtypes override the shared dtype without
+        an intermediate cast. Non-module components are left alone; they receive the
         device/dtype through their own configuration.
         """
-        for component in self.components.values():
+        component_dtypes = component_dtypes or {}
+        for name, component in self.components.items():
             if isinstance(component, nn.Module):
-                component.to(device=device, dtype=dtype)
+                component.to(device=device, dtype=component_dtypes.get(name, dtype))
         return self
 
     @property
