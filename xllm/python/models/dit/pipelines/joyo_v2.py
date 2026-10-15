@@ -360,15 +360,7 @@ class JoyOV2Pipeline(DiffusionPipeline):
 
         # ---- decode ----
         t_denoise1 = time.perf_counter()
-        # The sliced XVAE tail still peaks a few GiB above the post-denoise
-        # baseline, so park the LAST few MoE blocks (~0.5 GiB each) on the
-        # host for the decode window — a ~8 GiB round trip per rank (~2-4 s),
-        # versus the ~48 GiB full-transformer rolling this replaces — plus the
-        # audio VAE (~0.8 GiB).
-        park = list(self.transformer.transformer_blocks[-8:])
-        park_modules = [b for b in park if isinstance(b, torch.nn.Module)]
-        for m in park_modules:
-            m.to("cpu")
+        # Keep the Transformer resident; only offload the audio VAE for video decode.
         if self.generate_audio:
             self.audio_vae.to("cpu")
         t_av_offload = time.perf_counter()
@@ -399,9 +391,6 @@ class JoyOV2Pipeline(DiffusionPipeline):
             audio_latents = self.audio_vae.denormalize_latents(audio_latents)
             audio = self.audio_vae.decode(audio_latents).to(torch.float32)
             result["audio_tensors"] = [audio.cpu()]
-        # Bring the parked MoE blocks back for the next request.
-        for m in park_modules:
-            m.to(device)
         t_audio = time.perf_counter()
         print(
             f"[joyo-timing {time.strftime('%H:%M:%S')}] "
