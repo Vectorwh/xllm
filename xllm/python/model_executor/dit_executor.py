@@ -99,6 +99,8 @@ class DiTPipelineExecutor:
             keep_fp32 = getattr(component, "keep_fp32_modules", None)
             if callable(keep_fp32):
                 keep_fp32()
+        # inference_mode disables autograd, but does not switch module behavior.
+        self.pipeline.eval()
 
     @classmethod
     def create(cls, config: dict) -> DiTPipelineExecutor:

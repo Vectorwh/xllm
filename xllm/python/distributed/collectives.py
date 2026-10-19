@@ -1177,23 +1177,36 @@ def _(x: torch.Tensor, src: int, group_name: str) -> torch.Tensor:
     return x
 
 
-@torch.library.custom_op("xllm_ops::all_to_all_4D", mutates_args=())
-def all_to_all_4D(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str) -> torch.Tensor:
-    """Reshard a 4D [B, S, H, D] tensor across a named group.
-
-    ``scatter_idx=2, gather_idx=1`` converts a sequence shard into a head
-    shard; ``scatter_idx=1, gather_idx=2`` converts back. Mirrors the C++
-    ``parallel_state::all_to_all_4D`` layout so both stacks shard identically.
-    Identity when the group was never registered (single-rank execution).
-    """
-    if (group_name, str(x.device)) not in _groups:
-        return x
-    group = _require_group(x, group_name)
+def _all_to_all_4D_shape(x: torch.Tensor, scatter_idx: int, gather_idx: int, world_size: int) -> tuple[int, ...]:
+    """Shape contract shared by the eager kernel and fake implementation."""
     if x.dim() != 4:
         raise RuntimeError(f"all_to_all_4D: input must be 4D, got dim={x.dim()}")
-    sp_size = group.size()
-    if sp_size == 1:
-        return x
+    torch._check(world_size > 0, lambda: "all_to_all_4D: world_size must be positive")
+    if world_size == 1:
+        return tuple(x.shape)
+    bs, seqlen, head_num, head_size = x.shape
+    if scatter_idx == 2 and gather_idx == 1:
+        torch._check(head_num % world_size == 0, lambda: "all_to_all_4D: head_num must be divisible by world_size")
+        return bs, seqlen * world_size, head_num // world_size, head_size
+    if scatter_idx == 1 and gather_idx == 2:
+        torch._check(seqlen % world_size == 0, lambda: "all_to_all_4D: seqlen must be divisible by world_size")
+        return bs, seqlen // world_size, head_num * world_size, head_size
+    raise RuntimeError(f"all_to_all_4D: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
+
+
+@torch.library.custom_op("xllm_ops::all_to_all_4D", mutates_args=())
+def _all_to_all_4D(
+    x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str, world_size: int
+) -> torch.Tensor:
+    # Pass the group size explicitly so fake/export never reads a live group.
+    _all_to_all_4D_shape(x, scatter_idx, gather_idx, world_size)
+    if world_size == 1:
+        # The custom-op schema forbids returning an alias of the input.
+        return x.clone()
+    group = _require_group(x, group_name)
+    if group.size() != world_size:
+        raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
+    sp_size = world_size
 
     if scatter_idx == 2 and gather_idx == 1:
         # Sequence shard -> head shard:
@@ -1237,9 +1250,29 @@ def all_to_all_4D(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name
     raise RuntimeError(f"all_to_all_4D: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
 
 
-@all_to_all_4D.register_fake
-def _(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str) -> torch.Tensor:
-    return x
+@_all_to_all_4D.register_fake
+def _all_to_all_4D_fake(
+    x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str, world_size: int
+) -> torch.Tensor:
+    del group_name
+    return x.new_empty(_all_to_all_4D_shape(x, scatter_idx, gather_idx, world_size))
+
+
+def all_to_all_4D(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str) -> torch.Tensor:
+    """Reshard [B, S, H, D], preserving the public four-argument API.
+
+    Resolve SP size before the graph operator. Missing or single-rank groups
+    keep the original identity fast path; the fake kernel needs no group state.
+    """
+    group = named_group(group_name, x.device)
+    if group is None:
+        return x
+    if x.dim() != 4:
+        raise RuntimeError(f"all_to_all_4D: input must be 4D, got dim={x.dim()}")
+    world_size = group.size()
+    if world_size == 1:
+        return x
+    return _all_to_all_4D(x, scatter_idx, gather_idx, group_name, world_size)
 
 
 def all_to_all_4D_async(
