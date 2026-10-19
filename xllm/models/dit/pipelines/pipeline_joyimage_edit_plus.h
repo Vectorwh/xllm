@@ -39,6 +39,8 @@ limitations under the License.
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/runtime/dit_forward_params.h"
 #include "models/dit/autoencoders/autoencoder_kl_wan.h"
+#include "models/dit/encoders/joyimage_qwen3_vl.h"
+#include "models/dit/processors/joyimage_qwen3_image_processor.h"
 #include "models/dit/processors/vae_image_processor.h"
 #include "models/dit/schedulers/flowmatch_euler_discrete_scheduler.h"
 #include "models/dit/transformers/transformer_joyimage_edit_plus.h"
@@ -46,13 +48,11 @@ limitations under the License.
 #include "models/dit/utils/util.h"
 #include "models/model_registry.h"
 #include "models/vlm/mposition/mposition.h"
-#include "models/vlm/qwen3_vl.h"
 #include "processors/multimodal_processor.h"
-#include "util/tensor_helper.h"
 
 namespace xllm {
 
-using JoyImageEditTextEncoder = Qwen3_VLForConditionalGeneration;
+using JoyImageEditTextEncoder = JoyImageQwen3VLForConditionalGeneration;
 
 class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
                                      public dit::CFGParallelMixin {
@@ -67,7 +67,6 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
 
   JoyImageEditPlusPipelineImpl(const DiTModelContext& context)
       : dit::CFGParallelMixin(context),
-        context_(context),
         parallel_args_(context.get_parallel_args()),
         vae_model_args_(context.get_model_args("vae")) {
     options_ = context.get_tensor_options();
@@ -193,7 +192,6 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     std::vector<torch::Tensor> all_target_masks;
     std::vector<std::vector<std::array<int64_t, 3>>> all_shapes;
     int64_t max_patches = 0;
-
     int64_t h_target = height / vae_scale_factor_spatial_;
     int64_t w_target = width / vae_scale_factor_spatial_;
 
@@ -265,8 +263,10 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     torch::NoGradGuard no_grad;
     const auto& gp = input.generation_params;
     int64_t num_inference_steps = gp.num_inference_steps;
-    double guidance_scale =
-        gp.true_cfg_scale > 0 ? gp.true_cfg_scale : gp.guidance_scale;
+    double guidance_scale = gp.guidance_scale;
+    if (gp.true_cfg_scale > 1.0) {
+      guidance_scale = gp.true_cfg_scale;
+    }
     int64_t seed = gp.seed >= 0 ? gp.seed : 42;
 
     // Collect reference images (one sample per batch entry).
@@ -295,33 +295,36 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       const auto& last = raw_images.back();
       int64_t ih = last.size(last.dim() - 2);
       int64_t iw = last.size(last.dim() - 1);
-      auto hw = joyimage_bucket(ih, iw);
+      auto hw = JoyImageQwen3ImageProcessor::select_bucket(ih, iw);
       height = hw.first;
       width = hw.second;
     }
     height = (height / vae_scale_factor_spatial_) * vae_scale_factor_spatial_;
     width = (width / vae_scale_factor_spatial_) * vae_scale_factor_spatial_;
 
-    // Reference images per sample, in two forms:
-    //  - vae_refs: VAE-preprocessed to [-1,1] (for latent encoding), each
-    //    bucket-resized to its own aspect bucket.
+    const std::vector<std::vector<torch::Tensor>> processed_images =
+        preprocess_images(raw_images, batch_size);
+
     std::vector<std::vector<torch::Tensor>> vae_refs(batch_size);
-    for (int64_t b = 0; b < batch_size; ++b) {
-      for (const auto& imgs : raw_images) {
-        auto img = imgs.dim() == 4 ? imgs[b] : imgs;  // [C,H,W]
-        int64_t ih = img.size(1), iw = img.size(2);
-        auto hw = joyimage_bucket(ih, iw);
-        auto img4 = img.unsqueeze(0).to(device_);
-        vae_refs[b].push_back(vae_image_processor_->preprocess(
-            img4, hw.first, hw.second, /*resize_mode=*/"lanczos"));
+    for (int64_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+      vae_refs[batch_index].reserve(processed_images[batch_index].size());
+      for (const torch::Tensor& image : processed_images[batch_index]) {
+        vae_refs[batch_index].emplace_back(normalize_reference_image(image));
       }
     }
-    bool do_cfg = guidance_scale > 1.0;
+    const bool do_true_cfg = guidance_scale > 1.0;
+    const bool reuse_image_embeddings =
+        do_true_cfg && !input.tensor_sources.contains("prompt_embed") &&
+        !input.tensor_sources.contains("negative_prompt_embed");
+    std::vector<MMDict> image_embeddings_cache(
+        reuse_image_embeddings ? static_cast<size_t>(batch_size) : 0);
+    auto* image_embeddings_cache_ptr =
+        reuse_image_embeddings ? &image_embeddings_cache : nullptr;
     torch::Tensor prompt_embeds;
     torch::Tensor prompt_embeds_mask;
-    const bool encode_text =
-        !input.tensor_sources.contains("prompt_embed") ||
-        (do_cfg && !input.tensor_sources.contains("negative_prompt_embed"));
+    const bool encode_text = !input.tensor_sources.contains("prompt_embed") ||
+                             (do_true_cfg && !input.tensor_sources.contains(
+                                                 "negative_prompt_embed"));
     if (encode_text) {
       CHECK(!text_encoder_.is_empty()) << "Qwen3-VL text encoder is not loaded";
     }
@@ -336,11 +339,15 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       CHECK(!input.prompts.empty())
           << "JoyImageEditPlus requires `prompts` or `prompt_embeds`";
       std::tie(prompt_embeds, prompt_embeds_mask) =
-          encode_prompts(input.prompts, raw_images, batch_size);
+          encode_prompts(input.prompts,
+                         processed_images,
+                         batch_size,
+                         gp.max_sequence_length,
+                         image_embeddings_cache_ptr);
     }
 
     torch::Tensor neg_embeds, neg_embeds_mask;
-    if (do_cfg) {
+    if (do_true_cfg) {
       if (input.tensor_sources.contains("negative_prompt_embed")) {
         neg_embeds = input.tensor_sources.get("negative_prompt_embed")
                          .value_or(torch::Tensor())
@@ -351,10 +358,19 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       } else {
         std::vector<std::string> negative_prompts = input.negative_prompts;
         if (negative_prompts.empty()) {
-          negative_prompts.resize(static_cast<size_t>(batch_size));
+          negative_prompts.assign(static_cast<size_t>(batch_size), " ");
+        } else {
+          std::replace(negative_prompts.begin(),
+                       negative_prompts.end(),
+                       std::string(),
+                       std::string(" "));
         }
         std::tie(neg_embeds, neg_embeds_mask) =
-            encode_prompts(negative_prompts, raw_images, batch_size);
+            encode_prompts(negative_prompts,
+                           processed_images,
+                           batch_size,
+                           gp.max_sequence_length,
+                           image_embeddings_cache_ptr);
       }
       // Pad/concat [negative, positive] to equal sequence length.
       int64_t max_l = std::max(prompt_embeds.size(1), neg_embeds.size(1));
@@ -363,6 +379,7 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       prompt_embeds_mask = pad_seq(prompt_embeds_mask, max_l);
       neg_embeds_mask = pad_seq(neg_embeds_mask, max_l);
     }
+    image_embeddings_cache.clear();
     // Latents.
     int64_t num_channels_latents = in_channels_;
     auto lp = prepare_latents(
@@ -376,6 +393,7 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     auto latents = std::get<0>(lp);
     auto target_mask = std::get<1>(lp);
     auto shape_list = std::get<2>(lp);
+
     auto clean_backup = latents.clone();
     const std::array<int64_t, 3>& target_shape = shape_list.front().front();
     const int64_t target_patch_count =
@@ -395,7 +413,7 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
                                     prompt_embeds_mask,
                                     shape_list);
     TransformerForwardContext negative_transformer_context;
-    if (do_cfg) {
+    if (do_true_cfg) {
       negative_transformer_context =
           prepare_transformer_context(batch_size,
                                       latents.size(1),
@@ -408,7 +426,7 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       auto t = timesteps[i];
 
       torch::Tensor noise_pred;
-      if (do_cfg) {
+      if (do_true_cfg) {
         torch::Tensor t_expand = t.repeat({batch_size});
         auto [cond, uncond] = exec_with_cfg([&](bool is_positive) {
           const torch::Tensor& encoder_hidden_states =
@@ -421,7 +439,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
                                      encoder_hidden_states,
                                      transformer_context,
                                      /*use_cfg=*/!is_positive,
-                                     /*step_index=*/i + 1);
+                                     /*step_index=*/i + 1,
+                                     do_true_cfg);
         });
         auto comb = uncond + guidance_scale * (cond - uncond);
         // Norm-rescale (diffusers): comb * (||cond|| / ||comb||) over channel
@@ -438,7 +457,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
                                          prompt_embeds,
                                          prompt_transformer_context,
                                          /*use_cfg=*/false,
-                                         /*step_index=*/i + 1);
+                                         /*step_index=*/i + 1,
+                                         do_true_cfg);
       }
 
       latents = scheduler_->step(noise_pred, t, latents).to(latents.dtype());
@@ -521,36 +541,36 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     return chat_prompt;
   }
 
-  std::vector<torch::Tensor> prepare_vl_images(
+  std::vector<std::vector<torch::Tensor>> preprocess_images(
       const std::vector<torch::Tensor>& raw_images,
-      int64_t batch_index,
       int64_t batch_size) const {
-    std::vector<torch::Tensor> images;
-    images.reserve(raw_images.size());
-    for (const torch::Tensor& raw_image : raw_images) {
-      CHECK(raw_image.dim() == 3 || raw_image.dim() == 4)
+    std::vector<std::vector<torch::Tensor>> processed_images(batch_size);
+    for (std::vector<torch::Tensor>& images : processed_images) {
+      images.reserve(raw_images.size());
+    }
+    for (const torch::Tensor& images : raw_images) {
+      CHECK(images.dim() == 3 || images.dim() == 4)
           << "JoyImageEditPlus image input must be [C,H,W] or [B,C,H,W]";
-      torch::Tensor image;
-      if (raw_image.dim() == 4) {
-        CHECK_EQ(raw_image.size(0), batch_size)
+      if (images.dim() == 4) {
+        CHECK_EQ(images.size(0), batch_size)
             << "JoyImageEditPlus image batch must match prompt batch";
-        image = raw_image[batch_index];
       } else {
         CHECK_EQ(batch_size, 1)
             << "Unbatched JoyImageEditPlus images require batch_size=1";
-        image = raw_image;
       }
-      image = image.to(torch::kCPU).to(torch::kFloat32);
-      const float max_value = image.max().item<float>();
-      image = max_value <= 1.1f ? image.clamp(0.0f, 1.0f) * 255.0f
-                                : image.clamp(0.0f, 255.0f);
-      images.emplace_back(std::move(image));
+      for (int64_t batch_index = 0; batch_index < batch_size; ++batch_index) {
+        const torch::Tensor image =
+            images.dim() == 4 ? images[batch_index] : images;
+        processed_images[batch_index].emplace_back(
+            JoyImageQwen3ImageProcessor::preprocess(image));
+      }
     }
-    return images;
+    return processed_images;
   }
 
   ModelInputParams build_text_encoder_input(const torch::Tensor& tokens,
-                                            const MMData& mm_data) {
+                                            const MMData& mm_data,
+                                            MMDict* image_embeddings_cache) {
     CHECK_LE(tokens.numel(), std::numeric_limits<int32_t>::max())
         << "JoyImageEditPlus Qwen3-VL prompt is too long";
     const int32_t sequence_length = static_cast<int32_t>(tokens.numel());
@@ -592,8 +612,14 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
 
     ModelInputParams multimodal_params;
     multimodal_params.multimodal.mm_data = mm_batch;
-    MMDict multimodal_embeddings =
-        text_encoder_->get_multimodal_embeddings(multimodal_params);
+    MMDict uncached_embeddings;
+    MMDict& multimodal_embeddings = image_embeddings_cache != nullptr
+                                        ? *image_embeddings_cache
+                                        : uncached_embeddings;
+    if (multimodal_embeddings.empty()) {
+      multimodal_embeddings =
+          text_encoder_->get_multimodal_embeddings(multimodal_params);
+    }
     EncoderOutputScatterVisitor output_scatter(multimodal_embeddings);
     CHECK(mm_batch.foreach (output_scatter));
     CHECK(output_scatter.finish())
@@ -613,9 +639,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
 
   std::pair<torch::Tensor, torch::Tensor> encode_single_prompt(
       const std::string& prompt,
-      const std::vector<torch::Tensor>& raw_images,
-      int64_t batch_index,
-      int64_t batch_size) {
+      const std::vector<torch::Tensor>& images,
+      MMDict* image_embeddings_cache) {
     CHECK(!text_encoder_.is_empty()) << "Qwen3-VL text encoder is not loaded";
     CHECK(tokenizer_ != nullptr) << "Qwen3-VL tokenizer is not loaded";
     CHECK(multimodal_processor_ != nullptr)
@@ -623,14 +648,12 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     CHECK(mposition_generator_ != nullptr)
         << "Qwen3-VL position generator is not loaded";
 
-    std::vector<torch::Tensor> images =
-        prepare_vl_images(raw_images, batch_index, batch_size);
     std::vector<MMInputItem> input_items;
     input_items.reserve(images.size());
-    for (torch::Tensor& image : images) {
+    for (const torch::Tensor& image : images) {
       MMInputItem item;
       item.type = MMType::IMAGE;
-      item.decode_image = std::move(image);
+      item.decode_image = image;
       input_items.emplace_back(std::move(item));
     }
     MMInput multimodal_input;
@@ -658,7 +681,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
         torch::tensor(token_ids, torch::TensorOptions().dtype(torch::kInt32))
             .to(device_);
     positions = positions.to(device_);
-    ModelInputParams input_params = build_text_encoder_input(tokens, mm_data);
+    ModelInputParams input_params =
+        build_text_encoder_input(tokens, mm_data, image_embeddings_cache);
     ModelOutput model_output = text_encoder_->forward(
         tokens, positions, text_encoder_empty_kv_caches_, input_params);
     CHECK(model_output.residual.defined())
@@ -682,30 +706,46 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
 
   std::pair<torch::Tensor, torch::Tensor> encode_prompts(
       const std::vector<std::string>& prompts,
-      const std::vector<torch::Tensor>& raw_images,
-      int64_t batch_size) {
+      const std::vector<std::vector<torch::Tensor>>& processed_images,
+      int64_t batch_size,
+      int64_t max_sequence_length,
+      std::vector<MMDict>* image_embeddings_cache) {
     CHECK_EQ(static_cast<int64_t>(prompts.size()), batch_size)
         << "JoyImageEditPlus prompt batch size mismatch";
+    CHECK_EQ(static_cast<int64_t>(processed_images.size()), batch_size)
+        << "JoyImageEditPlus image batch size mismatch";
+    if (image_embeddings_cache != nullptr) {
+      CHECK_EQ(static_cast<int64_t>(image_embeddings_cache->size()), batch_size)
+          << "JoyImageEditPlus image embedding cache batch size mismatch";
+    }
     std::vector<torch::Tensor> embeddings;
     std::vector<torch::Tensor> masks;
     embeddings.reserve(static_cast<size_t>(batch_size));
     masks.reserve(static_cast<size_t>(batch_size));
-    int64_t max_sequence_length = 0;
+    int64_t batch_sequence_length = 0;
     for (int64_t batch_index = 0; batch_index < batch_size; ++batch_index) {
       auto [embedding, mask] =
           encode_single_prompt(prompts[static_cast<size_t>(batch_index)],
-                               raw_images,
-                               batch_index,
-                               batch_size);
-      max_sequence_length = std::max(max_sequence_length, embedding.size(1));
+                               processed_images[batch_index],
+                               image_embeddings_cache != nullptr
+                                   ? &(*image_embeddings_cache)[batch_index]
+                                   : nullptr);
+      const int64_t sequence_length = embedding.size(1);
+      if (max_sequence_length > 0 && sequence_length > max_sequence_length) {
+        const int64_t start = sequence_length - max_sequence_length;
+        embedding = embedding.slice(1, start, sequence_length);
+        mask = mask.slice(1, start, sequence_length);
+      }
+      batch_sequence_length =
+          std::max(batch_sequence_length, embedding.size(1));
       embeddings.emplace_back(std::move(embedding));
       masks.emplace_back(std::move(mask));
     }
     for (int64_t batch_index = 0; batch_index < batch_size; ++batch_index) {
       embeddings[static_cast<size_t>(batch_index)] = pad_seq(
-          embeddings[static_cast<size_t>(batch_index)], max_sequence_length);
-      masks[static_cast<size_t>(batch_index)] =
-          pad_seq(masks[static_cast<size_t>(batch_index)], max_sequence_length);
+          embeddings[static_cast<size_t>(batch_index)], batch_sequence_length);
+      masks[static_cast<size_t>(batch_index)] = pad_seq(
+          masks[static_cast<size_t>(batch_index)], batch_sequence_length);
     }
     return {torch::cat(embeddings, /*dim=*/0), torch::cat(masks, /*dim=*/0)};
   }
@@ -716,7 +756,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       const torch::Tensor& encoder_hidden_states,
       const TransformerForwardContext& forward_context,
       bool use_cfg,
-      int64_t step_index) {
+      int64_t step_index,
+      bool do_true_cfg) {
     return transformer_->forward(hidden_states,
                                  timestep,
                                  encoder_hidden_states,
@@ -724,7 +765,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
                                  forward_context.rope_sin,
                                  forward_context.attention_mask,
                                  use_cfg,
-                                 step_index);
+                                 step_index,
+                                 do_true_cfg);
   }
 
   TransformerForwardContext prepare_transformer_context(
@@ -820,7 +862,7 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     }
 
     torch::TensorOptions float_options =
-        torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
     std::vector<torch::Tensor> grids;
     grids.reserve(3);
     for (int64_t dimension_index = 0; dimension_index < 3; ++dimension_index) {
@@ -845,35 +887,17 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
       cos_parts.emplace_back(angles.cos().repeat_interleave(2, /*dim=*/1));
       sin_parts.emplace_back(angles.sin().repeat_interleave(2, /*dim=*/1));
     }
-    return {torch::cat(cos_parts, /*dim=*/1), torch::cat(sin_parts, /*dim=*/1)};
+    return {torch::cat(cos_parts, /*dim=*/1).to(device),
+            torch::cat(sin_parts, /*dim=*/1).to(device)};
   }
 
-  // Nearest 1024-base aspect bucket (h, w).
-  std::pair<int64_t, int64_t> joyimage_bucket(int64_t h, int64_t w) {
-    static const std::vector<std::pair<int64_t, int64_t>> kBuckets = {
-        {512, 1792},  {512, 1856}, {512, 1920}, {512, 1984}, {512, 2048},
-        {576, 1600},  {576, 1664}, {576, 1728}, {576, 1792}, {640, 1472},
-        {640, 1536},  {640, 1600}, {704, 1344}, {704, 1408}, {704, 1472},
-        {768, 1216},  {768, 1280}, {768, 1344}, {832, 1152}, {832, 1216},
-        {896, 1088},  {896, 1152}, {960, 1024}, {960, 1088}, {1024, 960},
-        {1024, 1024}, {1088, 896}, {1088, 960}, {1152, 832}, {1152, 896},
-        {1216, 768},  {1216, 832}, {1280, 768}, {1344, 704}, {1344, 768},
-        {1408, 704},  {1472, 640}, {1472, 704}, {1536, 640}, {1600, 576},
-        {1600, 640},  {1664, 576}, {1728, 576}, {1792, 512}, {1792, 576},
-        {1856, 512},  {1920, 512}, {1984, 512}, {2048, 512}};
-    double target = static_cast<double>(h) / static_cast<double>(w);
-    int64_t best_h = 1024, best_w = 1024;
-    double best_diff = std::numeric_limits<double>::max();
-    for (const auto& hw : kBuckets) {
-      double diff =
-          std::abs(static_cast<double>(hw.first) / hw.second - target);
-      if (diff < best_diff) {
-        best_diff = diff;
-        best_h = hw.first;
-        best_w = hw.second;
-      }
+  torch::Tensor normalize_reference_image(const torch::Tensor& image) const {
+    torch::Tensor processed = image.to(torch::kFloat32) / 255.0f;
+    if (processed.dim() == 3) {
+      processed = processed.unsqueeze(0);
     }
-    return {best_h, best_w};
+    processed = 2.0f * processed - 1.0f;
+    return processed.to(device_, dtype_);
   }
 
   torch::Tensor pad_seq(const torch::Tensor& x, int64_t target_len) {
@@ -886,7 +910,6 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
     return torch::cat({x, zeros}, 1);
   }
 
-  DiTModelContext context_;
   const ParallelArgs parallel_args_;
   const ModelArgs& vae_model_args_;
   torch::Device device_ = torch::kCPU;

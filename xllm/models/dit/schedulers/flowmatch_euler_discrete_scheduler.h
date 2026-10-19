@@ -164,22 +164,31 @@ class FlowMatchEulerDiscreteSchedulerImpl : public xllm::dit::Scheduler {
 
     if (!sigmas.has_value()) {
       if (!timesteps.has_value()) {
-        // The ramp runs from sigma_max_ down to a lower bound. The standard
-        // schedule ends at sigma_min_, the smallest sigma of the training
-        // grid; distilled Wan2.2 weights need it at 1/N instead. Only the
-        // endpoint differs -- the interpolation below and the shift applied
-        // afterwards are the same for both.
-        const float sigma_end =
-            raw_sigmas_ ? 1.0f / static_cast<float>(num_steps) : sigma_min_;
-        std::vector<float> ts_vec(num_steps);
-        float start = sigma_max_ * num_train_timesteps_;
-        float end = sigma_end * num_train_timesteps_;
-        for (int64_t i = 0; i < num_steps; ++i) {
-          ts_vec[i] = start + (end - start) * i / (num_steps - 1);
+        if (raw_sigmas_) {
+          const float sigma_end = 1.0f / static_cast<float>(num_steps);
+          std::vector<float> ts_vec(num_steps);
+          const float start = sigma_max_ * num_train_timesteps_;
+          const float end = sigma_end * num_train_timesteps_;
+          for (int64_t index = 0; index < num_steps; ++index) {
+            ts_vec[index] =
+                num_steps > 1 ? start + (end - start) * index / (num_steps - 1)
+                              : start;
+          }
+          ts_tensor =
+              torch::from_blob(ts_vec.data(), {num_steps}, torch::kFloat32)
+                  .clone();
+        } else {
+          const double start =
+              static_cast<double>(sigma_max_) * num_train_timesteps_;
+          const double end =
+              static_cast<double>(sigma_min_) * num_train_timesteps_;
+          const double step =
+              num_steps > 1 ? (end - start) / (num_steps - 1) : 0.0;
+          ts_tensor = torch::arange(num_steps, torch::kFloat64) * step + start;
+          if (num_steps > 1) {
+            ts_tensor.index_put_({num_steps - 1}, end);
+          }
         }
-        ts_tensor =
-            torch::from_blob(ts_vec.data(), {num_steps}, torch::kFloat32)
-                .clone();
       }
       sigmas_tensor = ts_tensor / num_train_timesteps_;
     } else {
@@ -205,7 +214,7 @@ class FlowMatchEulerDiscreteSchedulerImpl : public xllm::dit::Scheduler {
       sigmas_tensor = convert_to_exponential(sigmas_tensor, num_steps);
     }
 
-    sigmas_tensor = sigmas_tensor.to(device).to(torch::kFloat32);
+    sigmas_tensor = sigmas_tensor.to(torch::kFloat32).to(device);
     if (!is_timesteps_provided) {
       ts_tensor = sigmas_tensor * num_train_timesteps_;
     } else {

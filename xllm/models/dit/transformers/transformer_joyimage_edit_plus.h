@@ -34,7 +34,6 @@ limitations under the License.
 #include "core/framework/parallel_state/parallel_state.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
-#include "core/layers/common/ada_layer_norm.h"
 #include "core/layers/common/add_matmul.h"
 #include "core/layers/common/rms_norm.h"
 #include "models/dit/transformers/transformer_qwen_image.h"
@@ -286,6 +285,19 @@ class TimeTextEmbeddingImpl final : public torch::nn::Module {
 };
 TORCH_MODULE(TimeTextEmbedding);
 
+class AttentionOutputProjectionImpl final : public layer::AddMatmulImpl {
+ public:
+  AttentionOutputProjectionImpl(int64_t input_size,
+                                int64_t output_size,
+                                const torch::TensorOptions& options)
+      : layer::AddMatmulImpl(input_size, output_size, true, options) {}
+
+  torch::Tensor forward(const torch::Tensor& hidden_states) override {
+    return torch::matmul(hidden_states, weight_.transpose(0, 1)) + bias_;
+  }
+};
+TORCH_MODULE(AttentionOutputProjection);
+
 using JoyAttentionOutput = std::tuple<torch::Tensor, torch::Tensor>;
 
 class JoyAttentionImpl final : public torch::nn::Module,
@@ -317,8 +329,7 @@ class JoyAttentionImpl final : public torch::nn::Module,
     img_attn_k_norm_ = register_module("img_attn_k_norm",
                                        layer::RMSNorm(head_dim, eps, options_));
     img_attn_proj_ = register_module(
-        "img_attn_proj",
-        layer::AddMatmulWeightTransposed(inner, dim, true, options_));
+        "img_attn_proj", AttentionOutputProjection(inner, dim, options_));
 
     txt_attn_q_ = register_module(
         "txt_attn_q",
@@ -334,8 +345,7 @@ class JoyAttentionImpl final : public torch::nn::Module,
     txt_attn_k_norm_ = register_module("txt_attn_k_norm",
                                        layer::RMSNorm(head_dim, eps, options_));
     txt_attn_proj_ = register_module(
-        "txt_attn_proj",
-        layer::AddMatmulWeightTransposed(inner, dim, true, options_));
+        "txt_attn_proj", AttentionOutputProjection(inner, dim, options_));
   }
 
   JoyAttentionOutput forward(const torch::Tensor& hidden_states,
@@ -497,13 +507,13 @@ class JoyAttentionImpl final : public torch::nn::Module,
   layer::AddMatmulWeightTransposed img_attn_v_{nullptr};
   layer::RMSNorm img_attn_q_norm_{nullptr};
   layer::RMSNorm img_attn_k_norm_{nullptr};
-  layer::AddMatmulWeightTransposed img_attn_proj_{nullptr};
+  AttentionOutputProjection img_attn_proj_{nullptr};
   layer::AddMatmulWeightTransposed txt_attn_q_{nullptr};
   layer::AddMatmulWeightTransposed txt_attn_k_{nullptr};
   layer::AddMatmulWeightTransposed txt_attn_v_{nullptr};
   layer::RMSNorm txt_attn_q_norm_{nullptr};
   layer::RMSNorm txt_attn_k_norm_{nullptr};
-  layer::AddMatmulWeightTransposed txt_attn_proj_{nullptr};
+  AttentionOutputProjection txt_attn_proj_{nullptr};
 
  private:
   void load_qkv_projections(const StateDict& state_dict,
@@ -556,38 +566,17 @@ class TransformerBlockImpl final : public torch::nn::Module {
                        int64_t dim,
                        int64_t num_heads,
                        int64_t head_dim,
-                       double mlp_width_ratio,
                        ProcessGroup* sp_group,
                        double eps = 1e-6)
       : eps_(eps) {
-    int64_t mlp_hidden = static_cast<int64_t>(dim * mlp_width_ratio);
-
     img_mod_ = register_module("img_mod", Modulate(dim, 6));
-#if defined(USE_NPU)
-    const torch::TensorOptions options = context.get_tensor_options();
-    img_norm1_ = register_module(
-        "img_norm1",
-        layer::AdaLayerNorm(dim, eps, /*elementwise_affine=*/false, options));
-    img_norm2_ = register_module(
-        "img_norm2",
-        layer::AdaLayerNorm(dim, eps, /*elementwise_affine=*/false, options));
-#endif
     img_mlp_ = register_module(
         "img_mlp", qwenimage::FeedForward(context, dim, dim, /*mult=*/4));
     txt_mod_ = register_module("txt_mod", Modulate(dim, 6));
-#if defined(USE_NPU)
-    txt_norm1_ = register_module(
-        "txt_norm1",
-        layer::AdaLayerNorm(dim, eps, /*elementwise_affine=*/false, options));
-    txt_norm2_ = register_module(
-        "txt_norm2",
-        layer::AdaLayerNorm(dim, eps, /*elementwise_affine=*/false, options));
-#endif
     txt_mlp_ = register_module(
         "txt_mlp", qwenimage::FeedForward(context, dim, dim, /*mult=*/4));
     attn_ = register_module(
         "attn", JoyAttention(context, dim, num_heads, head_dim, sp_group, eps));
-    (void)mlp_hidden;  // FeedForward uses dim*4 internally (== dim*ratio)
   }
 
   // FP32 layernorm without affine.
@@ -625,17 +614,12 @@ class TransformerBlockImpl final : public torch::nn::Module {
     auto ehs = encoder_hidden_states;
 
     // --- attention ---
-#if defined(USE_NPU)
-    auto img_modulated = img_norm1_->forward(hs, img_c1, img_s1);
-    auto txt_modulated = txt_norm1_->forward(ehs, txt_c1, txt_s1);
-#else
     auto img_normed = fp32_norm(hs, eps_);
     auto txt_normed = fp32_norm(ehs, eps_);
     auto img_modulated =
         img_normed * (1 + img_c1.unsqueeze(1)) + img_s1.unsqueeze(1);
     auto txt_modulated =
         txt_normed * (1 + txt_c1.unsqueeze(1)) + txt_s1.unsqueeze(1);
-#endif
 
     JoyAttentionOutput attn_out = attn_->forward(
         img_modulated, txt_modulated, rope_cos, rope_sin, attn_mask);
@@ -650,17 +634,12 @@ class TransformerBlockImpl final : public torch::nn::Module {
     ehs = txt_attn;
 
     // --- FFN ---
-#if defined(USE_NPU)
-    auto img_ffn_in = img_norm2_->forward(hs, img_c2, img_s2);
-    auto txt_ffn_in = txt_norm2_->forward(ehs, txt_c2, txt_s2);
-#else
     auto img_ffn_normed = fp32_norm(hs, eps_);
     auto txt_ffn_normed = fp32_norm(ehs, eps_);
     auto img_ffn_in =
         img_ffn_normed * (1 + img_c2.unsqueeze(1)) + img_s2.unsqueeze(1);
     auto txt_ffn_in =
         txt_ffn_normed * (1 + txt_c2.unsqueeze(1)) + txt_s2.unsqueeze(1);
-#endif
     auto img_ffn = img_mlp_->forward(img_ffn_in);
     auto txt_ffn = txt_mlp_->forward(txt_ffn_in);
     img_ffn.mul_(img_g2.unsqueeze(1));
@@ -692,12 +671,6 @@ class TransformerBlockImpl final : public torch::nn::Module {
   double eps_;
   Modulate img_mod_{nullptr};
   Modulate txt_mod_{nullptr};
-#if defined(USE_NPU)
-  layer::AdaLayerNorm img_norm1_{nullptr};
-  layer::AdaLayerNorm img_norm2_{nullptr};
-  layer::AdaLayerNorm txt_norm1_{nullptr};
-  layer::AdaLayerNorm txt_norm2_{nullptr};
-#endif
   qwenimage::FeedForward img_mlp_{nullptr};
   qwenimage::FeedForward txt_mlp_{nullptr};
   JoyAttention attn_{nullptr};
@@ -722,7 +695,6 @@ class JoyImageEditPlusTransformer3DModelImpl final
     int64_t out_channels = model_args.out_channels();
     out_channels_ = (out_channels > 0) ? out_channels : in_channels_;
     patch_size_ = model_args.wan_patch_size();  // {pt, ph, pw}
-    double mlp_width_ratio = model_args.mlp_width_ratio();
     int64_t text_dim = model_args.text_dim();
 
     head_dim_ = hidden_size_ / num_heads_;
@@ -759,7 +731,6 @@ class JoyImageEditPlusTransformer3DModelImpl final
                                     hidden_size_,
                                     num_heads_,
                                     head_dim_,
-                                    mlp_width_ratio,
                                     parallel_args.dit_sp_group_);
       double_blocks_->push_back(block);
       block_layers_.push_back(block);
@@ -782,7 +753,8 @@ class JoyImageEditPlusTransformer3DModelImpl final
                         const torch::Tensor& rope_sin,
                         const torch::Tensor& attention_mask,
                         bool use_cfg = false,
-                        int64_t step_index = 1) {
+                        int64_t step_index = 1,
+                        bool do_true_cfg = false) {
     xllm::dit::SequenceParallelTensorMap model_outputs =
         sequence_parallel_forward(
             {{"hidden_states", {hidden_states, 1}},
@@ -793,7 +765,8 @@ class JoyImageEditPlusTransformer3DModelImpl final
              &rope_sin,
              &attention_mask,
              use_cfg,
-             step_index](
+             step_index,
+             do_true_cfg](
                 const xllm::dit::SequenceParallelTensorMap& model_inputs) {
               torch::Tensor output =
                   forward_impl(model_inputs.at("hidden_states").first,
@@ -803,7 +776,8 @@ class JoyImageEditPlusTransformer3DModelImpl final
                                rope_sin,
                                attention_mask,
                                use_cfg,
-                               step_index);
+                               step_index,
+                               do_true_cfg);
               return xllm::dit::SequenceParallelTensorMap{
                   {"hidden_states", {output, 1}}};
             });
@@ -818,7 +792,8 @@ class JoyImageEditPlusTransformer3DModelImpl final
                              const torch::Tensor& rope_sin,
                              const torch::Tensor& attention_mask,
                              bool use_cfg,
-                             int64_t step_index) {
+                             int64_t step_index,
+                             bool do_true_cfg) {
     int64_t batch_size = local_hidden_states.size(0);
     int64_t sequence_length = local_hidden_states.size(1);
     int64_t channels = local_hidden_states.size(2);
@@ -871,7 +846,17 @@ class JoyImageEditPlusTransformer3DModelImpl final
         use_cfg);
 
     // 4. Output projection + reshape to [B, N, C_out, pt, ph, pw].
-    img = proj_out_->forward(fp32_norm_out(img));
+    img = fp32_norm_out(img);
+    if (do_true_cfg) {
+      auto zeros = torch::zeros_like(img);
+      auto padded =
+          use_cfg ? torch::cat({img, zeros}, 1) : torch::cat({zeros, img}, 1);
+      const int64_t length = img.size(1);
+      const int64_t start = use_cfg ? 0 : length;
+      img = proj_out_->forward(padded).slice(1, start, start + length);
+    } else {
+      img = proj_out_->forward(img);
+    }
     img = img.reshape({batch_size, sequence_length, pt, ph, pw, out_channels_})
               .permute({0, 1, 5, 2, 3, 4});
     return img;
@@ -922,7 +907,20 @@ class JoyImageEditPlusTransformer3DModelImpl final
     }
   }
 
-  void keep_fp32_modules() { condition_embedder_->keep_fp32_modules(); }
+  void keep_fp32_modules() {
+    condition_embedder_->keep_fp32_modules();
+    for (const auto& module : modules(false)) {
+      auto linear =
+          std::dynamic_pointer_cast<layer::AddMatmulWeightTransposedImpl>(
+              module);
+      if (linear == nullptr) {
+        continue;
+      }
+      auto weight = linear->named_parameters(false)["weight"];
+      CHECK(weight.is_floating_point());
+      weight.set_data(weight.transpose(0, 1).contiguous().transpose(0, 1));
+    }
+  }
 
  private:
   torch::TensorOptions options_;
@@ -951,7 +949,6 @@ REGISTER_MODEL_ARGS(JoyImageEditPlusTransformer3DModel, [&] {
   LOAD_ARG_OR(in_channels, "in_channels", 16);
   LOAD_ARG_OR(out_channels, "out_channels", 16);
   LOAD_ARG_OR(wan_patch_size, "patch_size", (std::vector<int64_t>{1, 2, 2}));
-  LOAD_ARG_OR(mlp_width_ratio, "mlp_width_ratio", 4.0);
   LOAD_ARG_OR(text_dim, "text_dim", 4096);
   LOAD_ARG_OR(
       rope_dim_list, "rope_dim_list", (std::vector<int64_t>{16, 56, 56}));

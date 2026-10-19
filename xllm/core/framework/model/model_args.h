@@ -732,7 +732,7 @@ struct ModelArgs {
 
   // scheduler related args
   PROPERTY(int64_t, num_train_timesteps) = 0;
-  PROPERTY(int64_t, shift) = 0;
+  PROPERTY(float, shift) = 0.0f;
   PROPERTY(bool, use_dynamic_shifting) = false;
   PROPERTY(float, base_shift) = 0;
   PROPERTY(float, max_shift) = 0;

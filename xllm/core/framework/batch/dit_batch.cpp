@@ -74,6 +74,8 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
   input.generation_params = request_vec_[0]->state().generation_params();
 
   const size_t batch_size = request_vec_.size();
+  bool has_negative_prompts = false;
+  input.negative_prompts.reserve(batch_size);
   for (const auto& request : request_vec_) {
     const auto& generation_params = request->state().generation_params();
     CHECK(input.generation_params == generation_params)
@@ -86,8 +88,8 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
     if (!input_params.prompt_2.empty())
       input.prompts_2.emplace_back(input_params.prompt_2);
 
-    if (!input_params.negative_prompt.empty())
-      input.negative_prompts.emplace_back(input_params.negative_prompt);
+    has_negative_prompts |= !input_params.negative_prompt.empty();
+    input.negative_prompts.emplace_back(input_params.negative_prompt);
 
     if (!input_params.negative_prompt_2.empty())
       input.negative_prompts_2.emplace_back(input_params.negative_prompt_2);
@@ -106,9 +108,7 @@ DiTForwardInput DiTBatch::prepare_forward_input() {
     input.prompts_2.clear();
   }
 
-  const bool has_full_negative_prompts =
-      input.negative_prompts.size() == request_vec_.size();
-  if (!has_full_negative_prompts) {
+  if (!has_negative_prompts) {
     input.negative_prompts.clear();
   }
 
