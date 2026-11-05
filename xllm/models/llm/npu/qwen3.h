@@ -193,8 +193,7 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
     }
 
     if (use_deepstack) {
-      deep_stacks =
-          input_params.multimodal.deep_stacks;  // [num_deepstack, hidden_size]
+      deep_stacks = std::move(input_params.multimodal.deep_stacks);
     }
     auto target_cos_sin = atb_pos_emb_(cos_sin_, positions, 0);
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
@@ -298,6 +297,7 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
       if (use_deepstack) {
         if (deep_stacks.size() > 0 && i < deep_stacks.size()) {
           h = h + deep_stacks[i];
+          deep_stacks[i] = torch::Tensor();
         }
       }
       // ATB keeps `h` as the full residual stream, so no separate residual.

@@ -17,42 +17,25 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
 
 #include "core/framework/multimodal/mm_batch_data.h"
-#include "core/framework/parallel_state/parallel_state.h"
+#include "core/framework/parallel_state/process_group.h"
 
 namespace xllm {
-
-namespace {
-int32_t compute_max_token_total(
-    const std::vector<std::vector<int32_t>>& rank_to_items,
-    const std::vector<int32_t>& token_nums) {
-  auto token_total = [&](const std::vector<int32_t>& items) {
-    int32_t total = 0;
-    for (int32_t idx : items) {
-      total += token_nums[idx];
-    }
-    return total;
-  };
-  int32_t max_total = 0;
-  for (const auto& items : rank_to_items) {
-    max_total = std::max(max_total, token_total(items));
-  }
-  return max_total;
-}
-}  // namespace
-
-class ProcessGroup;
 
 std::vector<int32_t> get_mm_token_nums(MMBatchData& mm_data, MMType type);
 
 std::vector<torch::Tensor> split_by_token_nums(
     const torch::Tensor& tensor,
     const std::vector<int32_t>& token_nums);
+
+std::vector<torch::Tensor> merge_multimodal_embeddings(
+    torch::Tensor& inputs_embeds,
+    MMBatchData& mm_data,
+    int64_t num_deepstacks);
 
 std::vector<std::vector<int32_t>> build_lpt_assignment(
     const std::vector<int32_t>& patch_nums,
@@ -66,15 +49,11 @@ std::pair<torch::Tensor, torch::Tensor> slice_local_input(
     const std::vector<int32_t>& patch_nums,
     const std::vector<int32_t>& local_index);
 
-torch::Tensor all_gather_padded(const torch::Tensor& local_embeds,
-                                int32_t max_token_total,
-                                ProcessGroup* dp_group);
-
-std::vector<torch::Tensor> restore_outputs(
-    const torch::Tensor& gathered,
+std::vector<torch::Tensor> gather_encoder_outputs(
+    const torch::Tensor& local_embeds,
     const std::vector<int32_t>& token_nums,
     const std::vector<std::vector<int32_t>>& rank_to_items,
-    int32_t max_token_total);
+    ProcessGroup* dp_group);
 
 template <typename VisionEncoder>
 std::vector<torch::Tensor> run_dp_encoder(
@@ -99,9 +78,8 @@ std::vector<torch::Tensor> run_dp_encoder(
     local_embeds = torch::empty({0, feature_dim}, pixel_values.options());
   }
 
-  int32_t max_total = compute_max_token_total(rank_to_items, token_nums);
-  torch::Tensor gathered = all_gather_padded(local_embeds, max_total, dp_group);
-  return restore_outputs(gathered, token_nums, rank_to_items, max_total);
+  return gather_encoder_outputs(
+      local_embeds, token_nums, rank_to_items, dp_group);
 }
 
 }  // namespace xllm

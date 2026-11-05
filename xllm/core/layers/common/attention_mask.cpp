@@ -72,15 +72,12 @@ torch::Tensor AttentionMask::gen_append_mask(int32_t q_len,
                                              int32_t max_kv_len,
                                              torch::Dtype dtype,
                                              torch::Device device) {
-  int diagonal = kv_len - q_len;
-  auto options = torch::TensorOptions().dtype(torch::kBool).device(device);
-  auto bias = torch::tril(torch::ones({q_len, max_kv_len}, options), diagonal);
-  bias = ~bias;
-
-  auto mask_options = torch::TensorOptions().dtype(dtype).device(device);
-  auto mask = torch::zeros({q_len, max_kv_len}, mask_options)
-                  .masked_fill(bias, mask_value_);
-  return mask;
+  const int64_t diagonal = static_cast<int64_t>(kv_len) - q_len + 1;
+  const torch::TensorOptions mask_options =
+      torch::TensorOptions().dtype(dtype).device(device);
+  torch::Tensor mask =
+      torch::full({q_len, max_kv_len}, mask_value_, mask_options);
+  return mask.triu_(diagonal);
 }
 
 void AttentionMask::update_attn_cache(torch::Dtype dtype,

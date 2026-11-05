@@ -719,64 +719,17 @@ class Qwen3_VLForConditionalGenerationImpl : public torch::nn::Module {
     return multimodal_embeds;
   }
 
-  std::pair<torch::Tensor, std::vector<torch::Tensor>>
-  split_multimodal_embedding(const torch::Tensor& embedding) const {
-    const size_t num_deepstacks =
-        model_args_.mm_deepstack_visual_indexes().size();
-    CHECK(embedding.defined()) << "Multimodal embedding is not defined.";
-    CHECK_GT(num_deepstacks, 0)
-        << "There should be at least one deepstack when splitting multimodal "
-           "embedding.";
-    const int64_t num_chunks = static_cast<int64_t>(num_deepstacks + 1);
-    auto chunks = embedding.chunk(/*chunks=*/num_chunks, /*dim=*/1);
-    std::vector<torch::Tensor> deepstacks;
-    deepstacks.reserve(num_deepstacks);
-    for (size_t idx = 1; idx < chunks.size(); ++idx) {
-      deepstacks.push_back(chunks[idx]);
-    }
-    return {chunks[0], std::move(deepstacks)};
-  }
-
-  torch::Tensor merge_multimodal_embeddings(
-      torch::Tensor inputs_embeds,
-      const torch::Tensor& multimodal_embeds,
-      const torch::Tensor& is_multimodal) {
-    inputs_embeds.index_put_({is_multimodal}, multimodal_embeds);
-    return inputs_embeds;
-  }
-
   torch::Tensor get_input_embeddings(const torch::Tensor input_ids,
                                      const ModelInputParams& input_params) {
-    const auto& mm_data = input_params.multimodal.mm_data;
+    auto& mm_data = input_params.multimodal.mm_data;
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
     if (!mm_data.valid()) {
       return inputs_embeds;
     }
     const size_t num_deepstacks =
         model_args_.mm_deepstack_visual_indexes().size();
-    std::vector<torch::Tensor> deepstack_input_embeds;
-    deepstack_input_embeds.resize(num_deepstacks);
-    for (auto& deepstack : deepstack_input_embeds) {
-      deepstack = torch::zeros_like(inputs_embeds);
-    }
-    auto merge_modality = [&](const std::string& embed_key,
-                              const std::string& mask_key) {
-      auto emb = mm_data.get<torch::Tensor>(embed_key);
-      if (!emb.has_value()) return;
-      auto mask = mm_data.get<torch::Tensor>(mask_key);
-      if (!mask.has_value()) return;
-      auto [embedding, deepstacks] = split_multimodal_embedding(emb.value());
-      inputs_embeds =
-          merge_multimodal_embeddings(inputs_embeds, embedding, mask.value());
-      for (size_t idx = 0; idx < num_deepstacks; ++idx) {
-        deepstack_input_embeds[idx] = merge_multimodal_embeddings(
-            deepstack_input_embeds[idx], deepstacks[idx], mask.value());
-      }
-    };
-
-    merge_modality("image|embedding", "image|mask");
-    merge_modality("video|embedding", "video|mask");
-    input_params.multimodal.deep_stacks = std::move(deepstack_input_embeds);
+    input_params.multimodal.deep_stacks = ::xllm::merge_multimodal_embeddings(
+        inputs_embeds, mm_data, static_cast<int64_t>(num_deepstacks));
     return inputs_embeds;
   }
 

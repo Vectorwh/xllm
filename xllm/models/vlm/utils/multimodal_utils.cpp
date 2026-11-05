@@ -109,31 +109,87 @@ std::vector<torch::Tensor> split_by_token_nums(
   return tensor.split(split_sizes, 0);
 }
 
-torch::Tensor all_gather_padded(const torch::Tensor& local_embeds,
-                                int32_t max_token_total,
-                                ProcessGroup* dp_group) {
-  torch::Tensor padded = torch::zeros({max_token_total, local_embeds.size(1)},
-                                      local_embeds.options());
-  padded.slice(0, 0, local_embeds.size(0)).copy_(local_embeds);
-  return parallel_state::gather(padded, dp_group, 0);
+std::vector<torch::Tensor> merge_multimodal_embeddings(
+    torch::Tensor& inputs_embeds,
+    MMBatchData& mm_data,
+    int64_t num_deepstacks) {
+  if (!mm_data.valid()) {
+    return {};
+  }
+  std::vector<torch::Tensor> deepstacks;
+  deepstacks.reserve(num_deepstacks);
+  for (int64_t index = 0; index < num_deepstacks; ++index) {
+    deepstacks.emplace_back(torch::zeros_like(inputs_embeds));
+  }
+  const auto merge_modality = [&](const std::string& embedding_key,
+                                  const std::string& mask_key) {
+    const auto embedding = mm_data.get<torch::Tensor>(embedding_key);
+    const auto mask = mm_data.get<torch::Tensor>(mask_key);
+    if (!embedding.has_value() || !mask.has_value()) {
+      return;
+    }
+    CHECK(embedding->defined()) << "Multimodal embedding is not defined.";
+    CHECK_GT(num_deepstacks, 0)
+        << "There should be at least one deepstack when splitting multimodal "
+           "embedding.";
+    CHECK_EQ(embedding->size(1), inputs_embeds.size(1) * (num_deepstacks + 1))
+        << "Packed multimodal width must match the main and DeepStack widths.";
+    const auto chunks =
+        embedding->chunk(/*chunks=*/num_deepstacks + 1, /*dim=*/1);
+    inputs_embeds.index_put_({mask.value()}, chunks[0]);
+    for (int64_t index = 0; index < num_deepstacks; ++index) {
+      deepstacks[index].index_put_({mask.value()}, chunks[index + 1]);
+    }
+  };
+  merge_modality("image|embedding", "image|mask");
+  merge_modality("video|embedding", "video|mask");
+  mm_data.replace({});
+  return deepstacks;
 }
 
-std::vector<torch::Tensor> restore_outputs(
-    const torch::Tensor& gathered,
+std::vector<torch::Tensor> gather_encoder_outputs(
+    const torch::Tensor& local_embeds,
     const std::vector<int32_t>& token_nums,
     const std::vector<std::vector<int32_t>>& rank_to_items,
-    int32_t max_token_total) {
+    ProcessGroup* dp_group) {
   std::vector<torch::Tensor> outputs(token_nums.size());
   const int32_t world_size = static_cast<int32_t>(rank_to_items.size());
+  std::vector<torch::Tensor> rank_buffers;
+  rank_buffers.reserve(world_size);
+  std::vector<c10::intrusive_ptr<c10d::Work>> broadcasts;
+  broadcasts.reserve(world_size);
   for (int32_t rank = 0; rank < world_size; ++rank) {
-    int32_t offset_in_rank = 0;
-    for (int32_t item_idx : rank_to_items[rank]) {
-      outputs[item_idx] = gathered.slice(
-          0,
-          rank * max_token_total + offset_in_rank,
-          rank * max_token_total + offset_in_rank + token_nums[item_idx]);
+    const auto& items = rank_to_items[rank];
+    if (items.empty()) {
+      continue;
+    }
+    int64_t rank_tokens = 0;
+    for (int32_t item_idx : items) {
+      rank_tokens += token_nums[item_idx];
+    }
+    if (rank == dp_group->rank()) {
+      CHECK_EQ(local_embeds.size(0), rank_tokens)
+          << "Encoder output token count does not match the DP assignment.";
+    }
+    torch::Tensor rank_embeds =
+        rank == dp_group->rank()
+            ? local_embeds.contiguous()
+            : torch::empty({rank_tokens, local_embeds.size(1)},
+                           local_embeds.options());
+    rank_buffers.emplace_back(std::move(rank_embeds));
+    auto work = dp_group->broadcast_async(rank_buffers.back(), rank);
+    if (work.defined()) {
+      broadcasts.emplace_back(std::move(work));
+    }
+    int64_t offset_in_rank = 0;
+    for (int32_t item_idx : items) {
+      outputs[item_idx] = rank_buffers.back().slice(
+          0, offset_in_rank, offset_in_rank + token_nums[item_idx]);
       offset_in_rank += token_nums[item_idx];
     }
+  }
+  for (auto& work : broadcasts) {
+    work->wait();
   }
   return outputs;
 }

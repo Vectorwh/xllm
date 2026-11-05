@@ -108,6 +108,16 @@ if(USE_MUSA)
 endif()
 
 if(USE_NPU)
+  cc_test(
+    NAME
+      attention_mask_test
+    SRCS
+      attention_mask_test.cpp
+      ${PROJECT_SOURCE_DIR}/xllm/core/layers/common/attention_mask.cpp
+    DEPS
+      torch
+      GTest::gtest_main
+  )
   add_subdirectory(npu_torch)
 endif()
 

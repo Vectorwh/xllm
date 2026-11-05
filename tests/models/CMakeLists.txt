@@ -18,6 +18,18 @@ target_link_libraries(linear_attention_policy_test
                              $<$<BOOL:${USE_NPU}>:c_sec>
                              $<$<BOOL:${USE_NPU}>:nnopbase>)
 
+cc_test(
+  NAME
+    multimodal_utils_test
+  CPU_ONLY
+  SRCS
+    multimodal_utils_test.cpp
+  DEPS
+    models
+    torch
+    GTest::gtest_main
+)
+
 if(USE_NPU)
   cc_test(
     NAME
