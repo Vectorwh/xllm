@@ -42,6 +42,14 @@ limitations under the License.
 #include "models/dit/transformers/transformer_qwen_image.h"
 #include "models/dit/utils/util.h"
 #include "models/model_registry.h"
+#if defined(USE_NPU)
+#include <acl/acl.h>
+#ifdef TORCH_HIGHER_THAN_PTA6
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
+#else
+#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
+#endif
+#endif
 #if defined(USE_NPU) || defined(USE_DCU)
 #include "models/vlm/qwen2_5_vl.h"
 #endif
@@ -1237,6 +1245,31 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
 
     LOG(INFO) << "QwenImageEditPlusPipeline moving transformer to device";
     transformer_->to(options_.device());
+#if defined(USE_NPU)
+    // After Module::to — ND→FRACTAL_NZ for 2-D float MatMul weights so
+    // hot-path MatMul can skip TransData. Bias / LN / int8 left unchanged.
+    for (auto& named : transformer_->named_parameters(/*recurse=*/true)) {
+      torch::Tensor& tensor = named.value();
+      if (!tensor.defined() || !tensor.device().is_privateuseone() ||
+          tensor.dim() != 2 || !tensor.is_floating_point()) {
+        continue;
+      }
+#ifdef TORCH_HIGHER_THAN_PTA6
+      if (at_npu::native::get_npu_format(tensor) == ACL_FORMAT_FRACTAL_NZ) {
+        continue;
+      }
+      tensor.set_data(
+          at_npu::native::npu_format_cast(tensor, ACL_FORMAT_FRACTAL_NZ));
+#else
+      if (at_npu::native::NPUNativeFunctions::get_npu_format(tensor) ==
+          ACL_FORMAT_FRACTAL_NZ) {
+        continue;
+      }
+      tensor.set_data(at_npu::native::NPUNativeFunctions::npu_format_cast(
+          tensor, ACL_FORMAT_FRACTAL_NZ));
+#endif
+    }
+#endif
     LOG(INFO) << "QwenImageEditPlusPipeline transformer loaded";
 
 #if defined(USE_NPU) || defined(USE_DCU)
