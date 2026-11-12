@@ -57,6 +57,7 @@ class DiTConfig final {
          "dit_h3_task_type",
          "dit_generation_image_area_max",
          "dit_vae_image_size",
+         "dit_vae_dtype",
          "dit_enable_vae_tiling",
          "dit_vae_tail_chunk_frames",
          "dit_enable_text_encoder",
@@ -101,6 +102,8 @@ class DiTConfig final {
   PROPERTY(int64_t, dit_generation_image_area_max) = 0;
 
   PROPERTY(int64_t, dit_vae_image_size) = 1048576;
+
+  PROPERTY(std::string, dit_vae_dtype) = "bfloat16";
 
   PROPERTY(bool, dit_enable_vae_tiling) = false;
 

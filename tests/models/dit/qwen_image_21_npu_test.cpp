@@ -44,6 +44,110 @@ void expect_noise_close(const torch::Tensor& actual,
   EXPECT_GT(cosine, 0.999);
 }
 
+TEST(QwenImage21KernelsNpu, AdaNormSupportsTokenwiseAndBroadcastScales) {
+  torch::NoGradGuard guard;
+  torch::manual_seed(21);
+  const auto options = torch::TensorOptions()
+                           .device(torch::Device(torch::kPrivateUse1, 0))
+                           .dtype(torch::kBFloat16);
+  constexpr double kEps = 1e-6;
+  layer::AdaLayerNorm norm(
+      /*dim=*/128, kEps, /*elementwise_affine=*/false, options);
+  auto input = torch::randn({1, 7, 128}).to(options);
+  auto normalized = torch::nn::functional::layer_norm(
+      input.to(torch::kCPU, torch::kFloat32),
+      torch::nn::functional::LayerNormFuncOptions({128}).eps(kEps));
+  for (const auto& shape :
+       std::vector<std::vector<int64_t>>{{1, 128}, {1, 1, 128}, {1, 7, 128}}) {
+    auto scale = (torch::randn(shape) * 0.25).to(options);
+    auto zero_shift = torch::zeros_like(scale);
+    auto actual = qwen_image_21::apply_adaptive_layer_norm(
+        norm, input, scale, zero_shift);
+    auto expected = normalized * (1 + scale.to(torch::kCPU, torch::kFloat32));
+    EXPECT_EQ(actual.sizes(), input.sizes());
+    EXPECT_EQ(actual.scalar_type(), torch::kBFloat16);
+    EXPECT_TRUE(torch::allclose(
+        actual.to(torch::kCPU, torch::kFloat32), expected, 1e-2, 1e-2));
+  }
+}
+
+TEST(QwenImage21KernelsNpu, SwiGluPreservesGateProjectionOrder) {
+  torch::NoGradGuard guard;
+  torch::manual_seed(21);
+  const auto device = torch::Device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, device);
+  qwen_image_21::SwiGlu mlp(
+      /*dim=*/128, /*hidden=*/256, &process_group, options);
+  auto gate = (torch::randn({256, 128}) * 0.02).to(options);
+  auto up = (torch::randn({256, 128}) * 0.02).to(options);
+  auto output = (torch::randn({128, 256}) * 0.02).to(options);
+  mlp->load_state_dict(
+      StateDict({{"proj.weight", up}, {"out.weight", output}}));
+  mlp->load_state_dict(StateDict({{"gate_layer.weight", gate}}));
+  mlp->verify_loaded_weights("img_mlp.");
+  auto input = torch::randn({1, 7, 128}).to(options);
+  auto expected = torch::nn::functional::linear(
+      torch::silu(torch::nn::functional::linear(input, gate)) *
+          torch::nn::functional::linear(input, up),
+      output);
+  EXPECT_TRUE(torch::allclose(mlp->forward(input), expected, 1e-2, 1e-3));
+}
+
+TEST(QwenImage21CacheNpu, TaylorSeerPreservesPrefixKvAndSupportsHits) {
+  torch::NoGradGuard guard;
+  torch::manual_seed(21);
+  const auto device = torch::Device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  QwenImage21TransformerConfig config;
+  config.num_heads = 2;
+  config.num_layers = 2;
+  config.context_in_dim = 32;
+  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, device);
+  QwenImage21Transformer2DModel model(config, &process_group, options);
+  for (auto& weight : model->parameters()) {
+    weight.copy_(torch::randn(weight.sizes(), torch::kFloat32) * 0.02);
+  }
+  auto layout = model->prepare_layout(
+      torch::zeros({1, 3}, torch::kBool), {}, {{1, 2, 2}}, device);
+  auto prompt = torch::randn({1, 3, config.context_in_dim}).to(options);
+  auto target = torch::randn({1, 4, config.in_channels}).to(options);
+  for (int32_t interval : {1, 2}) {
+    TaylorSeerOptions taylor_options;
+    taylor_options.warmup_steps = 2;
+    taylor_options.skip_interval_steps = interval;
+    taylor_options.n_derivatives = 1;
+    qwen_image_21::RequestTaylorSeer state(taylor_options, /*total_steps=*/6);
+    qwen_image_21::PrefixKVCache cache(config.num_layers);
+    torch::Tensor saved_key;
+    for (int64_t step = 1; step <= 6; ++step) {
+      auto time = torch::tensor({1.0f / step}).to(options);
+      auto actual = model->forward(target,
+                                   prompt,
+                                   time,
+                                   layout,
+                                   &cache,
+                                   /*sp=*/nullptr,
+                                   &state,
+                                   step);
+      EXPECT_TRUE(torch::isfinite(actual).all().item<bool>());
+      EXPECT_EQ(actual.sizes(), target.sizes());
+      if (step == 1) {
+        saved_key = cache.layer(0).key.clone();
+      }
+      EXPECT_TRUE(torch::equal(saved_key, cache.layer(0).key));
+      if (interval == 1) {
+        expect_noise_close(actual,
+                           model->forward(target, prompt, time, layout));
+      }
+    }
+    EXPECT_EQ(state.hit_steps(), interval == 1 ? 0 : 2);
+    EXPECT_EQ(state.full_steps(), interval == 1 ? 6 : 4);
+  }
+}
+
 TEST(QwenImage21CacheNpu, RectangularAttentionPreservesPaddingAndTargetRows) {
   torch::NoGradGuard guard;
   torch::manual_seed(21);
@@ -79,7 +183,8 @@ TEST(QwenImage21CacheNpu, Bf16TransformerCacheMatchesChangingTimesteps) {
   config.num_layers = 4;
   config.context_in_dim = 32;
   auto options = torch::TensorOptions().device(device).dtype(torch::kBFloat16);
-  QwenImage21Transformer2DModel model(config, options);
+  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, device);
+  QwenImage21Transformer2DModel model(config, &process_group, options);
   for (auto& weight : model->parameters()) {
     weight.copy_(torch::randn(weight.sizes(), torch::kFloat32) * 0.02);
   }
@@ -124,7 +229,9 @@ TEST(QwenImage21CacheNpu, RealCheckpointNoiseParity) {
   torch::manual_seed(21);
   const auto device = torch::Device(torch::kPrivateUse1, 0);
   auto options = torch::TensorOptions().device(device).dtype(torch::kBFloat16);
-  QwenImage21Transformer2DModel model(QwenImage21TransformerConfig{}, options);
+  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, device);
+  QwenImage21Transformer2DModel model(
+      QwenImage21TransformerConfig{}, &process_group, options);
   std::vector<std::filesystem::path> files;
   for (const auto& file : std::filesystem::directory_iterator(
            std::filesystem::path(model_dir) / "transformer")) {
@@ -229,7 +336,8 @@ TEST(QwenImage21SpNpu, TwoRankUlyssesAndPrefixCacheParity) {
     config.num_layers = 4;
     config.context_in_dim = 32;
   }
-  QwenImage21Transformer2DModel model(config, options);
+  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, device);
+  QwenImage21Transformer2DModel model(config, &process_group, options);
   if (real) {
     std::vector<std::filesystem::path> files;
     for (const auto& f : std::filesystem::directory_iterator(

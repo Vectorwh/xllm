@@ -37,14 +37,17 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/parallel_state/mapping_npu.h"
-#include "core/framework/parallel_state/parallel_state.h"
 #include "core/framework/request/dit_request_state.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/layers/common/rotary_embedding_util.h"
 #include "core/runtime/dit_forward_params.h"
+#include "core/util/tensor_helper.h"
 #include "models/dit/autoencoders/autoencoder_kl_qwenimage21.h"
 #include "models/dit/schedulers/flowmatch_euler_discrete_scheduler.h"
 #include "models/dit/transformers/transformer_qwen_image_21.h"
+#include "models/dit/utils/dit_parallel_mixin.h"
+#include "models/dit/utils/lanczos_resample.h"
+#include "models/dit/utils/util.h"
 #include "models/model_registry.h"
 #include "models/vlm/npu/qwen3_vl.h"
 #include "processors/qwen2_vl_image_processor.h"
@@ -215,7 +218,8 @@ inline std::string read_qwen_image_21_prompt(
     const auto* data = std::get_if<std::vector<int64_t>>(&declared->second);
     if (data == nullptr || *data != expected_sizes) {
       return source.name +
-             " input_image_sizes must match the uploaded images in [w,h] order";
+             " input_image_sizes must match the resized condition images in "
+             "[w,h] order";
     }
   } else if (!sizes.empty()) {
     return source.name +
@@ -348,16 +352,6 @@ inline torch::Tensor combine_cfg_noise(const torch::Tensor& positive,
   return negative + scale * (positive - negative);
 }
 
-// all-gather along dimension 0 of two [1,N,64] branch outputs. Ordering is
-// group-local rank order, not completion order or a presumed global device id.
-inline torch::Tensor combine_gathered_cfg_noise(const torch::Tensor& gathered,
-                                                float scale) {
-  CHECK_EQ(gathered.dim(), 3);
-  CHECK_EQ(gathered.size(0), 2);
-  return combine_cfg_noise(
-      gathered.slice(0, 0, 1), gathered.slice(0, 1, 2), scale);
-}
-
 }  // namespace xllm::qwen_image_21
 
 namespace xllm {
@@ -455,11 +449,19 @@ REGISTER_MODEL_ARGS(AutoencoderKLQwenImage21, [&] {
 // All ranks run VAE encode/decode within their own VAE groups and initialize
 // request-seeded CPU latents locally.
 // Prefix KV caching and TaylorSeer remain request-local.
-class QwenImage21PipelineImpl final : public torch::nn::Module {
+class QwenImage21PipelineImpl final : public torch::nn::Module,
+                                      public dit::CFGParallelMixin {
  public:
   explicit QwenImage21PipelineImpl(const DiTModelContext& context)
-      : options_(context.get_tensor_options()),
+      : dit::CFGParallelMixin(context),
+        options_(context.get_tensor_options()),
         scheduler_context_(context.get_model_context("scheduler")) {
+    const std::string& dtype = DiTConfig::get_instance().dit_vae_dtype();
+    const auto parsed = try_get_scalar_type_from_string(dtype);
+    CHECK(parsed.has_value())
+        << "Unsupported dit_vae_dtype='" << dtype
+        << "'; expected a recognized dtype name, e.g. float32 or bfloat16";
+    vae_dtype_ = *parsed;
     const auto& parallel = context.get_parallel_args();
     cfg_size_ = parallel.cfg_size();
     CHECK(cfg_size_ == 1 || cfg_size_ == 2)
@@ -483,12 +485,12 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
       CHECK_EQ(sp_group_->world_size(), sp_size_);
       sp_rank_ = sp_group_->rank();
     }
-    cfg_group_ = parallel.dit_cfg_group_;
+    ProcessGroup* cfg_group = parallel.dit_cfg_group_;
     cfg_rank_ = 0;
     if (cfg_size_ == 2) {
-      CHECK(cfg_group_ != nullptr);
-      CHECK_EQ(cfg_group_->world_size(), 2);
-      cfg_rank_ = cfg_group_->rank();
+      CHECK(cfg_group != nullptr);
+      CHECK_EQ(cfg_group->world_size(), 2);
+      cfg_rank_ = cfg_group->rank();
     }
     CHECK_EQ(static_cast<int64_t>(parallel.rank()),
              static_cast<int64_t>(cfg_rank_) * sp_size_ + sp_rank_)
@@ -525,14 +527,15 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
           transformer_config.causal_block);
     transformer_ = register_module(
         "transformer",
-        QwenImage21Transformer2DModel(std::move(transformer_config), options_));
+        QwenImage21Transformer2DModel(
+            std::move(transformer_config), parallel.dit_tp_group_, options_));
     // Every VAE group processes the inputs independently, with width shards
-    // selected by group-local rank. All workers load the FP32 VAE weights.
+    // selected by group-local rank. Weights use the configured VAE dtype.
     vae_ = register_module(
         "vae",
         AutoencoderKLQwenImage21(context.get_model_context("vae"),
                                  std::move(vae_config),
-                                 options_.dtype(torch::kFloat32)));
+                                 options_.dtype(vae_dtype_)));
     CHECK_EQ(vae_->spatial_scale(), 16);
     if (DiTConfig::get_instance().dit_enable_vae_tiling()) {
       vae_->enable_tiling();
@@ -622,7 +625,7 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
     LOG(INFO) << "QwenImage21 loaded: cfg_size=" << cfg_size_
               << " cfg_rank=" << cfg_rank_ << " sp_size=" << sp_size_
               << " sp_rank=" << sp_rank_ << " vae_size=" << vae_size_
-              << "; rank_local_text_encoder="
+              << " vae_dtype=" << vae_dtype_ << "; rank_local_text_encoder="
               << static_cast<bool>(text_encoder_);
   }
 
@@ -647,10 +650,16 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
     // groups.
     const qwen_image_21::CfgExecutionPlan plan(
         cfg_size_, use_cfg ? cfg_rank_ : 0, use_cfg);
-    // Validate and collect the shared images once, before either prompt path
-    // performs preprocessing or iterates over the CFG branches.
+    // The default target area matches diffusers' 1024x1024 condition images.
+    // All ranks resize on CPU, and the VLM and VAE share these exact pixels.
+    const int64_t condition_image_area =
+        DiTConfig::get_instance().dit_vae_image_size();
+    CHECK_GT(condition_image_area, 0)
+        << "QwenImage21 dit_vae_image_size must be a positive pixel area";
+    std::vector<torch::Tensor> conditions_u8;
     std::vector<QwenImage21ImageSize> sizes;
     std::vector<qwen_image_21::ImageShape> shapes;
+    conditions_u8.reserve(input.media_sources.size());
     sizes.reserve(input.media_sources.size());
     shapes.reserve(input.media_sources.size() + 1);
     CHECK_LE(input.media_sources.size(), 4);
@@ -661,12 +670,22 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
       CHECK_EQ(image.size(0), 1);
       CHECK(image.size(1) == 3 || image.size(1) == 4);
       CHECK_EQ(image.scalar_type(), torch::kUInt8);
-      CHECK(is_valid_qwen_image_21_image_size(image.size(3), image.size(2)))
-          << "QwenImage21 condition images require 32-aligned width/height "
-             "in [32, 32768]";
-      sizes.emplace_back(QwenImage21ImageSize{image.size(3), image.size(2)});
-      shapes.emplace_back(
-          qwen_image_21::ImageShape{1, image.size(2) / 16, image.size(3) / 16});
+      CHECK_GT(image.size(2), 0);
+      CHECK_GT(image.size(3), 0);
+      const auto [condition_width, condition_height] =
+          dit::calculate_dimensions(
+              static_cast<double>(condition_image_area),
+              static_cast<double>(image.size(3)) / image.size(2));
+      CHECK(
+          is_valid_qwen_image_21_image_size(condition_width, condition_height))
+          << "QwenImage21 resized condition images require 32-aligned "
+             "width/height in [32, 32768]";
+      conditions_u8.emplace_back(lanczos::resize_rgba_like_pil(
+          image, condition_width, condition_height));
+      sizes.emplace_back(
+          QwenImage21ImageSize{condition_width, condition_height});
+      shapes.emplace_back(qwen_image_21::ImageShape{
+          1, condition_height / 16, condition_width / 16});
     }
     shapes.emplace_back(qwen_image_21::ImageShape{1, height / 16, width / 16});
     QwenImage21PromptInput positive, negative;
@@ -682,10 +701,12 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
       // Encode one CFG branch per call for identical VLM batch shapes across
       // cfg_size=1 and cfg_size=2, including request-local encoder K/V.
       if (plan.positive()) {
-        positive = encode_prompt(input, sizes, /*encode_negative=*/false);
+        positive = encode_prompt(
+            input, conditions_u8, sizes, /*encode_negative=*/false);
       }
       if (plan.negative()) {
-        negative = encode_prompt(input, sizes, /*encode_negative=*/true);
+        negative = encode_prompt(
+            input, conditions_u8, sizes, /*encode_negative=*/true);
       }
     }
     const auto prompt_source =
@@ -750,7 +771,7 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
             negative_layout, sp_group_);
       }
     }
-    auto conditions = encode_condition_images(input.media_sources);
+    auto conditions = encode_condition_images(conditions_u8);
     auto latents = prepare_initial_latents(
         input.tensor_sources, height, width, params.seed);
     CHECK_EQ(latents.size(1), target_tokens);
@@ -785,41 +806,25 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
                              ? torch::cat({conditions, latents}, 1)
                              : latents;
       auto timestep = timesteps[i].expand({1}).to(options_) / 1000.0;
-      torch::Tensor positive_noise, negative_noise, noise;
-      if (plan.positive()) {
-        positive_noise = transformer_->forward(model_input,
-                                               positive.embeddings,
-                                               timestep,
-                                               positive_layout,
-                                               positive_cache.get(),
-                                               positive_sp.get(),
-                                               positive_ts.get(),
-                                               i + 1);
-      }
-      if (plan.negative()) {
-        negative_noise = transformer_->forward(model_input,
-                                               negative.embeddings,
-                                               timestep,
-                                               negative_layout,
-                                               negative_cache.get(),
-                                               negative_sp.get(),
-                                               negative_ts.get(),
-                                               i + 1);
-      }
-      if (plan.distributed()) {
-        auto local_noise =
-            (plan.positive() ? positive_noise : negative_noise).contiguous();
-        // Same gather API as EditPlus, but no CFG renormalization. Both ranks
-        // receive [cond, uncond] and advance identical local scheduler states.
-        auto gathered =
-            parallel_state::gather(local_noise, cfg_group_, /*dim=*/0);
-        noise = qwen_image_21::combine_gathered_cfg_noise(
-            gathered, params.true_cfg_scale);
+      auto forward_branch = [&](bool is_positive) {
+        return transformer_->forward(
+            model_input,
+            (is_positive ? positive : negative).embeddings,
+            timestep,
+            is_positive ? positive_layout : negative_layout,
+            is_positive ? positive_cache.get() : negative_cache.get(),
+            is_positive ? positive_sp.get() : negative_sp.get(),
+            is_positive ? positive_ts.get() : negative_ts.get(),
+            i + 1);
+      };
+      torch::Tensor noise;
+      if (use_cfg) {
+        auto [positive_noise, negative_noise] = exec_with_cfg(forward_branch);
+        noise = qwen_image_21::combine_cfg_noise(
+            positive_noise, negative_noise, params.true_cfg_scale);
       } else {
-        noise = use_cfg
-                    ? qwen_image_21::combine_cfg_noise(
-                          positive_noise, negative_noise, params.true_cfg_scale)
-                    : positive_noise;
+        // Every rank still runs the positive branch for cross-CFG VAE groups.
+        noise = forward_branch(/*is_positive=*/true);
       }
       // The 2.1 reference explicitly disables CFG norm renormalization.
       latents = scheduler->step(noise, timesteps[i], latents).to(options_);
@@ -850,6 +855,7 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
  private:
   QwenImage21PromptInput encode_prompt(
       const DiTForwardInput& input,
+      const std::vector<torch::Tensor>& conditions_u8,
       const std::vector<QwenImage21ImageSize>& sizes,
       bool encode_negative) {
     torch::NoGradGuard guard;
@@ -858,9 +864,9 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
     CHECK(!encode_negative || input.generation_params.true_cfg_scale > 1.0f);
     CHECK(!encode_negative || input.negative_prompts.size() <= 1);
     std::vector<MMDataItem> items;
-    items.reserve(input.media_sources.size());
-    for (const auto& source : input.media_sources.entries()) {
-      const auto image = source.tensor.squeeze(0).to(torch::kCPU);
+    items.reserve(conditions_u8.size());
+    for (const auto& condition : conditions_u8) {
+      const auto image = condition.squeeze(0);
       auto rgb = image.slice(0, 0, 3).to(torch::kFloat32);
       if (image.size(0) == 4) {
         const auto alpha = image.slice(0, 3, 4).to(torch::kFloat32);
@@ -868,7 +874,7 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
         rgb = torch::floor((rgb * alpha + 255.0f * (255.0f - alpha) + 127.0f) /
                            255.0f);
       }
-      // The uploaded VLM/VAE size is one contract. Pin the processor's pixel
+      // The resized VLM/VAE size is one contract. Pin the processor's pixel
       // budget to this exact, already 32-aligned image; never resize it again.
       auto processor_args = text_encoder_processor_args_;
       const int64_t area = image.size(1) * image.size(2);
@@ -1014,7 +1020,7 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
     // an image to the caller.
     auto unpacked =
         qwen_image_21::unpack_latents(latents, height / 16, width / 16)
-            .to(torch::kFloat32);
+            .to(vae_dtype_);
     auto decoded = vae_->decode(vae_->denormalize_latents(unpacked)).squeeze(2);
     if (!is_driver_) {
       return {};
@@ -1043,24 +1049,26 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
     return branch;
   }
 
-  torch::Tensor encode_condition_images(const DiTMediaSources& sources) {
-    if (sources.empty()) {
+  torch::Tensor encode_condition_images(
+      const std::vector<torch::Tensor>& conditions_u8) {
+    if (conditions_u8.empty()) {
       return {};
     }
     std::vector<torch::Tensor> encoded;
-    encoded.reserve(sources.size());
-    for (const auto& source : sources.entries()) {
-      auto image = source.tensor;
+    encoded.reserve(conditions_u8.size());
+    for (const auto& condition : conditions_u8) {
+      auto image = condition;
       if (image.size(1) == 3) {
         auto alpha = torch::full(
             {1, 1, image.size(2), image.size(3)}, 255, image.options());
         image = torch::cat({image, alpha}, 1);
       }
       // Images are already resized jointly with the VLM. Never resize them
-      // again here: the uploaded dimensions and slot grid are a contract.
+      // again here: the resized dimensions and slot grid are a contract.
       auto pixels =
           (image.to(options_.dtype(torch::kFloat32)) / 255.0 * 2.0 - 1.0)
-              .unsqueeze(2);
+              .unsqueeze(2)
+              .to(vae_dtype_);
       auto latent = vae_->normalize_latents(vae_->encode_mode(pixels));
       encoded.emplace_back(qwen_image_21::pack_latents(latent).to(options_));
     }
@@ -1094,9 +1102,8 @@ class QwenImage21PipelineImpl final : public torch::nn::Module {
   ProcessGroup* sp_group_ = nullptr;  // Non-owning.
   int32_t cfg_size_ = 1;
   int32_t cfg_rank_ = 0;
-  ProcessGroup* cfg_group_ =
-      nullptr;  // Non-owning; communicator outlives pipeline.
   torch::TensorOptions options_;
+  torch::ScalarType vae_dtype_;
   ModelContext scheduler_context_;
   ModelArgs text_encoder_args_;
   ModelArgs text_encoder_processor_args_;

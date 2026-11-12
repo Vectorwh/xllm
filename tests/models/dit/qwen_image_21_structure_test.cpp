@@ -16,6 +16,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -25,6 +26,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/parallel_state/process_group.h"
 #include "models/dit/autoencoders/autoencoder_kl_qwenimage21.h"
 #include "models/dit/transformers/transformer_qwen_image_21.h"
 
@@ -51,14 +53,59 @@ void initialize_weights(torch::nn::Module& module) {
   }
 }
 
+// Expose views under the original checkpoint keys for manifest/shard checks.
+// Runtime parameters remain fused and own the only copy of each weight.
+torch::OrderedDict<std::string, torch::Tensor> checkpoint_parameters(
+    const torch::nn::Module& module) {
+  torch::OrderedDict<std::string, torch::Tensor> parameters;
+  for (const auto& parameter : module.named_parameters()) {
+    const auto add_parts = [&](const std::string& suffix,
+                               const std::vector<std::string>& names) {
+      const std::string& key = parameter.key();
+      if (key.size() < suffix.size() ||
+          key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return false;
+      }
+      const std::string prefix = key.substr(0, key.size() - suffix.size());
+      auto parts = parameter.value().chunk(static_cast<int64_t>(names.size()),
+                                           /*dim=*/0);
+      for (size_t i = 0; i < names.size(); ++i) {
+        parameters.insert(prefix + names[i], parts[i]);
+      }
+      return true;
+    };
+    if (add_parts(
+            "attn.to_qkv.weight",
+            {"attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight"}) ||
+        add_parts("img_mlp.gate_up.weight",
+                  {"img_mlp.gate_layer.weight", "img_mlp.proj.weight"})) {
+      continue;
+    }
+    parameters.insert(parameter.key(), parameter.value());
+  }
+  return parameters;
+}
+
 TEST(QwenImage21Structure, CheckpointParameterCountsAndShapes) {
   const auto options = torch::TensorOptions().device(torch::kMeta);
+  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, options.device());
   QwenImage21Transformer2DModel transformer(QwenImage21TransformerConfig{},
+                                            &process_group,
                                             options.dtype(torch::kBFloat16));
   AutoencoderKLQwenImage21 vae(
       ModelContext{}, QwenImage21VaeConfig{}, options.dtype(torch::kFloat32));
-  EXPECT_EQ(transformer->named_parameters().size(), 297);
+  EXPECT_EQ(transformer->named_parameters().size(), 201);
+  EXPECT_EQ(checkpoint_parameters(*transformer).size(), 297);
   EXPECT_EQ(vae->named_parameters().size(), 238);
+  EXPECT_EQ(
+      transformer->named_parameters()["transformer_blocks.0.attn.to_qkv.weight"]
+          .sizes(),
+      (torch::IntArrayRef{12288, 4096}));
+  EXPECT_EQ(
+      transformer
+          ->named_parameters()["transformer_blocks.0.img_mlp.gate_up.weight"]
+          .sizes(),
+      (torch::IntArrayRef{24576, 4096}));
   EXPECT_EQ(transformer->named_parameters()["modulation.1.weight"].sizes(),
             (torch::IntArrayRef{16384, 4096}));
   EXPECT_EQ(vae->named_parameters()["decoder.conv_in.weight"].sizes(),
@@ -74,7 +121,7 @@ TEST(QwenImage21Structure, CheckpointParameterCountsAndShapes) {
   for (const auto& [component, module] :
        std::vector<std::pair<std::string, torch::nn::Module*>>{
            {"transformer", transformer.get()}, {"vae", vae.get()}}) {
-    auto parameters = module->named_parameters();
+    auto parameters = checkpoint_parameters(*module);
     ASSERT_EQ(parameters.size(), expected.at(component).size());
     for (const auto& [key, value] : expected.at(component).items()) {
       ASSERT_TRUE(parameters.contains(key)) << component << "." << key;
@@ -130,57 +177,56 @@ TEST(QwenImage21Structure, ExportedSingleImageLayout) {
   EXPECT_TRUE(layout.allowed_attention[0][0][4536][8631].item<bool>());
 }
 
-TEST(QwenImage21Structure, RotaryPreservesPairNorm) {
-  auto layout =
-      qwen_image_21::prepare_sequence_layout(torch::zeros({1, 2}, torch::kBool),
-                                             {},
-                                             {{1, 2, 2}},
-                                             {2, 2, 4},
-                                             torch::kCPU);
-  auto input = torch::randn({1, 6, 2, 8});
-  auto result = qwen_image_21::apply_rotary(input, layout);
+TEST(QwenImage21Structure, TransformerRejectsMissingOrShardedTpGroup) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  auto config = small_transformer_config();
+  EXPECT_DEATH((QwenImage21Transformer2DModel(config, nullptr)),
+               "requires a TP process group");
+  ProcessGroup process_group(
+      /*rank=*/0, /*world_size=*/2, torch::Device(torch::kCPU));
+  EXPECT_DEATH((QwenImage21Transformer2DModel(config, &process_group)),
+               "requires TP=1");
+}
+
+TEST(QwenImage21Structure, ModulationKeepsRawScalesAndTemporalSelection) {
+  torch::NoGradGuard guard;
+  qwen_image_21::SequenceLayout layout;
+  layout.target_mask = torch::tensor({false, true, false}, torch::kBool);
+  auto parameters =
+      torch::tensor({{0.25f, 0.5f, 0.0f, 0.0f, -0.5f, -0.25f, 0.0f, 0.0f},
+                     {-0.25f, -0.5f, 1.0f, -1.0f, 0.5f, 0.25f, -1.0f, 1.0f}});
+  auto prefill = qwen_image_21::prepare_block_modulation(
+      parameters, layout, /*causal_condition=*/true, /*decode=*/false);
+  auto expected_scale1 =
+      torch::tensor({{{-0.25f, -0.5f}, {0.25f, 0.5f}, {-0.25f, -0.5f}}});
+  auto expected_scale2 =
+      torch::tensor({{{0.5f, 0.25f}, {-0.5f, -0.25f}, {0.5f, 0.25f}}});
+  EXPECT_TRUE(torch::equal(prefill.scale1, expected_scale1));
+  EXPECT_TRUE(torch::equal(prefill.scale2, expected_scale2));
+  const float gate = std::tanh(1.0f);
   EXPECT_TRUE(torch::allclose(
-      input.square().sum(-1), result.square().sum(-1), 1e-5, 1e-5));
-}
+      prefill.gate1_tanh,
+      torch::tensor({{{gate, -gate}, {0.0f, 0.0f}, {gate, -gate}}})));
+  // CPU tanh implementations may round positive and negative inputs
+  // differently.
+  EXPECT_TRUE(torch::allclose(prefill.gate2_tanh,
+                              -prefill.gate1_tanh,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
 
-TEST(QwenImage21Structure, TransformerSyntheticForward) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  QwenImage21Transformer2DModel model(config);
-  initialize_weights(*model);
-  auto layout =
-      model->prepare_layout(torch::tensor({{false, true, false}}, torch::kBool),
-                            {},
-                            {{1, 2, 2}, {1, 2, 2}},
-                            torch::kCPU);
-  auto result = model->forward(torch::randn({1, 8, 4}),
-                               torch::randn({1, 3, 8}),
-                               torch::tensor({0.5f}),
-                               layout);
-  EXPECT_EQ(result.sizes(), (torch::IntArrayRef{1, 4, 4}));
-  EXPECT_TRUE(torch::isfinite(result).all().item<bool>());
-}
-
-TEST(QwenImage21Structure, PrefixCannotSeeTargetNoise) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  qwen_image_21::TransformerBlock block(
-      config, torch::TensorOptions().dtype(torch::kFloat32));
-  initialize_weights(*block);
-  auto layout = qwen_image_21::prepare_sequence_layout(
-      torch::tensor({{false, true, false}}, torch::kBool),
-      {},
-      {{1, 2, 2}, {1, 2, 2}},
-      {2, 2, 4},
-      torch::kCPU);
-  auto input = torch::randn({1, 10, 16});
-  auto altered = input.clone();
-  altered.slice(1, layout.prefix_tokens).normal_(2, 3);
-  auto modulation = torch::randn({2, 64});
-  auto a = block->forward(input, modulation, layout);
-  auto b = block->forward(altered, modulation, layout);
-  EXPECT_TRUE(torch::equal(a.slice(1, 0, layout.prefix_tokens),
-                           b.slice(1, 0, layout.prefix_tokens)));
+  auto decode = qwen_image_21::prepare_block_modulation(
+      parameters, layout, /*causal_condition=*/true, /*decode=*/true);
+  EXPECT_EQ(decode.scale1.sizes(), (torch::IntArrayRef{1, 1, 2}));
+  EXPECT_TRUE(torch::equal(decode.scale1, expected_scale1.slice(1, 1, 2)));
+  EXPECT_TRUE(torch::equal(decode.scale2, expected_scale2.slice(1, 1, 2)));
+  EXPECT_TRUE(torch::equal(decode.gate1_tanh, torch::zeros({1, 1, 2})));
+  auto unconditioned =
+      qwen_image_21::prepare_block_modulation(parameters.slice(0, 0, 1),
+                                              layout,
+                                              /*causal_condition=*/false,
+                                              /*decode=*/false);
+  EXPECT_TRUE(torch::equal(unconditioned.scale1, decode.scale1));
+  EXPECT_TRUE(torch::equal(unconditioned.scale2, decode.scale2));
 }
 
 TEST(QwenImage21Structure, StaticTemporalShortcutSemantics) {
@@ -240,7 +286,7 @@ TEST(QwenImage21Structure, LayerWeightLoadingChecksMissingDuplicateAndShape) {
 
 template <typename Model>
 void check_sharded_layer_loading(Model& model) {
-  auto parameters = model->named_parameters();
+  auto parameters = checkpoint_parameters(*model);
   std::unordered_map<std::string, torch::Tensor> first, second;
   first.reserve(parameters.size());
   second.reserve(parameters.size());
@@ -262,7 +308,7 @@ void check_sharded_layer_loading(Model& model) {
   EXPECT_DEATH(
       model->load_state_dict(first_shard.get_dict_with_prefix("component.")),
       "weight already loaded");
-  auto loaded = model->named_parameters();
+  auto loaded = checkpoint_parameters(*model);
   for (const auto& parameter : loaded) {
     auto value = first_shard.get_tensor("component." + parameter.key());
     if (!value.defined()) {
@@ -278,7 +324,10 @@ void check_sharded_layer_loading(Model& model) {
 }
 
 TEST(QwenImage21Structure, TransformerLoadsWeightsWithNestedPrefixes) {
-  QwenImage21Transformer2DModel model(small_transformer_config());
+  ProcessGroup process_group(
+      /*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  QwenImage21Transformer2DModel model(small_transformer_config(),
+                                      &process_group);
   check_sharded_layer_loading(model);
 }
 
@@ -311,6 +360,53 @@ TEST(QwenImage21Structure, SharedLinearMatchesBiasFreeFunctionalLinear) {
   }
 }
 
+TEST(QwenImage21Structure, FusedQkvLoadsOutOfOrderAndChecksCompleteness) {
+  torch::NoGradGuard guard;
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ProcessGroup process_group(
+      /*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  layer::ColumnParallelLinear linear(
+      /*in_features=*/4,
+      /*out_features=*/9,
+      /*bias=*/false,
+      /*gather_output=*/false,
+      QuantArgs{},
+      &process_group,
+      torch::TensorOptions().dtype(torch::kFloat32));
+  const std::vector<std::string> prefixes{"to_q.", "to_k.", "to_v."};
+  auto query = torch::arange(12, torch::kFloat64).reshape({3, 4}) / 8.0;
+  auto key = query + 1.0;
+  auto value = query - 2.0;
+  linear->load_state_dict(StateDict({}), prefixes);
+  EXPECT_FALSE(linear->is_weight_loaded());
+  EXPECT_DEATH(
+      linear->load_state_dict(StateDict({{"to_q.weight", torch::zeros({4, 4})},
+                                         {"to_k.weight", key},
+                                         {"to_v.weight", value}}),
+                              prefixes),
+      "weight size mismatch");
+  // A later projection can arrive first without shifting its destination.
+  linear->load_state_dict(StateDict({{"to_k.weight", key}}), prefixes);
+  EXPECT_FALSE(linear->is_weight_loaded());
+  linear->load_state_dict(StateDict({{"to_q.weight", query}}), prefixes);
+  EXPECT_FALSE(linear->is_weight_loaded());
+  linear->load_state_dict(StateDict({{"to_v.weight", value}}), prefixes);
+  ASSERT_TRUE(linear->is_weight_loaded());
+  EXPECT_EQ(linear->named_parameters().size(), 1);
+  auto input = torch::arange(40, torch::kFloat32).reshape({2, 5, 4}) / 16.0;
+  for (const auto& x : {input, input.transpose(0, 1), input[0]}) {
+    auto actual = linear->forward(x).chunk(/*chunks=*/3, /*dim=*/-1);
+    EXPECT_TRUE(torch::allclose(
+        actual[0],
+        torch::nn::functional::linear(x, query.to(torch::kFloat32))));
+    EXPECT_TRUE(torch::allclose(
+        actual[1], torch::nn::functional::linear(x, key.to(torch::kFloat32))));
+    EXPECT_TRUE(torch::allclose(
+        actual[2],
+        torch::nn::functional::linear(x, value.to(torch::kFloat32))));
+  }
+}
+
 TEST(QwenImage21Structure, RejectInconsistentImageSlotCount) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
@@ -320,137 +416,6 @@ TEST(QwenImage21Structure, RejectInconsistentImageSlotCount) {
                                              {2, 2, 4},
                                              torch::kCPU),
       "VLM image slots");
-}
-
-}  // namespace
-}  // namespace xllm
-
-namespace xllm {
-namespace {
-
-void check_prefix_cache_case(
-    const torch::Tensor& image_mask,
-    const torch::Tensor& valid_mask,
-    const std::vector<qwen_image_21::ImageShape>& shapes) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  QwenImage21Transformer2DModel model(config);
-  initialize_weights(*model);
-  auto layout =
-      model->prepare_layout(image_mask, valid_mask, shapes, torch::kCPU);
-  auto prompt = torch::randn({1, image_mask.size(1), config.context_in_dim});
-  auto full =
-      torch::randn({1, layout.image_positions.numel(), config.in_channels});
-  qwen_image_21::PrefixKVCache cache(config.num_layers);
-  auto timestep = torch::tensor({1.0f});
-  auto uncached = model->forward(full, prompt, timestep, layout);
-  auto prefill = model->forward(full, prompt, timestep, layout, &cache);
-  EXPECT_TRUE(torch::equal(uncached, prefill));
-  ASSERT_TRUE(cache.ready());
-  const int64_t expected_bytes = config.num_layers * 2 * layout.prefix_tokens *
-                                 config.num_heads * config.head_dim *
-                                 sizeof(float);
-  EXPECT_EQ(cache.bytes(), expected_bytes);
-  EXPECT_EQ(cache.decode_layout().allowed_attention.defined(),
-            layout.has_padding);
-  EXPECT_EQ(cache.decode_layout().rope_cos.size(0), layout.target_tokens);
-  auto saved_key = cache.layer(0).key.clone();
-  for (int64_t index = 0; index < config.num_layers; ++index) {
-    const auto& kv = cache.layer(index);
-    EXPECT_TRUE(kv.key.is_contiguous());
-    EXPECT_TRUE(kv.value.is_contiguous());
-    EXPECT_EQ(kv.key.storage_offset(), 0);
-    EXPECT_EQ(kv.key.storage().nbytes(),
-              kv.key.numel() * kv.key.element_size());
-  }
-  for (float time : {0.7f, 0.4f, 0.05f}) {
-    auto target = torch::randn({1, layout.target_tokens, config.in_channels});
-    full.slice(1, full.size(1) - layout.target_tokens).copy_(target);
-    auto t = torch::tensor({time});
-    auto expected = model->forward(full, prompt, t, layout);
-    auto actual = model->forward(target, prompt, t, layout, &cache);
-    EXPECT_TRUE(torch::allclose(actual, expected, 1e-4, 1e-6))
-        << "max abs=" << (actual - expected).abs().max().item<float>();
-    EXPECT_TRUE(torch::equal(saved_key, cache.layer(0).key));
-  }
-  qwen_image_21::PrefixKVCache fresh(config.num_layers);
-  EXPECT_FALSE(fresh.ready());
-  EXPECT_EQ(fresh.bytes(), 0);
-}
-
-TEST(QwenImage21PrefixCache, TextOnlyMatchesUncachedAcrossSteps) {
-  check_prefix_cache_case(torch::zeros({1, 3}, torch::kBool), {}, {{1, 2, 2}});
-}
-
-TEST(QwenImage21PrefixCache, AdjacentConditionImagesMatchAcrossSteps) {
-  check_prefix_cache_case(
-      torch::tensor({{false, true, true, false}}, torch::kBool),
-      {},
-      {{1, 2, 2}, {1, 2, 2}, {1, 2, 2}});
-}
-
-TEST(QwenImage21PrefixCache, PaddingKeysRemainMaskedDuringDecode) {
-  check_prefix_cache_case(
-      torch::tensor({{false, true, false, false}}, torch::kBool),
-      torch::tensor({{1, 1, 1, 0}}, torch::kLong),
-      {{1, 2, 2}, {1, 2, 2}});
-}
-
-TEST(QwenImage21PrefixCache, CfgBranchesHaveIndependentStorage) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  QwenImage21Transformer2DModel model(config);
-  initialize_weights(*model);
-  auto positive_layout = model->prepare_layout(
-      torch::zeros({1, 3}, torch::kBool), {}, {{1, 2, 2}}, torch::kCPU);
-  auto negative_layout = model->prepare_layout(
-      torch::zeros({1, 5}, torch::kBool), {}, {{1, 2, 2}}, torch::kCPU);
-  auto positive = torch::randn({1, 3, config.context_in_dim});
-  auto negative = torch::randn({1, 5, config.context_in_dim});
-  auto target = torch::randn({1, 4, config.in_channels});
-  qwen_image_21::PrefixKVCache cond(config.num_layers),
-      uncond(config.num_layers);
-  model->forward(
-      target, positive, torch::tensor({1.0f}), positive_layout, &cond);
-  auto original = cond.layer(0).key.clone();
-  model->forward(
-      target, negative, torch::tensor({1.0f}), negative_layout, &uncond);
-  EXPECT_TRUE(torch::equal(original, cond.layer(0).key));
-  EXPECT_NE(cond.layer(0).key.data_ptr(), uncond.layer(0).key.data_ptr());
-  EXPECT_EQ(cond.layer(0).key.size(2), 3);
-  EXPECT_EQ(uncond.layer(0).key.size(2), 5);
-  auto time = torch::tensor({0.25f});
-  auto cached =
-      model->forward(target, negative, time, negative_layout, &uncond);
-  auto expected = model->forward(target, negative, time, negative_layout);
-  EXPECT_TRUE(torch::allclose(cached, expected, 1e-4, 1e-6));
-}
-
-TEST(QwenImage21PrefixCache, RejectsUnsafeConfigurationAndBranchReuse) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  QwenImage21Transformer2DModel model(config);
-  initialize_weights(*model);
-  auto layout = model->prepare_layout(
-      torch::zeros({1, 3}, torch::kBool), {}, {{1, 2, 2}}, torch::kCPU);
-  auto prompt = torch::randn({1, 3, config.context_in_dim});
-  auto target = torch::randn({1, 4, config.in_channels});
-  qwen_image_21::PrefixKVCache cache(config.num_layers);
-  model->forward(target, prompt, torch::tensor({1.0f}), layout, &cache);
-  EXPECT_DEATH(
-      model->forward(
-          target, prompt.clone(), torch::tensor({0.5f}), layout, &cache),
-      "prompt/CFG branch changed");
-  for (bool disable_condition : {true, false}) {
-    auto unsafe = config;
-    unsafe.causal_condition = !disable_condition;
-    unsafe.causal_block = disable_condition;
-    QwenImage21Transformer2DModel invalid(unsafe);
-    EXPECT_DEATH(
-        invalid->forward(target, prompt, torch::tensor({0.5f}), layout, &cache),
-        "requires causal_condition and causal_block");
-  }
 }
 
 }  // namespace
@@ -519,28 +484,6 @@ TEST(QwenImage21Sp, PaddingKeysMaskedAndPaddedQueryRowsValid) {
   EXPECT_TRUE(torch::equal(torch::cat(outputs, 1).slice(1, 0, 12), target));
 }
 
-TEST(QwenImage21Sp, HeadPartitionsRecombineFullAttention) {
-  auto layout = qwen_image_21::prepare_sequence_layout(
-      torch::tensor({{false, true, false}}, torch::kBool),
-      {},
-      {{1, 2, 2}, {1, 2, 2}},
-      {2, 2, 4},
-      torch::kCPU);
-  const int64_t total = layout.prefix_tokens + layout.target_tokens;
-  auto q = torch::randn({1, 4, total, 8}), k = torch::randn_like(q),
-       v = torch::randn_like(q);
-  auto full =
-      qwen_image_21::transformer_attention(q, k, v, layout.allowed_attention);
-  std::vector<torch::Tensor> per_head;
-  for (int64_t rank = 0; rank < 2; ++rank) {
-    per_head.emplace_back(qwen_image_21::transformer_attention(
-        q.slice(1, 2 * rank, 2 * (rank + 1)),
-        k.slice(1, 2 * rank, 2 * (rank + 1)),
-        v.slice(1, 2 * rank, 2 * (rank + 1)),
-        layout.allowed_attention));
-  }
-  EXPECT_TRUE(torch::allclose(full, torch::cat(per_head, 1), 1e-6, 1e-6));
-}
 }  // namespace
 }  // namespace xllm
 
@@ -624,52 +567,6 @@ TEST(QwenImage21SpDegree, HigherDegreesPreservePrefixRopeAndPadding) {
   }
 }
 
-TEST(QwenImage21SpDegree, AllHeadPartitionsRecombinePaddedAttention) {
-  torch::manual_seed(21);
-  auto full = qwen_image_21::prepare_sequence_layout(
-      torch::zeros({1, 3}, torch::kBool),
-      torch::tensor({{1, 1, 0}}, torch::kLong),
-      {{1, 2, 6}},
-      {2, 2, 4},
-      torch::kCPU);
-  const int64_t total = full.prefix_tokens + full.target_tokens;
-  auto query = torch::randn({1, 32, total, 8});
-  auto key = torch::randn_like(query);
-  auto value = torch::randn_like(query);
-  auto expected = qwen_image_21::transformer_attention(
-      query, key, value, full.allowed_attention);
-  for (int32_t degree : {2, 4, 8, 16, 32}) {
-    qwen_image_21::SpSequenceLayout geometry(full, 0, degree);
-    const int64_t padding = geometry.padding();
-    auto pad = [&](const torch::Tensor& input) {
-      return torch::cat(
-          {input, torch::zeros({1, 32, padding, 8}, input.options())}, 2);
-    };
-    auto q = pad(query), k = pad(key), v = pad(value);
-    std::vector<torch::Tensor> parts, decode_parts;
-    parts.reserve(degree);
-    decode_parts.reserve(degree);
-    const int64_t heads = 32 / degree;
-    for (int32_t rank = 0; rank < degree; ++rank) {
-      auto hq = q.slice(1, rank * heads, (rank + 1) * heads);
-      auto hk = k.slice(1, rank * heads, (rank + 1) * heads);
-      auto hv = v.slice(1, rank * heads, (rank + 1) * heads);
-      parts.emplace_back(qwen_image_21::transformer_attention(
-          hq, hk, hv, geometry.attention_mask(false)));
-      decode_parts.emplace_back(
-          qwen_image_21::transformer_attention(hq.slice(2, full.prefix_tokens),
-                                               hk,
-                                               hv,
-                                               geometry.attention_mask(true)));
-    }
-    EXPECT_TRUE(torch::allclose(
-        torch::cat(parts, 1).slice(2, 0, total), expected, 1e-6, 1e-6));
-    EXPECT_TRUE(torch::allclose(torch::cat(decode_parts, 1).slice(2, 0, 12),
-                                expected.slice(2, full.prefix_tokens),
-                                1e-6,
-                                1e-6));
-  }
-}
 }  // namespace
 }  // namespace xllm
 
@@ -795,64 +692,5 @@ TEST(QwenImage21TaylorSeer, InvalidOptionsAndSequencingAreRejected) {
   EXPECT_DEATH(state.predict(torch::zeros({1, 8, 8})), "shape changed");
 }
 
-TEST(QwenImage21TaylorSeer,
-     NoHitTransformerPathMatchesBaselineWithAndWithoutKv) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  QwenImage21Transformer2DModel model(config);
-  initialize_weights(*model);
-  auto layout =
-      model->prepare_layout(torch::tensor({{false, true, false}}, torch::kBool),
-                            {},
-                            {{1, 2, 2}, {1, 2, 2}},
-                            torch::kCPU);
-  auto prompt = torch::randn({1, 3, config.context_in_dim});
-  auto full = torch::randn({1, 8, config.in_channels});
-  for (bool use_kv : {false, true}) {
-    qwen_image_21::PrefixKVCache kv(config.num_layers);
-    qwen_image_21::RequestTaylorSeer ts(taylor_options(0, 1, 1), 4);
-    for (int64_t step = 1; step <= 4; ++step) {
-      auto t = torch::tensor({1.0f / step});
-      auto expected = model->forward(full, prompt, t, layout);
-      auto input = use_kv && kv.ready() ? full.slice(1, 4) : full;
-      auto actual = model->forward(
-          input, prompt, t, layout, use_kv ? &kv : nullptr, nullptr, &ts, step);
-      EXPECT_TRUE(torch::allclose(actual, expected, 1e-5, 1e-6));
-    }
-    EXPECT_EQ(ts.hit_steps(), 0);
-  }
-}
-
-TEST(QwenImage21TaylorSeer, TransformerHitsRemainFiniteAndPreservePrefixKv) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  QwenImage21Transformer2DModel model(config);
-  initialize_weights(*model);
-  auto layout = model->prepare_layout(
-      torch::zeros({1, 3}, torch::kBool), {}, {{1, 2, 2}}, torch::kCPU);
-  auto prompt = torch::randn({1, 3, config.context_in_dim});
-  auto target = torch::randn({1, 4, config.in_channels});
-  qwen_image_21::PrefixKVCache kv(config.num_layers);
-  qwen_image_21::RequestTaylorSeer ts(taylor_options(2, 2, 1), 6);
-  torch::Tensor saved;
-  for (int64_t step = 1; step <= 6; ++step) {
-    auto out = model->forward(target,
-                              prompt,
-                              torch::tensor({1.0f / step}),
-                              layout,
-                              &kv,
-                              nullptr,
-                              &ts,
-                              step);
-    EXPECT_TRUE(torch::isfinite(out).all().item<bool>());
-    EXPECT_EQ(out.sizes(), target.sizes());
-    if (step == 1) {
-      saved = kv.layer(0).key.clone();
-    }
-    EXPECT_TRUE(torch::equal(saved, kv.layer(0).key));
-  }
-  EXPECT_EQ(ts.full_steps(), 4);
-  EXPECT_EQ(ts.hit_steps(), 2);
-}
 }  // namespace
 }  // namespace xllm

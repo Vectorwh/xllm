@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 
+#include <ATen/ops/scaled_dot_product_attention.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
@@ -22,6 +23,7 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -241,27 +243,16 @@ class Conv2dImpl final : public torch::nn::Module,
 };
 TORCH_MODULE(Conv2d);
 
-// An explicit FP32, chunked math path for CPU reference tests and the VAE's
-// large single attention head (the real decoder has head_dim=1152). It does not
-// depend on fused-attention head-size limits or materialize all L*L scores.
+// Match Diffusers: one SDPA call with the input dtype and the full query.
 inline torch::Tensor spatial_attention(const torch::Tensor& q,
                                        const torch::Tensor& k,
-                                       const torch::Tensor& v,
-                                       int64_t chunk_size = 128) {
-  CHECK_GT(chunk_size, 0);
-  const double scale = 1.0 / std::sqrt(static_cast<double>(q.size(-1)));
-  auto key = k.to(torch::kFloat32).transpose(-1, -2);
-  auto value = v.to(torch::kFloat32);
-  std::vector<torch::Tensor> chunks;
-  chunks.reserve((q.size(-2) + chunk_size - 1) / chunk_size);
-  for (int64_t start = 0; start < q.size(-2); start += chunk_size) {
-    auto query = q.slice(-2, start, std::min(start + chunk_size, q.size(-2)))
-                     .to(torch::kFloat32);
-    auto scores = torch::matmul(query, key) * scale;
-    chunks.emplace_back(
-        torch::matmul(torch::softmax(scores, -1), value).to(q.scalar_type()));
-  }
-  return torch::cat(chunks, -2);
+                                       const torch::Tensor& v) {
+  return torch::scaled_dot_product_attention(q,
+                                             k,
+                                             v,
+                                             /*attn_mask=*/std::nullopt,
+                                             /*dropout_p=*/0.0,
+                                             /*is_causal=*/false);
 }
 
 }  // namespace xllm::qwen_image_21
@@ -389,9 +380,10 @@ class VaeAttentionImpl final : public torch::nn::Module,
     auto value = vae_parallel_merge(spatial_qkv[2]);
     // Gather along spatial width BEFORE flattening, preserving row-major H/W
     // order. Queries remain local but attend to all global pixels.
-    auto query = spatial_qkv[0].flatten(2).transpose(1, 2).unsqueeze(1);
-    key = key.flatten(2).transpose(1, 2).unsqueeze(1);
-    value = value.flatten(2).transpose(1, 2).unsqueeze(1);
+    auto query =
+        spatial_qkv[0].flatten(2).transpose(1, 2).unsqueeze(1).contiguous();
+    key = key.flatten(2).transpose(1, 2).unsqueeze(1).contiguous();
+    value = value.flatten(2).transpose(1, 2).unsqueeze(1).contiguous();
     auto hidden = spatial_attention(query, key, value);
     hidden = hidden.squeeze(1).transpose(1, 2).reshape(x.sizes());
     return output_->forward(hidden).unsqueeze(2) + input;

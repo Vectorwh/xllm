@@ -9,12 +9,13 @@
  *   Copyright (c) 1995-2005 by Fredrik Lundh
  */
 
-#include "lanczos_resample.h"
+#include "models/dit/utils/lanczos_resample.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace lanczos {
@@ -244,6 +245,66 @@ void resample_vertical_f32(float* dst,
 }
 
 }  // namespace
+
+torch::Tensor resize_rgba_like_pil(const torch::Tensor& image,
+                                   int64_t width,
+                                   int64_t height) {
+  const int64_t src_width = image.size(3);
+  const int64_t src_height = image.size(2);
+  auto cpu_image = image.to(torch::kCPU);
+  // PIL takes this shortcut before converting RGBA to premultiplied RGBa.
+  // Avoid a lossy premultiply/unpremultiply round trip when no resize is
+  // needed.
+  if (src_width == width && src_height == height) {
+    return cpu_image;
+  }
+
+  const int32_t channels = static_cast<int32_t>(image.size(1));
+  auto hwc = cpu_image.squeeze(0).permute({1, 2, 0}).contiguous();
+  if (channels == 4) {
+    auto premultiplied = torch::empty_like(hwc);
+    const auto* source = hwc.data_ptr<uint8_t>();
+    auto* target = premultiplied.data_ptr<uint8_t>();
+    for (int64_t pixel = 0; pixel < src_width * src_height; ++pixel) {
+      const int64_t offset = pixel * channels;
+      const int32_t alpha = source[offset + 3];
+      for (int32_t channel = 0; channel < 3; ++channel) {
+        // PIL's MULDIV255 rounds the product to the nearest uint8 value.
+        const int32_t tmp = source[offset + channel] * alpha + 128;
+        target[offset + channel] =
+            static_cast<uint8_t>(((tmp >> 8) + tmp) >> 8);
+      }
+      target[offset + 3] = static_cast<uint8_t>(alpha);
+    }
+    hwc = std::move(premultiplied);
+  }
+
+  auto resized = torch::empty({height, width, channels}, hwc.options());
+  resize_8bpc(hwc.data_ptr<uint8_t>(),
+              static_cast<int32_t>(src_width),
+              static_cast<int32_t>(src_height),
+              channels,
+              static_cast<int32_t>(width),
+              static_cast<int32_t>(height),
+              resized.data_ptr<uint8_t>());
+  if (channels == 4) {
+    auto* pixels = resized.data_ptr<uint8_t>();
+    for (int64_t pixel = 0; pixel < width * height; ++pixel) {
+      const int64_t offset = pixel * channels;
+      const int32_t alpha = pixels[offset + 3];
+      if (alpha == 0 || alpha == 255) {
+        continue;
+      }
+      for (int32_t channel = 0; channel < 3; ++channel) {
+        // PIL's RGBa -> RGBA conversion truncates, then clips Lanczos
+        // overshoot.
+        pixels[offset + channel] = static_cast<uint8_t>(
+            std::min(255, 255 * pixels[offset + channel] / alpha));
+      }
+    }
+  }
+  return resized.permute({2, 0, 1}).unsqueeze(0).contiguous();
+}
 
 void resize_8bpc(const uint8_t* src,
                  int32_t src_w,

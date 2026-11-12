@@ -276,7 +276,7 @@ DeepSeek-V4.1 的另一套 PCP 路径（`cp_size>1`）目前尚未支持。
 | `dit_debug_print` | `bool` | `false` | 是否打印 DiT 模型 debug 信息。 |
 | `dit_generation_image_area_max` | `int64` | `0` | 图像生成请求允许的最大图像面积（宽 * 高）；`0` 表示不限制。 |
 | `dit_enable_vae_tiling` | `bool` | `false` | 是否启用 VAE tiling，目前仅支持 `qwen-image-edit-plus`。 |
-| `dit_vae_image_size` | `int64` | `1048576` | Qwen-Image-Edit-Plus VAE 用于计算维度的 image size。 |
+| `dit_vae_image_size` | `int64` | `1048576` | 条件图目标像素面积，支持 Qwen-Image-Edit-Plus 和 Qwen-Image-2.1。 |
 | `dit_sparse_attention_enabled` | `bool` | `false` | 是否为 WAN 启用 block-wise sparse attention / RainFusion。 |
 | `dit_sparse_attention_sparsity` | `double` | `0.5` | sparse attention 稀疏度，取值 `[0.0, 1.0)`；`0.0` 表示 dense attention，`0.5` 表示丢弃 50% 的 block。 |
 | `dit_sparse_attention_pool_size` | `int64` | `128` | block-wise mask 生成时 sparse attention 的 pooling 窗口大小。 |

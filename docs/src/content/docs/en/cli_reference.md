@@ -278,7 +278,7 @@ DeepSeek-V4.1's separate PCP path (`cp_size>1`) is currently unsupported.
 | `dit_debug_print` | `bool` | `false` | Whether to print debug information for DiT models. |
 | `dit_generation_image_area_max` | `int64` | `0` | Maximum allowed image area (`width * height`) for image generation requests. `0` means no limit. |
 | `dit_enable_vae_tiling` | `bool` | `false` | Whether to enable VAE tiling. Currently only supported for `qwen-image-edit-plus`. |
-| `dit_vae_image_size` | `int64` | `1048576` | Qwen-Image-Edit-Plus VAE image size used to calculate dimensions. |
+| `dit_vae_image_size` | `int64` | `1048576` | Target pixel area for condition images, supported by Qwen-Image-Edit-Plus and Qwen-Image-2.1. |
 | `dit_sparse_attention_enabled` | `bool` | `false` | Whether to enable block-wise sparse attention / RainFusion for WAN. |
 | `dit_sparse_attention_sparsity` | `double` | `0.5` | Sparse attention sparsity ratio in `[0.0, 1.0)`. `0.0` means dense attention, `0.5` drops 50 percent of blocks. |
 | `dit_sparse_attention_pool_size` | `int64` | `128` | Sparse attention pooling window size for block-wise mask generation. |

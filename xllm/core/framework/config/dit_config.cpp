@@ -74,6 +74,10 @@ DEFINE_int64(dit_generation_image_area_max,
              0,
              "Maximum allowed image area (width * height) for image generation "
              "requests. If set to 0, there is no limit.");
+DEFINE_string(dit_vae_dtype,
+              "bfloat16",
+              "Qwen-Image-2.1 VAE dtype (e.g. float32 or bfloat16).");
+
 // --- dit vae tiling ---
 
 DEFINE_bool(
@@ -99,7 +103,8 @@ DEFINE_bool(dit_enable_text_encoder,
 DEFINE_int64(
     dit_vae_image_size,
     1048576,
-    "Qwen Image Edit Plus VAE image size used to calculate dimensions.");
+    "Target pixel area for condition images in Qwen-Image-Edit-Plus and "
+    "Qwen-Image-2.1.");
 
 DEFINE_bool(dit_sparse_attention_enabled,
             false,
@@ -156,6 +161,7 @@ void DiTConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_h3_task_type);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_generation_image_area_max);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_image_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_vae_tiling);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_tail_chunk_frames);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_text_encoder);
@@ -185,6 +191,7 @@ void DiTConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_h3_task_type);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_generation_image_area_max);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_image_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_vae_tiling);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_tail_chunk_frames);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_text_encoder);
@@ -231,6 +238,8 @@ void DiTConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, dit_generation_image_area_max);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_vae_image_size);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_vae_dtype);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_enable_vae_tiling);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

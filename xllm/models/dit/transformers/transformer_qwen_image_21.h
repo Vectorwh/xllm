@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch_npu/csrc/aten/CustomFunctions.h>
 
 #include "core/framework/parallel_state/parallel_state.h"
+#include "core/kernels/npu/npu_ops_api.h"
 #endif
 
 #include <algorithm>
@@ -36,8 +37,11 @@ limitations under the License.
 
 #include "core/framework/dit_cache/dit_cache_config.h"
 #include "core/framework/dit_model_loader.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/state_dict/utils.h"
+#include "core/layers/common/ada_layer_norm.h"
 #include "core/layers/common/add_matmul.h"
+#include "core/layers/common/linear.h"
 
 namespace xllm::qwen_image_21 {
 
@@ -58,7 +62,22 @@ struct SequenceLayout {
   int64_t prompt_tokens = 0;
   bool has_padding = false;
   int64_t attention_query_offset = 0;
+  torch::Tensor rope_cos_interleaved;  // FP32 [1,L,1,head_dim]
+  torch::Tensor rope_sin_interleaved;
 };
+
+// Each adjacent even/odd pair shares one frequency. Prepare full-width caches
+// once per layout, not once per layer or diffusion step.
+inline void prepare_interleaved_rope_cache(SequenceLayout& layout) {
+  layout.rope_cos_interleaved =
+      layout.rope_cos.repeat_interleave(/*repeats=*/2, /*dim=*/-1)
+          .unsqueeze(0)
+          .unsqueeze(2);
+  layout.rope_sin_interleaved =
+      layout.rope_sin.repeat_interleave(/*repeats=*/2, /*dim=*/-1)
+          .unsqueeze(0)
+          .unsqueeze(2);
+}
 
 // Layout is constructed once per positive/negative branch, outside the layers.
 // Both masks cover only the VLM sequence; target slots are appended here.
@@ -206,17 +225,19 @@ inline SequenceLayout prepare_sequence_layout(
     cos_parts.emplace_back(torch::cos(angle));
     sin_parts.emplace_back(torch::sin(angle));
   }
-  return {torch::tensor(source, cpu_long).to(device),
-          torch::tensor(positions, cpu_long).to(device),
-          image_ids,
-          indices.ge(joint_tokens - target_tokens),
-          allowed.unsqueeze(0).unsqueeze(0).contiguous(),
-          torch::cat(cos_parts, -1).to(device),
-          torch::cat(sin_parts, -1).to(device),
-          target_tokens,
-          joint_tokens - target_tokens,
-          prompt_tokens,
-          seen_padding};
+  SequenceLayout layout{torch::tensor(source, cpu_long).to(device),
+                        torch::tensor(positions, cpu_long).to(device),
+                        image_ids,
+                        indices.ge(joint_tokens - target_tokens),
+                        allowed.unsqueeze(0).unsqueeze(0).contiguous(),
+                        torch::cat(cos_parts, -1).to(device),
+                        torch::cat(sin_parts, -1).to(device),
+                        target_tokens,
+                        joint_tokens - target_tokens,
+                        prompt_tokens,
+                        seen_padding};
+  prepare_interleaved_rope_cache(layout);
+  return layout;
 }
 
 inline torch::Tensor apply_rotary(const torch::Tensor& input,
@@ -224,6 +245,17 @@ inline torch::Tensor apply_rotary(const torch::Tensor& input,
   CHECK_EQ(input.dim(), 4);  // [B,S,H,D]
   CHECK_EQ(input.size(1), layout.rope_cos.size(0));
   CHECK_EQ(input.size(3), layout.rope_cos.size(1) * 2);
+#if defined(USE_NPU)
+  CHECK(layout.rope_cos_interleaved.defined());
+  CHECK(layout.rope_sin_interleaved.defined());
+  // Match the reference's FP32 complex rotation and adjacent-element pairs.
+  return at_npu::native::custom_ops::npu_rotary_mul(
+             input.to(torch::kFloat32),
+             layout.rope_cos_interleaved,
+             layout.rope_sin_interleaved,
+             /*rotary_mode=*/"interleave")
+      .to(input.scalar_type());
+#else
   auto pairs =
       input.to(torch::kFloat32)
           .reshape({input.size(0), input.size(1), input.size(2), -1, 2});
@@ -235,6 +267,7 @@ inline torch::Tensor apply_rotary(const torch::Tensor& input,
                       -1)
       .flatten(-2)
       .to(input.scalar_type());
+#endif
 }
 
 // Exact request-local prefix KV cache.
@@ -291,6 +324,7 @@ class PrefixKVCache final {
         layout.rope_cos.slice(0, layout.prefix_tokens).clone();
     decode_layout_.rope_sin =
         layout.rope_sin.slice(0, layout.prefix_tokens).clone();
+    prepare_interleaved_rope_cache(decode_layout_);
     // Target queries may attend to every valid prefix and target key. For an
     // unpadded sequence this is full rectangular attention, requiring no mask.
     if (layout.has_padding) {
@@ -369,6 +403,7 @@ class SpSequenceLayout final {
         shard(full.rope_sin.slice(0, prefix_tokens_), 0, 0.0);
     local_decode_.has_padding = full.has_padding || padding_ != 0;
     local_decode_.attention_query_offset = prefix_tokens_;
+    prepare_interleaved_rope_cache(local_decode_);
     local_prefill_ = local_decode_;
     local_prefill_.prefix_tokens = prefix_tokens_;
     local_prefill_.attention_query_offset = 0;
@@ -379,6 +414,7 @@ class SpSequenceLayout final {
         {full.rope_cos.slice(0, 0, prefix_tokens_), local_decode_.rope_cos});
     local_prefill_.rope_sin = torch::cat(
         {full.rope_sin.slice(0, 0, prefix_tokens_), local_decode_.rope_sin});
+    prepare_interleaved_rope_cache(local_prefill_);
     const int64_t total = prefix_tokens_ + target_tokens_;
     if (padding_ == 0) {
       prefill_mask_ = full.allowed_attention;
@@ -689,12 +725,25 @@ class RmsNormImpl final : public torch::nn::Module {
     weight_ = register_parameter("weight", torch::empty({dim}, options));
   }
   torch::Tensor forward(const torch::Tensor& input) {
+#if defined(USE_NPU)
+    if (!zero_centered_) {
+      // Match diffusers RMSNorm's NPU path: cast to a low-precision weight
+      // dtype when needed, then let npu_rms_norm apply the checkpoint scale.
+      auto x = input;
+      if (weight_.scalar_type() == torch::kFloat16 ||
+          weight_.scalar_type() == torch::kBFloat16) {
+        x = x.to(weight_.scalar_type());
+      }
+      return std::get<0>(
+          at_npu::native::custom_ops::npu_rms_norm(x, weight_, eps_));
+    }
+#endif
     auto x = input.to(torch::kFloat32);
     x = x * torch::rsqrt(x.square().mean(-1, /*keepdim=*/true) + eps_);
     if (zero_centered_) {
       return (x * (weight_.to(torch::kFloat32) + 1)).to(input.scalar_type());
     }
-    // Q/K norm casts BEFORE applying the checkpoint scale.
+    // Retain the non-NPU Q/K reference path.
     return x.to(input.scalar_type()) * weight_;
   }
 
@@ -819,20 +868,7 @@ inline torch::Tensor transformer_attention(const torch::Tensor& q,
                                            const torch::Tensor& allowed,
                                            int64_t query_offset = 0) {
   const double scale = 1.0 / std::sqrt(static_cast<double>(q.size(-1)));
-  if (q.device().is_cpu()) {
-    // Explicit CPU reference path, not a recovery path for failed NPU ops.
-    auto scores = torch::matmul(q.to(torch::kFloat32),
-                                k.to(torch::kFloat32).transpose(-1, -2)) *
-                  scale;
-    if (allowed.defined()) {
-      scores = scores.masked_fill(allowed.logical_not(),
-                                  -std::numeric_limits<float>::infinity());
-    }
-    return torch::matmul(torch::softmax(scores, -1), v.to(torch::kFloat32))
-        .to(q.scalar_type());
-  }
 #if defined(USE_NPU)
-  CHECK(q.device().type() == torch::kPrivateUse1);
   CHECK(q.scalar_type() == torch::kBFloat16 ||
         q.scalar_type() == torch::kFloat16);
   CHECK_EQ(q.size(-1), 128)
@@ -879,8 +915,15 @@ inline torch::Tensor transformer_attention(const torch::Tensor& q,
   return std::get<0>(result).slice(2, query_padding);
 
 #else
-  LOG(FATAL) << "QwenImage21 requires an NPU build for non-CPU execution";
-  return {};
+  auto scores = torch::matmul(q.to(torch::kFloat32),
+                              k.to(torch::kFloat32).transpose(-1, -2)) *
+                scale;
+  if (allowed.defined()) {
+    scores = scores.masked_fill(allowed.logical_not(),
+                                -std::numeric_limits<float>::infinity());
+  }
+  return torch::matmul(torch::softmax(scores, -1), v.to(torch::kFloat32))
+      .to(q.scalar_type());
 #endif
 }
 
@@ -889,15 +932,18 @@ class AttentionImpl final : public torch::nn::Module {
   AttentionImpl(int64_t heads,
                 int64_t head_dim,
                 double eps,
+                ProcessGroup* process_group,
                 const torch::TensorOptions& options)
       : heads_(heads), head_dim_(head_dim) {
     const int64_t dim = heads * head_dim;
-    query_ = register_module(
-        "to_q", layer::AddMatmul(dim, dim, /*with_bias=*/false, options));
-    key_ = register_module(
-        "to_k", layer::AddMatmul(dim, dim, /*with_bias=*/false, options));
-    value_ = register_module(
-        "to_v", layer::AddMatmul(dim, dim, /*with_bias=*/false, options));
+    qkv_ = register_module("to_qkv",
+                           layer::ColumnParallelLinear(dim,
+                                                       3 * dim,
+                                                       /*bias=*/false,
+                                                       /*gather_output=*/false,
+                                                       QuantArgs{},
+                                                       process_group,
+                                                       options));
     norm_q_ = register_module("norm_q", RmsNorm(head_dim, eps, false, options));
     norm_k_ = register_module("norm_k", RmsNorm(head_dim, eps, false, options));
     output_ = register_module("to_out",
@@ -911,14 +957,16 @@ class AttentionImpl final : public torch::nn::Module {
                         const UlyssesContext* sp = nullptr) {
     const std::vector<int64_t> shape{
         input.size(0), input.size(1), heads_, head_dim_};
-    auto q =
-        apply_rotary(norm_q_->forward(query_->forward(input).reshape(shape)),
-                     layout)
-            .transpose(1, 2);
-    auto k = apply_rotary(norm_k_->forward(key_->forward(input).reshape(shape)),
-                          layout)
-                 .transpose(1, 2);
-    auto v = value_->forward(input).reshape(shape).transpose(1, 2);
+    auto qkv = qkv_->forward(input).chunk(/*chunks=*/3, /*dim=*/-1);
+    auto q = qkv[0].reshape(shape);
+    auto k = qkv[1].reshape(shape);
+    auto v = qkv[2].reshape(shape);
+    // diffusers aligns normalized Q/K with V's dtype before applying RoPE.
+    q = norm_q_->forward(q).to(v.scalar_type());
+    k = norm_k_->forward(k).to(v.scalar_type());
+    q = apply_rotary(q, layout).transpose(1, 2);
+    k = apply_rotary(k, layout).transpose(1, 2);
+    v = v.transpose(1, 2);
     if (!decode && cache != nullptr) {
       CHECK(!cache->key.defined() && !cache->value.defined());
       cache->key = k.slice(2, 0, layout.prefix_tokens).clone().contiguous();
@@ -979,9 +1027,7 @@ class AttentionImpl final : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    query_->load_state_dict(state_dict.get_dict_with_prefix("to_q."));
-    key_->load_state_dict(state_dict.get_dict_with_prefix("to_k."));
-    value_->load_state_dict(state_dict.get_dict_with_prefix("to_v."));
+    qkv_->load_state_dict(state_dict, {"to_q.", "to_k.", "to_v."});
     norm_q_->load_state_dict(state_dict.get_dict_with_prefix("norm_q."));
     norm_k_->load_state_dict(state_dict.get_dict_with_prefix("norm_k."));
     output_->at<layer::AddMatmulImpl>(0).load_state_dict(
@@ -989,9 +1035,8 @@ class AttentionImpl final : public torch::nn::Module {
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    query_->verify_loaded_weights(prefix + "to_q.");
-    key_->verify_loaded_weights(prefix + "to_k.");
-    value_->verify_loaded_weights(prefix + "to_v.");
+    CHECK(qkv_->is_weight_loaded())
+        << "weight is not loaded for " << prefix + "to_qkv.weight";
     norm_q_->verify_loaded_weights(prefix + "norm_q.");
     norm_k_->verify_loaded_weights(prefix + "norm_k.");
     output_->at<layer::AddMatmulImpl>(0).verify_loaded_weights(prefix +
@@ -1000,7 +1045,7 @@ class AttentionImpl final : public torch::nn::Module {
 
  private:
   int64_t heads_, head_dim_;
-  layer::AddMatmul query_{nullptr}, key_{nullptr}, value_{nullptr};
+  layer::ColumnParallelLinear qkv_{nullptr};
   RmsNorm norm_q_{nullptr}, norm_k_{nullptr};
   torch::nn::Sequential output_{nullptr};
 };
@@ -1008,86 +1053,149 @@ TORCH_MODULE(Attention);
 
 class SwiGluImpl final : public torch::nn::Module {
  public:
-  SwiGluImpl(int64_t dim, int64_t hidden, const torch::TensorOptions& options) {
-    projection_ = register_module(
-        "proj", layer::AddMatmul(dim, hidden, /*with_bias=*/false, options));
-    gate_ = register_module(
-        "gate_layer",
-        layer::AddMatmul(dim, hidden, /*with_bias=*/false, options));
+  SwiGluImpl(int64_t dim,
+             int64_t hidden,
+             ProcessGroup* process_group,
+             const torch::TensorOptions& options) {
+    // npu_swiglu applies SiLU to the first half: [gate_layer, proj].
+    gate_up_ =
+        register_module("gate_up",
+                        layer::ColumnParallelLinear(dim,
+                                                    2 * hidden,
+                                                    /*bias=*/false,
+                                                    /*gather_output=*/false,
+                                                    QuantArgs{},
+                                                    process_group,
+                                                    options));
     output_ = register_module(
         "out", layer::AddMatmul(hidden, dim, /*with_bias=*/false, options));
   }
   torch::Tensor forward(const torch::Tensor& input) {
-    return output_->forward(torch::silu(gate_->forward(input)) *
-                            projection_->forward(input));
+    auto projected = gate_up_->forward(input);
+#if defined(USE_NPU)
+    return output_->forward(
+        kernel::npu::active(projected, /*act_mode=*/"swiglu"));
+#else
+    auto parts = projected.chunk(/*chunks=*/2, /*dim=*/-1);
+    return output_->forward(torch::silu(parts[0]) * parts[1]);
+#endif
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    projection_->load_state_dict(state_dict.get_dict_with_prefix("proj."));
-    gate_->load_state_dict(state_dict.get_dict_with_prefix("gate_layer."));
+    gate_up_->load_state_dict(state_dict, {"gate_layer.", "proj."});
     output_->load_state_dict(state_dict.get_dict_with_prefix("out."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    projection_->verify_loaded_weights(prefix + "proj.");
-    gate_->verify_loaded_weights(prefix + "gate_layer.");
+    CHECK(gate_up_->is_weight_loaded())
+        << "weight is not loaded for " << prefix + "gate_up.weight";
     output_->verify_loaded_weights(prefix + "out.");
   }
 
  private:
-  layer::AddMatmul projection_{nullptr}, gate_{nullptr}, output_{nullptr};
+  layer::ColumnParallelLinear gate_up_{nullptr};
+  layer::AddMatmul output_{nullptr};
 };
 TORCH_MODULE(SwiGlu);
 
 inline torch::Tensor select_modulation(const torch::Tensor& parameters,
                                        const torch::Tensor& target_mask,
-                                       bool causal_condition) {
+                                       bool causal_condition,
+                                       bool decode = false) {
   if (!causal_condition) {
     return parameters.unsqueeze(1);
   }
   CHECK_EQ(parameters.size(0), 2);  // batch=1 plus the t=0 row
+  if (decode) {
+    // Cached decode contains only target rows, including SP padding. Keep
+    // [1,1,D] for broadcasting instead of materializing [1,local_tokens,D].
+    return parameters.slice(0, 0, 1).unsqueeze(1);
+  }
   return torch::where(target_mask.reshape({1, -1, 1}),
                       parameters.slice(0, 0, 1).unsqueeze(1),
                       parameters.slice(0, 1, 2).unsqueeze(1));
 }
 
+struct BlockModulation {
+  torch::Tensor scale1;
+  torch::Tensor gate1_tanh;
+  torch::Tensor scale2;
+  torch::Tensor gate2_tanh;
+};
+
+// Shared by all blocks in one step/CFG branch, never retained across steps.
+inline BlockModulation prepare_block_modulation(const torch::Tensor& modulation,
+                                                const SequenceLayout& layout,
+                                                bool causal_condition,
+                                                bool decode) {
+  auto parts = modulation.chunk(4, -1);
+  auto scale1 =
+      select_modulation(parts[0], layout.target_mask, causal_condition, decode);
+  auto gate1 =
+      select_modulation(parts[1], layout.target_mask, causal_condition, decode);
+  auto scale2 =
+      select_modulation(parts[2], layout.target_mask, causal_condition, decode);
+  auto gate2 =
+      select_modulation(parts[3], layout.target_mask, causal_condition, decode);
+  // AdaLayerNorm adds one internally; keep the selected scales unmodified.
+  return {scale1, gate1.tanh(), scale2, gate2.tanh()};
+}
+
+inline torch::Tensor apply_adaptive_layer_norm(
+    layer::AdaLayerNorm& norm,
+    const torch::Tensor& hidden,
+    const torch::Tensor& scale,
+    const torch::Tensor& zero_shift) {
+#if defined(USE_NPU)
+  return norm->forward(hidden, scale, zero_shift);
+#else
+  return torch::nn::functional::layer_norm(
+             hidden,
+             torch::nn::functional::LayerNormFuncOptions({hidden.size(-1)})
+                 .eps(norm->eps())) *
+         (1 + scale);
+#endif
+}
+
 class TransformerBlockImpl final : public torch::nn::Module {
  public:
   TransformerBlockImpl(const QwenImage21TransformerConfig& config,
+                       ProcessGroup* process_group,
                        const torch::TensorOptions& options)
-      : dim_(config.num_heads * config.head_dim),
-        eps_(config.eps),
-        causal_condition_(config.causal_condition) {
-    attention_ = register_module(
-        "attn",
-        Attention(config.num_heads, config.head_dim, config.eps, options));
-    mlp_ = register_module("img_mlp",
-                           SwiGlu(dim_, dim_ * config.mlp_ratio, options));
+      : dim_(config.num_heads * config.head_dim) {
+    norm1_ = register_module(
+        "norm1",
+        layer::AdaLayerNorm(
+            dim_, config.eps, /*elementwise_affine=*/false, options));
+    norm2_ = register_module(
+        "norm2",
+        layer::AdaLayerNorm(
+            dim_, config.eps, /*elementwise_affine=*/false, options));
+    attention_ = register_module("attn",
+                                 Attention(config.num_heads,
+                                           config.head_dim,
+                                           config.eps,
+                                           process_group,
+                                           options));
+    mlp_ = register_module(
+        "img_mlp",
+        SwiGlu(dim_, dim_ * config.mlp_ratio, process_group, options));
   }
   torch::Tensor forward(torch::Tensor hidden,
-                        const torch::Tensor& modulation,
+                        const BlockModulation& modulation,
                         const SequenceLayout& layout,
+                        const torch::Tensor& zero_shift,
                         PrefixLayerKV* cache = nullptr,
                         bool decode = false,
                         const UlyssesContext* sp = nullptr) {
-    auto parts = modulation.chunk(4, -1);
-    auto scale1 =
-        select_modulation(parts[0], layout.target_mask, causal_condition_);
-    auto gate1 =
-        select_modulation(parts[1], layout.target_mask, causal_condition_);
-    auto scale2 =
-        select_modulation(parts[2], layout.target_mask, causal_condition_);
-    auto gate2 =
-        select_modulation(parts[3], layout.target_mask, causal_condition_);
-    auto norm_options =
-        torch::nn::functional::LayerNormFuncOptions({dim_}).eps(eps_);
-    auto normalized =
-        torch::nn::functional::layer_norm(hidden, norm_options) * (1 + scale1);
-    hidden = hidden + gate1.tanh() * attention_->forward(
-                                         normalized, layout, cache, decode, sp);
-    normalized =
-        torch::nn::functional::layer_norm(hidden, norm_options) * (1 + scale2);
-    hidden = hidden + gate2.tanh() * mlp_->forward(normalized);
+    auto normalized = apply_adaptive_layer_norm(
+        norm1_, hidden, modulation.scale1, zero_shift);
+    hidden =
+        hidden + modulation.gate1_tanh *
+                     attention_->forward(normalized, layout, cache, decode, sp);
+    normalized = apply_adaptive_layer_norm(
+        norm2_, hidden, modulation.scale2, zero_shift);
+    hidden = hidden + modulation.gate2_tanh * mlp_->forward(normalized);
     return hidden.scalar_type() == torch::kFloat16 ? hidden.clamp(-65504, 65504)
                                                    : hidden;
   }
@@ -1104,8 +1212,7 @@ class TransformerBlockImpl final : public torch::nn::Module {
 
  private:
   int64_t dim_;
-  double eps_;
-  bool causal_condition_;
+  layer::AdaLayerNorm norm1_{nullptr}, norm2_{nullptr};
   Attention attention_{nullptr};
   SwiGlu mlp_{nullptr};
 };
@@ -1117,20 +1224,25 @@ class OutputNormImpl final : public torch::nn::Module {
                  double eps,
                  bool causal_condition,
                  const torch::TensorOptions& options)
-      : dim_(dim), eps_(eps), causal_condition_(causal_condition) {
+      : causal_condition_(causal_condition) {
+    norm_ = register_module(
+        "norm",
+        layer::AdaLayerNorm(dim, eps, /*elementwise_affine=*/false, options));
     linear_ = register_module(
         "linear", layer::AddMatmul(dim, dim, /*with_bias=*/false, options));
   }
   torch::Tensor forward(const torch::Tensor& hidden,
                         const torch::Tensor& time,
-                        const SequenceLayout& layout) {
+                        const SequenceLayout& layout,
+                        const torch::Tensor& zero_shift,
+                        bool decode = false) {
+    // Output scale has its own weights; only the target-row selection is shared
+    // with block modulation during cached decode.
     auto scale = select_modulation(linear_->forward(torch::silu(time)),
                                    layout.target_mask,
-                                   causal_condition_);
-    return torch::nn::functional::layer_norm(
-               hidden,
-               torch::nn::functional::LayerNormFuncOptions({dim_}).eps(eps_)) *
-           (1 + scale);
+                                   causal_condition_,
+                                   decode);
+    return apply_adaptive_layer_norm(norm_, hidden, scale, zero_shift);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -1142,9 +1254,8 @@ class OutputNormImpl final : public torch::nn::Module {
   }
 
  private:
-  int64_t dim_;
-  double eps_;
   bool causal_condition_;
+  layer::AdaLayerNorm norm_{nullptr};
   layer::AddMatmul linear_{nullptr};
 };
 TORCH_MODULE(OutputNorm);
@@ -1155,11 +1266,16 @@ TORCH_MODULE(OutputNorm);
 // CFG, device movement and per-request layouts; no VLM is constructed here.
 class QwenImage21Transformer2DModelImpl final : public torch::nn::Module {
  public:
-  explicit QwenImage21Transformer2DModelImpl(
+  QwenImage21Transformer2DModelImpl(
       QwenImage21TransformerConfig config,
+      ProcessGroup* process_group,
       const torch::TensorOptions& options =
           torch::TensorOptions().dtype(torch::kFloat32))
       : config_(std::move(config)) {
+    CHECK(process_group != nullptr)
+        << "QwenImage21 Transformer requires a TP process group";
+    CHECK_EQ(process_group->world_size(), 1)
+        << "QwenImage21 Transformer requires TP=1";
     CHECK_EQ(config_.patch_size, 1);
     CHECK_GT(config_.num_heads, 0);
     CHECK_GT(config_.num_layers, 0);
@@ -1187,7 +1303,8 @@ class QwenImage21Transformer2DModelImpl final : public torch::nn::Module {
             layer::AddMatmul(dim, 4 * dim, /*with_bias=*/false, options)));
     blocks_ = register_module("transformer_blocks", torch::nn::ModuleList());
     for (int64_t i = 0; i < config_.num_layers; ++i) {
-      blocks_->push_back(qwen_image_21::TransformerBlock(config_, options));
+      blocks_->push_back(
+          qwen_image_21::TransformerBlock(config_, process_group, options));
     }
     norm_ = register_module(
         "norm_out",
@@ -1223,6 +1340,10 @@ class QwenImage21Transformer2DModelImpl final : public torch::nn::Module {
                         const qwen_image_21::UlyssesContext* sp = nullptr,
                         qwen_image_21::RequestTaylorSeer* taylorseer = nullptr,
                         int64_t step_id = 0) {
+#if defined(USE_NPU)
+    CHECK(hidden.device().type() == torch::kPrivateUse1)
+        << "QwenImage21 Transformer requires NPU inputs in an NPU build";
+#endif
     CHECK_EQ(hidden.dim(), 3);
     CHECK_EQ(hidden.size(0), 1);
     CHECK_EQ(hidden.size(2), config_.in_channels);
@@ -1276,6 +1397,15 @@ class QwenImage21Transformer2DModelImpl final : public torch::nn::Module {
     }
     auto time = time_->forward(t, joint);
     auto modulation = modulation_->forward(time);
+    // Reuse one materialized zero shift for all blocks and the final norm.
+    // Match token-wise prefill scales; keep decode modulation broadcastable.
+    torch::Tensor zero_shift;
+#if defined(USE_NPU)
+    const int64_t modulation_tokens =
+        config_.causal_condition && !decode ? joint.size(1) : 1;
+    zero_shift = torch::zeros({joint.size(0), modulation_tokens, joint.size(2)},
+                              joint.options());
+#endif
     bool approximate = false;
     if (taylorseer != nullptr) {
       taylorseer->bind(layout.source_indices, encoder_hidden);
@@ -1285,12 +1415,15 @@ class QwenImage21Transformer2DModelImpl final : public torch::nn::Module {
     if (approximate) {
       joint = taylorseer->predict(joint);
     } else {
+      const auto block_modulation = qwen_image_21::prepare_block_modulation(
+          modulation, active_layout, config_.causal_condition, decode);
       for (int64_t index = 0; index < config_.num_layers; ++index) {
         auto* layer_cache = cache == nullptr ? nullptr : &cache->layer(index);
         joint = blocks_->at<qwen_image_21::TransformerBlockImpl>(index).forward(
             std::move(joint),
-            modulation,
+            block_modulation,
             active_layout,
+            zero_shift,
             layer_cache,
             decode,
             sp);
@@ -1299,7 +1432,8 @@ class QwenImage21Transformer2DModelImpl final : public torch::nn::Module {
         taylorseer->record(joint);
       }
     }
-    auto normalized = norm_->forward(joint, time, active_layout);
+    auto normalized =
+        norm_->forward(joint, time, active_layout, zero_shift, decode);
     auto result =
         output_->forward(normalized.slice(1, active_layout.prefix_tokens));
     if (cache != nullptr && !decode) {
