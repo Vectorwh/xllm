@@ -2423,17 +2423,20 @@ inline void initialize_device_buffer_session(ReadContext& context,
 #endif
 
   auto& session = *context.device_session;
-  // POSIX shared-memory pages are not pinned merely because TensorOptions says
-  // so. Own a genuinely pinned staging copy and keep it alive with ForwardInput
-  // until the asynchronous H2D has completed.
-  forward_input.input_host_buffer =
-      torch::empty({static_cast<int64_t>(payload_size)},
-                   torch::TensorOptions()
-                       .dtype(torch::kUInt8)
-                       .device(torch::kCPU)
-                       .pinned_memory(/*pinned_memory=*/true));
-  std::memcpy(
-      forward_input.input_host_buffer.data_ptr(), payload_base, payload_size);
+  const torch::Tensor& existing_host_buffer = forward_input.input_host_buffer;
+  const bool can_reuse_payload =
+      existing_host_buffer.defined() &&
+      existing_host_buffer.data_ptr() == payload_base &&
+      existing_host_buffer.is_pinned();
+  if (!can_reuse_payload) {
+    auto host_buffer = torch::empty({static_cast<int64_t>(payload_size)},
+                                    torch::TensorOptions()
+                                        .dtype(torch::kUInt8)
+                                        .device(torch::kCPU)
+                                        .pinned_memory(/*pinned_memory=*/true));
+    std::memcpy(host_buffer.data_ptr(), payload_base, payload_size);
+    forward_input.input_host_buffer = std::move(host_buffer);
+  }
   const torch::Tensor& host_input_buffer = forward_input.input_host_buffer;
   context.tensor_cursor =
       static_cast<const char*>(host_input_buffer.data_ptr()) +

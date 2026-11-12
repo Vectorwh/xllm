@@ -28,13 +28,91 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/batch/batch_input_builder.h"
 #include "core/framework/block/block_manager_impl.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/runtime/forward_params.h"
+#include "core/runtime/forward_shared_memory_manager.h"
 #include "core/runtime/params_utils.h"
 
 namespace xllm {
+
+#if defined(USE_NPU)
+TEST(BatchPackedInputTest,
+     DeferredSharedMemoryMaterializationReusesPinnedPayload) {
+  ASSERT_TRUE(ExecutionConfig::get_instance().use_contiguous_input_buffer());
+  const torch::Device device(torch::kPrivateUse1, 0);
+  ForwardInput input;
+  input.token_ids = torch::tensor({1, 2, 3}, torch::kInt32);
+  input.positions = torch::tensor({0, 1, 2}, torch::kInt32);
+
+  const std::string name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_deferred_pinned_payload",
+      /*dp_group=*/0,
+      ForwardType::RAW_INPUT,
+      /*rank=*/0);
+  bool is_creator = false;
+  ForwardSharedMemoryManager writer(
+      name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader(
+      name, /*size=*/1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+  ASSERT_TRUE(writer.input_write(input));
+
+  ForwardInput deferred_input;
+  reader.input_read(deferred_input,
+                    device,
+                    InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE);
+  ASSERT_TRUE(deferred_input.input_host_buffer.is_pinned());
+  ASSERT_FALSE(deferred_input.device_tensors_ready);
+  const void* payload = deferred_input.input_host_buffer.data_ptr();
+  input.token_ids.fill_(9);
+  ASSERT_TRUE(writer.input_write(input));
+
+  const ForwardInput materialized_input =
+      deferred_input.to(device, torch::kFloat32);
+  EXPECT_EQ(materialized_input.input_host_buffer.data_ptr(), payload);
+  EXPECT_TRUE(materialized_input.input_host_buffer.is_pinned());
+  EXPECT_TRUE(materialized_input.device_tensors_ready);
+  EXPECT_EQ(materialized_input.device_input_buffer.device(), device);
+  deferred_input = ForwardInput();
+  EXPECT_TRUE(torch::equal(materialized_input.token_ids.cpu(),
+                           torch::tensor({1, 2, 3}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(materialized_input.token_ids_host,
+                           torch::tensor({1, 2, 3}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(materialized_input.positions.cpu(),
+                           torch::tensor({0, 1, 2}, torch::kInt32)));
+}
+
+TEST(BatchPackedInputTest, MaterializationPinsPageablePackedPayload) {
+  ASSERT_TRUE(ExecutionConfig::get_instance().use_contiguous_input_buffer());
+  const torch::Device device(torch::kPrivateUse1, 0);
+  ForwardInput input;
+  input.token_ids = torch::tensor({4, 5}, torch::kInt32);
+  input.positions = torch::tensor({0, 1}, torch::kInt32);
+  proto::PackedForwardInput packed_input;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed_input));
+
+  ForwardInput lazy_input;
+  packed_proto_to_forward_input(packed_input, lazy_input, device, nullptr);
+  lazy_input.input_host_buffer = lazy_input.input_host_buffer.clone();
+  ASSERT_FALSE(lazy_input.input_host_buffer.is_pinned());
+
+  const ForwardInput materialized_input =
+      lazy_input.to(device, torch::kFloat32);
+  EXPECT_NE(materialized_input.input_host_buffer.data_ptr(),
+            lazy_input.input_host_buffer.data_ptr());
+  EXPECT_TRUE(materialized_input.input_host_buffer.is_pinned());
+  EXPECT_TRUE(torch::equal(materialized_input.input_host_buffer,
+                           lazy_input.input_host_buffer));
+  lazy_input = ForwardInput();
+  EXPECT_TRUE(
+      torch::equal(materialized_input.token_ids.cpu(), input.token_ids));
+  EXPECT_TRUE(
+      torch::equal(materialized_input.positions.cpu(), input.positions));
+}
+#endif
 
 TEST(BatchPackedInputTest, ModelInputConversionPreservesValidityMask) {
   ModelInputParams input_params;
