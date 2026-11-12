@@ -203,6 +203,7 @@ def _register_builtin_models() -> None:
         "DFlashQwen3ForCausalLM",
         "DFlashDraftModel",
         "DFlashQwen3Model",
+        execution_metadata_builders=(("xllm.python.model_executor.sampling_metadata", "ModelSamplingMetadataBuilder"),),
     )
     _register_model_path(
         "xllm.python.models.qwen3_dflash2",

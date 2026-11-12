@@ -21,11 +21,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/parallel_state/process_group.h"
-#include "core/framework/speculative/dflash_async_input_builder.h"
-#include "core/framework/speculative/spec_input_builder.h"
 #include "framework/sampling/gumbel_sampling.h"
-#include "layers/common/attention_metadata.h"
-#include "layers/common/attention_metadata_builder.h"
 #include "runtime/speculative_worker_utils.h"
 #include "util/timer.h"
 
@@ -40,131 +36,9 @@ DFlash2WorkerImpl::DFlash2WorkerImpl(const ParallelArgs& parallel_args,
           draft_impl_->get_parallel_args())) {
   async_output_enabled_ = enable_schedule_overlap() &&
                           !options_.enable_adaptive_speculative_decode();
-  proposal_xfia_enabled_ =
-      enable_dflash_proposal_xfia(parallel_args, device, options);
   draft_prelaunch_enabled_for_init_ =
       async_output_enabled_ && proposal_xfia_enabled_ &&
       parallel_args_.kv_split_size_effective() == 1;
-}
-
-DFlash2WorkerImpl::~DFlash2WorkerImpl() { retire_async_output(); }
-
-std::optional<ForwardOutput> DFlash2WorkerImpl::step_decode(
-    const ForwardInput& raw_input) {
-  ForwardInput input = raw_input;
-  ForwardInput validate_input;
-  const bool can_prelaunch = can_prelaunch_draft_for_this_step(input);
-  std::vector<int64_t> pending_rows;
-  if (can_prelaunch) {
-    pending_rows = build_batch_to_pending_row_mapping(input);
-  }
-  DraftBlock draft_block;
-  if (!pending_rows.empty()) {
-    draft_block = run_decode_draft_from_pending(input, pending_rows);
-    commit_pending_context();
-    prepare_decode_input(input);
-    prepare_validate_inputs(input, validate_input);
-  } else {
-    commit_pending_context();
-    prepare_decode_input(input);
-    draft_block = run_decode_draft(input, validate_input);
-  }
-  if (can_prelaunch) {
-    prepare_target_metadata(validate_input);
-  }
-  const bool async_output = async_output_enabled_ &&
-                            !input.input_params.meta.is_graph_warmup &&
-                            input.transfer_kv_infos.empty();
-  auto output = run_validate(input, draft_block, validate_input, async_output);
-  if (!async_output) {
-    consumed_context_tensors_.clear();
-  }
-  return output;
-}
-
-void DFlash2WorkerImpl::prepare_target_metadata(ForwardInput& validate_input) {
-  ForwardInput prepared;
-  impl_->prepare_work_before_execute_on_stream(
-      validate_input, prepared, *prepare_stream_, false, false, false);
-  c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
-  prepared.input_params.attn_metadata =
-      std::make_shared<layer::AttentionMetadata>(
-          layer::AttentionMetadataBuilder::build(
-              prepared.input_params,
-              impl_->context_.get_model_args().enable_mla(),
-              std::nullopt,
-              device_.unwrap()));
-  speculative_worker::record_metadata_ready_event(*prepare_stream_, prepared);
-  validate_input = std::move(prepared);
-}
-
-std::optional<ForwardOutput> DFlash2WorkerImpl::step_prefill(
-    const ForwardInput& input) {
-  commit_pending_context();
-  std::optional<ForwardOutput> output = DFlashWorkerImpl::step_prefill(input);
-  consumed_context_tensors_.clear();
-  return output;
-}
-
-std::optional<ForwardOutput> DFlash2WorkerImpl::step_empty(
-    const ForwardInput& input) {
-  commit_pending_context();
-  ForwardInput empty_input = input;
-  empty_input.input_params.use_dflash_proposal_attention =
-      proposal_xfia_enabled_ && !input.input_params.meta.is_graph_warmup &&
-      input.input_params.meta.batch_forward_type.is_decode();
-  return DFlashWorkerImpl::step_empty(empty_input);
-}
-
-bool DFlash2WorkerImpl::can_prepare_without_compute_stream_wait(
-    const ForwardInput& input) const {
-  return can_prelaunch_draft_for_this_step(input);
-}
-
-bool DFlash2WorkerImpl::can_prelaunch_draft_for_this_step(
-    const ForwardInput& input) const {
-  if (!draft_prelaunch_enabled_for_init_ ||
-      !can_prepare_device_draft_inputs(input)) {
-    return false;
-  }
-  const auto rows = specBuilder::make_decode_row_context(input);
-  const int32_t max_query_tokens_with_pending_acceptance =
-      2 * (options_.num_speculative_tokens() + 1);
-  return specBuilder::has_decode_lookahead_capacity(
-      rows,
-      max_query_tokens_with_pending_acceptance,
-      options_.block_size(),
-      draft_impl_->context_.get_model_args().max_position_embeddings());
-}
-
-bool DFlash2WorkerImpl::can_prepare_device_draft_inputs(
-    const ForwardInput& input) const {
-  if (!proposal_xfia_enabled_ || input.input_params.meta.is_graph_warmup ||
-      !input.input_params.meta.batch_forward_type.is_decode() ||
-      input.input_params.meta.num_sequences <= 0 ||
-      !input.input_params.multi_block_tables.empty() ||
-      input.input_params.meta.requires_host_restore ||
-      !input.input_params.block_copy.swap_blocks.empty() ||
-      (input.input_params.block_copy.src_block_indices.defined() &&
-       input.input_params.block_copy.src_block_indices.numel() > 0) ||
-      !input.transfer_kv_infos.empty() ||
-      // Constraint rows stage normally: the draft query samples with the
-      // cleared mask (make_draft_sampling_params) and the verify rows are
-      // rebuilt from the fresh states, so the sequence-level constraint
-      // bitmask no longer blocks draft preparation.
-      input.input_params.embedding.mtp_bootstrap_embeddings.defined() ||
-      input.input_params.embedding.embedding_ids.empty() ||
-      input.input_params.embedding.request_ids.size() !=
-          input.input_params.embedding.embedding_ids.size()) {
-    return false;
-  }
-  const auto rows = specBuilder::make_decode_row_context(input);
-  return !rows.model_managed_multiblock &&
-         specBuilder::has_decode_lookahead_capacity(
-             rows,
-             options_.num_speculative_tokens() + 1,
-             options_.block_size(),
-             draft_impl_->context_.get_model_args().max_position_embeddings());
 }
 
 torch::Tensor DFlash2WorkerImpl::prepare_draft_noise(
@@ -216,68 +90,26 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
 DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft_from_pending(
     const ForwardInput& input,
     const std::vector<int64_t>& rows) {
-  ForwardInput query;
-  prepare_query_inputs(input, query);
-  query.input_params.use_dflash_proposal_attention = true;
-  query.skip_sampling_for_logits_only = true;
-  query.return_selected_hidden = true;
-  ForwardInput prepared;
-  draft_impl_->prepare_work_before_execute_on_stream(
-      query, prepared, *prepare_stream_, true, false);
   ForwardInput device_input = input;
-  torch::Tensor row_indices;
-  torch::Tensor host_row_indices;
   torch::Tensor noise;
   {
     c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
+    speculative_worker::wait_metadata_ready_event(input, *prepare_stream_);
     device_input.sampling_params =
         input.sampling_params.to(draft_impl_->device(), torch::kFloat32);
     noise = prepare_draft_noise(input);
-    host_row_indices = torch::empty(
-        {static_cast<int64_t>(rows.size())},
-        torch::TensorOptions().dtype(torch::kLong).pinned_memory(true));
-    std::copy(rows.begin(), rows.end(), host_row_indices.data_ptr<int64_t>());
-    row_indices = host_row_indices.to(device_, torch::kLong, true);
-    prepared.metadata_ready_event = prepare_stream_->record_event();
   }
-  CHECK(prepared.metadata_ready_event != nullptr);
-  c10::StreamGuard compute_guard = compute_stream_->set_stream_guard();
-  CHECK(compute_stream_->wait_event(prepared.metadata_ready_event));
-  torch::Tensor accepted =
-      pending_context_->accepted_device.index_select(0, row_indices);
-  torch::Tensor base_positions =
-      pending_context_->base_positions.index_select(0, row_indices);
-  dflash_async::NextDraftInputs next = dflash_async::prepare_next_draft(
-      accepted,
-      base_positions,
-      prepared.input_params.attention.device.block_tables,
-      mask_token_id_,
-      options_.block_size());
-  prepared.token_ids.copy_(next.query_tokens);
-  prepared.positions.copy_(next.query_positions);
-  prepared.input_params.attention.device.new_cache_slots.copy_(
-      next.query_slots);
-  prepared.input_params.attention.device.kv_seq_lens.copy_(next.kv_lengths);
-  prepared.input_params.attn_metadata.reset();
-  prepared.metadata_ready_event.reset();
-  prepared.device_tensors_ready = true;
-  DraftBlock block = execute_draft_query(
-      device_input, prepared, next.anchor_tokens, noise, true);
+  auto [prepared, anchor_tokens] = prepare_pending_draft_query(input, rows);
+  DraftBlock block =
+      execute_draft_query(device_input, prepared, anchor_tokens, noise, true);
   block.retained_inputs.reserve(block.retained_inputs.size() + 2);
   block.retained_inputs.emplace_back(
       std::make_shared<ForwardInput>(std::move(prepared)));
   block.retained_inputs.emplace_back(
       std::make_shared<ForwardInput>(std::move(device_input)));
-  block.retained_tensors.reserve(block.retained_tensors.size() + 8);
+  block.retained_tensors.reserve(block.retained_tensors.size() + 2);
   block.retained_tensors.insert(block.retained_tensors.end(),
-                                {row_indices,
-                                 host_row_indices,
-                                 noise,
-                                 accepted,
-                                 base_positions,
-                                 next.anchor_tokens,
-                                 pending_context_->accepted_device,
-                                 pending_context_->base_positions});
+                                {noise, anchor_tokens});
   return block;
 }
 

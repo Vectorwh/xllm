@@ -28,6 +28,7 @@ from xllm.python.model_executor.forward_context import get_execution_context
 from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.model_input import ModelInput
 from xllm.python.model_executor.model_output import DraftCandidates, DraftDecoderOutput, DraftProposal, ModelOutput
+from xllm.python.models.dflash_model import DFlashDecoderMetadata
 
 if TYPE_CHECKING:
     from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
@@ -145,38 +146,6 @@ class DFlash2SamplingMetadataBuilder:
             destination[count:].zero_()
 
 
-@dataclass(frozen=True)
-class DFlash2DecoderMetadata:
-    num_requests: int
-
-
-class DFlash2DecoderMetadataBuilder:
-    """Capture complete decoder blocks independently of whether sampling follows.
-
-    Eager backbone-only calls skip the head and selector. Graphs with complete
-    query blocks always include them, so a warmup without sampling cannot cache
-    a backbone-only graph for a later proposal step with the same shape.
-    """
-
-    metadata_type = DFlash2DecoderMetadata
-
-    def __init__(self, query_width: int) -> None:
-        self._query_width = query_width
-
-    def build(self, input_batch: InputBatch, metadata: AttentionMetadata) -> DFlash2DecoderMetadata:
-        requests = 0 if input_batch.is_dummy or input_batch.sampling is None else input_batch.num_reqs
-        return DFlash2DecoderMetadata(requests)
-
-    def allocate_persistent(self, input_batch: InputBatch, metadata: AttentionMetadata) -> DFlash2DecoderMetadata:
-        requests, remainder = divmod(input_batch.num_tokens_after_padding, self._query_width)
-        return DFlash2DecoderMetadata(0 if remainder else requests)
-
-    def update_persistent(
-        self, persistent_metadata: DFlash2DecoderMetadata, input_batch: InputBatch, metadata: AttentionMetadata
-    ) -> None:
-        return None
-
-
 class DFlash2DecoderModel(nn.Module):
     """Execute backbone, proposal-position LM head and candidate selector together."""
 
@@ -209,7 +178,7 @@ class DFlash2DecoderModel(nn.Module):
         hidden = model.model(input_ids, positions, input_embedding)
         if not isinstance(hidden, torch.Tensor):
             raise TypeError("DFlash2 backbone must return hidden states")
-        decoder = get_execution_context(DFlash2DecoderMetadata)
+        decoder = get_execution_context(DFlashDecoderMetadata)
         if decoder is None or decoder.num_requests == 0:
             return DraftDecoderOutput(hidden_states=hidden)
         requests = decoder.num_requests

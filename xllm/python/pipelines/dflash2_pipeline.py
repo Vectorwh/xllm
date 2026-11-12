@@ -26,11 +26,11 @@ from xllm.python.model_executor.model_output import DraftCandidates, DraftDecode
 from xllm.python.model_executor.runner import RunnerConfig
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.models.dflash2_model import (
-    DFlash2DecoderMetadataBuilder,
     DFlash2DecoderModel,
     DFlash2ProposalModel,
     DFlash2SamplingMetadataBuilder,
 )
+from xllm.python.models.dflash_model import DFlashDecoderMetadataBuilder
 
 if TYPE_CHECKING:
     from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
@@ -56,7 +56,7 @@ class DFlash2ExecutionPipeline(ExecutionPipeline):
             DFlash2DecoderModel(model, self._sampling_builder.query_width),
             (
                 *(builder for builder in builders if builder not in sampling_builders),
-                DFlash2DecoderMetadataBuilder(self._sampling_builder.query_width),
+                DFlashDecoderMetadataBuilder(self._sampling_builder.query_width),
             ),
             runner_config,
             attention_backend=attention_backend,

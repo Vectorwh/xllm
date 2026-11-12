@@ -20,6 +20,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/speculative_config.h"
@@ -102,7 +103,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
                    const runtime::Options& options,
                    WorkerType worker_type);
 
-  ~DFlashWorkerImpl() override = default;
+  ~DFlashWorkerImpl() override;
 
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
@@ -111,6 +112,14 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
  protected:
+  bool can_prepare_without_compute_stream_wait(
+      const ForwardInput& input) const override;
+  bool can_prelaunch_draft_for_this_step(const ForwardInput& input) const;
+  bool can_prepare_device_draft_inputs(const ForwardInput& input) const;
+  void prepare_target_metadata(ForwardInput& validate_input);
+  std::pair<ForwardInput, torch::Tensor> prepare_pending_draft_query(
+      const ForwardInput& input,
+      const std::vector<int64_t>& rows);
   std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
 
   std::optional<ForwardOutput> step_decode(const ForwardInput& input) override;
@@ -140,6 +149,9 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // one forward + sequential Markov-head sampling loop).
   virtual DraftBlock run_decode_draft(const ForwardInput& input,
                                       ForwardInput& validate_input);
+  virtual DraftBlock run_decode_draft_from_pending(
+      const ForwardInput& input,
+      const std::vector<int64_t>& rows);
 
   virtual void prepare_validate_output_async(const ForwardInput& input);
   virtual void finalize_validate_output_async(const ForwardInput& input,
@@ -199,6 +211,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   };
 
   bool async_output_enabled_ = false;
+  bool proposal_xfia_enabled_ = false;
   bool draft_prelaunch_enabled_for_init_ = false;
   std::optional<PendingContext> pending_context_;
   // One idle step's inputs; retired only after the following step is queued.
@@ -209,6 +222,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   std::vector<torch::Tensor> consumed_context_tensors_;
 
  private:
+  DraftBlock execute_greedy_draft_query(ForwardInput query, bool prepared);
   bool draft_use_block_parallel_rows() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
   }

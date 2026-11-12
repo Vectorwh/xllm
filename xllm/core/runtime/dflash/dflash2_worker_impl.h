@@ -30,32 +30,22 @@ class DFlash2WorkerImpl final : public DFlashWorkerImpl {
                     const runtime::Options& options,
                     WorkerType worker_type);
 
-  ~DFlash2WorkerImpl() override;
-
  protected:
-  bool can_prepare_without_compute_stream_wait(
-      const ForwardInput& input) const override;
-  std::optional<ForwardOutput> step_decode(const ForwardInput& input) override;
-  std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
-  std::optional<ForwardOutput> step_empty(const ForwardInput& input) override;
   DraftBlock run_decode_draft(const ForwardInput& input,
                               ForwardInput& validate_input) override;
+  DraftBlock run_decode_draft_from_pending(
+      const ForwardInput& input,
+      const std::vector<int64_t>& rows) override;
 
  private:
   friend class DFlash2WorkerImplTestPeer;
 
-  bool can_prelaunch_draft_for_this_step(const ForwardInput& input) const;
-  bool can_prepare_device_draft_inputs(const ForwardInput& input) const;
-  void prepare_target_metadata(ForwardInput& validate_input);
-  DraftBlock run_decode_draft_from_pending(const ForwardInput& input,
-                                           const std::vector<int64_t>& rows);
   torch::Tensor prepare_draft_noise(const ForwardInput& input) const;
   DraftBlock execute_draft_query(const ForwardInput& input,
                                  ForwardInput query_input,
                                  const torch::Tensor& anchor_token_ids,
                                  const torch::Tensor& gumbel_noise,
                                  bool prepared);
-  bool proposal_xfia_enabled_ = false;
 
   struct BlockSampleOutput {
     torch::Tensor token_ids;

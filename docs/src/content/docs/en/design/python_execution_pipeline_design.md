@@ -390,7 +390,7 @@ management in the modules that actually own the resources.**
 
 ### 7. Step-local DFlash2 Orchestration
 
-DFlash2 and DSpark use the same cross-step lifecycle instead of predicting the next batch and caching a complete draft:
+DFlash, DFlash2 and DSpark use the same cross-step lifecycle instead of predicting the next batch and caching a complete draft:
 
 - After target verification in step `n-1`, enqueue the accepted-token D2H copy and context KV writes in that step.
   Asynchronous outputs carry a completion event covering the context writes; resource and block retirement must wait
@@ -406,12 +406,26 @@ DFlash2 and DSpark use the same cross-step lifecycle instead of predicting the n
   and do not depend on another step being scheduled.
 
 The existing `DFlashWorkerImpl` owns shared pending-context commit, asynchronous finalization, and idle DP-rank
-lifetimes. DSpark and DFlash2 retain their own draft computation and batch admission rules. Asynchronous finalization
+lifetimes. DFlash and DFlash2 also share decode-step orchestration, target metadata preparation, and pending-device query
+construction; their proposal algorithms remain separate. DSpark retains its own draft computation and batch admission rules. Asynchronous finalization
 and prelaunch remain separate decisions: prelaunch restrictions such as CP/KV split do not disable asynchronous
-finalization. DFlash2 batches with nonempty KV transfers currently retain synchronous finalization to preserve the
+finalization. DFlash/DFlash2 batches with nonempty KV transfers currently retain synchronous finalization to preserve the
 existing draft PUSH completion protocol.
 Prelaunch capacity checks include the upper bound of the still-unconfirmed accepted prefix. After host correction,
 the ordinary path can independently select the draft graph.
+
+Python DFlash uses `DFlashExecutionPipeline` with a decoder Runner (backbone and proposal-position LM head) and a
+separate greedy sampling Runner. The decoder skips the anchor's LM head row. Sampling consumes the existing repeated
+draft parameters through the native sampler, preserving penalties and masks rather than substituting an unconditional
+argmax. Only unconstrained greedy sampling is graph-capturable; constrained sampling falls back independently of the
+decoder. There is no candidate selector, Markov sampling loop, or dense draft-probability output. Target request sampling
+may still be random, but ordinary DFlash does not support probabilistic draft sampling.
+
+NPU Python DFlash enables asynchronous output with schedule overlap when adaptive speculation is off. Prelaunch reuses
+the DFlash2 proposal-attention limits (A3, CP1, effective KV split1, fused or PD decode), pending-request identity checks,
+and conservative lookahead capacity. Host restoration, KV movement, structured constraints, and history-dependent draft
+penalties prevent prelaunch without disabling asynchronous output or independently eligible graphs. Native DFlash paths
+remain synchronous; the target's backbone graph boundary and verification semantics are unchanged.
 
 Python DFlash2 uses `DFlash2ExecutionPipeline` with two independently dispatched Runners:
 
@@ -434,7 +448,7 @@ candidates to N rows per request for the independent proposal Runner; the public
 unchanged. Sampling returns request-aligned `[batch, N]`
 tokens and `[batch, N, vocab]` dense draft probabilities. Each of the two stages selects eager or graph independently;
 sampling fallback does not disable the decoder graph.
-`DFlash2DecoderMetadataBuilder` preserves eager backbone-only calls without sampling. Graphs with complete query blocks
+The shared `DFlashDecoderMetadataBuilder` preserves eager backbone-only calls without sampling. Graphs with complete query blocks
 always capture the whole decoder, so a sampling-free warmup cannot cache a graph that omits LM head or selector for
 later proposal requests. Calls without sampling and dummy calls still return only backbone hidden states to their caller.
 Attention Runner input management and capture logic remain unchanged.

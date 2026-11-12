@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,8 +25,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
+from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
 from xllm.python.layers import RMSNorm
+from xllm.python.model_executor.execution_context import ExecutionMetadataBuilder
+from xllm.python.model_executor.execution_pipeline import ExecutionPipeline
 from xllm.python.model_executor.forward_context import LayerSynchronizer
+from xllm.python.model_executor.runner import RunnerConfig
 from xllm.python.model_loader import (
     ParallelLoadContext,
     ScopedWeightLoader,
@@ -351,8 +356,23 @@ class DFlashQwen3ForCausalLM(PyModelBase):
         self.cfg.validate()
         self.dtype = self.resolve_dtype(config.get("dtype") or config.get("torch_dtype"))
         self.device = torch.device(config.get("device", "npu"))
+        self.draft_query_width = int(config.get("draft_query_width", 1))
         self.model = self.model_cls(self.cfg, self.dtype, self.device)  # pyright: ignore[reportIncompatibleVariableOverride]
         self.lm_head: nn.Module | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    def create_execution_pipeline(
+        self,
+        builders: Sequence[ExecutionMetadataBuilder],
+        runner_config: RunnerConfig,
+        *,
+        attention_backend: AttentionBackend | None = None,
+        restore_history: Callable[[AttentionMetadata], None] | None = None,
+    ) -> ExecutionPipeline:
+        from xllm.python.pipelines.dflash_pipeline import DFlashExecutionPipeline
+
+        return DFlashExecutionPipeline(
+            self, builders, runner_config, attention_backend=attention_backend, restore_history=restore_history
+        )
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         all_weights = self.model.load_weights(state_dicts, tp_rank, tp_size)

@@ -35,6 +35,7 @@ from xllm.python.model_executor.runners import base as runner_base
 from xllm.python.model_executor.runners.base import BaseRunner
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.dflash2_model import DFlash2DecoderModel, DFlash2SamplingMetadataBuilder
+from xllm.python.models.dflash_model import DFlashDecoderModel
 from xllm.python.models.qwen3_dflash2 import DFlash2CandidateSelector, DFlash2Qwen3ForCausalLM
 from xllm.python.pipelines.dflash2_pipeline import DFlash2ExecutionPipeline
 from xllm.python.registry import get_execution_metadata_builder_classes
@@ -287,10 +288,13 @@ def test_backbone_only_execution_without_proposal(dummy: bool) -> None:
     assert model.lm_head.rows == []
 
 
-def test_dp_draft_warmup_uses_eager_without_relaxing_target_row_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("decoder_cls", [DFlashDecoderModel, DFlash2DecoderModel])
+def test_dp_draft_warmup_uses_eager_without_relaxing_target_row_validation(
+    monkeypatch: pytest.MonkeyPatch, decoder_cls: type[DFlashDecoderModel] | type[DFlash2DecoderModel]
+) -> None:
     model = _Model()
     runner = Runner(
-        DFlash2DecoderModel(model, 8),
+        decoder_cls(model, 8),
         (),
         RunnerConfig(
             torch.device("cpu"),
@@ -328,13 +332,14 @@ def test_dp_draft_warmup_uses_eager_without_relaxing_target_row_validation(monke
 
 
 @pytest.mark.parametrize("num_reqs", [0, 2])
+@pytest.mark.parametrize("decoder_cls", [DFlashDecoderModel, DFlash2DecoderModel])
 def test_expanded_draft_dp_admission_preserves_empty_and_busy_shards(
-    monkeypatch: pytest.MonkeyPatch, num_reqs: int
+    monkeypatch: pytest.MonkeyPatch, num_reqs: int, decoder_cls: type[DFlashDecoderModel] | type[DFlash2DecoderModel]
 ) -> None:
     model = _Model()
     width = 8
     runner = Runner(
-        DFlash2DecoderModel(model, width),
+        decoder_cls(model, width),
         (),
         RunnerConfig(
             torch.device("cpu"),

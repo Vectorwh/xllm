@@ -534,6 +534,19 @@ if(USE_NPU)
   message(STATUS "VCPKG_INCLUDE_DIR = ${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include")
   include_directories("${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include")
 
+  # torch npu_torch and npu ops is only used by npu related modules/classes, so system priority is reasonable.
+  include_directories(SYSTEM
+      $ENV{PYTHON_INCLUDE_PATH}
+      $ENV{PYTORCH_INSTALL_PATH}/include
+      $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/api/include
+      $ENV{PYTORCH_NPU_INSTALL_PATH}/include
+      $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/distributed
+      $ENV{NPU_HOME_PATH}/include
+      $ENV{NPU_HOME_PATH}/include/aclnnop
+      $ENV{ATB_HOME_PATH}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/torch_npu_ops/
+  )
+
   add_subdirectory(
     "${XLLM_ATB_LAYERS_SOURCE_DIR}"
     "${CMAKE_BINARY_DIR}/xllm_atb_layers"
@@ -555,18 +568,6 @@ if(USE_NPU)
     )
   endif()
 
-  # torch npu_torch and npu ops is only used by npu related modules/classes, so system priority is reasonable.
-  include_directories(SYSTEM
-      $ENV{PYTHON_INCLUDE_PATH}
-      $ENV{PYTORCH_INSTALL_PATH}/include
-      $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/api/include
-      $ENV{PYTORCH_NPU_INSTALL_PATH}/include
-      $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/distributed
-      $ENV{NPU_HOME_PATH}/include
-      $ENV{NPU_HOME_PATH}/include/aclnnop
-      $ENV{ATB_HOME_PATH}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/torch_npu_ops/
-  )
   ## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math
   if(EXISTS "$ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include")
     include_directories(SYSTEM

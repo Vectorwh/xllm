@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <folly/executors/InlineExecutor.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
@@ -20,8 +21,10 @@ limitations under the License.
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -146,20 +149,59 @@ class DSparkWorkerImplTestPeer final {
 
 namespace {
 
+class DeviceTailGate final {
+ public:
+  ~DeviceTailGate() { release(); }
+
+  aclError enqueue(aclrtStream stream) const {
+    auto callback_state = std::make_unique<std::shared_ptr<State>>(state_);
+    const aclError result = aclrtLaunchHostFunc(
+        stream,
+        [](void* user_data) {
+          std::unique_ptr<std::shared_ptr<State>> callback_state(
+              static_cast<std::shared_ptr<State>*>(user_data));
+          State& state = **callback_state;
+          std::unique_lock<std::mutex> lock(state.mutex);
+          state.entered = true;
+          state.condition.notify_all();
+          state.condition.wait(lock, [&state] { return state.released; });
+        },
+        callback_state.get());
+    if (result == ACL_SUCCESS) {
+      callback_state.release();
+    }
+    return result;
+  }
+
+  bool wait_until_entered() const {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    return state_->condition.wait_for(
+        lock, std::chrono::seconds(10), [this] { return state_->entered; });
+  }
+
+  void release() const {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->released = true;
+    state_->condition.notify_all();
+  }
+
+ private:
+  struct State {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool released = false;
+  };
+
+  std::shared_ptr<State> state_ = std::make_shared<State>();
+};
+
 class OverlapResultWorker final : public WorkerImpl {
  public:
   OverlapResultWorker(const ParallelArgs& parallel_args,
                       const torch::Device& device,
                       const runtime::Options& options)
-      : WorkerImpl(parallel_args, device, options) {
-    auto guard = compute_stream_->set_stream_guard();
-    const torch::TensorOptions tensor_options =
-        torch::TensorOptions().device(device).dtype(torch::kBFloat16);
-    lhs_ = torch::ones({4096, 4096}, tensor_options);
-    rhs_ = torch::ones_like(lhs_);
-    scratch_ = torch::empty_like(lhs_);
-    compute_stream_->synchronize();
-  }
+      : WorkerImpl(parallel_args, device, options) {}
 
   bool init_model(ModelContext& context) override { return false; }
 
@@ -189,10 +231,18 @@ class OverlapResultWorker final : public WorkerImpl {
 
   bool has_recorded_output() const { return is_recorded_; }
 
+  std::shared_ptr<DeviceTailGate> hold_next_tail() {
+    std::lock_guard<std::mutex> lock(gate_mutex_);
+    CHECK(next_gate_ == nullptr);
+    next_gate_ = std::make_shared<DeviceTailGate>();
+    return next_gate_;
+  }
+
  protected:
   std::optional<ForwardOutput> step_for_schedule_overlap(
       ForwardInput& input) override {
     if (input.input_params.meta.batch_forward_type.is_empty()) {
+      submitted_step_.store(-1, std::memory_order_release);
       return std::nullopt;
     }
     const int64_t step_id = input.positions_host.item<int64_t>();
@@ -207,10 +257,14 @@ class OverlapResultWorker final : public WorkerImpl {
     auto retained = std::make_shared<ForwardInput>(input);
     retained->token_ids = tokens;
     retained->token_ids_host = host_tokens;
-    if (!driver_ || step_id % 2 == 0) {
-      for (int32_t iteration = 0; iteration < 128; ++iteration) {
-        torch::mm_out(scratch_, lhs_, rhs_);
-      }
+    std::shared_ptr<DeviceTailGate> gate;
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex_);
+      gate = std::exchange(next_gate_, nullptr);
+    }
+    if (gate != nullptr) {
+      EXPECT_EQ(gate->enqueue(compute_stream_->get_stream()->stream()),
+                ACL_SUCCESS);
     }
     tokens.fill_(step_id);
     host_tokens.copy_(tokens, true);
@@ -224,9 +278,8 @@ class OverlapResultWorker final : public WorkerImpl {
   }
 
  private:
-  torch::Tensor lhs_;
-  torch::Tensor rhs_;
-  torch::Tensor scratch_;
+  std::mutex gate_mutex_;
+  std::shared_ptr<DeviceTailGate> next_gate_;
   std::atomic<int64_t> submitted_step_{-1};
 };
 
@@ -269,11 +322,14 @@ TEST_P(WorkerOverlapResultSlotTest,
   int32_t dequeued_not_ready_windows = 0;
   for (int64_t iteration = 0; iteration < 1000; ++iteration) {
     const int64_t step_id = iteration * 2;
+    auto gate = worker.hold_next_tail();
     auto current = worker.step_async(make_overlap_producer_input(step_id));
     ASSERT_TRUE(std::move(current).get().has_value());
-    auto next = worker.step_async(make_overlap_producer_input(step_id + 1));
+    ASSERT_TRUE(gate->wait_until_entered());
+    auto next = worker.step_async(make_overlap_producer_input(step_id + 1))
+                    .via(&folly::InlineExecutor::instance());
     EXPECT_TRUE(worker.wait_for_submission(step_id + 1));
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    next.wait(std::chrono::milliseconds(1));
     if (!next.isReady()) {
       ++full_slot_windows;
     }
@@ -287,11 +343,13 @@ TEST_P(WorkerOverlapResultSlotTest,
     if (status == ACL_EVENT_RECORDED_STATUS_NOT_READY) {
       ++dequeued_not_ready_windows;
     }
+    EXPECT_EQ(status, ACL_EVENT_RECORDED_STATUS_NOT_READY);
     EXPECT_EQ(
         result.retained_inputs.front()->input_params.embedding.request_ids,
         std::vector<std::string>{"request-" + std::to_string(step_id)});
     EXPECT_EQ(result.retained_inputs.front()->sample_sequence_ids,
               std::vector<std::string>{"sequence-" + std::to_string(step_id)});
+    gate->release();
     EXPECT_TRUE(result.ready_event->synchronize());
     EXPECT_EQ(result.retained_inputs.front()->token_ids_host.item<int64_t>(),
               step_id);
@@ -326,12 +384,14 @@ TEST_P(WorkerOverlapResultSlotTest,
       .enable_speculative_decode(true)
       .num_speculative_tokens(15);
   OverlapResultWorker worker(parallel_args, device.unwrap(), options);
+  auto gate = worker.hold_next_tail();
   auto previous =
       std::move(worker.step_async(make_overlap_producer_input(0))).get();
   ASSERT_TRUE(previous.has_value());
   int32_t overwrite_not_ready_windows = 0;
   int32_t clear_not_ready_windows = 0;
   for (int64_t step_id = 0; step_id < 1000; ++step_id) {
+    ASSERT_TRUE(gate->wait_until_entered());
     const StreamEventPtr previous_ready = previous->ready_event;
     const std::weak_ptr<ForwardInput> previous_owner =
         previous->retained_inputs.front();
@@ -345,9 +405,17 @@ TEST_P(WorkerOverlapResultSlotTest,
     if (status == ACL_EVENT_RECORDED_STATUS_NOT_READY) {
       ++overwrite_not_ready_windows;
     }
-    previous =
-        std::move(worker.step_async(make_overlap_producer_input(step_id + 1)))
-            .get();
+    EXPECT_EQ(status, ACL_EVENT_RECORDED_STATUS_NOT_READY);
+    auto next_gate = worker.hold_next_tail();
+    auto next = worker.step_async(make_overlap_producer_input(step_id + 1))
+                    .via(&folly::InlineExecutor::instance());
+    EXPECT_TRUE(worker.wait_for_submission(step_id + 1));
+    next.wait(std::chrono::milliseconds(1));
+    EXPECT_FALSE(next.isReady());
+    EXPECT_FALSE(previous_owner.expired());
+    gate->release();
+    previous = std::move(next).get();
+    gate = std::move(next_gate);
     ASSERT_TRUE(previous.has_value());
     ASSERT_EQ(aclrtQueryEventStatus(previous_ready->npu_event(), &status),
               ACL_SUCCESS);
@@ -357,6 +425,7 @@ TEST_P(WorkerOverlapResultSlotTest,
     EXPECT_FALSE(worker.has_recorded_output());
   }
   for (int64_t step_id = 1000; step_id < 2000; ++step_id) {
+    ASSERT_TRUE(gate->wait_until_entered());
     const StreamEventPtr previous_ready = previous->ready_event;
     const std::weak_ptr<ForwardInput> previous_owner =
         previous->retained_inputs.front();
@@ -370,8 +439,15 @@ TEST_P(WorkerOverlapResultSlotTest,
     if (status == ACL_EVENT_RECORDED_STATUS_NOT_READY) {
       ++clear_not_ready_windows;
     }
-    const auto cleared =
-        std::move(worker.step_async(make_overlap_empty_input())).get();
+    EXPECT_EQ(status, ACL_EVENT_RECORDED_STATUS_NOT_READY);
+    auto clearing = worker.step_async(make_overlap_empty_input())
+                        .via(&folly::InlineExecutor::instance());
+    EXPECT_TRUE(worker.wait_for_submission(-1));
+    clearing.wait(std::chrono::milliseconds(1));
+    EXPECT_FALSE(clearing.isReady());
+    EXPECT_FALSE(previous_owner.expired());
+    gate->release();
+    const auto cleared = std::move(clearing).get();
     EXPECT_FALSE(cleared.has_value());
     ASSERT_EQ(aclrtQueryEventStatus(previous_ready->npu_event(), &status),
               ACL_SUCCESS);
@@ -381,6 +457,7 @@ TEST_P(WorkerOverlapResultSlotTest,
     EXPECT_FALSE(worker.has_stored_output());
     EXPECT_FALSE(worker.has_recorded_output());
     if (step_id < 1999) {
+      gate = worker.hold_next_tail();
       previous =
           std::move(worker.step_async(make_overlap_producer_input(step_id + 1)))
               .get();
@@ -414,10 +491,12 @@ TEST_P(WorkerOverlapResultSlotTest,
   OverlapResultWorker worker(parallel_args, device.unwrap(), options);
   int32_t idle_not_ready_windows = 0;
   for (int64_t step_id = 0; step_id < 100; ++step_id) {
+    auto gate = worker.hold_next_tail();
     auto output =
         std::move(worker.step_async(make_overlap_producer_input(step_id)))
             .get();
     ASSERT_TRUE(output.has_value());
+    ASSERT_TRUE(gate->wait_until_entered());
     const StreamEventPtr ready = output->ready_event;
     const std::weak_ptr<ForwardInput> owner = output->retained_inputs.front();
     const torch::Tensor host = output->retained_inputs.front()->token_ids_host;
@@ -429,6 +508,8 @@ TEST_P(WorkerOverlapResultSlotTest,
     if (status == ACL_EVENT_RECORDED_STATUS_NOT_READY) {
       ++idle_not_ready_windows;
     }
+    EXPECT_EQ(status, ACL_EVENT_RECORDED_STATUS_NOT_READY);
+    gate->release();
     EXPECT_TRUE(ready->synchronize());
     EXPECT_EQ(host.item<int64_t>(), step_id);
     EXPECT_FALSE(owner.expired());

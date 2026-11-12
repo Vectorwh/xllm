@@ -314,18 +314,39 @@ TEST(DraftModelConfigTest,
       runtime::Options options;
       options.is_draft_engine(true)
           .speculative_algorithm(algorithm)
+          .draft_graph_query_width(algorithm == "DFlash" ? 7 : 0)
           .num_speculative_tokens(6);
 
       configure_block_diffusion_model(args, options);
 
-      EXPECT_EQ(args.requires_eager_execution(),
-                model_impl != "python" || algorithm == "DFlash");
+      EXPECT_EQ(args.requires_eager_execution(), model_impl != "python");
       EXPECT_FALSE(args.draft_query_uses_decode());
       if (algorithm == "DSpark") {
         EXPECT_EQ(args.dummy_token_count(), model_impl == "python" ? 6 : 1);
+      } else if (algorithm == "DFlash") {
+        EXPECT_EQ(args.dummy_token_count(), model_impl == "python" ? 7 : 1);
+      } else {
+        EXPECT_EQ(args.dummy_token_count(), 8);
       }
     }
   }
+  model_config.model_impl(original_model_impl);
+}
+
+TEST(DraftModelConfigTest, DFlashDummyGeometryUsesDraftQueryWidth) {
+  auto& model_config = ModelConfig::get_instance();
+  const std::string original_model_impl = model_config.model_impl();
+  model_config.model_impl("python");
+  ModelArgs args;
+  args.model_type("qwen3");
+  runtime::Options options;
+  options.is_draft_engine(true)
+      .speculative_algorithm("DFlash")
+      .num_speculative_tokens(0)
+      .draft_graph_query_width(8);
+  configure_block_diffusion_model(args, options);
+  EXPECT_EQ(args.dummy_token_count(), 8);
+  EXPECT_FALSE(args.requires_eager_execution());
   model_config.model_impl(original_model_impl);
 }
 

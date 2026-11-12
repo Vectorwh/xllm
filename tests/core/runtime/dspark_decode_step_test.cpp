@@ -81,11 +81,7 @@ class DFlashWorkerImplTestPeer final {
     CHECK_EQ(worker.compute_stream_->synchronize(), 0);
     return validation;
   }
-};
-
-class DFlash2WorkerImplTestPeer final {
- public:
-  static void configure_execution(DFlash2WorkerImpl& worker,
+  static void configure_execution(DFlashWorkerImpl& worker,
                                   std::unique_ptr<LLMWorkerImpl> draft,
                                   std::unique_ptr<WorkerImpl> target,
                                   std::shared_ptr<EmbeddingCache> cache) {
@@ -103,22 +99,22 @@ class DFlash2WorkerImplTestPeer final {
     worker.proposal_xfia_enabled_ = true;
   }
 
-  static void set_prelaunch_enabled(DFlash2WorkerImpl& worker, bool enabled) {
+  static void set_prelaunch_enabled(DFlashWorkerImpl& worker, bool enabled) {
     worker.draft_prelaunch_enabled_for_init_ = enabled;
   }
 
-  static bool can_prelaunch_draft_for_this_step(const DFlash2WorkerImpl& worker,
+  static bool can_prelaunch_draft_for_this_step(const DFlashWorkerImpl& worker,
                                                 const ForwardInput& input) {
     return worker.can_prelaunch_draft_for_this_step(input);
   }
 
   static std::optional<ForwardOutput> run_decode_step(
-      DFlash2WorkerImpl& worker,
+      DFlashWorkerImpl& worker,
       const ForwardInput& input) {
     return worker.step_decode(input);
   }
 
-  static void install_pending_context(DFlash2WorkerImpl& worker,
+  static void install_pending_context(DFlashWorkerImpl& worker,
                                       ForwardInput identity,
                                       const torch::Tensor& accepted_device,
                                       const torch::Tensor& accepted_host,
@@ -137,15 +133,15 @@ class DFlash2WorkerImplTestPeer final {
     worker.pending_context_->context_ready = std::move(ready);
   }
 
-  static bool has_pending(const DFlash2WorkerImpl& worker) {
+  static bool has_pending(const DFlashWorkerImpl& worker) {
     return worker.pending_context_.has_value();
   }
 
-  static bool async_output_enabled(const DFlash2WorkerImpl& worker) {
+  static bool async_output_enabled(const DFlashWorkerImpl& worker) {
     return worker.async_output_enabled_;
   }
 
-  static void commit_pending_context(DFlash2WorkerImpl& worker) {
+  static void commit_pending_context(DFlashWorkerImpl& worker) {
     worker.commit_pending_context();
   }
 };
@@ -1450,7 +1446,8 @@ class DecodeStepDraftWorker final : public LLMWorkerImpl {
     args.model_type("dspark_decode_step_test")
         .n_layers(1)
         .hidden_size(4)
-        .draft_query_uses_decode(!dflash2)
+        .draft_query_uses_decode(!dflash2 &&
+                                 options.speculative_algorithm() != "DFlash")
         .dflash2_selector_top_k(1)
         .max_position_embeddings(8192);
     context_ = ModelContext(parallel_args, args, QuantArgs(), tensor_options);
@@ -1723,28 +1720,38 @@ TEST_F(DSparkDecodeExecutionTest, PrelaunchFallsBackForPenaltyAndRecovers) {
   EXPECT_EQ(trace->context_slots.size(), 3);
 }
 
-class DFlash2DecodeExecutionTest : public DSparkDecodeExecutionTest,
-                                   public ::testing::WithParamInterface<bool> {
+class DFlashDecodeExecutionTest
+    : public DSparkDecodeExecutionTest,
+      public ::testing::WithParamInterface<std::tuple<std::string, bool>> {
+ protected:
+  std::unique_ptr<DFlashWorkerImpl> make_worker(
+      const ParallelArgs& parallel_args,
+      const runtime::Options& options) {
+    if (options.speculative_algorithm() == "DFlash") {
+      return std::make_unique<DFlashWorkerImpl>(
+          parallel_args, device_.unwrap(), options, WorkerType::LLM);
+    }
+    return std::make_unique<DFlash2WorkerImpl>(
+        parallel_args, device_.unwrap(), options, WorkerType::LLM);
+  }
 };
 
-TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
+TEST_P(DFlashDecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
   const ParallelArgs parallel_args(0, 1, nullptr);
   runtime::Options options;
   options.enable_graph(false)
       .backend("llm")
       .enable_schedule_overlap(true)
       .enable_speculative_decode(true)
-      .speculative_algorithm("dflash2")
+      .speculative_algorithm(std::get<0>(GetParam()))
       .draft_sampling_mode("greedy")
       .num_speculative_tokens(2)
       .block_size(4);
-  DFlash2WorkerImpl worker(parallel_args,
-                           device_.unwrap(),
-                           options,
-                           /*worker_type=*/WorkerType::LLM);
+  auto owned_worker = make_worker(parallel_args, options);
+  auto& worker = *owned_worker;
   auto cache = std::make_shared<EmbeddingCache>(2, true);
   auto trace = std::make_shared<DecodeStepTrace>();
-  trace->pipeline_output = GetParam();
+  trace->pipeline_output = std::get<1>(GetParam());
   trace->pending_at_draft.reserve(3);
   trace->draft_tokens.reserve(3);
   trace->draft_positions.reserve(3);
@@ -1753,17 +1760,15 @@ TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
   runtime::Options leaf_options = options;
   leaf_options.enable_schedule_overlap(false);
   trace->target_metadata.reserve(3);
-  DFlash2WorkerImplTestPeer::configure_execution(
+  DFlashWorkerImplTestPeer::configure_execution(
       worker,
       std::make_unique<DecodeStepDraftWorker>(
           parallel_args,
           device_.unwrap(),
           leaf_options,
           trace,
-          [&worker]() {
-            return DFlash2WorkerImplTestPeer::has_pending(worker);
-          },
-          true),
+          [&worker]() { return DFlashWorkerImplTestPeer::has_pending(worker); },
+          options.speculative_algorithm() != "DFlash"),
       std::make_unique<DecodeStepTargetWorker>(
           parallel_args, device_.unwrap(), leaf_options, trace),
       cache);
@@ -1785,14 +1790,14 @@ TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
   torch::Tensor base_positions = previous.positions_host.to(device_.unwrap());
   auto ready = device_.current_stream()->record_event();
   ASSERT_NE(ready, nullptr);
-  DFlash2WorkerImplTestPeer::install_pending_context(worker,
-                                                     previous,
-                                                     accepted_device,
-                                                     accepted_host,
-                                                     embeddings,
-                                                     base_positions,
-                                                     ready,
-                                                     cache);
+  DFlashWorkerImplTestPeer::install_pending_context(worker,
+                                                    previous,
+                                                    accepted_device,
+                                                    accepted_host,
+                                                    embeddings,
+                                                    base_positions,
+                                                    ready,
+                                                    cache);
 
   const std::vector<torch::Tensor> scheduler_positions = {
       torch::tensor({3, 11}, torch::kInt),
@@ -1833,7 +1838,14 @@ TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
     input.sampling_params.all_greedy_sample = true;
     input.sampling_params.do_sample =
         torch::zeros({2}, input.token_ids.options().dtype(torch::kBool));
-    DFlash2WorkerImplTestPeer::set_prelaunch_enabled(worker, step != 1);
+    DFlashWorkerImplTestPeer::set_prelaunch_enabled(worker, step != 1);
+    if (options.speculative_algorithm() == "DFlash" && step == 0) {
+      input.sampling_params.frequency_penalties = torch::ones({2});
+      EXPECT_FALSE(DFlashWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+          worker, input));
+      EXPECT_TRUE(DFlashWorkerImplTestPeer::async_output_enabled(worker));
+      input.sampling_params.frequency_penalties = torch::Tensor();
+    }
     if (step == 2) {
       input.input_params.embedding.embedding_ids = {1, 0};
       input.input_params.embedding.request_ids = {"second", "first"};
@@ -1844,10 +1856,10 @@ TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
     input.input_params.attention.device.block_tables =
         input.input_params.attention.host.block_tables.to(device_.unwrap());
     input.metadata_ready_event = device_.current_stream()->record_event();
-    EXPECT_EQ(DFlash2WorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+    EXPECT_EQ(DFlashWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
                   worker, input),
               step != 1);
-    auto output = DFlash2WorkerImplTestPeer::run_decode_step(worker, input);
+    auto output = DFlashWorkerImplTestPeer::run_decode_step(worker, input);
     ASSERT_TRUE(output.has_value());
     ASSERT_NE(output->ready_event, nullptr);
     EXPECT_TRUE(output->requires_host_retirement);
@@ -1857,8 +1869,8 @@ TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
     ASSERT_EQ(trace->context_slots.size(), step + 1);
     ASSERT_EQ(trace->target_metadata.size(), step + 1);
     EXPECT_EQ(trace->target_metadata.back() != nullptr, step != 1);
-    EXPECT_TRUE(DFlash2WorkerImplTestPeer::has_pending(worker));
-    EXPECT_TRUE(DFlash2WorkerImplTestPeer::async_output_enabled(worker));
+    EXPECT_TRUE(DFlashWorkerImplTestPeer::has_pending(worker));
+    EXPECT_TRUE(DFlashWorkerImplTestPeer::async_output_enabled(worker));
     const auto states =
         cache->read_decode_states(input.input_params.embedding.embedding_ids,
                                   input.input_params.embedding.request_ids);
@@ -1919,17 +1931,17 @@ TEST_P(DFlash2DecodeExecutionTest, PrelaunchFallbackAndReorderedBatch) {
         torch::equal(outputs[step].sample_output.next_tokens.to(torch::kLong),
                      expected_accepted));
   }
-  DFlash2WorkerImplTestPeer::commit_pending_context(worker);
-  EXPECT_FALSE(DFlash2WorkerImplTestPeer::has_pending(worker));
+  DFlashWorkerImplTestPeer::commit_pending_context(worker);
+  EXPECT_FALSE(DFlashWorkerImplTestPeer::has_pending(worker));
   const auto states = cache->read_decode_states({0, 1}, {"first", "second"});
   ASSERT_EQ(states.size(), 2);
   EXPECT_EQ(states[0].token_id, 13);
   EXPECT_EQ(states[1].token_id, 23);
-  DFlash2WorkerImplTestPeer::commit_pending_context(worker);
+  DFlashWorkerImplTestPeer::commit_pending_context(worker);
   EXPECT_EQ(trace->context_slots.size(), 3);
 }
 
-TEST_P(DFlash2DecodeExecutionTest, LastStepWritesContextWithoutPrelaunch) {
+TEST_P(DFlashDecodeExecutionTest, LastStepWritesContextWithoutPrelaunch) {
   const ParallelArgs parallel_args(0, 1, nullptr);
   for (const bool overlap : {false, true}) {
     SCOPED_TRACE(overlap);
@@ -1938,18 +1950,18 @@ TEST_P(DFlash2DecodeExecutionTest, LastStepWritesContextWithoutPrelaunch) {
         .backend("llm")
         .enable_schedule_overlap(overlap)
         .enable_speculative_decode(true)
-        .speculative_algorithm("dflash2")
+        .speculative_algorithm(std::get<0>(GetParam()))
         .draft_sampling_mode("greedy")
         .num_speculative_tokens(2)
         .block_size(4);
-    DFlash2WorkerImpl worker(
-        parallel_args, device_.unwrap(), options, WorkerType::LLM);
+    auto owned_worker = make_worker(parallel_args, options);
+    auto& worker = *owned_worker;
     auto cache = std::make_shared<EmbeddingCache>(1, true);
     auto trace = std::make_shared<DecodeStepTrace>();
-    trace->pipeline_output = GetParam();
+    trace->pipeline_output = std::get<1>(GetParam());
     runtime::Options leaf_options = options;
     leaf_options.enable_schedule_overlap(false);
-    DFlash2WorkerImplTestPeer::configure_execution(
+    DFlashWorkerImplTestPeer::configure_execution(
         worker,
         std::make_unique<DecodeStepDraftWorker>(
             parallel_args,
@@ -1957,13 +1969,13 @@ TEST_P(DFlash2DecodeExecutionTest, LastStepWritesContextWithoutPrelaunch) {
             leaf_options,
             trace,
             [&worker]() {
-              return DFlash2WorkerImplTestPeer::has_pending(worker);
+              return DFlashWorkerImplTestPeer::has_pending(worker);
             },
-            true),
+            options.speculative_algorithm() != "DFlash"),
         std::make_unique<DecodeStepTargetWorker>(
             parallel_args, device_.unwrap(), leaf_options),
         cache);
-    DFlash2WorkerImplTestPeer::set_prelaunch_enabled(worker, false);
+    DFlashWorkerImplTestPeer::set_prelaunch_enabled(worker, false);
     DFlashWorkerImplTestPeer::set_context_hidden_size(worker, 4);
     cache->write_mtp_bootstrap_context(
         0,
@@ -1999,10 +2011,10 @@ TEST_P(DFlash2DecodeExecutionTest, LastStepWritesContextWithoutPrelaunch) {
     input.sampling_params.do_sample =
         torch::zeros({1}, input.token_ids.options().dtype(torch::kBool));
     input.metadata_ready_event = device_.current_stream()->record_event();
-    auto output = DFlash2WorkerImplTestPeer::run_decode_step(worker, input);
+    auto output = DFlashWorkerImplTestPeer::run_decode_step(worker, input);
     ASSERT_TRUE(output.has_value());
     EXPECT_EQ(output->requires_host_retirement, overlap);
-    EXPECT_EQ(DFlash2WorkerImplTestPeer::has_pending(worker), overlap);
+    EXPECT_EQ(DFlashWorkerImplTestPeer::has_pending(worker), overlap);
     ASSERT_EQ(trace->pending_at_draft, std::vector<bool>({false}));
     ASSERT_EQ(trace->context_slots.size(), 1);
     if (output->ready_event != nullptr) {
@@ -2300,8 +2312,10 @@ TEST(DSparkDecodeStepTest, TextTargetBuildsLlmWorker) {
 }
 
 INSTANTIATE_TEST_SUITE_P(NativeAndPipeline,
-                         DFlash2DecodeExecutionTest,
-                         ::testing::Bool());
+                         DFlashDecodeExecutionTest,
+                         ::testing::Values(std::make_tuple("dflash2", false),
+                                           std::make_tuple("dflash2", true),
+                                           std::make_tuple("DFlash", true)));
 
 }  // namespace
 }  // namespace xllm

@@ -40,7 +40,10 @@ limitations under the License.
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/layers/common/kv_shard_batch_metadata.h"
 #include "framework/model/model_args.h"
+#include "framework/model/model_sampling_input.h"
 #include "framework/sampling/sampling_params.h"
+#include "layers/common/attention_metadata.h"
+#include "layers/common/attention_metadata_builder.h"
 #if defined(USE_NPU) || defined(USE_MLU)
 #include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
@@ -386,7 +389,8 @@ std::vector<int64_t> build_accepted_context_rows(
 bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
                                  const torch::Device& device,
                                  const runtime::Options& options) {
-  if (!SpeculativeConfig::is_dflash2_algorithm(
+  if (options.speculative_algorithm() != "DFlash" &&
+      !SpeculativeConfig::is_dflash2_algorithm(
           options.speculative_algorithm())) {
     return false;
   }
@@ -474,6 +478,17 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
             return std::make_unique<LLMWorkerImpl>(
                 config.parallel_args, device, config.options);
           }) {
+  const bool python_dflash = options.speculative_algorithm() == "DFlash" &&
+                             Platform::is_npu() &&
+                             ModelConfig::is_python_model_impl(
+                                 ModelConfig::get_instance().model_impl());
+  async_output_enabled_ = python_dflash && enable_schedule_overlap() &&
+                          !options.enable_adaptive_speculative_decode();
+  proposal_xfia_enabled_ =
+      enable_dflash_proposal_xfia(parallel_args, device, options);
+  draft_prelaunch_enabled_for_init_ =
+      async_output_enabled_ && proposal_xfia_enabled_ &&
+      parallel_args.kv_split_size_effective() == 1;
   speculative_position_labels_.reserve(
       static_cast<size_t>(options.num_speculative_tokens()));
   for (int32_t position = 0; position < options.num_speculative_tokens();
@@ -491,6 +506,8 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
         std::make_unique<AdaptiveSpeculativeController>(options);
   }
 }
+
+DFlashWorkerImpl::~DFlashWorkerImpl() { retire_async_output(); }
 
 bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
                                   int32_t random_seed,
@@ -661,6 +678,7 @@ std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
     const ForwardInput& input) {
+  commit_pending_context();
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
     std::optional<ForwardOutput> output =
         speculative_worker::run_worker_no_sync(
@@ -683,6 +701,9 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
   ForwardInput query_input = input;
   dflash_detail::reset_draft_model_metadata(query_input.input_params);
+  query_input.input_params.use_dflash_proposal_attention =
+      input.input_params.use_dflash_proposal_attention ||
+      (proposal_xfia_enabled_ && !input.input_params.meta.is_graph_warmup);
   query_input.input_params.meta.batch_forward_type = draft_batch_forward_type();
   if (draft_impl_->context_.get_model_args().dummy_token_count() == 1) {
     // The metadata builder uses zero query length to materialize a dummy row.
@@ -781,6 +802,7 @@ void DFlashWorkerImpl::finish_empty_decode(
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
     const ForwardInput& input) {
+  commit_pending_context();
   Timer timer;
   ForwardInput processed_target_input;
   ForwardOutput output =
@@ -888,6 +910,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
     clear_all_output_embeddings(output);
   }
 
+  consumed_context_tensors_.clear();
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     if (output.failed_request_ids.empty()) {
       return std::nullopt;
@@ -1087,9 +1110,159 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
     const ForwardInput& raw_input) {
   ForwardInput input = raw_input;
   ForwardInput validate_input;
-  prepare_decode_input(input);
-  DraftBlock draft_block = run_decode_draft(input, validate_input);
-  return run_validate(input, draft_block, validate_input);
+  const bool can_prelaunch = can_prelaunch_draft_for_this_step(input);
+  std::vector<int64_t> pending_rows;
+  if (can_prelaunch) {
+    pending_rows = build_batch_to_pending_row_mapping(input);
+  }
+  DraftBlock draft_block;
+  if (!pending_rows.empty()) {
+    draft_block = run_decode_draft_from_pending(input, pending_rows);
+    commit_pending_context();
+    prepare_decode_input(input);
+    prepare_validate_inputs(input, validate_input);
+  } else {
+    commit_pending_context();
+    prepare_decode_input(input);
+    draft_block = run_decode_draft(input, validate_input);
+  }
+  if (can_prelaunch) {
+    prepare_target_metadata(validate_input);
+  }
+  const bool async_output = async_output_enabled_ &&
+                            !input.input_params.meta.is_graph_warmup &&
+                            input.transfer_kv_infos.empty();
+  auto output = run_validate(input, draft_block, validate_input, async_output);
+  if (!async_output) {
+    consumed_context_tensors_.clear();
+  }
+  return output;
+}
+
+void DFlashWorkerImpl::prepare_target_metadata(ForwardInput& validate_input) {
+  ForwardInput prepared;
+  impl_->prepare_work_before_execute_on_stream(
+      validate_input, prepared, *prepare_stream_, false, false, false);
+  c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
+  prepared.input_params.attn_metadata =
+      std::make_shared<layer::AttentionMetadata>(
+          layer::AttentionMetadataBuilder::build(
+              prepared.input_params,
+              impl_->context_.get_model_args().enable_mla(),
+              std::nullopt,
+              device_.unwrap()));
+  speculative_worker::record_metadata_ready_event(*prepare_stream_, prepared);
+  validate_input = std::move(prepared);
+}
+
+bool DFlashWorkerImpl::can_prepare_without_compute_stream_wait(
+    const ForwardInput& input) const {
+  return can_prelaunch_draft_for_this_step(input);
+}
+
+bool DFlashWorkerImpl::can_prelaunch_draft_for_this_step(
+    const ForwardInput& input) const {
+  if (!draft_prelaunch_enabled_for_init_ ||
+      !can_prepare_device_draft_inputs(input)) {
+    return false;
+  }
+  const auto rows = specBuilder::make_decode_row_context(input);
+  const int32_t max_query_tokens_with_pending_acceptance =
+      2 * (options_.num_speculative_tokens() + 1);
+  return specBuilder::has_decode_lookahead_capacity(
+      rows,
+      max_query_tokens_with_pending_acceptance,
+      options_.block_size(),
+      draft_impl_->context_.get_model_args().max_position_embeddings());
+}
+
+bool DFlashWorkerImpl::can_prepare_device_draft_inputs(
+    const ForwardInput& input) const {
+  const auto& sampling = input.sampling_params;
+  if (options_.speculative_algorithm() == "DFlash" &&
+      (sampling.unique_token_ids.defined() ||
+       sampling.frequency_penalties.defined() ||
+       sampling.presence_penalties.defined() ||
+       sampling.repetition_penalties.defined())) {
+    return false;
+  }
+  if (!proposal_xfia_enabled_ || input.input_params.meta.is_graph_warmup ||
+      !input.input_params.meta.batch_forward_type.is_decode() ||
+      input.input_params.meta.num_sequences <= 0 ||
+      !input.input_params.multi_block_tables.empty() ||
+      input.input_params.meta.requires_host_restore ||
+      !input.input_params.block_copy.swap_blocks.empty() ||
+      (input.input_params.block_copy.src_block_indices.defined() &&
+       input.input_params.block_copy.src_block_indices.numel() > 0) ||
+      !input.transfer_kv_infos.empty() ||
+      input.input_params.embedding.mtp_bootstrap_embeddings.defined() ||
+      input.input_params.embedding.embedding_ids.empty() ||
+      input.input_params.embedding.request_ids.size() !=
+          input.input_params.embedding.embedding_ids.size()) {
+    return false;
+  }
+  const auto rows = specBuilder::make_decode_row_context(input);
+  return !rows.model_managed_multiblock &&
+         specBuilder::has_decode_lookahead_capacity(
+             rows,
+             options_.num_speculative_tokens() + 1,
+             options_.block_size(),
+             draft_impl_->context_.get_model_args().max_position_embeddings());
+}
+
+std::pair<ForwardInput, torch::Tensor>
+DFlashWorkerImpl::prepare_pending_draft_query(
+    const ForwardInput& input,
+    const std::vector<int64_t>& rows) {
+  ForwardInput query;
+  prepare_query_inputs(input, query);
+  query.input_params.use_dflash_proposal_attention = true;
+  ForwardInput prepared;
+  draft_impl_->prepare_work_before_execute_on_stream(
+      query, prepared, *prepare_stream_, true, false);
+  torch::Tensor row_indices;
+  torch::Tensor host_row_indices;
+  {
+    c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
+    host_row_indices = torch::empty(
+        {static_cast<int64_t>(rows.size())},
+        torch::TensorOptions().dtype(torch::kLong).pinned_memory(true));
+    std::copy(rows.begin(), rows.end(), host_row_indices.data_ptr<int64_t>());
+    row_indices = host_row_indices.to(device_, torch::kLong, true);
+    prepared.metadata_ready_event = prepare_stream_->record_event();
+  }
+  CHECK(prepared.metadata_ready_event != nullptr);
+  c10::StreamGuard compute_guard = compute_stream_->set_stream_guard();
+  CHECK(compute_stream_->wait_event(prepared.metadata_ready_event));
+  torch::Tensor accepted =
+      pending_context_->accepted_device.index_select(0, row_indices);
+  torch::Tensor base_positions =
+      pending_context_->base_positions.index_select(0, row_indices);
+  dflash_async::NextDraftInputs next = dflash_async::prepare_next_draft(
+      accepted,
+      base_positions,
+      prepared.input_params.attention.device.block_tables,
+      mask_token_id_,
+      options_.block_size());
+  prepared.token_ids.copy_(next.query_tokens);
+  prepared.positions.copy_(next.query_positions);
+  prepared.input_params.attention.device.new_cache_slots.copy_(
+      next.query_slots);
+  prepared.input_params.attention.device.kv_seq_lens.copy_(next.kv_lengths);
+  prepared.input_params.attn_metadata.reset();
+  prepared.metadata_ready_event.reset();
+  prepared.device_tensors_ready = true;
+  prepared.retained_device_tensors.reserve(
+      prepared.retained_device_tensors.size() + 6);
+  prepared.retained_device_tensors.insert(
+      prepared.retained_device_tensors.end(),
+      {row_indices,
+       host_row_indices,
+       accepted,
+       base_positions,
+       pending_context_->accepted_device,
+       pending_context_->base_positions});
+  return {std::move(prepared), std::move(next.anchor_tokens)};
 }
 
 void DFlashWorkerImpl::prepare_decode_input(ForwardInput& input) {
@@ -1149,38 +1322,76 @@ DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::run_decode_draft(
     const ForwardInput& input,
     ForwardInput& validate_input) {
   Timer timer;
-
   ForwardInput query_input;
   prepare_query_inputs(input, query_input);
-
-  ForwardOutput draft_output =
-      speculative_worker::run_worker_no_sync(
-          *draft_impl_, query_input, *prepare_stream_, *compute_stream_)
-          .value();
+  query_input.input_params.use_dflash_proposal_attention =
+      proposal_xfia_enabled_ && !input.input_params.meta.is_graph_warmup;
+  DraftBlock draft_block =
+      execute_greedy_draft_query(std::move(query_input), false);
   // Overlap validate input preparation with the async draft forward: the draft
   // launch above returns immediately, so building validate_input here (it only
   // reads the original input; draft tokens are injected later in
   // fill_validate_input_from_draft_outputs) runs on the host while the draft
   // computes on device, instead of delaying the draft launch.
   prepare_validate_inputs(input, validate_input);
-  // Keep draft tokens consistent across tensor-parallel ranks.
-  maybe_broadcast_spec_tokens(draft_output.sample_output.next_tokens);
-  process_draft_sample_output(draft_output.sample_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
+  return draft_block;
+}
 
+DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::run_decode_draft_from_pending(
+    const ForwardInput& input,
+    const std::vector<int64_t>& rows) {
+  Timer timer;
+  auto [prepared, anchor_tokens] = prepare_pending_draft_query(input, rows);
+  DraftBlock draft_block =
+      execute_greedy_draft_query(std::move(prepared), true);
+  COUNTER_ADD(speculative_execution_latency_seconds_draft,
+              timer.elapsed_seconds());
+  return draft_block;
+}
+
+DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::execute_greedy_draft_query(
+    ForwardInput query,
+    bool prepared) {
+  ForwardInput processed_input;
+  if (prepared) {
+    processed_input = std::move(query);
+  } else {
+    draft_impl_->prepare_work_before_execute_on_stream(
+        query, processed_input, *prepare_stream_);
+  }
+  ModelSamplingInput sampling;
+  sampling.parameters = processed_input.sampling_params;
+  processed_input.input_params.sampling = std::move(sampling);
+  ForwardOutput draft_output =
+      draft_impl_
+          ->execute_no_sync_on_stream(processed_input, *compute_stream_, false)
+          .value();
+  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  torch::Tensor tokens;
+  if (draft_output.draft_proposal.has_value()) {
+    tokens = draft_output.draft_proposal->token_ids();
+    CHECK_EQ(
+        tokens.sizes(),
+        torch::IntArrayRef({processed_input.input_params.meta.num_sequences,
+                            num_speculative_tokens}));
+    CHECK(!draft_output.draft_proposal->draft_probs().has_value());
+  } else {
+    process_draft_sample_output(draft_output.sample_output);
+    tokens = draft_output.sample_output.next_tokens;
+  }
+  // Keep draft tokens consistent across tensor-parallel ranks.
+  maybe_broadcast_spec_tokens(tokens);
   // Draft emits the whole block in one forward; reshape the flat outputs into
   // [batch, num_speculative_tokens] instead of splitting into per-step outputs.
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int32_t num_draft_tokens =
-      static_cast<int32_t>(draft_output.sample_output.next_tokens.numel());
+  const int32_t num_draft_tokens = static_cast<int32_t>(tokens.numel());
   CHECK_EQ(num_draft_tokens % num_speculative_tokens, 0)
       << "DFlash draft token count mismatch.";
   const int32_t batch_size = num_draft_tokens / num_speculative_tokens;
   DraftBlock draft_block;
   draft_block.proposal =
-      DraftProposal(draft_output.sample_output.next_tokens.view(
-          {batch_size, num_speculative_tokens}));
+      DraftProposal(tokens.view({batch_size, num_speculative_tokens}));
   draft_block.retained_inputs = take_retained_inputs(draft_output);
   return draft_block;
 }

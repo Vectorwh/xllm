@@ -332,7 +332,7 @@ Runner 不再在 `can_execute` 之外维护另一组否决条件。对实现了 
 
 ### 7. DFlash2 的逐 step 编排
 
-DFlash2 与 DSpark 采用同一种跨 step 生命周期，而不是在上一轮预测下一批请求并缓存完整 draft：
+DFlash、DFlash2 与 DSpark 采用同一种跨 step 生命周期，而不是在上一轮预测下一批请求并缓存完整 draft：
 
 - 第 `n-1` 轮完成 target verify 后，提交 accepted tokens 的 D2H，并在本轮提交 context KV 写入。
   异步输出携带覆盖 context 写入的完成事件，资源和块的释放必须等待该事件；最后一轮也不例外。
@@ -345,10 +345,22 @@ DFlash2 与 DSpark 采用同一种跨 step 生命周期，而不是在上一轮�
 - 关闭异步调度时，沿用同步收尾；context 写入仍属于当前轮，不依赖下一轮是否存在。
 
 公共 pending-context 提交、异步收尾和空 DP rank 的生命周期由已有 `DFlashWorkerImpl` 承担，
-DSpark 和 DFlash2 各自保留具体 draft 计算和逐 batch 准入条件。
+DFlash/DFlash2 进一步共用 decode-step 编排、target metadata 准备和 pending-device query 构造，
+各自保留 proposal 算法；DSpark 保留自身 draft 计算和逐 batch 准入条件。
 异步收尾与 prelaunch 是不同决定：CP/KV split 等 prelaunch 限制不关闭异步收尾。
-本轮 DFlash2 的非空 KV transfer batch 暂时保留原同步收尾，避免绕过既有 draft PUSH completion 协议。
+本轮 DFlash/DFlash2 的非空 KV transfer batch 暂时保留原同步收尾，避免绕过既有 draft PUSH completion 协议。
 prelaunch 的容量检查包含尚未确认的接受长度上界；普通路径完成 host 修正后，仍可独立选择 draft graph。
+
+Python DFlash 通过 `DFlashExecutionPipeline` 拆分 decoder Runner（backbone + proposal 位置的 lm_head）
+和独立的 greedy sampling Runner。lm_head 不计算 anchor 行；采样仍把原有按 proposal 行展开的参数交给
+native sampler，保留 penalty 和 mask，而不是一律替换成 argmax。仅无约束 greedy sampling 可以入图；
+有约束时只回退 sampling，不连带关闭 decoder graph。这里没有 candidate selector、Markov 采样循环和
+dense draft probabilities；target 请求仍可随机采样，普通 DFlash 仍不支持 probabilistic draft sampling。
+
+NPU Python DFlash 在 overlap 开启且未启用 adaptive speculation 时使用异步输出。prelaunch 沿用
+DFlash2 proposal attention 的支持范围（A3、CP1、effective KV split1、fused 或 PD decode）、pending 请求身份
+校验和保守的 lookahead 容量检查。host restore、KV 搬运、结构化约束及依赖历史的 draft penalty 阻止 prelaunch，
+不连带关闭异步输出或独立满足条件的图。native DFlash 保留原同步路径；target backbone 的图边界和验证语义不变。
 
 Python DFlash2 通过 `DFlash2ExecutionPipeline` 编排两个 Runner：
 
@@ -369,7 +381,7 @@ decoder 通过内部阶段输出 `DraftDecoderOutput.candidates` 返回 `[batch,
 Pipeline 将候选结果展平为每请求 N 行，交给独立的 proposal Runner；对外的 `ModelOutput` 与 C++ 契约不变。
 proposal 模块输出 request 对齐的 `[batch, N]` token ids 和 `[batch, N, vocab]` dense draft probabilities。
 两个阶段独立选择 eager/graph；sampling fallback 不影响整个 decoder 的图执行。
-`DFlash2DecoderMetadataBuilder` 在 eager 的无采样调用中保留 backbone-only 执行；完整 query block 的图
+共用的 `DFlashDecoderMetadataBuilder` 在 eager 的无采样调用中保留 backbone-only 执行；完整 query block 的图
 始终捕获整个 decoder，避免无采样 warmup 缓存的图在后续 proposal 请求中漏掉 lm_head 和 selector。
 无采样或 dummy 调用对外仍只返回 backbone hidden states。这里不修改 attention Runner 的输入管理或捕获逻辑。
 
