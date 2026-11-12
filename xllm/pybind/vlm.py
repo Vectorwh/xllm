@@ -94,6 +94,7 @@ class VLM:
         enable_return_mm_full_embeddings: bool = False,
         capture_hidden_state_layer: int = -1,
         enable_return_embedding_modality_tags: bool = False,
+        max_vit_attention_units_per_chunk: int = 0,
         **kwargs: Any,
     ) -> None:
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
@@ -128,6 +129,7 @@ class VLM:
         options.enable_prefix_cache = enable_prefix_cache
         options.max_encoder_cache_size = max_encoder_cache_size
         options.max_processor_cache_items = max_processor_cache_items
+        options.max_vit_attention_units_per_chunk = max_vit_attention_units_per_chunk
         options.max_tokens_per_batch = max_tokens_per_batch
         options.max_seqs_per_batch = max_seqs_per_batch
         options.max_tokens_per_chunk_for_prefill = max_tokens_per_chunk_for_prefill

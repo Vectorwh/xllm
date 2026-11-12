@@ -191,6 +191,8 @@ DECLARE_bool(enable_fia_decode);
 
 DECLARE_bool(enable_chunked_prefill);
 
+DECLARE_int32(max_vit_attention_units_per_chunk);
+
 DECLARE_string(master_node_addr);
 
 DECLARE_string(xtensor_master_node_addr);

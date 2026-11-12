@@ -50,6 +50,7 @@ class MultimodalConfig final {
          "fps_min_frames",
          "fps_max_frames",
          "video_max_token_num",
+         "max_vit_attention_units_per_chunk",
          "max_encoder_cache_size",
          "max_processor_cache_items",
          "enable_return_mm_full_embeddings",
@@ -74,6 +75,8 @@ class MultimodalConfig final {
   PROPERTY(int32_t, fps_max_frames) = 768;
 
   PROPERTY(int32_t, video_max_token_num) = -1;
+
+  PROPERTY(int32_t, max_vit_attention_units_per_chunk) = 0;
 
   PROPERTY(int64_t, max_encoder_cache_size) = 0;
 

@@ -22,6 +22,7 @@ limitations under the License.
 #include <unordered_map>
 
 #include "core/common/global_flags.h"
+#include "core/framework/config/multimodal_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
@@ -31,6 +32,7 @@ limitations under the License.
 #include "models/llm/npu/qwen2.h"
 #include "models/model_registry.h"
 #include "models/vlm/mposition/mposition.h"
+#include "models/vlm/utils/chunked_encoder.h"
 #include "models/vlm/utils/multimodal_utils.h"
 #include "processors/qwen2_vl_image_processor.h"
 #include "processors/qwen2_vl_video_processor.h"
@@ -359,8 +361,19 @@ class Qwen2_VisionTransformerImpl : public torch::nn::Module {
     return rotary_pos_emb;
   }
 
-  torch::Tensor forward(torch::Tensor hidden_states,
-                        torch::Tensor grid_thw) {  // [batch,thw]
+  torch::Tensor forward(torch::Tensor hidden_states, torch::Tensor grid_thw) {
+    return run_chunked_encoder(
+        hidden_states,
+        grid_thw,
+        MultimodalConfig::get_instance().max_vit_attention_units_per_chunk(),
+        [this](torch::Tensor pixels, torch::Tensor grid) {
+          return forward_single(std::move(pixels), std::move(grid));
+        });
+  }
+
+ private:
+  torch::Tensor forward_single(torch::Tensor hidden_states,
+                               torch::Tensor grid_thw) {  // [batch,thw]
     // patchify
     // hidden_states = x.to(device=self.device, dtype=self.dtype);
     hidden_states = patch_embed_(hidden_states);
@@ -397,6 +410,7 @@ class Qwen2_VisionTransformerImpl : public torch::nn::Module {
     return hidden_states;
   }
 
+ public:
   void load_state_dict(const StateDict& state_dict) {
     patch_embed_->load_state_dict(
         state_dict.get_dict_with_prefix("patch_embed."));

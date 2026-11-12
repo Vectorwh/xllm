@@ -87,6 +87,29 @@ class PublicModelImplTest(unittest.TestCase):
                     options = getattr(self._export, master_name).call_args.args[0]
                     self.assertEqual(options.model_impl, expected)
 
+    def test_vision_chunk_budget_reaches_offline_vlm_master(self) -> None:
+        parser = importlib.import_module("xllm.pybind.args").ArgumentParser().parser
+        self._export.get_model_backend.return_value = "vlm"
+        for module_name, class_name in (("vlm", "VLM"), ("llm", "LLM")):
+            for budget in (0, 2):
+                with self.subTest(api=class_name, budget=budget):
+                    arguments = vars(
+                        parser.parse_args(
+                            ["--model", str(self._model), "--max_vit_attention_units_per_chunk", str(budget)]
+                        )
+                    )
+                    module = importlib.import_module(f"xllm.pybind.{module_name}")
+                    if class_name == "LLM":
+                        module.LLM(**arguments)
+                    else:
+                        module.VLM(
+                            str(self._model),
+                            max_vit_attention_units_per_chunk=arguments["max_vit_attention_units_per_chunk"],
+                        )
+                    options = self._export.VLMMaster.call_args.args[0]
+                    self.assertEqual(options.max_vit_attention_units_per_chunk, budget)
+                    self._export.init_config_from_option.assert_called_with(options, "qwen3")
+
     def test_constructors_preserve_native_default(self) -> None:
         for module_name, class_name, master_name in (
             ("llm", "LLM", "LLMMaster"),

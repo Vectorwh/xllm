@@ -218,7 +218,9 @@ void init_config_from_option(const Options& options,
       .enable_return_mm_full_embeddings(
           options.enable_return_mm_full_embeddings())
       .enable_return_embedding_modality_tags(
-          options.enable_return_embedding_modality_tags());
+          options.enable_return_embedding_modality_tags())
+      .max_vit_attention_units_per_chunk(
+          options.max_vit_attention_units_per_chunk());
   LoadConfig::get_instance()
       .enable_manual_loader(options.enable_manual_loader())
       .enable_rolling_load(options.enable_rolling_load())

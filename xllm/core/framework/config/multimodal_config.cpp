@@ -61,6 +61,15 @@ DEFINE_int32(video_max_token_num,
              "video_max_token_num * (patch_size * merge_size)^2. -1 uses "
              "video_max_pixels from the model configuration.");
 
+DEFINE_int32(
+    max_vit_attention_units_per_chunk,
+    0,
+    "Max complete spatial ViT attention units per encoder chunk for NPU "
+    "Qwen2-VL, Qwen2.5-VL, Qwen3-VL and Qwen3.5 VL (dense and MoE). Each "
+    "image is one unit; videos contribute their temporal grid units. Values "
+    "<= 0 disable "
+    "visual attention chunking.");
+
 DEFINE_int64(max_encoder_cache_size,
              0,
              "Max gpu/npu memory size in MB for encoder cache per worker. "
@@ -110,6 +119,7 @@ void MultimodalConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(fps_min_frames);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(fps_max_frames);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(video_max_token_num);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(max_vit_attention_units_per_chunk);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_encoder_cache_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_processor_cache_items);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_return_mm_full_embeddings);
@@ -128,6 +138,7 @@ void MultimodalConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(fps_min_frames);
   XLLM_CONFIG_ASSIGN_FROM_JSON(fps_max_frames);
   XLLM_CONFIG_ASSIGN_FROM_JSON(video_max_token_num);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(max_vit_attention_units_per_chunk);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_encoder_cache_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_processor_cache_items);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_return_mm_full_embeddings);
@@ -153,6 +164,8 @@ void MultimodalConfig::append_config_json(
       config_json, default_config, fps_max_frames);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, video_max_token_num);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, max_vit_attention_units_per_chunk);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, max_encoder_cache_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

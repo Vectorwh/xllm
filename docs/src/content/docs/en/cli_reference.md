@@ -50,6 +50,12 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `use_audio_in_video` | `bool` | `false` | Whether to decode both audio and video when the input is a video. |
 | `use_cpp_chat_template` | `bool` | `true` | Use native C++ chat templates for supported models, for example `deepseek_v32` and `deepseek_v4`. Set to `false` to fall back to Jinja for debugging. |
 
+## MultimodalConfig
+
+| Parameter | Type | Default | Description |
+|:----------|:-----|:--------|:------------|
+| `max_vit_attention_units_per_chunk` | `int32` | `0` | Maximum complete spatial attention units per vision encoder chunk for NPU Qwen2-VL, Qwen2.5-VL, Qwen3-VL and Qwen3.5 VL (dense and MoE). An image is one unit; videos contribute their temporal grid units. Chunks preserve unit boundaries and output order, including DeepStack features. Values less than or equal to `0` disable splitting. This limits units, not patches; one large spatial unit remains intact. Also available in offline Python `LLM(...)` and `VLM(...)`, including spawned workers. |
+
 ## LoadConfig
 
 | Parameter | Type | Default | Description |

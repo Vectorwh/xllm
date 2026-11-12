@@ -90,6 +90,12 @@ class ArgumentParser:
         )
         self.parser.add_argument("--num_speculative_tokens", type=int, default=0, help="Number of speculative tokens.")
         self.parser.add_argument(
+            "--max_vit_attention_units_per_chunk",
+            type=int,
+            default=0,
+            help="Max complete spatial attention units per vision encoder chunk; <= 0 disables chunking.",
+        )
+        self.parser.add_argument(
             "--speculative_algorithm",
             type=str,
             default="MTP",

@@ -137,6 +137,7 @@ class LLM:
         disable_log_stats: bool = True,
         enable_sleep_mode: bool = False,
         model_impl: str = "native",
+        max_vit_attention_units_per_chunk: int = 0,
         **kwargs: Any,
     ) -> None:
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
@@ -175,6 +176,7 @@ class LLM:
         options.max_cache_size = max_cache_size
         options.max_memory_utilization = max_memory_utilization
         options.enable_prefix_cache = enable_prefix_cache
+        options.max_vit_attention_units_per_chunk = max_vit_attention_units_per_chunk
         options.max_tokens_per_batch = max_tokens_per_batch
         options.max_seqs_per_batch = max_seqs_per_batch
         options.max_tokens_per_chunk_for_prefill = max_tokens_per_chunk_for_prefill

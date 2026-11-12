@@ -50,6 +50,12 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `use_audio_in_video` | `bool` | `false` | 输入为视频时，是否同时解码音频和视频。 |
 | `use_cpp_chat_template` | `bool` | `true` | 对支持的模型使用原生 C++ chat template，例如 `deepseek_v32`、`deepseek_v4`；设为 `false` 可回退到 Jinja 以便调试。 |
 
+## MultimodalConfig
+
+| 参数 | 类型 | 默认值 | 说明 |
+|:-----|:-----|:-------|:-----|
+| `max_vit_attention_units_per_chunk` | `int32` | `0` | NPU Qwen2-VL、Qwen2.5-VL、Qwen3-VL 和 Qwen3.5 VL（dense 和 MoE）每次视觉编码分块的完整空间 attention unit 数上限。一张图片为一个 unit，视频按 grid 时间维计数。分块保留各 unit 的注意力边界和输出顺序，包括 DeepStack 特征。小于等于 `0` 时不分块。该参数限制 unit 数而非 patch 数，单个较大的空间 unit 保持完整。离线 Python `LLM(...)`、`VLM(...)` 同样支持，并传递给子 worker。 |
+
 ## LoadConfig
 
 | 参数名称 | 类型 | 默认值 | 参数含义 |

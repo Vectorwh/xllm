@@ -71,6 +71,8 @@ class Options {
   // maximum processor cache item count (default 256; 0 disables)
   PROPERTY(int64_t, max_processor_cache_items) = 256;
 
+  PROPERTY(int32_t, max_vit_attention_units_per_chunk) = 0;
+
   // active linear-state slots. 0 derives capacity from the KV cache budget.
   PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 

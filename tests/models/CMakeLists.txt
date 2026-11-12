@@ -1,5 +1,17 @@
 include(cc_test)
 
+cc_test(
+  NAME
+    chunked_encoder_test
+  CPU_ONLY
+  SRCS
+    chunked_encoder_test.cpp
+  DEPS
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
 add_subdirectory(dit)
 
 cc_test(

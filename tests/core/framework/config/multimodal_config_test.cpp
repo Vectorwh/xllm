@@ -24,6 +24,9 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <string>
 
+#include "core/common/options.h"
+#include "core/framework/config/config_utils.h"
+
 namespace xllm {
 namespace {
 
@@ -43,6 +46,23 @@ class MultimodalConfigTest : public ::testing::Test {
  private:
   google::FlagSaver flag_saver_;
 };
+
+TEST_F(MultimodalConfigTest,
+       OfflineVisionChunkBudgetReachesWorkerConfiguration) {
+  for (const int32_t budget : {1, 3}) {
+    Options options;
+    options.max_vit_attention_units_per_chunk(budget);
+    config::init_config_from_option(options, "qwen3_vl");
+    const auto& parent = MultimodalConfig::get_instance();
+    nlohmann::ordered_json worker_config;
+    parent.append_config_json(worker_config);
+    google::FlagSaver worker_flags;
+    MultimodalConfig worker;
+    worker.from_flags();
+    worker.from_json(config::parse_json_string(worker_config.dump()));
+    EXPECT_EQ(worker.max_vit_attention_units_per_chunk(), budget);
+  }
+}
 
 TEST_F(MultimodalConfigTest, EmptyOverridesPreserveAllModalities) {
   for (const std::string mm_args : {"", "{}", R"({"image":{}})"}) {
