@@ -446,7 +446,15 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
   const auto sizes = forward_input_sizes(prepared_inputs);
   bool fits = true;
   for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
-    fits &= sizes[dp_rank] <= limits[dp_rank];
+    if (sizes[dp_rank] <= limits[dp_rank]) {
+      continue;
+    }
+    fits = false;
+    LOG(WARNING) << "VLM inference input exceeds transport capacity: dp_rank="
+                 << dp_rank << " input_bytes=" << sizes[dp_rank]
+                 << " capacity_bytes=" << limits[dp_rank]
+                 << " excess_bytes=" << sizes[dp_rank] - limits[dp_rank]
+                 << " schedule_overlap=" << options_.enable_schedule_overlap();
   }
   if (fits) {
     batch = std::move(candidate_batch);
@@ -514,7 +522,7 @@ ForwardOutput VLMEngine::step(std::vector<Batch>& batch) {
           std::to_string(sub_sizes[dp_rank]) + " bytes required, " +
           std::to_string(limits[dp_rank]) +
           " bytes available. Reduce image resolution/count or video frames.";
-      LOG(WARNING) << message;
+      LOG(WARNING) << message << " dp_rank=" << dp_rank;
       for (Sequence* sequence : sub_batch[dp_rank].get_sequences()) {
         sequence->fail(Status(StatusCode::INVALID_ARGUMENT, message));
       }

@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "core/framework/model/model_args.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "processors/processor_util.h"
 
 namespace xllm {
 
@@ -31,6 +32,13 @@ class ImageProcessor {
 
   virtual bool process(const std::vector<torch::Tensor>& images,
                        std::vector<MMDataItem>& output_items) const = 0;
+
+ protected:
+  ImageProcessor() = default;
+  explicit ImageProcessor(const ModelArgs& args)
+      : output_dtype_(get_pixel_output_dtype(args.dtype())) {}
+
+  torch::ScalarType output_dtype_ = torch::kFloat32;
 };
 
 class ImageNoneProcessor final : public ImageProcessor {

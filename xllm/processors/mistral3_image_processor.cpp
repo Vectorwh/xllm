@@ -23,7 +23,8 @@ limitations under the License.
 namespace xllm {
 
 Mistral3ImageProcessor::Mistral3ImageProcessor(const ModelArgs& args,
-                                               const ProcessorConfig& config) {
+                                               const ProcessorConfig& config)
+    : ImageProcessor(args) {
   image_mean_ =
       torch::tensor(std::vector<double>{0.48145466, 0.4578275, 0.40821073},
                     torch::dtype(torch::kFloat32));
@@ -78,7 +79,8 @@ bool Mistral3ImageProcessor::process_image(
 
     // Normalize (rescale already fused in)
     if (do_normalize_) {
-      processed = transforms::normalize(processed, image_mean_, image_std_);
+      processed = transforms::normalize(
+          processed, image_mean_, image_std_, output_dtype_);
     }
 
     // Rescale (only if not fused)
@@ -87,7 +89,7 @@ bool Mistral3ImageProcessor::process_image(
     }
 
     // pixel_values: [1, C, H, W] for Conv2d patch embedding inside model
-    pixel_values.push_back(processed.unsqueeze(0).to(torch::kFloat32));
+    pixel_values.push_back(processed.unsqueeze(0));
 
     // image_grid_thw: [[1, grid_h, grid_w]]
     int64_t grid_h = height / patch_size_;

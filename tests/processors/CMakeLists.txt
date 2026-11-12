@@ -17,10 +17,10 @@ include(cc_test)
 
 cc_test(
   NAME
-    image_processor_config_test
+    multimodal_processor_test
   CPU_ONLY
   SRCS
-    image_processor_config_test.cpp
+    multimodal_processor_test.cpp
   DEPS
     :processors
     GTest::gtest_main

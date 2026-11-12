@@ -13,21 +13,151 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "processors/multimodal_processor.h"
+
 #include <gtest/gtest.h>
 
 #include <string>
 #include <vector>
 
 #include "processors/glm4v_image_processor.h"
+#include "processors/glm4v_video_processor.h"
 #include "processors/kimi25_image_processor.h"
 #include "processors/minicpmv_image_processor.h"
 #include "processors/minicpmv_prompt_processor.h"
 #include "processors/mistral3_image_processor.h"
-#include "processors/multimodal_processor.h"
 #include "processors/qwen2_vl_image_processor.h"
+#include "processors/qwen2_vl_video_processor.h"
+#include "processors/qwen3_omni_video_processor.h"
+#include "processors/qwen3_vl_video_processor.h"
 
 namespace xllm {
 namespace {
+
+ModelArgs pixel_dtype_args() {
+  ModelArgs args;
+  args.dtype("float32")
+      .mm_image_patch_size(14)
+      .mm_image_merge_size(2)
+      .mm_image_temporal_patch_size(2)
+      .mm_image_min_pixels(3136)
+      .mm_image_max_pixels(12544)
+      .mm_image_normalize_mean({0.48145466, 0.4578275, 0.40821073})
+      .mm_image_normalize_std({0.26862954, 0.26130258, 0.27577711})
+      .mm_patch_size(14)
+      .mm_spatial_merge_size(2)
+      .mm_image_size(56)
+      .vision_max_slice_nums(4)
+      .mm_scale_resolution(56)
+      .mm_slice_mode(true)
+      .mm_image_feature_size(4)
+      .mm_video_patch_size(14)
+      .mm_video_merge_size(2)
+      .mm_video_temporal_patch_size(2)
+      .mm_video_shortest_edge(6272)
+      .mm_video_longest_edge(25088)
+      .mm_video_normalize_mean({0.48145466, 0.4578275, 0.40821073})
+      .mm_video_normalize_std({0.26862954, 0.26130258, 0.27577711});
+  return args;
+}
+
+void expect_pixel_item_matches(const MMDataItem& actual,
+                               const MMDataItem& expected) {
+  ASSERT_EQ(actual.data().size(), expected.data().size());
+  for (const auto& [key, value] : expected.data()) {
+    SCOPED_TRACE(key);
+    ASSERT_TRUE(actual.has(key));
+    std::vector<torch::Tensor> expected_tensors;
+    std::vector<torch::Tensor> actual_tensors;
+    expected.get(key, expected_tensors);
+    actual.get(key, actual_tensors);
+    ASSERT_EQ(actual_tensors.size(), expected_tensors.size());
+    const bool is_pixel = key == "pixel_values" || key == "pixel_values_videos";
+    for (size_t index = 0; index < expected_tensors.size(); ++index) {
+      const torch::Tensor reference =
+          is_pixel ? expected_tensors[index].to(torch::kBFloat16)
+                   : expected_tensors[index];
+      EXPECT_EQ(actual_tensors[index].scalar_type(), reference.scalar_type());
+      EXPECT_TRUE(torch::equal(actual_tensors[index], reference));
+    }
+  }
+}
+
+template <typename Processor>
+class ImagePixelDtypeTest : public ::testing::Test {};
+
+using ImagePixelProcessors = ::testing::Types<Qwen2VLImageProcessor,
+                                              Glm4VImageProcessor,
+                                              Mistral3ImageProcessor,
+                                              MiniCPMVImageProcessor,
+                                              KimiK25ImageProcessor>;
+TYPED_TEST_SUITE(ImagePixelDtypeTest, ImagePixelProcessors);
+
+TYPED_TEST(ImagePixelDtypeTest, MatchesFinalFloat32CastAndPreservesMetadata) {
+  ModelArgs args = pixel_dtype_args();
+  const TypeParam baseline(args);
+  const torch::Tensor image = torch::arange(3 * 56 * 84, torch::kInt64)
+                                  .remainder(256)
+                                  .to(torch::kUInt8)
+                                  .reshape({3, 56, 84});
+  const std::vector<torch::Tensor> images{image, image.flip({2})};
+  std::vector<MMDataItem> expected_items;
+  ASSERT_TRUE(baseline.process(images, expected_items));
+  for (const std::string model_dtype : {"bfloat16", "BFLOAT16", "BFloat16"}) {
+    SCOPED_TRACE(model_dtype);
+    args.dtype(model_dtype);
+    const TypeParam processor(args);
+    std::vector<MMDataItem> actual_items;
+    ASSERT_TRUE(processor.process(images, actual_items));
+    ASSERT_EQ(actual_items.size(), expected_items.size());
+    for (size_t index = 0; index < actual_items.size(); ++index) {
+      expect_pixel_item_matches(actual_items[index], expected_items[index]);
+    }
+  }
+}
+
+template <typename Processor>
+class VideoPixelDtypeTest : public ::testing::Test {};
+
+using VideoPixelProcessors = ::testing::Types<Qwen2VLVideoProcessor,
+                                              Qwen3VLVideoProcessor,
+                                              Qwen3OmniVideoProcessor,
+                                              Glm4VVideoProcessor,
+                                              KimiK25VideoProcessor>;
+TYPED_TEST_SUITE(VideoPixelDtypeTest, VideoPixelProcessors);
+
+TYPED_TEST(VideoPixelDtypeTest, MatchesFinalFloat32CastAndPreservesMetadata) {
+  ModelArgs args = pixel_dtype_args();
+  const TypeParam baseline(args);
+  const torch::Tensor video = torch::arange(8 * 3 * 56 * 84, torch::kInt64)
+                                  .remainder(256)
+                                  .to(torch::kUInt8)
+                                  .reshape({8, 3, 56, 84});
+  VideoMetadata metadata;
+  metadata.fps = 2.0;
+  metadata.total_num_frames = 8;
+  metadata.duration = 4.0;
+  metadata.frame_indices = torch::arange(8, torch::kInt64);
+  MMDataItem expected(MMType::VIDEO);
+  ASSERT_TRUE(baseline.process(video, metadata, expected));
+  for (const std::string model_dtype : {"bfloat16", "BFLOAT16", "BFloat16"}) {
+    SCOPED_TRACE(model_dtype);
+    args.dtype(model_dtype);
+    const TypeParam processor(args);
+    MMDataItem actual(MMType::VIDEO);
+    ASSERT_TRUE(processor.process(video, metadata, actual));
+    expect_pixel_item_matches(actual, expected);
+    const auto expected_metadata =
+        expected.template get_metadata<VideoMetadata>();
+    const auto actual_metadata = actual.template get_metadata<VideoMetadata>();
+    ASSERT_TRUE(expected_metadata.has_value());
+    ASSERT_TRUE(actual_metadata.has_value());
+    EXPECT_EQ(actual_metadata->timestamps, expected_metadata->timestamps);
+    EXPECT_EQ(actual_metadata->sampled_fps, expected_metadata->sampled_fps);
+    EXPECT_TRUE(torch::equal(actual_metadata->frame_indices,
+                             expected_metadata->frame_indices));
+  }
+}
 
 class VideoConfigPromptProcessor final {
  public:
@@ -40,7 +170,7 @@ class VideoConfigPromptProcessor final {
   int32_t stride_;
 };
 
-TEST(ImageProcessorConfigTest, PromptCanConsumeVideoConfiguration) {
+TEST(MultimodalProcessorTest, PromptCanConsumeVideoConfiguration) {
   ModelArgs args;
   args.mm_patch_size(14).mm_spatial_merge_size(2).mm_image_size(112);
   const ProcessorConfig config(nlohmann::json{
@@ -60,7 +190,7 @@ TEST(ImageProcessorConfigTest, PromptCanConsumeVideoConfiguration) {
   EXPECT_TRUE(torch::equal(*grid, torch::tensor({{1, 4, 4}}, torch::kInt64)));
 }
 
-TEST(ImageProcessorConfigTest, LegacyProcessorDoesNotConsumeOverrides) {
+TEST(MultimodalProcessorTest, LegacyProcessorDoesNotConsumeOverrides) {
   const ModelArgs args{};
   const ProcessorConfig defaults;
   const auto processor = create_processor<ImageNoneProcessor>(args, defaults);
@@ -71,7 +201,7 @@ TEST(ImageProcessorConfigTest, LegacyProcessorDoesNotConsumeOverrides) {
   EXPECT_DEATH(config.validate("image"), "image.max_pixels");
 }
 
-TEST(ImageProcessorConfigTest, MistralUsesItsOwnEdgeParameter) {
+TEST(MultimodalProcessorTest, MistralUsesItsOwnEdgeParameter) {
   ModelArgs args;
   args.mm_patch_size(14).mm_spatial_merge_size(2).mm_image_size(112);
   const ProcessorConfig config(
@@ -88,7 +218,7 @@ TEST(ImageProcessorConfigTest, MistralUsesItsOwnEdgeParameter) {
   EXPECT_EQ(args.mm_image_size(), 112);
 }
 
-TEST(ImageProcessorConfigTest, KimiUsesItsOwnPatchBudgetParameter) {
+TEST(MultimodalProcessorTest, KimiUsesItsOwnPatchBudgetParameter) {
   ModelArgs args;
   const ProcessorConfig config(
       nlohmann::json{{"image", {{"in_patch_limit", 16}}}});
@@ -103,7 +233,7 @@ TEST(ImageProcessorConfigTest, KimiUsesItsOwnPatchBudgetParameter) {
   EXPECT_TRUE(torch::equal(*grid, torch::tensor({{1, 4, 4}}, torch::kInt64)));
 }
 
-TEST(ImageProcessorConfigTest, UnknownParametersAreRejectedByActualConsumer) {
+TEST(MultimodalProcessorTest, UnknownParametersAreRejectedByActualConsumer) {
   ModelArgs args;
   args.mm_patch_size(14).mm_spatial_merge_size(2).mm_image_size(112);
   const ProcessorConfig config(
@@ -113,7 +243,7 @@ TEST(ImageProcessorConfigTest, UnknownParametersAreRejectedByActualConsumer) {
                "Unsupported processor parameter.*max_pixels");
 }
 
-TEST(ImageProcessorConfigTest, VideoOverridesDoNotEnableImagePixelValidation) {
+TEST(MultimodalProcessorTest, VideoOverridesDoNotEnableImagePixelValidation) {
   ModelArgs args;
   args.mm_image_min_tokens(4).mm_image_max_tokens(16);
   const ProcessorConfig config(
@@ -123,7 +253,7 @@ TEST(ImageProcessorConfigTest, VideoOverridesDoNotEnableImagePixelValidation) {
   EXPECT_DEATH(config.validate("video"), "video.frame_stride");
 }
 
-TEST(ImageProcessorConfigTest, GlmPreservesItsTemporalAreaSemantics) {
+TEST(MultimodalProcessorTest, GlmPreservesItsTemporalAreaSemantics) {
   ModelArgs args;
   args.mm_image_patch_size(14)
       .mm_image_merge_size(2)
@@ -153,7 +283,7 @@ TEST(ImageProcessorConfigTest, GlmPreservesItsTemporalAreaSemantics) {
       torch::equal(*qwen_grid, torch::tensor({{1, 8, 8}}, torch::kInt64)));
 }
 
-TEST(ImageProcessorConfigTest, PixelBudgetsPreserveProcessorMinimumGridSizes) {
+TEST(MultimodalProcessorTest, PixelBudgetsPreserveProcessorMinimumGridSizes) {
   ModelArgs args;
   args.mm_image_patch_size(14)
       .mm_image_merge_size(2)
@@ -174,7 +304,7 @@ TEST(ImageProcessorConfigTest, PixelBudgetsPreserveProcessorMinimumGridSizes) {
                "one aligned image patch group");
 }
 
-TEST(ImageProcessorConfigTest, MiniCpmSlicesAndPromptShareConfiguration) {
+TEST(MultimodalProcessorTest, MiniCpmSlicesAndPromptShareConfiguration) {
   ModelArgs args;
   args.vision_max_slice_nums(9)
       .mm_scale_resolution(112)

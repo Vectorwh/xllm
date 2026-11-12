@@ -175,7 +175,8 @@ std::optional<Size> smart_resize_tokens(int32_t num_frames,
 }  // namespace
 
 Glm4VImageProcessor::Glm4VImageProcessor(const ModelArgs& args,
-                                         const ProcessorConfig& config) {
+                                         const ProcessorConfig& config)
+    : ImageProcessor(args) {
   image_mean_ = torch::tensor(args.mm_image_normalize_mean(),
                               torch::dtype(torch::kFloat32));
   image_std_ = torch::tensor(args.mm_image_normalize_std(),
@@ -259,7 +260,8 @@ bool Glm4VImageProcessor::process_image(
   }
 
   if (do_normalize_) {
-    batch_images = transforms::normalize(batch_images, image_mean_, image_std_);
+    batch_images = transforms::normalize(
+        batch_images, image_mean_, image_std_, output_dtype_);
   }
 
   if (do_rescale_) {

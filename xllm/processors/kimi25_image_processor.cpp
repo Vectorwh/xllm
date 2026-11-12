@@ -75,7 +75,8 @@ KimiK25MediaConfig make_kimi_k25_media_config(const ModelArgs& args) {
 
 torch::Tensor km_normalize(const torch::Tensor& image,
                            const std::vector<double>& mean,
-                           const std::vector<double>& std) {
+                           const std::vector<double>& std,
+                           torch::ScalarType output_dtype) {
   if (image.dim() != 3) {
     LOG(FATAL)
         << "Input image must be a 3-dimensional tensor in (C, H, W) format.";
@@ -104,14 +105,14 @@ torch::Tensor km_normalize(const torch::Tensor& image,
   auto s_inv_tensor = 1.0 / s_tensor;
 
   result = result.sub(m_tensor);
-  return result.mul_(s_inv_tensor);
+  return result.mul_(s_inv_tensor).to(output_dtype);
 }
 
 }  // namespace
 
 KimiK25ImageProcessor::KimiK25ImageProcessor(const ModelArgs& args,
                                              const ProcessorConfig& config)
-    : config_(make_kimi_k25_media_config(args)) {
+    : ImageProcessor(args), config_(make_kimi_k25_media_config(args)) {
   config_.in_patch_limit =
       config.value("image.in_patch_limit", config_.in_patch_limit);
   config_.patch_limit_on_one_side = config.value(
@@ -124,7 +125,7 @@ KimiK25ImageProcessor::KimiK25ImageProcessor(const ModelArgs& args,
 }
 
 KimiK25VideoProcessor::KimiK25VideoProcessor(const ModelArgs& args)
-    : config_(make_kimi_k25_media_config(args)) {}
+    : VideoProcessor(args), config_(make_kimi_k25_media_config(args)) {}
 
 bool KimiK25ImageProcessor::process_image(
     const std::vector<torch::Tensor>& images,
@@ -485,7 +486,8 @@ bool KimiK25ImageProcessor::process_image(torch::Tensor image,
   }
 
   if (config_.do_normalize) {
-    image = km_normalize(image, config_.image_mean, config_.image_std);
+    image = km_normalize(
+        image, config_.image_mean, config_.image_std, output_dtype_);
   }
 
   image = image.unsqueeze(0);
@@ -601,7 +603,8 @@ bool KimiK25VideoProcessor::process_video_chunk(torch::Tensor video_chunk,
     }
 
     if (config_.do_normalize) {
-      frame = km_normalize(frame, config_.image_mean, config_.image_std);
+      frame = km_normalize(
+          frame, config_.image_mean, config_.image_std, output_dtype_);
     }
 
     processed_frames.emplace_back(frame);

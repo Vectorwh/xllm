@@ -24,6 +24,23 @@ limitations under the License.
 namespace xllm::transforms {
 namespace {
 
+TEST(NormalizeTest, Bfloat16OutputRoundsAfterFloat32Arithmetic) {
+  const torch::Tensor mean =
+      torch::tensor({0.48145466f, 0.4578275f, 0.40821073f});
+  const torch::Tensor std =
+      torch::tensor({0.26862954f, 0.26130258f, 0.27577711f});
+  const torch::Tensor pixels =
+      torch::arange(3 * 7 * 11, torch::kFloat32).reshape({3, 7, 11}) / 257.0;
+  for (const torch::Tensor& input :
+       {pixels, pixels.unsqueeze(0).repeat({2, 1, 1, 1})}) {
+    const torch::Tensor expected =
+        input.sub(mean.reshape({3, 1, 1})).div(std.reshape({3, 1, 1}));
+    const torch::Tensor actual = normalize(input, mean, std, torch::kBFloat16);
+    EXPECT_EQ(actual.scalar_type(), torch::kBFloat16);
+    EXPECT_TRUE(torch::equal(actual, expected.to(torch::kBFloat16)));
+  }
+}
+
 // Deterministic uint8 pattern shared with the golden generator.
 torch::Tensor make_pattern(int64_t channels, int64_t height, int64_t width) {
   auto img =

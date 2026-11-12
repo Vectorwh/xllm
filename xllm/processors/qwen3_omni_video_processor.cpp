@@ -72,7 +72,8 @@ std::optional<Size> smart_resize(int32_t height,
 
 }  // namespace
 
-Qwen3OmniVideoProcessor::Qwen3OmniVideoProcessor(const ModelArgs& args) {
+Qwen3OmniVideoProcessor::Qwen3OmniVideoProcessor(const ModelArgs& args)
+    : VideoProcessor(args) {
   image_mean_ = torch::tensor(args.mm_image_normalize_mean(),
                               torch::dtype(torch::kFloat32));
   image_std_ = torch::tensor(args.mm_image_normalize_std(),
@@ -254,7 +255,8 @@ bool Qwen3OmniVideoProcessor::process_video(const torch::Tensor& origin_video,
     out_video = transforms::rescale(out_video, rescale_factor_);
   }
   if (do_normalize_) {
-    out_video = transforms::normalize(out_video, image_mean_, image_std_);
+    out_video = transforms::normalize(
+        out_video, image_mean_, image_std_, output_dtype_);
   }
 
   auto pad_t =

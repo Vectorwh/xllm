@@ -18,11 +18,18 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <array>
+#include <boost/algorithm/string/predicate.hpp>
 #include <cstdint>
 #include <map>
+#include <string_view>
 #include <vector>
 
 namespace xllm {
+
+inline torch::ScalarType get_pixel_output_dtype(std::string_view model_dtype) {
+  return boost::iequals(model_dtype, "bfloat16") ? torch::kBFloat16
+                                                 : torch::kFloat32;
+}
 
 using ImageShape = std::array<int64_t, 3>;
 

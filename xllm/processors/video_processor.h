@@ -21,6 +21,7 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
+#include "processors/processor_util.h"
 
 namespace xllm {
 
@@ -31,6 +32,13 @@ class VideoProcessor {
   virtual bool process(const torch::Tensor& origin_video,
                        const VideoMetadata& metadata,
                        MMDataItem& output_item) const = 0;
+
+ protected:
+  VideoProcessor() = default;
+  explicit VideoProcessor(const ModelArgs& args)
+      : output_dtype_(get_pixel_output_dtype(args.dtype())) {}
+
+  torch::ScalarType output_dtype_ = torch::kFloat32;
 };
 
 class VideoNoneProcessor final : public VideoProcessor {

@@ -47,4 +47,9 @@ torch::Tensor normalize(const torch::Tensor& image,
                         const torch::Tensor& mean,
                         const torch::Tensor& std);
 
+torch::Tensor normalize(const torch::Tensor& image,
+                        const torch::Tensor& mean,
+                        const torch::Tensor& std,
+                        torch::ScalarType output_dtype);
+
 }  // namespace xllm::transforms

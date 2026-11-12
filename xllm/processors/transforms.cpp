@@ -332,4 +332,11 @@ torch::Tensor normalize(const torch::Tensor& image,
   return result.div_(std_tensor);
 }
 
+torch::Tensor normalize(const torch::Tensor& image,
+                        const torch::Tensor& mean,
+                        const torch::Tensor& std,
+                        torch::ScalarType output_dtype) {
+  return normalize(image, mean, std).to(output_dtype);
+}
+
 }  // namespace xllm::transforms

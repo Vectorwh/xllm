@@ -20,7 +20,8 @@ limitations under the License.
 namespace xllm {
 
 MiniCPMVImageProcessor::MiniCPMVImageProcessor(const ModelArgs& args,
-                                               const ProcessorConfig& config) {
+                                               const ProcessorConfig& config)
+    : ImageProcessor(args) {
   max_slice_nums_ =
       config.value("image.max_slice_nums", args.vision_max_slice_nums());
   scale_resolution_ =
@@ -48,7 +49,7 @@ bool MiniCPMVImageProcessor::process(
 
   for (auto& patch : image_patches) {
     patch = patch.to(torch::kFloat32);
-    patch = transforms::normalize(patch, norm_mean_, norm_std_);
+    patch = transforms::normalize(patch, norm_mean_, norm_std_, output_dtype_);
 
     const auto& one_patch_size = patch.sizes();
     int64_t tgt_h = one_patch_size[1] / patch_size_;
