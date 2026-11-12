@@ -41,6 +41,13 @@
 * If [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md) specifies a rule, that rule takes precedence over the Google C++/Python Style Guide.
 * Use the Google C++/Python Style Guide only for cases not specified in [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md).
 
+## Test Scope
+
+* Add or extend tests only for changed behavior missing from existing coverage. Reuse existing files and targets; avoid duplicate coverage, exhaustive input combinations, and tests of implementation details.
+* Documentation, formatting, and low-risk refactors that preserve behavior normally need no new unit tests. A bug fix normally needs one focused regression case that fails before the fix and passes after it.
+* For routine PRs, use **0-3 new cases** as a guideline, including parameterized instances and table-driven scenarios. This is neither a minimum nor a hard cap; explain distinct risks in the PR when more are needed, especially for concurrency, cache/resource lifecycle, or kernel precision. Do not remove or weaken tests to meet the guideline.
+* Run affected tests first; broaden validation for relevant risks or CI/user requirements. Apply this scope when using testing and review skills.
+
 ## Review Instructions
 
 * For code review tasks, you **MUST** first read [code-review/SKILL.md](.agents/skills/code-review/SKILL.md).

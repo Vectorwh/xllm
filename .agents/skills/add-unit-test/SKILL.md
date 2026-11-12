@@ -5,12 +5,14 @@ description: Add or update xLLM unit tests in the repository. Use when Codex nee
 
 # Add Unit Test
 
+Apply [Test Scope](../../../AGENTS.md#test-scope); sufficient existing coverage does not require new cases.
+
 ## Workflow
 
 1. Inspect the production code and the nearest existing tests before writing a new test.
    - Match the production path under `xllm/` to `tests/` where possible.
    - Prefer extending an existing nearby `*_test.cpp` and `cc_test` target when the behavior belongs to the same domain.
-   - Create a new test source only when it improves isolation, keeps platform setup separate, or follows an existing directory pattern.
+   - Create a new test source only when no suitable suite exists or process/platform isolation requires it.
 
 2. Read the project style guide before editing production files under `xllm/`, and apply the same C++ style discipline to new test code:
    `.agents/skills/code-review/references/custom-code-style.md`.
@@ -27,7 +29,7 @@ description: Add or update xLLM unit tests in the repository. Use when Codex nee
    - Use target-level `if(USE_NPU)`, `if(USE_MLU)`, `if(USE_CUDA)`, or generator expressions only when a mixed directory contains both generic and platform-specific tests.
 
 5. Write tests for observable behavior, not implementation trivia.
-   - Cover success, edge, and error paths touched by the change.
+   - Cover changed behavior missing from existing tests; add boundary/error cases only for distinct affected risks.
    - Prefer deterministic inputs, fixed seeds, and small tensors/data structures.
    - Keep helpers file-local in an anonymous namespace unless shared by multiple test files.
    - Use `TEST`/`TEST_F` names that describe behavior clearly.

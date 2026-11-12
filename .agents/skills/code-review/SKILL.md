@@ -54,8 +54,8 @@ Read [custom-code-style.md](references/custom-code-style.md) for project-specifi
 
 **Testing:**
 - Tests verify actual logic, not just mock wiring
-- Edge cases and error paths covered
-- Integration tests for cross-component changes
+- Apply [Test Scope](../../../AGENTS.md#test-scope); request new tests only for a concrete gap in changed behavior, including relevant edge/error paths
+- Integration tests are needed when lower-level tests cannot verify affected component interactions
 
 **Production Readiness:**
 - Backward compatibility maintained (or breaking changes documented)
