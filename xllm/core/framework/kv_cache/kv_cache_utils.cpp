@@ -689,16 +689,6 @@ std::optional<std::string> validate_host_cache_options(
     violations.emplace_back("KV cache has no key-cache tensor to offload");
   }
   if (options.has_grouped_cache_layout &&
-      util::is_deepseek_v41_model_type(options.model_type)) {
-    if (options.instance_role == InstanceRole::DECODE) {
-      violations.emplace_back(
-          "V4.1 grouped host offload/Store is not supported on DECODE "
-          "instances; "
-          "C1/C2 and SWA prefix restore is not implemented for this role; "
-          "disable host offload and Store on DECODE instances");
-    }
-  }
-  if (options.has_grouped_cache_layout &&
       !options.supports_grouped_cache_offload) {
     std::ostringstream violation;
     violation << "model \"" << options.model_type

@@ -1500,7 +1500,7 @@ TEST_F(HostKVCacheConfigTest, AcceptsSupportedGroupedCacheLayout) {
   EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
-TEST_F(HostKVCacheConfigTest, V41GroupedHostCacheRejectsDecodeRole) {
+TEST_F(HostKVCacheConfigTest, V41GroupedHostCacheSupportsDisaggregatedDecode) {
   HostCacheValidationOptions options;
   options.host_blocks_factor = 2.0;
   options.device_block_count = 128;
@@ -1509,34 +1509,9 @@ TEST_F(HostKVCacheConfigTest, V41GroupedHostCacheRejectsDecodeRole) {
   options.supports_grouped_cache_offload = true;
   options.model_type = "deepseek_v41";
   options.enable_disagg_pd = true;
-  for (bool store_enabled : {false, true}) {
-    SCOPED_TRACE(store_enabled);
-    options.enable_kvcache_store = store_enabled;
-    for (bool prefix_enabled : {false, true}) {
-      SCOPED_TRACE(prefix_enabled);
-      options.enable_prefix_cache = prefix_enabled;
-      options.instance_role = InstanceRole::DECODE;
-      const std::optional<std::string> error =
-          validate_host_cache_options(options);
-      ASSERT_TRUE(error.has_value());
-      EXPECT_NE(error->find("V4.1 grouped host offload/Store"),
-                std::string::npos);
-      EXPECT_NE(error->find("DECODE"), std::string::npos);
-    }
-    options.enable_prefix_cache = true;
-    for (const InstanceRole role :
-         {InstanceRole::DEFAULT, InstanceRole::PREFILL}) {
-      options.instance_role = role;
-      EXPECT_FALSE(validate_host_cache_options(options).has_value());
-    }
-    options.instance_role = InstanceRole::DECODE;
-    options.model_type = "deepseek_v4";
-    EXPECT_FALSE(validate_host_cache_options(options).has_value());
-    options.model_type = "deepseek_v41";
-    options.host_blocks_factor = 1.0;
-    EXPECT_FALSE(validate_host_cache_options(options).has_value());
-    options.host_blocks_factor = 2.0;
-  }
+  options.enable_kvcache_store = true;
+  options.instance_role = InstanceRole::DECODE;
+  EXPECT_FALSE(validate_host_cache_options(options).has_value());
 }
 
 TEST_F(HostKVCacheConfigTest, RejectsFractalNzPoolWithTransferFolding) {

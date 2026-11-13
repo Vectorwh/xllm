@@ -47,7 +47,7 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
   if (GetParam() && master == nullptr) {
     GTEST_SKIP()
         << "Set XLLM_TEST_STORE_MASTER to a Mooncake master with an active "
-           "TCP storage node; host-only coverage is the /0 case";
+           "storage node; host-only coverage is the /0 case";
   }
   Device device(/*device_index=*/0);
   device.set_device();
@@ -75,10 +75,14 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
       .tp_rank(0)
       .tp_size(1)
       .host_blocks_factor(2.0)
-      .layers_wise_copy_batchs(2);
+      .layers_wise_copy_batchs(2)
+      .instance_role(GetParam() ? InstanceRole::DECODE : InstanceRole::PREFILL);
   if (GetParam()) {
+    const char* protocol = std::getenv("XLLM_TEST_STORE_PROTOCOL");
+    const char* devices = std::getenv("XLLM_TEST_STORE_RDMA_DEVICES");
     transfer_options.enable_kvcache_store(true)
-        .store_protocol("tcp")
+        .store_protocol(protocol == nullptr ? "tcp" : protocol)
+        .store_rdma_devices(devices == nullptr ? "" : devices)
         .store_master_server_address(master)
         .store_metadata_server("P2PHANDSHAKE")
         .store_namespace(
@@ -87,15 +91,18 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
                 std::chrono::steady_clock::now().time_since_epoch().count()));
   }
   std::unique_ptr<Stream> compute_stream = device.current_stream();
-  HierarchyKVCacheTransfer transfer(transfer_options,
-                                    device.unwrap(),
-                                    compute_stream.get(),
-                                    &caches,
-                                    shape,
-                                    options);
-  ASSERT_TRUE(transfer.supports_block_type(BlockType::C1));
-  ASSERT_TRUE(transfer.supports_block_type(BlockType::C2));
-  EXPECT_FALSE(transfer.supports_block_type(BlockType::C4));
+  auto make_transfer = [&]() {
+    return std::make_unique<HierarchyKVCacheTransfer>(transfer_options,
+                                                      device.unwrap(),
+                                                      compute_stream.get(),
+                                                      &caches,
+                                                      shape,
+                                                      options);
+  };
+  auto transfer = make_transfer();
+  ASSERT_TRUE(transfer->supports_block_type(BlockType::C1));
+  ASSERT_TRUE(transfer->supports_block_type(BlockType::C2));
+  EXPECT_FALSE(transfer->supports_block_type(BlockType::C4));
   for (const BlockType type : {BlockType::SWA, BlockType::C2, BlockType::C1}) {
     for (KVCache& cache : caches) {
       for (const auto& [role, tensor] : cache.get_block_type_tensors(type)) {
@@ -108,13 +115,24 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
     hash.fill(static_cast<uint8_t>(type));
     BlockTransferInfo offload(
         /*src_id=*/1, /*dst_id=*/0, hash.data(), TransferType::D2H2G, type);
-    ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/81, {offload}), 1u);
+    ASSERT_EQ(transfer->transfer_kv_blocks(/*batch_id=*/81, {offload}), 1u);
+  }
+  if (GetParam()) {
+    // Fresh Host buffers on P must fetch objects produced by D, rather than
+    // accidentally reading the writer's D2H staging memory.
+    transfer.reset();
+    transfer_options.instance_role(InstanceRole::PREFILL);
+    transfer = make_transfer();
+  }
+  for (const BlockType type : {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+    std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> hash{};
+    hash.fill(static_cast<uint8_t>(type));
     if (GetParam()) {
       std::vector<BlockTransferInfo> infos;
       infos.emplace_back(-1, 1, hash.data(), TransferType::G2H, type);
       Slice<BlockTransferInfo> slice(infos);
       // Read into a different Host block; H2D cannot reuse the D2H buffer.
-      EXPECT_EQ(transfer.prefetch_kv_blocks(slice, /*stats=*/nullptr),
+      EXPECT_EQ(transfer->prefetch_kv_blocks(slice, /*stats=*/nullptr),
                 (std::vector<uint8_t>{1}));
     }
     BlockTransferInfo load(/*src_id=*/GetParam() ? 1 : 0,
@@ -122,11 +140,11 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
                            hash.data(),
                            TransferType::H2D,
                            type);
-    ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/81, {load}), 1u);
+    ASSERT_EQ(transfer->transfer_kv_blocks(/*batch_id=*/81, {load}), 1u);
     ModelInputParams params;
     params.meta.batch_id = 81;
     params.meta.requires_host_restore = true;
-    transfer.set_layer_synchronizer(params);
+    transfer->set_layer_synchronizer(params);
     for (int32_t layer = 0; layer < 6; ++layer) {
       ASSERT_TRUE(params.synchronize_layer(layer));
     }
@@ -146,8 +164,7 @@ TEST_P(V41HierarchyTransferTest,
   }
   const char* master = std::getenv("XLLM_TEST_STORE_MASTER");
   if (GetParam() && master == nullptr) {
-    GTEST_SKIP()
-        << "Set XLLM_TEST_STORE_MASTER to an active TCP Mooncake Store";
+    GTEST_SKIP() << "Set XLLM_TEST_STORE_MASTER to an active Mooncake Store";
   }
   Device device(/*device_index=*/0);
   device.set_device();
@@ -190,10 +207,15 @@ TEST_P(V41HierarchyTransferTest,
           .tp_rank(0)
           .tp_size(1)
           .host_blocks_factor(2.0)
-          .layers_wise_copy_batchs(2);
+          .layers_wise_copy_batchs(2)
+          .instance_role(GetParam() ? InstanceRole::DECODE
+                                    : InstanceRole::PREFILL);
       if (GetParam()) {
+        const char* protocol = std::getenv("XLLM_TEST_STORE_PROTOCOL");
+        const char* devices = std::getenv("XLLM_TEST_STORE_RDMA_DEVICES");
         transfer_options.enable_kvcache_store(true)
-            .store_protocol("tcp")
+            .store_protocol(protocol == nullptr ? "tcp" : protocol)
+            .store_rdma_devices(devices == nullptr ? "" : devices)
             .store_master_server_address(master)
             .store_metadata_server("P2PHANDSHAKE")
             .store_namespace("v41-dspark-" +
@@ -201,9 +223,14 @@ TEST_P(V41HierarchyTransferTest,
                                                 .time_since_epoch()
                                                 .count()));
       }
+      bool is_reader = false;
       auto make_transfer = [&](const std::string& draft_component) {
+        auto role_options = transfer_options;
+        if (is_reader) {
+          role_options.instance_role(InstanceRole::PREFILL);
+        }
         auto transfer = std::make_unique<HierarchyKVCacheTransfer>(
-            transfer_options, device.unwrap());
+            role_options, device.unwrap());
         HierarchyKVCacheTransfer::CacheRegistration registration;
         registration.role = HierarchyKVCacheTransfer::CacheRole::DRAFT;
         registration.device_kv_caches = &draft_caches;
@@ -263,6 +290,7 @@ TEST_P(V41HierarchyTransferTest,
       ASSERT_EQ(device.synchronize_default_stream(), 0);
       ASSERT_EQ(transfer->transfer_kv_blocks(91, offloads), block_types.size());
       if (GetParam()) {
+        is_reader = true;
         transfer.reset();
         transfer = make_transfer("spec_draft::dspark::different-weights");
         Slice<BlockTransferInfo> missing_draft(gets);

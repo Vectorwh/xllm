@@ -608,6 +608,53 @@ TEST(HierarchyBlockManagerPoolTest, TypedLayoutHasSwaC4C128HostLeaves) {
   EXPECT_EQ(per_type.at(BlockType::C128).leaf->num_total_blocks(), 511u);
 }
 
+TEST(HierarchyBlockManagerPoolTest, V41DecodeOffloadsCommittedTokenUnit) {
+  auto options = make_typed_cache_options();
+  options.model_type("deepseek_v41")
+      .instance_is_decode(true)
+      .enable_disagg_pd(true)
+      .enable_kvcache_store(true)
+      .enable_host_offload(true)
+      .enable_prefix_cache(true)
+      .num_blocks(64)
+      .sliding_window_size(512)
+      .swa_blocks_per_seq(5)
+      .compress_ratios({0, 2, 1})
+      .manager_types({1, 0, 0})
+      .host_num_blocks_by_type(
+          {{BlockType::SWA, 128}, {BlockType::C2, 64}, {BlockType::C1, 128}});
+  HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+  const size_t unit = 256;
+  Sequence sequence = make_test_sequence(
+      /*index=*/0, std::vector<int32_t>(unit, 83));
+  // D reserves P's prompt without offloading that checkpoint again.
+  sequence.kv_state().set_kv_cache_tokens_num(unit);
+  ASSERT_TRUE(pool.try_allocate(&sequence));
+  EXPECT_EQ(sequence.host_kv_state().kv_cache_tokens_num(), unit);
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+  for (size_t i = 0; i <= unit; ++i) {
+    sequence.append_token(83);
+  }
+  ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+  sequence.kv_state().set_kv_cache_tokens_num(2 * unit);
+  HierarchyPoolTestPeer::device_composite(pool)->cache_full_blocks_for_sequence(
+      &sequence);
+  HierarchyPoolTestPeer::collect_offload_pairs(pool, &sequence);
+  std::map<BlockType, size_t> counts;
+  std::shared_ptr<OffloadBlockPair> pair;
+  while ((pair = HierarchyPoolTestPeer::take_pending_offload_pair(pool))) {
+    ++counts[pair->block_type];
+    EXPECT_TRUE(pair->src.is_valid());
+    EXPECT_TRUE(pair->dst.is_valid());
+  }
+  EXPECT_GT(counts[BlockType::SWA], 0u);
+  EXPECT_EQ(counts[BlockType::C2], 1u);
+  EXPECT_EQ(counts[BlockType::C1], 2u);
+  EXPECT_EQ(sequence.host_kv_state().kv_cache_tokens_num(), 2 * unit);
+  pool.deallocate(&sequence);
+  HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+}
+
 TEST(HierarchyBlockManagerPoolTest, V41TokenGroupsOffloadAndRestoreCommonUnit) {
   for (const uint32_t ratio : {1u, 2u, 0u}) {
     SCOPED_TRACE(ratio);
@@ -774,19 +821,6 @@ TEST(HierarchyBlockManagerPoolTest, V41DSparkOffloadsOnlyCommittedCheckpoints) {
     EXPECT_EQ(point.restore_target_tokens, safe_units * 256);
     pool.deallocate(&restored);
   }
-}
-
-TEST(HierarchyBlockManagerPoolTest,
-     V41DecodeUnsupportedLayoutNamesRoleAndLeaves) {
-  auto options = make_typed_cache_options();
-  options.model_type("deepseek_v41")
-      .compress_ratios({0, 2, 1})
-      .enable_disagg_pd(true)
-      .instance_is_decode(true);
-  EXPECT_DEATH(
-      { HierarchyBlockManagerPool pool(options, nullptr, 1); },
-      "Unsupported prefix-cache leaf combination: instance_is_decode=1, "
-      "leaves=.*prefix=0");
 }
 
 TEST(HierarchyBlockManagerPoolTest, V41StorePrefetchGatesBothTokenGroups) {

@@ -2941,12 +2941,11 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheKeepsDeviceOnlyRolePolicy) {
       const BlockManager* leaf =
           BlockManagerPoolTestPeer::leaf_of(manager, type);
       ASSERT_NE(leaf, nullptr);
-      EXPECT_EQ(leaf->options().enable_prefix_cache(), !is_decode);
+      EXPECT_EQ(leaf->options().enable_prefix_cache(),
+                type != BlockType::SWA || !is_decode);
     }
     EXPECT_EQ(manager.leaf_combination(),
-              is_decode
-                  ? CompositeBlockManager::LeafCombination::UNSUPPORTED
-                  : CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
+              CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
   }
 }
 
@@ -2956,8 +2955,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsMissingSwaWindow) {
   ASSERT_EQ(leaves.erase(BlockType::SWA), 1u);
   EXPECT_DEATH(
       { CompositeBlockManager manager(std::move(leaves), options); },
-      "V4.1 prefix cache requires the SWA restore window.*C1=1 C2=1.*"
-      "disable prefix cache");
+      "Grouped history prefix requires physical SWA storage");
 }
 
 TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsMissingHistoryLeaves) {

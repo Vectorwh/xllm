@@ -100,13 +100,12 @@ bool leaf_participates_in_prefix_cache(BlockType type,
       return !instance_is_decode;
     case BlockType::EMBEDDING:
       return false;
-    // V4.1 TOKEN groups must be restored with SWA, which does not participate
-    // on DECODE instances. Unlike V4's full-history anchors, C1/C2 therefore
-    // stay disabled there until V4.1 disaggregated PD supports this restore.
-    // DEFAULT serving (including decode steps) still participates.
+    // C1/C2 reuse committed prefixes through the same path as V4 C4/C128.
+    // Like V4, Decode keeps SWA private and receives it through the common
+    // PD transfer path before queueing the first forward.
     case BlockType::C1:
     case BlockType::C2:
-      return !instance_is_decode;
+      return true;
   }
   // Fail loudly on unhandled BlockType. Falling back to false would silently
   // disable prefix cache for the new leaf across both P and D, and every
@@ -394,6 +393,16 @@ CompositeBlockManager::CompositeBlockManager(
       combination_(classify_leaf_combination(leaves_)),
       publish_mode_(publish_mode) {
   CHECK(!leaves_.empty()) << "CompositeBlockManager requires at least one leaf";
+  if (combination_ == LeafCombination::SWA_COMPRESSED &&
+      (leaves_.contains(BlockType::C1) || leaves_.contains(BlockType::C2))) {
+    const auto swa = leaves_.find(BlockType::SWA);
+    CHECK(swa != leaves_.end() && swa->second.leaf != nullptr)
+        << "Grouped history prefix requires physical SWA storage";
+    // V4.1 restores SWA prefixes on Prefill; PD Decode gets a
+    // non-shared window from P, so only its history leaves participate.
+    CHECK(options.instance_is_decode() || swa->second.supports_prefix_cache)
+        << "Prefill history prefix requires the SWA restore window";
+  }
 }
 
 CompositeBlockManager::LeafCombination
@@ -403,6 +412,7 @@ CompositeBlockManager::classify_leaf_combination(const LeafMap& leaves) {
     return it != leaves.end() && it->second.supports_prefix_cache;
   };
   const bool has_kv = has_prefix(BlockType::KV);
+  // SWA prefix-cache capability, not merely the presence of a physical leaf.
   const bool has_swa = has_prefix(BlockType::SWA);
   const bool has_c4 = has_prefix(BlockType::C4);
   const bool has_c128 = has_prefix(BlockType::C128);
@@ -426,13 +436,10 @@ CompositeBlockManager::classify_leaf_combination(const LeafMap& leaves) {
     return LeafCombination::SWA_COMPRESSED;
   }
   if (has_c1 || has_c2) {
-    CHECK(has_swa) << "V4.1 prefix cache requires the SWA restore window; "
-                   << "got SWA=" << has_swa << " C1=" << has_c1
-                   << " C2=" << has_c2
-                   << ". Register a prefix-capable SWA leaf or disable prefix "
-                      "cache with --enable_prefix_cache=false";
     CHECK(!has_kv && !has_linear)
         << "V4.1 prefix cache must not carry KV or LINEAR leaves";
+    // Like V4, Decode omits SWA prefix probes; trim_swa_compressed checks
+    // the window only when a participating SWA probe is present.
     return LeafCombination::SWA_COMPRESSED;
   }
   if (has_swa) {

@@ -44,6 +44,7 @@ limitations under the License.
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/block/block_manager_pool_test_peer.h"
 #include "framework/config/disagg_pd_config.h"
 #include "framework/config/model_config.h"
 #include "framework/config/parallel_config.h"
@@ -146,6 +147,11 @@ class FakeEngine final : public Engine {
     tokenizer_ = std::make_unique<FakeTokenizer>();
     block_manager_ = std::make_unique<BlockManagerPool>(options, dp_size);
   }
+
+  explicit FakeEngine(const BlockManagerPool::Options& options)
+      : tokenizer_(std::make_unique<FakeTokenizer>()),
+        block_manager_(
+            std::make_unique<BlockManagerPool>(options, /*dp_size=*/1)) {}
 
   std::function<ForwardOutput(std::vector<Batch>&)> forward;
   std::function<void(std::vector<Batch>&)> complete_forward;
@@ -1439,6 +1445,114 @@ TEST(DisaggPDSchedulerTest, MtpFirstGenerationStoresBootstrapThenQueues) {
   EXPECT_EQ(queued->sequences()[0]->tokens().back(), 42);
   EXPECT_TRUE(torch::equal(
       queued->sequences()[0]->get_mtp_bootstrap_embedding(), embedding));
+}
+
+TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
+  const BlockType evicted = BlockType::C2;
+  for (const auto& [mode, pull_succeeds] :
+       {std::pair<std::string, bool>{"PUSH", true},
+        {"PULL", true},
+        {"PULL", false}}) {
+    SCOPED_TRACE(static_cast<int32_t>(evicted));
+    SCOPED_TRACE(mode);
+    SCOPED_TRACE(pull_succeeds);
+    BlockManagerPool::Options cache_options;
+    cache_options.model_type("deepseek_v41")
+        .num_blocks(128)
+        .block_size(128)
+        .sliding_window_size(512)
+        .swa_blocks_per_seq(5)
+        .swa_num_blocks(64)
+        .max_tokens_per_batch(2048)
+        .max_seqs_per_batch(4)
+        .manager_types({1, 0, 0})
+        .compress_ratios({0, 2, 1})
+        .enable_prefix_cache(true)
+        .enable_disagg_pd(true)
+        .instance_is_decode(true);
+    FakeEngine engine(cache_options);
+    ModelArgs args;
+    args.model_type("deepseek_v41").window_size(512);
+    engine.set_model_args(args);
+    BlockManagerPool* pool = engine.block_manager_pool();
+    const std::vector<int32_t> tokens(1025, 7);
+    auto seed = make_request(tokens, "seed");
+    ASSERT_TRUE(pool->allocate(seed->sequences()[0].get(), tokens.size()));
+    seed->sequences()[0]->kv_state().set_kv_cache_tokens_num(tokens.size());
+    pool->deallocate(seed.get());
+    BlockManagerPoolTestPeer::leaf_of(*pool, /*dp_rank=*/0, evicted)
+        ->reset_prefix_cache();
+    auto shorter = make_request(std::vector<int32_t>(641, 7), "shorter");
+    ASSERT_TRUE(pool->allocate(shorter->sequences()[0].get(), 641));
+    shorter->sequences()[0]->kv_state().set_kv_cache_tokens_num(641);
+    pool->deallocate(shorter.get());
+
+    auto options = make_decode_options();
+    options.enable_pd_ooc(false);
+    TestDisaggPDScheduler scheduler(&engine, options, /*start_services=*/false);
+    auto request = make_request(tokens);
+    Sequence* sequence = request->sequences()[0].get();
+    ASSERT_EQ(pool->prefix_hit_tokens(*sequence, /*rank=*/0), 512u);
+    pool->allocate_shared(sequence);
+    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::C1), 4u);
+    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::C2), 2u);
+    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::SWA), 0u);
+    // Use Decode admission, which reserves the full prompt but does not
+    // certify that P has filled these destination blocks.
+    ASSERT_TRUE(pool->try_allocate(sequence));
+    ASSERT_EQ(sequence->kv_state().kv_cache_tokens_num(), tokens.size());
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    std::shared_ptr<Request> queued;
+    // Even a real Device-prefix hit and allocated SWA cannot execute yet.
+    ASSERT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+    KVTransferMapping source;
+    source.group_id = cache_group_id(BlockType::SWA);
+    source.remote_ids = {101, 102, 103, 104, 105};
+    std::promise<void> pull_started;
+    auto started = pull_started.get_future();
+    std::promise<void> finish_pull;
+    auto finished = finish_pull.get_future();
+    engine.pull = [&] {
+      pull_started.set_value();
+      const auto status = finished.wait_for(std::chrono::seconds(5));
+      return status == std::future_status::ready && pull_succeeds;
+    };
+    auto receiving = std::async(std::launch::async, [&] {
+      return scheduler.decode_recv_first_generation(
+          "req",
+          42,
+          false,
+          0.0f,
+          0.1,
+          0.0,
+          {},
+          {},
+          mode,
+          {1},
+          {"remote"},
+          mode == "PULL" ? std::vector{source}
+                         : std::vector<KVTransferMapping>{},
+          1,
+          0);
+    });
+    if (mode == "PULL") {
+      EXPECT_EQ(started.wait_for(std::chrono::seconds(5)),
+                std::future_status::ready);
+      EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+      EXPECT_EQ(receiving.wait_for(std::chrono::milliseconds(0)),
+                std::future_status::timeout);
+      finish_pull.set_value();
+    }
+    EXPECT_EQ(receiving.get(), pull_succeeds);
+    if (pull_succeeds) {
+      ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+      EXPECT_EQ(queued.get(), request.get());
+      pool->deallocate(queued.get());
+    } else {
+      EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+      EXPECT_FALSE(sequence->has_any_blocks());
+    }
+  }
 }
 
 TEST(DisaggPDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
