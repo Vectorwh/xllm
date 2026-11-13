@@ -382,3 +382,55 @@ def test_non_kpool_verify_graph_key_matches_empty_dp(num_sequences: int, dp_size
     assert runner._graph_key(8, True, None, active_spans, verify_width=4) == runner._graph_key(
         8, True, None, empty_spans, verify_width=4
     )
+
+
+def test_dspark_empty_dp_keeps_native_proposal_rows_and_graph_plan() -> None:
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False, draft_query_width=3),
+        torch.device("cpu"),
+        max_batch=4,
+        max_model_len=512,
+        is_spec_draft=True,
+        draft_query_width=3,
+    )
+    runner.dp_size = 2
+    active = _dsa_metadata()
+    active.is_dummy = False
+    active.is_mixed = False
+    active.kv_split_size = 1
+    active.use_dflash_proposal_attention = True
+    active.block_table = torch.tensor([[4, 7]], dtype=torch.int32)
+    active.kv_seq_lens = torch.tensor([132], dtype=torch.int32)
+    active.kv_seq_lens_host_values = [132]
+    active.slot_mapping = torch.tensor([640, 641, 642], dtype=torch.int64)
+    active.dp_is_decode = [True, True]
+    active.dp_execution_token_counts = [3, 3]
+    active.raw_dp_execution_token_counts = [3, 0]
+    active.dp_global_kv_max_seq_lens = [130, 0]
+    empty = SimpleNamespace(
+        **(
+            vars(active)
+            | {
+                "is_dummy": True,
+                "block_table": None,
+                "kv_seq_lens": None,
+                "kv_seq_lens_host_values": None,
+                "slot_mapping": torch.zeros(3, dtype=torch.int64),
+            }
+        )
+    )
+    active_view = runner._normalize_metadata(active)
+    empty_view = runner._normalize_metadata(empty)
+    assert empty_view.slot_mapping.tolist() == [-1, -1, -1]
+    assert empty_view.block_table.shape == (3, 1)
+    assert active_view.dp_global_kv_max_seq_lens == empty_view.dp_global_kv_max_seq_lens == [132, 0]
+    assert active_view.dp_is_decode is active.dp_is_decode
+    assert runner._shared_graph_plan(active_view, 3) == runner._shared_graph_plan(empty_view, 3)
+    for metadata in (active_view, empty_view):
+        assert runner.can_execute(ModelInput(torch.ones(3, dtype=torch.int32), torch.zeros(3), metadata))
+        table, lengths, host, indptr, pages, last = runner._decode_metadata(metadata)
+        assert table.shape[0] == lengths.numel() == len(host) == last.numel() == 3
+        assert indptr.numel() == 4
+        assert pages.numel() > 0
+    assert active.block_table.shape == (1, 2)

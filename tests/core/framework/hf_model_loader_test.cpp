@@ -890,7 +890,9 @@ TEST(HFModelLoaderTest, Qwen3DSparkFieldsFromTorchConfig) {
       "model_type": "qwen3",
       "markov_rank": 256,
       "enable_confidence_head": true,
-      "confidence_head_with_markov": true
+      "confidence_head_with_markov": true,
+      "dflash_config": {"use_swa": true, "swa_window_size": 2048, "causal": false},
+      "layer_types": ["sliding_attention"]
     }
   )json"));
 
@@ -899,6 +901,16 @@ TEST(HFModelLoaderTest, Qwen3DSparkFieldsFromTorchConfig) {
   EXPECT_EQ(args.markov_rank(), 256);
   EXPECT_TRUE(args.enable_confidence_head());
   EXPECT_TRUE(args.confidence_head_with_markov());
+  EXPECT_TRUE(args.use_sliding_window());
+  EXPECT_TRUE(args.sliding_window_non_causal());
+  EXPECT_EQ(args.sliding_window(), 2048);
+  EXPECT_EQ(args.layer_types(), std::vector<std::string>{"sliding_attention"});
+
+  reader.mutable_data()["use_sliding_window"] = false;
+  reader.mutable_data()["sliding_window_non_causal"] = false;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_FALSE(args.use_sliding_window());
+  EXPECT_FALSE(args.sliding_window_non_causal());
 }
 
 TEST(HFModelLoaderTest, DeepseekV4DSparkModelArgsFrom0731Config) {

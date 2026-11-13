@@ -50,8 +50,10 @@ class Attention(nn.Module):
         self.sliding_window = sliding_window
         self.layer_id = layer_id
         self.causal = causal
-        # Optional (preceding, following) token extents relative to each query.
-        self.attention_window: tuple[int, int] | None = None
+        # Tuple: (preceding, following) extents relative to each query.
+        # Int: shared history width before the first query, with a fixed left
+        # boundary; the query block follows self.causal. None: no window.
+        self.attention_window: int | tuple[int, int] | None = None
 
     def forward(
         self,
@@ -61,4 +63,6 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         wait_for_layer_load(self.layer_id)
         backend = get_forward_context().attention_backend
+        if isinstance(self.attention_window, int) and not backend.supports_anchor_context_window:
+            raise NotImplementedError(f"{type(backend).__name__} does not support anchor_context_window")
         return backend.execute(q, k, v, self)

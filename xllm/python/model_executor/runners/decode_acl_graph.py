@@ -285,6 +285,64 @@ _GraphKey = tuple[
 ]
 
 
+class _DraftDerivedMetadataView:
+    """Expose validated proposal paging per row to decode graph buffers."""
+
+    __slots__ = (
+        "_base",
+        "block_table",
+        "kv_seq_lens",
+        "kv_seq_lens_host_values",
+        "slot_mapping",
+        "is_prefill",
+        "is_chunked_prefill",
+        "use_dflash_proposal_attention",
+        "expanded_decode_metadata",
+        "dp_global_kv_max_seq_lens",
+        "new_cache_slots_host_values",
+    )
+
+    def __init__(
+        self,
+        source: AttentionMetadata,
+        block_table: torch.Tensor,
+        kv_lengths: torch.Tensor,
+        query_width: int,
+    ) -> None:
+        self._base = source
+        self.block_table = block_table
+        self.kv_seq_lens = kv_lengths
+        self.kv_seq_lens_host_values = [1] * block_table.shape[0] if source.is_dummy else source.kv_seq_lens_host_values
+        self.slot_mapping = source.slot_mapping
+        # Dense draft writes use the device slot_mapping. The target's host
+        # slots can describe context rows and are consumed only by DSA.
+        self.new_cache_slots_host_values = None
+        if source.is_dummy:
+            # Dummy paging can stay request-scoped while native slots already
+            # describe every executed row, including single-row idle drafts.
+            dummy_rows = self.slot_mapping.numel() if self.slot_mapping is not None else block_table.shape[0]
+            self.slot_mapping = torch.full((dummy_rows,), -1, dtype=torch.int64, device=block_table.device)
+        self.is_prefill = False
+        self.is_chunked_prefill = True
+        self.use_dflash_proposal_attention = True
+        self.expanded_decode_metadata = None
+        expanded = resolve_expanded_decode_metadata(self)
+        assert expanded is not None
+        self.expanded_decode_metadata = expanded
+        self.block_table = expanded.block_table
+        self.kv_seq_lens = expanded.kv_seq_lens
+        self.kv_seq_lens_host_values = expanded.kv_seq_lens_host_values
+        self.is_chunked_prefill = False
+        # The engine's DP maxima already include the original decode query.
+        # The native draft row builder adds only width - 1 proposal positions.
+        self.dp_global_kv_max_seq_lens = [
+            int(length) + query_width - 1 if length else 0 for length in source.dp_global_kv_max_seq_lens
+        ]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._base, name)
+
+
 class DecodeAclGraphRunner(BaseRunner):
     """Decode graph runner for NPU (Ascend) using ACL graph capture/replay."""
 
@@ -560,13 +618,55 @@ class DecodeAclGraphRunner(BaseRunner):
     def can_execute(self, inputs: ModelInput) -> bool:
         can_execute = False
         if inputs.multimodal_inputs is None:
-            metadata = self._normalize_dsa_metadata(inputs.metadata)
+            metadata = self._normalize_metadata(inputs.metadata)
             if metadata is not inputs.metadata:
                 inputs = replace(inputs, metadata=metadata)
             can_execute = self._can_execute_inner(
                 inputs.input_ids, metadata, inputs.input_embedding
             ) and can_execute_graph(self.model, inputs)
         return self._agree_on_graph_execution(can_execute, self.dp_size)
+
+    def _normalize_metadata(
+        self,
+        metadata: AttentionMetadata,
+    ) -> AttentionMetadata:
+        """Adapt block-query draft rows and normalize DSA paging for graphs.
+
+        Keep the source metadata unchanged so eager execution retains
+        request-level paging.
+        """
+        if isinstance(metadata, (_DraftDerivedMetadataView, _DsaDerivedMetadataView)):
+            return metadata
+        width = int(getattr(self.attention_backend, "draft_query_width", 0))
+        if width and self._is_spec_draft and not metadata.is_prefill:
+            dummy = bool(metadata.is_dummy)
+            if (
+                not getattr(self.attention_backend, "graph_capturable", True)
+                or metadata.kv_split_size != 1
+                or metadata.is_mixed
+                or not (metadata.use_dflash_proposal_attention or dummy)
+            ):
+                return metadata
+            table = metadata.block_table
+            lengths = metadata.kv_seq_lens
+            if dummy and table is None:
+                table = torch.zeros((1, 1), dtype=torch.int32)
+                lengths = torch.ones(1, dtype=torch.int32)
+            if table is None or lengths is None or lengths.numel() != table.shape[0]:
+                return metadata
+            slots = metadata.slot_mapping
+            rows = slots.numel() if slots is not None else table.shape[0] if dummy else 0
+            if not (table.shape[0] * width == rows or table.shape[0] == rows and (dummy or rows % width == 0)):
+                return metadata
+            host_lengths = metadata.kv_seq_lens_host_values
+            if (
+                not dummy
+                and getattr(self.attention_backend, "requires_host_kv_lengths", True)
+                and (host_lengths is None or len(host_lengths) != table.shape[0])
+            ):
+                return metadata
+            return _DraftDerivedMetadataView(metadata, table, lengths, width)
+        return self._normalize_dsa_metadata(metadata)
 
     def _normalize_dsa_metadata(
         self,
@@ -689,6 +789,11 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
     ) -> bool:
+        if self._is_spec_draft and getattr(self.attention_backend, "draft_query_width", 0):
+            if not isinstance(metadata, _DraftDerivedMetadataView):
+                return False
+        if not getattr(self.attention_backend, "graph_capturable", True):
+            return False
         # Static MoE graph-capability gate (51361671 A): the fp8/none checkpoint
         # modes serve ``DeepseekV41MoE``, whose forward syncs to the host and
         # loops over data-dependent expert segments, so no ACL graph can capture
@@ -1495,7 +1600,7 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
     ) -> None:
-        metadata = self._normalize_dsa_metadata(metadata)
+        metadata = self._normalize_metadata(metadata)
         batch_size = input_ids.shape[0]
         # Same seq-vs-token admission as execute: MTP verify packs
         # (num_spec+1) token-rows per seq, so the capacity gate (max_batch,
@@ -1533,7 +1638,7 @@ class DecodeAclGraphRunner(BaseRunner):
         *,
         static_kernel: StaticKernelWorker | None = None,
     ) -> ModelExecutionOutput:
-        metadata = self._normalize_dsa_metadata(metadata)
+        metadata = self._normalize_metadata(metadata)
         # Keep event wrappers alive until the H2D-ready event has signalled;
         # an ACL stream wait may still reference its native handle meanwhile.
         self._pending_graph_preparations = [

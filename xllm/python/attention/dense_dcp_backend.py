@@ -188,6 +188,8 @@ def merge_dcp_attention_outputs(
 class DenseDcpAttentionBackend(NpuPagedAttentionBackend):
     """FIA backend that shards replicated GQA KV cache across DCP ranks."""
 
+    supports_anchor_context_window = False
+
     def __init__(
         self,
         num_heads: int,

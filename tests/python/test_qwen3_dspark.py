@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from xllm.python import kernels
+from xllm.python.attention.backend import LayerCache
+from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models.dspark_model import DSparkModel
 from xllm.python.models.qwen3_dspark import (
     Qwen3DSparkConfig,
@@ -191,3 +195,86 @@ def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:
         model.model.confidence_head.proj.bias,
         tensors["confidence_head.proj.bias"],
     )
+
+
+def test_community_swa_config_sets_anchor_attention() -> None:
+    values = _config_dict(dflash_config={"use_swa": True, "swa_window_size": 4, "causal": False})
+    model = Qwen3DSparkForCausalLM(values)
+    attention = model.model.backbone.layers[0].self_attn.attn
+    assert attention.attention_window == 4
+    assert not attention.causal
+    assert model.cfg.layer_types == ("sliding_attention",)
+    values.update(use_sliding_window=False, sliding_window=8, sliding_window_non_causal=False)
+    cfg = Qwen3DSparkConfig.from_dict(values)
+    cfg.validate()
+    assert not cfg.use_sliding_window
+    assert not cfg.sliding_window_non_causal
+    assert cfg.sliding_window == 8
+    values.update(use_sliding_window=True, sliding_window=0)
+    with pytest.raises(ValueError, match="sliding_window > 0"):
+        Qwen3DSparkConfig.from_dict(values).validate()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_swa_eager_and_graph_keep_one_anchor_for_the_whole_proposal(
+    monkeypatch: pytest.MonkeyPatch, causal: bool
+) -> None:
+    def scatter(slots, key, value, kc, vc):
+        kc.flatten(0, 1).index_copy_(0, slots, key)
+        vc.flatten(0, 1).index_copy_(0, slots, value)
+
+    def fia(query, key, value, **kwargs):
+        assert kwargs["input_layout"] == "BSND"
+        scores = query.transpose(1, 2) @ key.permute(0, 2, 3, 1)
+        scores.masked_fill_(kwargs["atten_mask"], -torch.inf)
+        output = scores.softmax(-1) @ value.transpose(1, 2)
+        return output.transpose(1, 2).contiguous(), None
+
+    monkeypatch.setattr(kernels, "reshape_paged_cache", scatter, raising=False)
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", fia, raising=False)
+    table = torch.tensor([[2, 0, 1], [6, 7, 4]], dtype=torch.int32)
+    slots = torch.tensor([11, 0, 1, 16, 17, 18])
+    query = key = torch.zeros(6, 1, 1)
+    value = torch.tensor([3, 4, 5, 108, 109, 110], dtype=torch.float32).view(6, 1, 1)
+    expected = [1.5, 2, 2.5, 106, 106.5, 107] if causal else [2.5] * 3 + [107] * 3
+    for graph_mode in (False, True):
+        cache = LayerCache(torch.full((8, 4, 1, 1), float("nan")), torch.full((8, 4, 1, 1), float("nan")))
+        for row, anchor in enumerate((3, 8)):
+            positions = torch.arange(anchor)
+            physical = table[row, positions // 4].long() * 4 + positions % 4
+            cache.key.flatten(0, 1).index_fill_(0, physical, 0)
+            cache.value.flatten(0, 1)[physical] = (positions + 100 * row).float().view(-1, 1, 1)
+        metadata = SimpleNamespace(
+            block_table=table.repeat_interleave(3, dim=0) if graph_mode else table,
+            kv_seq_lens=torch.tensor([6] * 3 + [11] * 3 if graph_mode else [6, 11], dtype=torch.int32),
+            kv_seq_lens_host_values=[6] * 3 + [11] * 3 if graph_mode else [6, 11],
+            slot_mapping=slots,
+            q_cu_seq_lens=None,
+            q_cu_seq_lens_host_values=[3, 6],
+            is_prefill=False,
+            is_chunked_prefill=not graph_mode,
+            is_mixed=False,
+            is_spec_verify=False,
+            use_dflash_proposal_attention=True,
+            kv_split_size=1,
+            dsa_graph_token_capacity=8,
+        )
+        backend = NpuPagedAttentionBackend(
+            1,
+            1,
+            1,
+            1.0,
+            4,
+            False,
+            torch.device("cpu"),
+            torch.float32,
+            draft_query_width=3,
+            draft_graph_window_size=4,
+        )
+        backend.bind_kv_caches([cache])
+        layer = SimpleNamespace(layer_id=0, causal=causal, attention_window=4)
+        context = ForwardContext(backend, torch.device("cpu"), metadata, [cache])
+        with forward_context(context):
+            backend.prepare(metadata, graph_mode=graph_mode)
+            output = backend.execute(query, key, value, layer)
+        torch.testing.assert_close(output.flatten(), torch.tensor(expected))

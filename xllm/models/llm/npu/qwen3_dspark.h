@@ -52,6 +52,8 @@ class DSparkQwen3ForCausalLMImpl final
         markov_head_(context.get_tensor_options(),
                      context.get_model_args().markov_rank()) {
     const ModelArgs& model_args = context.get_model_args();
+    CHECK(!model_args.use_sliding_window())
+        << "Qwen3 DSpark SWA requires the Python NPU model implementation.";
     // Only stand up the ConfidenceHead when adaptive speculative decode is on:
     // it is consumed solely by the adaptive pruning controller, so under static
     // decoding its weights would occupy device memory and never be read.

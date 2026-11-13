@@ -110,6 +110,7 @@ def _create_attention_backend(
     max_num_reqs: int = 1,
     num_decoding_tokens: int = 1,
     acl_graph_enabled: bool = False,
+    block_query_graph_metadata: bool = False,
 ) -> AttentionBackend:
     config = config or {}
     model_type = config.get("model_type", "")
@@ -156,6 +157,8 @@ def _create_attention_backend(
         )
     if current_platform.is_npu():
         dcp_group = distributed.dcp_group(device)
+        if isinstance(first_attention.attention_window, int) and dcp_group is not None and dcp_group.size() > 1:
+            raise NotImplementedError("anchor-window attention requires an unsharded KV pool")
         if int(config.get("cp_size", 1)) == 1 and dcp_group is not None and dcp_group.size() > 1:
             if _is_qwen3_5_model_type(str(model_type)):
                 if current_platform.get_ascend_soc_generation() == "a5":
@@ -222,6 +225,14 @@ def _create_attention_backend(
             # C++ enable_dflash_proposal_xfia already applied the prelaunch gate.
             # Confirm the device here so a stale config cannot enable XFIA off A3.
             use_xfia_decode = xllm_runtime.is_ascend_a3()
+        draft_graph_options = {}
+        if block_query_graph_metadata:
+            window = first_attention.attention_window
+            draft_graph_options = {
+                "draft_query_width": int(config.get("draft_query_width", 1)),
+                "draft_graph_window_size": window if isinstance(window, int) else None,
+                "graph_capturable": int(config.get("cp_size", 1)) == 1 and (dcp_group is None or dcp_group.size() == 1),
+            }
         return NpuPagedAttentionBackend(
             num_heads=first_attention.num_heads,
             num_kv_heads=first_attention.num_kv_heads,
@@ -234,6 +245,7 @@ def _create_attention_backend(
             num_decoding_tokens=num_decoding_tokens,
             xfia_query_width=max(proposal_width, 1),
             use_xfia_decode=use_xfia_decode,
+            **draft_graph_options,
         )
     if current_platform.is_cuda():
         from xllm.python.attention.flashinfer import FlashInferBackend
@@ -335,6 +347,7 @@ class ModelExecutor:
             max_seqs_per_batch,
             num_decoding_tokens=num_decoding_tokens,
             acl_graph_enabled=graph_enabled and current_platform.is_npu(),
+            block_query_graph_metadata=is_spec_draft and bool(getattr(model, "uses_block_query_graph_metadata", False)),
         )
 
         self._configure_bidirectional_prompt_attention(config, device)

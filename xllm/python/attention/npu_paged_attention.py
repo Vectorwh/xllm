@@ -22,7 +22,7 @@ Decode uses FIA TND with block_table.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch_npu
@@ -134,6 +134,13 @@ _sharded_write_transfer_warning_emitted = False
 _HAS_FIA_V2 = hasattr(torch.ops.npu, "npu_fused_infer_attention_score_v2") and hasattr(
     torch_npu, "_npu_fused_infer_attention_score_v2_get_max_workspace"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _DraftGraphAttentionMetadata:
+    slot_indices: torch.Tensor
+    valid: torch.Tensor
+    visible: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +280,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         num_decoding_tokens: int = 1,
         use_xfia_decode: bool = False,
         xfia_query_width: int = 1,
+        *,
+        draft_query_width: int = 0,
+        draft_graph_window_size: int | None = None,
+        graph_capturable: bool = True,
     ) -> None:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -281,6 +292,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self.sliding_window = sliding_window
         self.dtype = dtype
         self.device = device
+        self.draft_query_width = draft_query_width
+        self._draft_has_full_attention = draft_graph_window_size is None
+        self.graph_capturable = graph_capturable
+        self.graph_token_capacity_ceiling = (
+            draft_graph_window_size + draft_query_width
+            if draft_query_width and draft_graph_window_size is not None and not use_xfia_decode
+            else 0
+        )
         self._use_xfia_decode = use_xfia_decode
         self._device_only_decode_inputs = False
         self._xfia_query_width = xfia_query_width
@@ -302,7 +321,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._page_size: int | None = None
         self._metadata: AttentionMetadata | None = None
         self._prefix_bidir_enabled = False
+        self._prepared_in_graph_mode = False
         self._graph_workspace: torch.Tensor | None = None
+        self._draft_graph_workspaces: dict[int, torch.Tensor] = {}
         self._graph_outputs: dict[int, torch.Tensor] = {}
         self._graph_lses: dict[int, torch.Tensor] = {}
         self._current_graph_output: torch.Tensor | None = None
@@ -416,6 +437,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     @property
     def is_mla(self) -> bool:
         return self._is_mla
+
+    @property
+    def supports_anchor_context_window(self) -> bool:
+        return not (self._is_mla or self._use_xfia_decode)
 
     @property
     def requires_host_kv_lengths(self) -> bool:
@@ -538,6 +563,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if self._prefix_bidir_enabled and (metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_mixed):
             self._validate_prefix_bidir(metadata)
         self._metadata = metadata
+        self._prepared_in_graph_mode = graph_mode
         if self._device_only_decode_inputs and _use_dflash_proposal_attention(metadata):
             if metadata.is_prefill:
                 raise ValueError("Device-only draft proposals cannot use prefill metadata")
@@ -618,15 +644,42 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 else:
                     kv_list = [1] * real_batch
 
-            self._actual_seq_q = list(range(1, real_batch + 1))
+            if graph_mode and self.draft_query_width and _use_dflash_proposal_attention(metadata):
+                width = self.draft_query_width
+                query_rows = metadata.slot_mapping.numel()
+                if real_batch == query_rows:
+                    # Graph metadata is row-aligned; paged FIA reads one table
+                    # and length per complete proposal block.
+                    if self._draft_has_full_attention:
+                        table = self._block_table_i32[::width]
+                        # Each graph entry owns this compact table, including
+                        # O2's separate contexts. Replay updates its contents.
+                        self._block_table_i32 = get_execution_buffer(
+                            ("DRAFT_FIA_BLOCK_TABLE", tuple(table.shape)),
+                            lambda: torch.empty(table.shape, dtype=table.dtype, device=table.device),
+                        )
+                        self._block_table_i32.copy_(table, non_blocking=True)
+                    kv_list = kv_list[width - 1 :: width]
+                self._actual_seq_q = list(range(width, query_rows + 1, width))
+            else:
+                self._actual_seq_q = list(range(1, real_batch + 1))
             self._actual_seq_kv = kv_list
         else:
             self._block_table_i32 = None
             self._actual_seq_q = []
             self._actual_seq_kv = []
 
-        if graph_mode and self._block_table_i32 is not None and not self._is_mla:
-            graph_batch_size = self._block_table_i32.shape[0]
+        if (
+            graph_mode
+            and self._block_table_i32 is not None
+            and not self._is_mla
+            and (not self.draft_query_width or self._draft_has_full_attention)
+        ):
+            graph_batch_size = (
+                metadata.slot_mapping.numel() if self.draft_query_width else self._block_table_i32.shape[0]
+            )
+            if self.draft_query_width:
+                self._graph_workspace = self._draft_graph_workspaces.get(graph_batch_size)
             if self._graph_workspace is None:
                 block_size = self.page_size
                 dummy_q = torch.empty(
@@ -675,6 +728,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                         scale=self.scale,
                         softmax_lse_flag=False,
                     )
+                if self.draft_query_width:
+                    self._draft_graph_workspaces[graph_batch_size] = self._graph_workspace
             if graph_batch_size not in self._graph_outputs:
                 self._graph_outputs[graph_batch_size] = torch.empty(
                     graph_batch_size,
@@ -879,6 +934,33 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         v_3d = v.view(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
         q_3d = q.view(num_tokens, self.num_heads, self.head_dim).contiguous()
 
+        attention_window = layer.attention_window
+        draft_graph = (
+            self.draft_query_width
+            and self._prepared_in_graph_mode
+            and not self._use_xfia_decode
+            and _use_dflash_proposal_attention(metadata)
+        )
+        if draft_graph or isinstance(attention_window, int):
+            context = get_forward_context()
+            if context.cp_context is not None or metadata.kv_split_size != 1:
+                raise NotImplementedError("draft proposal attention requires an unsharded KV pool")
+            if not self.draft_query_width or num_tokens % self.draft_query_width:
+                raise ValueError("draft proposal attention requires complete query blocks")
+        if draft_graph:
+            if attention_window is None and layer.causal:
+                raise NotImplementedError("paged draft graph attention requires non-causal full layers")
+            if attention_window is not None and metadata.dsa_graph_token_capacity <= 0:
+                raise ValueError("windowed draft graph attention requires a positive token capacity")
+        elif isinstance(attention_window, int) and (
+            not metadata.is_chunked_prefill
+            or metadata.is_prefill
+            or metadata.is_mixed
+            or metadata.is_spec_verify
+            or self._use_expanded_decode
+        ):
+            raise ValueError("anchor-window attention requires a chunked proposal batch")
+
         # Context-Parallel prefill: q/k/v are this rank's sequence shard while
         # the slot_mapping/metadata still describe the full global sequence
         # (C++ does not pre-shard the Python path). All-gather K/V to the full
@@ -898,6 +980,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
         if self._device_only_decode_inputs and _use_dflash_proposal_attention(metadata):
             return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
+        if isinstance(attention_window, int):
+            return self._draft_window_attention(q_3d, k_cache, v_cache, metadata, layer.causal, attention_window)
+        if draft_graph:
+            return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
 
         if metadata.is_prefill or metadata.is_chunked_prefill:
             if (
@@ -919,7 +1005,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 metadata,
                 num_tokens,
                 layer.causal,
-                layer.attention_window,
+                attention_window,
             )
         return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
 
@@ -2276,6 +2362,81 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     # ------------------------------------------------------------------
     # Prefill: packed TND with causal mask
     # ------------------------------------------------------------------
+
+    def _draft_window_attention(
+        self,
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: AttentionMetadata,
+        causal: bool,
+        window: int,
+    ) -> torch.Tensor:
+        """Use the same fixed-anchor window for eager and captured proposals."""
+        context = get_forward_context()
+        width = self.draft_query_width
+        rows = query.shape[0]
+        groups = rows // width
+        capacity = min(
+            metadata.dsa_graph_token_capacity if self._prepared_in_graph_mode else max(self._actual_seq_kv),
+            window + width,
+        )
+        cache_key = (_DraftGraphAttentionMetadata, capacity, width)
+        plan = context.layer_shared_cache.get(cache_key)
+        if plan is None:
+            table = metadata.block_table
+            lengths = metadata.kv_seq_lens
+            if table is None or lengths is None:
+                raise ValueError("draft window attention requires device paging and KV lengths")
+            if table.shape[0] == rows:
+                table = table[::width]
+                lengths = lengths[width - 1 :: width]
+            table = table.to(device=query.device, dtype=torch.int32)
+            kv_lengths = lengths.to(device=query.device, dtype=torch.int64)
+            offsets = torch.arange(capacity, device=query.device)
+            positions = kv_lengths[:, None] - capacity + offsets[None, :]
+            valid = positions >= 0
+            logical = positions.clamp_min(0)
+            page_columns = torch.div(logical, self.page_size, rounding_mode="floor").clamp_max(table.shape[1] - 1)
+            pages = table.gather(1, page_columns).to(torch.int64).clamp_min(0)
+            slots = pages * self.page_size + logical.remainder(self.page_size)
+            visible = valid | ((kv_lengths == 0)[:, None] & (offsets == capacity - 1)[None, :])
+            plan = _DraftGraphAttentionMetadata(slots, valid, visible)
+            context.layer_shared_cache[cache_key] = plan
+        plan = cast(_DraftGraphAttentionMetadata, plan)
+        shape = (groups, capacity, self.num_kv_heads, self.head_dim)
+        keys = (
+            k_cache.view(-1, self.num_kv_heads, self.head_dim)
+            .index_select(0, plan.slot_indices.reshape(-1))
+            .view(shape)
+        )
+        values = (
+            v_cache.view(-1, self.num_kv_heads, self.head_dim)
+            .index_select(0, plan.slot_indices.reshape(-1))
+            .view(shape)
+        )
+        valid = plan.valid[:, :, None, None]
+        keys.masked_fill_(~valid, 0)
+        values.masked_fill_(~valid, 0)
+        query = query.view(groups, width, self.num_heads, self.head_dim)
+        visible = plan.visible[:, None, :].expand(groups, width, capacity)
+        if causal:
+            query_positions = capacity - width + torch.arange(width, device=query.device)
+            key_positions = torch.arange(capacity, device=query.device)
+            visible = visible & (key_positions[None, :] <= query_positions[:, None])[None, :, :]
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            keys,
+            values,
+            atten_mask=(~visible)[:, None, :, :].contiguous(),
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BSND",
+            scale=self.scale,
+            sparse_mode=_SPARSE_MODE_NONE,
+            softmax_lse_flag=False,
+        )
+        return output.reshape(rows, self.num_heads * self.head_dim)
 
     def _prefill(
         self,

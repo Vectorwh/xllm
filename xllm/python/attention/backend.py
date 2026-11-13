@@ -132,7 +132,8 @@ class AttentionMetadata(Protocol):
     num_accepted_tokens: torch.Tensor | None
     dp_execution_token_counts: Sequence[int]
     raw_dp_execution_token_counts: Sequence[int]
-    # Host-planned logical KV lengths for all DP ranks, including this query.
+    # Host-planned KV lengths for all DP ranks, including the original decode
+    # query. Draft views add width - 1 to match the native proposal row builder.
     # Empty DP ranks retain zero; this is not reserved block-table capacity.
     dp_global_kv_max_seq_lens: Sequence[int]
     mega_moe_token_mask: torch.Tensor | None
@@ -338,6 +339,7 @@ class MlaUnabsorbedPrefill:
 class AttentionBackend(ABC):
     # Opt in when target graph inputs and Engram staging can overlap draft execution.
     supports_draft_to_target_overlap: bool = False
+    supports_anchor_context_window: bool = False
 
     def graph_uses_dsa_metadata(self, metadata: AttentionMetadata) -> bool:
         """Whether this graph uses the DSA metadata path."""

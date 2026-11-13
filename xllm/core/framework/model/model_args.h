@@ -587,6 +587,7 @@ struct ModelArgs {
 
   // sliding window for attention
   PROPERTY(bool, use_sliding_window) = false;
+  PROPERTY(bool, sliding_window_non_causal) = false;
   PROPERTY(int32_t, sliding_window) = -1;
   PROPERTY(int32_t, max_window_layers) = 0;
 
@@ -1046,6 +1047,7 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", mm_pad_token_id: " << args.mm_pad_token_id();
   os << ", tie_word_embeddings: " << args.tie_word_embeddings();
   os << ", use_sliding_window: " << args.use_sliding_window();
+  os << ", sliding_window_non_causal: " << args.sliding_window_non_causal();
   os << ", sliding_window: " << args.sliding_window();
   os << ", max_window_layers: " << args.max_window_layers();
   os << ", query_num: " << args.query_num();

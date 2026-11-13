@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/nn/functional/normalization.h>
 
+#include <algorithm>
+
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_output.h"
@@ -320,8 +322,15 @@ REGISTER_MODEL_ARGS(qwen3, [&] {
   // For qwen3/2.5 model < 7B,  tie_word_embeddings = true
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);
 
-  LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
-  LOAD_ARG_OR(sliding_window, "sliding_window", -1);
+  LOAD_ARG_OR(use_sliding_window,
+              "use_sliding_window",
+              json.value_or<bool>("dflash_config.use_swa", false));
+  LOAD_ARG_OR(sliding_window_non_causal,
+              "sliding_window_non_causal",
+              !json.value_or<bool>("dflash_config.causal", true));
+  LOAD_ARG_OR(sliding_window,
+              "sliding_window",
+              json.value_or<int32_t>("dflash_config.swa_window_size", -1));
   LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
 
   LOAD_ARG_OR(markov_rank, "markov_rank", 0);
@@ -329,6 +338,7 @@ REGISTER_MODEL_ARGS(qwen3, [&] {
   LOAD_ARG_OR(enable_confidence_head, "enable_confidence_head", false);
   LOAD_ARG_OR(
       confidence_head_with_markov, "confidence_head_with_markov", false);
+  LOAD_ARG(layer_types, "layer_types");
   LOAD_ARG_OR(dflash2_block_size, "dflash_config.block_size", 0);
   LOAD_ARG_OR(dflash2_conv_group_size, "dflash_config.conv_group_size", 0);
   LOAD_ARG_OR(dflash2_conv_kernel_size, "dflash_config.conv_kernel_size", 0);
