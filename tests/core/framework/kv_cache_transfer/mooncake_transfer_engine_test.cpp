@@ -654,6 +654,35 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 #if defined(USE_NPU)
+constexpr char kIntraHostNpuResourceConfig[] =
+    R"({"comm_resource_config.protocol_desc":"hccs:device"})";
+
+// Keep same-host NPU tests on HCCS with manual connection instead of depending
+// on RoCE device IPs or HIXL auto-connect probing. Construct before launching
+// child processes; their inherited environment stays pinned until scope exit.
+class ScopedIntraHostNpuTransferEnv final {
+ public:
+  ScopedIntraHostNpuTransferEnv() {
+    ok_ = resource_config_.set(kIntraHostNpuResourceConfig) &&
+          intra_roce_.set("0") && intra_pcie_.set("0") &&
+          auto_connect_.set("0");
+  }
+
+  ScopedIntraHostNpuTransferEnv(const ScopedIntraHostNpuTransferEnv&) = delete;
+  ScopedIntraHostNpuTransferEnv& operator=(
+      const ScopedIntraHostNpuTransferEnv&) = delete;
+
+  bool ok() const { return ok_; }
+
+ private:
+  xllm::tests::ScopedEnvironmentVariable resource_config_{
+      "ASCEND_GLOBAL_RESOURCE_CONFIG"};
+  xllm::tests::ScopedEnvironmentVariable intra_roce_{"HCCL_INTRA_ROCE_ENABLE"};
+  xllm::tests::ScopedEnvironmentVariable intra_pcie_{"HCCL_INTRA_PCIE_ENABLE"};
+  xllm::tests::ScopedEnvironmentVariable auto_connect_{"ASCEND_AUTO_CONNECT"};
+  bool ok_ = false;
+};
+
 constexpr int32_t kValidatePushCommand = 1;
 constexpr int32_t kPreparePullCommand = 2;
 constexpr int32_t kStopChildCommand = 3;
@@ -2637,6 +2666,9 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
 TEST(MooncakeKVCacheTransferDefaultTest,
      NpuLinearIndexerScalePushAndPullRoundTrip) {
+  ScopedIntraHostNpuTransferEnv env;
+  ASSERT_TRUE(env.ok());
+
   if (std::getenv(kControllerProcessEnv) == nullptr) {
     xllm::tests::ScopedEnvironmentVariable controller_process(
         kControllerProcessEnv);
@@ -2943,6 +2975,9 @@ TEST(MooncakeKVCacheTransferDefaultTest, PushStopsAfterLayerFailure) {
   if (Platform::device_count() < 1) {
     GTEST_SKIP() << "NPU device is required for the layer synchronizer.";
   }
+  ScopedIntraHostNpuTransferEnv env;
+  ASSERT_TRUE(env.ok());
+
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_EXIT(
       ([&] {
