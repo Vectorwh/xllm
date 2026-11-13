@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/kv_cache/kv_cache_shape.h"
+#include "core/framework/kv_cache/kv_cache_utils.h"
 #include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/model/rec_causal_lm.h"
@@ -176,6 +177,24 @@ class GlmCheckpointLoader final : public ModelLoader {
 #endif
 
 }  // namespace
+
+TEST(HFModelLoaderTest, SlidingAttentionUsesPagedKvClassification) {
+  ModelArgs args;
+  args.full_attention_interval(4).layer_types(
+      {"sliding_attention", "full_attention"});
+  EXPECT_FALSE(has_linear_attention_layers(args));
+  EXPECT_TRUE(is_full_attention_layer(args, /*layer_id=*/0));
+  EXPECT_TRUE(is_full_attention_layer(args, /*layer_id=*/1));
+  EXPECT_FALSE(is_linear_attention_layer(0, 4, args.layer_types()));
+  EXPECT_FALSE(is_linear_attention_layer(1, 4, args.layer_types()));
+
+  args.layer_types({"sliding_attention", "linear_attention"});
+  EXPECT_TRUE(has_linear_attention_layers(args));
+  EXPECT_TRUE(is_full_attention_layer(args, /*layer_id=*/0));
+  EXPECT_FALSE(is_full_attention_layer(args, /*layer_id=*/1));
+  EXPECT_FALSE(is_linear_attention_layer(0, 4, args.layer_types()));
+  EXPECT_TRUE(is_linear_attention_layer(1, 4, args.layer_types()));
+}
 
 TEST(HFModelLoaderTest, Qwen35DenseBackendAwareModelTypeSelection) {
   JsonReader reader;
