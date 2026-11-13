@@ -25,6 +25,8 @@ limitations under the License.
 
 namespace xllm {
 
+class VLMMaster;
+
 using CompletionCall =
     StreamCall<proto::CompletionRequest, proto::CompletionResponse>;
 
@@ -47,6 +49,18 @@ class CompletionServiceImpl final : public APIServiceImpl<CompletionCall> {
   LLMMaster* master_ = nullptr;
   mutable std::shared_mutex llm_model_to_master_mutex_;
   std::unordered_map<std::string, LLMMaster*> llm_model_to_master_;
+};
+
+class MMCompletionServiceImpl final : public APIServiceImpl<CompletionCall> {
+ public:
+  MMCompletionServiceImpl(VLMMaster* master,
+                          const std::vector<std::string>& models);
+
+  void process_async_impl(std::shared_ptr<CompletionCall> call) override;
+  void process_async_rpc_impl(const proto::CompletionRequest* request) override;
+
+ private:
+  VLMMaster* master_;
 };
 
 }  // namespace xllm

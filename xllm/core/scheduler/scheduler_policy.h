@@ -272,6 +272,7 @@ class SchedulerPolicy {
   void prune_inflight_restores();
   bool is_inflight_restore(const Request* request) const;
   void forget_inflight_restore(const Request* request);
+  bool requires_multimodal_recompute(Request& request) const;
   void fail_decode_restore(std::shared_ptr<Request> request,
                            absl::Time started_at,
                            SchedulerState& state);

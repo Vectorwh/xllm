@@ -17,6 +17,7 @@ limitations under the License.
 #include <unistd.h>
 
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,9 +28,154 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/runtime/forward_shared_memory_manager.h"
+#include "core/runtime/params_utils.h"
 
 namespace xllm {
 namespace {
+
+ForwardInput make_media_transport_input() {
+  ForwardInput input;
+  input.token_ids = torch::tensor({1, 2, 3, 4}, torch::kInt32);
+  std::vector<MMData> requests;
+  requests.reserve(2);
+  for (int32_t request = 0; request < 2; ++request) {
+    MMItemVec items;
+    items.reserve(3);
+    for (int32_t occurrence = 0; occurrence < 3; ++occurrence) {
+      MMDataItem item(MMType::IMAGE);
+      // Repeated media shares values, but each occurrence has its own identity.
+      item.mutable_data()["pixel_values"] = torch::arange(6).reshape({2, 3});
+      item.mutable_data()["grid"] =
+          std::vector<torch::Tensor>{torch::tensor({1, 2, 3}, torch::kInt64),
+                                     torch::tensor({4}, torch::kInt32)};
+      auto& state = item.mutable_state();
+      state.mutable_seq_index() = 13 + request * 16;
+      state.mutable_token_pos() = {occurrence * 3, 3};
+      state.mutable_mm_token_num() = 2;
+      state.mutable_mm_token_mask() =
+          torch::tensor({true, false, true}, torch::kBool);
+      state.mutable_schedule_data().start_pos = 1;
+      state.mutable_schedule_data().end_pos = 3;
+      std::memset(state.mutable_schedule_data().key.data,
+                  'm',
+                  XXH3_128BITS_HASH_VALUE_LEN);
+      items.emplace_back(std::move(item));
+    }
+    requests.emplace_back(MMType::IMAGE, items);
+  }
+  input.input_params.multimodal.mm_data.batch(std::move(requests));
+  return input;
+}
+
+void expect_media_transport(const ForwardInput& restored) {
+  const auto& requests = restored.input_params.multimodal.mm_data.mm_data_vec();
+  ASSERT_EQ(requests.size(), 2u);
+  for (int32_t request = 0; request < 2; ++request) {
+    ASSERT_TRUE(requests[request].hold<MMItemVec>());
+    const auto& items = requests[request].items<MMItemVec>();
+    ASSERT_EQ(items.size(), 3u);
+    for (int32_t occurrence = 0; occurrence < 3; ++occurrence) {
+      const auto& item = items[occurrence];
+      const auto& state = item.state();
+      EXPECT_EQ(item.type(), MMType::IMAGE);
+      EXPECT_EQ(state.seq_index(), 13 + request * 16);
+      EXPECT_EQ(state.token_pos().offset, occurrence * 3);
+      EXPECT_EQ(state.token_pos().length, 3);
+      EXPECT_EQ(state.mm_token_num(), 2);
+      EXPECT_EQ(state.schedule_data().start_pos, 1);
+      EXPECT_EQ(state.schedule_data().end_pos, 3);
+      EXPECT_EQ(state.schedule_data().key.data[0], 'm');
+      EXPECT_TRUE(
+          torch::equal(state.mm_token_mask(),
+                       torch::tensor({true, false, true}, torch::kBool)));
+      const auto pixels = item.get<torch::Tensor>("pixel_values");
+      ASSERT_TRUE(pixels.has_value());
+      EXPECT_TRUE(torch::equal(*pixels, torch::arange(6).reshape({2, 3})));
+      const auto grid = item.get<std::vector<torch::Tensor>>("grid");
+      ASSERT_TRUE(grid.has_value());
+      ASSERT_EQ(grid->size(), 2u);
+      EXPECT_EQ(grid->at(0).scalar_type(), torch::kInt64);
+      EXPECT_EQ(grid->at(1).scalar_type(), torch::kInt32);
+      EXPECT_TRUE(torch::equal(grid->at(1), torch::tensor({4}, torch::kInt32)));
+    }
+  }
+}
+
+TEST(BatchTransportTest, PackedMediaIdentity) {
+  const ForwardInput input = make_media_transport_input();
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed));
+  uint64_t tag = 0;
+  ASSERT_GE(packed.payload().size(), sizeof(tag));
+  std::memcpy(&tag, packed.payload().data(), sizeof(tag));
+  EXPECT_EQ(tag, 0x584C4C4D00000007ULL);
+  proto::ForwardInput envelope;
+  *envelope.mutable_packed_input() = packed;
+  proto::ForwardInput received;
+  ASSERT_TRUE(received.ParseFromString(envelope.SerializeAsString()));
+  ASSERT_TRUE(received.has_packed_input());
+  ForwardInput lazy;
+  packed_proto_to_forward_input(
+      received.packed_input(), lazy, torch::Device(torch::kCPU), nullptr);
+  ForwardInput restored;
+  ASSERT_TRUE(detail::unpack_from_input_host_buffer(
+      lazy,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      restored,
+      /*materialize_device_buffer=*/false));
+  expect_media_transport(restored);
+  EXPECT_TRUE(torch::equal(restored.host_token_ids(), input.token_ids));
+}
+
+TEST(BatchTransportTest, SharedMediaIdentity) {
+  const ForwardInput input = make_media_transport_input();
+  const uint64_t size = ForwardSharedMemoryManager::input_size(input);
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed));
+  EXPECT_EQ(
+      size,
+      packed.payload().size() + sizeof(ControlMetadata) + sizeof(uint64_t));
+  const std::string name = "media_identity_" + std::to_string(getpid());
+  bool creator = false;
+  ForwardSharedMemoryManager writer(
+      name, size, creator, ForwardType::RAW_INPUT);
+  ForwardSharedMemoryManager reader(
+      name, size, creator, ForwardType::RAW_INPUT);
+  ASSERT_TRUE(writer.input_write(input));
+  ForwardInput restored;
+  ASSERT_TRUE(reader.input_read(
+      restored,
+      torch::Device(torch::kCPU),
+      InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
+  expect_media_transport(restored);
+  // The production layout selects one representation for the whole batch.
+  // Exercise the dict representation in a separate message on this channel.
+  ForwardInput dict_input;
+  dict_input.input_params.multimodal.mm_data.batch(std::vector<MMData>{
+      MMData(MMType::AUDIO, MMDict{{"audio", torch::tensor({5.0, 6.0})}})});
+  ASSERT_TRUE(writer.input_write(dict_input));
+  ASSERT_TRUE(reader.input_read(
+      restored,
+      torch::Device(torch::kCPU),
+      InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
+  const auto& dict_requests =
+      restored.input_params.multimodal.mm_data.mm_data_vec();
+  ASSERT_EQ(dict_requests.size(), 1u);
+  ASSERT_TRUE(dict_requests[0].hold<MMDict>());
+  EXPECT_TRUE(torch::equal(*dict_requests[0].get<torch::Tensor>("audio"),
+                           torch::tensor({5.0, 6.0})));
+  // Reuse the same real channel for a text-only batch after the media batch.
+  ForwardInput text;
+  text.token_ids = torch::tensor({8, 9}, torch::kInt32);
+  ASSERT_TRUE(writer.input_write(text));
+  ASSERT_TRUE(reader.input_read(
+      restored,
+      torch::Device(torch::kCPU),
+      InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
+  EXPECT_TRUE(restored.input_params.multimodal.mm_data.mm_data_vec().empty());
+  EXPECT_TRUE(torch::equal(restored.host_token_ids(), text.token_ids));
+}
 
 TEST(BatchTransportTest, MultimodalPreviewMatchesMaterializedPayloadSize) {
   BlockManager::Options options;

@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <type_traits>
@@ -28,6 +29,7 @@ limitations under the License.
 #include "core/common/instance_name.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/multimodal/mm_codec.h"
 #include "core/framework/request/request.h"
 #include "core/util/uuid.h"
 // Pulls in RequestSamplingParam and SchedulerParam definitions for the
@@ -139,6 +141,14 @@ std::vector<JsonTool> handle_tools(
 RequestParams::RequestParams(const proto::CompletionRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
+  if (request.has_routing()) {
+    decode_address = request.routing().decode_name();
+  }
+  if (request.has_multimodal_prompt()) {
+    multimodal_prompt = std::make_shared<PreparedMultimodalInput>();
+    typed_input_status = decode_prepared_multimodal_input(
+        request.multimodal_prompt(), *multimodal_prompt);
+  }
   request_id = generate_completion_request_id();
   x_request_id = x_rid;
   x_request_time = x_rtime;
@@ -541,6 +551,14 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
 RequestParams::RequestParams(const proto::ChatRequest& request,
                              const std::string& x_rid,
                              const std::string& x_rtime) {
+  if (request.has_routing()) {
+    decode_address = request.routing().decode_name();
+  }
+  if (request.has_multimodal_prompt()) {
+    multimodal_prompt = std::make_shared<PreparedMultimodalInput>();
+    typed_input_status = decode_prepared_multimodal_input(
+        request.multimodal_prompt(), *multimodal_prompt);
+  }
   request_id = generate_chat_request_id();
   x_request_id = x_rid;
   x_request_time = x_rtime;
@@ -657,7 +675,25 @@ RequestParams::RequestParams(const proto::AnthropicMessagesRequest& request,
   tools = std::move(handle_tools(request));
 }
 
-bool RequestParams::verify_params(OutputCallback callback) const {
+Status RequestParams::validate_multimodal_input(bool typed_vlm_prefill) const {
+  if (!typed_input_status.ok()) {
+    return typed_input_status;
+  }
+  if (multimodal_prompt && !typed_vlm_prefill) {
+    return {StatusCode::INVALID_ARGUMENT,
+            "Typed media requires the VLM image Prefill path"};
+  }
+  return {StatusCode::OK};
+}
+
+bool RequestParams::verify_params(OutputCallback callback,
+                                  bool typed_vlm_prefill) const {
+  Status context_status = validate_multimodal_input(typed_vlm_prefill);
+  if (!context_status.ok()) {
+    callback(
+        {std::move(context_status), service_request_id, source_xservice_addr});
+    return false;
+  }
   const auto reject_parameter = [this, &callback](std::string param,
                                                   std::string message) {
     callback({Status::invalid_parameter(std::move(message), std::move(param)),

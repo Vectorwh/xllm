@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 

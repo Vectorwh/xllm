@@ -56,6 +56,44 @@ class VLMEngine : public Engine {
   // return the active activation memory
   std::vector<int64_t> get_active_activation_memory() const override;
 
+  // P/D
+  bool pull_kv_blocks(const int32_t src_dp_size,
+                      const int32_t src_dp_rank,
+                      const std::vector<uint64_t>& src_cluster_ids,
+                      const std::vector<std::string>& src_addrs,
+                      const int32_t dst_dp_rank,
+                      const std::vector<KVTransferMapping>& mappings) override;
+
+  std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
+      const uint32_t dp_rank,
+      const std::vector<BlockTransferInfo>& block_transfer_info) override;
+
+  void transfer_kv_blocks(
+      const uint32_t dp_rank,
+      const uint64_t batch_id,
+      const std::vector<BlockTransferInfo>& block_transfer_info) override;
+
+  void get_cache_info(std::vector<uint64_t>& cluster_ids,
+                      std::vector<std::string>& addrs,
+                      std::vector<uint16_t>& ports) override;
+
+  bool link_cluster(const std::vector<uint64_t>& cluster_ids,
+                    const std::vector<std::string>& addrs,
+                    const std::vector<uint16_t>& ports,
+                    const int32_t src_dp_size,
+                    const int32_t src_kv_split_size = 1) override;
+
+  bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                      const std::vector<std::string>& addrs,
+                      const std::vector<uint16_t>& ports,
+                      const int32_t src_dp_size,
+                      const int32_t src_kv_split_size = 1) override;
+
+  // P2P link for weight transfer - each worker links to one remote addr
+  bool link_p2p(const std::vector<std::string>& remote_addrs) override;
+
+  bool unlink_p2p(const std::vector<std::string>& remote_addrs) override;
+
  private:
   template <typename TargetEngine>
   friend class SpeculativeEngineBase;

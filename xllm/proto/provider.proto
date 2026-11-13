@@ -18,6 +18,8 @@ syntax = "proto3";
 option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
 
+import "multimodal.proto";
+
 // Provider contract version 1 is the shared xLLM Service V2 wire schema. The
 // Service validates all enum values and required semantic fields fail closed.
 enum ProviderId {
@@ -357,6 +359,8 @@ message ModelDescriptor {
   string quantization = 4;
   // Digest of the complete tokenizer + template rendering contract.
   string renderer_digest = 5;
+  reserved 6;
+  reserved "processor_digest";
 }
 
 message TopologyDescriptor {
@@ -473,6 +477,26 @@ message CanonicalRequest {
   optional uint64 tpot_slo_ms = 19;
 }
 
+message PromptMediaSource {
+  MMInputData media = 1;
+  ProviderEngineKey preprocessing_engine = 2;
+}
+
+// Prepared text and ordered original media for Native Prefill.
+message MultimodalPrompt {
+  repeated int32 token_ids = 1;
+  MMDataEntry mm_data = 2;
+  repeated PromptMediaSource sources = 3;
+  // Prepared prompts require an exact registered model revision and metadata
+  // contract. Media sources follow input order.
+  string model_revision = 4;
+  // Legacy descriptive hint; payload structure determines decoding. This field
+  // is not a capability or cache-routing switch.
+  string metadata_format = 5;
+  // Rendered text before the Native prompt processor expands media tokens.
+  string prompt_text = 6;
+}
+
 message EncodedRequest {
   ProviderId provider_id = 1;
   TokenCountQuality token_count_quality = 2;
@@ -480,6 +504,7 @@ message EncodedRequest {
   uint64 prompt_tokens_upper_bound = 4;
   string renderer_digest = 5;
   bytes provider_payload = 6;
+  MultimodalPrompt multimodal_prompt = 7;
 }
 
 message PerDpEngineState {
@@ -519,6 +544,7 @@ message ProviderEngineKey {
   ProviderId provider_id = 1;
   string profile_digest = 2;
   string engine_uid = 3;
+  string incarnation_id = 4;
 }
 
 // Identity and ordering domain for one Engine KV stream.
@@ -650,3 +676,10 @@ message ExecutionPlan {
   double score = 18;
 }
 
+message ImageMediaInput {
+  oneof content {
+    string url = 1;
+    bytes data = 2;
+  }
+  map<string, string> headers = 3;
+}

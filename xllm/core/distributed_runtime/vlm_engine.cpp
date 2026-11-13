@@ -405,13 +405,20 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   }
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
-  // init kv cache for each worker in parallel
+  // A role flag without a PD deployment still runs ordinary local batches.
+  // Pass the complete modern shape unchanged to either allocation path.
+  const bool with_transfer =
+      options_.enable_disagg_pd() &&
+      (options_.instance_role() == InstanceRole::PREFILL ||
+       options_.instance_role() == InstanceRole::DECODE);
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(worker_clients_.size());
-  for (auto& worker : worker_clients_) {
-    futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+  for (const auto& worker : worker_clients_) {
+    futures.emplace_back(
+        with_transfer
+            ? worker->allocate_kv_cache_with_transfer_async(kv_cache_shape)
+            : worker->allocate_kv_cache_async(kv_cache_shape));
   }
-  // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
   for (const auto& result : results) {
     if (!result.value()) {
@@ -808,6 +815,275 @@ std::vector<PreparedForwardInput> VLMEngine::prepare_inputs(
   }
 
   return batched_inputs;
+}
+
+bool VLMEngine::pull_kv_blocks(const int32_t src_dp_size,
+                               const int32_t src_dp_rank,
+                               const std::vector<uint64_t>& src_cluster_ids,
+                               const std::vector<std::string>& src_addrs,
+                               const int32_t dst_dp_rank,
+                               const std::vector<KVTransferMapping>& mappings) {
+  if (src_dp_size <= 0 || src_dp_rank < 0 || src_dp_rank >= src_dp_size ||
+      dst_dp_rank < 0 || static_cast<uint32_t>(dst_dp_rank) >= dp_size_ ||
+      src_cluster_ids.empty() || src_addrs.size() != src_cluster_ids.size() ||
+      src_cluster_ids.size() % static_cast<size_t>(src_dp_size) != 0 ||
+      dp_local_tp_size_ == 0) {
+    LOG(ERROR) << "Invalid VLM topology for KV pull";
+    return false;
+  }
+  const size_t src_tp_size =
+      src_cluster_ids.size() / static_cast<size_t>(src_dp_size);
+  std::vector<bool> results;
+  results.reserve(dp_local_tp_size_);
+  // nnodes counts hosts, not workers. Dispatch every TP worker in the selected
+  // local DP group, including single-host multi-device deployments.
+  for (uint32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
+    const uint32_t dst_worker_rank =
+        static_cast<uint32_t>(dst_dp_rank) * dp_local_tp_size_ + tp_rank;
+    const size_t src_worker_rank =
+        static_cast<size_t>(src_dp_rank) * src_tp_size +
+        dst_worker_rank % src_tp_size;
+    results.push_back(worker_clients_[dst_worker_rank]->pull_kv_blocks(
+        src_cluster_ids[src_worker_rank],
+        src_addrs[src_worker_rank],
+        mappings));
+  }
+
+  for (bool result : results) {
+    if (!result) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<folly::SemiFuture<uint32_t>> VLMEngine::transfer_kv_blocks(
+    const uint32_t dp_rank,
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
+  CHECK_LT(dp_rank, dp_size_);
+  CHECK_GT(dp_local_tp_size_, 0U);
+  std::vector<folly::SemiFuture<uint32_t>> futures;
+  futures.reserve(dp_local_tp_size_);
+
+  for (uint32_t local_rank = 0; local_rank < dp_local_tp_size_; ++local_rank) {
+    futures.emplace_back(
+        worker_clients_[local_rank + dp_local_tp_size_ * dp_rank]
+            ->transfer_kv_blocks(block_transfer_info));
+  }
+
+  return futures;
+}
+
+void VLMEngine::transfer_kv_blocks(
+    const uint32_t dp_rank,
+    const uint64_t batch_id,
+    const std::vector<BlockTransferInfo>& block_transfer_info) {
+  CHECK_LT(dp_rank, dp_size_);
+  CHECK_GT(dp_local_tp_size_, 0U);
+  for (uint32_t local_rank = 0; local_rank < dp_local_tp_size_; ++local_rank) {
+    worker_clients_[local_rank + dp_local_tp_size_ * dp_rank]
+        ->transfer_kv_blocks(batch_id, block_transfer_info);
+  }
+}
+
+void VLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
+                               std::vector<std::string>& addrs,
+                               std::vector<uint16_t>& ports) {
+  cluster_ids.reserve(worker_clients_num_);
+  addrs.reserve(worker_clients_num_);
+  ports.reserve(worker_clients_num_);
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    uint64_t cluster_id = 0;
+    std::string addr;
+    uint16_t port = 0;
+    worker_clients_[worker_rank]->get_cache_info(cluster_id, addr, port);
+    cluster_ids.emplace_back(cluster_id);
+    addrs.emplace_back(std::move(addr));
+    ports.emplace_back(port);
+  }
+}
+
+bool VLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
+                             const std::vector<std::string>& addrs,
+                             const std::vector<uint16_t>& ports,
+                             const int32_t src_dp_size,
+                             const int32_t src_kv_split_size) {
+  const int32_t src_world_size = static_cast<int32_t>(cluster_ids.size());
+  if (src_dp_size <= 0 || src_kv_split_size <= 0 || src_world_size <= 0 ||
+      src_world_size % src_dp_size != 0 ||
+      (src_world_size / src_dp_size) % src_kv_split_size != 0 ||
+      addrs.size() != cluster_ids.size() ||
+      ports.size() != cluster_ids.size()) {
+    LOG(ERROR) << "Invalid source topology for cache layout negotiation.";
+    return false;
+  }
+
+  // Every D worker negotiates with all P workers. Logical shard intersection
+  // determines which edges carry bytes; modulo TP routing cannot represent
+  // non-integer TP changes or KV-head replication.
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    std::vector<uint64_t> target_cluster_ids;
+    std::vector<std::string> target_addrs;
+    std::vector<uint16_t> target_ports;
+    target_cluster_ids.reserve(static_cast<size_t>(src_world_size));
+    target_addrs.reserve(static_cast<size_t>(src_world_size));
+    target_ports.reserve(static_cast<size_t>(src_world_size));
+    for (int32_t source_rank = 0; source_rank < src_world_size; ++source_rank) {
+      target_cluster_ids.emplace_back(cluster_ids[source_rank]);
+      target_addrs.emplace_back(addrs[source_rank]);
+      target_ports.emplace_back(ports[source_rank]);
+    }
+
+    folly::Promise<bool> promise;
+    auto future = promise.getSemiFuture();
+    threadpool_->schedule([this,
+                           promise = std::move(promise),
+                           worker_rank,
+                           target_cluster_ids = std::move(target_cluster_ids),
+                           target_addrs = std::move(target_addrs),
+                           target_ports = std::move(target_ports)]() mutable {
+      promise.setValue(worker_clients_[worker_rank]->link_cluster(
+          target_cluster_ids, target_addrs, target_ports));
+    });
+    futures.emplace_back(std::move(future));
+  }
+
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      LOG(ERROR) << "Link cluster failed.";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool VLMEngine::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
+                               const std::vector<std::string>& addrs,
+                               const std::vector<uint16_t>& ports,
+                               const int32_t src_dp_size,
+                               const int32_t src_kv_split_size) {
+  const int32_t src_world_size = static_cast<int32_t>(cluster_ids.size());
+  if (src_dp_size <= 0 || src_kv_split_size <= 0 || src_world_size <= 0 ||
+      src_world_size % src_dp_size != 0 ||
+      (src_world_size / src_dp_size) % src_kv_split_size != 0 ||
+      addrs.size() != cluster_ids.size() ||
+      ports.size() != cluster_ids.size()) {
+    LOG(ERROR) << "Invalid source topology for cache unlink.";
+    return false;
+  }
+
+  // Symmetric to link_cluster: close every negotiated source edge.
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    std::vector<uint64_t> target_cluster_ids;
+    std::vector<std::string> target_addrs;
+    std::vector<uint16_t> target_ports;
+    target_cluster_ids.reserve(static_cast<size_t>(src_world_size));
+    target_addrs.reserve(static_cast<size_t>(src_world_size));
+    target_ports.reserve(static_cast<size_t>(src_world_size));
+    for (int32_t source_rank = 0; source_rank < src_world_size; ++source_rank) {
+      target_cluster_ids.emplace_back(cluster_ids[source_rank]);
+      target_addrs.emplace_back(addrs[source_rank]);
+      target_ports.emplace_back(ports[source_rank]);
+    }
+
+    folly::Promise<bool> promise;
+    auto future = promise.getSemiFuture();
+    threadpool_->schedule([this,
+                           promise = std::move(promise),
+                           worker_rank,
+                           target_cluster_ids = std::move(target_cluster_ids),
+                           target_addrs = std::move(target_addrs),
+                           target_ports = std::move(target_ports)]() mutable {
+      promise.setValue(worker_clients_[worker_rank]->unlink_cluster(
+          target_cluster_ids, target_addrs, target_ports));
+    });
+    futures.emplace_back(std::move(future));
+  }
+
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      LOG(ERROR) << "Unlink cluster failed.";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool VLMEngine::link_p2p(const std::vector<std::string>& remote_addrs) {
+  if (remote_addrs.size() != worker_clients_num_) {
+    LOG(ERROR) << "remote_addrs size " << remote_addrs.size()
+               << " != worker_clients_num " << worker_clients_num_;
+    return false;
+  }
+
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    std::string remote_addr = remote_addrs[worker_rank];
+    folly::Promise<bool> promise;
+    auto future = promise.getSemiFuture();
+    threadpool_->schedule([this,
+                           promise = std::move(promise),
+                           worker_rank,
+                           remote_addr]() mutable {
+      promise.setValue(worker_clients_[worker_rank]->link_p2p(remote_addr));
+    });
+    futures.emplace_back(std::move(future));
+  }
+
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      LOG(ERROR) << "Link P2P failed.";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool VLMEngine::unlink_p2p(const std::vector<std::string>& remote_addrs) {
+  if (remote_addrs.size() != worker_clients_num_) {
+    LOG(ERROR) << "remote_addrs size " << remote_addrs.size()
+               << " != worker_clients_num " << worker_clients_num_;
+    return false;
+  }
+
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    std::string remote_addr = remote_addrs[worker_rank];
+    folly::Promise<bool> promise;
+    auto future = promise.getSemiFuture();
+    threadpool_->schedule([this,
+                           promise = std::move(promise),
+                           worker_rank,
+                           remote_addr]() mutable {
+      promise.setValue(worker_clients_[worker_rank]->unlink_p2p(remote_addr));
+    });
+    futures.emplace_back(std::move(future));
+  }
+
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      LOG(ERROR) << "Unlink P2P failed.";
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace xllm

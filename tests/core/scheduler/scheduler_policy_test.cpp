@@ -20,7 +20,10 @@ limitations under the License.
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <list>
@@ -32,13 +35,17 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/call.h"
-#include "continuous_scheduler.h"
+#include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/multimodal/mm_visitor.h"
+#include "core/scheduler/async_response_processor.h"
+#include "core/scheduler/continuous_scheduler.h"
 #include "distributed_runtime/engine.h"
+#include "framework/batch/batch_input_builder.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
 #include "framework/speculative/spec_input_builder.h"
@@ -3482,7 +3489,9 @@ ContinuousScheduler::Options make_restore_options(int32_t token_budget,
 class RestoreHarness final {
  public:
   RestoreHarness(BlockManagerPool* block_manager_pool,
-                 const ContinuousScheduler::Options& options)
+                 const ContinuousScheduler::Options& options,
+                 RequestPriorityQueue* prefill_queue = nullptr,
+                 RequestPriorityQueue* chunk_queue = nullptr)
       : options_(options),
         admission_(block_manager_pool,
                    DecodeAdmission::Options{
@@ -3492,8 +3501,8 @@ class RestoreHarness final {
                                .decode_reserved_tokens_per_request(),
                    }),
         state_{
-            .prefill_queue = prefill_queue_,
-            .chunk_queue = chunk_queue_,
+            .prefill_queue = prefill_queue ? *prefill_queue : prefill_queue_,
+            .chunk_queue = chunk_queue ? *chunk_queue : chunk_queue_,
             .decode_queue = decode_queue_,
             .unified_queue = unified_queue_,
             .decode_restore_waiting = waiting_,
@@ -4518,5 +4527,192 @@ TEST(DecodeRestoreTest, PrefillHandoffKeepsGrowthReserve) {
   }
   sequence->reset();
 }
+
+namespace {
+std::shared_ptr<Request> make_metadata_best_of(int32_t prompt_length,
+                                               int32_t media_end,
+                                               bool metadata_only,
+                                               bool finished_source) {
+  RequestSamplingParam sampling;
+  sampling.logprobs = true;
+  StoppingChecker stopping;
+  stopping.set_max_generated_tokens(finished_source ? 1 : 8);
+  stopping.set_max_context_len(4096);
+  stopping.set_ignore_eos(true);
+  RequestState state("x",
+                     std::vector<int32_t>(prompt_length, 3),
+                     sampling,
+                     SchedulerParam(),
+                     stopping,
+                     /*seq_capacity=*/4096,
+                     /*n=*/1,
+                     /*best_of=*/3,
+                     /*logprobs=*/false,
+                     /*stream=*/false,
+                     /*echo=*/false,
+                     /*skip_special_tokens=*/false,
+                     /*enable_schedule_overlap=*/false,
+                     /*output_func=*/nullptr,
+                     /*outputs_func=*/nullptr);
+  state.multimodal_metadata_only = metadata_only;
+  if (metadata_only) {
+    MMDataItem item(MMType::IMAGE);
+    auto& media = item.mutable_state();
+    media.mutable_token_pos().offset = 1;
+    media.mutable_token_pos().length = media_end - 1;
+    media.mutable_mm_token_num() = media_end - 1;
+    media.mutable_schedule_data().end_pos = media_end - 1;
+    std::memset(media.mutable_schedule_data().key.data, 37, sizeof(XXH3Key));
+    state.mm_data = MMData(MMType::IMAGE, MMItemVec{item});
+  }
+  return std::make_shared<Request>("best-of", "1", "1", std::move(state), "1");
+}
+
+// Runs the actual requeue -> expand_sequences -> real prefix owner -> policy
+// schedule path. The donor lives on rank 1, so a default-rank cache probe is a
+// miss. No tensors or pixels are supplied to the metadata-only candidates.
+void check_best_of_schedule(int32_t prompt_length,
+                            int32_t media_end,
+                            bool metadata_only,
+                            bool finished_source) {
+  for (BlockHasherType hasher :
+       {BlockHasherType::MM, BlockHasherType::MTP_MM}) {
+    BlockManagerPool::Options pool_options;
+    pool_options.num_blocks(32)
+        .block_size(4)
+        .max_seqs_per_batch(16)
+        .enable_prefix_cache(true)
+        .hasher_type(hasher);
+    const int32_t dp_size = metadata_only ? 2 : 1;
+    const int32_t rank = dp_size - 1;
+    BlockManagerPool pool(pool_options, dp_size);
+    auto options = make_restore_options(/*token_budget=*/64, dp_size);
+    BatchMode mode = decode_first_mode();
+    auto policy = create_scheduler_policy(mode, options);
+    RestoreHarness harness(&pool, options);
+    harness.state().enable_prefix_cache = true;
+    FakeEngine profile_engine(32, 4);
+    ProfileManager::Options profile_options;
+    profile_options.max_tokens_per_batch(64).max_seqs_per_batch(16);
+    ProfileManager profile(&profile_engine, profile_options);
+    harness.state().profile_manager = &profile;
+    FakeTokenizer tokenizer;
+    AsyncResponseProcessor responses(
+        &tokenizer, std::nullopt, false, true, [](std::shared_ptr<Request>) {});
+    harness.state().response_processor = &responses;
+    auto request = make_metadata_best_of(
+        prompt_length, media_end, metadata_only, finished_source);
+    Sequence* source = request->sequences()[0].get();
+    source->set_dp_rank(rank);
+    ASSERT_TRUE(pool.try_allocate(source));
+    source->set_mrope_position_delta(-7);
+    source->append_token(Token(42));
+    EXPECT_EQ(source->finished(), finished_source);
+    std::atomic<int32_t> terminals{0};
+    request->state().output_func = [&terminals](const RequestOutput&) {
+      ++terminals;
+      return true;
+    };
+    harness.state().running_requests.emplace_back(request);
+    const size_t exact_token_budget = static_cast<size_t>(
+        2 * (prompt_length - 8) + (finished_source ? 0 : 1));
+    harness.schedule(*policy,
+                     exact_token_budget,
+                     /*seq_budget=*/3);
+    responses.wait_completion();
+    ASSERT_EQ(request->sequences().size(), 3u);
+    EXPECT_EQ(terminals.load(), 0);
+    EXPECT_FALSE(request->has_terminal_outcome());
+    EXPECT_EQ(harness.running_sequences().size(), finished_source ? 2u : 3u);
+    // The cache owner shares two immutable full blocks, then allocates a
+    // distinct writable block for each candidate's remaining text suffix.
+    for (size_t index = 1; index < request->sequences().size(); ++index) {
+      Sequence* candidate = request->sequences()[index].get();
+      EXPECT_EQ(candidate->get_mrope_position_delta(), -7);
+      EXPECT_EQ(candidate->dp_rank(), rank);
+      EXPECT_EQ(candidate->kv_cache_tokens_num(), 8u);
+      EXPECT_EQ(candidate->kv_state().shared_blocks_num(BlockType::KV), 2u);
+      const auto blocks = candidate->kv_state().blocks(BlockType::KV);
+      ASSERT_EQ(blocks.size(), 3u);
+      const auto other =
+          request->sequences()[index == 1 ? 2 : 1]->kv_state().blocks(
+              BlockType::KV);
+      EXPECT_EQ(blocks[0].id(), other[0].id());
+      EXPECT_EQ(blocks[1].id(), other[1].id());
+      EXPECT_NE(blocks[2].id(), other[2].id());
+      if (metadata_only) {
+        EXPECT_EQ(candidate->mm_data().items<MMItemVec>()[0].data().size(), 0u);
+        ASSERT_TRUE(candidate->has_mrope_positions());
+        const torch::Tensor suffix = candidate->mrope_positions().slice(
+            /*dim=*/1, /*start=*/8, /*end=*/prompt_length);
+        EXPECT_TRUE(torch::equal(suffix,
+                                 torch::arange(/*start=*/1,
+                                               /*end=*/prompt_length - 7,
+                                               torch::kInt32)
+                                     .expand({3, -1})));
+        MMData scheduled = candidate->mm_data();
+        UpdateMMItemScheduleStateVisitor visitor(
+            /*computed_token_num=*/8,
+            /*q_seq_len=*/prompt_length - 8,
+            /*seq_idx=*/static_cast<int32_t>(index));
+        scheduled.foreach (visitor);
+        EXPECT_TRUE(visitor.mm_data_items_.empty());
+        // Exercise the actual PreparedForwardInput consumer too: no media
+        // processor or mRoPE generator may be needed for this suffix. Preparing
+        // a candidate must not advance tokens until the global capacity commit.
+        Batch batch;
+        batch.add(candidate, /*allowed_max_token=*/prompt_length - 8);
+        ModelArgs args;
+        args.rope_scaling_rope_type("mrope");
+        auto prepared = batch.prepare_forward_input_candidate(
+            args, /*thread_pool=*/nullptr);
+        EXPECT_TRUE(torch::equal(prepared.input().positions, suffix));
+        EXPECT_FALSE(prepared.input().input_params.multimodal.mm_data.valid());
+        EXPECT_EQ(candidate->kv_cache_tokens_num(), 8u);
+        EXPECT_EQ(candidate->get_mrope_position_delta(), -7);
+      }
+    }
+    size_t total_tokens = 0;
+    for (size_t tokens : harness.state().running_sequences_budgets) {
+      total_tokens += tokens;
+    }
+    EXPECT_EQ(total_tokens,
+              static_cast<size_t>(2 * (prompt_length - 8) +
+                                  (finished_source ? 0 : 1)));
+    // Complete the text suffix and sample independently. The following policy
+    // round must remain decode-only with no repeated expansion or terminal.
+    harness.advance();
+    for (Sequence* sequence : harness.running_sequences()) {
+      sequence->append_token(Token(43));
+    }
+    if (!finished_source) {
+      harness.schedule(*policy, /*token_budget=*/64);
+      responses.wait_completion();
+      EXPECT_EQ(terminals.load(), 0);
+      EXPECT_EQ(request->sequences().size(), 3u);
+    }
+    pool.deallocate(request.get());
+    pool.reset_prefix_cache();
+    EXPECT_EQ(pool.num_used_blocks()[rank], 0u);
+  }
+}
+
+TEST(VlmPDBestOfTest, DecodePolicySharesCompleteMediaPrefix) {
+  check_best_of_schedule(12, 3, true, false);
+}
+
+TEST(VlmPDBestOfTest, PartialTextTailUsesPrivateWritableBlocks) {
+  check_best_of_schedule(10, 3, true, false);
+}
+
+TEST(VlmPDBestOfTest, FinishedDonorPinsPrefixUntilCandidatesOwnIt) {
+  check_best_of_schedule(12, 3, true, true);
+}
+
+TEST(VlmPDBestOfTest, OrdinaryTextBestOfRetainsPrefixSharing) {
+  check_best_of_schedule(12, 3, false, false);
+}
+
+}  // namespace
 
 }  // namespace xllm

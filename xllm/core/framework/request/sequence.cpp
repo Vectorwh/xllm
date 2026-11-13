@@ -536,6 +536,28 @@ bool Sequence::restore_json_object_state(
   return true;
 }
 
+void Sequence::prepare_mrope_text_suffix() {
+  CHECK_EQ(num_generated_tokens(), 0u);
+  CHECK_GT(kv_cache_tokens_num(), 0u);
+  CHECK(mm_data_.hold<MMItemVec>());
+  const size_t cached_tokens = kv_cache_tokens_num();
+  for (const MMDataItem& item : mm_data_.items<MMItemVec>()) {
+    const auto& span = item.state().token_pos();
+    CHECK_GE(span.offset, 0);
+    CHECK_GT(span.length, 0);
+    CHECK_LE(static_cast<size_t>(span.offset) + span.length, cached_tokens);
+  }
+  // BatchInputBuilder slices [cached_tokens, num_tokens). Earlier positions
+  // are never forwarded: the cached media cannot be recomputed without pixels.
+  // Keep the existing full-prompt cache shape so PreparedForwardInput can use
+  // its normal staged slicing and commit path without invoking a generator.
+  set_mrope_positions(
+      torch::arange(mrope_position_delta_,
+                    mrope_position_delta_ + static_cast<int64_t>(num_tokens_),
+                    torch::kInt32)
+          .expand({3, -1}));
+}
+
 void Sequence::append_token(const Token& token) {
   CHECK_LT(num_tokens_, tokens_.size())
       << "exceed the token capacity of the sequence";

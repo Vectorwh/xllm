@@ -22,6 +22,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/constraint/builtin_json_machine.h"
+#include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "distributed_runtime/llm_engine.h"
 #include "framework/request/request_output.h"
@@ -122,7 +123,9 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
 
   auto output_callback = [this](const RequestOutput& output) -> bool {
     // response to xllm service to avoid the redirect cost.
-    if (xservice_client_ == nullptr) return false;
+    if (xservice_client_ == nullptr) {
+      return false;
+    }
     auto return_status = xservice_client_->generations({output});
     CHECK_EQ(return_status.size(), 1)
         << "return size of generations is not equal to 1";
@@ -153,6 +156,15 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
                          scheduler_->enable_schedule_overlap(),
                          output_callback,
                          batch_output_callback);
+  if (req.has_mm_data()) {
+    auto metadata = proto_to_mmdata_entry(req.mm_data());
+    if (!metadata) {
+      LOG(ERROR) << "Invalid VLM PD metadata, request_id=" << req.req_id();
+      return nullptr;
+    }
+    req_state.mm_data = std::move(*metadata);
+    req_state.multimodal_metadata_only = true;
+  }
   req_state.include_stop_str_in_output = req.include_stop_str_in_output();
 
   if (json_object) {
@@ -401,7 +413,10 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         first_token.prefill_text_withheld(),
         mtp_bootstrap_embedding,
         gen.num_cached_tokens(),
-        gen.has_phase_timing() ? &gen.phase_timing() : nullptr);
+        gen.has_phase_timing() ? &gen.phase_timing() : nullptr,
+        gen.has_mrope_position_delta()
+            ? std::optional<int32_t>(gen.mrope_position_delta())
+            : std::nullopt);
     if (!success) {
       response->set_ok(false);
       return;

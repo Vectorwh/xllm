@@ -85,8 +85,10 @@ bool SequencesGroup::expand_sequences(bool share_prefix) {
   // FIXME later share_prefix
   if (!share_prefix ||
       seq->kv_state().kv_cache_tokens_num() >= seq->num_prompt_tokens()) {
+    const int32_t mrope_position_delta = seq->get_mrope_position_delta();
     while (sequences_.size() < best_of) {
       add();
+      sequences_.back()->set_mrope_position_delta(mrope_position_delta);
     }
     return true;
   }

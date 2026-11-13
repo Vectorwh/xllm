@@ -444,6 +444,17 @@ void XServiceClient::set_scheduler(Scheduler* scheduler) {
 
 void XServiceClient::set_engine(Engine* engine) { engine_ = engine; }
 
+std::optional<std::pair<proto::ProviderDescriptor, std::string>>
+XServiceClient::registered_provider_snapshot() const {
+  std::lock_guard<std::mutex> lock(registration_mutex_);
+  if (exited_.load(std::memory_order_acquire) ||
+      !register_done_.load(std::memory_order_acquire) ||
+      !provider_descriptor_ || incarnation_id_.empty()) {
+    return std::nullopt;
+  }
+  return std::make_pair(*provider_descriptor_, incarnation_id_);
+}
+
 XServiceClient::~XServiceClient() { shutdown(); }
 
 void XServiceClient::stop_background_workers() {

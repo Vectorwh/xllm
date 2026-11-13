@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <folly/Function.h>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -85,6 +86,17 @@ class VLMMaster : public Master {
   // generate will run all requests, this is an blocking call
   void generate();
 
+  using PreprocessCallback =
+      std::function<void(Status, MMData, std::vector<int32_t>)>;
+  void preprocess(MMContentVec media,
+                  std::optional<std::string> prompt,
+                  BinaryPayload payload,
+                  PreprocessCallback callback);
+
+  Status validate_multimodal_request(const RequestParams& sp) const {
+    return request_factory_->validate_multimodal_request(sp);
+  }
+
   int get_image_limit() { return options_.limit_image_per_prompt(); }
 
   const std::string& model_type() const { return model_args_.model_type(); }
@@ -101,6 +113,7 @@ class VLMMaster : public Master {
   // request_factory_ and scheduler_, so the pool is explicitly reset
   // (drained/joined) in ~VLMMaster before those members are destroyed.
   std::unique_ptr<ThreadPool> threadpool_;
+  std::unique_ptr<ThreadPool> preprocess_threadpool_;
 
   std::unique_ptr<ChatTemplate> chat_template_;
   std::unique_ptr<MultimodalProcessorBase> processor_;

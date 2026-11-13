@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "anthropic_service_impl.h"
 #include "api_service/http_auth.h"
+#include "api_service/multimodal_preprocess_service_impl.h"
 #include "audio_generation_service_impl.h"
 #include "chat_service_impl.h"
 #include "completion_service_impl.h"
@@ -51,6 +52,10 @@ class APIService : public proto::XllmAPIService {
              const std::vector<std::string>& model_repository_names,
              const std::vector<std::string>& model_versions);
   ~APIService() = default;
+  void Preprocess(::google::protobuf::RpcController* controller,
+                  const proto::PreprocessRequest* request,
+                  proto::PreprocessResponse* response,
+                  ::google::protobuf::Closure* done) override;
 
   void Completions(::google::protobuf::RpcController* controller,
                    const proto::CompletionRequest* request,
@@ -310,6 +315,8 @@ class APIService : public proto::XllmAPIService {
   bool do_sleep(const proto::MasterInfos& request, std::string* error_message);
   bool do_wakeup(const proto::MasterInfos& request, std::string* error_message);
 
+  std::unique_ptr<MultimodalPreprocessServiceImpl>
+      multimodal_preprocess_service_impl_;
   Master* master_;
   api_service::HttpBearerAuthenticator http_auth_;
   ChatHttpHandler chat_completions_handler_;
@@ -317,6 +324,7 @@ class APIService : public proto::XllmAPIService {
   std::unordered_map<std::string, Master*> masters_;
   std::unique_ptr<AnthropicServiceImpl> anthropic_service_impl_;
   std::unique_ptr<CompletionServiceImpl> completion_service_impl_;
+  std::unique_ptr<MMCompletionServiceImpl> mm_completion_service_impl_;
   std::unique_ptr<SampleServiceImpl> sample_service_impl_;
   std::unique_ptr<ChatServiceImpl> chat_service_impl_;
   std::unique_ptr<MMChatServiceImpl> mm_chat_service_impl_;

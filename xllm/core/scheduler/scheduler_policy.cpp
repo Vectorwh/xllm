@@ -1537,6 +1537,37 @@ bool SchedulerPolicy::should_wait_for_decode_restore(
              "MTP";
 }
 
+bool SchedulerPolicy::requires_multimodal_recompute(Request& request) const {
+  if (!request.state().multimodal_metadata_only) {
+    return false;
+  }
+  for (const auto& sequence : request.sequences()) {
+    if (sequence->finished() || !sequence->is_prefill_stage()) {
+      continue;
+    }
+    const MMData& media = sequence->mm_data();
+    if (request.preempted() || sequence->num_generated_tokens() != 0 ||
+        sequence->kv_state().kv_cache_tokens_num() == 0 ||
+        sequence->kv_cache_tokens_num() !=
+            sequence->kv_state().kv_cache_tokens_num() ||
+        !media.valid() || !media.hold<MMItemVec>() || media.empty() ||
+        sequence->host_cache_copy_units() != 0) {
+      return true;
+    }
+    const size_t cached_tokens = sequence->kv_state().kv_cache_tokens_num();
+    for (const MMDataItem& item : media.items<MMItemVec>()) {
+      const auto& span = item.state().token_pos();
+      if (span.offset < 0 || span.length <= 0 ||
+          static_cast<size_t>(span.offset) > cached_tokens ||
+          static_cast<size_t>(span.length) >
+              cached_tokens - static_cast<size_t>(span.offset)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 void SchedulerPolicy::enqueue_decode_restore(
     const std::shared_ptr<Request>& request,
     SchedulerState& state,
@@ -1695,8 +1726,32 @@ void SchedulerPolicy::handle_running_requests(
                << request->request_id();
   }
 
+  const size_t previous_size = request->sequences().size();
   if (request->expand_sequences()) {
-    state.kv_cache_manager->cache(request->sequences()[0].get());
+    Sequence* source = request->sequences()[0].get();
+    state.kv_cache_manager->cache(source);
+    if (request->state().multimodal_metadata_only && !request->preempted() &&
+        state.enable_prefix_cache) {
+      // These are fresh best_of candidates, not restored sequences. Match on
+      // the donor's rank while its completed prompt blocks are still pinned,
+      // including when the donor finished on the first generated token. The
+      // real cache owner retains only immutable, complete blocks and leaves a
+      // private writable suffix for independent sampling. Never alias a
+      // partial last block, per-sequence LINEAR state, or EMBEDDING slot here.
+      for (size_t index = previous_size; index < request->sequences().size();
+           ++index) {
+        Sequence* candidate = request->sequences()[index].get();
+        candidate->set_dp_rank(source->dp_rank());
+        allocate_shared_blocks_for(candidate, state);
+      }
+      if (!requires_multimodal_recompute(*request)) {
+        for (size_t index = previous_size; index < request->sequences().size();
+             ++index) {
+          Sequence* candidate = request->sequences()[index].get();
+          candidate->prepare_mrope_text_suffix();
+        }
+      }
+    }
   }
 
   for (auto& sequence : request->sequences()) {

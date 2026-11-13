@@ -31,8 +31,11 @@ limitations under the License.
 #include "completion.pb.h"
 #include "core/common/instance_name.h"
 #include "core/distributed_runtime/llm_master.h"
+#include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/request/request_output.h"
 #include "core/framework/request/request_timing.h"
+#include "core/runtime/xservice_client.h"
+#include "core/util/scope_guard.h"
 #include "core/util/utils.h"
 
 #ifdef likely
@@ -220,10 +223,19 @@ void CompletionServiceImpl::process_async_rpc_impl(
   const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
-  auto callback = [master = master_](const RequestOutput& req_output) -> bool {
+  RequestParams request_params(*request, "", "");
+  OutputCallback callback =
+      [master = master_](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
     return master->handle_rpc_response(req_output);
   };
+  Status validation_status = request_params.validate_multimodal_input();
+  if (!validation_status.ok()) {
+    callback({std::move(validation_status),
+              service_request_id,
+              target_xservice_addr});
+    return;
+  }
 
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
@@ -236,7 +248,6 @@ void CompletionServiceImpl::process_async_rpc_impl(
     return;
   }
 
-  RequestParams request_params(rpc_request, "", "");
   request_params.timing = std::make_shared<RequestTiming>();
   request_params.timing->record_arrival(arrival_time);
 
@@ -262,6 +273,7 @@ void CompletionServiceImpl::process_async_impl(
     std::shared_ptr<CompletionCall> call) {
   // Route input preparation starts here, after transport/JSON parsing.
   call->request_timing()->record_arrival();
+
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
   LLMMaster* master = get_model_master(model);
@@ -330,6 +342,111 @@ void CompletionServiceImpl::process_async_impl(
         // non-stream request in prefill instance, we send a virtual response
         return send_result_to_client_brpc(
             call, request_id, created_time, model, req_output, query_ids);
+      });
+}
+
+MMCompletionServiceImpl::MMCompletionServiceImpl(
+    VLMMaster* master,
+    const std::vector<std::string>& models)
+    : APIServiceImpl(models), master_(master) {
+  CHECK(master != nullptr);
+}
+
+void MMCompletionServiceImpl::process_async_rpc_impl(
+    const proto::CompletionRequest* request) {
+  const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
+  auto callback = [](const RequestOutput& output) {
+    output.log_request_status();
+    const auto accepted = XServiceClient::get_instance()->generations({output});
+    return accepted.size() == 1 && accepted.front();
+  };
+  Status status = api_service_internal::admit_rpc_request(
+      request->model(), models_, master_->get_rate_limiter());
+  if (!status.ok()) {
+    callback({std::move(status),
+              request->service_request_id(),
+              request->source_xservice_addr()});
+    return;
+  }
+  ScopeGuard rate_limit_guard(
+      [this] { master_->get_rate_limiter()->decrease_one_request(); });
+  RequestParams request_params(*request, "", "");
+  if (!request->has_multimodal_prompt() && request->token_ids_size() > 0) {
+    request_params.prompt_tokens.emplace(request->token_ids().begin(),
+                                         request->token_ids().end());
+  }
+  status = master_->validate_multimodal_request(request_params);
+  if (!status.ok()) {
+    callback({std::move(status),
+              request->service_request_id(),
+              request->source_xservice_addr()});
+    return;
+  }
+  request_params.timing = std::make_shared<RequestTiming>();
+  request_params.timing->record_arrival(arrival_time);
+  rate_limit_guard.dismiss();
+  master_->handle_request(request->prompt(),
+                          MMData{},
+                          std::move(request_params),
+                          std::nullopt,
+                          std::move(callback));
+}
+
+void MMCompletionServiceImpl::process_async_impl(
+    std::shared_ptr<CompletionCall> call) {
+  call->request_timing()->record_arrival();
+  const auto& request = call->request();
+  auto admission = api_service_internal::admit_rpc_request(
+      request.model(), models_, master_->get_rate_limiter());
+  if (!admission.ok()) {
+    call->finish_with_error(admission);
+    return;
+  }
+  ScopeGuard ingress_guard(
+      [this] { master_->get_rate_limiter()->decrease_one_request(); });
+  RequestParams params(
+      request, call->get_x_request_id(), call->get_x_request_time());
+  call->clear_multimodal_prompt();
+  params.timing = call->request_timing();
+  auto status = master_->validate_multimodal_request(params);
+  if (call->take_request_iobuf().size() != 0 && status.ok()) {
+    status = {StatusCode::INVALID_ARGUMENT,
+              "Typed image cannot include a legacy binary attachment"};
+  }
+  if (status.ok() && !params.multimodal_prompt) {
+    status = {StatusCode::INVALID_ARGUMENT,
+              "VLM Completion ingress requires typed media"};
+  }
+  if (!status.ok()) {
+    call->finish_with_error(status);
+    return;
+  }
+  const bool stream = params.streaming;
+  const std::string request_id = params.request_id;
+  const bool include_usage =
+      request.has_stream_options() && request.stream_options().include_usage();
+  ingress_guard.dismiss();
+  master_->handle_request(
+      std::string{},
+      MMData{},
+      std::move(params),
+      call.get(),
+      [call,
+       model = request.model(),
+       stream,
+       include_usage,
+       request_id,
+       created_time = absl::ToUnixSeconds(absl::Now())](
+          const RequestOutput& output) mutable {
+        if (output.status.has_value() && !output.status->ok()) {
+          return call->finish_with_error(*output.status);
+        }
+        if (stream) {
+          return send_delta_to_client_brpc(
+              call, include_usage, request_id, created_time, model, output);
+        }
+        return send_result_to_client_brpc(
+            call, request_id, created_time, model, output, {});
       });
 }
 

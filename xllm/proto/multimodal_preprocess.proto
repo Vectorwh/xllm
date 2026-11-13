@@ -1,0 +1,77 @@
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+syntax = "proto3";
+
+package xllm.proto;
+
+import "provider.proto";
+import "multimodal.proto";
+
+enum PreprocessCode {
+  PREPROCESS_CODE_UNSPECIFIED = 0;
+  PREPROCESS_CODE_OK = 1;
+  PREPROCESS_CODE_INVALID_ARGUMENT = 2;
+  PREPROCESS_CODE_RESOURCE_EXHAUSTED = 3;
+  PREPROCESS_CODE_DEADLINE_EXCEEDED = 4;
+  PREPROCESS_CODE_CANCELLED = 5;
+  PREPROCESS_CODE_FENCED = 6;
+  PREPROCESS_CODE_UNAVAILABLE = 7;
+  reserved 8;
+  reserved "PREPROCESS_CODE_PROCESSOR_MISMATCH";
+  PREPROCESS_CODE_PROCESSING_FAILED = 9;
+}
+
+message PreprocessItemRequest {
+  // Zero-based index of the multimodal item within this request, in input
+  // order.
+  uint32 mm_item_index = 1;
+  ImageMediaInput image = 2; // Legacy image metadata callers.
+  MMInputData media = 3;
+}
+
+message PreprocessRequest {
+  string request_uid = 1;
+  string model_revision = 2;
+  ProviderEngineKey expected_engine = 3;
+  repeated PreprocessItemRequest items = 5;
+  reserved 6;
+  reserved "expected_processor_digest";
+  // Presence selects Native prompt preparation, even for empty text.
+  // Each item must set media, leave image unset, and use a unique index in
+  // [0, items_size). Without this field, the legacy path reads item.image.
+  optional string prompt_text = 7;
+}
+
+message PreprocessItemResult {
+  // Zero-based index of the multimodal item within this request, in input
+  // order.
+  uint32 mm_item_index = 1;
+  PreprocessCode code = 2;
+  string message = 3;
+  MMDataItem media_item = 4;
+}
+
+message PreprocessResponse {
+  PreprocessCode code = 1;
+  string message = 2;
+  string request_uid = 3;
+  ProviderEngineKey engine = 4;
+  reserved 5;
+  reserved "processor_digest";
+  repeated PreprocessItemResult items = 6;
+  repeated int32 token_ids = 7;
+  MMDataEntry mm_data = 8;
+}

@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-#include <optional>
 #include <string>
 #include <vector>
 

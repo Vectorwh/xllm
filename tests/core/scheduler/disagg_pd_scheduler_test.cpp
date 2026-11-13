@@ -153,6 +153,10 @@ class FakeEngine final : public Engine {
         block_manager_(
             std::make_unique<BlockManagerPool>(options, /*dp_size=*/1)) {}
 
+  void replace_block_manager(std::unique_ptr<BlockManagerPool> manager) {
+    block_manager_ = std::move(manager);
+  }
+
   std::function<ForwardOutput(std::vector<Batch>&)> forward;
   std::function<void(std::vector<Batch>&)> complete_forward;
   std::function<void()> on_link_cluster;
@@ -330,12 +334,14 @@ class TestDisaggPDScheduler final
   void wait_notifications() {
     std::promise<void> done;
     auto future = done.get_future();
-    reservation_release_threadpool_.schedule([&done] { done.set_value(); });
+    reservation_release_threadpool_.schedule(
+        [done = std::move(done)]() mutable { done.set_value(); });
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
     future.get();
   }
 
   void wait_responses() { response_processor_->wait_completion(); }
-
   std::shared_ptr<CancelRequestQueue> cancel_queue_for_test() {
     return cancel_request_queue_;
   }
@@ -3543,4 +3549,71 @@ TEST(DisaggPDSchedulerTest,
   EXPECT_TRUE(build_native_provider_descriptor(*config, &error).has_value())
       << error;
 }
+
+namespace {
+
+TEST(VlmPDMetadataTest, MissingDeltaConsumesReservationAndReleasesSlots) {
+  FakeEngine engine(16, 2, /*num_speculative_tokens=*/1);
+  TestDisaggPDScheduler decode(&engine, make_mtp_decode_options(), false);
+  auto request = make_request({1, 2, 3, 4});
+  request->state().multimodal_metadata_only = true;
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(decode.decode_schedule(request, "prefill"));
+  ASSERT_FALSE(recv_first_generation(&decode, torch::ones({1, 4})));
+  EXPECT_TRUE(decode.reservations_empty());
+  EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
+  EXPECT_LT(request->sequences()[0]->get_embedding_block_id(), 0);
+  EXPECT_FALSE(request->has_terminal_outcome());
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(decode.pop_decode_request_for_test(&queued));
+  EXPECT_FALSE(recv_first_generation(&decode, torch::ones({1, 4})));
+}
+
+}  // namespace
+
+namespace {
+class PositionHandoffChannel final : public google::protobuf::RpcChannel {
+ public:
+  std::optional<int32_t> delta;
+  void CallMethod(const google::protobuf::MethodDescriptor* method,
+                  google::protobuf::RpcController*,
+                  const google::protobuf::Message* request,
+                  google::protobuf::Message* response,
+                  google::protobuf::Closure* done) override {
+    EXPECT_EQ(method->name(), "FirstGeneration");
+    const auto& handoff =
+        static_cast<const proto::DisaggGenerationsRequests&>(*request);
+    if (handoff.multi_gens(0).has_mrope_position_delta()) {
+      delta = handoff.multi_gens(0).mrope_position_delta();
+    }
+    static_cast<proto::Status*>(response)->set_ok(true);
+    if (done != nullptr) {
+      done->Run();
+    }
+  }
+};
+
+TEST(VlmPDMetadataTest, ProductionFirstGenerationSendsNegativeDelta) {
+  FakeEngine engine(16, 2);
+  auto options = make_options();
+  options.enable_pd_ooc(false).disable_log_stats(true).kv_cache_transfer_mode(
+      "PUSH");
+  TestDisaggPDScheduler prefill(&engine, options, false);
+  PositionHandoffChannel channel;
+  proto::DisaggPDService_Stub stub(&channel);
+  auto request = make_request({1, 2, 3, 4});
+  request->state().output_func = [](const RequestOutput&) { return true; };
+  request->sequences()[0]->set_mrope_position_delta(-9);
+  prefill.admit_prefill(request, &stub);
+  const auto batches = prefill.prepare_batch_test();
+  ASSERT_FALSE(batches[0].empty());
+  finish_prefill(request->sequences()[0].get());
+  prefill.prefill_send_first_generation();
+  prefill.wait_prefill_completion();
+  ASSERT_TRUE(channel.delta.has_value());
+  EXPECT_EQ(*channel.delta, -9);
+}
+
+}  // namespace
 }  // namespace xllm

@@ -40,6 +40,12 @@ bool CacheableMultimodalProcessor::process_prompt(
   return inner_->process_prompt(prompt, mm_data, token_ids);
 }
 
+bool CacheableMultimodalProcessor::bind_prompt_tokens(
+    const std::vector<int32_t>& token_ids,
+    MMData& mm_data) const {
+  return inner_->bind_prompt_tokens(token_ids, mm_data);
+}
+
 bool CacheableMultimodalProcessor::process_multimodal(const MMInput& inputs,
                                                       MMData& data) const {
   ProcessorCacheLookupVisitor cache_lookup_visitor(*cache_, inputs.size());

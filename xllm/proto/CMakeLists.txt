@@ -15,6 +15,7 @@ proto_library(
     rerank.proto
     models.proto
     worker.proto
+    multimodal_preprocess.proto
     provider.proto
     observability.proto
     disagg_pd.proto

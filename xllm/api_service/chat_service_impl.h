@@ -26,6 +26,8 @@ limitations under the License.
 
 namespace xllm {
 
+class VLMMaster;
+
 class RecMaster;
 
 using ChatCall = StreamCall<proto::ChatRequest, proto::ChatResponse>;
@@ -60,7 +62,6 @@ class ChatServiceImpl final : public APIServiceImpl<ChatCall> {
   const std::string reasoning_parser_format_;
 };
 
-class VLMMaster;
 using MMChatCall = StreamCall<proto::MMChatRequest, proto::ChatResponse>;
 
 // a class to handle mm chat completion requests
@@ -68,10 +69,17 @@ class MMChatServiceImpl : public APIServiceImpl<MMChatCall> {
  public:
   MMChatServiceImpl(VLMMaster* master, const std::vector<std::string>& models);
 
+  using APIServiceImpl<MMChatCall>::process_async;
+  void process_async(std::shared_ptr<ChatCall> call);
+  void process_async_rpc_impl(const proto::ChatRequest* request);
+
   // brpc call_data needs to use shared_ptr
   void process_async_impl(std::shared_ptr<MMChatCall> call);
 
  private:
+  template <typename ChatCallType>
+  void process_chat_request(std::shared_ptr<ChatCallType> call);
+
   DISALLOW_COPY_AND_ASSIGN(MMChatServiceImpl);
 
   VLMMaster* master_ = nullptr;

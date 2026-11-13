@@ -42,7 +42,6 @@ limitations under the License.
 #include "core/distributed_runtime/dit_master.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
-#include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/multimodal_config.h"
@@ -168,6 +167,20 @@ Master* APIService::get_model_master(const std::string& model_id) const {
   return it->second;
 }
 
+void APIService::Preprocess(::google::protobuf::RpcController* controller,
+                            const proto::PreprocessRequest* request,
+                            proto::PreprocessResponse* response,
+                            ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!multimodal_preprocess_service_impl_) {
+    response->set_code(proto::PREPROCESS_CODE_UNAVAILABLE);
+    response->set_message("Preprocess service is not available on this server");
+    return;
+  }
+  multimodal_preprocess_service_impl_->process_request(
+      controller, request, response, done_guard.release());
+}
+
 void APIService::Completions(::google::protobuf::RpcController* controller,
                              const proto::CompletionRequest* request,
                              proto::CompletionResponse* response,
@@ -183,6 +196,8 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
 
   if (completion_service_impl_) {
     completion_service_impl_->process_async_rpc_impl(request);
+  } else if (mm_completion_service_impl_) {
+    mm_completion_service_impl_->process_async_rpc_impl(request);
   } else if (rec_completion_service_impl_) {
     request_in_metric(nullptr);
     auto arena = GetArenaWithCheck<CompletionCall>(response);
@@ -248,13 +263,15 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
     return;
   }
 
-  if (!completion_service_impl_ && !rec_completion_service_impl_) {
+  if (!completion_service_impl_ && !mm_completion_service_impl_ &&
+      !rec_completion_service_impl_) {
     api_service::write_bad_request(
         ctrl, "Completions service is not available on this server.");
     return;
   }
 
-  if (req_pb->prompt().empty() && req_pb->token_ids_size() == 0) {
+  if (req_pb->prompt().empty() && req_pb->token_ids_size() == 0 &&
+      !req_pb->has_multimodal_prompt()) {
     api_service::write_http_error(
         ctrl, Status::invalid_parameter("Prompt is empty!", "prompt"));
     return;
@@ -269,6 +286,8 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
                                        /*is_http_request=*/true);
   if (completion_service_impl_) {
     completion_service_impl_->process_async(call);
+  } else if (mm_completion_service_impl_) {
+    mm_completion_service_impl_->process_async(call);
   } else if (rec_completion_service_impl_) {
     rec_completion_service_impl_->process_async(call);
   }
@@ -517,7 +536,11 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
     return;
   }
 
-  if (req_pb->messages_size() == 0) {
+  bool typed_prompt = false;
+  if constexpr (requires { req_pb->has_multimodal_prompt(); }) {
+    typed_prompt = req_pb->has_multimodal_prompt();
+  }
+  if (req_pb->messages_size() == 0 && !typed_prompt) {
     api_service::write_http_error(
         ctrl, Status::invalid_parameter("Messages is empty!", "messages"));
     return;
@@ -539,6 +562,25 @@ void APIService::register_chat_completions_handler() {
                                        brpc::Controller* ctrl,
                                        const proto::HttpRequest* request,
                                        proto::HttpResponse* response) {
+      auto [status, content_length] = api_service::http_json_body_length(*ctrl);
+      if (!status.ok()) {
+        api_service::write_http_error(ctrl, status);
+        return;
+      }
+      std::string body;
+      ctrl->request_attachment().copy_to(&body, content_length, 0);
+      const auto json = nlohmann::json::parse(body, nullptr, false);
+      if (json.is_object() && (json.contains("multimodal_prompt") ||
+                               json.contains("multimodalPrompt"))) {
+        chat_completions_http_impl<ChatCall, MMChatServiceImpl>(
+            mm_chat_service_impl_,
+            guard,
+            ctrl,
+            request,
+            response,
+            ChatJsonParser::get(ServingMode::LLM));
+        return;
+      }
       chat_completions_http_impl<MMChatCall, MMChatServiceImpl>(
           mm_chat_service_impl_,
           guard,
@@ -577,7 +619,11 @@ void APIService::ChatCompletions(::google::protobuf::RpcController* controller,
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
   // Maybe need double check later
 
-  chat_service_impl_->process_async_rpc_impl(request);
+  if (mm_chat_service_impl_) {
+    mm_chat_service_impl_->process_async_rpc_impl(request);
+  } else {
+    chat_service_impl_->process_async_rpc_impl(request);
+  }
 }
 
 void APIService::ChatCompletionsHttp(

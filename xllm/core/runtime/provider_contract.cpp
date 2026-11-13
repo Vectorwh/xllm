@@ -753,13 +753,17 @@ collect_native_provider_descriptor_config(
       std::to_string(TORCH_VERSION_PATCH);
   const std::string model_dtype =
       model_args.dtype().empty() ? "unspecified" : model_args.dtype();
-  const std::vector<std::string> api_features =
+  std::vector<std::string> api_features =
       api_features_for_backend(model_config.backend());
   if (api_features.empty()) {
     if (error != nullptr) {
       *error = "Native V2 serving backend is unknown for API features";
     }
     return std::nullopt;
+  }
+
+  if (*role == proto::ENGINE_ROLE_PREFILL && model_config.backend() == "vlm") {
+    api_features.emplace_back("multimodal_preprocess");
   }
 
   return ProviderDescriptorConfig{

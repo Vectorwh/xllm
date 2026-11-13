@@ -268,10 +268,13 @@ std::optional<xllm::MMDict> proto_to_mmdict(const ProtoMap& pb_dict) {
 }
 
 bool mmitem_state_to_proto(const xllm::MMItemState& cpp_state,
-                           proto::MMItemState* pb_state) {
+                           proto::MMItemState* pb_state,
+                           bool include_tensors) {
+  pb_state->Clear();
+  pb_state->set_mm_token_num(cpp_state.mm_token_num());
   pb_state->set_token_pos_offset(cpp_state.token_pos().offset);
   pb_state->set_token_pos_length(cpp_state.token_pos().length);
-  if (cpp_state.mm_token_mask().defined() &&
+  if (include_tensors && cpp_state.mm_token_mask().defined() &&
       !util::torch_to_proto(cpp_state.mm_token_mask(),
                             pb_state->mutable_mm_token_mask())) {
     LOG(ERROR) << "Failed to convert MMItemState mm_token_mask";
@@ -292,6 +295,7 @@ bool proto_to_mmitem_state(const proto::MMItemState& pb_state,
     return false;
   }
 
+  cpp_state->mutable_mm_token_num() = pb_state.mm_token_num();
   cpp_state->mutable_token_pos().offset = pb_state.token_pos_offset();
   cpp_state->mutable_token_pos().length = pb_state.token_pos_length();
 
@@ -326,20 +330,26 @@ bool proto_to_mmitem_state(const proto::MMItemState& pb_state,
   return true;
 }
 
+}  // namespace
+
 bool mmdata_item_to_proto(const xllm::MMDataItem& cpp_item,
-                          proto::MMDataItem* pb_item) {
+                          proto::MMDataItem* pb_item,
+                          bool include_tensors) {
   if (!pb_item) {
     LOG(ERROR) << "PB MMDataItem pointer is null";
     return false;
   }
 
+  pb_item->Clear();
   pb_item->set_type(cpp_item.type());
   pb_item->set_seq_index(cpp_item.state().seq_index());
-  if (!mmdict_to_proto(cpp_item.data(), pb_item->mutable_dict())) {
+  if (include_tensors &&
+      !mmdict_to_proto(cpp_item.data(), pb_item->mutable_dict())) {
     LOG(ERROR) << "Failed to convert MMDataItem dict";
     return false;
   }
-  if (!mmitem_state_to_proto(cpp_item.state(), pb_item->mutable_state())) {
+  if (!mmitem_state_to_proto(
+          cpp_item.state(), pb_item->mutable_state(), include_tensors)) {
     LOG(ERROR) << "Failed to convert MMDataItem state";
     return false;
   }
@@ -356,7 +366,8 @@ std::optional<xllm::MMDataItem> proto_to_mmdata_item(
   }
 
   xllm::MMType type{static_cast<xllm::MMType::Value>(pb_item.type())};
-  xllm::MMDataItem cpp_item(type, std::move(*dict_opt));
+  xllm::MMDataItem cpp_item(type);
+  cpp_item.mutable_data() = std::move(*dict_opt);
   cpp_item.mutable_state().mutable_seq_index() = pb_item.seq_index();
   if (!proto_to_mmitem_state(pb_item.state(), &cpp_item.mutable_state())) {
     return std::nullopt;
@@ -366,27 +377,30 @@ std::optional<xllm::MMDataItem> proto_to_mmdata_item(
 }
 
 bool mmdata_entry_to_proto(const xllm::MMData& cpp_entry,
-                           proto::MMDataEntry* pb_entry) {
+                           proto::MMDataEntry* pb_entry,
+                           bool include_tensors) {
   if (!pb_entry) {
     LOG(ERROR) << "PB MMDataEntry pointer is null";
     return false;
   }
 
+  pb_entry->Clear();
   pb_entry->set_type(cpp_entry.type());
   if (cpp_entry.hold<xllm::MMItemVec>()) {
     pb_entry->set_is_item_vec(true);
     const auto& cpp_items = cpp_entry.items<xllm::MMItemVec>();
     pb_entry->mutable_items()->Reserve(cpp_items.size());
     for (const auto& cpp_item : cpp_items) {
-      if (!mmdata_item_to_proto(cpp_item, pb_entry->add_items())) {
+      if (!mmdata_item_to_proto(
+              cpp_item, pb_entry->add_items(), include_tensors)) {
         LOG(ERROR) << "Failed to convert MMDataEntry item";
         return false;
       }
     }
   } else if (cpp_entry.hold<xllm::MMDict>()) {
     pb_entry->set_is_item_vec(false);
-    if (!mmdict_to_proto(cpp_entry.items<xllm::MMDict>(),
-                         pb_entry->mutable_dict())) {
+    if (include_tensors && !mmdict_to_proto(cpp_entry.items<xllm::MMDict>(),
+                                            pb_entry->mutable_dict())) {
       LOG(ERROR) << "Failed to convert MMDataEntry dict";
       return false;
     }
@@ -421,7 +435,6 @@ std::optional<xllm::MMData> proto_to_mmdata_entry(
   }
   return xllm::MMData(pb_entry.type(), std::move(*dict_opt));
 }
-}  // namespace
 
 bool mmdata_to_proto(const xllm::MMBatchData& cpp_mmdata,
                      proto::MMData* pb_mmdata) {
@@ -493,6 +506,25 @@ bool proto_to_mmdata(const proto::MMData& pb_mmdata,
   }
 
   return true;
+}
+
+bool media_metadata_to_proto(const MMDataItem& item,
+                             proto::MMDataItem* metadata) {
+  if (metadata == nullptr) {
+    return false;
+  }
+  const auto grid = item.get<torch::Tensor>("image_grid_thw");
+  if (!grid) {
+    return false;
+  }
+  metadata->Clear();
+  metadata->set_type(item.type());
+  metadata->set_seq_index(item.state().seq_index());
+  metadata->mutable_state()->set_schedule_data_key(
+      item.state().schedule_data().key.data, XXH3_128BITS_HASH_VALUE_LEN);
+  return util::torch_to_proto(
+      *grid,
+      (*metadata->mutable_dict())["image_grid_thw"].mutable_single_tensor());
 }
 
 }  // namespace xllm

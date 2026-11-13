@@ -158,6 +158,11 @@ class Sequence final {
   void set_mrope_position_delta(int val) { mrope_position_delta_ = val; }
   int get_mrope_position_delta() { return mrope_position_delta_; }
 
+  // For a new candidate whose device KV covers every media span. Only the
+  // text suffix is forwarded; its positions use the transferred final delta.
+  // Cached media positions are deliberately not reconstructed without pixels.
+  void prepare_mrope_text_suffix();
+
   // Full-prompt mRoPE positions cache, see `mrope_positions_`.
   void set_mrope_positions(const torch::Tensor& positions) {
     CHECK(!positions.defined() || positions.dim() == 2)

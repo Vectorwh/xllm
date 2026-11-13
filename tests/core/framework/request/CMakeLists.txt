@@ -343,3 +343,22 @@ target_link_libraries(sequence_mrope_positions_test
 target_link_options(sequence_mrope_positions_test
                     PRIVATE
                     $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+# Register extracted multiline cases even with source-scanning GTest discovery.
+if(TARGET vlm_request_factory_test)
+  foreach(case_filter IN ITEMS
+    TypedImageRequestTest.FactoryConsumesAuthoritativeTokensWithoutRendering
+    TypedImageRequestTest.RoutesTypedImageStreamingBatchAfterFactoryDestruction
+    TypedImageRequestTest.RoutesTypedImageCompletedBatchAfterFactoryDestruction
+    TypedImageRequestTest.FactoryRechecksCancellationAfterProcessing
+  )
+    if(NOT TEST "${case_filter}")
+      add_test(NAME "${case_filter}"
+        COMMAND "$<TARGET_FILE:vlm_request_factory_test>" "--gtest_filter=${case_filter}")
+      set_tests_properties("${case_filter}" PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        LABELS "cpu;target:vlm_request_factory_test"
+        SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+    endif()
+  endforeach()
+endif()

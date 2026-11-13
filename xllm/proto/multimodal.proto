@@ -23,6 +23,50 @@ import "google/protobuf/struct.proto";
 import "tensor.proto";
 import "embedding_data.proto";
 
+message TensorList {
+  repeated Tensor tensors = 1;
+}
+
+message MMValue {
+  oneof value {
+    Tensor single_tensor = 1;
+    TensorList tensor_list = 2;
+  }
+}
+
+message MMItemState {
+  uint32 token_pos_offset = 1;
+  uint32 token_pos_length = 2;
+  Tensor mm_token_mask = 3;
+  bytes schedule_data_key = 4;
+  int32 schedule_data_start_pos = 5;
+  int32 schedule_data_end_pos = 6;
+  int32 mm_token_num = 7;
+}
+
+message MMDataItem {
+  uint32 type = 1;
+  map<string, MMValue> dict = 2;
+  MMItemState state = 3;
+  int32 seq_index = 4;
+  reserved 5;
+}
+
+// Preserve the original per-request MMData item vector over brpc/proto.
+message MMDataEntry {
+  reserved 5;
+  uint32 type = 1;
+  bool is_item_vec = 2;
+  repeated MMDataItem items = 3;
+  map<string, MMValue> dict = 4;
+}
+
+message MMData {
+  uint32 type = 1;
+  map<string, MMValue> dict = 2;
+  repeated MMDataEntry entries = 3;
+}
+
 message ImageURL {
   string url = 1;
   map<string, string> headers = 2;
@@ -146,7 +190,6 @@ message MMChatRequest {
   optional string request_id = 24;
 
   optional string service_request_id = 25;
-
 
   Routing routing = 26;
 

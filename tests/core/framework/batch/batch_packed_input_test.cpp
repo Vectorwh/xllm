@@ -583,6 +583,22 @@ TEST(BatchPackedInputTest, PackedProtoRejectsIncompatibleLayoutHeader) {
   const std::string payload = packed_input.payload();
   ASSERT_GE(payload.size(), kRawLayoutHeaderBytes);
 
+  // v5 has no occurrence identity; reject it before parsing the descriptor.
+  proto::PackedForwardInput v5_input = packed_input;
+  const uint64_t v5_tag = 0x584C4C4D00000005ULL;
+  std::memcpy(v5_input.mutable_payload()->data(), &v5_tag, sizeof(v5_tag));
+  ForwardInput v5_lazy;
+  packed_proto_to_forward_input(
+      v5_input, v5_lazy, torch::Device(torch::kCPU), nullptr);
+  ForwardInput v5_unpacked;
+  EXPECT_DEATH(detail::unpack_from_input_host_buffer(
+                   v5_lazy,
+                   torch::Device(torch::kCPU),
+                   torch::kFloat32,
+                   v5_unpacked,
+                   /*materialize_device_buffer=*/false),
+               "incompatible raw input format");
+
   // An engine build without the format tag leads with the old descriptor
   // length instead, which must not be parsed as a matching tag.
   std::string legacy_payload = payload;

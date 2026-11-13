@@ -80,6 +80,15 @@ void ServiceImplFactory::create(
           Master* master,
           const std::vector<std::string>& models) {
          auto* vlm_master = dynamic_cast<VLMMaster*>(master);
+
+         if (vlm_master->options().enable_service_routing() &&
+             InstanceRole(vlm_master->options().instance_role()) ==
+                 InstanceRole::PREFILL) {
+           self->multimodal_preprocess_service_impl_ =
+               std::make_unique<MultimodalPreprocessServiceImpl>(vlm_master);
+         }
+         self->mm_completion_service_impl_ =
+             std::make_unique<MMCompletionServiceImpl>(vlm_master, models);
          self->mm_chat_service_impl_ =
              std::make_unique<MMChatServiceImpl>(vlm_master, models);
          self->mm_embedding_service_impl_ =

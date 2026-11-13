@@ -27,6 +27,7 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 
 #include "api_service/mm_service_utils.h"
@@ -41,6 +42,7 @@ limitations under the License.
 #include "core/framework/lora/lora_runtime.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_params.h"
+#include "core/runtime/xservice_client.h"
 #include "core/util/binary_payload.h"
 #include "core/util/scope_guard.h"
 #include "core/util/utils.h"
@@ -484,6 +486,35 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
   return call->write_and_finish(response);
 }
 
+std::vector<Message> chat_messages_from_proto(
+    const proto::ChatRequest& request) {
+  std::vector<Message> messages;
+  messages.reserve(request.messages_size());
+  for (const auto& message : request.messages()) {
+    messages.emplace_back(message.role(), message.content());
+    auto& msg = messages.back();
+    if (message.has_tool_call_id()) {
+      msg.tool_call_id = message.tool_call_id();
+    }
+    if (message.has_reasoning_content()) {
+      msg.reasoning_content = message.reasoning_content();
+    }
+    if (message.tool_calls_size() > 0) {
+      Message::ToolCallVec tool_calls;
+      tool_calls.reserve(message.tool_calls_size());
+      for (const auto& tool_call : message.tool_calls()) {
+        tool_calls.emplace_back();
+        auto& converted = tool_calls.back();
+        converted.id = tool_call.id();
+        converted.type = tool_call.type();
+        converted.function.name = tool_call.function().name();
+        converted.function.arguments = tool_call.function().arguments();
+      }
+      msg.tool_calls = std::move(tool_calls);
+    }
+  }
+  return messages;
+}
 }  // namespace
 
 ChatServiceImpl::ChatServiceImpl(LLMMaster* master,
@@ -638,10 +669,21 @@ void ChatServiceImpl::process_async_rpc_impl(
   const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
-  auto callback = [master = master_](const RequestOutput& req_output) -> bool {
+  RequestParams request_params(*request, "", "");
+  OutputCallback callback =
+      [master = master_](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
     return master->handle_rpc_response(req_output);
   };
+  std::vector<Message> messages = chat_messages_from_proto(*request);
+
+  Status validation_status = request_params.validate_multimodal_input();
+  if (!validation_status.ok()) {
+    callback({std::move(validation_status),
+              service_request_id,
+              target_xservice_addr});
+    return;
+  }
 
   CHECK(master_ != nullptr);
   const auto& rpc_request = *request;
@@ -655,38 +697,8 @@ void ChatServiceImpl::process_async_rpc_impl(
     return;
   }
 
-  RequestParams request_params(rpc_request, "", "");
   request_params.timing = std::make_shared<RequestTiming>();
   request_params.timing->record_arrival(arrival_time);
-  std::vector<Message> messages;
-  messages.reserve(rpc_request.messages_size());
-  for (const auto& message : rpc_request.messages()) {
-    messages.emplace_back(message.role(), message.content());
-    auto& msg = messages.back();
-
-    if (message.has_tool_call_id()) {
-      msg.tool_call_id = message.tool_call_id();
-    }
-
-    if (message.has_reasoning_content()) {
-      msg.reasoning_content = message.reasoning_content();
-    }
-
-    if (message.tool_calls_size() > 0) {
-      Message::ToolCallVec tool_calls;
-      tool_calls.reserve(message.tool_calls_size());
-      for (const auto& tool_call : message.tool_calls()) {
-        tool_calls.emplace_back();
-        auto& tc = tool_calls.back();
-        tc.id = tool_call.id();
-        tc.type = tool_call.type();
-        tc.function.name = tool_call.function().name();
-        tc.function.arguments = tool_call.function().arguments();
-      }
-      msg.tool_calls = std::move(tool_calls);
-    }
-  }
-
   std::optional<std::vector<int>> prompt_tokens = std::nullopt;
   if (rpc_request.has_routing()) {
     prompt_tokens = std::vector<int>{};
@@ -904,10 +916,63 @@ MMChatServiceImpl::MMChatServiceImpl(VLMMaster* master,
 }
 
 void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
-  // Include build_messages() and its multimodal input preparation.
+  process_chat_request(std::move(call));
+}
+
+void MMChatServiceImpl::process_async(std::shared_ptr<ChatCall> call) {
+  if (!call->request_payload_status().ok()) {
+    call->finish_with_error(call->request_payload_status());
+    return;
+  }
+  process_chat_request(std::move(call));
+}
+
+void MMChatServiceImpl::process_async_rpc_impl(
+    const proto::ChatRequest* request) {
+  const RequestTiming::TimePoint arrival_time = RequestTiming::Clock::now();
+  auto callback = [](const RequestOutput& output) {
+    output.log_request_status();
+    const auto accepted = XServiceClient::get_instance()->generations({output});
+    return accepted.size() == 1 && accepted.front();
+  };
+  Status status = api_service_internal::admit_rpc_request(
+      request->model(), models_, master_->get_rate_limiter());
+  if (!status.ok()) {
+    callback({std::move(status),
+              request->service_request_id(),
+              request->source_xservice_addr()});
+    return;
+  }
+  ScopeGuard rate_limit_guard(
+      [this] { master_->get_rate_limiter()->decrease_one_request(); });
+  RequestParams request_params(*request, "", "");
+  if (!request->has_multimodal_prompt() && request->token_ids_size() > 0) {
+    request_params.prompt_tokens.emplace(request->token_ids().begin(),
+                                         request->token_ids().end());
+  }
+  status = master_->validate_multimodal_request(request_params);
+  if (!status.ok()) {
+    callback({std::move(status),
+              request->service_request_id(),
+              request->source_xservice_addr()});
+    return;
+  }
+  request_params.timing = std::make_shared<RequestTiming>();
+  request_params.timing->record_arrival(arrival_time);
+  std::vector<Message> messages = chat_messages_from_proto(*request);
+  rate_limit_guard.dismiss();
+  master_->handle_request(std::move(messages),
+                          std::move(request_params),
+                          BinaryPayload{},
+                          std::nullopt,
+                          std::move(callback));
+}
+
+template <typename ChatCallType>
+void MMChatServiceImpl::process_chat_request(
+    std::shared_ptr<ChatCallType> call) {
   call->request_timing()->record_arrival();
   const auto& rpc_request = call->request();
-  const auto& req_messages = rpc_request.messages();
   const auto& model = rpc_request.model();
   const Status admission_status = api_service_internal::admit_rpc_request(
       model, models_, master_->get_rate_limiter());
@@ -919,16 +984,33 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
       [this] { master_->get_rate_limiter()->decrease_one_request(); });
 
   std::vector<Message> messages;
-  const Status messages_status = mm_service_utils::build_messages(
-      req_messages, messages, master_->get_image_limit());
-  if (!messages_status.ok()) {
-    call->finish_with_error(messages_status);
-    return;
-  }
-
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
   request_params.timing = call->request_timing();
+  BinaryPayload payload(call->take_request_iobuf());
+  if constexpr (std::is_same_v<ChatCallType, ChatCall>) {
+    call->clear_multimodal_prompt();
+    Status status = master_->validate_multimodal_request(request_params);
+    if (status.ok() && !payload.empty()) {
+      status = {StatusCode::INVALID_ARGUMENT,
+                "Typed image cannot include a legacy binary attachment"};
+    }
+    if (status.ok() && !request_params.multimodal_prompt) {
+      status = {StatusCode::INVALID_ARGUMENT,
+                "VLM Chat ingress requires typed media"};
+    }
+    if (!status.ok()) {
+      call->finish_with_error(status);
+      return;
+    }
+  } else {
+    const Status status = mm_service_utils::build_messages(
+        rpc_request.messages(), messages, master_->get_image_limit());
+    if (!status.ok()) {
+      call->finish_with_error(status);
+      return;
+    }
+  }
 
   bool include_usage = false;
   if (rpc_request.has_stream_options()) {
@@ -952,8 +1034,6 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
   auto saved_streaming = request_params.streaming;
   auto saved_request_id = request_params.request_id;
   auto saved_tools = request_params.tools;
-
-  BinaryPayload payload(call->take_request_iobuf());
 
   // schedule the request
   rate_limit_guard.dismiss();

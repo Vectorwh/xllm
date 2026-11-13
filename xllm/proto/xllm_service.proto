@@ -34,6 +34,7 @@ import "models.proto";
 import "anthropic.proto";
 import "common.proto";
 import "provider.proto";
+import "multimodal_preprocess.proto";
 
 message HttpRequest {
 };
@@ -91,6 +92,8 @@ message ResumeResponse {
 }
 
 service XllmAPIService {
+  rpc Preprocess (PreprocessRequest) returns (PreprocessResponse);
+
   rpc Completions (CompletionRequest) returns (CompletionResponse);
   rpc CompletionsHttp (HttpRequest) returns (HttpResponse);
 

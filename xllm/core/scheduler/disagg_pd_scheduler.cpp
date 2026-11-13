@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/request/request_timing_proto.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/engine.h"
@@ -61,6 +62,25 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+bool fill_multimodal_metadata(Request& request, proto::DisaggRequest* output) {
+  output->clear_mm_data();
+  if (request.sequences().empty() || request.sequences().front() == nullptr) {
+    return false;
+  }
+  const MMData& data = request.sequences().front()->mm_data();
+  if (!data.valid()) {
+    return !request.state().multimodal_metadata_only &&
+           !request.state().mm_data.valid();
+  }
+  proto::MMDataEntry metadata;
+  if (!mmdata_entry_to_proto(data, &metadata, /*include_tensors=*/false) ||
+      !proto_to_mmdata_entry(metadata)) {
+    return false;
+  }
+  *output->mutable_mm_data() = std::move(metadata);
+  return true;
+}
 
 using RequestPtr = std::shared_ptr<Request>;
 
@@ -714,9 +734,16 @@ void DisaggPDScheduler::dispatch_requests() {
     reqs.set_prefill_name(xservice_client_->get_instance_name());
     reqs.mutable_reqs()->Reserve(requests.size());
     // currently we only support one request once.
+    bool valid_requests = true;
     for (size_t i = 0; i < requests.size(); ++i) {
-      // proto::DisaggRequest req;
       auto req = reqs.mutable_reqs()->Add();
+      if (!fill_multimodal_metadata(*requests[i], req)) {
+        const Status status(StatusCode::INVALID_ARGUMENT,
+                            "Invalid VLM PD metadata");
+        response_processor_->process_failed_request(requests[i], status);
+        valid_requests = false;
+        break;
+      }
       req->set_req_id(requests[i]->request_id());
       req->set_request_token_accounting(
           requests[i]->token_accounting_enabled());
@@ -776,6 +803,13 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_json_reasoning_enabled(
           requests[i]->state().json_reasoning_enabled);
       //*reqs.mutable_reqs()->Add() = req;
+    }
+    if (!valid_requests) {
+      std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
+      for (const auto& failed : requests) {
+        req_to_channel_map_.erase(failed->request_id());
+      }
+      continue;
     }
     reqs.mutable_cluster_infos()->mutable_cluster_ids()->Add(
         instance_info_.cluster_ids.begin(), instance_info_.cluster_ids.end());
@@ -924,7 +958,6 @@ void DisaggPDScheduler::dispatch_requests() {
         if (discard_cancelled_dispatch_request(requests[i])) {
           continue;
         }
-        // Push to request_queue_; it will be executed by the engine.
         request_queue_.write(requests[i]);
       }
     }
@@ -1017,6 +1050,8 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       proto::DisaggGenerationsRequests gens;
       auto gen = gens.mutable_multi_gens()->Add();
       gen->set_req_id(request->request_id());
+      gen->set_mrope_position_delta(
+          request->sequences()[0]->get_mrope_position_delta());
       gen->set_x_request_id(request->x_request_id());
       gen->set_x_request_time(request->x_request_time());
       const size_t num_cached_tokens = request->num_prefix_cache_tokens();
@@ -1429,7 +1464,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     bool prefill_text_withheld,
     torch::Tensor mtp_bootstrap_embedding,
     int32_t num_cached_tokens,
-    const proto::RequestPhaseTiming* phase_timing) {
+    const proto::RequestPhaseTiming* phase_timing,
+    std::optional<int32_t> mrope_position_delta) {
   Timer receive_timer;
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
@@ -1442,6 +1478,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     }
     request = take_waiting_request(req_id);
   }
+
   auto& sequences = request->sequences();
   request->state().timing->restore_pd(request_timing_from_proto(phase_timing));
   kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -1458,6 +1495,16 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     return false;
   }
   Sequence* sequence = request->sequences()[0].get();
+  if (request->state().multimodal_metadata_only &&
+      !mrope_position_delta.has_value()) {
+    // The waiting reservation is already consumed. P owns the failure response;
+    // release D's blocks/slots without emitting a second terminal callback.
+    kv_cache_manager_->deallocate(request.get());
+    return false;
+  }
+  if (mrope_position_delta.has_value()) {
+    sequence->set_mrope_position_delta(*mrope_position_delta);
+  }
   if (num_cached_tokens < 0 ||
       static_cast<size_t>(num_cached_tokens) > sequence->num_prompt_tokens()) {
     LOG(WARNING) << "Invalid num_cached_tokens from prefill, request_id: "

@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-
 #include <brpc/channel.h>
 
 #include <atomic>
@@ -67,6 +66,8 @@ class XServiceClient {
   // the signal that the whole instance must stop together.
   void withdraw_instance_registration();
   void heartbeat();
+  std::optional<std::pair<proto::ProviderDescriptor, std::string>>
+  registered_provider_snapshot() const;
   InstanceInfo get_instance_info(const std::string& instance_name);
   std::vector<std::string> get_static_decode_list();
   std::vector<std::string> get_static_prefill_list();

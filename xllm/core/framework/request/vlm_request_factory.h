@@ -16,9 +16,11 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/message.h"
@@ -57,25 +59,37 @@ class VLMRequestFactory final {
                     const Tokenizer* tokenizer,
                     const ModelArgs* model_args,
                     const Options* options,
-                    RateLimiter* rate_limiter);
+                    RateLimiter* rate_limiter,
+                    OutputsFunc rpc_response_handler);
+
+  ~VLMRequestFactory() = default;
+
+  Status validate_multimodal_request(const RequestParams& sp) const;
+  Status preprocess(PreparedMultimodalInput& input) const;
 
   // completion: a text prompt plus already-decoded multimodal data.
-  std::shared_ptr<Request> create(std::string prompt,
-                                  MMData mm_data,
-                                  const RequestParams& sp,
-                                  std::optional<Call*> call,
-                                  OutputCallback callback);
+  std::shared_ptr<Request> create_request(std::string prompt,
+                                          MMData mm_data,
+                                          const RequestParams& sp,
+                                          std::optional<Call*> call,
+                                          OutputCallback callback);
 
   // chat: decodes the multimodal payload and renders messages into a prompt,
   // then delegates to the completion overload above.
-  std::shared_ptr<Request> create(std::vector<Message> messages,
-                                  const RequestParams& sp,
-                                  BinaryPayload payload,
-                                  std::optional<Call*> call,
-                                  OutputCallback callback,
-                                  bool use_prompt_as_is = false);
+  std::shared_ptr<Request> create_request(std::vector<Message> messages,
+                                          const RequestParams& sp,
+                                          BinaryPayload payload,
+                                          std::optional<Call*> call,
+                                          OutputCallback callback,
+                                          bool use_prompt_as_is = false);
 
  private:
+  OutputsFunc rpc_response_handler_;
+
+  Status process_media(const std::vector<Message>& messages,
+                       BinaryPayload payload,
+                       MMData& mm_data) const;
+
   std::shared_ptr<Request> build_request(std::string prompt,
                                          std::vector<int32_t> prompt_tokens,
                                          MMData mm_data,

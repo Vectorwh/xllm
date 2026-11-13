@@ -16,6 +16,7 @@ cc_library(
 
 # Define the base dependencies
 set(BASE_DEPS
+  :util
   :multimodal
   :processor_cache
   :common
@@ -28,10 +29,9 @@ set(BASE_DEPS
   nlohmann_json::nlohmann_json
 )
 
-
 # Define the library
 cc_library(
-  NAME 
+  NAME
     processors
   HDRS
     transforms.h
@@ -95,4 +95,5 @@ cc_library(
     qwen3_omni_prompt_processor.cpp
   DEPS
     ${BASE_DEPS}
+    proto::xllm_proto
 )

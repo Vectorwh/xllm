@@ -30,6 +30,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
@@ -37,6 +38,7 @@ limitations under the License.
 #include "models/llm/py_causal_lm.h"
 #include "models/model_registry.h"
 #include "runtime/params_utils.h"
+#include "util/scope_guard.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -177,17 +179,111 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     ForwardSyncPolicy sync_policy,
     bool record_ready_event) {
   Timer timer;
+  KVTransferCompletion kv_transfers;
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  std::shared_ptr<KVPushSynchronizerImpl> layer_synchronizer;
+#endif
+  std::unique_ptr<Stream> push_stream = device_.current_stream();
+  bool push_finished = false;
+  bool push_aborted = false;
+  const std::vector<std::string> canonical_request_ids =
+      canonical_transfer_request_ids(input.transfer_kv_infos);
+
+  // Install cleanup before starting PUSH: startup and model execution can both
+  // throw after a transfer has begun waiting for layer events. The current
+  // stream must stop using those events before abort wakes the transfer.
+  auto abort_push = [&]() {
+    if (push_aborted) {
+      return;
+    }
+    push_aborted = true;
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+    if (layer_synchronizer) {
+      CHECK_EQ(push_stream->synchronize(), 0);
+      layer_synchronizer->abort();
+    }
+#endif
+  };
+  auto fail_aborted_push = [&]() {
+    abort_push();
+    if (options_.kv_cache_transfer_mode() == "PUSH" &&
+        !canonical_request_ids.empty()) {
+      KVTransferTaskResult result;
+      result.request_ids = canonical_request_ids;
+      result.error_code = KVTransferErrorCode::FAILED;
+      kv_transfers.add(folly::makeSemiFuture(std::vector<KVTransferTaskResult>{
+                           std::move(result)}),
+                       canonical_request_ids);
+    }
+  };
+  ScopeGuard push_guard([&]() {
+    if (!push_finished) {
+      abort_push();
+      // Drain real writes before input/block ownership can leave this frame.
+      // Do not enter cross-rank collectives while propagating an exception.
+      kv_transfers.wait();
+    }
+  });
+  if (options_.kv_cache_transfer_mode() == "PUSH" &&
+      !input.transfer_kv_infos.empty()) {
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU)
+    layer_synchronizer = std::make_shared<NPULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
+#elif defined(USE_MLU)
+    layer_synchronizer = std::make_shared<MLULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
+#elif defined(USE_DCU)
+    layer_synchronizer = std::make_shared<DCULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
+#endif
+    CHECK(kv_cache_transfer_ != nullptr);
+    const_cast<ModelInputParams&>(input.input_params)
+        .parallel.layer_synchronizer = layer_synchronizer;
+    kv_transfers.add(
+        kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
+                                                 context_.get_parallel_args(),
+                                                 layer_synchronizer,
+                                                 is_spec_draft_),
+        canonical_request_ids);
+#else
+    LOG(FATAL) << "VLM KV PUSH requires a supported transfer platform";
+#endif
+  }
+  auto finish_push = [&]() {
+    std::vector<std::string> failures =
+        finalize_kv_push_failures(kv_transfers,
+                                  input.transfer_kv_infos,
+                                  options_.kv_cache_transfer_mode(),
+                                  options_.instance_role(),
+                                  context_.get_parallel_args(),
+                                  device_);
+    push_finished = true;
+    return failures;
+  };
   const bool empty_shard =
       input.input_params.meta.num_sequences == 0 &&
       (!input.token_ids.defined() || input.token_ids.numel() == 0);
   if (empty_shard) {
-    return ForwardOutput{};
+    fail_aborted_push();
+    ForwardOutput output;
+    output.failed_request_ids = finish_push();
+    return output;
   }
 
   // TODO guojinrong, to adapt multi stream parallel later
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
+  if (!model_output.hidden_states.defined()) {
+    fail_aborted_push();
+    auto failures = finish_push();
+
+    if (!failures.empty()) {
+      return make_failed_output(std::move(failures));
+    }
+    return std::nullopt;
+  }
   auto& sampling_params = input.sampling_params;
   const bool has_aux_hidden_states = model_output.aux_hidden_states.defined();
   torch::Tensor logits;
@@ -229,6 +325,10 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     if (sync_policy == ForwardSyncPolicy::LEGACY) {
       auto ret = device_.synchronize_default_stream();
       (void)ret;
+    }
+    auto failures = finish_push();
+    if (!failures.empty()) {
+      return make_failed_output(std::move(failures));
     }
     return std::nullopt;
   }
@@ -289,6 +389,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     }
   }
 
+  output.failed_request_ids = finish_push();
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
     if (record_ready_event && enable_schedule_overlap()) {

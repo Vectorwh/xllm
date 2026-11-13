@@ -83,7 +83,9 @@ struct RequestParams {
     }
   }
 
-  bool verify_params(OutputCallback callback) const;
+  Status validate_multimodal_input(bool typed_vlm_prefill = false) const;
+  bool verify_params(OutputCallback callback,
+                     bool typed_vlm_prefill = false) const;
 
   // Projects the shared sampling-related fields into a RequestSamplingParam.
   // `best_of` is the effective best_of (== best_of.value_or(n)); when it
@@ -107,6 +109,11 @@ struct RequestParams {
   std::string x_request_id;
   std::string x_request_time;
   std::shared_ptr<RequestTiming> timing;
+  // Service-rendered text tokens bypass local templating and tokenization.
+  // Typed media retains its own token/span validation and never uses this.
+  std::optional<std::vector<int32_t>> prompt_tokens;
+  std::shared_ptr<PreparedMultimodalInput> multimodal_prompt;
+  Status typed_input_status;
 
   bool streaming = false;
 

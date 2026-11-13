@@ -9,8 +9,10 @@ cc_library(
   SRCS
     provider_contract.cpp
   DEPS
+    :block_hasher
     OpenSSL::Crypto
     glog::glog
+    torch
     proto::xllm_proto
 )
 

@@ -23,6 +23,8 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "core/common/message.h"
+#include "core/util/binary_payload.h"
 #include "core/util/tensor_helper.h"
 #include "mm_data_item.h"
 #include "mm_type.h"
@@ -185,6 +187,14 @@ class MMData {
  private:
   uint32_t type_ = MMType::NONE;
   MMItems items_;
+};
+
+struct PreparedMultimodalInput {
+  std::vector<int32_t> token_ids;
+  MMData metadata;
+  MMContentVec media;
+  BinaryPayload payload;
+  std::optional<std::string> prompt;
 };
 
 }  // namespace xllm

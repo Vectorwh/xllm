@@ -25,7 +25,7 @@ limitations under the License.
 
 #include "mm_data.h"
 #include "mm_type.h"
-#include "worker.pb.h"
+#include "multimodal.pb.h"
 
 namespace xllm {
 
@@ -88,6 +88,21 @@ class MMBatchData {
   MMDict data_;
   std::vector<MMData> mm_datas_;
 };
+
+// Basic item/entry codec shared by batch transport and typed prompt consumers.
+// Metadata-only encoding retains identity, spans and counts, but no tensors.
+bool mmdata_item_to_proto(const MMDataItem& item,
+                          proto::MMDataItem* output,
+                          bool include_tensors = true);
+std::optional<MMDataItem> proto_to_mmdata_item(const proto::MMDataItem& item);
+bool mmdata_entry_to_proto(const MMData& entry,
+                           proto::MMDataEntry* output,
+                           bool include_tensors = true);
+std::optional<MMData> proto_to_mmdata_entry(const proto::MMDataEntry& entry);
+// Metadata RPC projection carries only positive image grid, content key and
+// request-local identity. Text-relative positions/counts remain unbound.
+bool media_metadata_to_proto(const MMDataItem& item,
+                             proto::MMDataItem* metadata);
 
 bool mmdata_to_proto(const xllm::MMBatchData& cpp_mmdata,
                      proto::MMData* pb_mmdata);

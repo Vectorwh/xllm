@@ -22,6 +22,7 @@ option cc_generic_services = true;
 
 import "common.proto";
 import "tensor.proto";
+import public "multimodal.proto";
 import "disagg_pd.proto";
 
 // NPU: HcclRootInfo
@@ -121,7 +122,7 @@ message UnloadLoraAdapterRequest {
 }
 
 message P2PLinkWorkerRequest {
-  string remote_addr = 1; 
+  string remote_addr = 1;
 }
 
 message PullKVCacheRequest {
@@ -271,47 +272,6 @@ message BlockPair {
   int32 host_block_id = 2;
 }
 
-message TensorList {
-  repeated Tensor tensors = 1;
-}
-
-message MMValue {
-  oneof value {
-    Tensor single_tensor = 1;
-    TensorList tensor_list = 2;
-  }
-}
-
-message MMItemState {
-  uint32 token_pos_offset = 1;
-  uint32 token_pos_length = 2;
-  Tensor mm_token_mask = 3;
-  bytes schedule_data_key = 4;
-  int32 schedule_data_start_pos = 5;
-  int32 schedule_data_end_pos = 6;
-}
-
-message MMDataItem {
-  uint32 type = 1;
-  map<string, MMValue> dict = 2;
-  MMItemState state = 3;
-  int32 seq_index = 4;
-}
-
-// Preserve the original per-request MMData item vector over brpc/proto.
-message MMDataEntry {
-  uint32 type = 1;
-  bool is_item_vec = 2;
-  repeated MMDataItem items = 3;
-  map<string, MMValue> dict = 4;
-}
-
-message MMData {
-  uint32 type = 1;
-  map<string, MMValue> dict = 2;
-  repeated MMDataEntry entries = 3;
-}
-
 message NamedTensor {
   string name = 1;
   Tensor tensor = 2;
@@ -325,19 +285,19 @@ message MediaNamedTensor {
 
 message DiTForwardInput {
   int32 batch_size = 1;
-  
+
   // Primary input text description for image generation
   repeated string prompts = 2;
-  
+
   // Secondary prompt for additional details (e.g., color, lighting)
   repeated string prompts_2 = 3;
-  
+
   // Negative prompt to exclude low-quality features
   repeated string negative_prompts = 4;
-  
+
   // Secondary negative prompt to exclude additional unwanted features
   repeated string negative_prompts_2 = 5;
-  
+
   reserved 6, 7, 8, 9, 10, 11, 12, 13, 14, 15;
   // generation params
   DiTGenerationParams generation_params = 16;

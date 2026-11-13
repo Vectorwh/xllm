@@ -19,6 +19,7 @@ option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
 
 import "common.proto";
+import "provider.proto";
 import "tensor.proto";
 import "google/protobuf/struct.proto";
 
@@ -54,7 +55,7 @@ message ResponseFormat {
   optional string regex = 3;
 }
 
-// Next Id: 45
+// Next ID: 51
 message ChatRequest {
   // ID of the model to use. You can use the ListModels endpoint to list available models.
   string model = 1;
@@ -187,6 +188,9 @@ message ChatRequest {
   // default = false
   optional bool include_stop_str_in_output = 46;
   optional ResponseFormat response_format = 47;
+
+  // Prepared text and ordered media sources, independent of ExecutionPlan.
+  MultimodalPrompt multimodal_prompt = 50;
 }
 
 message ChatLogProbData {

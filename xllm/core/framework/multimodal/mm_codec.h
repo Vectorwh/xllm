@@ -21,9 +21,22 @@ limitations under the License.
 #include <string>
 #include <string_view>
 
-#include "mm_type.h"
+#include "core/common/message.h"
+#include "core/common/types.h"
+#include "core/framework/multimodal/mm_type.h"
+#include "provider.pb.h"
 
 namespace xllm {
+
+struct PreparedMultimodalInput;
+Status decode_prepared_multimodal_input(const proto::MultimodalPrompt& prompt,
+                                        PreparedMultimodalInput& output);
+
+Status decode_media_input(const proto::MMInputData& source, MMContent& content);
+bool valid_image_media_input(const proto::ImageMediaInput& image);
+Status decode_image_media_input(const proto::ImageMediaInput& image,
+                                MMContent& content,
+                                std::string& payload);
 
 class OpenCVImageDecoder {
  public:

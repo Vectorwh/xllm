@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -104,6 +105,96 @@ TEST(MMDataEncoderHandoffTest, RestoresIndependentModalityMasksInChunk) {
                            torch::tensor({false, true, false}, torch::kBool)));
   EXPECT_TRUE(torch::equal(batch.get<torch::Tensor>("image|mask").value(),
                            torch::tensor({false, false, true}, torch::kBool)));
+}
+
+MMData make_codec_media() {
+  MMDataItem item(MMType::IMAGE);
+  item.mutable_data()["pixel_values"] = torch::arange(6).reshape({2, 3});
+  item.mutable_data()["grids"] = std::vector<torch::Tensor>{
+      torch::tensor({1, 2}, torch::kInt64), torch::tensor({3}, torch::kInt32)};
+  auto& state = item.mutable_state();
+  state.mutable_token_pos() = {2, 5};
+  state.mutable_mm_token_num() = 3;
+  state.mutable_mm_token_mask() =
+      torch::tensor({true, false, true, false, true}, torch::kBool);
+  state.mutable_schedule_data().end_pos = 5;
+  std::memset(
+      state.mutable_schedule_data().key.data, 'a', XXH3_128BITS_HASH_VALUE_LEN);
+  state.mutable_seq_index() = 19;
+  return MMData(MMType::IMAGE, MMItemVec{item});
+}
+
+TEST(MMCodecTest, TensorsAndMetadata) {
+  const MMData original = make_codec_media();
+  proto::MMDataEntry encoded;
+  ASSERT_TRUE(mmdata_entry_to_proto(original, &encoded));
+  auto decoded = proto_to_mmdata_entry(encoded);
+  ASSERT_TRUE(decoded.has_value());
+  const auto& item = decoded->items<MMItemVec>().front();
+  EXPECT_EQ(item.state().seq_index(), 19);
+  EXPECT_EQ(item.state().mm_token_num(), 3);
+  EXPECT_TRUE(torch::equal(*item.get<torch::Tensor>("pixel_values"),
+                           torch::arange(6).reshape({2, 3})));
+  const auto grids = item.get<std::vector<torch::Tensor>>("grids");
+  ASSERT_TRUE(grids.has_value());
+  ASSERT_EQ(grids->size(), 2u);
+  EXPECT_EQ(grids->at(0).scalar_type(), torch::kInt64);
+  EXPECT_EQ(grids->at(1).scalar_type(), torch::kInt32);
+  EXPECT_TRUE(torch::equal(grids->at(1), torch::tensor({3}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(
+      item.state().mm_token_mask(),
+      original.items<MMItemVec>().front().state().mm_token_mask()));
+  ASSERT_TRUE(mmdata_entry_to_proto(original, &encoded, false));
+  EXPECT_TRUE(encoded.items(0).dict().empty());
+  EXPECT_FALSE(encoded.items(0).state().has_mm_token_mask());
+  decoded = proto_to_mmdata_entry(encoded);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->items<MMItemVec>().front().state().mm_token_num(), 3);
+  MMDataItem absent(MMType::IMAGE);
+  proto::MMDataItem reused = encoded.items(0);
+  ASSERT_TRUE(mmdata_item_to_proto(absent, &reused, false));
+  EXPECT_TRUE(reused.dict().empty());
+  EXPECT_EQ(reused.state().mm_token_num(), 0);
+}
+
+TEST(MMCodecTest, DictAndItemOrder) {
+  MMData first = make_codec_media();
+  MMDataItem second = first.items<MMItemVec>().front();
+  second.mutable_state().mutable_token_pos() = {7, 5};
+  first.items<MMItemVec>().emplace_back(second);
+  const MMData dict(MMType::AUDIO, MMDict{{"audio", torch::tensor({4, 5})}});
+  MMBatchData batch(std::vector<MMData>{first, dict});
+  proto::MMData wire;
+  ASSERT_TRUE(mmdata_to_proto(batch, &wire));
+  MMBatchData restored;
+  ASSERT_TRUE(proto_to_mmdata(wire, &restored));
+  ASSERT_EQ(restored.mm_data_vec().size(), 2u);
+  const auto& items = restored.mm_data_vec().front().items<MMItemVec>();
+  ASSERT_EQ(items.size(), 2u);
+  EXPECT_TRUE(restored.mm_data_vec()[1].hold<MMDict>());
+  EXPECT_TRUE(
+      torch::equal(*restored.mm_data_vec()[1].get<torch::Tensor>("audio"),
+                   torch::tensor({4, 5})));
+}
+
+TEST(MMCodecTest, SourceWireGolden) {
+  // Frozen source mm_data_entry_test.cpp:PreservesExistingWireFields.
+  const std::string wire = std::string(
+                               "\x08\x01\x10\x01\x1a\x20\x08\x01\x1a\x1a"
+                               "\x08\x02\x10\x05\x22\x10") +
+                           std::string(16, 'a') + "\x30\x05\x38\x05\x20\x03";
+  proto::MMDataEntry entry;
+  ASSERT_TRUE(entry.ParseFromString(wire));
+  auto decoded = proto_to_mmdata_entry(entry);
+  ASSERT_TRUE(decoded.has_value());
+  const auto& state = decoded->items<MMItemVec>().front().state();
+  EXPECT_EQ(state.token_pos().offset, 2);
+  EXPECT_EQ(state.token_pos().length, 5);
+  EXPECT_EQ(state.mm_token_num(), 5);
+  EXPECT_EQ(state.seq_index(), 3);
+  proto::MMDataEntry encoded;
+  ASSERT_TRUE(mmdata_entry_to_proto(*decoded, &encoded));
+  EXPECT_EQ(encoded.SerializeAsString(), wire);
 }
 
 INSTANTIATE_TEST_SUITE_P(

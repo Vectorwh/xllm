@@ -14,7 +14,6 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 
@@ -189,6 +188,7 @@ class RequestState final {
 
   // multimodal
   MMData mm_data;
+  bool multimodal_metadata_only = false;
 
   // whether to return log probabilities for output token.
   bool logprobs;

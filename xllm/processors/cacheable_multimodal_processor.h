@@ -37,6 +37,9 @@ class CacheableMultimodalProcessor final : public MultimodalProcessorBase {
                       std::vector<int32_t>& token_ids) override;
   bool process_multimodal(const MMInput& inputs, MMData& data) const override;
 
+  bool bind_prompt_tokens(const std::vector<int32_t>& token_ids,
+                          MMData& mm_data) const override;
+
  private:
   bool process_misses(const std::vector<MMInputItem>& miss_inputs,
                       MMItemVec& miss_items) const;

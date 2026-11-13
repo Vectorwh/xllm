@@ -21,6 +21,7 @@ option cc_generic_services = true;
 
 import "common.proto";
 import "tensor.proto";
+import "multimodal.proto";
 
 message ClusterInfos {
   repeated uint64 cluster_ids = 1;
@@ -94,6 +95,9 @@ message DisaggRequest {
   // Transfer output accounting only. Decode never counts forwarded input.
   // False from older senders disables request token accounting on Decode.
   bool request_token_accounting = 43;
+
+  // Tensor-free media identity and prompt-relative spans. Absence means text.
+  optional MMDataEntry mm_data = 51;
 
 }
 
@@ -306,6 +310,8 @@ message DisaggGenerationsRequest {
   // Cumulative end-to-end latency measured by the source at handoff.
   optional double upstream_elapsed_seconds = 21;
   RequestPhaseTiming phase_timing = 22;
+  // Required for metadata-only VLM Decode; zero is a valid explicit delta.
+  optional int32 mrope_position_delta = 25;
 }
 
 message DisaggGenerationsRequests {

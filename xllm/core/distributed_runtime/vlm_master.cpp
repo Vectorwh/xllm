@@ -18,7 +18,6 @@ limitations under the License.
 #include <glog/logging.h>
 #include <pybind11/pybind11.h>
 
-#include <atomic>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -26,6 +25,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/common/instance_name.h"
 #include "core/common/message.h"
 #include "core/common/metrics.h"
 #include "core/distributed_runtime/speculative_engine.h"
@@ -170,15 +170,27 @@ VLMMaster::VLMMaster(const Options& options)
       .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
       .enable_service_routing(options_.enable_service_routing())
       .disable_log_stats(options_.disable_log_stats())
+      .priority_strategy(options_.priority_strategy())
+      .enable_online_preempt_offline(options_.enable_online_preempt_offline())
+      .enable_profile_step_time(options_.enable_profile_step_time())
+      .enable_profile_token_budget(options_.enable_profile_token_budget())
+      .enable_latency_aware_schedule(options_.enable_latency_aware_schedule())
+      .profile_max_prompt_length(options_.profile_max_prompt_length())
+      .enable_profile_kv_blocks(options_.enable_profile_kv_blocks())
       .disable_ttft_profiling(options_.disable_ttft_profiling())
       .enable_forward_interruption(options_.enable_forward_interruption())
+      .max_global_ttft_ms(options_.max_global_ttft_ms())
+      .max_global_tpot_ms(options_.max_global_tpot_ms())
       .enable_schedule_overlap(options_.enable_schedule_overlap())
       .server_idx(options_.server_idx());
   scheduler_ = create_continuous_scheduler(engine_.get(), scheduler_options);
 
   if (options_.enable_service_routing()) {
-    auto& instance_info = scheduler_->get_instance_info();
-    XServiceClient::get_instance()->register_instance(instance_info);
+    // P/D descriptors must use the loaded VLM runtime independently of the
+    // optional xtensor path that may also bind the scheduler's engine.
+    XServiceClient::get_instance()->set_engine(engine_.get());
+    XServiceClient::get_instance()->register_instance(
+        scheduler_->get_instance_info());
   }
 
   // Match LLMMaster: honour the native C++ template for supported models
@@ -201,17 +213,28 @@ VLMMaster::VLMMaster(const Options& options)
                                            options_.max_processor_cache_items(),
                                            engine_->tokenizer_args());
 
-  request_factory_ = std::make_unique<VLMRequestFactory>(processor_.get(),
-                                                         chat_template_.get(),
-                                                         tokenizer_.get(),
-                                                         &model_args_,
-                                                         &options_,
-                                                         get_rate_limiter());
+  request_factory_ = std::make_unique<VLMRequestFactory>(
+      processor_.get(),
+      chat_template_.get(),
+      tokenizer_.get(),
+      &model_args_,
+      &options_,
+      get_rate_limiter(),
+      [](const std::vector<RequestOutput>& outputs) {
+        return XServiceClient::get_instance()->generations(outputs);
+      });
 
   threadpool_ = std::make_unique<ThreadPool>(
       /*num_threads=*/options_.num_request_handling_threads(),
       /*cpu_binding=*/false,
       /*pool_name=*/"VLMMaster.request");
+  if (options_.enable_service_routing() &&
+      InstanceRole(options_.instance_role()) == InstanceRole::PREFILL) {
+    preprocess_threadpool_ = std::make_unique<ThreadPool>(
+        /*num_threads=*/16,
+        /*cpu_binding=*/false,
+        /*pool_name=*/"VLMMaster.preprocess");
+  }
 }
 
 VLMMaster::~VLMMaster() {
@@ -226,6 +249,7 @@ VLMMaster::~VLMMaster() {
   // destroyed, so reset it here explicitly while all dependencies are alive.
   // Done before joining loop_thread_ so the scheduler keeps advancing while the
   // pool drains.
+  preprocess_threadpool_.reset();
   threadpool_.reset();
 
   // wait for the loop thread to finish
@@ -240,6 +264,28 @@ VLMMaster::~VLMMaster() {
     scheduler_.reset();
     client->shutdown();
   }
+}
+
+void VLMMaster::preprocess(MMContentVec media,
+                           std::optional<std::string> prompt,
+                           BinaryPayload payload,
+                           PreprocessCallback callback) {
+  preprocess_threadpool_->schedule([this,
+                                    media = std::move(media),
+                                    prompt = std::move(prompt),
+                                    payload = std::move(payload),
+                                    callback = std::move(callback)]() mutable {
+    PreparedMultimodalInput input;
+    input.media = std::move(media);
+    input.prompt = std::move(prompt);
+    input.payload = std::move(payload);
+    Status status = request_factory_->preprocess(input);
+    if (!status.ok()) {
+      callback(std::move(status), {}, {});
+      return;
+    }
+    callback({}, std::move(input.metadata), std::move(input.token_ids));
+  });
 }
 
 void VLMMaster::handle_request(std::string prompt,
@@ -277,17 +323,19 @@ void VLMMaster::handle_request(std::string prompt,
     if (is_suffix_vlm_sampling_rejected(options_, sp)) {
       CALLBACK_WITH_ERROR(
           StatusCode::INVALID_ARGUMENT,
-          "Suffix speculative decoding on VLM supports greedy sampling only");
+          "Suffix speculative decoding on VLM supports greedy sampling only",
+          sp.service_request_id,
+          sp.source_xservice_addr);
       return;
     }
     // verify the prompt
-    if (!sp.verify_params(callback)) {
+    if (!sp.verify_params(callback, bool(sp.multimodal_prompt))) {
       return;
     }
 
     rate_limit_guard.dismiss();
     // Retain a callback for rejection if the scheduler queue is full.
-    auto request = request_factory_->create(
+    auto request = request_factory_->create_request(
         std::move(prompt), std::move(mm_data), sp, call, callback);
     if (!request) {
       return;
@@ -300,7 +348,8 @@ void VLMMaster::handle_request(std::string prompt,
                     "No available resources to schedule request",
                     FailureReason::TEMPORARY_OVERLOAD);
       request->record_timing_failure(status);
-      callback(std::move(status));
+      callback(
+          {std::move(status), sp.service_request_id, sp.source_xservice_addr});
     } else {
       timing_guard.dismiss();
     }
@@ -349,22 +398,24 @@ void VLMMaster::handle_request(std::vector<Message> messages,
     if (is_suffix_vlm_sampling_rejected(options_, sp)) {
       CALLBACK_WITH_ERROR(
           StatusCode::INVALID_ARGUMENT,
-          "Suffix speculative decoding on VLM supports greedy sampling only");
+          "Suffix speculative decoding on VLM supports greedy sampling only",
+          sp.service_request_id,
+          sp.source_xservice_addr);
       return;
     }
     // verify the prompt
-    if (!sp.verify_params(callback)) {
+    if (!sp.verify_params(callback, bool(sp.multimodal_prompt))) {
       return;
     }
 
     rate_limit_guard.dismiss();
     // Retain a callback for rejection if the scheduler queue is full.
-    auto request = request_factory_->create(std::move(messages),
-                                            sp,
-                                            std::move(payload),
-                                            call,
-                                            callback,
-                                            use_prompt_as_is);
+    auto request = request_factory_->create_request(std::move(messages),
+                                                    sp,
+                                                    std::move(payload),
+                                                    call,
+                                                    callback,
+                                                    use_prompt_as_is);
     if (!request) {
       return;
     }
@@ -376,7 +427,8 @@ void VLMMaster::handle_request(std::vector<Message> messages,
                     "No available resources to schedule request",
                     FailureReason::TEMPORARY_OVERLOAD);
       request->record_timing_failure(status);
-      callback(std::move(status));
+      callback(
+          {std::move(status), sp.service_request_id, sp.source_xservice_addr});
     } else {
       timing_guard.dismiss();
     }

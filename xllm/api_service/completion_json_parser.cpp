@@ -38,7 +38,9 @@ std::pair<Status, std::string> preprocess_completion_prompt(
     }
     if (has_prompt && prompt_it->is_string() &&
         prompt_it->get_ref<const std::string&>().empty() &&
-        (!json.contains("token_ids") || json["token_ids"].empty())) {
+        (!json.contains("token_ids") || json["token_ids"].empty()) &&
+        !json.contains("multimodal_prompt") &&
+        !json.contains("multimodalPrompt")) {
       return {Status::invalid_parameter("Prompt is empty!", "prompt"), ""};
     }
     if (!has_prompt || !prompt_it->is_array()) {

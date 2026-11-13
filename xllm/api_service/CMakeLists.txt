@@ -66,6 +66,7 @@ cc_library(
     qwen3_rerank_service_impl.cpp
     embedding_output_builder.cpp
   DEPS
+    :multimodal_preprocess_service
     :master
     :request_timing
     :chat_template
@@ -81,3 +82,15 @@ cc_library(
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
 )
+
+cc_library(
+  NAME multimodal_preprocess_service
+  HDRS multimodal_preprocess_service_impl.h
+  SRCS multimodal_preprocess_service_impl.cpp
+  DEPS :processors :multimodal proto::xllm_proto brpc
+)
+
+# Typed preparation adds request -> processors to the existing API/master
+# archive cycle. Retain the donor rescan policy for that shared owner; link
+# validation of this extracted graph is still required.
+set_property(TARGET api_service PROPERTY LINK_INTERFACE_MULTIPLICITY 4)

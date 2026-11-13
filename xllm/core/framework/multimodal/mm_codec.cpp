@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include "mm_codec.h"
+#include "core/framework/multimodal/mm_codec.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string_view>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -29,9 +30,158 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include "core/framework/multimodal/mm_batch_data.h"
 #include "core/util/scope_guard.h"
 
 namespace xllm {
+namespace {
+constexpr size_t kMaxImageBytes = 16 * 1024 * 1024;
+constexpr size_t kMaxImageHeaderBytes = 16 * 1024;
+constexpr size_t kDataUrlOverheadBytes = 256;
+constexpr size_t kMaxHeaderCount = 32;
+
+bool valid_remote_image(
+    std::string_view url,
+    size_t byte_count,
+    const std::vector<std::pair<std::string_view, std::string_view>>& headers) {
+  if (byte_count > kMaxImageBytes ||
+      url.size() > ((kMaxImageBytes + 2) / 3) * 4 + kDataUrlOverheadBytes) {
+    return false;
+  }
+  if (headers.size() > kMaxHeaderCount) {
+    return false;
+  }
+  size_t header_bytes = 0;
+  for (const auto& [key, value] : headers) {
+    header_bytes += key.size() + value.size();
+    if (key.empty() || key.find_first_of("\r\n:") != std::string_view::npos ||
+        value.find_first_of("\r\n") != std::string_view::npos) {
+      return false;
+    }
+  }
+  if (header_bytes > kMaxImageHeaderBytes) {
+    return false;
+  }
+  if (byte_count == 0 && url.substr(0, 7) != "http://" &&
+      url.substr(0, 8) != "https://" && url.substr(0, 11) != "data:image/") {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+Status decode_media_input(const proto::MMInputData& source,
+                          MMContent& content) {
+  const std::string& type = source.type();
+  ImageURL url;
+  if (type == "image_url" && source.has_image_url()) {
+    url.url = source.image_url().url();
+    for (const auto& [key, value] : source.image_url().headers()) {
+      url.headers.emplace(key, value);
+    }
+  } else if (type == "video_url" && source.has_video_url()) {
+    url.url = source.video_url().url();
+    for (const auto& [key, value] : source.video_url().headers()) {
+      url.headers.emplace(key, value);
+    }
+  } else if (type == "audio_url" && source.has_audio_url()) {
+    url.url = source.audio_url().url();
+    for (const auto& [key, value] : source.audio_url().headers()) {
+      url.headers.emplace(key, value);
+    }
+  } else {
+    return {StatusCode::INVALID_ARGUMENT, "Missing Native media source"};
+  }
+  ImageURL validated = url;
+  const std::string prefix = type == "video_url"   ? "data:video/"
+                             : type == "audio_url" ? "data:audio/"
+                                                   : "data:image/";
+  if (url.url.rfind("data:", 0) == 0) {
+    if (url.url.rfind(prefix, 0) != 0) {
+      return {StatusCode::INVALID_ARGUMENT, "Mismatched media data URL"};
+    }
+    validated.url.replace(0, prefix.size(), "data:image/");
+  }
+  std::vector<std::pair<std::string_view, std::string_view>> headers;
+  headers.reserve(validated.headers.size());
+  for (const auto& [key, value] : validated.headers) {
+    headers.emplace_back(key, value);
+  }
+  if (!valid_remote_image(validated.url, 0, headers)) {
+    return {StatusCode::INVALID_ARGUMENT, "Invalid bounded media source"};
+  }
+  content.type = type;
+  content.image_url = url;
+  content.video_url = {url.url, url.headers};
+  content.audio_url = {url.url, url.headers};
+  return {};
+}
+
+bool valid_image_media_input(const proto::ImageMediaInput& image) {
+  if (image.headers_size() > kMaxHeaderCount ||
+      image.content_case() == proto::ImageMediaInput::CONTENT_NOT_SET ||
+      (image.has_data() && image.data().empty())) {
+    return false;
+  }
+  std::vector<std::pair<std::string_view, std::string_view>> headers;
+  headers.reserve(image.headers_size());
+  for (const auto& [key, value] : image.headers()) {
+    headers.emplace_back(key, value);
+  }
+  return valid_remote_image(image.url(), image.data().size(), headers);
+}
+
+Status decode_image_media_input(const proto::ImageMediaInput& image,
+                                MMContent& content,
+                                std::string& payload) {
+  if (!valid_image_media_input(image)) {
+    return {StatusCode::INVALID_ARGUMENT, "Invalid image input"};
+  }
+  content.type = "image_url";
+  auto& url = content.image_url;
+  url.url = image.url();
+  if (image.has_data()) {
+    url.url = "data:image/jpeg;binary," + std::to_string(payload.size()) + "," +
+              std::to_string(image.data().size());
+    payload.append(image.data());
+  }
+  url.headers.clear();
+  url.headers.reserve(image.headers_size());
+  for (const auto& [key, value] : image.headers()) {
+    url.headers.emplace(key, value);
+  }
+  return {};
+}
+
+Status decode_prepared_multimodal_input(const proto::MultimodalPrompt& prompt,
+                                        PreparedMultimodalInput& output) {
+  PreparedMultimodalInput input;
+  input.token_ids.assign(prompt.token_ids().begin(), prompt.token_ids().end());
+  proto::MMDataEntry metadata = prompt.mm_data();
+  for (auto& item : *metadata.mutable_items()) {
+    item.mutable_state()->clear_mm_token_mask();
+  }
+  auto decoded = proto_to_mmdata_entry(metadata);
+  if (!decoded) {
+    return {StatusCode::INVALID_ARGUMENT, "Invalid prepared media metadata"};
+  }
+  input.metadata = std::move(*decoded);
+  if (!prompt.prompt_text().empty()) {
+    input.prompt = prompt.prompt_text();
+  }
+  input.media.reserve(prompt.sources_size());
+  for (const auto& source : prompt.sources()) {
+    MMContent content("text", "");
+    Status status = decode_media_input(source.media(), content);
+    if (!status.ok()) {
+      return status;
+    }
+    input.media.emplace_back(std::move(content));
+  }
+  output = std::move(input);
+  return {};
+}
 
 namespace {
 

@@ -14,7 +14,7 @@ cc_library(
 )
 
 cc_library(
-  NAME 
+  NAME
     request
   HDRS
     request_token_accounting.h
@@ -75,6 +75,7 @@ cc_library(
   DEPS
     :config
     :constraint
+    :processors
     :request_timing
     :kv_cache
     :block_hasher

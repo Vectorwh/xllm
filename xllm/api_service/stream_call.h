@@ -251,6 +251,14 @@ class StreamCall : public Call {
   }
 
   const Request& request() const { return *request_; }
+
+  void clear_multimodal_prompt()
+    requires requires(Request& value) { value.clear_multimodal_prompt(); }
+  {
+    CHECK(request_->GetArena() == nullptr);
+    delete request_->release_multimodal_prompt();
+    controller_->request_attachment().clear();
+  }
   Response& response() { return *response_; }
   ::google::protobuf::Closure* done() { return done_; }
 

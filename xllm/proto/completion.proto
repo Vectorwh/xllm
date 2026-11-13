@@ -19,9 +19,10 @@ option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
 
 import "common.proto";
+import "provider.proto";
 import "rec.proto";
 
-// Next ID: 44
+// Next ID: 52
 message CompletionRequest {
   // ID of the model to use. (required)
   // You can use the ListModels endpoint to list available models.
@@ -144,6 +145,9 @@ message CompletionRequest {
 
   // Request full-vocabulary log probabilities for token IDs at one generation step.
   repeated int32 logprob_token_ids = 43;
+
+  // Prepared text and ordered media sources, independent of ExecutionPlan.
+  MultimodalPrompt multimodal_prompt = 51;
 }
 
 message LogProbs {

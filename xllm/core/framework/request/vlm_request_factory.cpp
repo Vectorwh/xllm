@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "api_service/call.h"
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/common/message.h"
@@ -32,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
+#include "framework/multimodal/mm_batch_data.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "util/scope_guard.h"
 #include "util/timer.h"
@@ -98,8 +100,10 @@ VLMRequestFactory::VLMRequestFactory(MultimodalProcessorBase* processor,
                                      const Tokenizer* tokenizer,
                                      const ModelArgs* model_args,
                                      const Options* options,
-                                     RateLimiter* rate_limiter)
-    : processor_(processor),
+                                     RateLimiter* rate_limiter,
+                                     OutputsFunc rpc_response_handler)
+    : rpc_response_handler_(std::move(rpc_response_handler)),
+      processor_(processor),
       chat_template_(chat_template),
       tokenizer_(tokenizer),
       model_args_(model_args),
@@ -113,30 +117,226 @@ VLMRequestFactory::VLMRequestFactory(MultimodalProcessorBase* processor,
   CHECK(rate_limiter_ != nullptr);
 }
 
-std::shared_ptr<Request> VLMRequestFactory::create(std::string prompt,
-                                                   MMData mm_data,
-                                                   const RequestParams& sp,
-                                                   std::optional<Call*> call,
-                                                   OutputCallback callback) {
+Status VLMRequestFactory::preprocess(PreparedMultimodalInput& input) const {
+  std::vector<Message> messages;
+  messages.reserve(1);
+  messages.emplace_back("user", std::move(input.media));
+  Status status =
+      process_media(messages, std::move(input.payload), input.metadata);
+  if (!status.ok()) {
+    return status;
+  }
+  if (input.prompt && !processor_->process_prompt(
+                          *input.prompt, input.metadata, input.token_ids)) {
+    return {StatusCode::INVALID_ARGUMENT, "Failed to process prompt."};
+  }
+  return {};
+}
+
+Status VLMRequestFactory::process_media(const std::vector<Message>& messages,
+                                        BinaryPayload payload,
+                                        MMData& mm_data) const {
+  static MMInputTransfer mm_input_transfer;
+  const bool has_mm_content =
+      std::any_of(messages.begin(), messages.end(), [](const Message& message) {
+        return message.has_mm_content();
+      });
+  MMInput mm_inputs(std::move(payload));
+  Timer transfer_timer;
+  const MMErrCode code = mm_input_transfer.trans(messages, mm_inputs);
+  if (has_mm_content) {
+    HISTOGRAM_OBSERVE(
+        mm_transfer_latency_milliseconds,
+        static_cast<int64_t>(transfer_timer.elapsed_milliseconds()));
+    MULTI_COUNTER_ADD(mm_input_stage_failures_total,
+                      "transfer",
+                      code == MMErrCode::SUCCESS ? 0 : 1);
+  }
+  if (code != MMErrCode::SUCCESS) {
+    const std::string error_message = MMErrToString(code);
+    LOG(ERROR) << error_message;
+    return {StatusCode::INVALID_ARGUMENT, error_message};
+  }
+  if (!mm_inputs.empty()) {
+    Timer processor_timer;
+    const bool ok = processor_->process_multimodal(mm_inputs, mm_data);
+    HISTOGRAM_OBSERVE(
+        mm_processor_latency_milliseconds,
+        static_cast<int64_t>(processor_timer.elapsed_milliseconds()));
+    MULTI_COUNTER_ADD(mm_input_stage_failures_total, "processor", ok ? 0 : 1);
+    if (!ok) {
+      return {StatusCode::INVALID_ARGUMENT,
+              "Failed to process multimodal input."};
+    }
+  }
+  return {};
+}
+
+Status VLMRequestFactory::validate_multimodal_request(
+    const RequestParams& sp) const {
+  if (!sp.typed_input_status.ok()) {
+    return sp.typed_input_status;
+  }
+
+  if (!sp.multimodal_prompt) {
+    return sp.validate_multimodal_input();
+  }
+  const auto invalid = [] {
+    return Status(StatusCode::INVALID_ARGUMENT,
+                  "Typed media requires VLM Prefill with disaggregated PD");
+  };
+  if (!options_->enable_disagg_pd() || options_->enable_pd_ooc() ||
+      InstanceRole(options_->instance_role()) != InstanceRole::PREFILL ||
+      !options_->enable_service_routing() || sp.decode_address.empty()) {
+    return invalid();
+  }
+  return {};
+}
+
+std::shared_ptr<Request> VLMRequestFactory::create_request(
+    std::string prompt,
+    MMData mm_data,
+    const RequestParams& sp,
+    std::optional<Call*> call,
+    OutputCallback callback) {
   // Guard the rate-limit slot acquired at the service entry. build_request
   // installs its own guard, so we dismiss ours before forwarding.
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
 
-  if (prompt.empty() && mm_data.empty()) {
-    LOG(ERROR) << "Prompt and multimodal data cannot be both empty.";
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "Prompt and multimodal data are both empty.");
+  Status validation_status = validate_multimodal_request(sp);
+  if (!validation_status.ok()) {
+    callback({std::move(validation_status),
+              sp.service_request_id,
+              sp.source_xservice_addr});
     return nullptr;
   }
 
   std::vector<int32_t> prompt_tokens;
-  if (!processor_->process_prompt(prompt, mm_data, prompt_tokens)) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "Failed to process prompt.");
-    return nullptr;
+  if (sp.multimodal_prompt) {
+    if (!mm_data.empty()) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Typed image input cannot include legacy media",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
+    const auto& typed_prompt = *sp.multimodal_prompt;
+    const auto interrupted = [&]() -> Status {
+      if (call.has_value() && *call != nullptr && (*call)->is_disconnected()) {
+        return {StatusCode::CANCELLED, "Image request cancelled"};
+      }
+      return {};
+    };
+    Status status = interrupted();
+    if (status.ok()) {
+      status = [&]() -> Status {
+        std::vector<Message> messages;
+        messages.reserve(1);
+        messages.emplace_back("user", typed_prompt.media);
+        Status media_status =
+            process_media(messages, typed_prompt.payload, mm_data);
+        if (!media_status.ok()) {
+          return media_status;
+        }
+        if (typed_prompt.prompt) {
+          prompt = *typed_prompt.prompt;
+          std::vector<int32_t> tokens;
+          if (!processor_->process_prompt(prompt, mm_data, tokens) ||
+              tokens != typed_prompt.token_ids) {
+            return {StatusCode::INVALID_ARGUMENT,
+                    "Prepared media tokens changed"};
+          }
+        }
+        if (!mm_data.hold<MMItemVec>() ||
+            !typed_prompt.metadata.hold<MMItemVec>() ||
+            mm_data.size() != typed_prompt.metadata.size()) {
+          return {StatusCode::INVALID_ARGUMENT, "Prepared media count changed"};
+        }
+        const auto& expected_items = typed_prompt.metadata.items<MMItemVec>();
+        for (size_t index = 0; index < mm_data.size(); ++index) {
+          const auto& item = mm_data.items<MMItemVec>()[index];
+          const auto& expected = expected_items[index];
+          if (item.type() != expected.type() ||
+              item.state().schedule_data().key !=
+                  expected.state().schedule_data().key) {
+            return {StatusCode::INVALID_ARGUMENT,
+                    "Local media key differs from prepared metadata"};
+          }
+          if (!typed_prompt.prompt) {
+            const auto grid = item.get<torch::Tensor>("image_grid_thw");
+            const auto expected_grid =
+                expected.get<torch::Tensor>("image_grid_thw");
+            if (!grid || !expected_grid ||
+                !torch::equal(*grid, *expected_grid)) {
+              return {
+                  StatusCode::INVALID_ARGUMENT,
+                  "Local processed image grid differs from prepared metadata"};
+            }
+          }
+        }
+        if (!typed_prompt.prompt &&
+            !processor_->bind_prompt_tokens(typed_prompt.token_ids, mm_data)) {
+          return {StatusCode::INVALID_ARGUMENT,
+                  "Failed to bind authoritative image tokens"};
+        }
+        for (size_t index = 0; index < mm_data.size(); ++index) {
+          const auto& state = mm_data.items<MMItemVec>()[index].state();
+          const auto& expected = expected_items[index].state();
+          if (state.token_pos().offset != expected.token_pos().offset ||
+              state.token_pos().length != expected.token_pos().length ||
+              state.mm_token_num() != expected.mm_token_num()) {
+            return {StatusCode::INVALID_ARGUMENT,
+                    "Prepared media spans changed"};
+          }
+        }
+        return {};
+      }();
+      const Status interrupted_status = interrupted();
+      if (!interrupted_status.ok()) {
+        status = interrupted_status;
+      }
+    }
+    if (!status.ok()) {
+      callback(
+          {std::move(status), sp.service_request_id, sp.source_xservice_addr});
+      return nullptr;
+    }
+    prompt_tokens = typed_prompt.token_ids;
+  } else if (sp.prompt_tokens) {
+    // Tokens are authoritative only for text. Media must carry typed spans or
+    // pass through the processor so its mRoPE and embedding metadata agree.
+    if (!mm_data.empty() || sp.prompt_tokens->empty() ||
+        std::any_of(sp.prompt_tokens->begin(),
+                    sp.prompt_tokens->end(),
+                    [this](int32_t token) {
+                      return token < 0 || static_cast<size_t>(token) >=
+                                              tokenizer_->vocab_size();
+                    })) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Invalid pretokenized VLM text input",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
+    prompt_tokens = *sp.prompt_tokens;
+  } else {
+    if (prompt.empty() && mm_data.empty()) {
+      LOG(ERROR) << "Prompt and multimodal data cannot be both empty.";
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Prompt and multimodal data are both empty.",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
+    if (!processor_->process_prompt(prompt, mm_data, prompt_tokens)) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Failed to process prompt.",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
   }
-
   rate_limit_guard.dismiss();
   return build_request(std::move(prompt),
                        std::move(prompt_tokens),
@@ -167,9 +367,11 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   }
   if (prompt_tokens.size() >= static_cast<size_t>(prompt_token_limit)) {
     LOG(ERROR) << "Prompt is too long: " << prompt_tokens.size();
-    callback(Status{StatusCode::INVALID_ARGUMENT,
-                    "Prompt is too long",
-                    FailureReason::PROMPT_TOO_LONG});
+    callback({Status{StatusCode::INVALID_ARGUMENT,
+                     "Prompt is too long",
+                     FailureReason::PROMPT_TOO_LONG},
+              sp.service_request_id,
+              sp.source_xservice_addr});
     return nullptr;
   }
 
@@ -193,7 +395,10 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   // would throw inside the sampler and take the whole batch down with it.
   if (const auto error =
           sampling_param.top_logprobs_vocab_error(model_args_->vocab_size())) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, *error);
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        *error,
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
     return nullptr;
   }
 
@@ -207,6 +412,18 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   bool stream = sp.streaming;
   if (best_of != sp.n) {
     stream = false;
+  }
+
+  OutputsFunc batch_callback;
+  if (options_->enable_service_routing()) {
+    // Requests can outlive the factory while the scheduler drains responses.
+    batch_callback = [handler = rpc_response_handler_](
+                         const std::vector<RequestOutput>& outputs) {
+      for (const auto& output : outputs) {
+        output.log_request_status();
+      }
+      return handler(outputs);
+    };
   }
 
   RequestState req_state(std::move(prompt),
@@ -223,10 +440,11 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
                          sp.skip_special_tokens,
                          options_->enable_schedule_overlap(),
                          callback,
-                         nullptr,
-                         /*decode_address=*/"",
+                         batch_callback,
+                         /*decode_address=*/sp.decode_address,
                          call);
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
+  req_state.scheduler_param = sp.to_scheduler_param();
   req_state.timing = sp.timing;
 
   rate_limit_guard.dismiss();
@@ -258,7 +476,9 @@ std::optional<StoppingChecker> VLMRequestFactory::build_stopping_checker(
       std::vector<int32_t> tmp_tokens;
       if (!tokenizer_->encode(s, &tmp_tokens)) {
         CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                            "Failed to encode stop sequence");
+                            "Failed to encode stop sequence",
+                            sp.service_request_id,
+                            sp.source_xservice_addr);
         LOG(ERROR) << "Failed to encode stop sequence: " << s;
         return std::nullopt;
       }
@@ -274,7 +494,7 @@ std::optional<StoppingChecker> VLMRequestFactory::build_stopping_checker(
                          std::move(stop_sequences));
 }
 
-std::shared_ptr<Request> VLMRequestFactory::create(
+std::shared_ptr<Request> VLMRequestFactory::create_request(
     std::vector<Message> messages,
     const RequestParams& sp,
     BinaryPayload payload,
@@ -282,12 +502,26 @@ std::shared_ptr<Request> VLMRequestFactory::create(
     OutputCallback callback,
     bool use_prompt_as_is) {
   // Guard the rate-limit slot acquired at the service entry. The next hop
-  // (create(prompt, ...)) installs its own guard, so we dismiss ours before
-  // forwarding.
+  // (create_request(prompt, ...)) installs its own guard, so we dismiss ours
+  // before forwarding.
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
 
-  static MMInputTransfer mm_input_transfer;
+  if (sp.multimodal_prompt) {
+    if (!payload.empty() ||
+        std::any_of(
+            messages.begin(), messages.end(), [](const Message& message) {
+              return message.has_mm_content();
+            })) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Typed image input cannot include legacy media",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
+    rate_limit_guard.dismiss();
+    return create_request("", MMData{}, sp, call, std::move(callback));
+  }
 
   Status arguments_status = validate_tool_call_arguments(messages);
   if (!arguments_status.ok()) {
@@ -301,37 +535,24 @@ std::shared_ptr<Request> VLMRequestFactory::create(
       std::any_of(messages.begin(), messages.end(), [](const Message& message) {
         return message.has_mm_content();
       });
-  MMInput mm_inputs(std::move(payload));
-  Timer transfer_timer;
-  MMErrCode code = mm_input_transfer.trans(messages, mm_inputs);
-  if (has_mm_content) {
-    HISTOGRAM_OBSERVE(
-        mm_transfer_latency_milliseconds,
-        static_cast<int64_t>(transfer_timer.elapsed_milliseconds()));
-    MULTI_COUNTER_ADD(mm_input_stage_failures_total,
-                      "transfer",
-                      code == MMErrCode::SUCCESS ? 0 : 1);
-  }
-  if (code != MMErrCode::SUCCESS) {
-    std::string error_message = MMErrToString(code);
-    LOG(ERROR) << error_message;
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, error_message);
-    return nullptr;
-  }
-
-  MMData mm_data;
-  if (!mm_inputs.empty()) {
-    Timer processor_timer;
-    bool ok = processor_->process_multimodal(mm_inputs, mm_data);
-    HISTOGRAM_OBSERVE(
-        mm_processor_latency_milliseconds,
-        static_cast<int64_t>(processor_timer.elapsed_milliseconds()));
-    MULTI_COUNTER_ADD(mm_input_stage_failures_total, "processor", ok ? 0 : 1);
-    if (!ok) {
+  if (sp.prompt_tokens) {
+    if (has_mm_content || !payload.empty()) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                          "Failed to process multimodal input.");
+                          "Pretokenized VLM text cannot include legacy media",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
       return nullptr;
     }
+    rate_limit_guard.dismiss();
+    return create_request("", MMData{}, sp, call, std::move(callback));
+  }
+  MMData mm_data;
+  Status media_status = process_media(messages, std::move(payload), mm_data);
+  if (!media_status.ok()) {
+    callback({std::move(media_status),
+              sp.service_request_id,
+              sp.source_xservice_addr});
+    return nullptr;
   }
 
   std::optional<std::string> prompt;
@@ -362,16 +583,19 @@ std::shared_ptr<Request> VLMRequestFactory::create(
   if (!prompt.has_value()) {
     std::string error_message = "Failed to construct prompt from messages";
     LOG(ERROR) << error_message;
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, error_message);
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        error_message,
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
     return nullptr;
   }
 
   rate_limit_guard.dismiss();
-  return create(std::move(prompt.value()),
-                std::move(mm_data),
-                sp,
-                call,
-                std::move(callback));
+  return create_request(std::move(prompt.value()),
+                        std::move(mm_data),
+                        sp,
+                        call,
+                        std::move(callback));
 }
 
 }  // namespace xllm

@@ -55,6 +55,11 @@ class MultimodalProcessorBase {
   virtual bool process_multimodal(const MMInput& inputs,
                                   MMData& data) const = 0;
 
+  virtual bool bind_prompt_tokens(const std::vector<int32_t>& /*token_ids*/,
+                                  MMData& /*mm_data*/) const {
+    return false;
+  }
+
  protected:
   MultimodalProcessorBase(
       std::shared_ptr<Tokenizer> tokenizer,
@@ -130,6 +135,11 @@ class MultimodalProcessor final : public MultimodalProcessorBase {
       return false;
     }
     return true;
+  }
+
+  bool bind_prompt_tokens(const std::vector<int32_t>& token_ids,
+                          MMData& mm_data) const override {
+    return prompt_processor_->find_mm_spans(token_ids, mm_data);
   }
 
   bool process_multimodal(const MMInput& inputs, MMData& data) const override {
