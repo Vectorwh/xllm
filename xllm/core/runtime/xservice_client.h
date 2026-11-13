@@ -60,6 +60,9 @@ class XServiceClient {
 
   std::string get_instance_name();
   void register_instance(const InstanceInfo& instance_info);
+  // Deletes this process's instance key. Remote machines treat its absence as
+  // the signal that the whole instance must stop together.
+  void withdraw_instance_registration();
   void heartbeat();
   InstanceInfo get_instance_info(const std::string& instance_name);
   std::vector<std::string> get_static_decode_list();

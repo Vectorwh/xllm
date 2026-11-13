@@ -58,8 +58,10 @@ bool ShmChannel::execute_model_with_shm(const ForwardInput& input,
     bool use_shm_ret = input_shm_manager_->input_write(input);
     if (!use_shm_ret) {
       input_shm_manager_->cancel();
-      HealthCheckManager::instance().set_unhealthy(
-          "Worker SHM input write failed");
+      // Overflow or an already-cancelled segment is local. EHOSTDOWN is fatal
+      // and would restart the instance for a payload that does not fit.
+      HealthCheckManager::instance().report_worker_failure(
+          EMSGSIZE, "Worker SHM input write failed");
       LOG(ERROR)
           << "Worker SHM input write failed; cancelling the worker group";
       return false;
@@ -72,7 +74,10 @@ bool ShmChannel::execute_model_with_shm(const ForwardInput& input,
       input_shm_manager_.get());
   if (!success) {
     input_shm_manager_->cancel();
-    HealthCheckManager::instance().set_unhealthy("Worker SHM execution failed");
+    // Match a brpc ExecuteModel timeout. ERPCTIMEDOUT only marks the cluster
+    // unhealthy. A dead worker is still reported by the Hello health check.
+    HealthCheckManager::instance().report_worker_failure(
+        brpc::ERPCTIMEDOUT, "Worker SHM execution timed out");
   }
   return success;
 }

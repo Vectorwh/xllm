@@ -398,11 +398,12 @@ uint8_t prefetch_hit_count(size_t position,
 
 }  // namespace
 
-// A hit past the KV common prefix has overwritten that host page. Incomplete
-// prefetch tails stay invalid at allocate time, so they never enter the
-// overwrite set. Indexes are absolute block positions. hit_counts covers the
-// prefetched tail and starts at base_blocks. Positions below base_blocks are
-// the existing host prefix and are not inspected.
+// Any hit writes that host page, including a partial hit inside the KV
+// prefix. A miss leaves the previous checkpoint in place. Incomplete tails
+// stay invalid at allocate time, so they never enter the overwrite set.
+// Indexes are absolute block positions. hit_counts covers the prefetched
+// tail and starts at base_blocks. Positions below base_blocks are the
+// existing host prefix and are not inspected.
 size_t last_reusable_linear_checkpoint(const Slice<Block>& linear_blocks,
                                        size_t base_blocks,
                                        size_t kv_common_blocks,
@@ -431,7 +432,11 @@ size_t last_reusable_linear_checkpoint(const Slice<Block>& linear_blocks,
     if (!block.is_valid()) {
       continue;
     }
-    if (prefetch_hit_count(position, base_blocks, hit_counts) < rank_count) {
+    const uint8_t hits = prefetch_hit_count(position, base_blocks, hit_counts);
+    if (hits < rank_count) {
+      if (hits > 0) {
+        overwritten_ids.insert(block.id());
+      }
       continue;
     }
     if (overwritten_ids.find(block.id()) != overwritten_ids.end()) {

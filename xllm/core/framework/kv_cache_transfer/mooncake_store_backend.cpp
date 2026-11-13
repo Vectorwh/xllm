@@ -172,8 +172,11 @@ std::vector<uint8_t> MooncakeStoreBackend::batch_get(
 
   // Error codes are per object. Unexpected exceptions cannot identify which
   // writes completed, so they propagate instead of being converted to misses.
+  // true selects Mooncake's endpoint-grouped BatchGet, which submits one RDMA
+  // batch per transport endpoint. A failure in that group fails every key on
+  // the same endpoint. This path accepts memory replicas only.
   const std::vector<int> results = client_ptr_->batch_get_into_multi_buffers(
-      get_keys, all_buffers, all_sizes, /*prefer_same_node=*/false);
+      get_keys, all_buffers, all_sizes, /*prefer_same_node=*/true);
   if (results.size() != get_keys.size()) {
     LOG(ERROR) << "Mooncake batch Get result count mismatch: batch_size="
                << keys.size() << " submitted=" << get_keys.size()

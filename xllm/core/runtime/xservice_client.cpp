@@ -680,6 +680,22 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   LOG(INFO) << "Success register instance to etcd.";
 }
 
+void XServiceClient::withdraw_instance_registration() {
+  std::string registration_key;
+  {
+    std::lock_guard<std::mutex> lock(registration_mutex_);
+    registration_key = registration_key_;
+    register_done_.store(false, std::memory_order_release);
+  }
+  if (registration_key.empty() || etcd_client_ == nullptr) {
+    return;
+  }
+  if (etcd_client_->withdraw_registration(registration_key)) {
+    LOG(INFO) << "Withdrew instance registration from etcd: "
+              << registration_key;
+  }
+}
+
 InstanceInfo instance_info_from_proto(
     const xllm_service::proto::InstanceMetaInfo& response) {
   InstanceInfo result;

@@ -4676,6 +4676,34 @@ TEST(LinearPrefetchSelectionTest, KeepsDeepestFullHitInsideKvPrefix) {
             12u);
 }
 
+// One worker GET inside the KV prefix still writes the reused host page.
+// The earlier full hit of that id is dirty; the previous clean page remains.
+TEST(LinearPrefetchSelectionTest, PartialHitInsidePrefixOverwritesSharedPage) {
+  std::vector<Block> blocks = {linear_block(1),
+                               linear_block(2),
+                               linear_block(3),
+                               linear_block(4),
+                               linear_block(1),
+                               linear_block(2),
+                               linear_block(3),
+                               linear_block(4)};
+  const std::vector<uint8_t> hits = {4, 4, 4, 4, 0, 0, 0, 1};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/8, hits, 4),
+            3u);
+}
+
+// The same partial write drops the checkpoint when no earlier page is clean.
+TEST(LinearPrefetchSelectionTest, PartialHitInsidePrefixDropsDirtyPage) {
+  std::vector<Block> blocks(8);
+  blocks[3] = linear_block(4);
+  blocks[7] = linear_block(4);
+  const std::vector<uint8_t> hits = {0, 0, 0, 4, 0, 0, 0, 1};
+  EXPECT_EQ(last_reusable_linear_checkpoint(
+                blocks, /*base_blocks=*/0, /*kv_common_blocks=*/8, hits, 4),
+            0u);
+}
+
 // A miss past the KV prefix does not pollute. The full hit at position 4
 // stays reusable even though an earlier alias shared its page id.
 TEST(LinearPrefetchSelectionTest, MissPastKvPrefixDoesNotOverwrite) {

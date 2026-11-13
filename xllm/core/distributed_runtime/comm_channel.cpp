@@ -113,9 +113,10 @@ bool CommChannel::check_health() {
   proto::Status resp;
   brpc::Controller cntl;
 
-  // Set a timeout for health check
-  // check hang status: 10min(magic num)
-  cntl.set_timeout_ms(600000);
+  // Health check times out after 10 seconds. A dead worker must close this
+  // RPC promptly. A live but busy worker still answers Hello without waiting
+  // for its current execution.
+  cntl.set_timeout_ms(10000);
   stub_->Hello(&cntl, &req, &resp, nullptr);
   if (cntl.Failed()) {
     LOG(WARNING) << "Health check failed: " << cntl.ErrorText();
@@ -655,7 +656,8 @@ bool CommChannel::get_last_step_result_async(
   if (cntl.Failed()) {
     LOG(ERROR) << "Get last step model output result failed, "
                << cntl.ErrorText();
-    HealthCheckManager::instance().set_unhealthy(cntl.ErrorText());
+    HealthCheckManager::instance().report_worker_failure(cntl.ErrorCode(),
+                                                         cntl.ErrorText());
     promise.setValue(std::nullopt);
     return false;
   }
@@ -727,7 +729,8 @@ void ExecuteModelClosure::Run() {
   if (cntl.Failed()) {
     LOG(ERROR) << "Execute_model_async failed. Error code : "
                << cntl.ErrorCode() << ", error message : " << cntl.ErrorText();
-    HealthCheckManager::instance().set_unhealthy(cntl.ErrorText());
+    HealthCheckManager::instance().report_worker_failure(cntl.ErrorCode(),
+                                                         cntl.ErrorText());
     promise.setValue(std::nullopt);
     return;
   }

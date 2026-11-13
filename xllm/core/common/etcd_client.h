@@ -53,6 +53,9 @@ class EtcdClient {
   bool register_instance(const std::string& key,
                          const std::string& value,
                          const int ttl);
+  // Removes the registration before the lease expires. A worker failure uses
+  // this so remote watchdogs observe the missing key immediately.
+  bool withdraw_registration(const std::string& key);
   RegistrationLookupState lookup_registration(const std::string& key);
 
   bool get_master_service(const std::string& key_prefix, std::string* values);

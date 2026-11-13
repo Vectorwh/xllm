@@ -202,7 +202,7 @@ RegistrationLookupState EtcdClient::lookup_registration(
   if (keep_alive_failed->load(std::memory_order_acquire)) {
     auto replacement_failed = std::make_shared<std::atomic<bool>>(false);
     auto replacement = make_keep_alive(key, ttl, lease_id, replacement_failed);
-    // The background stream waits ttl / 3 before its first refresh. Renew
+    // The background stream waits ttl / 2 before its first refresh. Renew
     // immediately: a recovered connection can have less than that TTL left.
     try {
       replacement->Check();
@@ -323,6 +323,30 @@ bool EtcdClient::register_instance(const std::string& key,
     old_keep_alive->Cancel();
   }
 
+  return true;
+}
+
+bool EtcdClient::withdraw_registration(const std::string& key) {
+  std::shared_ptr<etcd::KeepAlive> keep_alive;
+  {
+    std::lock_guard<std::mutex> lock(keep_alives_mutex_);
+    auto it = keep_alives_.find(key);
+    if (it == keep_alives_.end()) {
+      return true;
+    }
+    keep_alive = it->second.keep_alive;
+    keep_alives_.erase(it);
+    ownership_cv_.notify_all();
+  }
+  if (keep_alive != nullptr) {
+    keep_alive->Cancel();
+  }
+  auto response = client_.rm(namespaced_key(key));
+  if (!response.is_ok()) {
+    LOG(ERROR) << "etcd withdraw " << key
+               << " failed: " << response.error_message();
+    return false;
+  }
   return true;
 }
 

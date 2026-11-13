@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <brpc/errno.pb.h>
+
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -29,8 +31,8 @@ limitations under the License.
 namespace xllm {
 
 // Singleton class to manage cluster health status.
-// When master detects any worker disconnection,
-// it will set the cluster health status to unhealthy.
+// A lost worker connection ends the master process. An execution timeout only
+// marks the cluster unhealthy so the process can keep serving.
 class HealthCheckManager {
  public:
   using HealthCheckFunc = std::function<bool()>;
@@ -52,6 +54,44 @@ class HealthCheckManager {
       unhealthy_reason_ = reason;
     }
     is_healthy_.store(false, std::memory_order_release);
+  }
+
+  // A worker process or its connection is gone. An execution timeout is not
+  // fatal: the worker may still be computing and the process stays up.
+  void report_worker_failure(int32_t error_code, const std::string& reason) {
+    if (!worker_connection_lost(error_code)) {
+      set_unhealthy(reason);
+      return;
+    }
+    bool expected = false;
+    if (!worker_lost_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(reason_mutex_);
+      unhealthy_reason_ = reason;
+    }
+    is_healthy_.store(false, std::memory_order_release);
+    LOG(ERROR) << "Worker connection lost: " << reason;
+    if (fatal_handler_) {
+      fatal_handler_(reason);
+    }
+  }
+
+  void set_worker_loss_handler(
+      std::function<void(const std::string&)> handler) {
+    fatal_handler_ = std::move(handler);
+  }
+
+  // brpc uses these values for a peer that closed or never accepted the
+  // connection. EEOF is the clean peer close ("Got EOF"). A plain execution
+  // timeout stays non-fatal.
+  static bool worker_connection_lost(int32_t error_code) {
+    return error_code == ECONNREFUSED || error_code == ECONNRESET ||
+           error_code == EHOSTDOWN || error_code == ETIMEDOUT ||
+           error_code == brpc::EFAILEDSOCKET || error_code == brpc::EEOF ||
+           error_code == brpc::ELOGOFF || error_code == brpc::ECLOSE;
   }
 
   // Set cluster health status to healthy
@@ -98,30 +138,46 @@ class HealthCheckManager {
   }
 
  private:
-  HealthCheckManager() : is_healthy_(true), health_check_running_(false) {}
+  HealthCheckManager()
+      : is_healthy_(true), worker_lost_(false), health_check_running_(false) {}
   ~HealthCheckManager() { stop_health_check_thread(); }
 
   DISALLOW_COPY_AND_ASSIGN(HealthCheckManager);
 
+  // A single Hello failure is not a lost worker. Startup can fail the probe
+  // while the worker is still initializing, and one timeout must not end the
+  // instance. Only this many consecutive failures for the same rank are fatal.
+  static constexpr int kConsecutiveFailureLimit = 3;
+
   void check_all_workers() {
     for (const auto& [rank, check_func] : health_checks_) {
-      if (!check_func()) {
-        {
-          std::lock_guard<std::mutex> lock(reason_mutex_);
-          unhealthy_reason_ =
-              "Worker " + std::to_string(rank) + " disconnected";
-        }
-        is_healthy_.store(false, std::memory_order_release);
-        return;
+      if (check_func()) {
+        consecutive_failures_[rank] = 0;
+        continue;
       }
+      const int failures = ++consecutive_failures_[rank];
+      if (failures < kConsecutiveFailureLimit) {
+        LOG(WARNING) << "Worker " << rank << " health check failed ("
+                     << failures << "/" << kConsecutiveFailureLimit << ")";
+        continue;
+      }
+      report_worker_failure(
+          EHOSTDOWN,
+          "Worker " + std::to_string(rank) + " disconnected after " +
+              std::to_string(failures) + " consecutive health check failures");
+      return;
     }
   }
 
   std::atomic<bool> is_healthy_;
+  std::atomic<bool> worker_lost_;
+  std::function<void(const std::string&)> fatal_handler_;
   std::atomic<bool> health_check_running_;
   mutable std::mutex reason_mutex_;
   std::string unhealthy_reason_;
   std::unordered_map<int, HealthCheckFunc> health_checks_;
+  // Touched only by the health check thread.
+  std::unordered_map<int, int> consecutive_failures_;
   std::thread health_check_thread_;
 };
 

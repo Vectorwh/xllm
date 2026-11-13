@@ -32,6 +32,7 @@ limitations under the License.
 #include "remote_worker.h"
 #include "runtime/forward_shared_memory_manager.h"
 #include "runtime/llm_worker_impl.h"
+#include "runtime/xservice_client.h"
 #include "server/xllm_server_registry.h"
 #include "shm_channel.h"
 #include "util/net.h"
@@ -321,6 +322,18 @@ void DistManager::setup_multi_node_workers(
                                          devices[r % each_node_ranks],
                                          std::move(channel)));
     }
+
+    // A lost worker takes this master process with it. The deployment watchdog
+    // sees the etcd registration disappear and stops every machine together.
+    HealthCheckManager::instance().set_worker_loss_handler(
+        [service_routing =
+             options.enable_service_routing()](const std::string& reason) {
+          if (service_routing) {
+            XServiceClient::get_instance()->withdraw_instance_registration();
+          }
+          LOG(FATAL) << "Worker lost: " << reason
+                     << "; restart the whole instance together";
+        });
 
     // Register health check for each worker and start background health check
     for (auto& worker_client : worker_clients_) {
