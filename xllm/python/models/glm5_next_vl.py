@@ -60,6 +60,7 @@ from xllm.python.models.multimodal import (
     EncoderTokenCounts,
     MultimodalData,
     MultimodalInputs,
+    encode_batched_vision,
     merge_multimodal_embeddings,
 )
 
@@ -926,22 +927,12 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         return out.pooler_output
 
     def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
-        outputs: EncoderOutputs = {}
-        for modality, pixel_key, grid_key in (
-            ("image", "pixel_values", "image_grid_thw"),
-            ("video", "pixel_values_videos", "video_grid_thw"),
-        ):
-            counts = token_counts.get(modality, [])
-            if not counts:
-                continue
-            pixels, grid = data[pixel_key], data[grid_key]
-            if not isinstance(pixels, torch.Tensor) or not isinstance(grid, torch.Tensor):
-                raise TypeError("batched vision pixels and grids must be tensors")
-            features = self.encode(pixels, grid)
-            if self._hidden_rot is not None:
-                features = features @ self._hidden_rot
-            outputs[f"{modality}|embedding"] = list(features.split(counts, dim=0))
-        return outputs
+        return encode_batched_vision(self.encode, data, token_counts, transform=self._rotate_features)
+
+    def _rotate_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self._hidden_rot is None:
+            return features
+        return features @ self._hidden_rot
 
     def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
         return MultimodalInputs(merge_multimodal_embeddings(self.language_model.embed_tokens(input_ids), data))

@@ -53,6 +53,7 @@ from xllm.python.models.multimodal import (
     EncoderTokenCounts,
     MultimodalData,
     MultimodalInputs,
+    encode_batched_vision,
     merge_multimodal_embeddings,
 )
 from xllm.python.models.qwen3 import (
@@ -119,6 +120,71 @@ class Qwen3VLVisionConfig:
                 )
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared vision-tower weight loading
+# ---------------------------------------------------------------------------
+
+# Checkpoint tensors of one vision block / merger; the two maps differ only in
+# ``patch_embed`` carrying an extra ".proj" on the checkpoint side.
+_VISION_BLOCK_TENSORS: tuple[str, ...] = (
+    "norm1.weight",
+    "norm1.bias",
+    "norm2.weight",
+    "norm2.bias",
+    "attn.qkv.weight",
+    "attn.qkv.bias",
+    "attn.proj.weight",
+    "attn.proj.bias",
+    "mlp.linear_fc1.weight",
+    "mlp.linear_fc1.bias",
+    "mlp.linear_fc2.weight",
+    "mlp.linear_fc2.bias",
+)
+_VISION_MERGER_TENSORS: tuple[str, ...] = (
+    "norm.weight",
+    "norm.bias",
+    "linear_fc1.weight",
+    "linear_fc1.bias",
+    "linear_fc2.weight",
+    "linear_fc2.bias",
+)
+
+
+def load_qwen3_vl_vision_weights(
+    vision_model: nn.Module,
+    weights: ScopedWeightLoader,
+    *,
+    depth: int,
+    deepstack_levels: int,
+) -> None:
+    """Load a Qwen3-VL vision tower; replicated across ranks, no TP sharding.
+
+    The key layout belongs to ``Qwen3VLVisionTransformer``, so every host that
+    reuses that module shares this table. ``deepstack_levels`` is 0 for hosts
+    whose checkpoint carries no DeepStack mergers (Qwen3.5).
+    """
+    params: dict[str, torch.Tensor] = dict(vision_model.named_parameters())
+
+    def copy(param_name: str, ckpt_name: str | None = None) -> None:
+        source = ckpt_name or param_name
+        if not weights.has(source):
+            raise KeyError(f"checkpoint is missing vision tensor {source!r} required by parameter {param_name!r}")
+        weights.load_tensor(params[param_name], source)
+
+    copy("patch_embed.weight", "patch_embed.proj.weight")
+    copy("patch_embed.bias", "patch_embed.proj.bias")
+    copy("pos_embed.weight")
+
+    for i in range(depth):
+        for name in _VISION_BLOCK_TENSORS:
+            copy(f"blocks.{i}.{name}")
+    for name in _VISION_MERGER_TENSORS:
+        copy(f"merger.{name}")
+    for i in range(deepstack_levels):
+        for name in _VISION_MERGER_TENSORS:
+            copy(f"deepstack_merger_list.{i}.{name}")
 
 
 # ---------------------------------------------------------------------------
@@ -847,20 +913,7 @@ class Qwen3VLForConditionalGeneration(PyModelBase):
         return image_embeds
 
     def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
-        outputs: EncoderOutputs = {}
-        for modality, pixel_key, grid_key in (
-            ("image", "pixel_values", "image_grid_thw"),
-            ("video", "pixel_values_videos", "video_grid_thw"),
-        ):
-            counts = token_counts.get(modality, [])
-            if not counts:
-                continue
-            pixels, grid = data[pixel_key], data[grid_key]
-            if not isinstance(pixels, torch.Tensor) or not isinstance(grid, torch.Tensor):
-                raise TypeError("batched vision pixels and grids must be tensors")
-            features = self.encode(pixels, grid)
-            outputs[f"{modality}|embedding"] = list(features.split(counts, dim=0))
-        return outputs
+        return encode_batched_vision(self.encode, data, token_counts)
 
     def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
         inputs_embeds = self.model.embed_tokens(input_ids)
@@ -891,45 +944,9 @@ class Qwen3VLForConditionalGeneration(PyModelBase):
         )
 
     def _load_vision_weights(self, weights: ScopedWeightLoader) -> None:
-        """Load vision tower weights (replicated, no TP sharding)."""
-        params: dict[str, torch.Tensor] = dict(self.vision_model.named_parameters())
-
-        def copy(param_name: str, ckpt_name: str | None = None) -> None:
-            weights.load_tensor(params[param_name], ckpt_name or param_name)
-
-        # patch_embed (Conv3d): checkpoint names carry an extra ".proj".
-        copy("patch_embed.weight", "patch_embed.proj.weight")
-        copy("patch_embed.bias", "patch_embed.proj.bias")
-        copy("pos_embed.weight")
-
-        # Every other vision tensor maps 1:1 (same trailing key); load by list.
-        block_ts = (
-            "norm1.weight",
-            "norm1.bias",
-            "norm2.weight",
-            "norm2.bias",
-            "attn.qkv.weight",
-            "attn.qkv.bias",
-            "attn.proj.weight",
-            "attn.proj.bias",
-            "mlp.linear_fc1.weight",
-            "mlp.linear_fc1.bias",
-            "mlp.linear_fc2.weight",
-            "mlp.linear_fc2.bias",
+        load_qwen3_vl_vision_weights(
+            self.vision_model,
+            weights,
+            depth=self.vision_cfg.depth,
+            deepstack_levels=len(self.vision_cfg.deepstack_visual_indexes),
         )
-        merger_ts = (
-            "norm.weight",
-            "norm.bias",
-            "linear_fc1.weight",
-            "linear_fc1.bias",
-            "linear_fc2.weight",
-            "linear_fc2.bias",
-        )
-        for i in range(self.vision_cfg.depth):
-            for t in block_ts:
-                copy(f"blocks.{i}.{t}")
-        for t in merger_ts:
-            copy(f"merger.{t}")
-        for i in range(len(self.vision_cfg.deepstack_visual_indexes)):
-            for t in merger_ts:
-                copy(f"deepstack_merger_list.{i}.{t}")

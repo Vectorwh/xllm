@@ -15,7 +15,12 @@ target_link_libraries(npu_profiler_lifecycle_test PRIVATE
   glog::glog
 )
 add_dependencies(all_tests npu_profiler_lifecycle_test)
-gtest_add_tests(TARGET npu_profiler_lifecycle_test)
+gtest_add_tests(TARGET npu_profiler_lifecycle_test
+  TEST_LIST _npu_profiler_lifecycle_tests)
+# Same hang guard as cc_test(): this binary embeds Python, so a stuck case
+# would otherwise wait out CTest's 1500s default.
+set_tests_properties(${_npu_profiler_lifecycle_tests}
+  PROPERTIES TIMEOUT 300)
 
 cc_test(
   NAME

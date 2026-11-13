@@ -43,7 +43,7 @@ function(cc_test)
   cmake_parse_arguments(
     CC_TEST # prefix
     "CPU_ONLY;RUN_SERIAL" # options
-    "NAME;GTEST_SUITE" # one value args
+    "NAME;GTEST_SUITE;TIMEOUT" # one value args
     "SRCS;COPTS;LINKOPTS;DEPS;INCLUDES;ARGS;DATA;ENVIRONMENT" # multi value args
     ${ARGN}
   )
@@ -172,5 +172,21 @@ function(cc_test)
   if(CC_TEST_RUN_SERIAL)
     set_tests_properties(${_cc_test_${CC_TEST_NAME}_tests}
       PROPERTIES RUN_SERIAL TRUE)
+  endif()
+
+  # A hung case otherwise stalls the whole parallel batch until CTest's 1500s
+  # default, which can outlast the CI job budget.  Fail it early instead so the
+  # log names the culprit.
+  #
+  # Two carve-outs: a grouped GTEST_SUITE registers every case as one CTest
+  # entry, so a default would become a shared budget for a whole multi-device
+  # suite -- those keep the CTest default.  And an explicit TIMEOUT 0 means
+  # "no timeout" in CTest, so it must pass through rather than be defaulted.
+  if(NOT DEFINED CC_TEST_TIMEOUT AND NOT CC_TEST_GTEST_SUITE)
+    set(CC_TEST_TIMEOUT 300)
+  endif()
+  if(CC_TEST_TIMEOUT AND _cc_test_${CC_TEST_NAME}_tests)
+    set_tests_properties(${_cc_test_${CC_TEST_NAME}_tests}
+      PROPERTIES TIMEOUT ${CC_TEST_TIMEOUT})
   endif()
 endfunction()

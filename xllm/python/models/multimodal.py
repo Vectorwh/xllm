@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -43,6 +44,38 @@ class SupportsMultimodal(Protocol):
     def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs: ...
 
     def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs: ...
+
+
+def encode_batched_vision(
+    encode: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    data: MultimodalData,
+    token_counts: EncoderTokenCounts,
+    *,
+    transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> EncoderOutputs:
+    """Run the vision encoder per modality and split it into one chunk per item.
+
+    Every VLM shares the same batched pixel/grid protocol, so the modality
+    table, the tensor check and the ``split`` belong here rather than in each
+    model. ``transform`` post-processes the encoder output as a whole (before
+    the split) for hosts that rotate the projected features.
+    """
+    outputs: EncoderOutputs = {}
+    for modality, pixel_key, grid_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        counts = token_counts.get(modality, [])
+        if not counts:
+            continue
+        pixels, grid = data[pixel_key], data[grid_key]
+        if not isinstance(pixels, torch.Tensor) or not isinstance(grid, torch.Tensor):
+            raise TypeError("batched vision pixels and grids must be tensors")
+        features = encode(pixels, grid)
+        if transform is not None:
+            features = transform(features)
+        outputs[f"{modality}|embedding"] = list(features.split(counts, dim=0))
+    return outputs
 
 
 def merge_multimodal_embeddings(
