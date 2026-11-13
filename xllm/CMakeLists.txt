@@ -94,6 +94,7 @@ else()
       xllm.cpp
     DEPS
       :config
+      :constraint
       :xllm_server
       :master
       :util

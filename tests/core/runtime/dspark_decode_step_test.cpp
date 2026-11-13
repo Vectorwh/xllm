@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/speculative/spec_input_builder.h"
+#include "core/framework/tokenizer/tokenizer.h"
 #include "layers/common/attention_metadata.h"
 #include "platform/device.h"
 #include "runtime/dflash/dflash2_worker_impl.h"
@@ -227,6 +228,48 @@ class DSparkWorkerImplTestPeer final {
 
   static bool async_output_enabled(const DSparkWorkerImpl& worker) {
     return worker.async_output_enabled_;
+  }
+
+  static void restore_states(DSparkWorkerImpl& worker, ForwardInput& input) {
+    worker.restore_json_object_states(input);
+  }
+
+  // The speculative wrapper forwards restore_json_object_states to its inner
+  // target worker, so the tokenizer and the model context it reads (vocab
+  // size for the deny machine width) must be installed on that inner worker.
+  // A test-local subclass reaches its own protected members directly.
+  class InstallableTargetWorker final : public LLMWorkerImpl {
+   public:
+    InstallableTargetWorker(const ParallelArgs& parallel_args,
+                            const torch::Device& device,
+                            const runtime::Options& options)
+        : LLMWorkerImpl(parallel_args, device, options) {}
+
+    void install_for_restore_test() {
+      class CountingTokenizer final : public Tokenizer {
+       public:
+        size_t vocab_size() const override { return 40; }
+        bool get_constraint_vocab(
+            std::vector<std::string>* pieces) const override {
+          pieces->assign(40, std::string());
+          return true;
+        }
+      };
+      tokenizer_ = std::make_unique<CountingTokenizer>();
+      ModelArgs args;
+      args.vocab_size(40);
+      context_ = ModelContext(parallel_args_,
+                              args,
+                              QuantArgs{},
+                              torch::TensorOptions().device(device_.unwrap()));
+    }
+  };
+
+  static void install_restore_dependencies(DSparkWorkerImpl& worker) {
+    auto target = std::make_unique<InstallableTargetWorker>(
+        worker.parallel_args_, worker.device_.unwrap(), worker.options_);
+    target->install_for_restore_test();
+    worker.impl_ = std::move(target);
   }
 
   static bool draft_prelaunch_enabled_for_init(const DSparkWorkerImpl& worker) {
@@ -742,6 +785,69 @@ TEST(DSparkDecodeStepTest, SamplingConstraintsDoNotDisableAsyncOutput) {
   EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
 }
 
+TEST(DSparkDecodeStepTest, ConstrainedRowWithoutSnapshotDecodesDenied) {
+  // Cross-process arrival of a constraint that could not be serialized: the
+  // request fails through the error channel, and the row must decode under an
+  // all-deny mask (initialized but invalid) instead of an unconstrained one,
+  // so the failing step itself cannot sample outside the grammar.
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(15);
+  DSparkWorkerImpl worker(
+      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
+  DSparkWorkerImplTestPeer::install_restore_dependencies(worker);
+
+  ForwardInput input;
+  input.sample_sequence_ids = {"cross-process"};
+  input.json_object_state_snapshots.resize(1);
+  input.json_object_state_snapshots[0].enabled = false;
+  input.json_object_state_snapshots[0].constrained_without_snapshot = true;
+
+  DSparkWorkerImplTestPeer::restore_states(worker, input);
+  ASSERT_EQ(input.json_object_errors.size(), 1u);
+  EXPECT_EQ(input.json_object_errors.front().sample_sequence_id,
+            "cross-process");
+  ASSERT_EQ(input.json_object_states.size(), 1u);
+  EXPECT_TRUE(input.json_object_states.front().initialized());
+  EXPECT_FALSE(input.json_object_states.front().is_valid());
+  // The batch mask assembles the deny row as all zeros: the failing step
+  // cannot emit an out-of-grammar token even before the error is surfaced.
+  const torch::Tensor mask = build_filter_bitmask(input.json_object_states);
+  ASSERT_EQ(mask.sizes(), torch::IntArrayRef({1, 2}));
+  EXPECT_TRUE(torch::equal(mask[0], torch::zeros_like(mask[0])));
+}
+
+TEST(DSparkDecodeStepTest, ConstrainedRowsKeepDraftPrelaunchEligible) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(15);
+  DSparkWorkerImpl worker(
+      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
+  DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 1;
+  input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  input.input_params.embedding.embedding_ids = {0};
+  input.input_params.embedding.request_ids = {"request"};
+  input.sampling_params.all_greedy_sample = true;
+  input.sampling_params.filter_bitmask =
+      torch::tensor({{10, 10}}, torch::kInt32);
+  input.json_object_states.emplace_back();
+  input.json_object_state_snapshots.emplace_back();
+
+  // The draft query clears the constraint bitmask and samples unconstrained,
+  // so constraint rows no longer disqualify a batch from prelaunch.
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+      worker, input));
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
+}
+
 enum class DSparkDecodeFallback {
   DEVICE_INPUTS_UNSUPPORTED,
   NEW_REQUEST,
@@ -951,14 +1057,6 @@ TEST(DSparkDecodeStepTest, BatchConstraintsSelectNormalPathAndAllowRecovery) {
     EXPECT_TRUE(DSparkWorkerImplTestPeer::async_output_enabled(worker));
   };
   expect_prelaunch();
-  input.json_object_states.emplace_back();
-  expect_normal_path();
-  input.json_object_states.clear();
-  expect_prelaunch();
-  input.json_object_state_snapshots.emplace_back();
-  expect_normal_path();
-  input.json_object_state_snapshots.clear();
-  expect_prelaunch();
 
   input.input_params.block_copy.src_block_indices = torch::tensor({0});
   expect_normal_path();
@@ -974,12 +1072,11 @@ TEST(DSparkDecodeStepTest, BatchConstraintsSelectNormalPathAndAllowRecovery) {
   expect_normal_path();
   input.sampling_params.all_greedy_sample = true;
   expect_prelaunch();
-  for (torch::Tensor* parameter : {&input.sampling_params.unique_token_ids,
-                                   &input.sampling_params.frequency_penalties,
-                                   &input.sampling_params.presence_penalties,
-                                   &input.sampling_params.repetition_penalties,
-                                   &input.sampling_params.filter_mask,
-                                   &input.sampling_params.filter_bitmask}) {
+  for (torch::Tensor* parameter :
+       {&input.sampling_params.unique_token_ids,
+        &input.sampling_params.frequency_penalties,
+        &input.sampling_params.presence_penalties,
+        &input.sampling_params.repetition_penalties}) {
     *parameter = torch::tensor({1.1f});
     expect_normal_path();
     *parameter = torch::Tensor();
@@ -1108,7 +1205,7 @@ TEST(DSparkDecodeStepTest, PrepareQueryClearsXgrammarDraftMaskLikeJsonStates) {
 }
 
 TEST(DSparkDecodeStepTest,
-     JsonDecodePreparationUsesNormalPathAndAllowsRecovery) {
+     JsonDecodePreparationStaysPrelaunchEligibleAndAllowsRecovery) {
   Device device(0);
   device.set_device();
   device.init_device_context();
@@ -1136,7 +1233,7 @@ TEST(DSparkDecodeStepTest,
   DSparkWorkerImpl worker(
       parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
   DSparkWorkerImplTestPeer::initialize_decode_modes(worker, true);
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
+  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_prelaunch_draft_for_this_step(
       worker, input));
   ForwardInput processed;
   worker.prepare_work_before_execute(input, processed);
@@ -1967,7 +2064,7 @@ TEST(DSparkDecodeStepTest, AsyncAcceptedOutputReplaysJsonForMixedRows) {
   }
 }
 
-TEST(DSparkDecodeStepTest, DraftQueryPreservesNonJsonSamplingMasks) {
+TEST(DSparkDecodeStepTest, DraftQueryClearsSequenceLevelSamplingMasks) {
   Device device(0);
   device.set_device();
   device.init_device_context();

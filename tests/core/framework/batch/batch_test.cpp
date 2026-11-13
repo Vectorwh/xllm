@@ -2190,6 +2190,25 @@ TEST(BatchTest, ForwardInputPreservesTransferInfoAndBatchId) {
   EXPECT_EQ(input.input_params.meta.batch_id, batch_id);
 }
 
+TEST(BatchTest, ForwardInputConversionKeepsJsonObjectErrors) {
+  // The prechannel restores on a local copy and the recursion converts the
+  // input through to(); a restore failure must survive that conversion or
+  // the row only denies (all-deny mask) without ever failing the request.
+  // (The SHM input serialization deliberately carries no errors: they are
+  // produced at the worker after arrival, and the output direction has its
+  // own proto round trip.)
+  ForwardInput input;
+  input.json_object_errors = {
+      {"req-conv#0", "constraint could not be restored"}};
+  input.json_object_state_snapshots.resize(1);
+  const ForwardInput converted =
+      input.to(torch::Device(torch::kCPU), torch::kFloat32);
+  ASSERT_EQ(converted.json_object_errors.size(), 1u);
+  EXPECT_EQ(converted.json_object_errors[0].sample_sequence_id, "req-conv#0");
+  EXPECT_EQ(converted.json_object_errors[0].message,
+            "constraint could not be restored");
+}
+
 TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   const uint64_t batch_id = 43;
   BlockManager::Options options;

@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/constraint/builtin_json_machine.h"
+#include "core/framework/constraint/xgrammar_machine.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -260,15 +261,29 @@ Sequence::Sequence(size_t index,
       sequence_params_.constraint_machine != nullptr
           ? sequence_params_.constraint_machine
           : wrap_builtin_machine(sequence_params_.json_object_grammar);
-  if (constraint_machine_ != nullptr) {
+  if (constraint_machine_ != nullptr &&
+      dynamic_cast<const BuiltinJsonConstraintMachine*>(
+          constraint_machine_.get()) != nullptr) {
+    // Only the builtin machine produces a JsonObjectGrammarState payload; the
+    // xgrammar machine's state lives in xgrammar_state_ below, and asking it
+    // for a JsonObjectGrammarState would trip the payload-type CHECK.
     json_object_state_ =
         constraint_machine_
             ->initial_state(sequence_params_.json_reasoning_enabled)
             .shared<JsonObjectGrammarState>();
   }
   if (sequence_params_.xgrammar_constraint != nullptr) {
+    // Pass the machine's cached grammar id so constructing the per-sequence
+    // matcher does not re-serialize the grammar on every new sequence. Use
+    // the interface, not a dynamic_cast (whose typeinfo is absent in
+    // non-XGrammar builds). The machine must exist: the factory CHECKs that
+    // a compiled xgrammar constraint always comes with one, so a null here
+    // is a wiring error that must fail loudly, not dereference.
+    CHECK(constraint_machine_ != nullptr)
+        << "an xgrammar constraint requires its state machine";
     xgrammar_state_ =
-        std::make_unique<XGrammarState>(*sequence_params_.xgrammar_constraint);
+        std::make_unique<XGrammarState>(*sequence_params_.xgrammar_constraint,
+                                        constraint_machine_->grammar_id());
   }
   if (is_onerec_model()) {
     init_onerec_sequence(prompt_token_ids, std::move(input_embedding));
@@ -600,6 +615,21 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   const int32_t token_id = static_cast<int32_t>(token.id);
   if (!try_commit_json_object_token(token_id,
                                     static_cast<int64_t>(token_offset))) {
+    return;
+  }
+  // Mirror the json commit on the xgrammar matcher: the worker advances only
+  // its forked copy, so the live matcher must be advanced here exactly once
+  // (symmetric with append_token's xgrammar accept_token).
+  if (xgrammar_state_ != nullptr && token_id >= 0 &&
+      !xgrammar_state_->accept_token(token_id)) {
+    LOG(ERROR) << "XGrammar overlap commit failed: request_id=" << request_id()
+               << ", sequence_index=" << index_
+               << ", token_offset=" << token_offset
+               << ", token_id=" << token_id;
+    fail(Status(
+        StatusCode::UNKNOWN,
+        "accepted overlap token violates XGrammar constraint, token_id=" +
+            std::to_string(token_id)));
     return;
   }
   // check if the token is the first token

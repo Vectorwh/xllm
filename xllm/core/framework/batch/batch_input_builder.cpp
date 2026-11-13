@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/constraint/builtin_json_machine.h"
+#include "core/framework/constraint/output_rows.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -727,12 +728,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.sampling_params.insert(state_.sampling_params.end(),
                                   state.sampling_params.begin(),
                                   state.sampling_params.end());
-    if (enable_xgrammar_output_) {
-      state_.xgrammar_states.insert(state_.xgrammar_states.end(),
-                                    state.xgrammar_states.begin(),
-                                    state.xgrammar_states.end());
-    }
-    if (enable_json_object_output_) {
+    if (enable_json_object_output_ || enable_xgrammar_output_) {
       state_.json_object_states.insert(state_.json_object_states.end(),
                                        state.json_object_states.begin(),
                                        state.json_object_states.end());
@@ -1137,10 +1133,7 @@ void BatchInputBuilder::handle_sampling_parameters(Sequence* sequence,
   state.selected_token_idxes.push_back(
       static_cast<int32_t>(state.flatten_tokens_vec.size() - 1));
   state.sampling_params.push_back(sequence->sampling_param());
-  if (enable_xgrammar_output_) {
-    state.xgrammar_states.emplace_back(sequence->xgrammar_state());
-  }
-  if (enable_json_object_output_) {
+  if (enable_json_object_output_ || enable_xgrammar_output_) {
     state.json_object_states.push_back(sequence->json_constraint_state());
     state.sample_sequence_ids.emplace_back(sequence->sample_sequence_id());
     const int32_t sampled_input_token = state.flatten_tokens_vec.back();
@@ -1558,12 +1551,7 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
                                        state_.unique_token_ids_vec,
                                        state_.unique_token_counts_vec,
                                        state_.unique_token_lens_vec);
-    if (enable_xgrammar_output_) {
-      forward_input.sampling_params.filter_bitmask =
-          build_xgrammar_filter_bitmask(state_.xgrammar_states);
-    }
-    if (forward_input.sampling_params.filter_bitmask.defined() ||
-        !enable_json_object_output_) {
+    if (!enable_json_object_output_ && !enable_xgrammar_output_) {
       return forward_input;
     }
     forward_input.json_object_states = std::move(state_.json_object_states);
@@ -1600,18 +1588,47 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
         forward_input.json_object_states.end(),
         [](const ConstraintState& state) { return state.initialized(); });
     if (has_json_object_state) {
+      std::vector<size_t> width_denied_rows;
       install_filter_bitmask(forward_input.sampling_params,
-                             forward_input.json_object_states);
+                             forward_input.json_object_states,
+                             /*device=*/torch::kCPU,
+                             JsonObjectMaskBuildPhase::NORMAL,
+                             &width_denied_rows);
+      // A width-denied row must fail its request explicitly: the all-deny
+      // mask alone would only halt it, and the output-time check needs the
+      // error entry to know the row failed.
+      for (const size_t row : width_denied_rows) {
+        forward_input.json_object_errors.emplace_back(JsonObjectOutputError{
+            row < sample_sequence_ids.size()
+                ? sample_sequence_ids[row]
+                : "<row " + std::to_string(row) + ">",
+            "constraint vocabulary width does not match the batch"});
+      }
       forward_input.sample_sequence_ids = std::move(sample_sequence_ids);
       forward_input.sample_prior_output_rows =
           std::move(sample_prior_output_rows);
       forward_input.json_object_state_snapshots.reserve(
           forward_input.json_object_states.size());
       for (const auto& json_state : forward_input.json_object_states) {
-        forward_input.json_object_state_snapshots.push_back(
-            json_state.initialized()
-                ? to_grammar_snapshot(json_state.snapshot())
-                : JsonObjectGrammarSnapshot());
+        // Builtin rows serialize their matcher snapshot; other backends
+        // ride the live channel until their spec transport lands (G9).
+        // supports_spec_snapshot() is the same predicate the worker uses to
+        // tell the two apart; the snapshot format is
+        // JsonObjectGrammarSnapshot, so a backend advertising support must
+        // produce that payload.
+        JsonObjectGrammarSnapshot entry;
+        if (json_state.initialized() &&
+            json_state.machine()->supports_spec_snapshot()) {
+          entry = to_grammar_snapshot(json_state.snapshot());
+        } else if (json_state.initialized()) {
+          // A non-builtin row keeps its live constraint on the live channel.
+          // Mark the empty entry so a cross-process arrival (which has no
+          // live state to keep) refuses on the worker instead of silently
+          // decoding the row unconstrained; intra-process arrivals preserve
+          // the live state.
+          entry.constrained_without_snapshot = true;
+        }
+        forward_input.json_object_state_snapshots.push_back(std::move(entry));
       }
     } else {
       forward_input.json_object_states.clear();

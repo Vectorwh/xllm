@@ -41,7 +41,7 @@ std::shared_ptr<XGrammarConstraintMachine> make_machine() {
     ADD_FAILURE() << error;
     return nullptr;
   }
-  return std::make_shared<XGrammarConstraintMachine>(grammar);
+  return wrap_xgrammar_machine(grammar);
 }
 
 TEST(XGrammarMachineTest, InitialStateAcceptsRegexPrefix) {
@@ -53,6 +53,27 @@ TEST(XGrammarMachineTest, InitialStateAcceptsRegexPrefix) {
   EXPECT_FALSE(machine->is_complete(state));
   EXPECT_TRUE(machine->can_accept(state, 0));   // "A"
   EXPECT_FALSE(machine->can_accept(state, 4));  // "x"
+}
+
+TEST(XGrammarMachineTest, StopTokenIsAcceptedOnlyAtATerminalState) {
+  // Stop handling lives in the tokenizer layer (this compiler is built with
+  // kStopTokenId as a terminator), not in the commit paths: neither
+  // append_token nor the overlap commit special-cases stops, they both ask the
+  // matcher. Pin that decision here - a mid-pattern stop is a grammar
+  // violation (the request should fail), while the stop at a fully matched
+  // pattern is legitimate and must be accepted.
+  std::shared_ptr<XGrammarConstraintMachine> machine = make_machine();
+  ASSERT_NE(machine, nullptr);
+
+  ConstraintState mid = machine->initial_state(false);
+  ASSERT_TRUE(machine->advance(mid, /*A=*/0, HaltPolicy::RESPECT));
+  EXPECT_FALSE(machine->advance(mid, kStopTokenId, HaltPolicy::RESPECT));
+
+  ConstraintState matched = machine->initial_state(false);
+  for (const int32_t token : {0, 0, 2, 3, 3, 3, 3}) {  // matches "AA-1111"
+    ASSERT_TRUE(machine->advance(matched, token, HaltPolicy::RESPECT));
+  }
+  EXPECT_TRUE(machine->advance(matched, kStopTokenId, HaltPolicy::RESPECT));
 }
 
 TEST(XGrammarMachineTest, AdvanceCommitsTokensAndDetectsCompletion) {
@@ -88,6 +109,34 @@ TEST(XGrammarMachineTest, HaltRespectFreezesOnFirstRejection) {
   EXPECT_FALSE(machine->advance(verify, 4, HaltPolicy::IGNORE));
   EXPECT_TRUE(machine->is_valid(verify));
   EXPECT_TRUE(machine->advance(verify, 0, HaltPolicy::IGNORE));
+}
+
+TEST(XGrammarMachineTest, ForkedViewDoesNotAdvanceTheSequenceOwnedMatcher) {
+  // After the overlap contract was unified to fork, the channel view is an
+  // independent copy: advancing it must NOT touch the sequence-owned matcher
+  // (the scheduler advances that via update_last_step_token's accept_token).
+  auto compiler = std::make_unique<XGrammarCompiler>(
+      std::vector<std::string>{"A", "B", "-", "1", "x", "", "{", "}"},
+      /*model_vocab_size=*/32,
+      std::vector<int32_t>{kStopTokenId},
+      /*cache_max_memory_bytes=*/0);
+  std::string error;
+  auto grammar = compiler->compile_regex("[A-Z]{2}-[0-9]{4}", error);
+  ASSERT_NE(grammar, nullptr) << error;
+  auto machine = wrap_xgrammar_machine(grammar);
+  ASSERT_NE(machine, nullptr);
+  // The sequence owns the matcher (unique_ptr), exactly like Sequence.
+  auto owned = std::make_unique<XGrammarState>(*grammar);
+  ConstraintState view(std::shared_ptr<XGrammarState>(
+                           std::shared_ptr<XGrammarState>(), owned.get()),
+                       machine);
+  ConstraintState forked = view.fork();
+  const uint64_t before = owned->fingerprint();
+  ASSERT_TRUE(machine->advance(forked, 0, HaltPolicy::IGNORE));
+  // The forked copy advanced, but the sequence-owned matcher is untouched:
+  // its fingerprint is unchanged and it holds no accepted tokens.
+  EXPECT_EQ(owned->fingerprint(), before);
+  EXPECT_TRUE(owned->accepted_tokens().empty());
 }
 
 TEST(XGrammarMachineTest, ForkDivergesIndependentlyFromSource) {

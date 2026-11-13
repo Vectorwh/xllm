@@ -1399,7 +1399,6 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
   std::vector<int32_t> dp_global_kv_max_seq_lens(dp_size_);
-  std::vector<int32_t> dp_global_json_object_active(dp_size_, 0);
   std::vector<int32_t> dp_is_decode(dp_size_, 0);
   // when enable dp, we need to check the forward type of each batch
   // and set the empty forward type of each batch to the same value as the first
@@ -1424,10 +1423,6 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
     // BatchInputBuilder returns materialized states/snapshots; packing happens
     // at dispatch. Never infer plain traffic from a lazily packed input.
     CHECK(!batched_inputs[dp_rank].input_host_buffer_has_layout);
-    const bool shard_has_json_object =
-        !batched_inputs[dp_rank].json_object_states.empty() ||
-        !batched_inputs[dp_rank].json_object_state_snapshots.empty();
-    dp_global_json_object_active[dp_rank] = shard_has_json_object ? 1 : 0;
     if (util::is_deepseek_v4_model_type(args_.model_type())) {
       const int64_t actual_scheduled_tokens = static_cast<int64_t>(
           batched_inputs[dp_rank].host_token_ids().numel());
@@ -1523,8 +1518,6 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         dp_batch_generations_;
     batched_inputs[dp_rank].input_params.parallel.dp_global_kv_max_seq_lens =
         dp_global_kv_max_seq_lens;
-    batched_inputs[dp_rank].input_params.parallel.dp_global_json_object_active =
-        dp_global_json_object_active;
     batched_inputs[dp_rank].input_params.parallel.dp_is_decode = dp_is_decode;
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       batched_inputs[dp_rank].input_params.expert.eplb_info = eplb_info;

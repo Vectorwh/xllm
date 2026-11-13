@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <absl/strings/str_join.h>
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -54,6 +55,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/constraint/xgrammar_support.h"
 #include "core/framework/lora/lora_config.h"
 #include "core/framework/lora/lora_runtime.h"
 #include "core/framework/model/model_args.h"
@@ -448,18 +450,26 @@ void validate_config(const std::string& model_type) {
           DeviceNameUtils::parse_devices("auto").size() == 1)
         << "XGrammar requires one visible NPU, nnodes=1, node_rank=0, "
            "dp_size=1, cp_size=1 and tp_size<=1";
-    CHECK(!execution_config.enable_graph() &&
-          !execution_config.enable_prefill_piecewise_graph() &&
-          !scheduler_config.enable_schedule_overlap() &&
-          !scheduler_config.enable_chunked_prefill() &&
-          speculative_config.num_speculative_tokens() == 0 &&
-          !disagg_pd_config.enable_disagg_pd() &&
-          !distributed_config.enable_service_routing() &&
-          !kv_cache_config.enable_prefix_cache())
-        << "XGrammar requires graph, prefill_piecewise_graph, "
-           "schedule_overlap, "
-           "chunked_prefill, speculative decoding, disagg_pd, service_routing "
-           "and prefix_cache to be disabled";
+    XGrammarSupportInputs support_inputs;
+    support_inputs.enable_graph = execution_config.enable_graph();
+    support_inputs.enable_prefill_piecewise_graph =
+        execution_config.enable_prefill_piecewise_graph();
+    support_inputs.num_speculative_tokens =
+        speculative_config.num_speculative_tokens();
+    support_inputs.speculative_algorithm =
+        speculative_config.speculative_algorithm();
+    support_inputs.enable_disagg_pd = disagg_pd_config.enable_disagg_pd();
+    support_inputs.enable_service_routing =
+        distributed_config.enable_service_routing();
+    support_inputs.enable_prefix_cache = kv_cache_config.enable_prefix_cache();
+    const std::vector<std::string> unsupported =
+        xgrammar_unsupported_features(support_inputs);
+    // Speculative decoding and schedule overlap are supported since the
+    // constraint state-machine migration; the rest stay gated until verified.
+    CHECK(unsupported.empty())
+        << "XGrammar does not yet support these enabled features: "
+        << absl::StrJoin(unsupported, ", ")
+        << "; disable them or use structured_output_backend=builtin";
 #endif
   }
 

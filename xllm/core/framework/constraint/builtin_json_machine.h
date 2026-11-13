@@ -102,6 +102,7 @@ class BuiltinJsonConstraintMachine final
   static const JsonObjectGrammarState& cast(const ConstraintState& state);
   static JsonObjectGrammarState& cast(ConstraintState& state);
 
+  // The builtin grammar, for the cached-mask fast path in the batch builder.
   std::shared_ptr<const JsonObjectGrammar> grammar_;
 };
 

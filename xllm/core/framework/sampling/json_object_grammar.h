@@ -27,7 +27,13 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
-#include "core/framework/constraint/state_machine.h"
+// The batch mask builders below operate on type-erased constraint states;
+// only a forward declaration is needed here (the constraint layer owns the
+// definition, and depending on its header from sampling would invert the
+// target dependency direction constraint -> sampling).
+namespace xllm {
+class ConstraintState;
+}
 #include "core/framework/tokenizer/tokenizer.h"
 
 namespace xllm {
@@ -45,6 +51,12 @@ struct SamplingParameters;
 struct JsonObjectGrammarSnapshot final {
   bool enabled = false;
   bool reasoning_enabled = false;
+  // Set by the batch builder for a row whose backend has a live constraint
+  // but no serializable snapshot yet (xgrammar until the backend-neutral
+  // transport lands): intra-process arrivals keep the live-channel state,
+  // while a cross-process arrival of this entry has no live state to keep
+  // and must refuse instead of silently decoding the row unconstrained.
+  bool constrained_without_snapshot = false;
   std::vector<int32_t> token_ids;
   // Frozen (halted) states round-trip their invalid flag so a RESPECT
   // freeze survives snapshot/restore instead of replaying back to valid.
@@ -250,7 +262,12 @@ class JsonObjectGrammar final {
 torch::Tensor build_filter_bitmask(
     const std::vector<ConstraintState>& states,
     const torch::Device& device = torch::kCPU,
-    JsonObjectMaskBuildPhase phase = JsonObjectMaskBuildPhase::NORMAL);
+    JsonObjectMaskBuildPhase phase = JsonObjectMaskBuildPhase::NORMAL,
+    // Rows denied because their machine's vocabulary width does not match
+    // the batch width. Callers with sequence ids turn each index into a
+    // request-level error so the row fails explicitly instead of only
+    // halting through the all-deny mask.
+    std::vector<size_t>* width_denied_rows = nullptr);
 
 // Installs the packed bitmask built from `states` on `sampling_params` and
 // clears the dense float mask: the sampler prefers the compact bitmask, and
@@ -259,7 +276,8 @@ void install_filter_bitmask(
     SamplingParameters& sampling_params,
     const std::vector<ConstraintState>& states,
     const torch::Device& device = torch::kCPU,
-    JsonObjectMaskBuildPhase phase = JsonObjectMaskBuildPhase::NORMAL);
+    JsonObjectMaskBuildPhase phase = JsonObjectMaskBuildPhase::NORMAL,
+    std::vector<size_t>* width_denied_rows = nullptr);
 
 // Apply a [batch, ceil(vocab/32)] int32 bitmask in-place on logits [batch,
 // vocab].

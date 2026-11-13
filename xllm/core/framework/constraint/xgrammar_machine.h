@@ -32,7 +32,9 @@ class XGrammarConstraintMachine final
     : public ConstraintStateMachine,
       public std::enable_shared_from_this<XGrammarConstraintMachine> {
  public:
-  explicit XGrammarConstraintMachine(
+  // Construct through wrap_xgrammar_machine only: states embed the machine
+  // via shared_from_this, so a stack or directly-owned instance is unusable.
+  friend std::shared_ptr<XGrammarConstraintMachine> wrap_xgrammar_machine(
       std::shared_ptr<const CompiledXGrammar> grammar);
 
   ConstraintState initial_state(bool reasoning_phase) const override;
@@ -58,14 +60,44 @@ class XGrammarConstraintMachine final
   std::string error_detail(const ConstraintState& state) const override;
 
   // Vocabulary row width from the compiled grammar's tokenizer info.
+  bool fill_allowed_bitmask(const ConstraintState& state,
+                            int32_t* row,
+                            size_t num_words) const override;
   size_t bitmask_num_words() const override;
 
+  // Cached grammar identity, so Sequence can construct its XGrammarState with
+  // the precomputed id instead of re-serializing the grammar per sequence.
+  uint64_t grammar_id() const override { return grammar_id_; }
+
  private:
+  explicit XGrammarConstraintMachine(
+      std::shared_ptr<const CompiledXGrammar> grammar);
+
   static const XGrammarState& cast(const ConstraintState& state);
   static XGrammarState& cast(ConstraintState& state);
 
   std::shared_ptr<const CompiledXGrammar> grammar_;
   uint64_t grammar_id_ = 0;
 };
+
+#if defined(USE_XGRAMMAR)
+inline std::shared_ptr<XGrammarConstraintMachine> wrap_xgrammar_machine(
+    std::shared_ptr<const CompiledXGrammar> grammar) {
+  if (grammar == nullptr) {
+    return nullptr;
+  }
+  // Plain new: make_shared's internal construction is not covered by the
+  // friend declaration guarding the private constructor.
+  return std::shared_ptr<XGrammarConstraintMachine>(
+      new XGrammarConstraintMachine(std::move(grammar)));
+}
+#else
+// The adapter sources build only under USE_XGRAMMAR; the null wrap keeps
+// always-compiled callers linkable.
+inline std::shared_ptr<XGrammarConstraintMachine> wrap_xgrammar_machine(
+    std::shared_ptr<const CompiledXGrammar> grammar) {
+  return nullptr;
+}
+#endif
 
 }  // namespace xllm

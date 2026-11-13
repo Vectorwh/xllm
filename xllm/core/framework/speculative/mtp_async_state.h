@@ -91,17 +91,6 @@ bool supports_python_dsv32_continuous_draft_configuration(
     int32_t target_index_topk,
     int32_t draft_index_topk);
 
-// Whether structured-output constraints permit the MTP first-draft prelaunch
-// window: constrained rows cannot rebuild their accounting in step_decode(),
-// and the decision must be DP-rank-consistent. dp_size==1 lets the rank-local
-// flag decide; dp_size>1 requires complete, all-zero replicated flags (json
-// states only today — xgrammar masks are future work, startup-gated). Missing
-// or malformed metadata is ineligible.
-bool json_object_allows_draft_prelaunch(
-    int32_t dp_size,
-    const std::vector<int32_t>& dp_global_json_object_active,
-    bool has_local_constraints);
-
 // Materialize proposer-owned token columns into the row-major target verify
 // input. Graph replay normally performs this copy internally; eager fallback
 // must use the same logical tokens before invoking the model.

@@ -165,7 +165,7 @@ std::vector<uint32_t> XGrammarState::allowed_bitmask() const {
   std::vector<int32_t> words(num_words, 0);
   // A false return means an unconstrained step (all tokens allowed); the
   // zero-initialized buffer would otherwise read as all-deny.
-  if (!const_cast<XGrammarState*>(this)->fill_next_token_bitmask(words)) {
+  if (!fill_next_token_bitmask(words)) {
     return std::vector<uint32_t>(num_words, ~uint32_t{0});
   }
   return std::vector<uint32_t>(words.begin(), words.end());
@@ -187,7 +187,25 @@ uint64_t XGrammarState::fingerprint() const {
   return hash;
 }
 
-bool XGrammarState::fill_next_token_bitmask(std::span<int32_t> words) {
+bool XGrammarState::fill_allowed_bitmask_row(int32_t* row,
+                                             size_t num_words) const {
+  if (row == nullptr || num_words == 0) {
+    return false;
+  }
+  if (!is_valid()) {
+    // A frozen matcher rejects everything; the caller needs no fill call.
+    std::fill_n(row, num_words, 0);
+    return true;
+  }
+  // A false return means an unconstrained step (all tokens allowed); the row
+  // must not keep whatever the caller had there.
+  if (!fill_next_token_bitmask(std::span<int32_t>(row, num_words))) {
+    std::fill_n(row, num_words, -1);
+  }
+  return true;
+}
+
+bool XGrammarState::fill_next_token_bitmask(std::span<int32_t> words) const {
   int64_t num_words = static_cast<int64_t>(words.size());
   DLTensor bitmask{};
   bitmask.data = words.data();
@@ -226,8 +244,11 @@ uint64_t XGrammarState::fingerprint() const { return 0; }
 bool XGrammarState::accept_token(int32_t) { return false; }
 bool XGrammarState::can_accept(int32_t) { return false; }
 bool XGrammarState::is_completed() const { return false; }
-bool XGrammarState::fill_next_token_bitmask(std::span<int32_t>) {
+bool XGrammarState::fill_next_token_bitmask(std::span<int32_t>) const {
   LOG(FATAL) << "Cannot construct a bitmask without XGrammar support";
+}
+bool XGrammarState::fill_allowed_bitmask_row(int32_t*, size_t) const {
+  LOG(FATAL) << "Cannot fill a bitmask without XGrammar support";
 }
 std::vector<uint32_t> XGrammarState::allowed_bitmask() const {
   LOG(FATAL) << "Cannot produce a bitmask without XGrammar support";
@@ -236,39 +257,5 @@ std::vector<uint32_t> XGrammarState::allowed_bitmask() const {
 
 XGrammarCompiler::~XGrammarCompiler() = default;
 XGrammarState::~XGrammarState() = default;
-
-torch::Tensor build_xgrammar_filter_bitmask(
-    std::span<XGrammarState* const> states) {
-  const auto first = std::find_if(
-      states.begin(), states.end(), [](const XGrammarState* state) {
-        return state != nullptr;
-      });
-  if (first == states.end()) {
-    return {};
-  }
-  const int64_t vocab_size = (*first)->vocab_size();
-  const int64_t num_words = (vocab_size + 31) / 32;
-  torch::Tensor bitmask = torch::empty(
-      {static_cast<int64_t>(states.size()), num_words},
-      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-  int32_t* data = bitmask.data_ptr<int32_t>();
-  for (size_t row = 0; row < states.size(); ++row) {
-    int32_t* row_data = data + row * static_cast<size_t>(num_words);
-    if (states[row] == nullptr) {
-      std::fill_n(row_data, num_words, -1);
-      continue;
-    }
-    CHECK_EQ(states[row]->vocab_size(), vocab_size)
-        << "mixed XGrammar vocabularies in one batch";
-    if (!states[row]->fill_next_token_bitmask(
-            {row_data, static_cast<size_t>(num_words)})) {
-      // A false fill means an unconstrained step (every token allowed) and
-      // leaves the buffer untouched; the torch::empty row would otherwise
-      // read as uninitialized garbage. Fill all-allow.
-      std::fill_n(row_data, num_words, -1);
-    }
-  }
-  return bitmask;
-}
 
 }  // namespace xllm

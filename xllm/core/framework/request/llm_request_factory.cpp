@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/constraint/builtin_json_machine.h"
+#include "core/framework/constraint/xgrammar_machine.h"
 #include "framework/request/request_state.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -536,6 +537,19 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   req_state.xgrammar_constraint = std::move(xgrammar_constraint);
+  if (req_state.constraint_machine == nullptr) {
+    req_state.constraint_machine =
+        wrap_xgrammar_machine(req_state.xgrammar_constraint);
+    // A compiled xgrammar constraint without its machine means the build
+    // lacks USE_XGRAMMAR support; Sequence would dereference the null
+    // machine on its first grammar_id() read. Unreachable through
+    // compile_response_format today (it rejects non-JSON formats when the
+    // backend is off), but the invariant is cheaper to enforce here than
+    // to debug at the dereference site.
+    CHECK(req_state.xgrammar_constraint == nullptr ||
+          req_state.constraint_machine != nullptr)
+        << "an xgrammar constraint requires a build with USE_XGRAMMAR";
+  }
   req_state.sample_slots = sp.sample_slots;
   req_state.timing = sp.timing;
   if (sp.adapter_id.has_value()) {

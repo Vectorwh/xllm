@@ -50,6 +50,11 @@ class ConstraintStateMachine {
   virtual ConstraintState initial_state(bool reasoning_phase) const = 0;
   virtual ConstraintState restore(const ConstraintSnapshot& snapshot) const = 0;
 
+  // Cached grammar identity for backends that precompute it; 0 means "not
+  // cached". Sequence passes it to XGrammarState construction so a new
+  // sequence does not re-serialize the compiled grammar.
+  virtual uint64_t grammar_id() const { return 0; }
+
   virtual bool can_accept(const ConstraintState& state,
                           int32_t token_id) const = 0;
   virtual bool is_valid(const ConstraintState& state) const = 0;
@@ -87,6 +92,19 @@ class ConstraintStateMachine {
       const ConstraintState& state) const {
     return nullptr;
   }
+  // Fill a caller-owned row (`num_words` int32 words) with the packed allowed
+  // mask for `state`, writing into the destination instead of returning a
+  // vector. Backends that must compute the mask per step (xgrammar) use this to
+  // skip a heap allocation and a full-row copy on the batched mask hot path;
+  // builtin keeps using shared_allowed_bitmask() (zero-copy cache read).
+  // Returns false when the backend cannot fill in place, and callers fall back
+  // to allowed_bitmask(). A frozen state fills all-deny, an unconstrained step
+  // fills all-allow.
+  virtual bool fill_allowed_bitmask(const ConstraintState& state,
+                                    int32_t* row,
+                                    size_t num_words) const {
+    return false;
+  }
   // Packed-mask row width in 32-bit words for this machine's vocabulary. This
   // is matcher metadata and must not depend on the state's validity, so the
   // batch builder can size an all-deny mask even when every row is invalid.
@@ -118,13 +136,25 @@ class ConstraintState final {
       : payload_(std::move(payload)),
         machine_(std::move(machine)),
         payload_type_(payload_ ? std::type_index(typeid(T))
-                               : std::type_index(typeid(void))) {}
+                               : std::type_index(typeid(void))) {
+    // Enforce the invariant the channels rely on: an empty payload is the
+    // unconstrained state, while a real payload always carries the machine
+    // that knows how to operate on it. Callers dereference machine() for any
+    // initialized() row (batch mask assembly, restore decisions), so a
+    // payload without a machine must fail here rather than at a random use.
+    CHECK(payload_ == nullptr || machine_ != nullptr)
+        << "a constraint state payload requires its state machine";
+  }
 
   explicit operator bool() const { return payload_ != nullptr; }
 
   const ConstraintStateMachine* machine() const { return machine_.get(); }
 
   // Interface shortcuts; require a non-empty state.
+  //
+  // Initialized implies machine() != nullptr: the constructor rejects a
+  // payload without its machine, so callers may dereference machine() for any
+  // row that passes this check.
   bool initialized() const { return payload_ != nullptr; }
   bool is_valid() const {
     CHECK(initialized());

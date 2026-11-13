@@ -387,21 +387,35 @@ class Sequence final {
   }
 
   // Machine-backed state for the constraint channels; empty when
-  // unconstrained or when no machine is attached.
+  // unconstrained or when no machine is attached. The xgrammar state is a
+  // non-owning view: the sequence keeps owning the matcher.
   ConstraintState json_constraint_state() const {
-    if (json_object_state_ == nullptr || constraint_machine_ == nullptr) {
+    if (constraint_machine_ == nullptr) {
       return ConstraintState();
     }
-    // Fork an independent copy for the channel: the worker advances the copy
-    // while the scheduler commits the live state exactly once. Returning the
-    // shared payload would double-advance it under schedule overlap (worker
-    // advance + scheduler try_commit on the same token) and race the
-    // non-atomic matcher between the two threads.
-    ConstraintState live(json_object_state_, constraint_machine_);
-    return live.fork();
+    if (xgrammar_state_ != nullptr) {
+      // Fork an independent copy for the channel, matching the builtin branch:
+      // the worker advances the copy while the scheduler commits the live
+      // matcher via update_last_step_token's accept_token. A non-owning
+      // aliasing view would be advanced by both threads (a data race) and
+      // would dangle if the sequence is released before the worker drains it.
+      ConstraintState live(
+          std::shared_ptr<XGrammarState>(std::shared_ptr<XGrammarState>(),
+                                         xgrammar_state_.get()),
+          constraint_machine_);
+      return live.fork();
+    }
+    if (json_object_state_ != nullptr) {
+      // Fork an independent copy for the channel: the worker advances the copy
+      // while the scheduler commits the live state exactly once. Returning the
+      // shared payload would double-advance it under schedule overlap (worker
+      // advance + scheduler try_commit on the same token) and race the
+      // non-atomic matcher between the two threads.
+      ConstraintState live(json_object_state_, constraint_machine_);
+      return live.fork();
+    }
+    return ConstraintState();
   }
-
-  XGrammarState* xgrammar_state() const { return xgrammar_state_.get(); }
 
   // get the stopping criteria
   const StoppingChecker* stopping_checker() const {

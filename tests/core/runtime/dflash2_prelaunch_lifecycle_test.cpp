@@ -594,11 +594,23 @@ TEST(DFlash2StepLocalLifecycleTest, PendingRowsFollowTheActualBatch) {
   current.sample_sequence_ids[0] = "replacement-sequence";
   EXPECT_TRUE(DFlash2WorkerImplTestPeer::pending_rows(worker, current).empty());
   current.sample_sequence_ids[0] = "sequence-2";
+  // Constraint rows stage normally now: the draft query samples with the
+  // cleared mask (make_draft_sampling_params) and the verify rows are rebuilt
+  // from the fresh states, so a snapshot row and the sequence-level filter
+  // bitmask no longer disqualify prelaunch.
   current.json_object_state_snapshots.emplace_back();
-  EXPECT_FALSE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
+  EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
   EXPECT_TRUE(DFlash2WorkerImplTestPeer::async_output_enabled(worker));
+  current.sampling_params.filter_bitmask =
+      torch::tensor({{4, 4}}, torch::kInt32);
+  EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
+  current.sampling_params.filter_bitmask = torch::Tensor();
   current.json_object_state_snapshots.clear();
   EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
+  // A real disqualifier still disqualifies: pending block copies are not
+  // capturable ahead of the target step.
+  current.input_params.block_copy.swap_blocks.emplace_back(0, 1);
+  EXPECT_FALSE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
 }
 
 TEST(DFlash2PrelaunchLifecycleTest,

@@ -21,6 +21,7 @@ limitations under the License.
 #include <cstring>
 
 #include "core/common/metrics.h"
+#include "core/framework/constraint/state_machine.h"
 #include "core/framework/sampling/fnv1a.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/util/slice.h"
@@ -59,14 +60,10 @@ void record_mask_build_metrics(JsonObjectMaskBuildPhase phase,
   }
 }
 
-uint64_t hash_byte(uint64_t hash, uint8_t value) {
-  return fnv1a_byte(hash, value);
-}
-
 uint64_t hash_uint64(uint64_t hash, uint64_t value) {
   for (int32_t byte_index = 0; byte_index < 8; ++byte_index) {
     const int32_t shift = byte_index * 8;
-    hash = hash_byte(
+    hash = fnv1a_byte(
         hash,
         static_cast<uint8_t>((value >> shift) & static_cast<uint64_t>(0xFF)));
   }
@@ -222,7 +219,7 @@ uint64_t JsonObjectGrammarState::fingerprint() const {
   hash = hash_uint64(hash, static_cast<uint64_t>(literal_index_));
   hash = hash_uint64(hash, static_cast<uint64_t>(literal_target_.size()));
   for (const unsigned char character : literal_target_) {
-    hash = hash_byte(hash, character);
+    hash = fnv1a_byte(hash, character);
   }
   hash = hash_uint64(hash, static_cast<uint64_t>(containers_.size()));
   for (const ContainerFrame& frame : containers_) {
@@ -915,58 +912,95 @@ torch::Tensor JsonObjectGrammar::build_filter_bitmask(
 
 torch::Tensor build_filter_bitmask(const std::vector<ConstraintState>& states,
                                    const torch::Device& device,
-                                   JsonObjectMaskBuildPhase phase) {
+                                   JsonObjectMaskBuildPhase phase,
+                                   std::vector<size_t>* width_denied_rows) {
   if (states.empty()) {
     return torch::Tensor();
   }
 
-  // Drive the batch through the machine interface: one machine per compiled
-  // spec, so machine identity replaces the vocabulary comparison and
-  // shared_allowed_bitmask hands out the zero-copy cached mask without a
-  // per-row deep copy or a cast to the concrete payload.
-  const ConstraintStateMachine* machine = nullptr;
+  // Backend-neutral row assembly: each row asks its own state machine for the
+  // allowed mask. The width comes from the first initialized row's machine
+  // (matcher metadata, validity-independent), so no probe fill is needed and
+  // an all-invalid batch still produces the all-deny mask instead of an empty
+  // (unconstrained) one.
+  size_t num_words = 0;
   for (const auto& state : states) {
     if (state.initialized()) {
-      machine = state.machine();
+      num_words = state.machine()->bitmask_num_words();
       break;
     }
   }
-  if (machine == nullptr) {
+  if (num_words == 0) {
     return torch::Tensor();
   }
 
   Timer batch_timer;
   int64_t constrained_rows = 0;
-  const int64_t num_words = static_cast<int64_t>(machine->bitmask_num_words());
   torch::Tensor mask = torch::empty(
-      {static_cast<int64_t>(states.size()), num_words},
+      {static_cast<int64_t>(states.size()), static_cast<int64_t>(num_words)},
       torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
   int32_t* mask_data = mask.data_ptr<int32_t>();
-  const size_t row_bytes = static_cast<size_t>(num_words) * sizeof(int32_t);
+  const size_t row_bytes = num_words * sizeof(int32_t);
   for (size_t row = 0; row < states.size(); ++row) {
-    int32_t* row_data = mask_data + row * static_cast<size_t>(num_words);
+    int32_t* row_data = mask_data + row * num_words;
     if (!states[row].initialized()) {
       // Unconstrained row: all tokens allowed (matches float-mask zeros).
       std::fill_n(row_data, num_words, static_cast<int32_t>(-1));
       continue;
     }
     ++constrained_rows;
-    // Dispatch each row through its own state's machine: a batch may mix
-    // machine instances (and, with equal vocabularies, grammars), so the
-    // only batch-wide invariant is the row layout - every cached mask is
-    // exactly as wide as the batch mask, which also guards the memcpy.
-    if (states[row].is_valid()) {
-      const std::shared_ptr<const std::vector<uint32_t>> cached_mask =
-          states[row].machine()->shared_allowed_bitmask(states[row]);
-      CHECK(cached_mask != nullptr)
-          << "backend did not provide a shared cached bitmask";
-      CHECK_EQ(cached_mask->size(), static_cast<size_t>(num_words))
-          << "constraint row mask width differs from the batch mask";
-      std::memcpy(row_data, cached_mask->data(), row_bytes);
-    } else {
-      // Frozen row: deny everything.
+    if (!states[row].is_valid()) {
+      // Frozen row: deny everything. Its mask content does not depend on the
+      // vocabulary width, so a batch mixing an invalid row from a
+      // different-width grammar must not turn a halted request into an
+      // engine-level abort.
       std::fill_n(row_data, num_words, 0);
+      continue;
     }
+    // A batch is assembled at one width. A row built against a different
+    // vocabulary cannot be expressed in it, so deny it instead of copying
+    // across widths or aborting the engine: the sequence then halts through
+    // the all-deny mask and the batch keeps serving its other rows.
+    if (states[row].machine()->bitmask_num_words() != num_words) {
+      LOG(ERROR) << "JSON object mask width mismatch: row=" << row
+                 << ", row_words=" << states[row].machine()->bitmask_num_words()
+                 << ", batch_words=" << num_words
+                 << "; denying the row instead of assembling a mixed width";
+      if (width_denied_rows != nullptr) {
+        width_denied_rows->push_back(row);
+      }
+      std::fill_n(row_data, num_words, 0);
+      continue;
+    }
+    // Cached backends (builtin) hand out a zero-copy view; computing backends
+    // (xgrammar) fill the destination row in place, avoiding a per-row
+    // allocation plus a full-row copy on this per-step hot path.
+    const std::shared_ptr<const std::vector<uint32_t>> shared =
+        states[row].machine()->shared_allowed_bitmask(states[row]);
+    if (shared != nullptr) {
+      std::memcpy(row_data, shared->data(), row_bytes);
+      continue;
+    }
+    if (states[row].machine()->fill_allowed_bitmask(
+            states[row], row_data, num_words)) {
+      continue;
+    }
+    const std::vector<uint32_t> bitmask = states[row].allowed_bitmask();
+    if (bitmask.size() != num_words) {
+      // Same treatment as the metadata width mismatch above: deny the row
+      // and report it, instead of aborting the engine when a backend's
+      // fallback vector disagrees with its declared bitmask_num_words().
+      LOG(ERROR) << "JSON object mask width mismatch (fallback): row=" << row
+                 << ", row_words=" << bitmask.size()
+                 << ", batch_words=" << num_words
+                 << "; denying the row instead of assembling a mixed width";
+      if (width_denied_rows != nullptr) {
+        width_denied_rows->push_back(row);
+      }
+      std::fill_n(row_data, num_words, 0);
+      continue;
+    }
+    std::memcpy(row_data, bitmask.data(), row_bytes);
   }
   HISTOGRAM_OBSERVE(json_object_mask_batch_build_latency_microseconds,
                     static_cast<int64_t>(batch_timer.elapsed_microseconds()));
@@ -1038,8 +1072,10 @@ const std::string& JsonObjectGrammar::token_piece(int32_t token_id) const {
 void install_filter_bitmask(SamplingParameters& sampling_params,
                             const std::vector<ConstraintState>& states,
                             const torch::Device& device,
-                            JsonObjectMaskBuildPhase phase) {
-  sampling_params.filter_bitmask = build_filter_bitmask(states, device, phase);
+                            JsonObjectMaskBuildPhase phase,
+                            std::vector<size_t>* width_denied_rows) {
+  sampling_params.filter_bitmask =
+      build_filter_bitmask(states, device, phase, width_denied_rows);
   // Only clear the dense mask when a bitmask was actually installed: an
   // all-unconstrained batch keeps whatever dense mask another constraint
   // backend left behind.

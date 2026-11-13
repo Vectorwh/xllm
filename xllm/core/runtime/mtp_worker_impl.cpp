@@ -1657,6 +1657,11 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     // run_validate(). Host metadata is corrected below after the accepted-token
     // update; continuous DSA drafts use device correction, while target
     // verification still consumes the exact Host metadata.
+    // The prelaunched draft sampled under the grammar state as of the submit,
+    // which is one commit stale; the advancement bookkeeping below runs
+    // against this step's fresh states, so a stale first token is rejected
+    // and resampled by validation instead of corrupting the matcher.
+    current_draft_input.json_object_states = input.json_object_states;
   } else if (use_device_target_context) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
 
@@ -1989,9 +1994,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         break;
       }
       install_filter_bitmask(current_draft_input.sampling_params,
-                            current_draft_input.json_object_states,
-                            device_,
-                            JsonObjectMaskBuildPhase::DRAFT);
+                             current_draft_input.json_object_states,
+                             device_,
+                             JsonObjectMaskBuildPhase::DRAFT);
     }
     record_current_metadata_ready_event(current_draft_input, *compute_stream_);
   }
@@ -2044,9 +2049,9 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
         *json_scratch,
         validate_input.json_object_invalid_draft);
     install_filter_bitmask(validate_input.sampling_params,
-                          validate_input.json_object_states,
-                          device_,
-                          JsonObjectMaskBuildPhase::TARGET);
+                           validate_input.json_object_states,
+                           device_,
+                           JsonObjectMaskBuildPhase::TARGET);
   }
 
   validate_input.device_tensors_ready = false;
@@ -2887,32 +2892,12 @@ bool MTPWorkerImpl::can_prelaunch_next_first_draft(
   if (!can_use_combined_first_draft(input)) {
     return false;
   }
-  // Structured-output-constrained rows carry host-side bookkeeping that a
-  // prelaunched draft cannot account for: step_decode() consumes the prepared
-  // draft without rebuilding current_draft_input, so the draft token count
-  // would not match the constraint state count (builtin JSON states) or the
-  // prelaunched sampling would miss the sequence-level constraint masks
-  // (xgrammar filter_bitmask/filter_mask). Keep those batches on the in-loop
-  // draft path, which copies the constraint state from this input. The
-  // decision must be identical on every DP rank because the prelaunched
-  // draft forward carries HCCL collectives.
-  if (!mtp_async::json_object_allows_draft_prelaunch(
-          parallel_args_.dp_size(),
-          input.input_params.parallel.dp_global_json_object_active,
-          !constraint_states_allow_prelaunch(input))) {
-    LOG_FIRST_N(WARNING, 4)
-        << "MTP first-draft prelaunch disabled: structured-output constrained "
-           "decoding is active for this DP batch; using the in-loop draft "
-           "path."
-        << " dp_size=" << parallel_args_.dp_size()
-        << ", local_json_object_rows=" << input.json_object_states.size()
-        << ", local_filter_bitmask="
-        << input.sampling_params.filter_bitmask.defined()
-        << ", local_filter_mask=" << input.sampling_params.filter_mask.defined()
-        << ", dp_global_json_object_active="
-        << input.input_params.parallel.dp_global_json_object_active;
-    return false;
-  }
+  // Constrained batches rejoin the prelaunch path: the consume branch seeds
+  // current_draft_input.json_object_states from this step's input, so the
+  // draft-token and grammar-state counts stay aligned; a first token drafted
+  // under the submit-time (one-commit-stale) mask is rejected and resampled
+  // by validation. The decision stays identical on every DP rank because it
+  // no longer depends on rank-local constraint rows.
   const bool requires_dp_symmetric_prelaunch =
       parallel_args_.dp_size() > 1 &&
       combined_draft_execution_path_ ==

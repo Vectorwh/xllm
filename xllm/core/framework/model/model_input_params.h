@@ -924,12 +924,9 @@ struct ParallelInput {
   // max kv seq len of all dp shards. Graph key generation uses this so empty
   // DP decode ranks pick the same graph as ranks with real decode tokens.
   std::vector<int32_t> dp_global_kv_max_seq_lens;
-  // Per-DP-shard json_object presence (0/1), replicated even to shards without
-  // constrained rows. The prelaunched first draft is submitted inside HCCL
-  // collectives, so the prelaunch decision must not read rank-local grammar
-  // state; only a complete all-zero vector permits a prelaunch. In-loop MTP
-  // drafting is unaffected.
-  std::vector<int32_t> dp_global_json_object_active;
+  // Per-DP-shard decode flag (1 = the shard has decode tokens), replicated to
+  // every shard so graph and collective-order decisions agree across the DP
+  // group even when a shard has no decode rows of its own.
   std::vector<int32_t> dp_is_decode;
 
   DpEpPaddingData dp_ep_padding_data;
@@ -960,7 +957,6 @@ struct ParallelInput {
     out.raw_dp_global_token_nums = raw_dp_global_token_nums;
     out.dp_global_batch_generations = dp_global_batch_generations;
     out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;
-    out.dp_global_json_object_active = dp_global_json_object_active;
     out.dp_is_decode = dp_is_decode;
     out.dp_ep_padding_data = dp_ep_padding_data;
     out.mega_active_mask = mega_active_mask;

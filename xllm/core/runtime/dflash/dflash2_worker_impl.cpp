@@ -148,7 +148,10 @@ bool DFlash2WorkerImpl::can_prepare_device_draft_inputs(
       (input.input_params.block_copy.src_block_indices.defined() &&
        input.input_params.block_copy.src_block_indices.numel() > 0) ||
       !input.transfer_kv_infos.empty() ||
-      !constraint_states_allow_prelaunch(input) ||
+      // Constraint rows stage normally: the draft query samples with the
+      // cleared mask (make_draft_sampling_params) and the verify rows are
+      // rebuilt from the fresh states, so the sequence-level constraint
+      // bitmask no longer blocks draft preparation.
       input.input_params.embedding.mtp_bootstrap_embeddings.defined() ||
       input.input_params.embedding.embedding_ids.empty() ||
       input.input_params.embedding.request_ids.size() !=
@@ -346,8 +349,13 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::execute_draft_query(
     c10::StreamGuard stream_guard = stream.set_stream_guard();
     DFlash2CandidateOutput candidates = draft_impl_->dflash2_candidates(
         hidden_states, unary_logits, anchor_token_ids);
-    SamplingParameters sampling_params = input.sampling_params.to(
-        unary_logits.device(), unary_logits.scalar_type());
+    // Drafts sample unconstrained: the sequence-level constraint mask does
+    // not model the expanded draft positions, and the verify rows enforce the
+    // grammar per position. Clear it (keeping every other sampling setting)
+    // instead of sampling under a wrongly-shaped mask.
+    SamplingParameters sampling_params =
+        dflash_detail::make_draft_sampling_params(input.sampling_params)
+            .to(unary_logits.device(), unary_logits.scalar_type());
     sampled = sample_path(candidates,
                           sampling_params,
                           gumbel_noise,

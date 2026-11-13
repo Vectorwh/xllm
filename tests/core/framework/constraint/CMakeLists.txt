@@ -24,3 +24,14 @@ if(USE_XGRAMMAR)
       GTest::gtest_main
   )
 endif()
+
+cc_test(
+  NAME
+    xgrammar_support_test
+  CPU_ONLY
+  SRCS
+    xgrammar_support_test.cpp
+  DEPS
+    :constraint
+    GTest::gtest_main
+)

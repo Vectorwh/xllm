@@ -221,14 +221,22 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
     }
 
     // H2D the sampling params on prepare_stream_ (overlapping the draft
-    // forward), then record an event so compute_stream_ only consumes the
-    // converted params after the H2D completes.
-    SamplingParameters sampling_params_on_device;
+    // forward) instead of on compute_stream_ after the forward is submitted.
+    // Prepared path: skip the prepare_stream_ H2D here (its prepare_stream
+    // section has already been recorded and waited on by the caller); the
+    // params stay host-side, but after the index-tensor clearing below the
+    // .to() payload is scalars and empty tensors only, so the one
+    // compute-stream conversion is negligible.
     StreamEventPtr sampling_params_ready;
-    {
+    if (!prepared) {
       c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
-      sampling_params_on_device =
+      // Store the converted params on processed_input so they outlive
+      // execute_draft_query: a local would be destroyed on return while
+      // compute_stream_ is still consuming them (non_blocking H2D).
+      processed_input.input_params.sampling->parameters =
           query_sampling_params.to(draft_impl_->device(), torch::kFloat32);
+      // Record the H2D so compute_stream_ only consumes the params after the
+      // copy has completed (ordering across the two streams).
       sampling_params_ready = prepare_stream_->record_event();
       CHECK(sampling_params_ready != nullptr);
     }
@@ -236,14 +244,23 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
     BlockSample sampled = [&]() {
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
       // Wait for the prepare_stream_ H2D before consuming the params.
-      CHECK(compute_stream_->wait_event(sampling_params_ready));
+      if (sampling_params_ready != nullptr) {
+        CHECK(compute_stream_->wait_event(sampling_params_ready));
+      }
       torch::Tensor anchor_token_ids =
           processed_input.token_ids.view({batch_size, num_speculative_tokens})
               .select(1, 0)
               .to(device_, torch::kLong);
-      // The params are already on device; only re-type (device-to-device).
-      SamplingParameters typed_params = sampling_params_on_device.to(
-          base_logits.device(), base_logits.scalar_type());
+      // Drop the index tensors first: sample_block clears them in its own
+      // local copy anyway, so converting them here would just waste a
+      // blocking H2D on data that gets discarded.
+      processed_input.input_params.sampling->parameters.selected_token_idxes =
+          torch::Tensor();
+      processed_input.input_params.sampling->parameters.sample_idxes =
+          torch::Tensor();
+      SamplingParameters typed_params =
+          processed_input.input_params.sampling->parameters.to(
+              base_logits.device(), base_logits.scalar_type());
       if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
         force_greedy_draft_sampling(typed_params);
       }
@@ -267,8 +284,10 @@ bool DSparkWorkerImpl::can_prepare_without_compute_stream_wait(
 
 bool DSparkWorkerImpl::can_prelaunch_draft_for_this_step(
     const ForwardInput& input) const {
-  // Draft sampling consumes constraint state, which is not available before
-  // the previous accepted-token D2H and Host state update.
+  // Constraint masks never block prelaunch: the draft query clears the
+  // constraint bitmask (drafts sample unconstrained) and the verify rows are
+  // rebuilt from this step's fresh states, both inside prepare_query_inputs
+  // and the validate path.
   if (!draft_prelaunch_enabled_for_init_ ||
       input.input_params.meta.is_graph_warmup ||
       !input.input_params.meta.batch_forward_type.is_decode() ||
@@ -283,11 +302,6 @@ bool DSparkWorkerImpl::can_prelaunch_draft_for_this_step(
   if (!block_copy.swap_blocks.empty() ||
       (block_copy.src_block_indices.defined() &&
        block_copy.src_block_indices.numel() > 0)) {
-    return false;
-  }
-  // Shared constraint gate: builtin JSON states/snapshots and sequence-level
-  // filter masks/bitmasks (e.g. xgrammar).
-  if (!constraint_states_allow_prelaunch(input)) {
     return false;
   }
   const auto& sampling = input.sampling_params;
@@ -308,7 +322,6 @@ DFlashWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft_from_pending(
   ForwardInput prepared;
   draft_impl_->prepare_work_before_execute_on_stream(
       query, prepared, *prepare_stream_, true, false);
-  ForwardInput device_input = input;
   dflash_async::DraftCacheBlockTable block_table;
   torch::Tensor row_indices;
   torch::Tensor host_row_indices;
@@ -341,9 +354,6 @@ DFlashWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft_from_pending(
               options_.num_speculative_tokens(),
               /*dim=*/0);
     }
-    device_input.sampling_params =
-        input.sampling_params.to(draft_impl_->device(), torch::kFloat32);
-    force_greedy_draft_sampling(device_input.sampling_params);
     host_row_indices = torch::empty(
         {static_cast<int64_t>(rows.size())},
         torch::TensorOptions().dtype(torch::kLong).pinned_memory(true));
@@ -379,8 +389,7 @@ DFlashWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft_from_pending(
   prepared.input_params.attn_metadata.reset();
   prepared.metadata_ready_event.reset();
   prepared.device_tensors_ready = true;
-  DraftBlock block =
-      execute_draft_query(device_input, std::move(prepared), true);
+  DraftBlock block = execute_draft_query(input, std::move(prepared), true);
   block.retained_tensors.reserve(block.retained_tensors.size() + 8);
   block.retained_tensors.emplace_back(std::move(block_table.blocks));
   block.retained_tensors.emplace_back(std::move(row_indices));

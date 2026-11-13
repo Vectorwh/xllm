@@ -736,7 +736,6 @@ std::vector<PreparedForwardInput> VLMEngine::prepare_inputs(
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
   std::vector<int32_t> dp_global_kv_max_seq_lens(dp_size_);
-  std::vector<int32_t> dp_global_json_object_active(dp_size_, 0);
   std::vector<int32_t> dp_is_decode(dp_size_, 0);
   // when enable dp, we need to check the forward type of each batch
   // and set the empty forward type of each batch to the same value as the first
@@ -760,12 +759,6 @@ std::vector<PreparedForwardInput> VLMEngine::prepare_inputs(
         batched_inputs[dp_rank].input().host_token_ids().numel());
     dp_global_kv_max_seq_lens[dp_rank] =
         batched_inputs[dp_rank].input().input_params.meta.kv_max_seq_len;
-    // BatchInputBuilder returns materialized states/snapshots; packing happens
-    // at dispatch. An empty shard carries neither and stays plain.
-    const bool shard_has_json_object =
-        !batched_inputs[dp_rank].input().json_object_states.empty() ||
-        !batched_inputs[dp_rank].input().json_object_state_snapshots.empty();
-    dp_global_json_object_active[dp_rank] = shard_has_json_object ? 1 : 0;
     if (batch_forward_type.is_empty() &&
         !batched_inputs[dp_rank]
              .input()
@@ -804,10 +797,6 @@ std::vector<PreparedForwardInput> VLMEngine::prepare_inputs(
         .input()
         .input_params.parallel.dp_global_kv_max_seq_lens =
         dp_global_kv_max_seq_lens;
-    batched_inputs[dp_rank]
-        .input()
-        .input_params.parallel.dp_global_json_object_active =
-        dp_global_json_object_active;
     batched_inputs[dp_rank].input().input_params.parallel.dp_is_decode =
         dp_is_decode;
     if (batched_inputs[dp_rank]

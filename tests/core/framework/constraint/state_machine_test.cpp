@@ -20,6 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/constraint/builtin_json_machine.h"
+#include "core/framework/constraint/deny_machine.h"
 #include "core/framework/sampling/json_object_grammar.h"
 
 namespace xllm {
@@ -113,6 +114,34 @@ TEST(ConstraintStateMachineTest, ReplayClampsTheReasoningPhaseToCapability) {
       /*committed_tokens=*/{2, 0}, /*reasoning_phase=*/true);
   EXPECT_TRUE(reasoning_machine->can_accept(exited, /*close empty*/ 1));
   EXPECT_FALSE(reasoning_machine->can_accept(exited, /*marker-as-key*/ 2));
+}
+
+TEST(ConstraintStateMachineTest, DenyMachineRejectsEverything) {
+  // The machine for rows whose constraint could not be restored: every
+  // operation denies, the mask is all zeros at the model's width, and the
+  // snapshot is disabled so a deny row never re-enters the restore path.
+  std::shared_ptr<DenyConstraintMachine> machine =
+      wrap_deny_machine(/*num_words=*/2);
+  ConstraintState state = machine->initial_state(false);
+  EXPECT_TRUE(state.initialized());
+  EXPECT_FALSE(machine->is_valid(state));
+  EXPECT_FALSE(machine->is_complete(state));
+  EXPECT_FALSE(machine->can_accept(state, 0));
+  EXPECT_EQ(machine->bitmask_num_words(), 2u);
+  EXPECT_EQ(machine->allowed_bitmask(state), std::vector<uint32_t>({0, 0}));
+
+  int32_t row[2] = {7, 7};
+  EXPECT_TRUE(machine->fill_allowed_bitmask(state, row, 2));
+  EXPECT_EQ(row[0], 0);
+  EXPECT_EQ(row[1], 0);
+
+  ConstraintState advanced = state;
+  EXPECT_FALSE(machine->advance(advanced, 0, HaltPolicy::RESPECT));
+  EXPECT_FALSE(machine->is_valid(advanced));
+  EXPECT_EQ(machine->fingerprint(state), machine->fingerprint(advanced));
+
+  EXPECT_FALSE(machine->snapshot(state).enabled);
+  EXPECT_FALSE(machine->supports_spec_snapshot());
 }
 
 TEST(ConstraintStateMachineTest, SnapshotRestoresTheFrozenFlag) {

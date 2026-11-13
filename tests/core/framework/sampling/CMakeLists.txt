@@ -48,6 +48,8 @@ cc_test(
     :platform
     :sampler
     :xgrammar_constraint
+    :json_object_grammar
+    $<$<BOOL:${USE_XGRAMMAR}>::constraint>
     GTest::gtest_main
 )
 target_link_libraries(sampler_filter_mask_test

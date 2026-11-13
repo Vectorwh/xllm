@@ -20,6 +20,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/constraint/xgrammar_machine.h"
+#include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/rec_sampler.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/sampling/xgrammar_constraint.h"
@@ -27,7 +29,6 @@ limitations under the License.
 
 namespace xllm {
 namespace {
-
 SamplingParameters make_greedy_params(int64_t batch_size) {
   SamplingParameters params;
   params.selected_token_idxes =
@@ -262,11 +263,12 @@ TEST(SamplerFilterMaskTest, XGrammarMasksConstrainNpuSampling) {
   const torch::Device device(Platform::type_torch(), /*index=*/0);
   for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
     SCOPED_TRACE(dtype);
-    XGrammarState state(*grammar);
+    std::shared_ptr<XGrammarConstraintMachine> machine =
+        wrap_xgrammar_machine(grammar);
+    ConstraintState state = machine->initial_state(false);
     for (const int32_t expected : {int32_t{'a'}, 256}) {
       SamplingParameters params = make_greedy_params(/*batch_size=*/2);
-      const std::vector<XGrammarState*> states = {&state, nullptr};
-      params.filter_bitmask = build_xgrammar_filter_bitmask(states);
+      params.filter_bitmask = build_filter_bitmask({state, ConstraintState()});
       params = params.to(device, dtype);
       torch::Tensor logits = torch::zeros({2, 288}, torch::kFloat32);
       logits.index_put_({0, 'x'}, 100.0F);
@@ -277,10 +279,58 @@ TEST(SamplerFilterMaskTest, XGrammarMasksConstrainNpuSampling) {
       const torch::Tensor tokens = output.next_tokens.to(torch::kCPU);
       EXPECT_EQ(tokens[0].item<int32_t>(), expected);
       EXPECT_EQ(tokens[1].item<int32_t>(), 'x');
-      ASSERT_TRUE(state.accept_token(tokens[0].item<int32_t>()));
+      ASSERT_TRUE(machine->advance(
+          state, tokens[0].item<int32_t>(), HaltPolicy::RESPECT));
     }
   }
 }
+#endif
+
+#if defined(USE_NPU) && defined(USE_XGRAMMAR)
+TEST(SamplerFilterMaskTest, UnifiedBuilderMasksConstrainNpuSampling) {
+  // The case above covers the mixed constrained/unconstrained batch and the
+  // multi-step advance through the machine; this one focuses on the
+  // in-place row fill (fill_allowed_bitmask) end-to-end on the device with a
+  // single constrained row.
+  ASSERT_GT(Platform::device_count(), 0);
+  std::vector<std::string> pieces;
+  pieces.reserve(257);
+  for (int32_t id = 0; id < 256; ++id) {
+    pieces.emplace_back(1, static_cast<char>(id));
+  }
+  pieces.emplace_back();
+  XGrammarCompiler compiler(pieces,
+                            /*model_vocab_size=*/288,
+                            std::vector<int32_t>{256},
+                            /*cache_max_memory_bytes=*/0);
+  std::string error;
+  auto grammar = compiler.compile_regex("a", error);
+  ASSERT_NE(grammar, nullptr) << error;
+  std::shared_ptr<XGrammarConstraintMachine> machine =
+      wrap_xgrammar_machine(grammar);
+  ASSERT_NE(machine, nullptr);
+  const ConstraintState state = machine->initial_state(false);
+  ASSERT_TRUE(state.initialized());
+
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  const torch::Tensor bitmask = build_filter_bitmask({state});
+  ASSERT_EQ(bitmask.size(1), 9);  // ceil(288 / 32)
+  for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
+    SCOPED_TRACE(dtype);
+    SamplingParameters params = make_greedy_params(/*batch_size=*/1);
+    params.filter_bitmask = bitmask;
+    params = params.to(device, dtype);
+    torch::Tensor logits = torch::zeros({1, 288}, torch::kFloat32);
+    logits.index_put_({0, 'x'}, 100.0F);
+    logits.index_put_({0, 'a'}, 10.0F);
+    logits = logits.to(device, dtype);
+    const SampleOutput output = Sampler().forward(logits, params);
+    const torch::Tensor tokens = output.next_tokens.to(torch::kCPU);
+    // 'x' has the higher logit but the grammar allows only "a".
+    EXPECT_EQ(tokens[0].item<int32_t>(), int32_t{'a'});
+  }
+}
+
 #endif
 
 TEST(SamplerFilterMaskTest, RandomSamplingCannotSelectDisallowedToken) {

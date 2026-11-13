@@ -159,25 +159,6 @@ bool supports_python_dsv32_continuous_draft_configuration(
          draft_index_topk > 0;
 }
 
-bool json_object_allows_draft_prelaunch(
-    int32_t dp_size,
-    const std::vector<int32_t>& dp_global_json_object_active,
-    bool has_local_constraints) {
-  if (dp_size == 1) {
-    // Single rank owns the batch; the flag covers every constraint form.
-    return !has_local_constraints;
-  }
-  if (dp_size <= 0 ||
-      dp_global_json_object_active.size() != static_cast<size_t>(dp_size)) {
-    return false;
-  }
-  // All-zero flags prove the whole DP batch is plain (json states only today;
-  // xgrammar masks are future work, startup-gated).
-  return std::all_of(dp_global_json_object_active.begin(),
-                     dp_global_json_object_active.end(),
-                     [](int32_t active) { return active == 0; });
-}
-
 torch::Tensor materialize_speculative_verify_tokens(
     const torch::Tensor& verify_tokens,
     const std::vector<torch::Tensor>& draft_token_sources) {

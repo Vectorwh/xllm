@@ -66,6 +66,38 @@ TEST(MtpJsonObjectStateTest, BuildsSequenceMajorRowsForMixedAcceptedDrafts) {
   EXPECT_EQ(initial_states[0].snapshot().token_ids, std::vector<int32_t>({}));
 }
 
+TEST(MtpJsonObjectStateTest, PrelaunchedStaleFirstTokenIsRejectedNotCommitted) {
+  // The MTP first-draft prelaunch seeds the consume branch from this step's
+  // fresh states, but the draft sampled under the submit-time (one-commit-
+  // stale) mask. This test pins that a stale first draft token is rejected by
+  // the current mask (can_accept on the seeded state) and never advances the
+  // live matcher: the invalid row is frozen at the initial fingerprint.
+  JsonObjectGrammar grammar = make_mtp_grammar();
+  const std::vector<ConstraintState> initial_states = {
+      make_builtin_test_states(grammar, /*count=*/1)[0], ConstraintState()};
+  std::vector<ConstraintState> current_states = initial_states;
+  std::vector<uint8_t> invalid_suffix(2, 0);
+  detail::JsonDraftValidationScratch scratch;
+
+  // Token 4 is illegal at the initial position under the current mask, so a
+  // stale first draft that proposed it must be flagged and frozen.
+  EXPECT_TRUE(detail::advance_json_draft_step(
+      current_states, invalid_suffix, {4, 0}, scratch));
+  // A legal token afterwards still processes normally on the live row.
+  EXPECT_FALSE(detail::advance_json_draft_step(
+      current_states, invalid_suffix, {0, 0}, scratch));
+
+  // The invalid first row never advanced: its state fingerprint is still the
+  // initial one, and the invalid suffix marks it (and the legal row's flag is
+  // untouched).
+  EXPECT_EQ(current_states[0].fingerprint(), initial_states[0].fingerprint());
+  EXPECT_TRUE(current_states[0].initialized());
+  EXPECT_FALSE(current_states[1].initialized());
+  EXPECT_EQ(invalid_suffix[0], 1);
+  EXPECT_EQ(invalid_suffix[1], 0);
+  EXPECT_EQ(initial_states[0].snapshot().token_ids, std::vector<int32_t>({}));
+}
+
 TEST(MtpJsonObjectStateTest, FreezesFirstInvalidDraftAndItsSuffix) {
   JsonObjectGrammar grammar = make_mtp_grammar();
   const std::vector<ConstraintState> initial_states = {
@@ -90,6 +122,47 @@ TEST(MtpJsonObjectStateTest, FreezesFirstInvalidDraftAndItsSuffix) {
     EXPECT_EQ(validation_states[row].fingerprint(),
               initial_states[0].fingerprint());
   }
+}
+
+TEST(MtpJsonObjectStateTest, FrozenSuffixRowsKeepTheCommittedVerifyMask) {
+  // Prelaunch samples the first draft under the submit-time (one commit stale)
+  // mask, so validation rejects it and freezes the suffix. The rejection must
+  // be durable: every suffix row keeps the committed state instead of
+  // advancing, the stale token stays outside every row's mask, and the freeze
+  // does not leak into the committed row itself.
+  JsonObjectGrammar grammar = make_mtp_grammar();
+  const std::vector<ConstraintState> initial_states =
+      make_builtin_test_states(grammar, /*count=*/1);
+  std::vector<ConstraintState> current_states = initial_states;
+  std::vector<uint8_t> invalid_suffix(1, 0);
+  detail::JsonDraftValidationScratch scratch;
+
+  // Step 0: "}" (4) is illegal at the initial position under the current mask,
+  // which is how a stale prelaunched first draft surfaces.
+  ASSERT_TRUE(detail::advance_json_draft_step(
+      current_states, invalid_suffix, {4}, scratch));
+  // Steps 1-2: the suffix still carries draft tokens; the freeze must keep them
+  // out of verification instead of advancing the matcher with them.
+  detail::advance_json_draft_step(current_states, invalid_suffix, {5}, scratch);
+  detail::advance_json_draft_step(current_states, invalid_suffix, {0}, scratch);
+
+  std::vector<uint8_t> invalid_draft;
+  const auto validation_states = detail::build_json_validation_states(
+      initial_states, scratch, invalid_draft);
+  EXPECT_EQ(invalid_draft, std::vector<uint8_t>({1, 1, 1}));
+  ASSERT_EQ(validation_states.size(), 4u);
+
+  for (size_t row = 0; row < 3; ++row) {
+    SCOPED_TRACE(row);
+    // No suffix row advanced: each verifies against the committed state.
+    EXPECT_EQ(validation_states[row].fingerprint(),
+              initial_states[0].fingerprint());
+    // The stale token is denied everywhere, so it can never verify.
+    EXPECT_FALSE(validation_states[row].can_accept(/*stale=*/4));
+  }
+  // The freeze is scoped to the draft suffix: the committed row still accepts
+  // the legal opening token.
+  EXPECT_TRUE(validation_states[0].can_accept(/*open=*/0));
 }
 
 TEST(MtpJsonObjectStateTest, PreservesAcceptedPrefixAfterMiddleInvalidDraft) {

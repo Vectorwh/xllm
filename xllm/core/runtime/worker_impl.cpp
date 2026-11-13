@@ -25,6 +25,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "core/framework/constraint/builtin_json_machine.h"
+#include "core/framework/constraint/deny_machine.h"
 #include "core/framework/constraint/output_rows.h"
 #include "core/runtime/forward_shared_memory_manager.h"
 #if defined(USE_NPU)
@@ -1315,15 +1316,30 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     bool wait_for_compute,
     bool restore_request_state) {
   if (!input.json_object_state_snapshots.empty()) {
-    ForwardInput restored_input = input;
-    restore_json_object_states(restored_input);
-    prepare_work_before_execute_on_stream(restored_input,
-                                          processed_input,
-                                          prepare_stream,
-                                          record_ready_event,
-                                          wait_for_compute,
-                                          restore_request_state);
-    return;
+    // Only enabled snapshots (restorable to fresh machines) need the copy +
+    // restore round-trip. Pure non-builtin batches carry only disabled
+    // entries because their rows ride the live channel, so skip the per-step
+    // ForwardInput copy and let the live states flow through unchanged. An
+    // arrival with empty states (SHM/RPC transport) always takes the restore
+    // path so row alignment and the cross-process refusal inside the restore
+    // stay enforced.
+    const bool has_enabled_snapshot =
+        std::any_of(input.json_object_state_snapshots.begin(),
+                    input.json_object_state_snapshots.end(),
+                    [](const JsonObjectGrammarSnapshot& snapshot) {
+                      return snapshot.enabled;
+                    });
+    if (has_enabled_snapshot || input.json_object_states.empty()) {
+      ForwardInput restored_input = input;
+      restore_json_object_states(restored_input);
+      prepare_work_before_execute_on_stream(restored_input,
+                                            processed_input,
+                                            prepare_stream,
+                                            record_ready_event,
+                                            wait_for_compute,
+                                            restore_request_state);
+      return;
+    }
   }
 #if defined(USE_NPU)
   // Without device_capture_lock, ACL graph capture will be interrupted by the
@@ -1541,12 +1557,34 @@ void WorkerImpl::restore_json_object_states(ForwardInput& input) {
 
   std::vector<ConstraintState> states;
   states.reserve(input.json_object_state_snapshots.size());
+  // A row whose constraint cannot be restored decodes this step under an
+  // all-deny mask instead of an unconstrained one: the request still fails
+  // through the error channel, but the failing step itself cannot sample
+  // outside the (unknown) grammar.
+  const int64_t model_vocab = context_.get_model_args().vocab_size();
+  const std::shared_ptr<DenyConstraintMachine> deny_machine = wrap_deny_machine(
+      model_vocab > 0 ? (static_cast<size_t>(model_vocab) + 31U) / 32U : 0U);
   // Reuse the stateless machine per grammar instead of re-wrapping per row.
   std::unordered_map<const JsonObjectGrammar*,
                      std::shared_ptr<BuiltinJsonConstraintMachine>>
       machine_cache;
   for (size_t row = 0; row < input.json_object_state_snapshots.size(); ++row) {
     const auto& snapshot = input.json_object_state_snapshots[row];
+    const std::string row_sequence_id =
+        row < input.sample_sequence_ids.size()
+            ? input.sample_sequence_ids[row]
+            : "<row " + std::to_string(row) + ">";
+    // A bad or unrepresentable snapshot is a request-level failure, not an
+    // engine fault: report the row through the error channel (the request
+    // fails at output time) and decode it unconstrained, instead of aborting
+    // the whole engine with a CHECK/FATAL.
+    const auto fail_row = [&](const std::string& message) {
+      LOG(ERROR) << "JSON object state restore failed: sequence_id="
+                 << row_sequence_id << ", error=" << message;
+      input.json_object_errors.emplace_back(
+          JsonObjectOutputError{row_sequence_id, message});
+      states.push_back(deny_machine->initial_state(false));
+    };
     if (!snapshot.enabled) {
       // An empty snapshot means either a genuinely unconstrained row or a
       // backend whose spec snapshot is not yet implemented (xgrammar). Only
@@ -1556,10 +1594,26 @@ void WorkerImpl::restore_json_object_states(ForwardInput& input) {
       // is the backend-neutral spec-snapshot support: a backend whose
       // snapshots round-trip the matcher restores from them, one without
       // keeps its live state instead of being reset to unconstrained.
+      // initialized() implies a machine (the ConstraintState constructor
+      // rejects a payload without one), so the dereference below is safe.
       const bool non_builtin_initialized =
           row < input.json_object_states.size() &&
           input.json_object_states[row].initialized() &&
           !input.json_object_states[row].machine()->supports_spec_snapshot();
+      if (!non_builtin_initialized && snapshot.constrained_without_snapshot) {
+        // The builder marked this row as carrying a live constraint it could
+        // not serialize. With no live state to preserve (a cross-process
+        // arrival, where states do not transport), decoding the row
+        // unconstrained would silently drop the constraint. Fail THIS request
+        // through the error channel rather than terminating the worker: the
+        // condition is reachable from ordinary request traffic (xgrammar +
+        // PD/transport) until the backend-neutral spec transport (G9) lands.
+        fail_row(
+            "constrained row arrived without a serializable snapshot or a "
+            "live state (the backend's spec transport is not implemented "
+            "until G9)");
+        continue;
+      }
       if (non_builtin_initialized) {
         states.push_back(input.json_object_states[row]);
       } else {
@@ -1567,22 +1621,6 @@ void WorkerImpl::restore_json_object_states(ForwardInput& input) {
       }
       continue;
     }
-
-    const std::string row_sequence_id =
-        row < input.sample_sequence_ids.size()
-            ? input.sample_sequence_ids[row]
-            : "<row " + std::to_string(row) + ">";
-    const auto fail_row = [&](const std::string& message) {
-      // A bad snapshot is a request-level failure, not an engine fault:
-      // report the row through the error channel (the request fails at
-      // output time) and decode it unconstrained, instead of aborting the
-      // whole engine with a CHECK like the sequence-side restore used to.
-      LOG(ERROR) << "JSON object state restore failed: sequence_id="
-                 << row_sequence_id << ", error=" << message;
-      input.json_object_errors.emplace_back(
-          JsonObjectOutputError{row_sequence_id, message});
-      states.emplace_back();
-    };
 
     std::shared_ptr<const JsonObjectGrammar> grammar =
         ensure_json_object_grammar(snapshot.reasoning_enabled);

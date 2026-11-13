@@ -415,6 +415,75 @@ TEST(JsonObjectGrammarTest, BuildsMaskWithMixedReasoningDefinitions) {
   EXPECT_TRUE(torch::equal(masked_logits, mask));
 }
 
+TEST(JsonObjectGrammarTest, FrozenRowInBatchDeniesEverythingWithoutAborting) {
+  // A frozen (invalid) row contributes an all-deny mask and nothing else: its
+  // content does not depend on the vocabulary width, so a batch mixing it with
+  // live rows must assemble the mask instead of tripping a width check. Pin
+  // that a mixed batch stays a request-level outcome rather than an engine
+  // abort.
+  JsonObjectGrammar grammar = make_grammar();
+  auto machine = make_builtin_test_machine(grammar);
+  ConstraintState live = machine->restore(
+      to_constraint_snapshot(grammar.initial_state().snapshot()));
+  ASSERT_TRUE(live.initialized());
+  ASSERT_TRUE(machine->is_valid(live));
+
+  JsonObjectGrammarState broken = grammar.initial_state();
+  ASSERT_FALSE(broken.accept_piece("["));
+  ASSERT_FALSE(broken.is_valid());
+  ConstraintState frozen =
+      machine->restore(to_constraint_snapshot(broken.snapshot()));
+  ASSERT_TRUE(frozen.initialized());
+  ASSERT_FALSE(machine->is_valid(frozen));
+
+  const torch::Tensor mask = build_filter_bitmask({live, frozen});
+  ASSERT_EQ(mask.size(0), 2);
+  EXPECT_EQ(mask.size(1), static_cast<int64_t>(machine->bitmask_num_words()));
+  // Frozen row: every bit cleared.
+  EXPECT_TRUE(torch::equal(mask[1], torch::zeros_like(mask[1])));
+  // Live row: compare against the same state built alone, bit for bit, so a
+  // regression that clears or shifts the live row alongside the frozen one
+  // cannot pass on a "not all zero" check.
+  const torch::Tensor live_alone = build_filter_bitmask({live});
+  ASSERT_EQ(live_alone.size(0), 1);
+  EXPECT_TRUE(torch::equal(mask[0], live_alone[0]));
+}
+
+TEST(JsonObjectGrammarTest, MixedWidthRowIsDeniedInsteadOfAborting) {
+  // A batch is assembled at one width. A row from a different-vocabulary
+  // machine cannot be expressed in it: the row must come out all-deny (so its
+  // sequence halts) rather than aborting the engine with a width CHECK.
+  JsonObjectGrammar narrow = make_grammar();
+  // Same token set padded past 32 pieces: the packed mask needs a second word,
+  // while the narrow grammar fits in one.
+  std::vector<std::string> padded = {
+      "{", "}", "\"", "a", "b", ":", ",", "[",  "]", "true", "false", "null",
+      "1", "-", "0",  ".", "2", "e", " ", "\\", "n", "u",    "0041",  "x"};
+  for (int32_t filler = 0; padded.size() < 40; ++filler) {
+    padded.push_back("<pad" + std::to_string(filler) + ">");
+  }
+  JsonObjectGrammar wide(std::move(padded), {24});
+  auto narrow_machine = make_builtin_test_machine(narrow);
+  auto wide_machine = make_builtin_test_machine(wide);
+  ASSERT_NE(narrow_machine->bitmask_num_words(),
+            wide_machine->bitmask_num_words());
+
+  ConstraintState narrow_live = narrow_machine->restore(
+      to_constraint_snapshot(narrow.initial_state().snapshot()));
+  ConstraintState wide_live = wide_machine->restore(
+      to_constraint_snapshot(wide.initial_state().snapshot()));
+  ASSERT_TRUE(narrow_live.initialized());
+  ASSERT_TRUE(wide_live.initialized());
+
+  const torch::Tensor mask = build_filter_bitmask({narrow_live, wide_live});
+  ASSERT_EQ(mask.size(0), 2);
+  EXPECT_EQ(mask.size(1),
+            static_cast<int64_t>(narrow_machine->bitmask_num_words()));
+  EXPECT_FALSE(torch::equal(mask[0], torch::zeros_like(mask[0])));
+  // The wider row cannot fit the batch width: denied, and the batch survives.
+  EXPECT_TRUE(torch::equal(mask[1], torch::zeros_like(mask[1])));
+}
+
 TEST(JsonObjectGrammarTest, ReusesMaskForTransitionEquivalentStates) {
   JsonObjectGrammar grammar = make_grammar();
   JsonObjectGrammarState first = grammar.initial_state();

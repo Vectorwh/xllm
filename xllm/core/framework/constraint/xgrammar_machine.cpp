@@ -48,10 +48,12 @@ XGrammarConstraintMachine::XGrammarConstraintMachine(
 
 const XGrammarState& XGrammarConstraintMachine::cast(
     const ConstraintState& state) {
+  CHECK(state.initialized()) << "xgrammar constraint op on an empty state";
   return state.as<XGrammarState>();
 }
 
 XGrammarState& XGrammarConstraintMachine::cast(ConstraintState& state) {
+  CHECK(state.initialized()) << "xgrammar constraint op on an empty state";
   return state.as<XGrammarState>();
 }
 
@@ -125,6 +127,13 @@ ConstraintState XGrammarConstraintMachine::replay(
     }
   }
   return wrap(*this, std::move(state));
+}
+
+bool XGrammarConstraintMachine::fill_allowed_bitmask(
+    const ConstraintState& state,
+    int32_t* row,
+    size_t num_words) const {
+  return cast(state).fill_allowed_bitmask_row(row, num_words);
 }
 
 std::vector<uint32_t> XGrammarConstraintMachine::allowed_bitmask(

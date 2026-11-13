@@ -92,7 +92,14 @@ class XGrammarState final {
   int64_t vocab_size() const { return vocab_size_; }
   // Fully writes a caller-owned CPU row of (vocab_size() + 31) / 32 words.
   // Returns whether the mask needs applying (false means all-true).
-  bool fill_next_token_bitmask(std::span<int32_t> words);
+  // Logically read-only: the matcher's fill may refresh its internal caches
+  // but leaves the FSM state unchanged. const because the mask assembly
+  // reads shared states; unique_ptr::operator-> still reaches the matcher.
+  bool fill_next_token_bitmask(std::span<int32_t> words) const;
+  // Write the allowed mask into a caller-owned row. Frozen states write
+  // all-deny and unconstrained steps write all-allow, so the row always ends up
+  // fully defined; returns false only when the backend cannot fill in place.
+  bool fill_allowed_bitmask_row(int32_t* row, size_t num_words) const;
   // The same mask as a packed uint32 vector: all-deny when frozen,
   // all-allow when the step is unconstrained. Single source for the
   // machine's allowed_bitmask and the FSM-only fingerprint.
@@ -108,9 +115,5 @@ class XGrammarState final {
   bool invalid_ = false;
   std::vector<int32_t> accepted_tokens_;
 };
-
-// Rows follow selected-token order, including unconstrained (nullptr) rows.
-torch::Tensor build_xgrammar_filter_bitmask(
-    std::span<XGrammarState* const> states);
 
 }  // namespace xllm
