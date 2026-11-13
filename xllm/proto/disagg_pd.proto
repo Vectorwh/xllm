@@ -265,6 +265,9 @@ message RemoteToken {
   repeated int64 top_tokens = 4;
   repeated float top_logprobs = 5;
   double time_to_first_token_latency_seconds = 6;
+  // Metadata is emitted by P even when stop suppression withholds the text.
+  // D must decode that text rather than infer delivery from token decoding.
+  bool prefill_text_withheld = 7;
 }
 
 // Only stage durations cross hosts; no clock timestamps are transported.

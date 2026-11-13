@@ -90,6 +90,7 @@ bool EtcdClient::register_instance(const std::string&,
 RegistrationLookupState EtcdClient::lookup_registration(const std::string&) {
   return RegistrationLookupState::kPresent;
 }
+bool EtcdClient::withdraw_registration(const std::string&) { return true; }
 
 namespace {
 

@@ -398,6 +398,7 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         std::move(source_mappings),
         gen.dp_size(),
         gen.dp_rank(),
+        first_token.prefill_text_withheld(),
         mtp_bootstrap_embedding,
         gen.num_cached_tokens(),
         gen.has_phase_timing() ? &gen.phase_timing() : nullptr);

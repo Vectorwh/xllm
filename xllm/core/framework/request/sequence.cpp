@@ -767,6 +767,9 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
   // because there might be fake token -1 if enable_schedule_overlap
   size = num_valid_tokens();
   CHECK_LE(size, num_tokens_);
+  if (size < stream_output_token_offset_) {
+    return std::nullopt;
+  }
   AUTO_COUNTER(detokenization_latency_seconds_stream);
   const auto ids = Slice<int32_t>(tokens_, size);
 

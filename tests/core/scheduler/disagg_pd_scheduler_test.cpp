@@ -438,7 +438,8 @@ class DelayedReservationService final : public proto::DisaggPDService {
         /*src_addrs=*/{},
         /*source_mappings=*/{},
         gen.dp_size(),
-        gen.dp_rank()));
+        gen.dp_rank(),
+        token.prefill_text_withheld()));
     if (before_first_generation_ack) {
       before_first_generation_ack();
     }
@@ -750,6 +751,7 @@ bool recv_first_generation(DisaggPDScheduler* scheduler,
       /*source_mappings=*/{},
       /*src_dp_size=*/1,
       /*src_dp_rank=*/0,
+      /*prefill_text_withheld=*/false,
       mtp_embedding,
       num_cached_tokens);
 }
@@ -781,11 +783,13 @@ void set_metrics_model(FakeEngine& engine) {
 }
 
 template <typename Scheduler, typename Receive>
-void check_kv_prepare_metrics(Scheduler& scheduler,
-                              FakeEngine& engine,
-                              const std::string& label,
-                              bool succeeds,
-                              Receive receive) {
+void check_kv_prepare_metrics(
+    Scheduler& scheduler,
+    FakeEngine& engine,
+    const std::string& label,
+    bool succeeds,
+    Receive receive,
+    const std::function<void(Sequence*)>& inspect_queued = {}) {
   scheduler.report_queues();
   expect_queue_sample(label, {{"pd_reservation", 1}, {"pd_kv_prepare", 0}}, 1);
   engine.pull = [&] {
@@ -809,6 +813,9 @@ void check_kv_prepare_metrics(Scheduler& scheduler,
   std::shared_ptr<Request> queued;
   EXPECT_EQ(scheduler.pop_decode_request_for_test(&queued), succeeds);
   if (queued != nullptr) {
+    if (inspect_queued) {
+      inspect_queued(queued->sequences()[0].get());
+    }
     engine.block_manager_pool()->deallocate(queued.get());
   }
   scheduler.report_queues();
@@ -837,26 +844,57 @@ TEST_P(KVPrepareMetricsTest, FirstGenerationTracksPullUntilCompletion) {
 }
 
 TEST_P(KVPrepareMetricsTest, OfflineMigrationTracksPullUntilCompletion) {
-  FakeEngine engine(8, 2);
-  set_metrics_model(engine);
-  auto options = make_decode_options();
-  options.server_idx(422).nnodes(1);
-  TestPDOOCScheduler scheduler(&engine, options);
-  proto::DisaggPDService_Stub stub(nullptr);
-  scheduler.set_prefill_channel("prefill", &stub);
-  auto request = make_request({1, 2});
-  request->state().scheduler_param.offline = true;
-  request->sequences().front()->kv_state().set_kv_cache_tokens_num(
-      request->sequences().front()->num_prompt_tokens());
-  ASSERT_TRUE(
-      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
-  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
-  proto::RemoteToken token;
-  token.set_token_id(42);
-  check_kv_prepare_metrics(scheduler, engine, "422", GetParam(), [&] {
-    return scheduler.decode_recv_multi_generations(
-        request->request_id(), {token}, 0.0, "PULL", {}, {}, {}, 1, 0);
-  });
+  for (const bool prefill_text_withheld : {false, true}) {
+    FakeEngine engine(8, 2);
+    set_metrics_model(engine);
+    auto options = make_decode_options();
+    options.server_idx(422).nnodes(1);
+    TestPDOOCScheduler scheduler(&engine, options);
+    proto::DisaggPDService_Stub stub(nullptr);
+    scheduler.set_prefill_channel("prefill", &stub);
+    auto request = make_request({1, 2});
+    request->state().scheduler_param.offline = true;
+    request->state().stream = true;
+    if (prefill_text_withheld) {
+      request->state().stopping_checker.set_stop_sequences({{7, 8}});
+    }
+    request->sequences().front()->kv_state().set_kv_cache_tokens_num(
+        request->sequences().front()->num_prompt_tokens());
+    ASSERT_TRUE(
+        engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    proto::RemoteToken token;
+    token.set_token_id(42);
+    token.set_prefill_text_withheld(prefill_text_withheld);
+    check_kv_prepare_metrics(
+        scheduler,
+        engine,
+        "422",
+        GetParam(),
+        [&] {
+          return scheduler.decode_recv_multi_generations(
+              request->request_id(), {token}, 0.0, "PULL", {}, {}, {}, 1, 0);
+        },
+        [&](Sequence* sequence) {
+          ASSERT_EQ(sequence->tokens().back(), 42);
+          sequence->append_token(Token(43));
+          auto output = sequence->generate_streaming_output(
+              sequence->num_tokens(), *engine.tokenizer());
+          ASSERT_TRUE(output.has_value());
+          EXPECT_EQ(output->text, prefill_text_withheld ? "42" : "43");
+          EXPECT_EQ(output->token_ids, (std::vector<int32_t>{43}));
+          sequence->finish();
+          auto terminal = sequence->generate_streaming_output(
+              sequence->num_tokens(), *engine.tokenizer());
+          if (prefill_text_withheld) {
+            ASSERT_TRUE(terminal.has_value());
+            EXPECT_EQ(terminal->text, "43");
+            EXPECT_TRUE(terminal->token_ids.empty());
+          } else {
+            EXPECT_FALSE(terminal.has_value());
+          }
+        });
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(PullResults, KVPrepareMetricsTest, ::testing::Bool());
@@ -1300,58 +1338,109 @@ TEST(DisaggPDSchedulerTest, PrefillTerminalTokenDoesNotHandoff) {
 }
 
 TEST(DisaggPDSchedulerTest, NonStreamHandoffFailureHasOneTerminalOutcome) {
-  TerminalLogSink sink;
-  FakeEngine engine(
-      /*num_blocks=*/16, /*block_size=*/2, /*num_speculative_tokens=*/1);
-  auto options = make_options();
-  options.enable_chunked_prefill(false)
-      .kv_cache_transfer_mode("PUSH")
-      .num_speculative_tokens(1);
-  TestDisaggPDScheduler prefill(&engine, options, /*start_services=*/false);
-  auto request = make_request({11, 12}, "failed-nonstream-handoff");
-  std::atomic<int32_t> callbacks{0};
-  request->state().output_func = [&callbacks](const RequestOutput& output) {
-    EXPECT_TRUE(output.status.has_value());
-    EXPECT_TRUE(output.status->ok());
-    EXPECT_TRUE(output.finished_on_prefill_instance);
-    ++callbacks;
-    return true;
-  };
-  prefill.admit_prefill(request);
-  auto batches = prefill.prepare_batch_test();
-  ASSERT_FALSE(batches[0].empty());
-  finish_prefill(request->sequences()[0].get());
-  prefill.prefill_send_first_generation();
-  prefill.prefill_completion().get();
+  for (bool batch_response : {false, true}) {
+    TerminalLogSink sink;
+    FakeEngine engine(
+        /*num_blocks=*/16, /*block_size=*/2, /*num_speculative_tokens=*/1);
+    auto options = make_options();
+    options.enable_chunked_prefill(false)
+        .kv_cache_transfer_mode("PUSH")
+        .num_speculative_tokens(1);
+    TestDisaggPDScheduler prefill(&engine, options, /*start_services=*/false);
+    if (batch_response) {
+      prefill.enable_batched_responses();
+    }
+    auto request = make_request({11, 12}, "failed-nonstream-handoff");
+    std::atomic<int32_t> callbacks{0};
+    std::promise<void> terminal_delivered;
+    std::future<void> terminal_delivery = terminal_delivered.get_future();
+    request->state().output_func = [&callbacks, &terminal_delivered](
+                                       const RequestOutput& output) {
+      const int32_t index = callbacks.fetch_add(1);
+      EXPECT_TRUE(output.status.has_value());
+      if (index == 0) {
+        EXPECT_TRUE(output.status->ok());
+        EXPECT_TRUE(output.finished_on_prefill_instance);
+        EXPECT_FALSE(output.finished);
+      } else {
+        EXPECT_EQ(index, 1);
+        EXPECT_EQ(output.status->code(), StatusCode::UNKNOWN);
+        EXPECT_EQ(output.status->message(), "Missing MTP bootstrap embedding");
+      }
+      if (!output.status->ok()) {
+        terminal_delivered.set_value();
+      }
+      return true;
+    };
+    std::promise<void> phase_started;
+    std::future<void> phase_start = phase_started.get_future();
+    std::promise<void> release_phase;
+    std::future<void> phase_release = release_phase.get_future();
+    if (batch_response) {
+      request->state().outputs_func =
+          [&phase_started,
+           &phase_release,
+           callback = request->state().output_func](
+              const std::vector<RequestOutput>& outputs) {
+            EXPECT_EQ(outputs.size(), 1u);
+            phase_started.set_value();
+            phase_release.wait();
+            return std::vector<bool>{callback(outputs.front())};
+          };
+    }
+    prefill.admit_prefill(request);
+    auto batches = prefill.prepare_batch_test();
+    ASSERT_FALSE(batches[0].empty());
+    std::thread release_delivery;
+    if (batch_response) {
+      // Hold the real batch callback: a terminal response must not bypass it
+      // on another worker. Release after a bounded observation, not a sleep.
+      release_delivery =
+          std::thread([&phase_start, &terminal_delivery, &release_phase] {
+            EXPECT_EQ(phase_start.wait_for(std::chrono::seconds(5)),
+                      std::future_status::ready);
+            EXPECT_EQ(
+                terminal_delivery.wait_for(std::chrono::milliseconds(100)),
+                std::future_status::timeout);
+            release_phase.set_value();
+          });
+    }
+    finish_prefill(request->sequences()[0].get());
+    prefill.prefill_send_first_generation();
+    prefill.prefill_completion().get();
+    if (release_delivery.joinable()) {
+      release_delivery.join();
+    }
 
-  EXPECT_EQ(callbacks.load(), 1);
-  EXPECT_TRUE(request->has_terminal_outcome());
-  EXPECT_FALSE(prefill.has_channel(request->request_id()));
-  const std::string logged = sink.messages();
-  const std::string terminal_record = "record_type: request_terminal";
-  const size_t first = logged.find(terminal_record);
-  ASSERT_NE(first, std::string::npos) << logged;
-  EXPECT_EQ(logged.find(terminal_record, first + 1), std::string::npos)
-      << logged;
-  const std::string terminal_log =
-      logged.substr(first, logged.find('\n', first) - first);
-  EXPECT_NE(terminal_log.find("outcome: failure"), std::string::npos);
-  EXPECT_NE(terminal_log.find("request_id: failed-nonstream-handoff"),
-            std::string::npos);
-  const size_t prefill_record = logged.find("record_type: pd_prefill_stage");
-  ASSERT_NE(prefill_record, std::string::npos);
-  const std::string prefill_log = logged.substr(
-      prefill_record, logged.find('\n', prefill_record) - prefill_record);
-  EXPECT_EQ(prefill_log.find("record_type: pd_prefill_stage, request_id: "
-                             "failed-nonstream-handoff, "
-                             "x-request-id: x-request-id, sequence: 0"),
-            0u);
-  EXPECT_NE(prefill_log.find("sequence: 0"), std::string::npos);
-  EXPECT_NE(prefill_log.find("request_id: failed-nonstream-handoff"),
-            std::string::npos);
-  EXPECT_NE(prefill_log.find("x-request-time: x-request-time"),
-            std::string::npos);
-  EXPECT_EQ(prefill_log.find("finish_reason:"), std::string::npos);
+    EXPECT_EQ(callbacks.load(), 2);
+    EXPECT_TRUE(request->has_terminal_outcome());
+    EXPECT_FALSE(prefill.has_channel(request->request_id()));
+    const std::string logged = sink.messages();
+    const std::string terminal_record = "record_type: request_terminal";
+    const size_t first = logged.find(terminal_record);
+    ASSERT_NE(first, std::string::npos) << logged;
+    EXPECT_EQ(logged.find(terminal_record, first + 1), std::string::npos)
+        << logged;
+    const std::string terminal_log =
+        logged.substr(first, logged.find('\n', first) - first);
+    EXPECT_NE(terminal_log.find("outcome: failure"), std::string::npos);
+    EXPECT_NE(terminal_log.find("request_id: failed-nonstream-handoff"),
+              std::string::npos);
+    const size_t prefill_record = logged.find("record_type: pd_prefill_stage");
+    ASSERT_NE(prefill_record, std::string::npos);
+    const std::string prefill_log = logged.substr(
+        prefill_record, logged.find('\n', prefill_record) - prefill_record);
+    EXPECT_EQ(prefill_log.find("record_type: pd_prefill_stage, request_id: "
+                               "failed-nonstream-handoff, "
+                               "x-request-id: x-request-id, sequence: 0"),
+              0u);
+    EXPECT_NE(prefill_log.find("sequence: 0"), std::string::npos);
+    EXPECT_NE(prefill_log.find("request_id: failed-nonstream-handoff"),
+              std::string::npos);
+    EXPECT_NE(prefill_log.find("x-request-time: x-request-time"),
+              std::string::npos);
+    EXPECT_EQ(prefill_log.find("finish_reason:"), std::string::npos);
+  }
 }
 
 TEST(DisaggPDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
@@ -1595,7 +1684,8 @@ TEST(DisaggPDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
       /*src_addrs=*/{"remote"},
       /*source_mappings=*/{source_mapping},
       /*src_dp_size=*/1,
-      /*src_dp_rank=*/0));
+      /*src_dp_rank=*/0,
+      /*prefill_text_withheld=*/false));
 
   ASSERT_EQ(engine.pulled_mappings.size(), 1U);
   EXPECT_EQ(engine.pulled_mappings[0].group_id, cache_group_id(BlockType::SWA));
@@ -1645,6 +1735,7 @@ TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
       /*source_mappings=*/{source_mapping},
       /*src_dp_size=*/1,
       /*src_dp_rank=*/0,
+      /*prefill_text_withheld=*/false,
       bootstrap_embedding));
 
   ASSERT_EQ(engine.pulled_mappings.size(), 1u);
@@ -2366,7 +2457,23 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   rejected->state().timing->mark_pd_local();
   rejected->state().pd_reservation_id = "missing-reservation";
   rejected->state().decode_rpc_address = address;
-  rejected->state().output_func = [](const RequestOutput&) { return true; };
+  std::atomic<int32_t> rejected_callbacks{0};
+  rejected->state().output_func =
+      [&rejected_callbacks](const RequestOutput& output) {
+        const int32_t index = rejected_callbacks.fetch_add(1);
+        EXPECT_TRUE(output.status.has_value());
+        if (index == 0) {
+          EXPECT_TRUE(output.status->ok());
+          EXPECT_TRUE(output.finished_on_prefill_instance);
+          EXPECT_FALSE(output.finished);
+        } else {
+          EXPECT_EQ(index, 1);
+          EXPECT_EQ(output.status->code(), StatusCode::UNAVAILABLE);
+          EXPECT_EQ(output.status->message(),
+                    "Failed to send first generation to decode instance");
+        }
+        return true;
+      };
   const int64_t before_rejection =
       HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
   prefill.admit_prefill(rejected, &stub);
@@ -2380,6 +2487,9 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
     prefill.prefill_completion().get();
     prefill.wait_notifications();
   }
+  EXPECT_EQ(rejected_callbacks.load(), 2);
+  EXPECT_TRUE(rejected->has_terminal_outcome());
+  EXPECT_FALSE(prefill.has_channel(rejected->request_id()));
   EXPECT_FALSE(rejected->state().timing->snapshot().server_ttft.valid);
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             before_rejection);
@@ -3066,7 +3176,8 @@ TEST(DisaggPDSchedulerTest, MtpExhaustionRollsBackKvReservation) {
 namespace {
 template <typename Scheduler>
 void check_prefill_response_completes_before_decode_handoff(
-    bool enable_service_routing = false) {
+    bool enable_service_routing,
+    bool prefill_text_withheld) {
   auto previous_perf_model = perf_model::get_perf_model();
   ScopeGuard restore_perf_model(
       [&] { perf_model::set_perf_model(previous_perf_model); });
@@ -3092,15 +3203,29 @@ void check_prefill_response_completes_before_decode_handoff(
   }
   auto request = make_request({11, 12}, "first-token-order");
   request->state().stream = true;
+  if (prefill_text_withheld) {
+    request->state().stopping_checker.set_stop_sequences({{7, 8}});
+  }
+  service.on_handoff_ =
+      [prefill_text_withheld](const proto::DisaggGenerationsRequests& gens) {
+        ASSERT_EQ(gens.multi_gens_size(), 1);
+        ASSERT_EQ(gens.multi_gens(0).tokens_size(), 1);
+        EXPECT_EQ(gens.multi_gens(0).tokens(0).prefill_text_withheld(),
+                  prefill_text_withheld);
+      };
   std::atomic<bool> first_token_observed{false};
   std::promise<void> response_started;
   auto started = response_started.get_future();
   std::promise<void> release_response;
   auto released = release_response.get_future().share();
-  auto observe_output = [&response_started, &first_token_observed, released](
-                            const RequestOutput& output) {
+  auto observe_output = [&response_started,
+                         &first_token_observed,
+                         released,
+                         prefill_text_withheld](const RequestOutput& output) {
     first_token_observed =
-        output.outputs.size() == 1 && output.outputs[0].text == "999";
+        output.outputs.size() == 1 &&
+        output.outputs[0].text == (prefill_text_withheld ? "" : "999") &&
+        output.outputs[0].token_ids == std::vector<int32_t>{999};
     response_started.set_value();
     released.wait();
     return true;
@@ -3162,17 +3287,25 @@ void check_prefill_response_completes_before_decode_handoff(
 }  // namespace
 
 TEST(DisaggPDSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
-  check_prefill_response_completes_before_decode_handoff<
-      TestDisaggPDScheduler>();
+  for (const bool prefill_text_withheld : {false, true}) {
+    check_prefill_response_completes_before_decode_handoff<
+        TestDisaggPDScheduler>(/*enable_service_routing=*/false,
+                               prefill_text_withheld);
+  }
 }
 
 TEST(PDOOCSchedulerTest, PrefillResponseCompletesBeforeDecodeHandoff) {
-  check_prefill_response_completes_before_decode_handoff<TestPDOOCScheduler>();
+  for (const bool prefill_text_withheld : {false, true}) {
+    check_prefill_response_completes_before_decode_handoff<TestPDOOCScheduler>(
+        /*enable_service_routing=*/false, prefill_text_withheld);
+  }
 }
 
 TEST(PDOOCSchedulerTest, BatchedPrefillResponseCompletesBeforeDecodeHandoff) {
-  check_prefill_response_completes_before_decode_handoff<TestPDOOCScheduler>(
-      /*enable_service_routing=*/true);
+  for (const bool prefill_text_withheld : {false, true}) {
+    check_prefill_response_completes_before_decode_handoff<TestPDOOCScheduler>(
+        /*enable_service_routing=*/true, prefill_text_withheld);
+  }
 }
 
 TEST(PDOOCSchedulerTest, BatchHandoffDoesNotWaitForLaterResponses) {

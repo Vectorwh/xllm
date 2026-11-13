@@ -997,8 +997,8 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       kv_cache_manager_->deallocate(request.get());
     };
     // Release the Decode reservation when handoff preparation or the
-    // FirstGeneration RPC fails. Non-stream requests already received their
-    // prefill response, so only shared cleanup is performed for them.
+    // FirstGeneration RPC fails. The non-stream Prefill response is only a
+    // phase output (finished=false), so failure must send a terminal error.
     auto fail_handoff_request = [this, &fail_request](
                                     const std::shared_ptr<Request>& request,
                                     Status status) {
@@ -1007,9 +1007,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         fail_request(request, status);
         return;
       }
-      response_processor_->process_failed_request(request,
-                                                  status,
-                                                  /*send_response=*/false);
+      response_processor_->process_failed_request(request, status);
       response_processor_->wait_completion();
       kv_cache_manager_->deallocate(request.get());
     };
@@ -1038,6 +1036,8 @@ void DisaggPDScheduler::prefill_send_first_generation() {
             request->sequences()[0]->first_token().value().token_id);
         token->set_time_to_first_token_latency_seconds(
             request->sequences()[0]->time_to_first_token_latency_seconds());
+        token->set_prefill_text_withheld(
+            request->sequences()[0]->prefill_text_withheld());
         if (request->sequences()[0]
                 ->first_token()
                 .value()
@@ -1426,6 +1426,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     std::vector<KVTransferMapping> source_mappings,
     int32_t src_dp_size,
     int32_t src_dp_rank,
+    bool prefill_text_withheld,
     torch::Tensor mtp_bootstrap_embedding,
     int32_t num_cached_tokens,
     const proto::RequestPhaseTiming* phase_timing) {
@@ -1503,7 +1504,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
   // Enable checking whether to skip the prefill token
   if (request->state().stream) {
-    sequence->enable_checking_prefill_token();
+    sequence->enable_checking_prefill_token(prefill_text_withheld);
   }
 
   // update latency metrics

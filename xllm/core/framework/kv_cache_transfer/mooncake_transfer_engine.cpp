@@ -134,7 +134,24 @@ bool wait_batch(TransferEngine* engine, BatchID batch_id) {
 // MooncakeTransferEngineCore (Singleton)
 // ============================================================================
 
-MooncakeTransferEngineCore::~MooncakeTransferEngineCore() {
+MooncakeTransferEngineCore::~MooncakeTransferEngineCore() { shutdown(); }
+
+void MooncakeTransferEngineCore::shutdown() {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  bool stop_server = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stop_server = initialized_;
+  }
+  if (stop_server) {
+    // Session RPC handlers acquire mutex_. Let them finish before taking it
+    // to clear shared state; holding it across Join would deadlock.
+    server_.Stop(0);
+    server_.Join();
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  server_.ClearServices();
+  service_.reset();
   for (auto& pair : stub_map_) {
     if (pair.second != nullptr) {
       delete pair.second->channel();
@@ -142,15 +159,16 @@ MooncakeTransferEngineCore::~MooncakeTransferEngineCore() {
     }
   }
   stub_map_.clear();
-
-  if (initialized_) {
-    server_.Stop(0);
-    server_.Join();
-  }
+  handles_.clear();
+  cache_peer_links_.clear();
+  local_cache_layout_.reset();
+  engine_.reset();
+  initialized_ = false;
 }
 
 bool MooncakeTransferEngineCore::initialize(uint16_t listen_port,
                                             const torch::Device& device) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (initialized_) {
@@ -212,6 +230,10 @@ bool MooncakeTransferEngineCore::open_session(const uint64_t cluster_id,
                                               bool increment_existing) {
   std::lock_guard<std::mutex> lock(mutex_);
 
+  if (engine_ == nullptr) {
+    LOG(ERROR) << "Mooncake engine is not initialized.";
+    return false;
+  }
   LOG(INFO) << "open_session, cluster_id=" << cluster_id
             << ", remote_addr=" << remote_addr;
 
@@ -284,7 +306,8 @@ void MooncakeTransferEngineCore::release_session_locked(
   if (it->second.ref_count > 0) {
     return;
   }
-  if (it->second.handle != static_cast<SegmentHandle>(-1)) {
+  if (engine_ != nullptr &&
+      it->second.handle != static_cast<SegmentHandle>(-1)) {
     engine_->closeSegment(it->second.handle);
   }
   handles_.erase(it);
@@ -294,6 +317,9 @@ bool MooncakeTransferEngineCore::close_session(const uint64_t cluster_id,
                                                const std::string& remote_addr) {
   std::unique_lock<std::mutex> lock(mutex_);
 
+  if (engine_ == nullptr) {
+    return true;
+  }
   LOG(INFO) << "close_session, cluster_id=" << cluster_id
             << ", remote_addr=" << remote_addr;
 
@@ -662,6 +688,10 @@ bool MooncakeTransferEngine::register_memory(std::vector<void*> addrs,
   }
 
   TransferEngine* engine = core_.engine();
+  if (engine == nullptr) {
+    LOG(ERROR) << "Cannot register memory without a Mooncake engine.";
+    return false;
+  }
   for (size_t i = 0; i < addrs.size(); ++i) {
     int32_t ret = engine->registerLocalMemory(
         addrs[i], lens[i], kWildcardLocation, true, true);
@@ -1074,6 +1104,10 @@ bool MooncakeTransferEngine::move_memory_regions(
   }
 
   TransferEngine* engine = core_.engine();
+  if (engine == nullptr) {
+    LOG(ERROR) << "Cannot transfer memory without a Mooncake engine.";
+    return false;
+  }
   std::shared_ptr<TransferMetadata::SegmentDesc> remote_segment_desc =
       engine->getMetadata()->getSegmentDescByID(remote_handle);
   if (!remote_segment_desc) {

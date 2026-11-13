@@ -188,20 +188,22 @@ void receive_prefill(TestPDScheduler& scheduler,
                      std::shared_ptr<Request>& request) {
   ASSERT_EQ(scheduler.try_admit(request), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
-  ASSERT_TRUE(scheduler.decode_recv_first_generation(request->request_id(),
-                                                     42,
-                                                     false,
-                                                     0.0f,
-                                                     0.1,
-                                                     0.0,
-                                                     {},
-                                                     {},
-                                                     "PUSH",
-                                                     {},
-                                                     {},
-                                                     {},
-                                                     1,
-                                                     0));
+  ASSERT_TRUE(
+      scheduler.decode_recv_first_generation(request->request_id(),
+                                             42,
+                                             false,
+                                             0.0f,
+                                             0.1,
+                                             0.0,
+                                             {},
+                                             {},
+                                             "PUSH",
+                                             {},
+                                             {},
+                                             {},
+                                             1,
+                                             0,
+                                             /*prefill_text_withheld=*/false));
 }
 
 enum class PendingRequestExit : int8_t { FINISHED, CANCELLED, FAILED };

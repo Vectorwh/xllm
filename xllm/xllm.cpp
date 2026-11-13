@@ -59,6 +59,9 @@ limitations under the License.
 #include "core/framework/lora/lora_config.h"
 #include "core/framework/lora/lora_runtime.h"
 #include "core/framework/model/model_args.h"
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#include "core/framework/kv_cache_transfer/mooncake_transfer_engine.h"
+#endif
 #include "core/framework/xtensor/global_xtensor.h"
 #include "core/framework/xtensor/options.h"
 #include "core/framework/xtensor/xtensor_allocator.h"
@@ -772,6 +775,11 @@ int run() {
   // release pybind11 type objects without the GIL (see
   // exit_without_python_teardown).
   master.reset();
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  // Transfer users have stopped. Release the shared transport explicitly;
+  // Coding's hard exit intentionally skips Python and static teardown.
+  MooncakeTransferEngineCore::get_instance().shutdown();
+#endif
   exit_without_python_teardown(0);
 }
 

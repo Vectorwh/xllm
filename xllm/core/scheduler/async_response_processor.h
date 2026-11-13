@@ -39,12 +39,12 @@ class AsyncResponseProcessor final {
       std::function<void(std::shared_ptr<Request>)> cancel_request);
   ~AsyncResponseProcessor();
 
+  // terminal=false is only a PD Prefill handoff after Decode admission.
+  // Ordinary completion keeps the default true, independent of service routing.
   void process_completed_request(std::shared_ptr<Request> request,
                                  bool terminal = true);
 
-  void process_failed_request(std::shared_ptr<Request> request,
-                              Status status,
-                              bool send_response = true);
+  void process_failed_request(std::shared_ptr<Request> request, Status status);
 
   // in disagg pd mode, decode send requests' responses to prefill
   void process_completed_requests(

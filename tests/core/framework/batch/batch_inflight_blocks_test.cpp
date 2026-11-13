@@ -29,6 +29,33 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(ForwardEmptyInputTest, DefinedEmptyTensorsKeepDestinationWithoutArena) {
+  // Meta tensors exercise device placement without initializing an NPU.
+  const torch::Device destination(torch::kMeta);
+  const auto options = torch::TensorOptions().dtype(torch::kInt32);
+  ForwardInput input;
+  input.token_ids = torch::empty({0}, options);
+  input.positions = torch::empty({0}, options);
+  input.input_params.attention.device.kv_seq_lens = torch::empty({0}, options);
+  input.input_params.attention.device.block_tables =
+      torch::empty({0, 0}, options);
+  ForwardInput prepared;
+  ASSERT_TRUE(input.to_contiguous_input_buffer(destination, prepared));
+  EXPECT_TRUE(prepared.device_tensors_ready);
+  EXPECT_FALSE(prepared.device_input_buffer.defined());
+  for (const torch::Tensor& tensor :
+       {prepared.token_ids,
+        prepared.positions,
+        prepared.input_params.attention.device.kv_seq_lens,
+        prepared.input_params.attention.device.block_tables}) {
+    ASSERT_TRUE(tensor.defined());
+    EXPECT_EQ(tensor.device(), destination);
+    EXPECT_EQ(tensor.numel(), 0);
+  }
+  EXPECT_EQ(prepared.input_params.attention.device.block_tables.dim(), 2);
+  EXPECT_EQ(input.token_ids.device(), torch::Device(torch::kCPU));
+}
+
 class BatchInflightBlocksTest : public ::testing::Test {
  protected:
   Sequence make_sequence(size_t prompt_tokens) {

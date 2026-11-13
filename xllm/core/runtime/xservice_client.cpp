@@ -446,7 +446,7 @@ void XServiceClient::set_engine(Engine* engine) { engine_ = engine; }
 
 XServiceClient::~XServiceClient() { shutdown(); }
 
-void XServiceClient::shutdown() {
+void XServiceClient::stop_background_workers() {
   // Wake a registration/init wait before taking the lifecycle lock it owns.
   {
     std::lock_guard<std::mutex> lock(kv_event_wait_mutex_);
@@ -454,6 +454,10 @@ void XServiceClient::shutdown() {
   }
   kv_event_wait_cv_.notify_all();
   std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  stop_background_workers_locked();
+}
+
+void XServiceClient::stop_background_workers_locked() {
   LOG(INFO) << "XServiceClient background workers stopping...";
   {
     std::lock_guard<std::mutex> lock(kv_event_wait_mutex_);
@@ -481,6 +485,17 @@ void XServiceClient::shutdown() {
   heartbeat_thread_.reset();
   reconcile_thread_.reset();
   kv_event_thread_.reset();
+}
+
+void XServiceClient::shutdown() {
+  // Wake a registration/init wait before taking the lifecycle lock it owns.
+  {
+    std::lock_guard<std::mutex> lock(kv_event_wait_mutex_);
+    exited_.store(true, std::memory_order_release);
+  }
+  kv_event_wait_cv_.notify_all();
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  stop_background_workers_locked();
 
   {
     std::lock_guard<std::mutex> lock(registration_mutex_);

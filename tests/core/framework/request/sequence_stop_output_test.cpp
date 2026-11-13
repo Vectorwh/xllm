@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -62,6 +62,25 @@ class DelayedStopAwareTokenizer final : public Tokenizer {
   StopAwareTokenizer tokenizer_;
 };
 
+class ByteFallbackTokenizer final : public Tokenizer {
+ public:
+  std::string decode(const Slice<int32_t>& ids,
+                     bool skip_special_tokens) const override {
+    if (ids.size() == 2 && ids[0] == kFirstByteTokenId &&
+        ids[1] == kLastByteTokenId) {
+      return "\xE4\xBD\xA0";
+    }
+    if (ids.size() == 1 &&
+        (ids[0] == kFirstByteTokenId || ids[0] == kLastByteTokenId)) {
+      return "\xEF\xBF\xBD";
+    }
+    return StopAwareTokenizer().decode(ids, skip_special_tokens);
+  }
+
+  static constexpr int32_t kFirstByteTokenId = 1001;
+  static constexpr int32_t kLastByteTokenId = 1002;
+};
+
 class SequenceStopOutputTest : public ::testing::Test {
  protected:
   void initialize(size_t max_generated_tokens,
@@ -71,7 +90,8 @@ class SequenceStopOutputTest : public ::testing::Test {
                   bool include_stop_str_in_output = false,
                   int32_t eos_token = -1,
                   bool skip_special_tokens = false,
-                  bool logprobs = false) {
+                  bool logprobs = false,
+                  bool enable_schedule_overlap = false) {
     stopping_checker_ = StoppingChecker(max_generated_tokens,
                                         /*max_context_len=*/0,
                                         eos_token,
@@ -86,7 +106,7 @@ class SequenceStopOutputTest : public ::testing::Test {
     params.include_stop_str_in_output = include_stop_str_in_output;
     params.logprobs = logprobs;
     params.streaming = false;
-    params.enable_schedule_overlap = false;
+    params.enable_schedule_overlap = enable_schedule_overlap;
     params.rec_type = RecType::kNone;
     params.bos_token_id = 0;
     params.request_id = "stop_output_test";
@@ -123,6 +143,82 @@ class SequenceStopOutputTest : public ::testing::Test {
   std::unique_ptr<Sequence> sequence_;
   StopAwareTokenizer tokenizer_;
 };
+
+TEST_F(SequenceStopOutputTest,
+       DecodeStreamCompletesPrefillBytesWithoutRepeatingMetadata) {
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{},
+             /*prompt_tokens=*/{'P'},
+             /*include_stop_str_in_output=*/false,
+             /*eos_token=*/-1,
+             /*skip_special_tokens=*/false,
+             /*logprobs=*/true);
+  ByteFallbackTokenizer tokenizer;
+  sequence_->enable_checking_prefill_token(/*prefill_text_withheld=*/false);
+  EXPECT_FALSE(sequence_->generate_streaming_output(1, tokenizer).has_value());
+  append_token(ByteFallbackTokenizer::kFirstByteTokenId, -0.1f);
+  append_token(ByteFallbackTokenizer::kLastByteTokenId, -0.2f);
+
+  auto output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer);
+  ASSERT_TRUE(output.has_value());
+  EXPECT_EQ(output->text, "\xE4\xBD\xA0");
+  ASSERT_EQ(output->token_ids.size(), 1);
+  EXPECT_EQ(output->token_ids[0], ByteFallbackTokenizer::kLastByteTokenId);
+  ASSERT_TRUE(output->logprobs.has_value());
+  ASSERT_EQ(output->logprobs->size(), 1);
+  EXPECT_EQ(output->logprobs->front().token_id,
+            ByteFallbackTokenizer::kLastByteTokenId);
+  EXPECT_EQ(sequence_->num_committed_generated_tokens(), 2);
+}
+
+TEST_F(SequenceStopOutputTest, DecodeReleasesTextWithheldByPrefillStopWindow) {
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{{'X', 'Y'}},
+             /*prompt_tokens=*/{'P'},
+             /*include_stop_str_in_output=*/false,
+             /*eos_token=*/-1,
+             /*skip_special_tokens=*/false,
+             /*logprobs=*/true,
+             /*enable_schedule_overlap=*/true);
+  append_token(-1);
+  Token first_token('A');
+  first_token.logprob = -0.1f;
+  sequence_->update_last_step_token(first_token);
+  const bool prefill_text_withheld = sequence_->prefill_text_withheld();
+  ASSERT_TRUE(prefill_text_withheld);
+  append_token(-1);
+  EXPECT_GT(sequence_->num_tokens(), sequence_->num_valid_tokens());
+  EXPECT_EQ(sequence_->prefill_text_withheld(), prefill_text_withheld);
+  // Decode consumes P's flag even when its physical token count includes a
+  // pending overlap slot. The placeholder must not release P's stop suffix.
+  sequence_->enable_checking_prefill_token(prefill_text_withheld);
+  EXPECT_FALSE(
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_)
+          .has_value());
+  Token second_token('B');
+  second_token.logprob = -0.2f;
+  sequence_->update_last_step_token(second_token);
+  append_token(-1);
+  auto output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+  ASSERT_TRUE(output.has_value());
+  EXPECT_EQ(output->text, "A");
+  EXPECT_EQ(output->token_ids, (std::vector<int32_t>{'B'}));
+  ASSERT_TRUE(output->logprobs.has_value());
+  ASSERT_EQ(output->logprobs->size(), 1u);
+  EXPECT_EQ(output->logprobs->front().token_id, 'B');
+  Token third_token('C');
+  third_token.logprob = -0.3f;
+  sequence_->update_last_step_token(third_token);
+  sequence_->finish();
+  auto terminal = sequence_->generate_streaming_output(4, tokenizer_);
+  ASSERT_TRUE(terminal.has_value());
+  EXPECT_EQ(terminal->text, "BC");
+  EXPECT_EQ(terminal->token_ids, (std::vector<int32_t>{'C'}));
+}
 
 TEST_F(SequenceStopOutputTest, EmbeddingsDoNotRecordDetokenizationLatency) {
   initialize(/*max_generated_tokens=*/8, /*stop_tokens=*/{});
@@ -547,15 +643,15 @@ TEST_F(SequenceStopOutputTest, PrefillTokenCheckToleratesWithheldStopSuffix) {
              /*stop_sequences=*/{stop_sequence});
   append_token('A');
   ASSERT_FALSE(sequence_->finished());
-  sequence_->enable_checking_prefill_token();
+  sequence_->enable_checking_prefill_token(/*prefill_text_withheld=*/false);
 
   // The only generated token is withheld, so the decoder gets a slice of length
-  // num_prompt_tokens and has no token to inspect.
+  // num_prompt_tokens and has no token to inspect. Prefill already emitted the
+  // token metadata, so there is no new output.
   auto output =
       sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
 
-  ASSERT_TRUE(output.has_value());
-  EXPECT_TRUE(output->text.empty());
+  EXPECT_FALSE(output.has_value());
 }
 
 // The deferred check must run once the token becomes visible. Clearing the flag
@@ -567,13 +663,12 @@ TEST_F(SequenceStopOutputTest, PrefillTokenCheckRunsOnceTokenIsVisible) {
              /*stop_tokens=*/{},
              /*stop_sequences=*/{stop_sequence});
   append_token('A');
-  sequence_->enable_checking_prefill_token();
+  sequence_->enable_checking_prefill_token(/*prefill_text_withheld=*/false);
 
   // Call 1: 'A' is withheld, so the check is deferred and nothing is emitted.
   auto first =
       sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
-  ASSERT_TRUE(first.has_value());
-  ASSERT_TRUE(first->text.empty());
+  EXPECT_FALSE(first.has_value());
 
   // Call 2: appending 'B' and 'C' releases 'A', so the deferred check runs and
   // skips the prefill token 'A'.
@@ -584,6 +679,7 @@ TEST_F(SequenceStopOutputTest, PrefillTokenCheckRunsOnceTokenIsVisible) {
 
   ASSERT_TRUE(second.has_value());
   EXPECT_EQ(second->text, "B");
+  EXPECT_EQ(second->token_ids, (std::vector<int32_t>{'B', 'C'}));
 }
 
 }  // namespace

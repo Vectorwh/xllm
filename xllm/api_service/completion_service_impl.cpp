@@ -80,7 +80,9 @@ bool send_delta_to_client_brpc(std::shared_ptr<CompletionCall> call,
 
   for (const auto& seq_output : output.outputs) {
     auto submission = call->token_submission();
-    if (!seq_output.text.empty()) {
+    // Byte fallback and stop withholding may commit tokens without text.
+    if (!seq_output.text.empty() ||
+        (seq_output.logprobs.has_value() && !seq_output.logprobs->empty())) {
       response.Clear();
       response.set_object("text_completion");
       response.set_id(request_id);

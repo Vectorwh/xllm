@@ -232,6 +232,14 @@ VLMMaster::~VLMMaster() {
   if (loop_thread_.joinable()) {
     loop_thread_.join();
   }
+  if (options_.enable_service_routing() && is_leader()) {
+    // Quiesce borrowed-pointer readers before destroying the scheduler; output
+    // RPC channels must remain alive until scheduler callbacks have drained.
+    XServiceClient* client = XServiceClient::get_instance();
+    client->stop_background_workers();
+    scheduler_.reset();
+    client->shutdown();
+  }
 }
 
 void VLMMaster::handle_request(std::string prompt,

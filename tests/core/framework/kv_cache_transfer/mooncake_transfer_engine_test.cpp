@@ -27,6 +27,7 @@ limitations under the License.
 #endif
 
 #include <algorithm>
+#include <barrier>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -464,6 +466,60 @@ TEST(KvRoleAxisTest, KeyValueAndIndexCarryIndependentShardDescriptors) {
   const uint64_t index_bytes = index.descriptor.spans[0].bytes_per_region;
   EXPECT_EQ(key_bytes, value_bytes);
   EXPECT_NE(index_bytes, key_bytes);
+}
+
+TEST(MooncakeTransferEngineTest,
+     ShutdownClearsPeerStateAndAllowsRepeatedCleanup) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  auto local = make_peer_manifest("shutdown-local", "shutdown", 1);
+  ASSERT_TRUE(core.set_local_cache_layout(local).ok());
+  ASSERT_TRUE(core.local_cache_layout().has_value());
+
+  core.shutdown();
+  std::barrier start(/*expected=*/3);
+  std::thread reader([&] {
+    start.arrive_and_wait();
+    for (int32_t i = 0; i < 128; ++i) {
+      const auto snapshot = core.local_cache_layout();
+      if (snapshot.has_value()) {
+        EXPECT_EQ(snapshot->incarnation_id, local.incarnation_id);
+        EXPECT_EQ(snapshot->layout_generation, local.layout_generation);
+      }
+      EXPECT_FALSE(core.is_initialized());
+      EXPECT_TRUE(core.close_session(/*cluster_id=*/0, "127.0.0.1:5001"));
+      EXPECT_EQ(core.get_handle("127.0.0.1:5001"),
+                static_cast<SegmentHandle>(-1));
+    }
+  });
+  std::thread cleanup([&] {
+    start.arrive_and_wait();
+    for (int32_t i = 0; i < 32; ++i) {
+      core.shutdown();
+    }
+  });
+  start.arrive_and_wait();
+  for (int32_t i = 0; i < 32; ++i) {
+    EXPECT_TRUE(core.set_local_cache_layout(local).ok());
+    core.shutdown();
+  }
+  reader.join();
+  cleanup.join();
+
+  EXPECT_FALSE(core.local_cache_layout().has_value());
+  EXPECT_FALSE(core.is_initialized());
+  EXPECT_EQ(core.engine(), nullptr);
+  core.shutdown();
+  EXPECT_TRUE(core.close_session(/*cluster_id=*/0, "127.0.0.1:5001"));
+  EXPECT_TRUE(core.close_session(/*cluster_id=*/1, "127.0.0.1:5001"));
+  EXPECT_FALSE(core.open_session(/*cluster_id=*/1, "127.0.0.1:5001"));
+  EXPECT_EQ(core.get_handle("127.0.0.1:5001"), static_cast<SegmentHandle>(-1));
+  MooncakeTransferEngine transfer(/*listen_port=*/0,
+                                  torch::Device(torch::kCPU));
+  EXPECT_FALSE(transfer.register_memory({}, {}, {}));
+  ByteRegion region;
+  region.length = 1;
+  EXPECT_FALSE(transfer.move_memory_regions(
+      "127.0.0.1:5001", {region}, MooncakeTransferEngine::MoveOpcode::WRITE));
 }
 
 TEST(MooncakeTransferEngineTest, LinksAllPcpSourcesWithOneActiveOwner) {

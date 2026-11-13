@@ -54,6 +54,9 @@ class XServiceClient {
             BlockManagerPool* block_manager_pool = nullptr,
             const std::string& etcd_namespace = "");
   void shutdown();
+  // Stop readers of borrowed scheduler/engine/cache pointers before their
+  // owners are destroyed. Keep output RPC channels alive while callbacks drain.
+  void stop_background_workers();
   void set_scheduler(Scheduler* scheduler);
   void set_engine(Engine* engine);
   bool initialize_done() { return initialize_done_.load() && !exited_.load(); }
@@ -74,6 +77,8 @@ class XServiceClient {
       const proto::KVCacheSnapshotRequest& request);
 
  private:
+  // lifecycle_mutex_ must be held; output channels remain alive for callbacks.
+  void stop_background_workers_locked();
   bool register_instance_with_retry(const std::string& key,
                                     const std::string& value);
   bool reconcile_registration();

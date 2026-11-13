@@ -827,7 +827,8 @@ TEST_F(RequestTokenResponseTest, PDCountsPromptAndCompletionOnce) {
       if (stream) {
         processor_.process_stream_request(prefill);
         processor_.wait_completion();
-        decode->sequences()[0]->enable_checking_prefill_token();
+        decode->sequences()[0]->enable_checking_prefill_token(
+            prefill->sequences()[0]->prefill_text_withheld());
         processor_.process_stream_request(decode);
       } else {
         processor_.process_completed_request(prefill, /*terminal=*/false);

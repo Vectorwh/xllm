@@ -1695,6 +1695,8 @@ void PDOOCScheduler::prefill_send_first_generation() {
         auto token = gen->mutable_tokens()->Add();
         token->set_token_id(
             request->sequences()[0]->first_token().value().token_id);
+        token->set_prefill_text_withheld(
+            request->sequences()[0]->prefill_text_withheld());
         token->set_time_to_first_token_latency_seconds(
             request->sequences()[0]->time_to_first_token_latency_seconds());
         if (request->sequences()[0]
@@ -1855,8 +1857,9 @@ bool PDOOCScheduler::decode_recv_multi_generations(
   });
 
   // Enable checking whether to skip the prefill token
-  if (request->state().stream) {
-    request->sequences()[0]->enable_checking_prefill_token();
+  if (request->state().stream && !migration_tokens.empty()) {
+    request->sequences()[0]->enable_checking_prefill_token(
+        migration_tokens.front().prefill_text_withheld());
   }
 
   double time_to_first_token_latency_seconds = 0.0;
@@ -2295,6 +2298,8 @@ void PDOOCScheduler::prefill_send_multi_generations() {
         auto remote_token = multi_req->mutable_tokens()->Add();
         remote_token->set_token_id(generated_token_ids[token_index]);
         remote_token->set_has_logprob(false);
+        remote_token->set_prefill_text_withheld(
+            sequence->prefill_text_withheld());
         if (token_index == 0) {
           remote_token->set_time_to_first_token_latency_seconds(
               sequence->time_to_first_token_latency_seconds());

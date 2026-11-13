@@ -389,6 +389,7 @@ class HostRestoreSchedulerTest : public ::testing::Test {
         /*source_mappings=*/{},
         /*src_dp_size=*/2,
         /*src_dp_rank=*/0,
+        /*prefill_text_withheld=*/false,
         speculative_tokens_ > 0 ? torch::zeros({1, 2}) : torch::Tensor());
   }
 

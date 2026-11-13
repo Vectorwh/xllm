@@ -101,6 +101,10 @@ bool AsyncResponseProcessor::prepare_completed_output(
   }
   if (!terminal && output->status.has_value() && output->status->ok()) {
     output->finished_on_prefill_instance = true;
+    // Completing P is a phase boundary, even when max_tokens=1 made its
+    // Sequence finished. D still owns the remote request's terminal output;
+    // closing it here would discard D's response and yield a header-only 200.
+    output->finished = false;
   }
   HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds,
                     static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
@@ -109,16 +113,12 @@ bool AsyncResponseProcessor::prepare_completed_output(
 
 void AsyncResponseProcessor::process_failed_request(
     std::shared_ptr<Request> request,
-    Status status,
-    bool send_response) {
+    Status status) {
   request->record_timing_failure(status);
   // schedule the response handling
-  auto runnable = [this, request, status = std::move(status), send_response]() {
+  auto runnable = [this, request, status = std::move(status)]() {
     if (!claim_and_log_terminal(
             *request, status, request->end_to_end_latency_seconds())) {
-      return;
-    }
-    if (!send_response) {
       return;
     }
     RequestOutput output;
@@ -126,7 +126,17 @@ void AsyncResponseProcessor::process_failed_request(
     output.service_request_id = request->service_request_id();
     output.target_xservice_addr = request->source_xservice_addr();
     output.status = status;
-    request->state().output_func(output);
+    auto send_output = [request, output = std::move(output)]() {
+      request->state().output_func(output);
+    };
+    if (enable_batch_response_ && !request->service_request_id().empty()) {
+      // A PD phase batch may already be preparing on this response worker.
+      // Deliver its terminal error on the same single FIFO RPC worker so it
+      // cannot overtake the phase callback and leave a late output at service.
+      rpc_threadpool_.schedule(std::move(send_output));
+    } else {
+      send_output();
+    }
   };
   schedule_on_response_thread(*request, std::move(runnable));
 }
@@ -164,8 +174,18 @@ void AsyncResponseProcessor::process_completed_request(
             *request, terminal, &generate_output_threadpool_, &req_output)) {
       return;
     }
-    const bool submitted = request->state().output_func(req_output);
-    request->record_token_output(req_output, submitted);
+    auto send_output = [request, req_output = std::move(req_output)]() {
+      const bool submitted = request->state().output_func(req_output);
+      request->record_token_output(req_output, submitted);
+    };
+    if (enable_batch_response_ && !request->service_request_id().empty()) {
+      // A queued stream batch may already own the final token. Deliver the
+      // terminal response after it, or Service closes before that token
+      // arrives.
+      rpc_threadpool_.schedule(std::move(send_output));
+    } else {
+      send_output();
+    }
   };
   schedule_on_response_thread(*request, std::move(runnable));
 }

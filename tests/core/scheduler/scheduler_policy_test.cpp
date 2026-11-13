@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -76,7 +77,8 @@ class FakeEngine : public Engine {
              int32_t block_size,
              bool enable_prefix_cache = false,
              bool enable_linear_attention = false,
-             int32_t speculative_tokens = 0) {
+             int32_t speculative_tokens = 0,
+             int32_t dp_size = 1) {
     BlockManagerPool::Options opt;
     opt.num_blocks_ = num_blocks;
     opt.block_size_ = block_size;
@@ -91,7 +93,7 @@ class FakeEngine : public Engine {
       model_args_.layer_types({"linear_attention"});
     }
     fake_tokenizer_ = std::make_unique<FakeTokenizer>();
-    fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, 1);
+    fake_block_manager_ = std::make_unique<BlockManagerPool>(opt, dp_size);
   }
   ForwardOutput step(std::vector<Batch>& batch) { return {}; }
   void update_last_step_result(std::vector<Batch>& batch) { NOT_IMPLEMENTED(); }
@@ -1238,6 +1240,65 @@ TEST(SchedulerPolicyTest, FirstScheduledCarriesRoundStartNotSelectionTime) {
       }
     }
   }
+}
+
+TEST(SchedulerPolicyTest, NonChunkedPrefillAssignsDpBeforeFairBudget) {
+  // BatchFactory fixes DP size on first use. Keep DP=4 isolated from other
+  // scheduler cases, and make an invalid-rank failure terminate this child.
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        alarm(5);
+        ScopedConfigValue<bool> fair_budget_guard(
+            SchedulerConfig::get_instance().enable_dp_fair_token_budget(),
+            true);
+        ScopedConfigValue<bool> chunked_prefill_guard(
+            SchedulerConfig::get_instance().enable_chunked_prefill(), false);
+        ScopedConfigValue<bool> mix_batch_guard(
+            SchedulerConfig::get_instance().enable_mix_batch(), false);
+        constexpr int32_t kDpSize = 4;
+        ContinuousScheduler::Options options = create_scheduler_options(
+            /*max_tokens_per_batch=*/64,
+            /*max_seqs_per_batch=*/4,
+            /*num_speculative_tokens=*/0,
+            /*max_tokens_per_chunk_for_prefill=*/64,
+            /*dp_size=*/kDpSize);
+        options.enable_chunked_prefill() = false;
+        options.enable_disagg_pd() = true;
+        options.instance_role() = InstanceRole::PREFILL;
+        auto engine = std::make_unique<FakeEngine>(
+            /*num_blocks=*/32,
+            /*block_size=*/16,
+            /*enable_prefix_cache=*/false,
+            /*enable_linear_attention=*/false,
+            /*speculative_tokens=*/0,
+            /*dp_size=*/kDpSize);
+        auto scheduler =
+            std::make_unique<ContinuousScheduler>(engine.get(), options);
+        auto requests = generate_request(/*prompt_lens=*/{16, 16},
+                                         /*max_tokens=*/{1, 1},
+                                         /*offlines=*/std::nullopt,
+                                         /*priorities=*/std::nullopt,
+                                         /*max_context_len=*/128);
+        ASSERT_EQ(requests[0]->sequences()[0]->dp_rank(), -1);
+        requests[1]->sequences()[0]->set_dp_rank(/*dp_rank=*/3);
+        scheduler->add_request(requests[0]);
+        scheduler->add_request(requests[1]);
+
+        std::vector<Batch> batches = scheduler->prepare_batch_test();
+
+        EXPECT_GE(requests[0]->sequences()[0]->dp_rank(), 0);
+        EXPECT_LT(requests[0]->sequences()[0]->dp_rank(), kDpSize);
+        EXPECT_EQ(requests[1]->sequences()[0]->dp_rank(), 3);
+        size_t scheduled_sequences = 0;
+        for (size_t dp_rank = 0; dp_rank < batches.size(); ++dp_rank) {
+          scheduled_sequences += batches[dp_rank].size();
+        }
+        EXPECT_EQ(scheduled_sequences, 2u);
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
 }
 
 TEST(SchedulerPolicyTest, UnifiedPrefixHitIncludesScheduledSuffixCapacity) {

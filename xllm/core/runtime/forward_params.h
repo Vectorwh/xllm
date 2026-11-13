@@ -538,6 +538,14 @@ struct ForwardInput {
                   torch::TensorOptions().dtype(torch::kUInt8).device(device),
                   true);
       plan.bind_device_views(inputs.device_input_buffer, device);
+    } else {
+      // Empty DP shards have no arena to bind, but their defined tensors
+      // must still be on the destination before device_tensors_ready is set.
+      for (const auto& entry : plan.entries) {
+        *entry.target = torch::empty(
+            entry.host_tensor.sizes(),
+            entry.host_tensor.options().device(device).pinned_memory(false));
+      }
     }
 
     inputs.device_tensors_ready = true;

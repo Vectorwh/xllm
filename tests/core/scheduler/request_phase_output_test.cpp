@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ limitations under the License.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
@@ -92,9 +93,11 @@ class PhaseTokenizer final : public Tokenizer {
   }
 };
 
-std::shared_ptr<Request> make_request(int32_t max_tokens = 2,
-                                      bool stream = false,
-                                      bool overlap = false) {
+std::shared_ptr<Request> make_request(
+    int32_t max_tokens = 2,
+    bool stream = false,
+    bool overlap = false,
+    const std::string& service_request_id = "") {
   RequestState state;
   state.prompt = "A";
   state.prompt_tokens = {1};
@@ -105,8 +108,8 @@ std::shared_ptr<Request> make_request(int32_t max_tokens = 2,
   state.enable_schedule_overlap = overlap;
   state.stopping_checker.set_max_generated_tokens(max_tokens);
   state.output_func = [](const RequestOutput&) { return true; };
-  auto request =
-      std::make_shared<Request>("phase-output", "", "", std::move(state));
+  auto request = std::make_shared<Request>(
+      "phase-output", "", "", std::move(state), service_request_id);
   request->state().timing =
       RequestTiming::start_ingress(request->state().timing, at_ms(0));
   request->state().timing->record_queued(at_ms(10));
@@ -135,6 +138,92 @@ void publish_concurrently(const std::shared_ptr<Request>& request,
   for (auto& callback : callbacks) {
     callback.join();
   }
+}
+
+TEST(RequestPhaseOutputTest,
+     SingleTokenCompletionDistinguishesPrefillPhaseFromTerminal) {
+  for (const bool service_routing : {false, true}) {
+    for (const bool terminal : {false, true}) {
+      SCOPED_TRACE(std::to_string(service_routing) + ":" +
+                   std::to_string(terminal));
+      PhaseTokenizer tokenizer;
+      AsyncResponseProcessor processor(&tokenizer,
+                                       InstanceRole::PREFILL,
+                                       service_routing,
+                                       /*disable_log_stats=*/true,
+                                       [](std::shared_ptr<Request>) {});
+      auto request = make_request(/*max_tokens=*/1);
+      commit_token(*request, /*token=*/65, /*milliseconds=*/30);
+      ASSERT_TRUE(request->finished());
+      std::vector<RequestOutput> received;
+      request->state().output_func = [&received](const RequestOutput& output) {
+        received.emplace_back(output);
+        return true;
+      };
+      if (terminal) {
+        // Non-PD callers use the default terminal completion, even when the
+        // processor's role is PREFILL and no Decode instance exists.
+        processor.process_completed_request(request);
+      } else {
+        processor.process_completed_request(request, /*terminal=*/false);
+      }
+      processor.wait_completion();
+      ASSERT_EQ(received.size(), 1u);
+      EXPECT_EQ(received.front().finished_on_prefill_instance, !terminal);
+      EXPECT_EQ(received.front().finished, terminal);
+      EXPECT_EQ(request->has_terminal_outcome(), terminal);
+      ASSERT_EQ(received.front().outputs.size(), 1u);
+      EXPECT_EQ(received.front().outputs.front().text, "A");
+    }
+  }
+}
+
+TEST(RequestPhaseOutputTest, TerminalCompletionDoesNotOvertakeBatchedStream) {
+  PhaseTokenizer tokenizer;
+  std::promise<void> stream_started;
+  std::future<void> started = stream_started.get_future();
+  std::promise<void> release_stream;
+  std::future<void> release = release_stream.get_future();
+  std::promise<void> terminal_delivered;
+  std::future<void> terminal = terminal_delivered.get_future();
+  std::atomic<bool> stream_delivered{false};
+  AsyncResponseProcessor processor(&tokenizer,
+                                   InstanceRole::PREFILL,
+                                   /*enable_service_routing=*/true,
+                                   /*disable_log_stats=*/true,
+                                   [](std::shared_ptr<Request>) {});
+  auto request = make_request(/*max_tokens=*/1,
+                              /*stream=*/true,
+                              /*overlap=*/false,
+                              "service-phase-output");
+  commit_token(*request, /*token=*/65, /*milliseconds=*/30);
+  request->state().outputs_func =
+      [&](const std::vector<RequestOutput>& outputs) {
+        EXPECT_EQ(outputs.size(), 1u);
+        EXPECT_EQ(outputs.front().outputs.front().text, "A");
+        stream_started.set_value();
+        EXPECT_EQ(release.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        stream_delivered.store(true);
+        return std::vector<bool>{true};
+      };
+  request->state().output_func = [&](const RequestOutput& output) {
+    EXPECT_TRUE(stream_delivered.load());
+    EXPECT_TRUE(output.finished);
+    terminal_delivered.set_value();
+    return true;
+  };
+  std::vector<std::shared_ptr<Request>> requests{request};
+  processor.process_stream_requests(requests);
+  ASSERT_EQ(started.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  processor.process_completed_request(request);
+  EXPECT_EQ(terminal.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::timeout);
+  release_stream.set_value();
+  processor.wait_completion();
+  EXPECT_EQ(terminal.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
 }
 
 TEST(RequestPhaseOutputTest, LocalMetricsPrecedeResponseAndPublishOnce) {

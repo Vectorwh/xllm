@@ -119,12 +119,14 @@ bool send_tool_call_chunk(std::shared_ptr<ChatCall> call,
 }
 
 template <typename ChatCall>
-bool send_normal_text_chunk(std::shared_ptr<ChatCall> call,
-                            size_t index,
-                            const std::string& content,
-                            const std::string& request_id,
-                            int64_t created_time,
-                            const std::string& model) {
+bool send_normal_text_chunk(
+    std::shared_ptr<ChatCall> call,
+    size_t index,
+    const std::string& content,
+    const std::string& request_id,
+    int64_t created_time,
+    const std::string& model,
+    const std::optional<std::vector<LogProb>>& logprobs = std::nullopt) {
   auto& response = call->response();
   response.Clear();
   response.set_object("chat.completion.chunk");
@@ -136,6 +138,7 @@ bool send_normal_text_chunk(std::shared_ptr<ChatCall> call,
   choice->set_index(index);
   auto* delta = choice->mutable_delta();
   delta->set_content(content);
+  set_logprobs(choice, logprobs);
 
   return call->write(response);
 }
@@ -292,19 +295,31 @@ bool send_delta_to_client_brpc(
           return false;
         }
       } else {
-        response.Clear();
-        response.set_object("chat.completion.chunk");
-        response.set_id(request_id);
-        response.set_created(created_time);
-        response.set_model(model);
-        auto* choice = response.add_choices();
-        choice->set_index(index);
-        set_logprobs(choice, seq_output.logprobs);
-        auto* message = choice->mutable_delta();
-        message->set_content(cur_text);
-        if (!call->write(response)) {
+        if (!send_normal_text_chunk(call,
+                                    index,
+                                    cur_text,
+                                    request_id,
+                                    created_time,
+                                    model,
+                                    seq_output.logprobs)) {
           return false;
         }
+      }
+    }
+
+    // Token metadata is independent of decoded/parser-visible text. Emit it
+    // even while byte fallback, stop suppression or a parser buffers text.
+    if (seq_output.logprobs.has_value() && !seq_output.logprobs->empty() &&
+        (cur_text.empty() ||
+         (stream_parser && stream_parser->is_tool_call()))) {
+      if (!send_normal_text_chunk(call,
+                                  index,
+                                  /*content=*/"",
+                                  request_id,
+                                  created_time,
+                                  model,
+                                  seq_output.logprobs)) {
+        return false;
       }
     }
 

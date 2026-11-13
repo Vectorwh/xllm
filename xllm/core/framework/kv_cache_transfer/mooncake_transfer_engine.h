@@ -55,7 +55,16 @@ class MooncakeTransferEngineCore {
   // Initialize the shared core. Only the first call takes effect.
   bool initialize(uint16_t listen_port, const torch::Device& device);
 
-  TransferEngine* engine() { return engine_.get(); }
+  // Call after all transfer users have stopped, before device runtime teardown.
+  // Drains incoming RPCs before clearing session state. Repeated shutdown is
+  // safe, including before initialization.
+  void shutdown();
+
+  // Borrowed pointer: callers must finish using it before shutdown starts.
+  TransferEngine* engine() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return engine_.get();
+  }
 
   const std::string& addr() const { return addr_; }
   const std::string& host_ip() const { return host_ip_; }
@@ -93,7 +102,10 @@ class MooncakeTransferEngineCore {
   proto::MooncakeTransferEngineService_Stub* get_or_create_stub(
       uint64_t cluster_id);
 
-  bool is_initialized() const { return initialized_; }
+  bool is_initialized() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return initialized_;
+  }
 
  private:
   proto::MooncakeTransferEngineService_Stub* get_or_create_stub_locked(
@@ -107,6 +119,9 @@ class MooncakeTransferEngineCore {
   MooncakeTransferEngineCore& operator=(const MooncakeTransferEngineCore&) =
       delete;
 
+  // Serialize initialize/shutdown without holding session state across Join:
+  // RPC handlers need mutex_ while the server drains them.
+  std::mutex lifecycle_mutex_;
   mutable std::mutex mutex_;
   bool initialized_ = false;
 

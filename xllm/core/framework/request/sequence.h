@@ -456,8 +456,21 @@ class Sequence final {
 
   int32_t dp_rank() const { return dp_rank_; }
 
-  void enable_checking_prefill_token() {
-    decoder_.enable_checking_prefill_token();
+  // P uses the same stop-suppression bound as generate_streaming_output(),
+  // excluding overlap placeholders via num_valid_tokens(). D consumes the
+  // transferred flag instead of recomputing this bound from its local tokens.
+  bool prefill_text_withheld() const {
+    return get_decodable_token_count(num_valid_tokens()) <= num_prompt_tokens_;
+  }
+
+  void enable_checking_prefill_token(bool prefill_text_withheld) {
+    if (!prefill_text_withheld) {
+      decoder_.enable_checking_prefill_token();
+    }
+    // Prefill already emitted this token's metadata. Keep the text decoder
+    // independent so it can still complete an unfinished byte sequence.
+    stream_output_token_offset_ =
+        std::max(stream_output_token_offset_, num_prompt_tokens_ + 1);
   }
 
   // get all generated token IDs (excluding prompt tokens)
