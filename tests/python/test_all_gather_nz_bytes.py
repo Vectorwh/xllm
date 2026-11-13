@@ -14,7 +14,7 @@
 
 """Correctness: byte AllGather returns FRACTAL_NZ (K-axis storage concat).
 
-torchrun --nproc_per_node=2 --master_port=29671 tests/python/test_all_gather_nz_bytes.py
+torchrun --standalone --nproc_per_node=2 tests/python/test_all_gather_nz_bytes.py
 """
 
 from __future__ import annotations

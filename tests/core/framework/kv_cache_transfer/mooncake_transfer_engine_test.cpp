@@ -19,6 +19,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include "tests/core/framework/kv_cache_transfer/scoped_environment_variable.h"
+#include "tests/scoped_port_range.h"
 
 #if defined(USE_NPU)
 #include <signal.h>
@@ -2951,11 +2952,13 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   ASSERT_GE(remote_device_index, 0);
   ASSERT_NE(local_device_index, remote_device_index);
 
-  const int32_t local_listen_port = net::get_local_free_port();
-  int32_t remote_listen_port = net::get_local_free_port();
-  while (remote_listen_port == local_listen_port) {
-    remote_listen_port = net::get_local_free_port();
-  }
+  xllm::tests::ScopedPortRange local_rpc_ports;
+  xllm::tests::ScopedPortRange remote_rpc_ports;
+  const int32_t local_listen_port = local_rpc_ports.base_port();
+  const int32_t remote_listen_port = remote_rpc_ports.base_port();
+  // HCCL derives several listener ports from each process's base port.
+  xllm::tests::ScopedPortRange local_hccl_ports(/*count=*/64);
+  xllm::tests::ScopedPortRange remote_hccl_ports(/*count=*/64);
   ASSERT_GT(local_listen_port, 0);
   ASSERT_GT(remote_listen_port, 0);
 
@@ -2965,7 +2968,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   ASSERT_EQ(pipe(child_to_parent), 0);
   ScopedSigpipeIgnore sigpipe_guard;
   xllm::tests::ScopedEnvironmentVariable hccl_base_port("HCCL_IF_BASE_PORT");
-  ASSERT_TRUE(hccl_base_port.set("35439"));
+  ASSERT_TRUE(
+      hccl_base_port.set(std::to_string(remote_hccl_ports.base_port())));
 
   ASSERT_EQ(setenv(kPeerCommandFdEnv,
                    std::to_string(parent_to_child[0]).c_str(),
@@ -2984,6 +2988,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                    /*overwrite=*/1),
             0);
 
+  remote_rpc_ports.release();
+  remote_hccl_ports.release();
   const pid_t child_pid = fork();
   ASSERT_GE(child_pid, 0);
   if (child_pid == 0) {
@@ -2999,7 +3005,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
     _exit(127);
   }
 
-  ASSERT_TRUE(hccl_base_port.set("34439"));
+  ASSERT_TRUE(hccl_base_port.set(std::to_string(local_hccl_ports.release())));
+  local_rpc_ports.release();
 
   unsetenv(kPeerCommandFdEnv);
   unsetenv(kPeerStatusFdEnv);

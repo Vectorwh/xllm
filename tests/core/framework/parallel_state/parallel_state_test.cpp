@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "tests/scoped_port_range.h"
 
 #if defined(USE_MLU)
 #include "framework/parallel_state/mlu_process_group.h"
@@ -385,7 +386,7 @@ class ReduceScatterMultiDeviceTest : public ::testing::Test {
   void SetUp() override {
     // Initialize test parameters
     world_size_ = 2;
-    port_ = 29501;
+    port_ = xllm::tests::ScopedPortRange().release();
     host_ = "127.0.0.1";
     input_size_ = 8;
     hidden_dim_ = 128;
@@ -464,7 +465,7 @@ class AllGatherBaseMultiDeviceTest : public ::testing::Test {
  protected:
   void SetUp() override {
     world_size_ = 2;
-    port_ = 29531;
+    port_ = xllm::tests::ScopedPortRange().release();
     host_ = "127.0.0.1";
     input_size_ = 4;
     hidden_dim_ = 6;
@@ -529,7 +530,7 @@ class BroadcastMultiDeviceTest : public ::testing::Test {
  protected:
   void SetUp() override {
     world_size_ = 2;
-    port_ = 29551;
+    port_ = xllm::tests::ScopedPortRange().release();
     host_ = "127.0.0.1";
     numel_ = 16;
   }

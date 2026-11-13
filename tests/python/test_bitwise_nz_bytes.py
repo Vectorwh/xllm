@@ -19,7 +19,7 @@ Compares:
   2. NZ storage bytes vs format_cast(ND-AllGather) storage (bit exact)
   3. Transdata-back ND vs full_nd / ND-AllGather (torch.equal)
 
-  torchrun --nproc_per_node=2 --master_port=29681 tests/python/test_bitwise_nz_bytes.py
+  torchrun --standalone --nproc_per_node=2 tests/python/test_bitwise_nz_bytes.py
 """
 
 from __future__ import annotations

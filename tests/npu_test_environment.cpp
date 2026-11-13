@@ -21,6 +21,9 @@ limitations under the License.
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+
+#include "tests/scoped_port_range.h"
 
 namespace xllm::testing {
 
@@ -37,6 +40,17 @@ PyThreadState* g_saved_thread_state = nullptr;
 void init_npu_test_runtime() {
   if (Py_IsInitialized()) {
     return;
+  }
+
+  // Each CTest process gets a separate HCCL listener block; forked ranks
+  // inherit the same base. Preserve explicit caller configuration.
+  if (std::getenv("HCCL_IF_BASE_PORT") == nullptr) {
+    xllm::tests::ScopedPortRange hccl_ports(/*count=*/64);
+    const std::string base = std::to_string(hccl_ports.release());
+    if (setenv("HCCL_IF_BASE_PORT", base.c_str(), /*overwrite=*/0) != 0) {
+      std::fprintf(stderr, "Failed to configure HCCL test ports\n");
+      std::abort();
+    }
   }
 
   // 1. Tolerate ACL_ERROR_INTERNAL_ERROR — dump server may fail to start but

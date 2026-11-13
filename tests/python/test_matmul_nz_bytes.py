@@ -14,7 +14,7 @@
 
 """2-rank: K-axis AllGather NZ weight goes straight into matmul vs full NZ matmul.
 
-torchrun --nproc_per_node=2 --master_port=29701 tests/python/test_matmul_nz_bytes.py
+torchrun --standalone --nproc_per_node=2 tests/python/test_matmul_nz_bytes.py
 """
 
 from __future__ import annotations

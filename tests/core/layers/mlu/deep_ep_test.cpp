@@ -30,6 +30,7 @@ limitations under the License.
 #include "layers/mlu/tests_utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "tests/scoped_port_range.h"
 #include "util/tensor_helper.h"
 
 #if defined(USE_MLU)
@@ -229,7 +230,7 @@ class DeepEPMultiDeviceTest : public ::testing::Test {
  protected:
   void SetUp() override {
     world_size_ = 2;
-    port_ = 29500;
+    port_ = xllm::tests::ScopedPortRange().release();
     host_ = "127.0.0.1";
     token_size_ = 128;
     max_tokens_ = 64;
