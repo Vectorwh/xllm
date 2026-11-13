@@ -94,6 +94,7 @@ cc_library(
   SRCS
     worker_prefetch_session.cpp
   DEPS
+    :common
     :util
     torch
     brpc

@@ -1104,9 +1104,13 @@ std::vector<Block> Sequence::get_inflight_blocks() const {
 size_t Sequence::num_prefix_cache_tokens() const {
   const size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
                                         host_kv_state_.shared_tokens_num());
-  // A restored preempted sequence also matches its generated tokens; usage
-  // only reports cached prompt tokens.
-  return std::min(cached_tokens, num_prompt_tokens_);
+  // A Host probe may exceed the scheduler-selected restore budget. Only the
+  // retained usable boundary is a hit; raw shared aliases are not sufficient.
+  // This is the scheduler's logical cursor, including the selected Host restore
+  // before H2D completes, not merely the device's execution progress.
+  // A preempted restore can also match generation, which is not prompt usage.
+  const size_t usable_tokens = kv_cache_tokens_num();
+  return std::min({cached_tokens, num_prompt_tokens_, usable_tokens});
 }
 
 void Sequence::set_host_cache_match(size_t restore_tokens, size_t copy_units) {

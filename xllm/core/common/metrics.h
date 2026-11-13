@@ -18,9 +18,15 @@ limitations under the License.
 #include <bvar/bvar.h>
 #include <bvar/multi_dimension.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <limits>
+#include <mutex>
 #include <string>
+#include <utility>
 
 #include "common/macros.h"
 #include "util/timer.h"
@@ -64,22 +70,109 @@ inline constexpr char kFixedPrefetched[] = "fixed_prefetched";
 
 class AutoCounter final {
  public:
-  AutoCounter(bvar::Adder<double>& counter) : counter_(counter) {}
+  explicit AutoCounter(bvar::Adder<double>& counter,
+                       bvar::LatencyRecorder* latency = nullptr)
+      : counter_(counter), latency_(latency) {}
 
   ~AutoCounter() {
     // add the elapsed time to the counter
-    counter_ << timer_.elapsed_seconds();
+    const double seconds = timer_.elapsed_seconds();
+    counter_ << seconds;
+    if (latency_ != nullptr) {
+      *latency_ << static_cast<int64_t>(seconds * 1e6);
+    }
   }
 
  private:
   // NOLINTNEXTLINE
   bvar::Adder<double>& counter_;
+  bvar::LatencyRecorder* latency_ = nullptr;
 
   // the timer
   Timer timer_;
 };
 
-// Records one admitted request in the process-cumulative token hit rate.
+// Token-weighted rolling rate over the latest 60 one-second buckets. Both
+// values enter and leave the window together, never as independent rates or
+// averaged per-request percentages. Reads expire idle buckets too. The clock
+// is evaluated under the lock so concurrent updates cannot reorder buckets.
+class PrefixCacheHitWindow final {
+ public:
+  using Clock = std::chrono::steady_clock;
+  using ClockFunction = std::function<Clock::time_point()>;
+  static constexpr int64_t kWindowSeconds = 60;
+
+  explicit PrefixCacheHitWindow(ClockFunction clock = Clock::now)
+      : clock_(std::move(clock)) {}
+
+  void record(size_t prompt_tokens, size_t hit_tokens) {
+    if (prompt_tokens == 0 || hit_tokens > prompt_tokens) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int64_t second = current_second();
+    expire(second);
+    if (buckets_.empty() || buckets_.back().second != second) {
+      buckets_.push_back({second, 0.0, 0.0});
+    }
+    const double prompt = static_cast<double>(prompt_tokens);
+    const double hit = static_cast<double>(hit_tokens);
+    buckets_.back().prompt_tokens += prompt;
+    buckets_.back().hit_tokens += hit;
+    prompt_tokens_ += prompt;
+    hit_tokens_ += hit;
+  }
+
+  double hit_rate() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    expire(current_second());
+    return prompt_tokens_ > 0.0 ? hit_tokens_ * 100.0 / prompt_tokens_
+                                : std::numeric_limits<double>::quiet_NaN();
+  }
+
+  bool has_samples() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    expire(current_second());
+    return prompt_tokens_ > 0.0;
+  }
+
+ private:
+  struct Bucket final {
+    int64_t second;
+    double prompt_tokens;
+    double hit_tokens;
+  };
+
+  int64_t current_second() const {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               clock_().time_since_epoch())
+        .count();
+  }
+
+  void expire(int64_t second) {
+    const int64_t cutoff = second - kWindowSeconds;
+    while (!buckets_.empty() && buckets_.front().second <= cutoff) {
+      prompt_tokens_ -= buckets_.front().prompt_tokens;
+      hit_tokens_ -= buckets_.front().hit_tokens;
+      buckets_.pop_front();
+    }
+    if (buckets_.empty()) {
+      prompt_tokens_ = 0.0;
+      hit_tokens_ = 0.0;
+    }
+  }
+
+  ClockFunction clock_;
+  std::mutex mutex_;
+  std::deque<Bucket> buckets_;
+  double prompt_tokens_ = 0.0;
+  double hit_tokens_ = 0.0;
+};
+
+// Records a paired prompt/hit sample at the first resolved allocation of each
+// local prefix-cache stage. PD roles are stage samples, not unique requests.
+// Cumulative and rolling rates share the same token-weighted sample.
+// Reject invalid pairs from both aggregates, retaining their diagnostic count.
 void record_prefix_cache_hit_metrics(size_t prompt_tokens, size_t hit_tokens);
 
 // Set a labeled gauge, reporting failures instead of silently dropping a
@@ -121,6 +214,13 @@ void set_multi_gauge_value(
 // example: AUTO_COUNTER(a_counter_name);
 #define AUTO_COUNTER(name) \
   xllm::AutoCounter SAFE_CONCAT(name, __LINE__)(COUNTER_##name);
+
+// One elapsed-time sample drives both the existing cumulative timer and the
+// new operation count/avg/P99 recorder, including early returns.
+#define AUTO_PREFIX_CACHE_COUNTER(operation)                              \
+  xllm::AutoCounter SAFE_CONCAT(prefix_cache_operation_timer_, __LINE__)( \
+      COUNTER_prefix_cache_latency_seconds_##operation,                   \
+      &HISTOGRAM_prefix_cache_operation_latency_microseconds_##operation);
 
 // define histogram (using bvar::LatencyRecorder for latency measurements)
 #define DEFINE_HISTOGRAM(name, desc) \
@@ -271,8 +371,39 @@ DECLARE_HISTOGRAM(encoder_cache_hit_rate);
 DECLARE_COUNTER(prefix_cache_latency_seconds_insert);
 DECLARE_COUNTER(prefix_cache_latency_seconds_match);
 DECLARE_COUNTER(prefix_cache_latency_seconds_evict);
+DECLARE_HISTOGRAM(prefix_cache_operation_latency_microseconds_insert);
+DECLARE_HISTOGRAM(prefix_cache_operation_latency_microseconds_match);
+DECLARE_HISTOGRAM(prefix_cache_operation_latency_microseconds_evict);
+DECLARE_COUNTER(prefix_cache_invalid_hit_samples_total);
 DECLARE_COUNTER(prefix_cache_prompt_tokens_total);
 DECLARE_COUNTER(prefix_cache_hit_tokens_total);
+
+// Store prefetch diagnostics; distinct from mooncake_transfer_* and prefix
+// cache hit counters. Each process exports its own Master or Worker work.
+DECLARE_MULTI_COUNTER(store_prefetch_master_sessions_total);
+DECLARE_COUNTER(store_prefetch_master_prompt_tokens_total);
+DECLARE_COUNTER(store_prefetch_master_host_hit_tokens_total);
+DECLARE_COUNTER(store_prefetch_master_target_tokens_total);
+DECLARE_COUNTER(store_prefetch_master_fetched_tokens_total);
+DECLARE_HISTOGRAM(store_prefetch_master_latency_microseconds);
+DECLARE_MULTI_COUNTER(store_prefetch_worker_sessions_total);
+DECLARE_COUNTER(store_prefetch_worker_requested_units_total);
+DECLARE_COUNTER(store_prefetch_worker_executed_units_total);
+DECLARE_COUNTER(store_prefetch_worker_hit_units_total);
+DECLARE_COUNTER(store_prefetch_worker_requested_blocks_total);
+DECLARE_COUNTER(store_prefetch_worker_hit_blocks_total);
+extern bvar::Adder<uint64_t> COUNTER_store_prefetch_worker_read_bytes_total;
+// Integer counts avoid MultiDimension's default six-significant-digit
+// floating-point serialization rounding Store object/byte totals.
+extern bvar::MultiDimension<bvar::Adder<uint64_t>>
+    MULTI_COUNTER_store_prefetch_worker_read_tier_objects_total;
+extern bvar::MultiDimension<bvar::Adder<uint64_t>>
+    MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total;
+DECLARE_COUNTER(store_prefetch_worker_batches_total);
+DECLARE_MULTI_HISTOGRAM(store_prefetch_worker_latency_microseconds);
+DECLARE_MULTI_COUNTER(store_prefetch_worker_probe_sessions_total);
+DECLARE_COUNTER(store_prefetch_worker_probed_units_total);
+DECLARE_COUNTER(store_prefetch_worker_probed_present_units_total);
 DECLARE_COUNTER(allocate_blocks_latency_seconds);
 
 // Failed private-write allocation attempts, not failed requests.
@@ -288,6 +419,14 @@ DECLARE_COUNTER(detokenization_latency_seconds_stream);
 DECLARE_COUNTER(detokenization_latency_seconds_non_stream);
 
 DECLARE_GAUGE(prefix_cache_token_hit_rate_perc);
+// Latest 60 one-second buckets; expires on scrape even without new requests.
+extern bvar::PassiveStatus<double>
+    GAUGE_prefix_cache_token_hit_rate_window_perc;
+// 1 only while the current rolling window has a nonzero prompt denominator.
+// Empty-window rate is NaN, not a measured zero-hit rate. The NaN also avoids
+// fabricating zero hits when a request arrives between rate/valid scrapes.
+extern bvar::PassiveStatus<int64_t>
+    GAUGE_prefix_cache_token_hit_rate_window_valid;
 
 // total number of model execution operations
 DECLARE_COUNTER(num_model_execution_total_eager);

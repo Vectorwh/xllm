@@ -295,6 +295,7 @@ std::optional<std::vector<Block>> LinearStateBlockManager::allocate_prefill(
             seq->block_hashes(static_cast<uint32_t>(stride));
         CHECK(blocks->front().is_valid());
         blocks->front().set_hash_value(hashes[checkpoint_index - 1].data);
+        AUTO_PREFIX_CACHE_COUNTER(insert);
         prefix_cache_->insert(Slice<Block>(*blocks).slice(0, 1));
       }
     }

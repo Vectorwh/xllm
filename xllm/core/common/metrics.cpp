@@ -118,13 +118,73 @@ DEFINE_COUNTER(prefix_cache_latency_seconds_match,
                "Latency of prefix cache match in seconds");
 DEFINE_COUNTER(prefix_cache_latency_seconds_evict,
                "Latency of prefix cache evict in seconds");
+DEFINE_HISTOGRAM(prefix_cache_operation_latency_microseconds_insert,
+                 "Individual prefix-cache insert operation duration");
+DEFINE_HISTOGRAM(prefix_cache_operation_latency_microseconds_match,
+                 "Individual prefix-cache match operation duration");
+DEFINE_HISTOGRAM(prefix_cache_operation_latency_microseconds_evict,
+                 "Individual prefix-cache evict operation duration");
+DEFINE_COUNTER(prefix_cache_invalid_hit_samples_total,
+               "Rejected paired prefix-hit samples whose hits exceed prompt");
 
 DEFINE_COUNTER(prefix_cache_prompt_tokens_total,
-               "Process-cumulative prompt tokens for admitted requests");
+               "Prompt tokens paired with first-allocation stage prefix hits");
 DEFINE_COUNTER(prefix_cache_hit_tokens_total,
                "Process-cumulative prefix-cache hit tokens");
 DEFINE_GAUGE(prefix_cache_token_hit_rate_perc,
              "Process-cumulative prefix-cache token hit rate in percent");
+
+DEFINE_MULTI_COUNTER(store_prefetch_master_sessions_total,
+                     "stop_reason",
+                     "Measured Store prefetch sessions by bounded stop reason");
+DEFINE_COUNTER(store_prefetch_master_prompt_tokens_total,
+               "Prompt tokens in measured Master Store prefetch sessions");
+DEFINE_COUNTER(store_prefetch_master_host_hit_tokens_total,
+               "Host prefix tokens present before the measured Store GET");
+DEFINE_COUNTER(store_prefetch_master_target_tokens_total,
+               "Total cacheable target tokens, including the Host prefix");
+DEFINE_COUNTER(store_prefetch_master_fetched_tokens_total,
+               "Effective Store-fetched tokens retained for publication");
+DEFINE_HISTOGRAM(store_prefetch_master_latency_microseconds,
+                 "Master prefetch session duration including tier queries");
+DEFINE_MULTI_COUNTER(store_prefetch_worker_sessions_total,
+                     "status",
+                     "Measured Worker sessions: completed or failed");
+DEFINE_COUNTER(store_prefetch_worker_requested_units_total,
+               "Units requested for measured Worker sessions");
+DEFINE_COUNTER(store_prefetch_worker_executed_units_total,
+               "Real units attempted, excluding batch wire padding");
+DEFINE_COUNTER(store_prefetch_worker_hit_units_total,
+               "Gated-hit units, including reads beyond a prefix miss");
+DEFINE_COUNTER(store_prefetch_worker_requested_blocks_total,
+               "Logical blocks requested in executed GET batches");
+DEFINE_COUNTER(store_prefetch_worker_hit_blocks_total,
+               "Logical block GET hits, not reusable prefix tokens");
+// Successfully read physical bytes, including unusable tails. Integers retain
+// small increments at TiB-scale totals through all bvar serialization paths.
+bvar::Adder<uint64_t> COUNTER_store_prefetch_worker_read_bytes_total(
+    "store_prefetch_worker_read_bytes_total");
+bvar::MultiDimension<bvar::Adder<uint64_t>>
+    MULTI_COUNTER_store_prefetch_worker_read_tier_objects_total(
+        "store_prefetch_worker_read_tier_objects_total",
+        {"tier"});
+bvar::MultiDimension<bvar::Adder<uint64_t>>
+    MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total(
+        "store_prefetch_worker_read_tier_bytes_total",
+        {"tier"});
+DEFINE_COUNTER(store_prefetch_worker_batches_total,
+               "GET batches executed in measured Worker sessions");
+DEFINE_MULTI_HISTOGRAM(store_prefetch_worker_latency_microseconds,
+                       "stage",
+                       "Per-session queue_wait/get/tier_query/control_wait/"
+                       "total duration; total excludes post-close probing");
+DEFINE_MULTI_COUNTER(store_prefetch_worker_probe_sessions_total,
+                     "status",
+                     "Post-close probe results: complete, invalid or skipped");
+DEFINE_COUNTER(store_prefetch_worker_probed_units_total,
+               "Tail units probed, not additional GET or reusable prefix hits");
+DEFINE_COUNTER(store_prefetch_worker_probed_present_units_total,
+               "Present tail units in valid rank-local metadata snapshots");
 
 DEFINE_COUNTER(allocate_blocks_latency_seconds,
                "Latency of blocks allocation in seconds");
@@ -143,18 +203,38 @@ DEFINE_COUNTER(linear_decode_shared_write_slot_failures,
 namespace {
 
 std::mutex prefix_cache_hit_metrics_mutex;
+xllm::PrefixCacheHitWindow prefix_cache_hit_window;
 
 }  // namespace
+
+bvar::PassiveStatus<double> GAUGE_prefix_cache_token_hit_rate_window_perc(
+    "prefix_cache_token_hit_rate_window_perc",
+    [](void*) { return prefix_cache_hit_window.hit_rate(); },
+    nullptr);
+
+bvar::PassiveStatus<int64_t> GAUGE_prefix_cache_token_hit_rate_window_valid(
+    "prefix_cache_token_hit_rate_window_valid",
+    [](void*) -> int64_t {
+      return prefix_cache_hit_window.has_samples() ? 1 : 0;
+    },
+    nullptr);
 
 namespace xllm {
 
 void record_prefix_cache_hit_metrics(size_t prompt_tokens, size_t hit_tokens) {
+  if (hit_tokens > prompt_tokens) {
+    COUNTER_INC(prefix_cache_invalid_hit_samples_total);
+    LOG_EVERY_N(WARNING, 100)
+        << "Rejected paired prefix-cache hit sample: hit=" << hit_tokens
+        << ", prompt=" << prompt_tokens;
+    return;
+  }
   if (prompt_tokens == 0) {
     return;
   }
 
-  hit_tokens = std::min(hit_tokens, prompt_tokens);
   const std::lock_guard<std::mutex> lock(prefix_cache_hit_metrics_mutex);
+  prefix_cache_hit_window.record(prompt_tokens, hit_tokens);
   COUNTER_ADD(prefix_cache_prompt_tokens_total, prompt_tokens);
   COUNTER_ADD(prefix_cache_hit_tokens_total, hit_tokens);
   const double prompt_total = COUNTER_VALUE(prefix_cache_prompt_tokens_total);

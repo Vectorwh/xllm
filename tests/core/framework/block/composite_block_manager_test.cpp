@@ -2496,7 +2496,15 @@ TEST_P(LinearStateWindowTest, PrefillReusesTwoSlotsAcrossArbitraryChunks) {
   Sequence sequence = make_sequence(0, std::vector<int32_t>(13, 7));
   int32_t previous_write_id = -1;
   for (const size_t target : {3u, 5u, 8u, 12u, 13u}) {
+    SCOPED_TRACE(target);
+    const int64_t insert_before =
+        HISTOGRAM_prefix_cache_operation_latency_microseconds_insert.count();
     ASSERT_TRUE(manager->allocate_sequence(&sequence, target));
+    // Composite publishes KV after each forward; aligned sources (8/12) also
+    // insert one LINEAR checkpoint. Both must be counted exactly once.
+    EXPECT_EQ(
+        HISTOGRAM_prefix_cache_operation_latency_microseconds_insert.count(),
+        insert_before + (GetParam() ? (target > 3) + (target >= 12) : 0));
     const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
     ASSERT_EQ(blocks.size(), target == 3 ? 1u : 2u);
     if (previous_write_id >= 0) {

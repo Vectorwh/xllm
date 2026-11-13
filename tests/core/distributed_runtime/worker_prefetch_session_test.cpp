@@ -26,6 +26,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "common/metrics.h"
+
 namespace xllm {
 namespace {
 
@@ -49,7 +51,8 @@ class SessionHarness final {
   explicit SessionHarness(Get get = nullptr,
                           bool stats_enabled = true,
                           std::function<void()> before_close = nullptr,
-                          std::function<void()> before_write = nullptr) {
+                          std::function<void()> before_write = nullptr,
+                          bool capture_report = true) {
     if (stats_enabled) {
       stats_pool_ = std::make_unique<ThreadPool>(/*num_threads=*/1);
     }
@@ -104,14 +107,16 @@ class SessionHarness final {
           ++close_calls;
           session->on_closed(id);
         };
-    callbacks.report = [this](const PrefetchSessionReport& report) {
-      EXPECT_GT(close_calls.load(), 0);
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        reports.emplace_back(report);
-      }
-      changed_.notify_all();
-    };
+    if (capture_report) {
+      callbacks.report = [this](const PrefetchSessionReport& report) {
+        EXPECT_GT(close_calls.load(), 0);
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          reports.emplace_back(report);
+        }
+        changed_.notify_all();
+      };
+    }
     session = std::make_shared<WorkerPrefetchSession>(copy_pool_.get(),
                                                       stats_pool_.get(),
                                                       make_request(),
@@ -176,6 +181,35 @@ class SessionHarness final {
 };
 
 TEST(WorkerPrefetchSessionTest, ReportsShortFinalBatchAndEmptyTail) {
+  const double completed_before =
+      MULTI_COUNTER_VALUE(store_prefetch_worker_sessions_total, "completed");
+  const uint64_t bytes_before =
+      COUNTER_VALUE(store_prefetch_worker_read_bytes_total);
+  bvar::Adder<uint64_t>* memory_bytes =
+      MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total.get_stats(
+          {"memory"});
+  ASSERT_NE(memory_bytes, nullptr);
+  const uint64_t memory_before = memory_bytes->get_value();
+  std::vector<std::pair<bvar::Adder<double>*, double>> expected = {
+      {&COUNTER_store_prefetch_worker_requested_units_total, 5},
+      {&COUNTER_store_prefetch_worker_executed_units_total, 5},
+      {&COUNTER_store_prefetch_worker_hit_units_total, 5},
+      {&COUNTER_store_prefetch_worker_requested_blocks_total, 5},
+      {&COUNTER_store_prefetch_worker_hit_blocks_total, 5},
+      {&COUNTER_store_prefetch_worker_batches_total, 2}};
+  for (auto& [counter, value] : expected) {
+    value += counter->get_value();
+  }
+  std::vector<std::pair<bvar::LatencyRecorder*, int64_t>> latencies;
+  latencies.reserve(5);
+  for (const char* stage :
+       {"queue_wait", "get", "tier_query", "control_wait", "total"}) {
+    bvar::LatencyRecorder* latency =
+        MULTI_HISTOGRAM_store_prefetch_worker_latency_microseconds.get_stats(
+            {stage});
+    ASSERT_NE(latency, nullptr);
+    latencies.emplace_back(latency, latency->count());
+  }
   SessionHarness harness;
   harness.start();
   ASSERT_TRUE(harness.wait_writes(/*count=*/1));
@@ -196,9 +230,25 @@ TEST(WorkerPrefetchSessionTest, ReportsShortFinalBatchAndEmptyTail) {
   EXPECT_EQ(harness.probe_calls, 0);
   EXPECT_EQ(harness.writes.back(),
             std::vector<uint8_t>({1, 0, 0, 0, 1, 0, 0, 0}));
+  EXPECT_EQ(
+      MULTI_COUNTER_VALUE(store_prefetch_worker_sessions_total, "completed"),
+      completed_before + 1);
+  EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_read_bytes_total),
+            bytes_before + 500);
+  EXPECT_EQ(memory_bytes->get_value(), memory_before + 500);
+  for (const auto& [counter, value] : expected) {
+    EXPECT_EQ(counter->get_value(), value);
+  }
+  for (const auto& [latency, samples_before] : latencies) {
+    EXPECT_EQ(latency->count(), samples_before + 1);
+  }
 }
 
 TEST(WorkerPrefetchSessionTest, ProbesReadHitsAfterGatedMiss) {
+  const uint64_t bytes_before =
+      COUNTER_VALUE(store_prefetch_worker_read_bytes_total);
+  const double hit_before =
+      COUNTER_VALUE(store_prefetch_worker_hit_units_total);
   SessionHarness harness(
       [](Slice<BlockTransferInfo>& /*blocks*/, StoreGetStats* stats) {
         stats->read_bytes = 300;
@@ -213,9 +263,19 @@ TEST(WorkerPrefetchSessionTest, ProbesReadHitsAfterGatedMiss) {
   EXPECT_EQ(harness.reports.front().stats.probe_begin_unit, 2U);
   EXPECT_EQ(harness.reports.front().probed_present_units, 3U);
   EXPECT_EQ(harness.probe_ids, std::vector<int32_t>({2, 3, 4}));
+  EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_read_bytes_total),
+            bytes_before + 300);
+  EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_hit_units_total),
+            hit_before + 3);
+  EXPECT_EQ(harness.get_calls, 1);
+  EXPECT_EQ(harness.probe_calls, 1);
 }
 
 TEST(WorkerPrefetchSessionTest, InvalidProbeRetainsReadStatistics) {
+  const double invalid_before = MULTI_COUNTER_VALUE(
+      store_prefetch_worker_probe_sessions_total, "invalid");
+  const double present_before =
+      COUNTER_VALUE(store_prefetch_worker_probed_present_units_total);
   SessionHarness harness;
   harness.invalid_probe = true;
   harness.start();
@@ -227,9 +287,18 @@ TEST(WorkerPrefetchSessionTest, InvalidProbeRetainsReadStatistics) {
   EXPECT_FALSE(harness.reports.front().failed);
   EXPECT_EQ(harness.reports.front().stats.get.read_bytes, 400U);
   EXPECT_FALSE(harness.reports.front().probed_present_units.has_value());
+  EXPECT_EQ(MULTI_COUNTER_VALUE(store_prefetch_worker_probe_sessions_total,
+                                "invalid"),
+            invalid_before + 1);
+  EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_probed_present_units_total),
+            present_before);
 }
 
 TEST(WorkerPrefetchSessionTest, FailureWhileWaitingReportsOnceWithoutProbe) {
+  const double failed_before =
+      MULTI_COUNTER_VALUE(store_prefetch_worker_sessions_total, "failed");
+  const uint64_t bytes_before =
+      COUNTER_VALUE(store_prefetch_worker_read_bytes_total);
   SessionHarness harness;
   harness.start();
   ASSERT_TRUE(harness.wait_writes(/*count=*/1));
@@ -242,6 +311,10 @@ TEST(WorkerPrefetchSessionTest, FailureWhileWaitingReportsOnceWithoutProbe) {
   EXPECT_EQ(harness.reports.front().stats.get.read_bytes, 400U);
   EXPECT_FALSE(harness.reports.front().probed_present_units.has_value());
   EXPECT_EQ(harness.probe_calls, 0);
+  EXPECT_EQ(MULTI_COUNTER_VALUE(store_prefetch_worker_sessions_total, "failed"),
+            failed_before + 1);
+  EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_read_bytes_total),
+            bytes_before + 400);
 }
 
 TEST(WorkerPrefetchSessionTest, ShutdownWaitsForGetAndDrainsStatistics) {
@@ -459,15 +532,33 @@ TEST(WorkerPrefetchSessionTest, StopDuringGetCompletesAfterWritingResult) {
   EXPECT_EQ(harness.probe_ids, std::vector<int32_t>({4}));
 }
 
-TEST(WorkerPrefetchSessionTest, DisabledStatsSkipsQueriesAndReports) {
-  SessionHarness harness(/*get=*/nullptr, /*stats_enabled=*/false);
-  harness.start();
-  ASSERT_TRUE(harness.wait_writes(/*count=*/1));
-  EXPECT_EQ(harness.control(PrefetchControl::STOP), 0);
-  harness.drain();
-  EXPECT_TRUE(harness.reports.empty());
-  EXPECT_EQ(harness.probe_calls, 0);
-  EXPECT_EQ(harness.get_calls, 1);
+TEST(WorkerPrefetchSessionTest, ExportsOnlyEnabledStatsWithoutReportCallback) {
+  for (const bool enabled : {false, true}) {
+    SCOPED_TRACE(enabled);
+    const uint64_t bytes_before =
+        COUNTER_VALUE(store_prefetch_worker_read_bytes_total);
+    bvar::LatencyRecorder* latency =
+        MULTI_HISTOGRAM_store_prefetch_worker_latency_microseconds.get_stats(
+            {"total"});
+    ASSERT_NE(latency, nullptr);
+    const int64_t samples_before = latency->count();
+    SessionHarness harness(/*get=*/nullptr,
+                           /*stats_enabled=*/enabled,
+                           /*before_close=*/nullptr,
+                           /*before_write=*/nullptr,
+                           /*capture_report=*/!enabled);
+    harness.start();
+    const bool wrote = harness.wait_writes(/*count=*/1);
+    EXPECT_EQ(harness.control(PrefetchControl::STOP), 0);
+    harness.drain();
+    EXPECT_TRUE(wrote);
+    EXPECT_TRUE(harness.reports.empty());
+    EXPECT_EQ(harness.get_calls, 1);
+    EXPECT_EQ(harness.probe_calls, enabled ? 1 : 0);
+    EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_read_bytes_total),
+              bytes_before + (enabled ? 400 : 0));
+    EXPECT_EQ(latency->count(), samples_before + (enabled ? 1 : 0));
+  }
 }
 
 }  // namespace

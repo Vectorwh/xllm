@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "common/metrics.h"
@@ -125,20 +126,49 @@ TEST(RequestCachedTokensTest, RecordsCachedTokensFromPrefixCache) {
         MakeSequence(0, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9});
     ASSERT_TRUE(pool.allocate(&seq1));
     seq1.kv_state().set_kv_cache_tokens_num(seq1.num_prompt_tokens());
+    const int64_t insert_before =
+        HISTOGRAM_prefix_cache_operation_latency_microseconds_insert.count();
     pool.cache(&seq1);
+    EXPECT_EQ(
+        HISTOGRAM_prefix_cache_operation_latency_microseconds_insert.count(),
+        insert_before + 1);
 
     // Create a Request whose prompt overlaps with the cached prefix.
     auto request = MakeRequest({1, 2, 3, 4, 5, 6, 7, 8, 10});
     auto* seq = request->sequences()[0].get();
+    const double prompt_before =
+        COUNTER_VALUE(prefix_cache_prompt_tokens_total);
+    const double hit_before = COUNTER_VALUE(prefix_cache_hit_tokens_total);
+    const int64_t match_before =
+        HISTOGRAM_prefix_cache_operation_latency_microseconds_match.count();
     ASSERT_TRUE(pool.allocate(seq, seq->num_prompt_tokens()));
+    EXPECT_EQ(
+        HISTOGRAM_prefix_cache_operation_latency_microseconds_match.count(),
+        match_before + 1);
 
+    // Matching publishes the cursor synchronously, before the first forward.
+    EXPECT_EQ(seq->kv_state().kv_cache_tokens_num(), 8u);
     EXPECT_EQ(seq->num_prefix_cache_tokens(), 8u);
 
     request->record_num_prefix_cache_tokens();
     EXPECT_EQ(request->num_prefix_cache_tokens(), 8u);
+    EXPECT_EQ(COUNTER_VALUE(prefix_cache_prompt_tokens_total),
+              prompt_before + 9);
+    EXPECT_EQ(COUNTER_VALUE(prefix_cache_hit_tokens_total), hit_before + 8);
   }
 
+  const int64_t evict_before =
+      HISTOGRAM_prefix_cache_operation_latency_microseconds_evict.count();
   EvictPrefixCache(pool, options);
+  EXPECT_EQ(HISTOGRAM_prefix_cache_operation_latency_microseconds_evict.count(),
+            evict_before + 1);
+  for (const char* operation : {"insert", "match", "evict"}) {
+    const std::string prefix =
+        std::string("prefix_cache_operation_latency_microseconds_") + operation;
+    EXPECT_FALSE(bvar::Variable::describe_exposed(prefix + "_latency").empty());
+    EXPECT_FALSE(
+        bvar::Variable::describe_exposed(prefix + "_latency_99").empty());
+  }
 }
 
 TEST(RequestCachedTokensTest, CachedTokensSurvivesKVBlockRelease) {
@@ -266,7 +296,7 @@ TEST(RequestCachedTokensTest, RecordIsIdempotentWithMaxSemantics) {
   EvictPrefixCache(pool, options);
 }
 
-TEST(RequestCachedTokensTest, AdmissionRecordsFinalMaximumOnlyOnce) {
+TEST(RequestCachedTokensTest, InheritedUsageDoesNotBecomeALocalStageHit) {
   auto request = MakeRequest({1, 2, 3, 4, 5, 6, 7, 8, 9});
   const double prompt_before = COUNTER_VALUE(prefix_cache_prompt_tokens_total);
   const double hit_before = COUNTER_VALUE(prefix_cache_hit_tokens_total);
@@ -282,8 +312,12 @@ TEST(RequestCachedTokensTest, AdmissionRecordsFinalMaximumOnlyOnce) {
   EXPECT_EQ(request->num_prefix_cache_tokens(), 6U);
   EXPECT_DOUBLE_EQ(COUNTER_VALUE(prefix_cache_prompt_tokens_total),
                    prompt_before + 9.0);
-  EXPECT_DOUBLE_EQ(COUNTER_VALUE(prefix_cache_hit_tokens_total),
-                   hit_before + 6.0);
+  EXPECT_DOUBLE_EQ(COUNTER_VALUE(prefix_cache_hit_tokens_total), hit_before);
+  request->record_num_prefix_cache_tokens(/*num_prefix_cache_tokens=*/8);
+  request->record_num_prefix_cache_tokens();
+  EXPECT_EQ(request->num_prefix_cache_tokens(), 8U);
+  EXPECT_EQ(COUNTER_VALUE(prefix_cache_prompt_tokens_total), prompt_before + 9);
+  EXPECT_EQ(COUNTER_VALUE(prefix_cache_hit_tokens_total), hit_before);
 }
 
 TEST(RequestCachedTokensTest, CancelledOutputPreservesUsageAndStatus) {

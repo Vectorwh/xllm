@@ -705,8 +705,12 @@ void Request::record_num_prefix_cache_tokens() {
     return;
   }
 
-  record_prefix_cache_hit_metrics(state_.prompt_tokens.size(),
-                                  num_prefix_cache_tokens_);
+  // Capture both values at this stage's first resolved allocation. The usage
+  // maximum may include upstream PD hits or later rematches, neither of which
+  // belongs to this stage's paired monitoring event.
+  // Schedulers call after successful allocation/restore trimming; matching has
+  // already published the usable logical cursor, even if H2D is still pending.
+  record_prefix_cache_hit_metrics(state_.prompt_tokens.size(), current_max);
   prefix_cache_hit_metrics_recorded_ = true;
 }
 

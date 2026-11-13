@@ -37,6 +37,7 @@ limitations under the License.
 
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
+#include "common/metrics.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/composite_block_manager.h"
@@ -50,6 +51,7 @@ limitations under the License.
 #include "framework/sampling/sampling_params.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "util/env_var.h"
 
 namespace xllm {
 
@@ -1383,14 +1385,31 @@ TEST(HierarchyBlockManagerPoolTest, FlatKvRestoreBudgetRemainsBlockLinear) {
   auto& host = HierarchyPoolTestPeer::host_leaves(pool);
   seed_host_prefix(host.at(BlockType::KV).leaf.get(), tokens);
 
-  Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+  auto request = make_test_request(tokens);
+  Sequence& sequence = *request->sequences().front();
   pool.allocate_shared(&sequence);
+  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0u);
   EXPECT_EQ(sequence.kv_cache_tokens_num(), 1024u);
+  EXPECT_EQ(sequence.num_prefix_cache_tokens(), 1024u);
   EXPECT_EQ(sequence.host_cache_copy_units(), 8u);
 
+  const HostCacheRestorePoint selected =
+      pool.select_host_cache_restore(&sequence, /*max_copy_units=*/4);
+  pool.trim_host_cache(&sequence, selected);
+  // The scheduler's selected boundary is usable even while HBM is still zero.
+  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0u);
+  EXPECT_EQ(sequence.kv_cache_tokens_num(), 512u);
+  EXPECT_EQ(sequence.num_prefix_cache_tokens(), 512u);
+  const double prompt_before = COUNTER_VALUE(prefix_cache_prompt_tokens_total);
+  const double hit_before = COUNTER_VALUE(prefix_cache_hit_tokens_total);
   ASSERT_TRUE(allocate_with_host_cache_budget(
       &pool, &sequence, /*num_tokens=*/kPromptTokens, /*max_copy_units=*/4));
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 512u);
+  EXPECT_EQ(sequence.num_prefix_cache_tokens(), 512u);
+  request->record_num_prefix_cache_tokens();
+  EXPECT_EQ(COUNTER_VALUE(prefix_cache_prompt_tokens_total),
+            prompt_before + kPromptTokens);
+  EXPECT_EQ(COUNTER_VALUE(prefix_cache_hit_tokens_total), hit_before + 512);
   const std::vector<BlockTransferInfo> infos =
       HierarchyPoolTestPeer::pending_load_infos(pool);
   ASSERT_EQ(infos.size(), 4u);
@@ -1428,6 +1447,8 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0u);
   EXPECT_TRUE(HierarchyPoolTestPeer::pending_load_infos(pool).empty());
   EXPECT_FALSE(sequence.has_host_cache_match());
+
+  EXPECT_EQ(sequence.num_prefix_cache_tokens(), 0u);
 
   pool.deallocate(&sequence);
 }
@@ -3090,6 +3111,12 @@ TEST(HierarchyBlockManagerPoolTest,
 
 TEST(HierarchyBlockManagerPoolTest,
      StoragePrefetchPublishesOnlyAfterAllTpWorkersEnd) {
+  const double fetched_before =
+      COUNTER_VALUE(store_prefetch_master_fetched_tokens_total);
+  const double sessions_before =
+      MULTI_COUNTER_VALUE(store_prefetch_master_sessions_total, "complete");
+  const int64_t samples_before =
+      HISTOGRAM_store_prefetch_master_latency_microseconds.count();
   BlockManagerPool::Options options = make_flat_kv_options();
   options.enable_kvcache_store(true).prefetch_batch_size(2);
   FakePrefetchEngine engine(/*worker_count=*/2);
@@ -3113,6 +3140,8 @@ TEST(HierarchyBlockManagerPoolTest,
 
   engine.finish_worker(/*worker_index=*/0, /*hit_units=*/8);
   EXPECT_FALSE(completed);
+  EXPECT_EQ(HISTOGRAM_store_prefetch_master_latency_microseconds.count(),
+            samples_before);
   EXPECT_TRUE(sequence->host_kv_state().prefix_cache_matched());
   engine.finish_worker(/*worker_index=*/1, /*hit_units=*/8);
 
@@ -3125,6 +3154,14 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_FALSE(sequence->kv_state().has_any_blocks());
   EXPECT_EQ(sequence->host_kv_state().num_blocks(BlockType::KV), 8u);
   EXPECT_EQ(sequence->kv_cache_tokens_num(), 1024u);
+  const int64_t expected_samples = util::store_prefetch_stats_enabled() ? 1 : 0;
+  EXPECT_EQ(COUNTER_VALUE(store_prefetch_master_fetched_tokens_total),
+            fetched_before + expected_samples * 1024);
+  EXPECT_EQ(
+      MULTI_COUNTER_VALUE(store_prefetch_master_sessions_total, "complete"),
+      sessions_before + expected_samples);
+  EXPECT_EQ(HISTOGRAM_store_prefetch_master_latency_microseconds.count(),
+            samples_before + expected_samples);
   pool.deallocate(sequence);
 }
 

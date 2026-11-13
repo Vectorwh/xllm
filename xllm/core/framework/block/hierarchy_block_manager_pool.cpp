@@ -19,8 +19,10 @@ limitations under the License.
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <exception>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -29,6 +31,7 @@ limitations under the License.
 #include <unordered_set>
 
 #include "block_manager_impl.h"
+#include "common/metrics.h"
 #include "composite_block_manager.h"
 #include "concurrent_block_manager_impl.h"
 #include "core/framework/block/block_utils.h"
@@ -40,6 +43,36 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+int64_t prefetch_duration_from_ms(double duration_ms) {
+  if (!std::isfinite(duration_ms) || duration_ms <= 0.0) {
+    return 0;
+  }
+  const double duration_us = duration_ms * 1000.0;
+  if (duration_us >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  return static_cast<int64_t>(duration_us);
+}
+
+// Called only from the existing statistics-enabled finalization path. Tokens
+// are the published reusable prefix, not Worker GET volume.
+void record_store_prefetch_master_metrics(size_t prompt_tokens,
+                                          size_t host_hit_tokens,
+                                          size_t target_tokens,
+                                          size_t fetched_tokens,
+                                          double latency_ms,
+                                          PrefetchStopReason stop_reason) {
+  MULTI_COUNTER_ADD(store_prefetch_master_sessions_total,
+                    prefetch_stop_reason_name(stop_reason),
+                    1);
+  COUNTER_ADD(store_prefetch_master_prompt_tokens_total, prompt_tokens);
+  COUNTER_ADD(store_prefetch_master_host_hit_tokens_total, host_hit_tokens);
+  COUNTER_ADD(store_prefetch_master_target_tokens_total, target_tokens);
+  COUNTER_ADD(store_prefetch_master_fetched_tokens_total, fetched_tokens);
+  HISTOGRAM_OBSERVE(store_prefetch_master_latency_microseconds,
+                    prefetch_duration_from_ms(latency_ms));
+}
 
 void finalize_host_blocks(bool publish,
                           std::vector<Block> host_blocks,
@@ -1250,6 +1283,12 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
       const size_t fetched_tokens =
           publish ? final_tokens - std::min(final_tokens, base_tokens) : 0;
       request->record_store_prefetch(fetched_tokens, summary.latency_ms);
+      record_store_prefetch_master_metrics(sequence->num_prompt_tokens(),
+                                           base_tokens,
+                                           target_tokens,
+                                           fetched_tokens,
+                                           summary.latency_ms,
+                                           summary.stop_reason);
       log_prefetch_summary(*request,
                            *sequence,
                            dp_rank,

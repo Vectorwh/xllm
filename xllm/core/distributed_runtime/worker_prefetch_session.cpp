@@ -18,13 +18,91 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <array>
 #include <iomanip>
+#include <limits>
 #include <utility>
 
+#include "common/metrics.h"
 #include "framework/kv_cache_transfer/prefetch_tail_probe.h"
 
 namespace xllm {
 namespace {
+
+void add_store_prefetch_tier_counter(
+    bvar::MultiDimension<bvar::Adder<uint64_t>>& metric,
+    const char* tier,
+    uint64_t value) {
+  bvar::Adder<uint64_t>* counter = metric.get_stats({tier});
+  if (counter != nullptr) {
+    *counter << value;
+  }
+}
+
+int64_t prefetch_duration_us(uint64_t duration_us) {
+  return static_cast<int64_t>(std::min(
+      duration_us, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+}
+
+// One immutable snapshot per closed session, including failed sessions' reads.
+// Stage latencies are session sums; total excludes post-close metadata probing.
+void record_store_prefetch_worker_metrics(const PrefetchSessionReport& report,
+                                          size_t requested_units) {
+  const PrefetchWorkerStats& stats = report.stats;
+  MULTI_COUNTER_ADD(store_prefetch_worker_sessions_total,
+                    report.failed ? "failed" : "completed",
+                    1);
+  COUNTER_ADD(store_prefetch_worker_requested_units_total, requested_units);
+  COUNTER_ADD(store_prefetch_worker_executed_units_total, stats.executed_units);
+  COUNTER_ADD(store_prefetch_worker_hit_units_total, stats.hit_units);
+  COUNTER_ADD(store_prefetch_worker_requested_blocks_total,
+              stats.requested_blocks);
+  COUNTER_ADD(store_prefetch_worker_hit_blocks_total, stats.hit_blocks);
+  COUNTER_ADD(store_prefetch_worker_read_bytes_total, stats.get.read_bytes);
+  add_store_prefetch_tier_counter(
+      MULTI_COUNTER_store_prefetch_worker_read_tier_objects_total,
+      "memory",
+      stats.get.memory_objects);
+  add_store_prefetch_tier_counter(
+      MULTI_COUNTER_store_prefetch_worker_read_tier_objects_total,
+      "disk",
+      stats.get.disk_objects);
+  add_store_prefetch_tier_counter(
+      MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total,
+      "memory",
+      stats.get.memory_bytes);
+  add_store_prefetch_tier_counter(
+      MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total,
+      "disk",
+      stats.get.disk_bytes);
+  COUNTER_ADD(store_prefetch_worker_batches_total, stats.batches);
+  const std::array<std::pair<const char*, uint64_t>, 5> durations = {{
+      {"queue_wait", stats.queue_wait_us},
+      {"get", stats.get_us},
+      {"tier_query", stats.get.tier_query_us},
+      {"control_wait", stats.control_wait_us},
+      {"total", stats.total_us},
+  }};
+  for (const auto& [stage, duration] : durations) {
+    MULTI_HISTOGRAM_OBSERVE(store_prefetch_worker_latency_microseconds,
+                            stage,
+                            prefetch_duration_us(duration));
+  }
+  const char* probe_status =
+      report.failed
+          ? "skipped"
+          : (report.probed_present_units.has_value() ? "complete" : "invalid");
+  MULTI_COUNTER_ADD(
+      store_prefetch_worker_probe_sessions_total, probe_status, 1);
+  if (!report.failed) {
+    COUNTER_ADD(store_prefetch_worker_probed_units_total, report.probed_units);
+    if (report.probed_present_units.has_value()) {
+      COUNTER_ADD(store_prefetch_worker_probed_present_units_total,
+                  *report.probed_present_units);
+    }
+  }
+}
+
 double bytes_to_gib(uint64_t bytes) {
   return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
 }
@@ -347,6 +425,10 @@ void WorkerPrefetchSession::report_stats() const {
           probe.count_present_units(callbacks_.probe(probe_slice));
     }
   }
+  // report_ready() schedules this once and only with the existing statistics
+  // pool enabled. Export the same snapshot without another Store query, and
+  // preserve both the default log sink and injected diagnostic callbacks.
+  record_store_prefetch_worker_metrics(report, request_.unit_count());
   if (callbacks_.report != nullptr) {
     callbacks_.report(report);
   } else {

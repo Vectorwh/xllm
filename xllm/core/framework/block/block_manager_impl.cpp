@@ -138,7 +138,7 @@ bool BlockManagerImpl::has_enough_blocks(uint32_t num_blocks) {
   // try to evict some blocks from the prefix cache
   const uint32_t n_blocks_to_evict = num_blocks - num_free_blocks_;
 
-  AUTO_COUNTER(prefix_cache_latency_seconds_evict);
+  AUTO_PREFIX_CACHE_COUNTER(evict);
   const uint32_t n_blocks_evicted = prefix_cache_->evict(n_blocks_to_evict);
   if (n_blocks_evicted < n_blocks_to_evict) {
     return false;
@@ -187,7 +187,7 @@ std::vector<Block> BlockManagerImpl::allocate_shared(
   const Slice<Block>& existed =
       ignore_existed ? empty_blocks : existed_shared_blocks;
 
-  AUTO_COUNTER(prefix_cache_latency_seconds_match);
+  AUTO_PREFIX_CACHE_COUNTER(match);
   std::vector<Block> shared_blocks =
       prefix_cache_->match(match_tokens, existed, mm_data, block_hashes);
 
@@ -206,7 +206,7 @@ void BlockManagerImpl::cache(const Slice<int32_t>& token_ids,
                              const Slice<XXH3Key>& block_hashes) {
   if (options_.enable_prefix_cache()) {
     check_owned(blocks);
-    AUTO_COUNTER(prefix_cache_latency_seconds_insert);
+    AUTO_PREFIX_CACHE_COUNTER(insert);
     // Add the kv cache to the prefix cache
     prefix_cache_->insert(
         token_ids, blocks, existed_shared_blocks_num, mm_data, block_hashes);
@@ -232,7 +232,7 @@ void BlockManagerImpl::cache(const std::vector<Block>& blocks) {
     return;
   }
   check_owned(blocks);
-  AUTO_COUNTER(prefix_cache_latency_seconds_insert);
+  AUTO_PREFIX_CACHE_COUNTER(insert);
   prefix_cache_->insert(blocks);
 }
 
