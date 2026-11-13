@@ -20,6 +20,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -310,6 +311,11 @@ class TestDisaggPDScheduler final
   }
 
   void stop_dispatch() { prefill_request_queue_.enqueue(nullptr); }
+
+  void start_dispatch_for_shutdown_test() {
+    dispatch_thread_ =
+        std::make_unique<std::thread>([this] { dispatch_requests(); });
+  }
   size_t dispatch_waiting() const {
     return dispatch_waiting_requests_.load(std::memory_order_relaxed) +
            dispatch_active_requests_.load(std::memory_order_relaxed);
@@ -585,6 +591,25 @@ DisaggPDScheduler::Options make_options() {
       .max_tokens_per_chunk_for_prefill(32)
       .dp_size(1);
   return options;
+}
+
+TEST(DisaggPDSchedulerDeathTest, DestructorWakesDispatchWithoutRpcServer) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+      {
+        alarm(5);
+        {
+          FakeEngine engine(/*num_blocks=*/4, /*block_size=*/16);
+          auto options = make_options();
+          options.enable_pd_ooc(false);
+          TestDisaggPDScheduler scheduler(
+              &engine, options, /*start_services=*/false);
+          scheduler.start_dispatch_for_shutdown_test();
+        }
+        _exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      ".*");
 }
 
 DisaggPDScheduler::Options make_mtp_decode_options(int32_t dp_size = 1) {

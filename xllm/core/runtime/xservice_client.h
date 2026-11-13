@@ -56,7 +56,7 @@ class XServiceClient {
   void shutdown();
   void set_scheduler(Scheduler* scheduler);
   void set_engine(Engine* engine);
-  bool initialize_done() { return initialize_done_; }
+  bool initialize_done() { return initialize_done_.load() && !exited_.load(); }
 
   std::string get_instance_name();
   void register_instance(const InstanceInfo& instance_info);
@@ -112,11 +112,13 @@ class XServiceClient {
 
   std::atomic_bool exited_{false};
   std::atomic_bool register_done_{false};
-  std::once_flag shutdown_once_;
-  bool initialize_done_ = false;
+  // Serialize initialization/registration with teardown; reader threads are
+  // joined before resources can be initialized for another master.
+  std::mutex lifecycle_mutex_;
+  std::atomic_bool initialize_done_{false};
   std::string instance_name_;
-  // Stable for this process. A restart gets a new value so Service can tell
-  // the replacement from the previous process at the same instance name.
+  // Stable for one initialized owner. Reinitialization gets a fresh identity
+  // so Service cannot confuse the replacement with the retired owner.
   std::string incarnation_id_;
   std::string registration_key_;
 

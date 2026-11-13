@@ -155,6 +155,12 @@ LLMMaster::~LLMMaster() {
   if (loop_thread_.joinable()) {
     loop_thread_.join();
   }
+  // XServiceClient is a process singleton, but its heartbeat borrows this
+  // master's scheduler and engine. Join its readers before member destruction,
+  // not later during static destruction after those objects have been freed.
+  if (xservice_client_ != nullptr) {
+    xservice_client_->shutdown();
+  }
 }
 
 void LLMMaster::handle_batch_request(std::vector<std::string> prompts,

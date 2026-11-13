@@ -306,7 +306,12 @@ bool XServiceClient::init(const std::string& etcd_addr,
                           const std::string& instance_name,
                           BlockManagerPool* block_manager_pool,
                           const std::string& etcd_namespace) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
   if (initialize_done_) {
+    if (exited_.load()) {
+      LOG(ERROR) << "XServiceClient is stopping; initialization rejected.";
+      return false;
+    }
     LOG(INFO) << "XServiceClient is already initialized, skipping.";
     return true;
   }
@@ -360,6 +365,7 @@ bool XServiceClient::init(const std::string& etcd_addr,
                << kEtcdPasswordEnvVar << " must be set together.";
     return false;
   }
+  exited_.store(false, std::memory_order_release);
   if (has_etcd_auth_user) {
     etcd_client_ = std::make_unique<EtcdClient>(
         etcd_addr, etcd_username, etcd_password, etcd_namespace);
@@ -368,10 +374,19 @@ bool XServiceClient::init(const std::string& etcd_addr,
   }
 
   // connect master xllm_service
-  while (!etcd_client_->get_master_service(master_service_key_,
-                                           &master_xservice_addr_)) {
+  while (!exited_.load()) {
+    if (etcd_client_->get_master_service(master_service_key_,
+                                         &master_xservice_addr_)) {
+      break;
+    }
     LOG(ERROR) << "Master service not set, wait 2s!";
-    sleep(2);
+    std::unique_lock<std::mutex> lock(kv_event_wait_mutex_);
+    kv_event_wait_cv_.wait_for(
+        lock, std::chrono::seconds(2), [this]() { return exited_.load(); });
+  }
+  if (exited_.load()) {
+    LOG(INFO) << "XServiceClient initialization cancelled during shutdown.";
+    return false;
   }
 
   if (!check_instance_name(master_xservice_addr_)) {
@@ -432,64 +447,85 @@ void XServiceClient::set_engine(Engine* engine) { engine_ = engine; }
 XServiceClient::~XServiceClient() { shutdown(); }
 
 void XServiceClient::shutdown() {
-  std::call_once(shutdown_once_, [this]() {
-    LOG(INFO) << "XServiceClient background workers stopping...";
+  // Wake a registration/init wait before taking the lifecycle lock it owns.
+  {
+    std::lock_guard<std::mutex> lock(kv_event_wait_mutex_);
     exited_.store(true, std::memory_order_release);
-    kv_event_wait_cv_.notify_all();
-    if (etcd_client_ != nullptr) {
-      etcd_client_->stop_watch();
-    }
-    if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
-      heartbeat_thread_->join();
-    }
-    if (reconcile_thread_ && reconcile_thread_->joinable()) {
-      reconcile_thread_->join();
-    }
-    if (kv_event_thread_ && kv_event_thread_->joinable()) {
-      kv_event_thread_->join();
-    }
-    heartbeat_thread_.reset();
-    reconcile_thread_.reset();
-    kv_event_thread_.reset();
+  }
+  kv_event_wait_cv_.notify_all();
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  LOG(INFO) << "XServiceClient background workers stopping...";
+  {
+    std::lock_guard<std::mutex> lock(kv_event_wait_mutex_);
+    exited_.store(true, std::memory_order_release);
+  }
+  kv_event_wait_cv_.notify_all();
+  if (etcd_client_ != nullptr) {
+    etcd_client_->stop_watch();
+  }
+  if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
+    heartbeat_thread_->join();
+  }
+  if (reconcile_thread_ && reconcile_thread_->joinable()) {
+    reconcile_thread_->join();
+  }
+  if (kv_event_thread_ && kv_event_thread_->joinable()) {
+    kv_event_thread_->join();
+  }
+  if (kv_event_thread_ != nullptr) {
+    // Retire the previous owner's queued hashes before a new publisher
+    // starts.
+    PrefixCacheJournal::instance()->publish_cleared();
+    PrefixCacheJournal::instance()->set_publishing_enabled(false);
+  }
+  heartbeat_thread_.reset();
+  reconcile_thread_.reset();
+  kv_event_thread_.reset();
 
-    {
-      std::lock_guard<std::mutex> lock(registration_mutex_);
-      register_done_.store(false, std::memory_order_release);
-      registration_key_.clear();
-      engine_state_builder_.reset();
-      provider_descriptor_.reset();
-    }
-    {
-      std::unique_lock<std::shared_mutex> lock(mutex_);
-      master_xservice_addr_.clear();
-      xservice_stubs_.clear();
-      xservice_channels_.clear();
-    }
-    etcd_client_.reset();
-    block_manager_pool_ = nullptr;
-    scheduler_ = nullptr;
-    engine_ = nullptr;
-    LOG(INFO) << "XServiceClient background workers stopped.";
-  });
+  {
+    std::lock_guard<std::mutex> lock(registration_mutex_);
+    register_done_.store(false, std::memory_order_release);
+    registration_key_.clear();
+    engine_state_builder_.reset();
+    provider_descriptor_.reset();
+    incarnation_id_.clear();
+  }
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    master_xservice_addr_.clear();
+    xservice_stubs_.clear();
+    xservice_channels_.clear();
+  }
+  etcd_client_.reset();
+  block_manager_pool_ = nullptr;
+  scheduler_ = nullptr;
+  engine_ = nullptr;
+  kv_failed_commit_version_.reset();
+  kv_failed_commit_error_.clear();
+  kv_last_pushed_version_ = 0;
+  initialize_done_.store(false, std::memory_order_release);
+  LOG(INFO) << "XServiceClient background workers stopped.";
 }
 
 std::string XServiceClient::get_instance_name() { return instance_name_; }
 
 bool XServiceClient::register_instance_with_retry(const std::string& key,
                                                   const std::string& value) {
-  int retry_cnt = 0;
-  while (!etcd_client_->register_instance(
-      key, value, ::xllm::DistributedConfig::get_instance().etcd_ttl())) {
-    if (retry_cnt >= 30) {
+  for (int32_t retry_cnt = 0; retry_cnt <= 30 && !exited_.load(); ++retry_cnt) {
+    if (etcd_client_->register_instance(
+            key, value, ::xllm::DistributedConfig::get_instance().etcd_ttl())) {
+      return !exited_.load();
+    }
+    if (retry_cnt == 30) {
       LOG(ERROR) << "Register instance failed! key: " << key;
       return false;
     }
-
     LOG(WARNING) << "Register instance failed, wait 2s! key: " << key;
-    sleep(2);
-    retry_cnt++;
+    std::unique_lock<std::mutex> lock(kv_event_wait_mutex_);
+    kv_event_wait_cv_.wait_for(
+        lock, std::chrono::seconds(2), [this]() { return exited_.load(); });
   }
-  return true;
+  return false;
 }
 
 bool XServiceClient::reconcile_registration() {
@@ -540,6 +576,13 @@ void XServiceClient::reconcile_registration_loop() {
 }
 
 void XServiceClient::register_instance(const InstanceInfo& instance_info) {
+  std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+  if (exited_.load()) {
+    LOG(INFO) << "Instance registration cancelled during shutdown.";
+    return;
+  }
+  CHECK(initialize_done_.load() && etcd_client_ != nullptr)
+      << "Instance registration requires an initialized XServiceClient.";
   InstanceInfo registered_info = instance_info;
   if (registered_info.register_ts_ms == 0) {
     registered_info.register_ts_ms =
@@ -614,6 +657,11 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   }
 
   if (!register_instance_with_retry(key, value)) {
+    if (exited_.load()) {
+      LOG(INFO) << "Instance registration cancelled during shutdown, key="
+                << key;
+      return;
+    }
     LOG(FATAL) << "Register instance to etcd failed!";
     return;
   }

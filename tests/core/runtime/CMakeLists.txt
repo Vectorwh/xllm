@@ -1,5 +1,19 @@
 include(cc_test)
 
+cc_test(
+  NAME xservice_client_test
+  CPU_ONLY
+  SRCS xservice_client_test.cpp
+  DEPS :runtime :config GTest::gtest_main
+)
+target_link_libraries(xservice_client_test PRIVATE
+  Python::Python
+  $<$<BOOL:${USE_NPU}>:torch_npu>
+  $<$<BOOL:${USE_NPU}>:ascendcl>
+  $<$<BOOL:${USE_NPU}>:hccl>
+  $<$<BOOL:${USE_NPU}>:c_sec>
+  $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 if(USE_NPU)
   cc_test(
     NAME py_runtime_module_test

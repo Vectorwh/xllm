@@ -280,6 +280,17 @@ DisaggPDScheduler::DisaggPDScheduler(Engine* engine,
 }
 
 DisaggPDScheduler::~DisaggPDScheduler() {
+  // start_rpc_server() waits in Server::Join; stop it before joining its
+  // thread.
+  auto* rpc_server = ServerRegistry::get_instance().get_server(server_name_);
+  if (rpc_server != nullptr) {
+    rpc_server->stop();
+  }
+
+  if (dispatch_thread_ && dispatch_thread_->joinable()) {
+    prefill_request_queue_.enqueue(nullptr);
+  }
+
   // Clean up common threads (shared by both OOC and non-OOC modes)
   if (rpc_server_thread_ && rpc_server_thread_->joinable()) {
     rpc_server_thread_->join();
@@ -291,10 +302,9 @@ DisaggPDScheduler::~DisaggPDScheduler() {
     dispatch_thread_->join();
   }
 
-  auto rpc_server = ServerRegistry::get_instance().get_server(server_name_);
+  // Keep the registry-owned server alive until its borrowed thread pointer
+  // ends.
   if (rpc_server != nullptr) {
-    rpc_server->stop();
-
     ServerRegistry::get_instance().unregister_server(server_name_);
   }
 }
