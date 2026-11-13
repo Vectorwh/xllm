@@ -317,6 +317,41 @@ def test_smla_decode_graph_reads_live_lengths() -> None:
         torch.testing.assert_close(actual.cpu(), reference_output, rtol=0.02, atol=0.003)
 
 
+@pytest.mark.parametrize("ratio", [0, 1, 2])
+def test_smla_paged_graph_1m_capacity_with_short_live_lengths(ratio: int) -> None:
+    """The large address bound must not replace live PA_BBND KV lengths."""
+    backend, layer, dsa, shared, q, _, picks = _case([1], "npu", ratio=max(ratio, 1))
+    layer.mode.compress_ratio = ratio
+    backend._kv_caches[0].swa = backend._kv_caches[0].swa.unsqueeze(2)
+    shared.key_cache = shared.key_cache.unsqueeze(2)
+    dsa.is_acl_graph = True
+    dsa.graph_token_capacity = 256
+    backend._csa2_attention_smla(q, layer, dsa, picks if ratio else None, shared)
+    small_state = backend._smla_state[(1, 256)]
+
+    dsa.graph_token_capacity = 1048576
+    for _ in range(3):
+        backend._csa2_attention_smla(q, layer, dsa, picks if ratio else None, shared)
+    large_state = backend._smla_state[(1, 1048576)]
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = backend._csa2_attention_smla(q, layer, dsa, picks if ratio else None, shared)
+
+    for length in (14, 63, 127):
+        dsa.seq_lens.fill_(length)
+        # Serving refreshes these persistent operands outside replay.
+        backend._refresh_smla_state(dsa, small_state)
+        backend._refresh_smla_state(dsa, large_state)
+        dsa.graph_token_capacity = 256
+        expected = backend._csa2_attention_smla(q, layer, dsa, picks if ratio else None, shared)
+        dsa.graph_token_capacity = 1048576
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(backend._smla_state) == 2
+
+
 def test_smla_forward_cache_separates_distinct_length_tensors() -> None:
     backend, layer, dsa, shared, q, kv, picks = _case([1], "npu")
     lengths = (dsa.seq_lens, dsa.seq_lens + 5)
@@ -492,8 +527,12 @@ def test_smla_fused_tail_only_on_validated_decode_graph(
         return fused(*args, **kwargs)
 
     monkeypatch.setattr(backend, "_csa2_attention_smla", tracked)
+    # DSpark block attention passes no compressed picks. Native SMLA reserves
+    # explicit original-window indices for the SWA-only path.
     with forward_context(_context(backend, dsa)):
-        actual = backend._csa2_attention(q, kv, layer, dsa, q_lens, dsa.seq_lens, picks, shared)
+        actual = backend._csa2_attention(
+            q, kv, layer, dsa, q_lens, dsa.seq_lens, None if shared_window else picks, shared
+        )
     torch.npu.synchronize()
     assert bool(calls) is expected
     assert actual.shape == q.shape

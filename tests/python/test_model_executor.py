@@ -209,7 +209,7 @@ def test_v41_executor_preserves_csa2_dispatch_after_main_integration(
     assert isinstance(backend, Csa2AttentionBackend)
     assert backend.quant_mode == "ascend"
     assert backend.moe_graph_capturable is True
-    assert backend.graph_token_capacity_granularity == 1024
+    assert backend.graph_token_capacity_ceiling == 0
     assert executor._execution_metadata_builders == ()
     assert executor.eager_runner.cp_size == 1
     if not enable_graph:

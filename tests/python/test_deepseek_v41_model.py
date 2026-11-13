@@ -42,7 +42,6 @@ from xllm.python.attention.csa2_attention import (
     Csa2AttentionBackend,
     Csa2LayerContext,
     CSA2SharedRuntime,
-    _derive_graph_token_capacity_granularity,
     _indexer_score,
     _indexer_topk,
     _quantize_indexer_rows_int8,
@@ -1588,7 +1587,7 @@ def test_csa2_marks_moe_graph_capability_from_quant_mode(quant_mode: str, expect
     assert backend.moe_graph_capturable is expected
 
 
-def test_csa2_acl_graph_capacity_is_checked_at_construction() -> None:
+def test_csa2_acl_graph_capacity_is_checked_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
     """C: fail at startup, not at the first captured forward.
 
     A derivable ``max_model_len`` satisfies the check; a non-capturable quant
@@ -1596,6 +1595,7 @@ def test_csa2_acl_graph_capacity_is_checked_at_construction() -> None:
     """
     cfg = _graph_admission_cfg()
 
+    monkeypatch.setattr(Csa2AttentionBackend, "_supports_paged_decode_graph", lambda _: True)
     derived = _make_csa2_backend(
         cfg,
         torch.device("cpu"),
@@ -1603,7 +1603,7 @@ def test_csa2_acl_graph_capacity_is_checked_at_construction() -> None:
         acl_graph_enabled=True,
         max_model_len=32768,
     )
-    assert derived.graph_token_capacity_granularity > 0
+    assert derived.graph_token_capacity_ceiling == 32768
 
     with pytest.raises(RuntimeError, match="static committed-row capacity"):
         _make_csa2_backend(
@@ -1622,22 +1622,6 @@ def test_csa2_acl_graph_capacity_is_checked_at_construction() -> None:
         acl_graph_enabled=True,
         max_model_len=0,
     )
-
-
-def test_graph_token_capacity_granularity_caps_the_serving_bound() -> None:
-    """The derivation caps ``max_model_len`` at 32768 (-> 2048 buckets).
-
-    ``max_position_embeddings`` (1048576 for V4.1) is the RoPE horizon, not a
-    served context, and must not drive the per-layer gather width; the cap
-    reproduces the launcher's historical 2048 default while still shortening
-    buckets for smaller served contexts. ``0`` / unknown keeps the fail-closed
-    eager guard.
-    """
-    assert _derive_graph_token_capacity_granularity(1048576) == 2048
-    assert _derive_graph_token_capacity_granularity(32768) == 2048
-    assert _derive_graph_token_capacity_granularity(8192) == 1024
-    assert _derive_graph_token_capacity_granularity(0) == 0
-    assert _derive_graph_token_capacity_granularity(-1) == 0
 
 
 def _random_init_v41(lm: DeepseekV41ForCausalLM) -> None:

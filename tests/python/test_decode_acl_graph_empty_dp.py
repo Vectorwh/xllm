@@ -249,27 +249,19 @@ def test_mismatched_manager_table_count_falls_back_to_eager() -> None:
     assert not runner.can_execute(ModelInput(input_ids, torch.zeros_like(input_ids), metadata))
 
 
-def test_token_capacity_bucket_is_group_wide_and_bounded_by_max_model_len() -> None:
-    runner = _dsa_runner(graph_token_capacity_granularity=128)
+@pytest.mark.parametrize("seq_len,expected", [(16, True), (200, True), (512, True), (513, False), (0, False)])
+def test_paged_graph_uses_group_wide_context_bound(seq_len: int, expected: bool) -> None:
+    runner = _dsa_runner(requires_paged_decode_graph=True, graph_token_capacity_ceiling=512)
     input_ids = torch.tensor([1], dtype=torch.int32)
-
-    in_range = _dsa_metadata()
-    in_range.dp_global_kv_max_seq_lens = (1, 200)
-    assert runner._token_capacity_bucket(in_range) == 2
-    assert runner.can_execute(ModelInput(input_ids, torch.zeros_like(input_ids), in_range))
-
-    beyond_model_len = _dsa_metadata()
-    beyond_model_len.dp_global_kv_max_seq_lens = (1, 100000)
-    assert runner._token_capacity_bucket(beyond_model_len) > (512 + 127) // 128
-    assert not runner.can_execute(ModelInput(input_ids, torch.zeros_like(input_ids), beyond_model_len))
+    metadata = _dsa_metadata()
+    metadata.dp_global_kv_max_seq_lens = (0, seq_len)
+    assert runner.can_execute(ModelInput(input_ids, torch.zeros_like(input_ids), metadata)) is expected
 
 
-def test_graph_key_partitions_by_token_capacity_bucket() -> None:
-    same = DecodeAclGraphRunner._graph_key(1, False, None, (), 1, 1)
-    assert same == DecodeAclGraphRunner._graph_key(1, False, None, (), 1, 1)
-    assert same != DecodeAclGraphRunner._graph_key(1, False, None, (), 1, 2)
-    # Backends that do not bucket keep the legacy zero bucket.
-    assert DecodeAclGraphRunner._graph_key(1, False, None, (), 1)[-1] == 0
+def test_csa2_without_paged_kernels_uses_eager() -> None:
+    runner = _dsa_runner(requires_paged_decode_graph=True)
+    input_ids = torch.tensor([1], dtype=torch.int32)
+    assert not runner.can_execute(ModelInput(input_ids, torch.zeros_like(input_ids), _dsa_metadata()))
 
 
 def test_busy_dsa_rank_admits_without_flat_scheduler_slots() -> None:

@@ -216,8 +216,7 @@ class _StaticAttentionMetadata:
     dsa_c128_cos_sin: torch.Tensor | None = None
     dsa_graph_mode: bool = False
     dsa_graph_block_table_cols: int = 0
-    # Token-capacity bound of the CSA2 committed-row buckets (0 = backend does
-    # not bucket); consumed by the backend's capacity gathers.
+    # Serving length bound for CSA2 paged kernel metadata.
     dsa_graph_token_capacity: int = 0
 
 
@@ -279,7 +278,6 @@ _GraphKey = tuple[
     tuple[int, ...] | None,
     tuple[int, ...],
     bool,
-    int,
 ]
 
 
@@ -323,6 +321,7 @@ class DecodeAclGraphRunner(BaseRunner):
         # eager instead of capturing ever-larger graphs (0 disables).
         self.decode_batch_size_limit = int(decode_batch_size_limit or 0)
         self.max_model_len = max_model_len
+        self._graph_token_capacity = min(max_model_len, getattr(attention_backend, "graph_token_capacity_ceiling", 0))
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
         self._is_spec_draft = is_spec_draft
         # Draft metadata stays one row per token. Query width defines complete
@@ -1195,25 +1194,13 @@ class DecodeAclGraphRunner(BaseRunner):
             source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
             if not source_tables or len(source_tables) != len(group_infos):
                 return False
-        # V4.1 CSA2 committed-row capacity buckets: the captured graph's
-        # gathers are sized by max_model_len, so a context beyond it (or a
-        # bucket the DP group does not share) must take the eager runner.
-        granularity = getattr(self.attention_backend, "graph_token_capacity_granularity", 0)
-        if granularity:
-            bucket = self._token_capacity_bucket(metadata)
-            if bucket <= 0:
-                # 0 == not graph-admissible: either this rank cannot read the
-                # host-planned global lengths under DP, or the max context is
-                # unknown. Keep the eager runner rather than capture a bucket
-                # the DP group may not share.
-                return False
-            if bucket > (self.max_model_len + int(granularity) - 1) // int(granularity):
-                # A bucket above ceil(max_model_len / granularity) sits beyond
-                # every capacity the graph may gather: fall back to the eager
-                # runner (admission == False) instead of capturing an
-                # out-of-range gather. This is the fail-closed upper bound, not
-                # a crash path.
-                return False
+        if getattr(self.attention_backend, "requires_paged_decode_graph", False):
+            # A group-wide zero context has no live paged decode rows; keep
+            # it eager. An empty shard still joins a busy group's graph via
+            # the positive DP-wide maximum returned below.
+            return self._graph_token_capacity > 0 and (
+                0 < self._max_graph_context_len(metadata) <= self._graph_token_capacity
+            )
         return True
 
     @staticmethod
@@ -1610,7 +1597,6 @@ class DecodeAclGraphRunner(BaseRunner):
             padded_batch_size,
             verify_width,
         )
-        token_capacity_bucket = self._token_capacity_bucket(metadata)
         graph_key = self._graph_key(
             padded_batch_size,
             is_expanded,
@@ -1618,7 +1604,6 @@ class DecodeAclGraphRunner(BaseRunner):
             kpool_query_lens,
             verify_width=verify_width,
             use_dflash_proposal_attention=bool(getattr(metadata, "use_dflash_proposal_attention", False)),
-            token_capacity_bucket=token_capacity_bucket,
         )
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
@@ -1631,9 +1616,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 input_batch,
                 verify_width=verify_width,
             )
-            entry.static_metadata.dsa_graph_token_capacity = token_capacity_bucket * int(
-                getattr(self.attention_backend, "graph_token_capacity_granularity", 0) or 0
-            )
+            entry.static_metadata.dsa_graph_token_capacity = self._graph_token_capacity
             entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
         entry_eplb = getattr(entry, "eplb", None)
         if not first_capture and (entry_eplb is None) != (eplb is None):
@@ -2019,15 +2002,8 @@ class DecodeAclGraphRunner(BaseRunner):
         kpool_query_lens: tuple[int, ...] = (),
         verify_width: int = 1,
         use_dflash_proposal_attention: bool = False,
-        token_capacity_bucket: int = 0,
     ) -> _GraphKey:
-        """Fix graph-captured attention mode as well as execution shape.
-
-        ``token_capacity_bucket`` partitions graphs by the max context length
-        for backends whose forward gathers grow with it (V4.1 CSA2
-        committed-row capacity); it stays 0 for backends that do not opt in,
-        keeping the legacy key space unchanged.
-        """
+        """Key the captured attention mode and execution shape."""
         if input_embedding is None:
             return (
                 padded_batch_size,
@@ -2038,7 +2014,6 @@ class DecodeAclGraphRunner(BaseRunner):
                 None,
                 kpool_query_lens,
                 use_dflash_proposal_attention,
-                token_capacity_bucket,
             )
         return (
             padded_batch_size,
@@ -2049,36 +2024,13 @@ class DecodeAclGraphRunner(BaseRunner):
             tuple(input_embedding.shape[1:]),
             kpool_query_lens,
             use_dflash_proposal_attention,
-            token_capacity_bucket,
         )
 
-    def _token_capacity_bucket(self, metadata: AttentionMetadata) -> int:
-        """Bucket index over the batch's max context length (0 when disabled).
-
-        Backends that gather per-context rows (the V4.1 CSA2 indexer /
-        attention) need a shape-stable capacity inside the captured graph, so
-        each bucket fixes the capacity at its upper bound; crossing into a new
-        bucket captures a fresh graph lazily.
-
-        Every DP rank in a communication group must derive the same bucket or
-        their capture/replay schedules desynchronize the HCCL collectives, so
-        DP uses the scheduler's host-planned global KV maximum
-        (``dp_global_kv_max_seq_lens``, the same source the C++ MLA capture
-        bucket uses) instead of this rank's local lengths.
-        """
-        granularity = int(getattr(self.attention_backend, "graph_token_capacity_granularity", 0) or 0)
-        if not granularity:
-            return 0
+    def _max_graph_context_len(self, metadata: AttentionMetadata) -> int:
+        """Use the same length admission on every DP rank, including empty ranks."""
         if self.dp_size > 1:
             global_lengths = getattr(metadata, "dp_global_kv_max_seq_lens", None)
-            if global_lengths is None or not global_lengths:
-                # Conservative DP contract: without the scheduler's host-planned
-                # global lengths, do not derive a per-rank bucket from this
-                # rank's local lengths (0 == not graph-admissible), otherwise
-                # ranks could pick different buckets and desync HCCL.
-                return 0
-            max_ctx = max((int(value) for value in global_lengths), default=0)
-            return (max_ctx + granularity - 1) // granularity
+            return max(global_lengths or (), default=0)
         expanded = resolve_expanded_decode_metadata(metadata)
         host_values = (
             expanded.kv_seq_lens_host_values
@@ -2088,8 +2040,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if not host_values:
             kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
             host_values = kv_seq_lens.tolist() if kv_seq_lens is not None else []
-        max_ctx = max((int(value) for value in host_values), default=0)
-        return (max_ctx + granularity - 1) // granularity
+        return max(host_values, default=0)
 
     def _padded_kpool_query_lens(
         self,

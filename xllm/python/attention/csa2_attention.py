@@ -954,37 +954,6 @@ def _token_cache_slots(
     return slots
 
 
-# Serving-context cap applied before deriving the default graph token-capacity
-# granularity. The model's ``max_position_embeddings`` (1048576 for V4.1) is the
-# theoretical RoPE horizon, not any served context, and deriving from it yields
-# an impractical 65536-token bucket whose indexer gather touches 65536 rows per
-# layer; the dual-node launcher historically pinned 2048 to keep that gather
-# bounded. Capping the derivation source at 32768 reproduces exactly that 2048
-# floor (32768 -> ceil(32768 / 16) = 2048) while still scaling with shorter
-# served contexts.
-_GRAPH_TOKEN_CAPACITY_SERVING_CAP = 32768
-
-
-def _derive_graph_token_capacity_granularity(max_model_len: int) -> int:
-    """Default ACL-graph token-capacity granularity from the served context.
-
-    The granularity is the token width of one captured capacity bucket
-    (``_committed_capacity`` gathers ``granularity // ratio`` compressed rows
-    per bucket). The derivation source is the served context length capped at
-    :data:`_GRAPH_TOKEN_CAPACITY_SERVING_CAP` so a large
-    ``max_position_embeddings`` cannot blow up the per-layer gather. Aligning
-    ``ceil(serving_capped / 16)`` up to a 1024 multiple keeps the captured
-    bucket count at roughly 16 across context lengths, while the 1024 floor
-    avoids over-fragmenting short contexts. Returns 0 when the context length
-    is unknown, keeping the fail-closed capture guard.
-    """
-    if max_model_len <= 0:
-        return 0
-    serving_capped = min(max_model_len, _GRAPH_TOKEN_CAPACITY_SERVING_CAP)
-    scaled = (serving_capped + 15) // 16
-    return max(1024, ((scaled + 1023) // 1024) * 1024)
-
-
 # --- QLI v3 fused indexer (always on when guards hold) -----------------------
 #
 # Replaces the pure-torch indexer chain of ``_run_indexer`` with the native
@@ -1219,18 +1188,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
     mappings. The AICPU precomputed-metadata step of the V4 backend is not
     needed (no NPU kernels are dispatched here).
 
-    ACL graph integration: every data-dependent branch in the forward is
-    tensor arithmetic (see :meth:`execute_csa2_layer`), so one captured graph
-    stays correct across parity and length changes. The one remaining dynamic
-    shape -- the committed-row gather of the indexer / sparse attention -- is
-    pinned to a constant row capacity instead of a per-replay host read:
-    ``graph_token_capacity_granularity`` is the largest decode context length
-    the serving run can reach, and the captured graph gathers at
-    ``granularity // ratio`` rows for every replay.
-
-    The granularity is resolved in :meth:`__init__`: it is derived from
-    ``max_model_len`` capped at :data:`_GRAPH_TOKEN_CAPACITY_SERVING_CAP`
-    (0 keeps the eager exact-max behaviour).
+    ACL graph decode uses paged QLI and SMLA. The graph keeps one static
+    capacity bound for tiling and reads the live lengths and page tables from
+    tensors on replay. The eager path sizes its gathers from the live batch.
 
     MoE graph capability: only the Ascend W8A8 export routes the experts
     through the grouped kernel chain (MC2) an ACL graph can replay. The
@@ -1275,6 +1235,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             candidate_source_layer_id=int(config.get("candidate_source_layer_id", -1)),
             candidate_topk_blocks=int(config.get("candidate_topk_blocks", 0)),
             candidate_block_size=int(config.get("candidate_block_size", 0)),
+            # Match the runner bound; this may be the RoPE horizon rather
+            # than a serving limit. Paged kernels must retain seqused_*.
             max_model_len=int(config.get("max_position_embeddings", 0) or 0),
             quant_mode=quant_mode,
             acl_graph_enabled=acl_graph_enabled,
@@ -1329,6 +1291,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         ):
             raise ValueError("CSA2 block attention requires a single SWA cache group")
         self.window_size = window_size
+        self._compress_ratios = tuple(compress_ratios)
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
@@ -1356,14 +1319,18 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         self.quant_mode = quant_mode
         self.moe_graph_capturable = quant_mode == V41_QUANT_ASCEND
 
-        self.graph_token_capacity_granularity = (
-            0 if block_query_width else _derive_graph_token_capacity_granularity(max_model_len)
+        # A target graph requires the paged QLI/SMLA tail; block/SWA graphs
+        # have a separate contract. This marks the required path, not kernel
+        # availability: an unavailable path has a zero capacity ceiling.
+        self.requires_paged_decode_graph = not block_query_width
+        self.graph_token_capacity_ceiling = (
+            max_model_len if max_model_len > 0 and self._supports_paged_decode_graph() else 0
         )
-        granularity_source = "fixed SWA window" if block_query_width else f"derived from max_model_len={max_model_len}"
-        logger.info(
-            f"DeepSeek-V4.1 CSA2 graph_token_capacity_granularity="
-            f"{self.graph_token_capacity_granularity} ({granularity_source})"
-        )
+        if acl_graph_enabled and self.requires_paged_decode_graph and self.moe_graph_capturable:
+            if self.graph_token_capacity_ceiling:
+                logger.info(f"DeepSeek-V4.1 CSA2 graph_token_capacity_ceiling={self.graph_token_capacity_ceiling}")
+            elif max_model_len > 0:
+                logger.warning("DeepSeek-V4.1 CSA2 paged ACL graph is unavailable; decode uses eager execution")
 
         # Startup checks (51361671 C). The graph-vs-eager decision and the
         # committed-row capacity are both static for the run, so fail (or warn)
@@ -1376,12 +1343,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 f"DeepSeek-V4.1 quant_mode={quant_mode} serves the torch MoE, which no ACL graph "
                 "can capture; decode-graph admission is disabled and decode stays eager"
             )
-        if (
-            acl_graph_enabled
-            and self.moe_graph_capturable
-            and not block_query_width
-            and self.graph_token_capacity_granularity <= 0
-        ):
+        if acl_graph_enabled and self.moe_graph_capturable and not block_query_width and max_model_len <= 0:
             raise RuntimeError(
                 "DeepSeek-V4.1 ACL-graph serving needs a static committed-row capacity, but "
                 "max_model_len was not provided to derive one. Provide "
@@ -1401,6 +1363,28 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # Persistent SMLA operands, one entry per (batch_rows, token capacity)
         # graph bucket; built in warmup, refreshed (never created) under capture.
         self._smla_state: dict[tuple[int, int], _SmlaGraphState] = {}
+
+    def _supports_paged_decode_graph(self) -> bool:
+        if (
+            not self.requires_paged_decode_graph
+            or not self.moe_graph_capturable
+            or self.device.type != "npu"
+            or self.index_head_dim != _QLI_V3_HEAD_DIM
+            or self.head_dim != 512
+            or self.dtype != torch.bfloat16
+            or self.window_size != 128
+            or not 0 < self.index_topk <= _SMLA_CMP_TOPK_MAX
+            or any(ratio not in _SMLA_SUPPORTED_RATIOS for ratio in self._compress_ratios)
+        ):
+            return False
+        if self.candidate_source_layer_id >= 0 and self._qli_v3_candidate_config_reason() is not None:
+            return False
+        ops = getattr(torch.ops, "xllm_ops", None)
+        return (
+            ops is not None
+            and _get_qli_v3_ops() is not None
+            and all(hasattr(ops, name) for name in ("smla_va", "smla_va_metadata"))
+        )
 
     # -- V4 backend overrides ----------------------------------------------
 
@@ -2175,6 +2159,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
                 block_table,
                 capacity,
             )
+        if getattr(dsa, "is_acl_graph", False) and getattr(self, "graph_token_capacity_ceiling", 0):
+            raise RuntimeError(f"DeepSeek-V4.1 paged graph requires the fused indexer: {qli_reason}")
         _log_qli_v3_fallback(qli_reason)
         # The eager indexer scores in the INT8 query domain: the query is
         # per-row symmetric INT8 quantized and dequantized back to fp32, the
@@ -2328,11 +2314,11 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             return f"unsupported index head dim {self.index_head_dim} (op requires {_QLI_V3_HEAD_DIM})"
         if int(shared.compress_ratio) not in _QLI_V3_SUPPORTED_RATIOS:
             return f"unsupported compression ratio {shared.compress_ratio}"
-        # The static per-bucket capacity is a decode-graph contract; an eager
+        # The static serving capacity is a decode-graph contract; an eager
         # prefill derives its committed capacity from the live context lengths
         # (``_committed_capacity``), so the clause does not apply there.
-        bucketed_capacity = int(getattr(dsa, "graph_token_capacity", 0) or 0)
-        if not prefill_step and bucketed_capacity <= 0:
+        graph_capacity = int(getattr(dsa, "graph_token_capacity", 0) or 0)
+        if not prefill_step and graph_capacity <= 0:
             return "missing static graph token capacity"
         is_candidate_layer = layer.layer_id == self.candidate_source_layer_id or self._uses_candidates(layer.layer_id)
         if is_candidate_layer:
@@ -2420,7 +2406,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         """Return (or, outside capture, build) the state of this graph bucket."""
         token_capacity = int(getattr(dsa, "graph_token_capacity", 0) or 0)
         if token_capacity <= 0:
-            # Non-graph (eager) path: there is no static per-bucket capacity, so
+            # Non-graph (eager) path: there is no static graph capacity, so
             # derive the token-level bound from the actual sequence lengths. The
             # host sync is free in eager (this branch is never taken under
             # capture, where graph_token_capacity > 0).
@@ -2496,9 +2482,10 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             # (``...tiling.cpp:619-631``). ``max_seqlen_k`` is the paged-cache
             # length bound: vllm-ascend feeds ``max_cache_seq_len`` (the largest
             # committed compressed length of the batch, ``dsa_v41.py:925-954``);
-            # xllm's graph-stable upper bound is the per-bucket per-sequence
-            # capacity ``cap``. ASSUMPTION (not yet on-device): the metadata
-            # accepts the bound instead of the exact max.
+            # xLLM passes the fixed per-sequence capacity ``cap`` and supplies
+            # actual compressed lengths in ``seqused_k``.
+            # Always supply seqused_k to both metadata and indexer calls: the
+            # fixed ceiling (possibly the 1M RoPE bound) is not a live length.
             cu_seqlens_k=None,
             seqused_k=state.seqused_k[ratio],
             # ``cmp_ratio==1`` has no residual semantics: pass ``None`` exactly
@@ -2904,6 +2891,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             and all(int(length) == 1 for length in q_lens)
         ):
             return self._csa2_attention_smla(q, layer, dsa, topk, shared)
+        if getattr(dsa, "is_acl_graph", False) and getattr(self, "graph_token_capacity_ceiling", 0):
+            raise RuntimeError("DeepSeek-V4.1 paged graph requires the fused SMLA decode path")
         if isinstance(dsa, Csa2BlockAttentionMetadata):
             swa_bt = dsa.block_table
         else:
@@ -3393,6 +3382,9 @@ class Csa2AttentionBackend(DsaAttentionBackend):
 
     def _refresh_smla_state(self, dsa: DsaMetadata, state: _SmlaGraphState) -> None:
         """Write one step's lengths, block table and tiling into the bucket's buffers, in place."""
+        # PA_BBND metadata and execution must always receive seqused_ori_kv
+        # and, when compressed KV is present, seqused_cmp_kv. The fixed
+        # max_seqlen_* values bound addressing; they are never live lengths.
         table = self._shared_swa_block_table(dsa)
         if table is None or int(table.size(1)) != state.read_cols:
             raise RuntimeError(
@@ -3448,22 +3440,15 @@ class Csa2AttentionBackend(DsaAttentionBackend):
     ) -> int:
         """Compressed-row gather capacity (rows) for one forward.
 
-        Under ACL graph capture this is a Python constant baked into the
-        graph: the runner's per-bucket bound ``graph_token_capacity`` when the
-        captured entry carries one (the decode-graph runner sets it to
-        ``bucket * granularity``), otherwise ``graph_token_capacity_granularity
-        // ratio`` -- so no replay ever sync-reads the device sequence lengths.
-        Eagerly it is the exact batch maximum, read on the host where the sync
-        is free.
+        ACL graph uses the fixed serving bound. Eager execution reads the
+        actual maximum to avoid materializing unused rows.
         """
         if ratio <= 0:
             return 0
         if bool(getattr(dsa, "is_acl_graph", False)):
-            bucketed_capacity = int(getattr(dsa, "graph_token_capacity", 0) or 0)
-            if bucketed_capacity > 0:
-                return max(bucketed_capacity // ratio, 1)
-            if self.graph_token_capacity_granularity > 0:
-                return max(self.graph_token_capacity_granularity // ratio, 1)
+            capacity = int(getattr(dsa, "graph_token_capacity", 0) or 0)
+            if capacity > 0:
+                return max(capacity // ratio, 1)
             raise RuntimeError(
                 "DeepSeek-V4.1 ACL graph capture needs a static committed-row "
                 "capacity, but the serving entry did not derive one (no "

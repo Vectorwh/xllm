@@ -219,7 +219,7 @@ def test_block_attention_declares_its_fixed_window_capacity(query_width: int) ->
         quant_mode="ascend",
         acl_graph_enabled=True,
     )
-    assert (backend.graph_token_capacity_granularity == 0) == (query_width > 0)
+    assert backend.requires_paged_decode_graph == (query_width == 0)
 
 
 def test_block_attention_builder_rejects_context_parallelism_at_initialization() -> None:

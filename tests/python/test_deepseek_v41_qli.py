@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -150,6 +151,10 @@ def _make_backend(
     index_source_layer_ids: list[int] | None = None,
     candidate_topk_blocks: int = 2048,
     candidate_block_size: int = 8,
+    max_model_len: int = 0,
+    quant_mode: str = csa2.V41_QUANT_NONE,
+    device: Any = None,
+    acl_graph_enabled: bool = False,
 ) -> Csa2AttentionBackend:
     return Csa2AttentionBackend(
         compress_ratios=list(_COMPRESS_RATIOS if compress_ratios is None else compress_ratios),
@@ -161,14 +166,80 @@ def _make_backend(
         index_n_heads=_INDEX_N_HEADS,
         index_head_dim=index_head_dim,
         rope_head_dim=_ROPE_HEAD_DIM,
-        device=torch.device("cpu"),
+        device=device or torch.device("cpu"),
         dtype=torch.bfloat16,
         kv_source_layer_ids=list(_KV_SOURCE_LAYERS if kv_source_layer_ids is None else kv_source_layer_ids),
         index_source_layer_ids=list(_INDEX_SOURCE_LAYERS if index_source_layer_ids is None else index_source_layer_ids),
         candidate_source_layer_id=candidate_source_layer_id,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
+        max_model_len=max_model_len,
+        quant_mode=quant_mode,
+        acl_graph_enabled=acl_graph_enabled,
     )
+
+
+def test_run_static_capacity_ceiling_needs_the_paged_decode_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_qli(monkeypatch)
+    ops = SimpleNamespace(smla_va=object(), smla_va_metadata=object())
+    monkeypatch.setattr(torch.ops, "xllm_ops", ops)
+    npu = SimpleNamespace(type="npu")
+    options = {"device": npu, "max_model_len": 4096, "quant_mode": csa2.V41_QUANT_ASCEND}
+    assert _make_backend(**options).graph_token_capacity_ceiling == 4096
+    assert _make_backend(**{**options, "max_model_len": 0}).graph_token_capacity_ceiling == 0
+    assert _make_backend(**options, index_head_dim=64).graph_token_capacity_ceiling == 0
+    assert (
+        _make_backend(**options, candidate_source_layer_id=1, candidate_block_size=4).graph_token_capacity_ceiling == 0
+    )
+    del ops.smla_va_metadata
+    assert _make_backend(**options).graph_token_capacity_ceiling == 0
+
+
+def test_paged_graph_probe_handles_missing_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch, "ops", SimpleNamespace())
+    # CPU construction short-circuits before trying to resolve extensions.
+    backend = _make_backend(max_model_len=4096, quant_mode=csa2.V41_QUANT_ASCEND)
+    assert backend.graph_token_capacity_ceiling == 0
+    assert not backend._supports_paged_decode_graph()
+    backend.device = SimpleNamespace(type="npu")
+    assert not backend._supports_paged_decode_graph()
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("index_head_dim", 64),
+        ("head_dim", 256),
+        ("dtype", torch.float16),
+        ("window_size", 64),
+        ("index_topk", 2048),
+        ("_compress_ratios", (4,)),
+    ],
+)
+def test_paged_graph_rejects_unsupported_configuration(
+    attribute: str, value: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _make_backend(quant_mode=csa2.V41_QUANT_ASCEND)
+    backend.device = SimpleNamespace(type="npu")
+    setattr(backend, attribute, value)
+    # Config guards must not need extension registration.
+    monkeypatch.setattr(torch, "ops", SimpleNamespace())
+    assert not backend._supports_paged_decode_graph()
+
+
+def test_paged_graph_warns_on_eager_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_qli(monkeypatch)
+    monkeypatch.setattr(torch.ops, "xllm_ops", SimpleNamespace(smla_va=object()))
+    warning = MagicMock()
+    monkeypatch.setattr(csa2.logger, "warning", warning)
+    backend = _make_backend(
+        device=SimpleNamespace(type="npu"),
+        max_model_len=4096,
+        quant_mode=csa2.V41_QUANT_ASCEND,
+        acl_graph_enabled=True,
+    )
+    assert backend.graph_token_capacity_ceiling == 0
+    warning.assert_called_once_with("DeepSeek-V4.1 CSA2 paged ACL graph is unavailable; decode uses eager execution")
 
 
 class _StubIndexerLayer:
@@ -533,25 +604,26 @@ def test_qli_v3_ratio2_uses_the_compressed_capacity_and_residual(
 # ---------------------------------------------------------------------------
 
 
-def test_qli_v3_metadata_kwargs_per_ratio(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("capacity", [_CAPACITY, 1048576])
+def test_qli_v3_metadata_kwargs_per_ratio(capacity: int, monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = _stub_qli(monkeypatch)
     backend = _make_backend()
 
     # A ratio-1 dispatch builds the state, which fills BOTH ratio classes.
-    _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), _make_shared(1))
+    _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(capacity=capacity), _make_shared(1))
 
     assert len(recorder.metadata_calls) == 2
     by_ratio = {kwargs["cmp_ratio"]: (args, kwargs) for args, kwargs in recorder.metadata_calls}
     assert set(by_ratio) == {1, 2}
     for ratio, (args, kwargs) in by_ratio.items():
         assert args[:3] == (_INDEX_N_HEADS, 1, _INDEX_HEAD_DIM)
-        assert args[3] == min(_INDEX_TOPK, max(_CAPACITY // ratio, 1))  # topk
+        assert args[3] == min(_INDEX_TOPK, max(capacity // ratio, 1))  # topk
         assert args[4] == 2  # quant_mode
         assert kwargs["batch_size"] == _ROWS
         assert kwargs["max_seqlen_q"] == 1
         # The per-bucket per-sequence capacity bound (vllm-ascend's
         # ``max_cache_seq_len`` static upper bound).
-        assert kwargs["max_seqlen_k"] == max(_CAPACITY // ratio, 1)
+        assert kwargs["max_seqlen_k"] == max(capacity // ratio, 1)
         assert kwargs["layout_q"] == "TND"
         assert kwargs["layout_k"] == "PA_BBND"
         assert kwargs["mask_mode"] == csa2._QLI_V3_MASK_MODE
@@ -568,6 +640,8 @@ def test_qli_v3_metadata_kwargs_per_ratio(monkeypatch: pytest.MonkeyPatch) -> No
             # IsTensorExist guard (fixed in xllm_ops ``...metadata_va_check.h``),
             # so ``None`` is now the canonical value, matching the indexer op.
             assert kwargs["cmp_residual_k"] is None
+    # The execution op must also retain actual lengths at the 1M ceiling.
+    assert recorder.indexer_calls[-1]["seqused_k"].tolist() == list(_CTX_LENS)
 
 
 def test_qli_v3_state_contract(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -3084,6 +3084,29 @@ def test_acl_runner_execute_registers_only_after_successful_capture(
     assert len(runner._graphs) == 1
 
 
+def test_csa2_execute_reuses_capture_across_context_lengths(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner, _, capture_calls, graphs = _engram_execute_harness(monkeypatch, staged=True)
+    runner.attention_backend.requires_paged_decode_graph = True
+    runner._graph_token_capacity = 1048576
+
+    for seq_len in (16, 2047, 2049, 131072, 1048576):
+        input_ids, positions, _ = _engram_execute_inputs()
+        metadata = _aligned_dp_decode_metadata(input_ids.numel())
+        metadata.is_spec_verify = False
+        metadata.kv_seq_lens.fill_(seq_len)
+        metadata.kv_seq_lens_host_values = [seq_len] * input_ids.numel()
+        assert runner.can_execute(ModelInput(input_ids, positions, metadata))
+        with pytest.raises(_StoppedAfterCaptureError):
+            runner.execute(input_ids, positions, metadata)
+
+    assert len(graphs) == len(capture_calls) == 1
+    assert capture_calls[0].static_metadata.dsa_graph_token_capacity == 1048576
+    for seq_len in (0, 1048577):
+        metadata.kv_seq_lens.fill_(seq_len)
+        metadata.kv_seq_lens_host_values = [seq_len] * input_ids.numel()
+        assert not runner.can_execute(ModelInput(input_ids, positions, metadata))
+
+
 def test_acl_runner_execute_leaves_no_entry_when_capture_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

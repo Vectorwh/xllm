@@ -200,8 +200,8 @@ def test_width_one_keeps_the_gate_blocked() -> None:
 
 
 def test_graph_key_separates_plain_decode_from_verify() -> None:
-    key_plain = DecodeAclGraphRunner._graph_key(48, False, None, (), verify_width=1, token_capacity_bucket=0)
-    key_verify = DecodeAclGraphRunner._graph_key(48, False, None, (), verify_width=6, token_capacity_bucket=0)
+    key_plain = DecodeAclGraphRunner._graph_key(48, False, None, (), verify_width=1)
+    key_verify = DecodeAclGraphRunner._graph_key(48, False, None, (), verify_width=6)
     assert key_plain != key_verify
 
 
