@@ -34,7 +34,7 @@ import os
 from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -155,6 +155,10 @@ def _padded_rank_slices(
             f"DP token counts must fit the ACL graph batch bucket: counts={counts}, bucket={per_rank_stride}"
         )
     return [(rank * per_rank_stride, count) for rank, count in enumerate(counts)]
+
+
+if TYPE_CHECKING:
+    from xllm.python.model_executor.static_kernel import StaticKernelWorker
 
 
 @dataclass(slots=True)
@@ -1526,6 +1530,8 @@ class DecodeAclGraphRunner(BaseRunner):
         layer_synchronizer: LayerSynchronizer | None = None,
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
+        *,
+        static_kernel: StaticKernelWorker | None = None,
     ) -> ModelExecutionOutput:
         metadata = self._normalize_dsa_metadata(metadata)
         # Keep event wrappers alive until the H2D-ready event has signalled;
@@ -1605,7 +1611,7 @@ class DecodeAclGraphRunner(BaseRunner):
             verify_width=verify_width,
             use_dflash_proposal_attention=bool(getattr(metadata, "use_dflash_proposal_attention", False)),
         )
-        entry = self._graphs.get(graph_key)
+        entry = None if static_kernel is not None else self._graphs.get(graph_key)
         first_capture = entry is None
         if first_capture:
             entry = self._allocate_entry(
@@ -1747,6 +1753,19 @@ class DecodeAclGraphRunner(BaseRunner):
 
             if first_capture:
                 self._engram_first_capture_gate(staged=staged)
+                if static_kernel is not None:
+                    # Reuse capture padding and metadata, but keep this entry
+                    # transient: graphs must be captured after kernel loading.
+                    with forward_context(prepare_context), static_kernel.collect_forward():
+                        output = self._forward_static(entry)
+                    release_inputs = getattr(self.model, "release_graph_inputs", None)
+                    if release_inputs is not None:
+                        release_inputs(entry.static_metadata)
+                    return self._slice_output(
+                        output,
+                        batch_size,
+                        num_reqs=input_batch.num_reqs if input_batch is not None else None,
+                    )
                 self._capture(entry)
                 if capture_metadata is not None:
                     # Capture may still read the persistent indices. Order real

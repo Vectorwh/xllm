@@ -2468,6 +2468,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     return false;
   }
 
+#if defined(USE_NPU)
+  CHECK(!ExecutionConfig::get_instance().enable_static_kernel() ||
+        ModelConfig::is_python_model_impl(context_.get_model_impl()))
+      << "Static Kernel requires --model_impl=python";
+#endif
+
   // Warm JSON grammars off the forward path so the first constrained request
   // does not pay tokenizer.decode over the full vocab under the step lock.
   // Draft-engine workers own no tokenizer and never serve constrained requests

@@ -101,27 +101,8 @@ int32_t decode_warmup_token_bucket(const DecodeGraphWarmupPlan& plan,
 ProfileManager::ProfileManager(Engine* engine, const Options& options)
     : options_(options), engine_(engine) {
   CHECK(engine_ != nullptr);
-  int32_t max_decode_batch_size = options_.max_seqs_per_batch();
-  const int32_t max_concurrent_requests =
-      ::xllm::ServiceConfig::get_instance().max_concurrent_requests();
-  if (max_concurrent_requests > 0) {
-    max_decode_batch_size =
-        std::min(max_decode_batch_size, max_concurrent_requests);
-  }
-  if (Platform::is_npu()) {
-    max_decode_batch_size =
-        static_cast<int32_t>(npu::acl_graph_max_global_batch_size(
-            static_cast<uint32_t>(std::max<int32_t>(1, max_decode_batch_size)),
-            static_cast<uint32_t>(
-                std::max<int32_t>(1,
-                                  ::xllm::ExecutionConfig::get_instance()
-                                      .acl_graph_decode_batch_size_limit())),
-            static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()))));
-  }
-  decode_graph_warmup_plan_ =
-      build_decode_graph_warmup_plan(engine_->decode_graph_warmup_config(),
-                                     max_decode_batch_size,
-                                     options_.dp_size());
+  decode_graph_warmup_plan_.warmup_config =
+      engine_->decode_graph_warmup_config();
   block_manager_pool_ = engine_->block_manager_pool();
   CHECK(block_manager_pool_ != nullptr);
   prefill_time_predictor_ = std::make_unique<TimePredictor>(
@@ -153,8 +134,16 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   // prediction.
 
 #if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
-  if (!is_rec_multi_round_mode()) {
-    const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
+  const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
+  const bool collect_only =
+      execution_config.enable_static_kernel() &&
+      execution_config.enable_graph() &&
+      (execution_config.disable_graph_warmup() || is_rec_multi_round_mode()) &&
+      options_.instance_role() != InstanceRole::PREFILL;
+  if (collect_only) {
+    // Static Kernel still needs decode inputs when normal warmup is skipped.
+    warmup_decode_for_graph();
+  } else if (!is_rec_multi_round_mode()) {
     if (execution_config.enable_graph()) {
       if (execution_config.disable_graph_warmup()) {
         LOG(INFO) << "Graph warmup disabled by execution config; graphs will "
@@ -1311,7 +1300,7 @@ void ProfileManager::warmup_decode_for_graph() {
     max_decode_batch_size =
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
-  if (Platform::is_npu()) {
+  if (Platform::is_npu() && ExecutionConfig::get_instance().enable_graph()) {
     max_decode_batch_size =
         static_cast<int32_t>(npu::acl_graph_max_global_batch_size(
             static_cast<uint32_t>(std::max<int32_t>(1, max_decode_batch_size)),

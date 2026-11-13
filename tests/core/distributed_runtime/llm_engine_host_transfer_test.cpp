@@ -21,12 +21,14 @@ limitations under the License.
 #include <iterator>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "core/distributed_runtime/llm_engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/config/execution_config.h"
 #include "framework/request/request.h"
 #include "framework/request/stopping_checker.h"
 
@@ -236,7 +238,9 @@ class StepCaptureWorker final : public WorkerClient {
   folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
       const ForwardInput& inputs) override {
     ++step_count_;
-    captured_token_ids_ = inputs.token_ids.clone();
+    captured_token_ids_ =
+        inputs.token_ids.defined() ? inputs.token_ids.clone() : torch::Tensor();
+    captured_is_graph_warmup_ = inputs.input_params.meta.is_graph_warmup;
     RawForwardOutput output;
     RawSampleOutput sample;
     RawToken token;
@@ -248,16 +252,19 @@ class StepCaptureWorker final : public WorkerClient {
   }
 
   uint32_t step_count() const { return step_count_; }
+  bool captured_is_graph_warmup() const { return captured_is_graph_warmup_; }
   const torch::Tensor& captured_token_ids() const {
     return captured_token_ids_;
   }
 
  private:
   uint32_t step_count_ = 0;
+  bool captured_is_graph_warmup_ = false;
   torch::Tensor captured_token_ids_;
 };
 
-std::shared_ptr<Request> make_overlap_step_request() {
+std::shared_ptr<Request> make_overlap_step_request(
+    bool is_graph_warmup = false) {
   const std::vector<int32_t> prompt{1, 2, 3, 4};
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
@@ -280,8 +287,55 @@ std::shared_ptr<Request> make_overlap_step_request() {
                          /*enable_schedule_overlap=*/false,
                          /*output_func=*/nullptr,
                          /*outputs_func=*/nullptr);
+  req_state.is_graph_warmup = is_graph_warmup;
   return std::make_shared<Request>("1", "1", "1", std::move(req_state), "1");
 }
+
+class EngineWarmupInputTest
+    : public ::testing::TestWithParam<std::tuple<bool, bool>> {
+ protected:
+  void TearDown() override {
+    ExecutionConfig::get_instance() = original_execution_;
+  }
+
+ private:
+  ExecutionConfig original_execution_ = ExecutionConfig::get_instance();
+};
+
+TEST_P(EngineWarmupInputTest, MarksEmptyDpOnlyForStaticKernelWarmup) {
+  const bool static_kernel = std::get<0>(GetParam());
+  const bool warmup = std::get<1>(GetParam());
+  ExecutionConfig::get_instance().enable_static_kernel() = static_kernel;
+  ExecutionConfig::get_instance().enable_graph() = true;
+  auto active = std::make_shared<StepCaptureWorker>();
+  auto empty = std::make_shared<StepCaptureWorker>();
+  runtime::Options options;
+  options.world_size(2).dp_size(2).cp_size(1);
+  ClientEngine engine(std::move(options), {active, empty});
+  BlockManagerPool::Options pool_options;
+  pool_options.num_blocks_ = 32;
+  pool_options.block_size_ = 4;
+  pool_options.max_seqs_per_batch_ = 4;
+  BlockManagerPool pool(pool_options, /*dp_size=*/2);
+  auto request = make_overlap_step_request(warmup);
+  Sequence* sequence = request->sequences().front().get();
+  ASSERT_TRUE(pool.try_allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(0);
+  std::vector<Batch> batches(2);
+  batches[0] = Batch(sequence);
+  engine.step(batches);
+  EXPECT_EQ(active->step_count(), 1U);
+  EXPECT_EQ(empty->step_count(), 1U);
+  EXPECT_EQ(active->captured_is_graph_warmup(), warmup);
+  EXPECT_EQ(empty->captured_is_graph_warmup(), static_kernel && warmup);
+  EXPECT_TRUE(active->captured_token_ids().defined());
+  EXPECT_FALSE(empty->captured_token_ids().defined());
+}
+
+INSTANTIATE_TEST_SUITE_P(StaticKernelAndWarmup,
+                         EngineWarmupInputTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool()));
 
 TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
   // Two workers form one DP group with cp_size=2: the engine must dispatch

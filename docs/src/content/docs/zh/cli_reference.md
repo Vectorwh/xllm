@@ -221,6 +221,8 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | 参数名称 | 类型 | 默认值 | 参数含义 |
 |:---------|:-----|:-------|:---------|
 | `enable_graph` | `bool` | `false` | 是否在 decode 阶段启用图执行以降低 kernel launch 开销和设备空闲时间；支持 CUDA Graph、ACL Graph（NPU）、MLU Graph 和 DCU Graph，详见 [图执行](/zh/features/graph_mode/)。 |
+| `enable_static_kernel` | `bool` | `false` | 在启动校准期间采集算子参数，编译并加载 CANN Static Kernel，然后执行图捕获。仅支持 NPU Python 执行器（`--model_impl=python`）；要求 CANN 提供静态编译和自定义路径重新选核接口。详见 [Static Kernel](/zh/features/static_kernel/)。 |
+| `static_kernel_cache_dir` | `string` | `""` | 私有 Static Kernel 缓存目录；空值使用 `$XDG_CACHE_HOME/xllm/static_kernel`，未设置该环境变量时使用 `~/.cache/xllm/static_kernel`。缓存需与当前模型布局、并行配置和编译环境匹配。 |
 | `enable_graph_double_buffer` | `bool` | `true` | 是否为 NPU schedule-overlap decode 启用双缓冲 ACL graph 持久化参数与 graph 实例。 |
 | `enable_graph_mode_decode_no_padding` | `bool` | `false` | decode 阶段是否按实际 `num_tokens` 捕获 graph，而不是按 padding 后 shape 捕获。 |
 | `enable_prefill_piecewise_graph` | `bool` | `false` | 是否在 prefill 阶段启用 piecewise CUDA graph；attention 使用 eager 模式，其他操作捕获进 CUDA graph。 |
@@ -232,6 +234,12 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `input_shm_size` | `uint64` | `1024` | 输入共享内存大小，默认 1GB。 |
 | `output_shm_size` | `uint64` | `128` | 输出共享内存大小，默认 128MB。 |
 | `random_seed` | `int32` | `-1` | 随机数生成器 seed；`-1` 表示不固定 seed。 |
+
+### NPU Static Kernel 环境变量
+
+| 环境变量 | 默认值 | 含义 |
+|:---------|:-------|:-----|
+| `XLLM_STATIC_KERNEL_BLACKLIST` | 空 | 以逗号分隔需要排除静态编译的 **CANN OpType**，例如 `export XLLM_STATIC_KERNEL_BLACKLIST="MatMulV2,Cast"`。名称区分大小写，不是 PyTorch 函数名或 `aclnn*` 接口名；忽略空项并去重。仅排除静态编译，算子仍正常执行；修改后重启生效，所有 worker 应保持一致。不支持黑名单文件路径配置。 |
 
 ## KernelConfig
 

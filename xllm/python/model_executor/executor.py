@@ -350,6 +350,14 @@ class ModelExecutor:
         self.layerwise_split_rank = int(config.get("layerwise_split_rank", 0))
         if self.layerwise_split_size > 1 and config.get("model_type") != "glm_moe_dsa":
             raise NotImplementedError("Python layerwise split is supported only for GLM5.2")
+        self._static_kernel = None
+        self._disable_graph_warmup = bool(config.get("disable_graph_warmup", False))
+        if config.get("enable_static_kernel", False):
+            if not current_platform.is_npu() or not graph_enabled:
+                raise ValueError("Static Kernel requires NPU graph execution")
+            from xllm.python.model_executor.static_kernel import StaticKernelWorker
+
+            self._static_kernel = StaticKernelWorker(config, device, is_spec_draft=is_spec_draft)
         self.dp_size = int(config.get("dp_size", 1))
         runner_config = RunnerConfig(
             device=device,
@@ -567,19 +575,33 @@ class ModelExecutor:
             else:
                 layer_load_context.synchronize_event(draft_load_event_index)
             layer_load_context = None
-        output = self.execution_pipeline.execute(
-            ModelInput(
-                input_ids=input_ids,
-                positions=positions,
-                metadata=metadata,
-                input_embedding=input_embedding,
-                layer_synchronizer=layer_synchronizer,
-                eplb=eplb,
-                input_batch=input_batch,
-                layer_load_context=layer_load_context,
-                multimodal_inputs=multimodal_inputs,
-            )
+        inputs = ModelInput(
+            input_ids=input_ids,
+            positions=positions,
+            metadata=metadata,
+            input_embedding=input_embedding,
+            layer_synchronizer=layer_synchronizer,
+            eplb=eplb,
+            input_batch=input_batch,
+            layer_load_context=layer_load_context,
+            multimodal_inputs=multimodal_inputs,
         )
+        if (
+            self._static_kernel is not None
+            and is_graph_warmup
+            and (
+                metadata.is_spec_verify
+                or any(metadata.dp_is_decode)
+                or not (metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_mixed or metadata.is_dummy)
+            )
+        ):
+            output, graph_inputs = self._static_kernel.prepare(
+                lambda: self.execution_pipeline.execute(inputs), self.execution_pipeline.runners
+            )
+            if graph_inputs and not self._disable_graph_warmup:
+                output = self.execution_pipeline.execute(inputs)
+        else:
+            output = self.execution_pipeline.execute(inputs)
         return self._attach_persistent_aux_hidden_states(
             output,
             input_ids.numel(),

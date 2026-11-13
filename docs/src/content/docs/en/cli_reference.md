@@ -220,6 +220,8 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
+| `enable_static_kernel` | `bool` | `false` | Collect operator arguments during startup calibration, compile and load CANN Static Kernels, then capture execution graphs. NPU Python executor only (`--model_impl=python`); requires CANN static compilation and custom-path kernel reselection interfaces. |
+| `static_kernel_cache_dir` | `string` | `""` | Private Static Kernel cache directory. An empty value selects `$XDG_CACHE_HOME/xllm/static_kernel`, or `~/.cache/xllm/static_kernel` when the environment variable is unset. Cache reuse requires matching model layouts, parallel configuration and toolchain. |
 | `enable_graph` | `bool` | `false` | Whether to enable graph execution for the decode phase to reduce kernel-launch overhead and device idle time. Supports CUDA Graph, ACL Graph (NPU), MLU Graph, and DCU Graph. See [Graph Mode](/en/features/graph_mode/). |
 | `enable_graph_double_buffer` | `bool` | `true` | Whether to enable double-buffered ACL graph persistent params and graph instances for NPU schedule-overlap decode. |
 | `enable_graph_mode_decode_no_padding` | `bool` | `false` | Whether decode graph capture uses the actual `num_tokens` instead of a padded shape. |
@@ -232,6 +234,12 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `input_shm_size` | `uint64` | `1024` | Input shared-memory size. Default is 1GB. |
 | `output_shm_size` | `uint64` | `128` | Output shared-memory size. Default is 128MB. |
 | `random_seed` | `int32` | `-1` | Random seed for the random number generator. `-1` means no fixed seed. |
+
+### NPU Static Kernel environment variables
+
+| Variable | Default | Description |
+|:---------|:--------|:------------|
+| `XLLM_STATIC_KERNEL_BLACKLIST` | Empty | Comma-separated **CANN OpTypes** to exclude from static compilation, for example `export XLLM_STATIC_KERNEL_BLACKLIST="MatMulV2,Cast"`. Names are case-sensitive, not PyTorch function or `aclnn*` API names. Empty entries and duplicates are ignored. Operators still execute normally; restart after changing the list and use the same value on all workers. Blacklist file paths are not supported. |
 
 ## KernelConfig
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,9 @@ from xllm.python.model_executor.model_input import ModelInput
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.platform import current_platform
+
+if TYPE_CHECKING:
+    from xllm.python.model_executor.static_kernel import StaticKernelWorker
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,7 @@ class Runner:
             if backend is not None:
                 backend.bind_execution_metadata_builders(self.metadata_builders)
         self.execution_mode: str | None = None
+        self.static_kernel: StaticKernelWorker | None = None
         self.last_graph_rows: int | None = None
         self.restore_history = restore_history
         self._graph_dp_size = int(config.model_config.get("dp_size", 1)) if coordinate_graph_execution else 1
@@ -147,6 +152,7 @@ class Runner:
         """Run a stage, or only join its admission when the pipeline has no local work."""
         self.last_graph_rows = None
         graph = self.graph_runner
+        static_kernel = self.static_kernel
         use_graph = graph is not None and (skip_execution or graph.can_execute(inputs))
         if graph is not None and self._graph_dp_size > 1:
             use_graph = distributed.dp_all_true(use_graph, graph.device, self._graph_dp_size)
@@ -159,7 +165,8 @@ class Runner:
             graph.warmup(inputs.input_ids, inputs.positions, inputs.metadata, inputs.input_embedding)
             if not getattr(graph, "supports_draft_to_target_overlap", False):
                 self._restore_history(inputs.metadata)
-            self.execution_mode = "graph"
+            self.execution_mode = "eager" if static_kernel is not None else "graph"
+            collection_options = {"static_kernel": static_kernel} if static_kernel is not None else {}
             output = graph.execute(
                 inputs.input_ids,
                 inputs.positions,
@@ -167,6 +174,7 @@ class Runner:
                 inputs.input_embedding,
                 eplb=inputs.eplb,
                 input_batch=inputs.input_batch,
+                **collection_options,
             )
             self.last_graph_rows = getattr(graph, "last_padded_batch_size", None)
             return output

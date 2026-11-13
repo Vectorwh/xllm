@@ -37,6 +37,20 @@ DEFINE_bool(disable_graph_warmup,
             "Whether to skip synthetic graph warmup during engine startup. "
             "When enabled, graphs are captured lazily by real requests.");
 
+DEFINE_bool(
+    enable_static_kernel,
+    false,
+    "Collect decode graph warmup operator arguments, compile CANN static "
+    "kernels and load them before graph capture. NPU Python executor only; "
+    "requires "
+    "CANN static compilation and custom-path reselection interfaces.");
+
+DEFINE_string(
+    static_kernel_cache_dir,
+    "",
+    "Private CANN static kernel cache directory. Empty selects "
+    "$XDG_CACHE_HOME/xllm/static_kernel or ~/.cache/xllm/static_kernel.");
+
 DEFINE_string(graph_capture_sizes,
               "",
               "Comma-separated positive decode graph capture sizes in "
@@ -156,6 +170,8 @@ std::vector<int32_t> parse_graph_capture_sizes(const nlohmann::json& value) {
 }  // namespace
 
 void ExecutionConfig::from_flags() {
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_static_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(static_kernel_cache_dir);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
   if (FLAGS_graph_capture_sizes.empty()) {
@@ -183,6 +199,8 @@ void ExecutionConfig::from_flags() {
 }
 
 void ExecutionConfig::from_json(const JsonReader& json) {
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_static_kernel);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(static_kernel_cache_dir);
   if (json.contains("python_graph_backend")) {
     LOG(WARNING)
         << "python_graph_backend has been removed and is ignored. Set "
@@ -217,6 +235,10 @@ void ExecutionConfig::from_json(const JsonReader& json) {
 void ExecutionConfig::append_config_json(
     nlohmann::ordered_json& config_json) const {
   const ExecutionConfig default_config;
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_static_kernel);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, static_kernel_cache_dir);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -267,6 +289,9 @@ void ExecutionConfig::initialize() {
 }
 
 void ExecutionConfig::validate() const {
+#if !defined(USE_NPU)
+  CHECK(!enable_static_kernel()) << "Static kernels require an NPU build";
+#endif
   CHECK_GT(forward_execution_timeout_ms(), 0);
   if (graph_capture_sizes().empty()) {
     return;

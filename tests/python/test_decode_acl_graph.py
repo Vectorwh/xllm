@@ -16,6 +16,7 @@
 
 import logging
 import os
+import sys
 from contextlib import nullcontext
 from dataclasses import replace
 from importlib import import_module
@@ -979,6 +980,66 @@ def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.Mon
     assert metadata.num_accepted_tokens.tolist() == [verify_width] * slots.numel()
     npu.graph_pool_handle.assert_called_once_with()
     assert npu.graph.call_args.kwargs["pool"] is npu.graph_pool_handle.return_value
+
+
+@pytest.mark.parametrize("verify_width,dp_counts", [(1, None), (1, (4, 7)), (2, (4, 6))])
+def test_static_collection_uses_capture_padding_without_caching_graph(
+    monkeypatch: pytest.MonkeyPatch, verify_width: int, dp_counts: tuple[int, int] | None
+) -> None:
+    npu = MagicMock()
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    monkeypatch.setattr(
+        import_module(DecodeAclGraphRunner.__module__), "device_capture_lock", lambda device: nullcontext()
+    )
+    collection = MagicMock()
+    collection.collect_forward.return_value = nullcontext()
+    runner = _runner()
+    runner.dp_size = 2 if dp_counts else 1
+    metadata = _metadata(torch.arange(1, 5, dtype=torch.int32))
+    if dp_counts:
+        metadata.dp_execution_token_counts = dp_counts
+    if verify_width > 1:
+        metadata.is_spec_verify = True
+        metadata.q_seq_lens_host_values = [verify_width] * (4 // verify_width)
+        metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
+            kv_seq_lens=metadata.kv_seq_lens,
+            block_table=metadata.block_table,
+            paged_kv_indptr=metadata.paged_kv_indptr,
+            paged_kv_indices=metadata.paged_kv_indices,
+            paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+            paged_attention_tiling_data=None,
+            kv_seq_lens_host=None,
+            kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
+        )
+    runner.attention_backend.prepare = MagicMock()
+    layouts = []
+
+    def forward(entry: Any) -> torch.Tensor:
+        layouts.append(
+            (
+                entry.static_input_ids.shape,
+                entry.static_positions.shape,
+                entry.static_metadata.block_table.shape,
+                None if entry.static_metadata.q_cu_seq_lens is None else entry.static_metadata.q_cu_seq_lens.shape,
+            )
+        )
+        return torch.zeros(entry.batch_size, 1)
+
+    monkeypatch.setattr(runner, "_forward_static", forward)
+    tokens = torch.arange(4, dtype=torch.int32)
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        result = runner.execute(tokens, tokens, metadata, static_kernel=collection)
+        collected_layout = layouts[0]
+        assert collected_layout[0] == (8 if dp_counts else 4,)
+        assert result.shape == (4, 1)
+        assert not runner._graphs
+        npu.graph.assert_not_called()
+        npu.graph_pool_handle.assert_not_called()
+        collection.collect_forward.assert_called_once_with()
+        layouts.clear()
+        runner.execute(tokens, tokens, metadata)
+    assert layouts and all(layout == collected_layout for layout in layouts)
+    assert len(runner._graphs) == 1
 
 
 def test_explicit_verify_reuses_row_aligned_paging_metadata() -> None:

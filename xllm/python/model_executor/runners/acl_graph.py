@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -34,6 +34,9 @@ from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.model_input import ModelInput
 from xllm.python.model_executor.runners.acl_graph_capture import capture_acl_graph, device_capture_lock
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
+
+if TYPE_CHECKING:
+    from xllm.python.model_executor.static_kernel import StaticKernelWorker
 
 
 @dataclass
@@ -98,6 +101,7 @@ class AclGraphRunner(BaseRunner):
         *,
         eplb: EplbRuntimeState | None = None,
         input_batch: InputBatch | None = None,
+        static_kernel: StaticKernelWorker | None = None,
     ) -> ModelExecutionOutput:
         """Execute inputs already admitted by can_execute."""
         if input_batch is None:
@@ -119,7 +123,7 @@ class AclGraphRunner(BaseRunner):
             for tensor in tensors:
                 if tensor is not None:
                     tensor.record_stream(self._stream)
-            entry = self._graphs.get(key)
+            entry = None if static_kernel is not None else self._graphs.get(key)
             if entry is None:
                 with device_capture_lock(self.device):
                     static_batch = input_batch.bind_graph_inputs(
@@ -149,6 +153,12 @@ class AclGraphRunner(BaseRunner):
                         eplb=eplb,
                     )
                     self._update_inputs(static_batch, context, input_batch, metadata, static_embedding, input_embedding)
+                    if static_kernel is not None:
+                        with static_kernel.collect_forward():
+                            output = self._forward(static_batch, context, static_embedding)
+                        caller.wait_stream(self._stream)
+                        self.last_padded_batch_size = rows
+                        return self._slice_output(output, input_batch.num_tokens, num_reqs=input_batch.num_reqs)
                     for _ in range(3):
                         self._forward(static_batch, context, static_embedding)
                     self._stream.synchronize()

@@ -540,6 +540,14 @@ py::dict PyCausalLM::build_config_dict(
   // Checkpoint directory: python models use it to discover side-car files
   // shipped with the weights (e.g. optional/quarot.safetensors).
   d["model_path"] = ModelConfig::get_instance().model();
+  d["enable_static_kernel"] =
+      ExecutionConfig::get_instance().enable_static_kernel();
+  d["static_kernel_cache_dir"] =
+      ExecutionConfig::get_instance().static_kernel_cache_dir();
+  d["disable_graph_warmup"] =
+      ExecutionConfig::get_instance().disable_graph_warmup();
+  d["python_rendezvous_host"] = parallel_args.python_rendezvous_host_;
+  d["python_rendezvous_port"] = parallel_args.python_rendezvous_port_;
   d["tp_size"] = tp_size_;
   d["tp_rank"] = tp_rank_;
   d["dp_size"] = dp_size_;
