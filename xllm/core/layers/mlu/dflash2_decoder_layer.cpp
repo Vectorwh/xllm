@@ -25,7 +25,7 @@ DFlash2DecoderLayerImpl::DFlash2DecoderLayerImpl(const ModelContext& context,
   const auto& quant_args = context.get_quant_args();
   const auto& options = context.get_tensor_options();
   const std::string mlp_module_prefix =
-      layer_id >= 0 ? "model.layers." + std::to_string(layer_id) + ".mlp" : "";
+      layer_id >= 0 ? "layers." + std::to_string(layer_id) + ".mlp" : "";
 
   // Initialize attention layers
   attention_ = register_module("self_attn", Qwen2Attention(context));

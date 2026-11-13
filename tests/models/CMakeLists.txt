@@ -90,6 +90,7 @@ if(USE_MLU)
       dflash2_mlu_model_test.cpp
     DEPS
       models
+      :runtime
       :mlu_layers
       :common_layers
       :parallel_state

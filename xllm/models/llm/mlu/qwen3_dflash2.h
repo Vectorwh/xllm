@@ -302,4 +302,14 @@ REGISTER_CAUSAL_MODEL_WITH_VARNAME(dflash2_draft_model,
                                    DFlash2DraftModel,
                                    DFlash2Qwen3ForCausalLM);
 
+namespace {
+const bool kDFlash2GraphContractRegistered = []() {
+  MtpModelCapabilities capabilities;
+  capabilities.supports_grouped_mtp_graph = true;
+  capabilities.graph_cache_pad_slot = -1;
+  ModelRegistry::register_mtp_capabilities("DFlash2DraftModel", capabilities);
+  return true;
+}();
+}  // namespace
+
 }  // namespace xllm::mlu::model

@@ -200,6 +200,43 @@ TEST(MluGraphPlannerTest, AcceptsBackendIndependentTopkGraphContract) {
       MluGraphPlanner(config), 3, params, EagerReason::UNSUPPORTED_INPUT);
 }
 
+TEST(MluGraphPlannerTest, DFlash2AdmitsOnlyCompleteProposalBlocks) {
+  GraphPlannerConfig config = topk_reuse_config();
+  config.options.speculative_algorithm("DFlash2").draft_graph_query_width(6);
+  ModelInputParams params = grouped_input();
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.meta.q_max_seq_len = 6;
+  params.attention.host.q_seq_lens = {0, 6, 12, 18};
+  params.attention.device.new_cache_slots = torch::zeros({18}, torch::kInt32);
+  params.parallel.dp_global_token_nums = {18};
+  const auto decision = MluGraphPlanner(config).plan({18, params});
+  ASSERT_TRUE(std::holds_alternative<GraphPlan>(decision));
+  const auto& layout = std::get<GraphPlan>(decision).layout;
+  EXPECT_EQ(layout.tokens_per_request, 6);
+  EXPECT_EQ(layout.padded_num_reqs, 4);
+  EXPECT_EQ(layout.padded_num_tokens, 24);
+
+  config.options.kv_cache_dtype("int8");
+  expect_eager(MluGraphPlanner(config), 18, params, EagerReason::NON_DECODE);
+  config.options.kv_cache_dtype("auto").dp_size(2);
+  expect_eager(MluGraphPlanner(config), 18, params, EagerReason::NON_DECODE);
+  config.options.dp_size(1).cp_size(2);
+  expect_eager(MluGraphPlanner(config), 18, params, EagerReason::NON_DECODE);
+  config.options.cp_size(1);
+  params.prefill_without_cache = true;
+  expect_eager(
+      MluGraphPlanner(config), 18, params, EagerReason::UNSUPPORTED_INPUT);
+  params.prefill_without_cache = false;
+  params.meta.q_max_seq_len = 5;
+  expect_eager(MluGraphPlanner(config), 18, params, EagerReason::NON_DECODE);
+  params.meta.q_max_seq_len = 6;
+  config.capabilities.supports_grouped_mtp_graph = false;
+  expect_eager(MluGraphPlanner(config), 18, params, EagerReason::NON_DECODE);
+  config.capabilities.supports_grouped_mtp_graph = true;
+  config.options.speculative_algorithm("DFlash");
+  expect_eager(MluGraphPlanner(config), 18, params, EagerReason::NON_DECODE);
+}
+
 // Data-parallel ranks compare the whole key in one fixed-size packet, so a key
 // that cannot fit is rejected here instead of being dropped at agreement time.
 TEST(MluGraphPlannerTest, KeyLayoutBeyondAgreementPacketStaysEager) {

@@ -86,11 +86,24 @@ bool dp_tokens_equal(const std::vector<int32_t>& dp_token_nums) {
              });
 }
 
+bool is_dflash2_query(const xllm::runtime::Options& options,
+                      const xllm::ModelInputParams& params) {
+  return options.is_draft_engine() && options.dp_size() == 1 &&
+         options.cp_size() == 1 && options.kv_cache_dtype() == "auto" &&
+         xllm::SpeculativeConfig::is_dflash2_algorithm(
+             options.speculative_algorithm()) &&
+         params.meta.batch_forward_type.is_chunked_prefill() &&
+         options.draft_graph_query_width() > 1 &&
+         params.meta.q_max_seq_len == options.draft_graph_query_width();
+}
+
 bool allows_graph_mode(const xllm::runtime::Options& options,
                        const xllm::MtpModelCapabilities& capabilities,
                        const xllm::ModelInputParams& params) {
   if (options.is_draft_engine()) {
-    return params.meta.batch_forward_type.is_decode();
+    return params.meta.batch_forward_type.is_decode() ||
+           (capabilities.supports_grouped_mtp_graph &&
+            is_dflash2_query(options, params));
   }
   const bool supports_target_verify =
       xllm::SpeculativeConfig::is_mtp_algorithm(
@@ -172,6 +185,7 @@ bool supports_grouped_graph(const xllm::runtime::Options& options,
   if (params.meta.q_max_seq_len <= 0 || params.meta.num_sequences <= 0 ||
       params.prefill_without_cache ||
       !(params.meta.batch_forward_type.is_decode() ||
+        is_dflash2_query(options, params) ||
         (params.is_spec_verify &&
          params.meta.batch_forward_type.is_chunked_prefill()))) {
     return false;

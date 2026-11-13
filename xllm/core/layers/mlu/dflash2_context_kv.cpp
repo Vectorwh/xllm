@@ -16,6 +16,7 @@ limitations under the License.
 #include "core/layers/mlu/dflash2_context_kv.h"
 
 #include "core/kernels/ops_api.h"
+#include "core/layers/common/quant_utils.h"
 #include "core/layers/common/rotary_embedding.h"
 
 namespace xllm::layer {
@@ -70,34 +71,20 @@ class DFlash2ContextKV::Impl final {
     if (per_layer_k_proj_.empty()) {
       per_layer_k_proj_.resize(num_layers);
       per_layer_v_proj_.resize(num_layers);
+      per_layer_k_scale_.resize(num_layers);
+      per_layer_v_scale_.resize(num_layers);
       per_layer_k_norm_.resize(num_layers);
     }
     for (int32_t i = 0; i < num_layers; ++i) {
       StateDict layer_dict =
           state_dict.get_dict_with_prefix("layers." + std::to_string(i) + ".");
-      torch::Tensor k_proj =
-          layer_dict.get_sharded_tensor("self_attn.k_proj.weight",
-                                        /*dim=*/0,
-                                        kv_shard_rank_,
-                                        kv_shard_count_);
-      torch::Tensor v_proj =
-          layer_dict.get_sharded_tensor("self_attn.v_proj.weight",
-                                        /*dim=*/0,
-                                        kv_shard_rank_,
-                                        kv_shard_count_);
+      load_projection(layer_dict.get_dict_with_prefix("self_attn.k_proj."),
+                      per_layer_k_proj_[i],
+                      per_layer_k_scale_[i]);
+      load_projection(layer_dict.get_dict_with_prefix("self_attn.v_proj."),
+                      per_layer_v_proj_[i],
+                      per_layer_v_scale_[i]);
       torch::Tensor k_norm = layer_dict.get_tensor("self_attn.k_norm.weight");
-      if (k_proj.defined()) {
-        CHECK_EQ(
-            k_proj.sizes(),
-            torch::IntArrayRef({local_kv_heads_ * head_dim_, hidden_size_}));
-        per_layer_k_proj_[i] = k_proj.to(tensor_options_);
-      }
-      if (v_proj.defined()) {
-        CHECK_EQ(
-            v_proj.sizes(),
-            torch::IntArrayRef({local_kv_heads_ * head_dim_, hidden_size_}));
-        per_layer_v_proj_[i] = v_proj.to(tensor_options_);
-      }
       if (k_norm.defined()) {
         CHECK_EQ(k_norm.sizes(), torch::IntArrayRef({head_dim_}));
         per_layer_k_norm_[i] = k_norm.to(tensor_options_).to(torch::kFloat32);
@@ -112,6 +99,12 @@ class DFlash2ContextKV::Impl final {
     for (int32_t i = 0; i < num_layers; ++i) {
       CHECK(per_layer_k_proj_[i].defined());
       CHECK(per_layer_v_proj_[i].defined());
+      CHECK(per_layer_k_proj_[i].scalar_type() != torch::kInt8 ||
+            per_layer_k_scale_[i].defined())
+          << "Missing DFlash2 K projection weight_scale for layer " << i;
+      CHECK(per_layer_v_proj_[i].scalar_type() != torch::kInt8 ||
+            per_layer_v_scale_[i].defined())
+          << "Missing DFlash2 V projection weight_scale for layer " << i;
       CHECK(per_layer_k_norm_[i].defined());
     }
   }
@@ -124,8 +117,10 @@ class DFlash2ContextKV::Impl final {
     kv_weights.reserve(num_layers * 2);
     k_norm_weights.reserve(num_layers);
     for (int32_t i = 0; i < num_layers; ++i) {
-      kv_weights.emplace_back(per_layer_k_proj_[i]);
-      kv_weights.emplace_back(per_layer_v_proj_[i]);
+      kv_weights.emplace_back(
+          projection_weight(per_layer_k_proj_[i], per_layer_k_scale_[i]));
+      kv_weights.emplace_back(
+          projection_weight(per_layer_v_proj_[i], per_layer_v_scale_[i]));
       k_norm_weights.emplace_back(per_layer_k_norm_[i]);
     }
     fused_kv_weight_ = torch::cat(kv_weights, /*dim=*/0).contiguous();
@@ -133,6 +128,8 @@ class DFlash2ContextKV::Impl final {
         torch::stack(k_norm_weights, /*dim=*/0).view({num_layers, 1, 1, -1});
     per_layer_k_proj_.clear();
     per_layer_v_proj_.clear();
+    per_layer_k_scale_.clear();
+    per_layer_v_scale_.clear();
     per_layer_k_norm_.clear();
   }
 
@@ -207,6 +204,39 @@ class DFlash2ContextKV::Impl final {
   }
 
  private:
+  void load_projection(const StateDict& state_dict,
+                       torch::Tensor& weight,
+                       torch::Tensor& scale) const {
+    CHECK(!state_dict.has("smooth"))
+        << "DFlash2 context KV does not support preserved smooth weights.";
+    const torch::Tensor loaded_weight = state_dict.get_sharded_tensor(
+        "weight", /*dim=*/0, kv_shard_rank_, kv_shard_count_);
+    if (loaded_weight.defined()) {
+      CHECK_EQ(loaded_weight.sizes(),
+               torch::IntArrayRef({local_kv_heads_ * head_dim_, hidden_size_}));
+      // Keep INT8 until all checkpoint shards (including scales) are loaded.
+      const bool keep_int8 = loaded_weight.scalar_type() == torch::kInt8;
+      weight = loaded_weight.to(keep_int8 ? tensor_options_.dtype(torch::kInt8)
+                                          : tensor_options_);
+    }
+    const torch::Tensor loaded_scale = state_dict.get_sharded_tensor(
+        "weight_scale", /*dim=*/0, kv_shard_rank_, kv_shard_count_);
+    if (loaded_scale.defined()) {
+      check_ct_scale(loaded_scale, "DFlash2 projection weight_scale");
+      CHECK_EQ(loaded_scale.numel(), local_kv_heads_ * head_dim_);
+      scale = loaded_scale.reshape({-1, 1}).to(
+          tensor_options_.dtype(torch::kFloat32));
+    }
+  }
+
+  torch::Tensor projection_weight(const torch::Tensor& weight,
+                                  const torch::Tensor& scale) const {
+    if (weight.scalar_type() == torch::kInt8) {
+      return (weight.to(torch::kFloat32) * scale).to(tensor_options_);
+    }
+    return weight;
+  }
+
   torch::Tensor apply_k_norm(const torch::Tensor& key,
                              const torch::Tensor& weight) const {
     torch::Tensor key_fp32 = key.to(torch::kFloat32);
@@ -231,6 +261,8 @@ class DFlash2ContextKV::Impl final {
 
   std::vector<torch::Tensor> per_layer_k_proj_;
   std::vector<torch::Tensor> per_layer_v_proj_;
+  std::vector<torch::Tensor> per_layer_k_scale_;
+  std::vector<torch::Tensor> per_layer_v_scale_;
   std::vector<torch::Tensor> per_layer_k_norm_;
   torch::Tensor fused_kv_weight_;
   torch::Tensor k_norm_weight_;

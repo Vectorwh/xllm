@@ -103,10 +103,12 @@ torch::Tensor make_weight(int64_t offset) {
 }
 
 class DFlash2ContextKVTest
-    : public ::testing::TestWithParam<std::pair<int32_t, int32_t>> {};
+    : public ::testing::TestWithParam<
+          std::tuple<std::pair<int32_t, int32_t>, bool>> {};
 
 TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
-  const auto [tp_size, rank] = GetParam();
+  const auto [topology, quantized] = GetParam();
+  const auto [tp_size, rank] = topology;
   const ModelArgs args = make_args();
   const auto options = torch::TensorOptions()
                            .dtype(torch::kBFloat16)
@@ -116,15 +118,27 @@ TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
   DFlash2ContextKV writer(context);
   const torch::Tensor norm =
       torch::linspace(0.5, 1.5, 128).to(torch::kBFloat16);
+  const torch::Tensor scale =
+      ((torch::arange(8 * 128, torch::kFloat32).remainder(7) + 1) / 128)
+          .to(torch::kBFloat16);
+  const auto checkpoint_weight = [quantized](int64_t offset) {
+    return quantized ? (make_weight(offset) * 32).to(torch::kInt8)
+                     : make_weight(offset).to(torch::kBFloat16);
+  };
   for (int32_t layer = 0; layer < 2; ++layer) {
     const std::string prefix =
         "layers." + std::to_string(layer) + ".self_attn.";
-    // Deliberately split K, V and norm across independent checkpoint shards.
-    writer.load_state_dict(StateDict(
-        {{prefix + "k_proj.weight", make_weight(layer).to(torch::kBFloat16)}}));
+    // Split weights and scales across shards, testing both arrival orders.
     writer.load_state_dict(
-        StateDict({{prefix + "v_proj.weight",
-                    make_weight(layer + 7).to(torch::kBFloat16)}}));
+        StateDict({{prefix + "k_proj.weight", checkpoint_weight(layer)}}));
+    if (quantized) {
+      writer.load_state_dict(
+          StateDict({{prefix + "k_proj.weight_scale", scale.view({-1, 1})}}));
+      writer.load_state_dict(
+          StateDict({{prefix + "v_proj.weight_scale", scale}}));
+    }
+    writer.load_state_dict(
+        StateDict({{prefix + "v_proj.weight", checkpoint_weight(layer + 7)}}));
     writer.load_state_dict(StateDict({{prefix + "k_norm.weight", norm}}));
   }
   writer.finalize_loaded_weights();
@@ -163,10 +177,12 @@ TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
                                  .unsqueeze(1);
   for (int32_t layer = 0; layer < 2; ++layer) {
     const auto project = [&](int64_t offset) {
+      const torch::Tensor full_weight =
+          quantized ? (make_weight(offset) * 32 * scale.view({-1, 1}))
+                          .to(torch::kBFloat16)
+                    : make_weight(offset).to(torch::kBFloat16);
       const torch::Tensor weight =
-          make_weight(offset)
-              .to(torch::kBFloat16)
-              .slice(0, first_head * 128, (first_head + heads) * 128);
+          full_weight.slice(0, first_head * 128, (first_head + heads) * 128);
       return torch::matmul(hidden.to(torch::kFloat32),
                            weight.to(torch::kFloat32).t())
           .to(torch::kBFloat16)
@@ -204,16 +220,35 @@ TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
   }
 }
 
-INSTANTIATE_TEST_SUITE_P(ShardedAndReplicatedHeads,
-                         DFlash2ContextKVTest,
-                         ::testing::Values(std::pair<int32_t, int32_t>{1, 0},
-                                           std::pair<int32_t, int32_t>{2, 0},
-                                           std::pair<int32_t, int32_t>{2, 1},
-                                           std::pair<int32_t, int32_t>{16, 0},
-                                           std::pair<int32_t, int32_t>{16, 1},
-                                           std::pair<int32_t, int32_t>{16, 14},
-                                           std::pair<int32_t, int32_t>{16,
-                                                                       15}));
+INSTANTIATE_TEST_SUITE_P(
+    ShardedAndReplicatedHeads,
+    DFlash2ContextKVTest,
+    ::testing::Combine(::testing::Values(std::pair<int32_t, int32_t>{1, 0},
+                                         std::pair<int32_t, int32_t>{2, 0},
+                                         std::pair<int32_t, int32_t>{2, 1},
+                                         std::pair<int32_t, int32_t>{16, 0},
+                                         std::pair<int32_t, int32_t>{16, 1},
+                                         std::pair<int32_t, int32_t>{16, 14},
+                                         std::pair<int32_t, int32_t>{16, 15}),
+                       ::testing::Bool()));
+
+TEST(DFlash2ContextKVDeathTest, RejectsInt8ProjectionWithoutScale) {
+  ModelArgs args = make_args();
+  args.n_layers(1);
+  ModelContext context(ParallelArgs(0, 1, nullptr),
+                       args,
+                       QuantArgs(),
+                       torch::TensorOptions().dtype(torch::kBFloat16));
+  DFlash2ContextKV writer(context);
+  writer.load_state_dict(
+      StateDict({{"layers.0.self_attn.k_proj.weight",
+                  make_weight(0).to(torch::kBFloat16)},
+                 {"layers.0.self_attn.v_proj.weight",
+                  (make_weight(7) * 32).to(torch::kInt8)},
+                 {"layers.0.self_attn.k_norm.weight", torch::ones({128})}}));
+  EXPECT_DEATH(writer.finalize_loaded_weights(),
+               "Missing DFlash2 V projection weight_scale");
+}
 
 TEST(DFlash2ContextKVDeathTest, RejectsInvalidHeadTopologyBeforeAllocation) {
   ModelArgs args = make_args();

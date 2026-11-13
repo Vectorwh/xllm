@@ -19,16 +19,37 @@ limitations under the License.
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 #include "core/framework/parallel_state/process_group.h"
 #include "core/layers/mlu/dflash2_decoder_layer.h"
 #include "core/platform/platform.h"
+#include "core/runtime/mlu_graph_executor_impl.h"
 #include "models/llm/mlu/qwen3_dflash2.h"
 
 namespace xllm {
 namespace {
 
 using MluDraftModel = mlu::model::DFlash2Qwen3ModelImpl;
+using DraftCausalLM = CausalLMImpl<mlu::model::DFlash2Qwen3ForCausalLM>;
+
+class CountingDraftCausalLM final : public DraftCausalLM {
+ public:
+  using DraftCausalLM::DraftCausalLM;
+
+  ModelOutput forward(const torch::Tensor& tokens,
+                      const torch::Tensor& positions,
+                      std::vector<KVCache>& caches,
+                      const ModelInputParams& params) override {
+    ++calls_;
+    return DraftCausalLM::forward(tokens, positions, caches, params);
+  }
+
+  int32_t calls() const { return calls_; }
+
+ private:
+  int32_t calls_ = 0;
+};
 static_assert(
     std::is_base_of_v<QWen3ModelImplBase<layer::mlu::DFlash2DecoderLayer>,
                       MluDraftModel>);
@@ -150,6 +171,190 @@ TEST(DFlash2MluModelTest, ActualDraftModelLoadsUnchangedLayerPrefixes) {
   EXPECT_FALSE(modules.contains("embed_tokens"));
   EXPECT_TRUE(modules.contains("fc"));
   EXPECT_TRUE(modules.contains("hidden_norm"));
+}
+
+TEST(DFlash2MluModelTest, CompressedInt8MlpMatchesDequantizedReference) {
+  const torch::Device device(Platform::type_torch(), 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  ProcessGroup group(0, 1, device);
+  ParallelArgs parallel(0, 1, &group);
+  parallel.tp_group_ = &group;
+  QuantArgs quant_args;
+  quant_args.quant_method("compressed-tensors")
+      .is_compressed_tensors_w8a8_dynamic(true);
+  CompressedQuantGroup scheme;
+  scheme.targets = {
+      R"(re:layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$)",
+      R"(re:layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)$)"};
+  quant_args.compressed_groups() = {scheme};
+  ModelContext context(parallel, make_draft_args(), quant_args, options);
+  layer::mlu::DFlash2DecoderLayer decoder(context, 0);
+  auto weights = make_decoder_weights(options.device(torch::kCPU));
+  for (const std::string& name : {"self_attn.q_proj",
+                                  "self_attn.k_proj",
+                                  "self_attn.v_proj",
+                                  "self_attn.o_proj",
+                                  "mlp.gate_proj",
+                                  "mlp.up_proj",
+                                  "mlp.down_proj"}) {
+    torch::Tensor& weight = weights.at(name + ".weight");
+    weights.emplace(
+        name + ".weight_scale",
+        torch::full(
+            {weight.size(0), 1}, 1.0 / 32, options.device(torch::kCPU)));
+    weight = (weight * 32).to(torch::kInt8);
+  }
+  // Preserve the real checkpoint prefix used by the linear quantization loader.
+  decoder->load_state_dict(StateDict(std::move(weights), "layers.0."));
+  decoder->verify_loaded_weights("layers.0.");
+  const auto modules = decoder->named_modules();
+  const auto mlp = modules["mlp"]->as<layer::DenseMLPImpl>();
+  ASSERT_NE(mlp, nullptr);
+  const torch::Tensor input = torch::full({2, 128}, 1.0 / 128, options);
+  const torch::Tensor actual = mlp->forward(input);
+  const torch::Tensor gate = torch::full({2, 256}, 0.25);
+  const torch::Tensor up = torch::full({2, 256}, 0.5);
+  const torch::Tensor expected = torch::matmul(
+      (torch::silu(gate) * up).to(torch::kBFloat16).to(torch::kFloat32),
+      torch::full({256, 128}, 0.125));
+  EXPECT_TRUE(
+      torch::allclose(actual.cpu().to(torch::kFloat32), expected, 0.02, 0.02));
+}
+
+TEST(DFlash2MluModelTest, DraftGraphReplaysFreshBlocksForBfloat16AndInt8) {
+  torch::manual_seed(42);
+  const torch::Device device(Platform::type_torch(), 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const auto ints = options.dtype(torch::kInt32);
+  ProcessGroup group(0, 1, device);
+  ParallelArgs parallel(0, 1, &group);
+  parallel.tp_group_ = &group;
+  for (const bool quantized : {false, true}) {
+    SCOPED_TRACE(quantized ? "INT8" : "BF16");
+    ModelArgs args = make_draft_args();
+    args.max_position_embeddings(128);
+    QuantArgs quant_args;
+    if (quantized) {
+      quant_args.quant_method("compressed-tensors")
+          .is_compressed_tensors_w8a8_dynamic(true);
+      CompressedQuantGroup scheme;
+      scheme.targets = {
+          R"(re:layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$)",
+          R"(re:layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)$)"};
+      quant_args.compressed_groups() = {scheme};
+    }
+    ModelContext context(parallel, args, quant_args, options);
+    mlu::model::DFlash2Qwen3ForCausalLM model(context);
+    const auto draft = model->named_modules()["model"]->as<MluDraftModel>();
+    ASSERT_NE(draft, nullptr);
+    std::unordered_map<std::string, torch::Tensor> weights;
+    for (const auto& [name, tensor] : make_decoder_weights(options)) {
+      const std::string key = "layers.0." + name;
+      auto weight =
+          tensor.dim() == 2 ? torch::randn_like(tensor) * 0.02 : tensor;
+      if (quantized &&
+          quant_args.module_quant_method(key.substr(0, key.size() - 7))
+              .has_value()) {
+        weights.emplace(key + "_scale",
+                        torch::full({weight.size(0), 1}, 1.0 / 1024, options));
+        weight = (weight.to(torch::kFloat32) * 1024)
+                     .round()
+                     .clamp(-127, 127)
+                     .to(torch::kInt8);
+      }
+      weights.emplace(key, std::move(weight));
+    }
+    weights.emplace("fc.weight", torch::ones({128, 128}, options));
+    weights.emplace("hidden_norm.weight", torch::ones({128}, options));
+    weights.emplace("norm.weight", torch::ones({128}, options));
+    weights.emplace("candidate_selector.hidden_projection.weight",
+                    torch::ones({8, 128}, options));
+    weights.emplace("candidate_selector.predecessor_codebook",
+                    torch::ones({16, 8}, options));
+    weights.emplace("candidate_selector.successor_codebook",
+                    torch::ones({16, 8}, options));
+    draft->load_state_dict(StateDict(std::move(weights)));
+    draft->verify_loaded_weights();
+    draft->finalize_loaded_weights();
+    CountingDraftCausalLM causal(std::move(model), options);
+    runtime::Options runtime_options;
+    runtime_options.is_draft_engine(true)
+        .speculative_algorithm("DFlash2")
+        .draft_graph_query_width(4)
+        .block_size(16)
+        .max_seqs_per_batch(4);
+    mlu::MluGraphExecutorImpl executor(&causal, args, device, runtime_options);
+    const auto initial_k = torch::randn({16, 1, 16, 128}, options);
+    const auto initial_v = torch::randn_like(initial_k);
+    std::vector<KVCache> eager_caches;
+    std::vector<KVCache> graph_caches;
+    eager_caches.emplace_back(
+        KVCacheTensors{initial_k.clone(), initial_v.clone()});
+    graph_caches.emplace_back(
+        KVCacheTensors{initial_k.clone(), initial_v.clone()});
+    torch::Tensor previous;
+    for (const int32_t history : {1, 7, 17, 3}) {
+      const int32_t requests = history == 7 ? 4 : 3;
+      ModelInputParams params;
+      params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+      params.meta.num_sequences = requests;
+      params.meta.q_max_seq_len = 4;
+      params.meta.kv_max_seq_len = history + 4;
+      params.parallel.dp_global_token_nums = {requests * 4};
+      params.parallel.dp_is_decode = {0};
+      params.attention.host.q_seq_lens = {0};
+      params.attention.host.kv_seq_lens = {0};
+      std::vector<int32_t> tables;
+      std::vector<int32_t> slots;
+      tables.reserve(requests * 4);
+      slots.reserve(requests * 4);
+      for (int32_t row = 0; row < requests; ++row) {
+        params.attention.host.q_seq_lens.emplace_back((row + 1) * 4);
+        params.attention.host.kv_seq_lens.emplace_back((row + 1) *
+                                                       (history + 4));
+        const int32_t base = ((row + history) % 4) * 4;
+        for (int32_t col = 0; col < 4; ++col) {
+          tables.emplace_back(base + col);
+          slots.emplace_back(base * 16 + history + col);
+        }
+      }
+      params.attention.device.q_seq_lens =
+          torch::tensor(params.attention.host.q_seq_lens, ints);
+      params.attention.device.kv_seq_lens =
+          torch::tensor(params.attention.host.kv_seq_lens, ints);
+      params.attention.device.new_cache_slots = torch::tensor(slots, ints);
+      params.attention.device.block_tables =
+          torch::tensor(tables, ints).view({requests, 4});
+      params.embedding.input_embedding =
+          torch::randn({requests * 4, 128}, options);
+      const auto tokens = torch::zeros({requests * 4}, ints);
+      const auto positions =
+          torch::arange(history, history + 4, ints).repeat({requests});
+      auto eager_params = params;
+      eager_params.embedding.input_embedding =
+          params.embedding.input_embedding.clone();
+      const auto expected =
+          causal.forward(tokens, positions, eager_caches, eager_params)
+              .hidden_states;
+      const int32_t before_graph = causal.calls();
+      const auto actual = executor.run(tokens, positions, graph_caches, params)
+                              .hidden_states.clone();
+      EXPECT_EQ(causal.calls(), before_graph + (history == 1 ? 1 : 0));
+      EXPECT_TRUE(torch::allclose(actual, expected, 0.002, 0.002))
+          << "history=" << history
+          << " max_error=" << (actual - expected).abs().max().item<float>();
+      EXPECT_TRUE(torch::equal(graph_caches[0].get_k_cache(),
+                               eager_caches[0].get_k_cache()));
+      EXPECT_TRUE(torch::equal(graph_caches[0].get_v_cache(),
+                               eager_caches[0].get_v_cache()));
+      if (previous.defined() && previous.sizes() == actual.sizes()) {
+        EXPECT_FALSE(torch::equal(previous, actual));
+      }
+      previous = actual;
+    }
+  }
 }
 
 }  // namespace
