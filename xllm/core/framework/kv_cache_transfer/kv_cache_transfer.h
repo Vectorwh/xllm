@@ -222,6 +222,13 @@ class KVCacheTransfer {
 #endif
 
  protected:
+  // Drafts may register only a subset of the target's cache groups. Prepare
+  // their request mappings before validating them in the draft's KV topology.
+  virtual bool prepare_draft_transfer_infos(
+      std::vector<TransferKVInfo>& /*transfer_kv_infos*/) const {
+    return true;
+  }
+
   static bool validate_transfer_mappings(
       const std::vector<KVTransferMapping>& mappings,
       const std::string& request_id,

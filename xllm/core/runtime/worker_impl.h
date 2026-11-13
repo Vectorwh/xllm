@@ -328,6 +328,10 @@ class WorkerImpl {
 
   Status get_status() const { return status_; }
 
+  const ParallelArgs& get_parallel_args() const { return parallel_args_; }
+
+  const runtime::Options& get_options() const { return options_; }
+
   // model context, includes model args, parallel args and date type etc.
   mutable ModelContext context_;
   LinearAttentionPolicy linear_attention_policy_;

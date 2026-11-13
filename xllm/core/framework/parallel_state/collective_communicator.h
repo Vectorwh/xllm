@@ -41,7 +41,8 @@ class CollectiveCommunicator : public CollectiveCommunicatorBase {
                          int dp_size,
                          int ep_size,
                          int cp_size,
-                         int32_t buffer_offset = 0);
+                         int32_t buffer_offset = 0,
+                         bool needs_tp_cp_group = false);
   ~CollectiveCommunicator() = default;
 
   void create_process_groups(const std::string& master_addr,
@@ -51,10 +52,12 @@ class CollectiveCommunicator : public CollectiveCommunicatorBase {
   const ParallelArgs* parallel_args() override;
 
  private:
+  bool needs_tp_cp_group_ = false;
   std::unique_ptr<ParallelArgs> parallel_args_;
   std::unique_ptr<ProcessGroup> process_group_;
   std::unique_ptr<ProcessGroup> dp_local_process_group_;
   std::unique_ptr<ProcessGroup> tp_group_;
+  std::unique_ptr<ProcessGroup> tp_cp_group_;
   std::unique_ptr<ProcessGroup> encoder_dp_group_;
   std::unique_ptr<ProcessGroup> single_rank_group_;
   // Owns a standalone CP ProcessGroup for orthogonal model-side CP.

@@ -236,6 +236,10 @@ struct ParallelArgs {
   ProcessGroup* process_group_ = nullptr;
   ProcessGroup* dp_local_process_group_ = nullptr;
   ProcessGroup* tp_group_ = nullptr;
+  // Spans the TP x CP domain within one DP partition.
+  // CP-independent models use the entire group for tensor parallelism.
+  // Owned by CollectiveCommunicator; may alias the world or TP group.
+  ProcessGroup* tp_cp_group_ = nullptr;
   // Optional output-projection group for models whose body and LMHead use
   // different tensor-parallel strategies.
   ProcessGroup* lm_head_group_ = nullptr;

@@ -404,11 +404,15 @@ KVCacheTransfer::push_kv_blocks_async(
   folly::Promise<std::vector<KVTransferTaskResult>> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this,
-                        transfer_kv_infos,
+                        transfer_kv_infos = transfer_kv_infos,
                         parallel_args,
                         layer_synchronizer,
                         is_spec_draft,
                         promise = std::move(promise)]() mutable {
+    if (is_spec_draft && !prepare_draft_transfer_infos(transfer_kv_infos)) {
+      promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
+      return;
+    }
     std::unordered_map<std::string, KVCacheInfo> merged_kv_infos;
     std::vector<TransferKVInfo> filtered_kv_infos;
     const std::vector<TransferKVInfo>* kv_infos = &transfer_kv_infos;

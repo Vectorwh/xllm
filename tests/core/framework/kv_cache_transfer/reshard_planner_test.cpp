@@ -1220,6 +1220,168 @@ TEST(ReshardPlannerTest, SupportsTp1SpecDraftBesideShardedMainCache) {
                           }));
 }
 
+TEST(ReshardPlannerTest, IndependentDraftTpAcrossMainCpPartitions) {
+  for (int32_t kv_split : {1, 4}) {
+    auto sources = make_cp_instance(4, kv_split, 2, 8, 3, "source");
+    auto destinations = make_instance(2, 8, 40, "destination");
+    for (int32_t rank = 0; rank < 8; ++rank) {
+      auto draft = make_head_manifest(rank, 8, 8, 80 + rank, "draft");
+      draft.tensors[0].cache_namespace = CacheNamespace::SPEC_DRAFT;
+      sources[rank].draft_coordinates = draft.coordinates;
+      sources[rank].tensors.push_back(draft.tensors[0]);
+      proto::WorkerCacheLayoutManifest wire;
+      cache_layout_to_proto(sources[rank], &wire);
+      WorkerCacheLayoutManifest decoded;
+      const Status status = cache_layout_from_proto(wire, &decoded);
+      ASSERT_TRUE(status.ok()) << status.message();
+      ASSERT_TRUE(decoded.draft_coordinates.has_value());
+      EXPECT_EQ(decoded.draft_coordinates->tp_rank, rank);
+      sources[rank] = std::move(decoded);
+    }
+    for (int32_t rank = 0; rank < 2; ++rank) {
+      auto draft = make_head_manifest(rank, 2, 8, 100 + rank, "draft");
+      draft.tensors[0].cache_namespace = CacheNamespace::SPEC_DRAFT;
+      destinations[rank].tensors.push_back(draft.tensors[0]);
+      std::vector<size_t> selected;
+      const Status status = ReshardPlanner().select_sources(
+          sources, destinations[rank], &selected);
+      ASSERT_TRUE(status.ok()) << status.message();
+      std::vector<uint8_t> coverage(kTokenCount * 4, 0);
+      for (size_t index : selected) {
+        ReshardPlanTemplate plan;
+        const Status planned =
+            ReshardPlanner().build_outgoing_plan(sources[index],
+                                                 destinations[rank],
+                                                 &plan,
+                                                 /*include_replicas=*/true);
+        ASSERT_TRUE(planned.ok()) << planned.message();
+        KVTransferMapping mapping;
+        mapping.group_id = 7;
+        mapping.local_ids = {0};
+        mapping.remote_ids = {0};
+        std::vector<ByteRegion> regions;
+        ASSERT_TRUE(
+            RequestRegionBinder()
+                .bind(plan, {mapping}, CacheNamespace::SPEC_DRAFT, 0, &regions)
+                .ok());
+        for (const ByteRegion& region : regions) {
+          for (uint64_t byte = region.remote_offset;
+               byte < region.remote_offset + region.length;
+               ++byte) {
+            ASSERT_LT(byte, coverage.size());
+            ++coverage[byte];
+          }
+        }
+      }
+      EXPECT_TRUE(std::all_of(coverage.begin(),
+                              coverage.end(),
+                              [](uint8_t count) { return count == 1; }));
+    }
+    auto invalid = sources.back();
+    invalid.draft_coordinates->tp_rank = 8;
+    EXPECT_FALSE(validate_worker_cache_layout(invalid).ok());
+    invalid = sources.back();
+    invalid.draft_coordinates.reset();
+    EXPECT_FALSE(validate_worker_cache_layout(invalid).ok());
+    invalid = sources.back();
+    invalid.draft_coordinates->dp_rank = 1;
+    EXPECT_FALSE(validate_worker_cache_layout(invalid).ok());
+  }
+}
+
+TEST(ReshardPlannerTest, IndependentDraftUnionWritesEachNamespaceExactlyOnce) {
+  for (int64_t draft_heads : {1, 4, 8}) {
+    auto sources = make_cp_instance(4, 1, 2, 8, 3, "source");
+    auto destinations = make_instance(2, 8, 40, "destination");
+    for (int32_t rank = 0; rank < 8; ++rank) {
+      auto draft = make_head_manifest(rank, 8, draft_heads, 80 + rank, "draft");
+      draft.tensors[0].cache_namespace = CacheNamespace::SPEC_DRAFT;
+      sources[rank].draft_coordinates = draft.coordinates;
+      sources[rank].tensors.emplace_back(draft.tensors[0]);
+    }
+    for (int32_t rank = 0; rank < 2; ++rank) {
+      auto draft =
+          make_head_manifest(rank, 2, draft_heads, 100 + rank, "draft");
+      draft.tensors[0].cache_namespace = CacheNamespace::SPEC_DRAFT;
+      destinations[rank].tensors.emplace_back(draft.tensors[0]);
+      std::vector<size_t> selected;
+      ASSERT_TRUE(ReshardPlanner()
+                      .select_sources(sources, destinations[rank], &selected)
+                      .ok());
+      for (CacheNamespace cache_namespace :
+           {CacheNamespace::MAIN, CacheNamespace::SPEC_DRAFT}) {
+        const uint64_t local_heads =
+            cache_namespace == CacheNamespace::MAIN
+                ? 4
+                : static_cast<uint64_t>(std::max<int64_t>(1, draft_heads / 2));
+        std::vector<uint32_t> coverage(kTokenCount * local_heads, 0);
+        for (size_t index : selected) {
+          ReshardPlanTemplate plan;
+          ASSERT_TRUE(ReshardPlanner()
+                          .build_outgoing_plan(sources[index],
+                                               destinations[rank],
+                                               &plan,
+                                               /*include_replicas=*/true)
+                          .ok());
+          KVTransferMapping mapping;
+          mapping.group_id = 7;
+          mapping.local_ids = {0};
+          mapping.remote_ids = {0};
+          std::vector<ByteRegion> regions;
+          ASSERT_TRUE(RequestRegionBinder()
+                          .bind(plan, {mapping}, cache_namespace, 0, &regions)
+                          .ok());
+          for (const ByteRegion& region : regions) {
+            for (uint64_t byte = region.remote_offset;
+                 byte < region.remote_offset + region.length;
+                 ++byte) {
+              ASSERT_LT(byte, coverage.size());
+              ++coverage[byte];
+            }
+          }
+        }
+        for (uint32_t count : coverage) {
+          EXPECT_EQ(count, 1)
+              << "draft_heads=" << draft_heads << ", destination_rank=" << rank
+              << ", namespace=" << static_cast<int32_t>(cache_namespace);
+        }
+      }
+    }
+  }
+}
+
+TEST(ReshardPlannerTest,
+     IndependentDraftPlanDoesNotWriteAnotherMainCpPartition) {
+  auto source = make_head_manifest(3, 4, 4, 7, "source");
+  source.coordinates.tp_rank = 1;
+  source.coordinates.tp_size = 2;
+  source.coordinates.cp_rank = 1;
+  source.coordinates.cp_size = 2;
+  // The MAIN shard belongs to TP rank 1 in CP partition 1.
+  source.tensors = make_head_manifest(1, 2, 4, 7, "main").tensors;
+  auto source_draft = make_head_manifest(3, 4, 4, 8, "draft");
+  source_draft.tensors[0].cache_namespace = CacheNamespace::SPEC_DRAFT;
+  source.draft_coordinates = source_draft.coordinates;
+  source.tensors.push_back(source_draft.tensors[0]);
+  auto destination = make_head_manifest(0, 1, 4, 9, "destination");
+  destination.coordinates.cp_size = 4;
+  auto destination_draft = make_head_manifest(0, 4, 4, 10, "draft");
+  // Receive rank 3's draft head on a rank in another MAIN CP partition.
+  destination_draft.tensors[0].shard.spans[0].logical_offset_bytes = 3;
+  destination_draft.tensors[0].cache_namespace = CacheNamespace::SPEC_DRAFT;
+  destination.draft_coordinates = destination_draft.coordinates;
+  destination.tensors.push_back(destination_draft.tensors[0]);
+  ReshardPlanTemplate plan;
+  const Status status =
+      ReshardPlanner().build_outgoing_plan(source, destination, &plan);
+  ASSERT_TRUE(status.ok()) << status.message();
+  ASSERT_FALSE(plan.regions.empty());
+  EXPECT_TRUE(std::all_of(
+      plan.regions.begin(), plan.regions.end(), [](const auto& region) {
+        return region.cache_namespace == CacheNamespace::SPEC_DRAFT;
+      }));
+}
+
 TEST(ReshardPlannerTest, RejectsIncompleteSourceWorkerSet) {
   std::vector<WorkerCacheLayoutManifest> sources =
       make_instance(/*tp_size=*/2, /*global_heads=*/2, 3, "source");

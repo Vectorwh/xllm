@@ -263,7 +263,7 @@ DraftModelSpecWorkerImpl::estimate_kv_cache_capacity_with_draft(
   const KVCacheEstimateOptions draft_estimate_options =
       make_kv_cache_estimate_options(draft_model_args,
                                      draft_options,
-                                     parallel_args_,
+                                     draft_impl_->get_parallel_args(),
                                      dtype_,
                                      cache_size_in_bytes);
   target_estimate_options.draft_model_args = &draft_model_args;

@@ -440,6 +440,7 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
           cache_tensor.group_id,
           logical_bytes / static_cast<uint64_t>(resource_count)};
       layer_buffers.emplace_back(std::move(desc));
+      layout.group_ids.emplace(cache_tensor.group_id);
       if (pending_registration_context_.has_value()) {
         KVCacheTensor described_tensor = cache_tensor;
         std::string descriptor_error;
@@ -514,6 +515,7 @@ void MooncakeKVCacheTransferBase::publish_cache_layout(
   CHECK(!tensor_manifests.empty());
   if (registration_context.cache_namespace == CacheNamespace::MAIN) {
     local_cache_layout_.tensors.clear();
+    local_cache_layout_.draft_coordinates.reset();
     local_cache_layout_.schema_version = kCacheLayoutSchemaVersion;
     local_cache_layout_.incarnation_id = incarnation_id_;
     local_cache_layout_.fingerprint = registration_context.fingerprint;
@@ -532,6 +534,10 @@ void MooncakeKVCacheTransferBase::publish_cache_layout(
     // Worker coordinates describe the MAIN cache topology. SPEC_DRAFT tensors
     // carry their independent logical TP placement in each shard descriptor,
     // which permits a replicated TP1 MTP draft body beside a sharded target.
+    if (registration_context.coordinates.tp_size >
+        local_cache_layout_.coordinates.tp_size) {
+      local_cache_layout_.draft_coordinates = registration_context.coordinates;
+    }
     local_cache_layout_.fingerprint.append("|spec:");
     local_cache_layout_.fingerprint.append(registration_context.fingerprint);
   }
@@ -705,6 +711,33 @@ void MooncakeKVCacheTransferDefault::register_kv_cache_impl(
 
   LOG(INFO) << "register_kv_cache_impl success, registered_layers="
             << kv_caches.size() << ", buffers=" << buf_bytes.size();
+}
+
+bool MooncakeKVCacheTransferDefault::prepare_draft_transfer_infos(
+    std::vector<TransferKVInfo>& transfer_kv_infos) const {
+  if (!spec_layout_.registered || spec_layout_.group_ids.empty()) {
+    LOG(ERROR) << "Draft KV cache groups are not registered.";
+    return false;
+  }
+  for (TransferKVInfo& info : transfer_kv_infos) {
+    std::erase_if(info.mappings, [this](const KVTransferMapping& mapping) {
+      return !spec_layout_.group_ids.contains(mapping.group_id);
+    });
+    for (const int32_t group_id : spec_layout_.group_ids) {
+      const bool has_mapping =
+          std::any_of(info.mappings.begin(),
+                      info.mappings.end(),
+                      [group_id](const KVTransferMapping& mapping) {
+                        return mapping.group_id == group_id;
+                      });
+      if (!has_mapping) {
+        LOG(ERROR) << "Missing draft KV cache transfer mapping, request_id="
+                   << info.request_id << ", group_id=" << group_id;
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool MooncakeKVCacheTransferDefault::pull_kv_blocks(

@@ -182,6 +182,24 @@ Status validate_compatibility(const WorkerCacheLayoutManifest& source,
   return Status();
 }
 
+// Plan each cache namespace in its own parallel domain. Physical worker
+// indices and buffer identities remain unchanged when projecting a manifest.
+WorkerCacheLayoutManifest namespace_layout(
+    const WorkerCacheLayoutManifest& manifest,
+    CacheNamespace cache_namespace) {
+  WorkerCacheLayoutManifest result = manifest;
+  if (cache_namespace == CacheNamespace::SPEC_DRAFT &&
+      result.draft_coordinates.has_value()) {
+    result.coordinates = *result.draft_coordinates;
+  }
+  result.draft_coordinates.reset();
+  std::erase_if(result.tensors,
+                [cache_namespace](const CacheTensorManifest& tensor) {
+                  return tensor.cache_namespace != cache_namespace;
+                });
+  return result;
+}
+
 // A logical span is identified by its logical tensor and logical offset.
 using SpanOwnerKey =
     std::tuple<int32_t, int64_t, int32_t, int32_t, std::string, uint64_t>;
@@ -1072,6 +1090,41 @@ Status ReshardPlanner::select_sources(
   if (sources.empty()) {
     return invalid("source layout set is empty");
   }
+  const bool independent_draft =
+      destination.draft_coordinates.has_value() ||
+      std::any_of(sources.begin(), sources.end(), [](const auto& source) {
+        return source.draft_coordinates.has_value();
+      });
+  if (independent_draft) {
+    for (const WorkerCacheLayoutManifest& source : sources) {
+      const Status status = validate_worker_cache_layout(source);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    std::set<size_t> selected;
+    for (CacheNamespace cache_namespace :
+         {CacheNamespace::MAIN, CacheNamespace::SPEC_DRAFT}) {
+      const WorkerCacheLayoutManifest receiver =
+          namespace_layout(destination, cache_namespace);
+      if (receiver.tensors.empty()) {
+        continue;
+      }
+      std::vector<WorkerCacheLayoutManifest> senders;
+      senders.reserve(sources.size());
+      for (const WorkerCacheLayoutManifest& source : sources) {
+        senders.emplace_back(namespace_layout(source, cache_namespace));
+      }
+      std::vector<size_t> indices;
+      const Status status = select_sources(senders, receiver, &indices);
+      if (!status.ok()) {
+        return status;
+      }
+      selected.insert(indices.begin(), indices.end());
+    }
+    selected_indices->assign(selected.begin(), selected.end());
+    return Status();
+  }
   const Status source_instance_status =
       validate_source_instance(sources, destination);
   if (!source_instance_status.ok()) {
@@ -1213,6 +1266,71 @@ Status ReshardPlanner::build_outgoing_plan(
   if (plan == nullptr) {
     return invalid("reshard plan output must not be null");
   }
+  if (source.draft_coordinates.has_value() ||
+      destination.draft_coordinates.has_value()) {
+    const Status source_status = validate_worker_cache_layout(source);
+    const Status destination_status = validate_worker_cache_layout(destination);
+    if (!source_status.ok()) {
+      return source_status;
+    }
+    if (!destination_status.ok()) {
+      return destination_status;
+    }
+    if (!same_instance_layout(source, destination)) {
+      return invalid("source and destination cache layouts are incompatible");
+    }
+    ReshardPlanTemplate combined;
+    combined.source_incarnation = source.incarnation_id;
+    combined.source_layout_generation = source.layout_generation;
+    combined.destination_incarnation = destination.incarnation_id;
+    combined.destination_layout_generation = destination.layout_generation;
+    combined.source_coordinates = source.coordinates;
+    combined.destination_coordinates = destination.coordinates;
+    combined.destination_addr = destination.addr;
+    for (CacheNamespace cache_namespace :
+         {CacheNamespace::MAIN, CacheNamespace::SPEC_DRAFT}) {
+      const WorkerCacheLayoutManifest sender =
+          namespace_layout(source, cache_namespace);
+      const WorkerCacheLayoutManifest receiver =
+          namespace_layout(destination, cache_namespace);
+      if (sender.tensors.empty() || receiver.tensors.empty()) {
+        continue;
+      }
+      // A peer selected for draft bytes can belong to another MAIN CP
+      // partition. It contributes only to the namespaces it can serve.
+      if (!supports_partition_pair(sender.coordinates, receiver.coordinates)) {
+        continue;
+      }
+      // Selection is a union across namespaces, not permission to send every
+      // replica a peer holds. Ordinary MAIN caches in later CP replicas are
+      // selected only for their draft bytes. Recurrent caches instead retain
+      // their per-head CP ownership in collapsed_source_writers().
+      const auto& coordinates = sender.coordinates;
+      if (!same_partition_sizes(coordinates, receiver.coordinates) &&
+          !kv_split_spans_cp_and_tp(coordinates) &&
+          !has_cp_sharded_resources(sender) &&
+          coordinates.kv_split_size <= coordinates.cp_size &&
+          coordinates.cp_rank %
+                  (coordinates.cp_size / coordinates.kv_split_size) !=
+              0) {
+        continue;
+      }
+      ReshardPlanTemplate part;
+      const Status status = build_outgoing_plan(sender,
+                                                receiver,
+                                                &part,
+                                                /*include_replicas=*/false,
+                                                source_cp_index_write_mode);
+      if (!status.ok()) {
+        return status;
+      }
+      combined.regions.insert(
+          combined.regions.end(), part.regions.begin(), part.regions.end());
+    }
+    *plan = std::move(combined);
+    return Status();
+  }
+
   const Status compatibility = validate_compatibility(source, destination);
   if (!compatibility.ok()) {
     return compatibility;

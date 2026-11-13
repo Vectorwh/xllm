@@ -24,13 +24,17 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/sampling/rejection_sampler.h"
 #include "core/kernels/mlu/dflash2_sampling.h"
+#include "core/layers/common/attention_metadata.h"
+#include "core/layers/common/attention_metadata_builder.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "core/runtime/dflash/dflash2_worker_impl.h"
 #include "core/runtime/llm_worker_impl.h"
+#include "core/util/scope_guard.h"
 
 namespace xllm {
 
@@ -66,6 +70,20 @@ class DFlashWorkerImplTestPeer final {
     worker.impl_ = std::move(target);
     worker.target_is_hybrid_recurrent_ = true;
     worker.dtype_ = torch::kFloat32;
+  }
+
+  static void set_empty_workers(DFlashWorkerImpl& worker,
+                                std::unique_ptr<WorkerImpl> target,
+                                std::unique_ptr<LLMWorkerImpl> draft,
+                                bool hybrid) {
+    worker.impl_ = std::move(target);
+    worker.draft_impl_ = std::move(draft);
+    worker.target_is_hybrid_recurrent_ = hybrid;
+  }
+
+  static std::optional<ForwardOutput> step_empty(DFlashWorkerImpl& worker,
+                                                 const ForwardInput& input) {
+    return worker.step_empty(input);
   }
 
   static ForwardInput prepare_validate(DFlashWorkerImpl& worker,
@@ -558,6 +576,107 @@ TEST_P(MluDFlashVerifyInputTest, ReplacesDecodeSpansOnlyForStatefulTargets) {
       EXPECT_TRUE(torch::equal(prepared.num_accepted_tokens.cpu(),
                                torch::ones({batch}, torch::kInt32)));
     }
+  }
+}
+
+// Exercise the production idle-worker staging path, stopping at model
+// execution so the test needs neither checkpoint weights nor remote ranks.
+class IdleVerifyRecordingWorker final : public LLMWorkerImpl {
+ public:
+  IdleVerifyRecordingWorker(const ParallelArgs& parallel_args,
+                            const torch::Device& device,
+                            const runtime::Options& options)
+      : LLMWorkerImpl(parallel_args, device, options) {
+    dtype_ = torch::kFloat32;
+    ModelArgs args;
+    args.model_type("idle_verify_test").dummy_token_count(1);
+    context_ =
+        ModelContext(parallel_args,
+                     args,
+                     QuantArgs(),
+                     torch::TensorOptions().device(device).dtype(dtype_));
+  }
+
+  std::optional<ForwardOutput> execute_no_sync_on_stream(
+      const ForwardInput& input,
+      Stream& stream) override {
+    auto guard = stream.set_stream_guard();
+    CHECK(stream.wait_event(input.metadata_ready_event));
+    last_input_ = input;
+    metadata_ = layer::AttentionMetadataBuilder::build(
+        input.input_params, /*enable_mla=*/false, {}, device_.unwrap());
+    return ForwardOutput{};
+  }
+
+  ForwardInput last_input_;
+  layer::AttentionMetadata metadata_;
+};
+
+TEST_P(MluDFlashVerifyInputTest,
+       IdleShardMatchesValidateModeWithDummyMetadata) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  runtime::Options options;
+  options.num_speculative_tokens(kDraftSteps)
+      .speculative_algorithm(GetParam() ? "DFlash2" : "DFlash")
+      .block_size(16)
+      .enable_schedule_overlap(false);
+  const ParallelArgs parallel_args(/*rank=*/1,
+                                   /*world_size=*/2,
+                                   /*dp_size=*/2,
+                                   /*cp_size=*/1,
+                                   /*process_group=*/nullptr,
+                                   /*ep_size=*/2);
+  auto& config = SpeculativeConfig::get_instance();
+  const bool saved_atb = config.enable_atb_spec_kernel();
+  const ScopeGuard restore_atb(
+      [&] { config.enable_atb_spec_kernel(saved_atb); });
+  config.enable_atb_spec_kernel(false);
+  for (bool hybrid : {false, true}) {
+    std::unique_ptr<DFlashWorkerImpl> worker;
+    if (GetParam()) {
+      worker = std::make_unique<DFlash2WorkerImpl>(
+          parallel_args, device.unwrap(), options, WorkerType::LLM);
+    } else {
+      worker = std::make_unique<DFlashWorkerImpl>(
+          parallel_args, device.unwrap(), options, WorkerType::LLM);
+    }
+    auto target = std::make_unique<IdleVerifyRecordingWorker>(
+        parallel_args, device.unwrap(), options);
+    IdleVerifyRecordingWorker* target_view = target.get();
+    auto draft = std::make_unique<IdleVerifyRecordingWorker>(
+        parallel_args, device.unwrap(), options);
+    DFlashWorkerImplTestPeer::set_empty_workers(
+        *worker, std::move(target), std::move(draft), hybrid);
+    ForwardInput input;
+    input.token_ids_host = torch::empty({0}, torch::kInt32);
+    input.positions_host = torch::empty({0}, torch::kInt32);
+    input.token_ids = input.token_ids_host.to(device.unwrap());
+    input.positions = input.positions_host.to(device.unwrap());
+    auto& params = input.input_params;
+    params.meta.batch_forward_type = BatchForwardType::DECODE;
+    params.meta.num_sequences = 0;
+    params.meta.q_max_seq_len = 0;
+    params.parallel.dp_global_token_nums = {1, 0};
+    params.parallel.raw_dp_global_token_nums = {1, 0};
+    const auto output = DFlashWorkerImplTestPeer::step_empty(*worker, input);
+    EXPECT_TRUE(output.has_value());
+    const auto& prepared = target_view->last_input_.input_params;
+    EXPECT_EQ(prepared.is_spec_verify, hybrid);
+    EXPECT_EQ(prepared.meta.batch_forward_type.is_chunked_prefill(), hybrid);
+    EXPECT_EQ(prepared.meta.num_sequences, 0);
+    EXPECT_EQ(prepared.meta.q_max_seq_len, 0);
+    EXPECT_EQ(prepared.parallel.dp_global_token_nums,
+              (std::vector<int32_t>{kDraftSteps + 1, 0}));
+    EXPECT_EQ(target_view->last_input_.token_ids.numel(), 1);
+    EXPECT_TRUE(target_view->metadata_.is_dummy);
+    EXPECT_EQ(target_view->metadata_.is_spec_verify, hybrid);
+    EXPECT_EQ(target_view->metadata_.is_chunked_prefill, hybrid);
+    EXPECT_EQ(target_view->metadata_.max_query_len, 1);
+    EXPECT_TRUE(torch::equal(target_view->metadata_.q_cu_seq_lens.cpu(),
+                             torch::tensor({0, 1}, torch::kInt32)));
+    EXPECT_TRUE(input.input_params.meta.batch_forward_type.is_decode());
   }
 }
 

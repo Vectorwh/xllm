@@ -97,6 +97,11 @@ class Platform final {
     return is_mlu() || is_npu();
   }
 
+  // Block-diffusion drafts use all CP x TP ranks within each DP domain as TP.
+  static constexpr bool uses_cp_independent_tp_for_block_diffusion_draft() {
+    return is_mlu();
+  }
+
   // DFlash2 drafts may run a proposal block shorter than the trained block.
   static constexpr bool supports_dflash2_runtime_block_size() {
     return is_mlu();

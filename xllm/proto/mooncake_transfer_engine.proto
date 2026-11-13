@@ -117,6 +117,7 @@ message WorkerCacheLayoutManifest {
   uint32 listen_port = 9;
   ParallelCoordinates coordinates = 10;
   repeated CacheTensorManifest tensors = 11;
+  ParallelCoordinates draft_coordinates = 12;
 }
 
 service MooncakeTransferEngineService {

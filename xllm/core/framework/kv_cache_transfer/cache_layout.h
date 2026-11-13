@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,8 @@ struct WorkerCacheLayoutManifest {
   std::string addr;
   uint16_t listen_port = 0;
   ParallelCoordinates coordinates;
+  // Independent placement of SPEC_DRAFT tensors; unset uses MAIN coordinates.
+  std::optional<ParallelCoordinates> draft_coordinates;
   std::vector<CacheTensorManifest> tensors;
 };
 

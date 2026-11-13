@@ -611,13 +611,13 @@ std::string kv_layout_contract(const ModelArgs& args,
 }
 
 std::vector<std::string> cache_groups(const BlockManagerPool& pool) {
+  // Manager implementation IDs are not cache identities: C1/C2 and C4/C128
+  // each share a manager implementation. Advertise the actual pool leaves.
   const auto utilization = pool.block_utilization_by_type_per_dp();
   CHECK(!utilization.empty());
   std::vector<std::string> groups;
   groups.reserve(utilization.front().size());
-  // Manager kinds select allocator implementations, not cache identities:
-  // V4.1 uses kinds [1, 0, 0] for distinct SWA, C2 and C1 pools.
-  for (const auto& [block_type, occupancy] : utilization.front()) {
+  for (const auto& [block_type, unused_usage] : utilization.front()) {
     if (block_type == BlockType::EMBEDDING) {
       continue;
     }

@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/parallel_state/parallel_state.h"
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
@@ -99,6 +100,47 @@ runtime::Options draft_options(const runtime::Options& options,
       .enable_dflash_xfia(enable_dflash_xfia)
       .enable_graph_aux_hidden_states(false);
   return opts;
+}
+
+// Resolve the draft topology once, before constructing its worker. Shared
+// output weights retain the target communication layout.
+struct DraftWorkerConfig {
+  ParallelArgs parallel_args;
+  runtime::Options options;
+};
+
+DraftWorkerConfig resolve_draft_worker_config(
+    const ParallelArgs& target_parallel_args,
+    const runtime::Options& options,
+    bool enable_dflash_xfia) {
+  DraftWorkerConfig config{target_parallel_args,
+                           draft_options(options, enable_dflash_xfia)};
+  if (Platform::uses_cp_independent_tp_for_block_diffusion_draft()) {
+    if (target_parallel_args.cp_size() > 1) {
+      config.parallel_args =
+          parallel_state::get_cp_independent_tp_parallel_args(
+              target_parallel_args);
+      if (!SpeculativeConfig::is_dspark_algorithm(
+              options.speculative_algorithm()) &&
+          config.parallel_args.lm_head_group_ == nullptr) {
+        config.parallel_args.lm_head_group_ = target_parallel_args.tp_group_;
+      }
+    }
+    config.options.cp_size(config.parallel_args.cp_size())
+        .tp_size(config.parallel_args.tp_size());
+  }
+  LOG(INFO) << "Draft parallel layout: algorithm="
+            << options.speculative_algorithm()
+            << ", rank=" << config.parallel_args.rank()
+            << ", target_cp=" << target_parallel_args.cp_size()
+            << ", target_tp=" << target_parallel_args.tp_size()
+            << ", draft_cp=" << config.parallel_args.cp_size()
+            << ", draft_tp=" << config.parallel_args.tp_size()
+            << ", draft_tp_group_size="
+            << (config.parallel_args.tp_group_ != nullptr
+                    ? config.parallel_args.tp_group_->world_size()
+                    : 1);
+  return config;
 }
 
 void expand_block_parallel_sequence_rows(ModelInputParams& input_params,
@@ -425,12 +467,12 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                   << "Block-diffusion speculative decoding does not support "
                      "context parallelism (cp_size > 1).";
             }
-            return std::make_unique<LLMWorkerImpl>(
+            const DraftWorkerConfig config = resolve_draft_worker_config(
                 parallel_args,
-                device,
-                draft_options(options,
-                              enable_dflash_proposal_xfia(
-                                  parallel_args, device, options)));
+                options,
+                enable_dflash_proposal_xfia(parallel_args, device, options));
+            return std::make_unique<LLMWorkerImpl>(
+                config.parallel_args, device, config.options);
           }) {
   speculative_position_labels_.reserve(
       static_cast<size_t>(options.num_speculative_tokens()));
@@ -613,11 +655,8 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
 
 std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
   CHECK(impl_ != nullptr);
-  return estimate_kv_cache_capacity_with_draft(
-      target_options(options_),
-      draft_options(options_,
-                    enable_dflash_proposal_xfia(
-                        parallel_args_, device_.unwrap(), options_)));
+  return estimate_kv_cache_capacity_with_draft(target_options(options_),
+                                               draft_impl_->get_options());
 }
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
@@ -688,7 +727,13 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   const bool use_chunked_spec_verify =
       SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
       validate_input.input_params.is_spec_verify;
-  if (!use_chunked_spec_verify) {
+  if (use_chunked_spec_verify) {
+    // Match the active shard's validate mode without turning the idle shard
+    // into a real query. Keep q_max_seq_len == 0 so metadata preparation uses
+    // its one-row dummy layout and does not update live recurrent state.
+    validate_input.input_params.meta.batch_forward_type =
+        BatchForwardType::CHUNKED_PREFILL;
+  } else {
     validate_input.input_params.meta.spec_verify_width =
         options_.num_speculative_tokens() + 1;
   }
@@ -1671,7 +1716,9 @@ void DFlashWorkerImpl::maybe_broadcast_spec_tokens(torch::Tensor& tokens) {
   if (get_optimization_config().enable_spec_token_broadcast) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     speculative_worker::broadcast_tokens_in_group(
-        tokens, speculative_worker::sampling_process_group(parallel_args_));
+        tokens,
+        speculative_worker::sampling_process_group(
+            draft_impl_->get_parallel_args()));
   }
 }
 

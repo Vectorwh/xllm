@@ -106,6 +106,9 @@ class ReshardPlanner final {
   // include_replicas: the link calls this per selected peer, so the source owns
   // everything it holds inside that pair, replica copies included (see
   // reshard_planner.cpp).
+  // Independent draft layouts always enforce each namespace's ownership:
+  // a peer selected for MAIN must not also write unselected draft replicas,
+  // and a draft writer must not overwrite another MAIN CP replica.
   //
   // source_cp_index_write_mode (a kCpIndexWriteMode* value, common/types.h)
   // selects which physical page of a source INDEX resource the plan reads

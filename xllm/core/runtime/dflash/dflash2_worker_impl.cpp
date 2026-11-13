@@ -36,8 +36,8 @@ DFlash2WorkerImpl::DFlash2WorkerImpl(const ParallelArgs& parallel_args,
                                      const runtime::Options& options,
                                      WorkerType worker_type)
     : DFlashWorkerImpl(parallel_args, device, options, worker_type),
-      sampling_process_group_(
-          speculative_worker::sampling_process_group(parallel_args)) {
+      sampling_process_group_(speculative_worker::sampling_process_group(
+          draft_impl_->get_parallel_args())) {
   async_output_enabled_ = enable_schedule_overlap() &&
                           !options_.enable_adaptive_speculative_decode();
   proposal_xfia_enabled_ =

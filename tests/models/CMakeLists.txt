@@ -110,6 +110,15 @@ if(USE_MLU)
       "PYTHONPATH=${_xllm_model_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
   )
 
+  # Fork the CP/TP ranks before the parent initializes any MLU device.
+  cc_test(
+    NAME dflash2_mlu_parallel_test
+    SRCS dflash2_mlu_parallel_test.cpp
+    DEPS models :runtime :mlu_layers :common_layers :parallel_state :model_context
+         :state_dict GTest::gtest_main torch_mlu
+    RUN_SERIAL
+  )
+
   # Parent stays device-free; every model run initializes its own fork rank.
   cc_test(
     NAME glm52_mlu_forward_test

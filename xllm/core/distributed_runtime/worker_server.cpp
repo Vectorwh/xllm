@@ -189,13 +189,19 @@ void WorkerServer::create_server(const runtime::Options& options,
         options.text_encoder_tp_size());
     comm = std::move(dit_comm);
   } else {
+    const bool needs_tp_cp_group =
+        Platform::uses_cp_independent_tp_for_block_diffusion_draft() &&
+        options.enable_speculative_decode() &&
+        SpeculativeConfig::is_block_diffusion_algorithm(
+            options.speculative_algorithm());
     auto common_comm = std::make_unique<CollectiveCommunicator>(
         worker_global_rank,
         world_size,
         dp_size,
         ep_size,
         cp_size,
-        options.comm_buffer_offset() + (options.is_draft_engine() ? 1 : 0));
+        options.comm_buffer_offset() + (options.is_draft_engine() ? 1 : 0),
+        needs_tp_cp_group);
     comm = std::move(common_comm);
   }
 

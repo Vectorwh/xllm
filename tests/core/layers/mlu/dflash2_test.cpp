@@ -28,6 +28,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/parallel_state/parallel_state.h"
 #include "core/kernels/mlu/bangc/include/dflash2_conv_norm.h"
 #include "core/kernels/mlu/bangc/include/dflash2_grouped_conv.h"
 #include "core/kernels/mlu/bangc/include/dflash2_sample_path.h"
@@ -104,17 +105,24 @@ torch::Tensor make_weight(int64_t offset) {
 
 class DFlash2ContextKVTest
     : public ::testing::TestWithParam<
-          std::tuple<std::pair<int32_t, int32_t>, bool>> {};
+          std::tuple<std::tuple<int32_t, int32_t, int32_t>, bool>> {};
 
 TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
   const auto [topology, quantized] = GetParam();
-  const auto [tp_size, rank] = topology;
+  const auto [tp_size, rank, target_cp_size] = topology;
   const ModelArgs args = make_args();
   const auto options = torch::TensorOptions()
                            .dtype(torch::kBFloat16)
                            .device(torch::Device(Platform::type_torch(), 0));
-  ModelContext context(
-      ParallelArgs(rank, tp_size, nullptr), args, QuantArgs(), options);
+  ProcessGroup tp_cp(rank, tp_size, options.device());
+  ParallelArgs target(rank, tp_size, nullptr);
+  target.cp_size(target_cp_size);
+  target.tp_cp_group_ = &tp_cp;
+  const ParallelArgs draft =
+      target_cp_size > 1
+          ? parallel_state::get_cp_independent_tp_parallel_args(target)
+          : target;
+  ModelContext context(draft, args, QuantArgs(), options);
   DFlash2ContextKV writer(context);
   const torch::Tensor norm =
       torch::linspace(0.5, 1.5, 128).to(torch::kBFloat16);
@@ -223,14 +231,19 @@ TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
 INSTANTIATE_TEST_SUITE_P(
     ShardedAndReplicatedHeads,
     DFlash2ContextKVTest,
-    ::testing::Combine(::testing::Values(std::pair<int32_t, int32_t>{1, 0},
-                                         std::pair<int32_t, int32_t>{2, 0},
-                                         std::pair<int32_t, int32_t>{2, 1},
-                                         std::pair<int32_t, int32_t>{16, 0},
-                                         std::pair<int32_t, int32_t>{16, 1},
-                                         std::pair<int32_t, int32_t>{16, 14},
-                                         std::pair<int32_t, int32_t>{16, 15}),
-                       ::testing::Bool()));
+    ::testing::Combine(
+        ::testing::Values(std::tuple<int32_t, int32_t, int32_t>{1, 0, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{2, 0, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{2, 1, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{16, 0, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{16, 1, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{16, 14, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{16, 15, 1},
+                          std::tuple<int32_t, int32_t, int32_t>{8, 0, 8},
+                          std::tuple<int32_t, int32_t, int32_t>{8, 3, 8},
+                          std::tuple<int32_t, int32_t, int32_t>{8, 4, 8},
+                          std::tuple<int32_t, int32_t, int32_t>{8, 7, 8}),
+        ::testing::Bool()));
 
 TEST(DFlash2ContextKVDeathTest, RejectsInt8ProjectionWithoutScale) {
   ModelArgs args = make_args();

@@ -250,8 +250,10 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
                                                int dp_size,
                                                int ep_size,
                                                int cp_size,
-                                               int32_t buffer_offset)
-    : CollectiveCommunicatorBase(global_rank, world_size) {
+                                               int32_t buffer_offset,
+                                               bool needs_tp_cp_group)
+    : CollectiveCommunicatorBase(global_rank, world_size),
+      needs_tp_cp_group_(needs_tp_cp_group) {
 #if defined(USE_NPU)
   // create hccl process group with hccl_root_info
   // std::vector<HcclRootInfo> unique_ids;
@@ -635,6 +637,29 @@ void CollectiveCommunicator::create_process_groups(
                                                    device);
     parallel_args_->dp_local_process_group_ = dp_local_process_group_.get();
     port += dp_group_count;
+  }
+
+  // Standalone block-diffusion drafts use all CP x TP ranks for tensor
+  // parallelism within each DP domain. Prepare this group only when requested,
+  // preserving communicator resources and port windows for other workers.
+  if (needs_tp_cp_group_) {
+    if (normalized_cp_size == 1) {
+      parallel_args_->tp_cp_group_ = tp_group_.get();
+    } else if (dp_size == 1) {
+      parallel_args_->tp_cp_group_ = process_group_.get();
+    } else {
+      const int32_t tp_cp_size = world_size / dp_size;
+      tp_cp_group_ = create_process_group(global_rank,
+                                          world_size,
+                                          tp_cp_size,
+                                          port + global_rank / tp_cp_size + 1,
+                                          false,
+                                          host,
+                                          "tp_cp_group",
+                                          device);
+      parallel_args_->tp_cp_group_ = tp_cp_group_.get();
+      port += dp_size;
+    }
   }
 
   int32_t moe_tp_size = world_size / ep_size;

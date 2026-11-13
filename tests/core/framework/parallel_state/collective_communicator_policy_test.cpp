@@ -16,9 +16,46 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include "core/framework/parallel_state/collective_communicator.h"
+#include "core/framework/parallel_state/parallel_state.h"
 
 namespace xllm {
 namespace {
+
+TEST(CollectiveCommunicatorPolicyTest,
+     CpIndependentTpPreservesDpAndClearsContextSharding) {
+  const torch::Device device(torch::kCPU);
+  // Two independent DP batches, each with four CP ranks and two TP ranks.
+  for (int32_t rank = 0; rank < 16; ++rank) {
+    ProcessGroup target_tp(rank % 2, /*world_size=*/2, device);
+    ProcessGroup tp_cp(rank % 8, /*world_size=*/8, device);
+    ProcessGroup cp((rank % 8) / 2, /*world_size=*/4, device);
+    ParallelArgs target(rank, /*world_size=*/16, /*process_group=*/nullptr);
+    target.dp_size(2).cp_size(4).tp_size(2).kv_split_size(4);
+    target.tp_group_ = &target_tp;
+    target.tp_cp_group_ = &tp_cp;
+    target.cp_group_ = &cp;
+    target.dcp_group_ = &cp;
+    target.dcp_topology_ = parallel_state::build_contiguous_dcp_topology(
+        rank, /*world_size=*/16, /*dp_size=*/2, /*dcp_size=*/4);
+
+    const ParallelArgs draft =
+        parallel_state::get_cp_independent_tp_parallel_args(target);
+    EXPECT_EQ(draft.rank(), rank);
+    EXPECT_EQ(draft.world_size(), 16);
+    EXPECT_EQ(draft.dp_size(), 2);
+    EXPECT_EQ(draft.tp_size(), 8);
+    EXPECT_EQ(draft.tp_group_, &tp_cp);
+    EXPECT_EQ(draft.lm_head_group_, nullptr);
+    EXPECT_EQ(draft.cp_size(), 1);
+    EXPECT_EQ(draft.kv_split_size_effective(), 1);
+    EXPECT_EQ(draft.cp_group_, nullptr);
+    EXPECT_EQ(draft.dcp_group_, nullptr);
+    EXPECT_FALSE(draft.dcp_topology_.has_value());
+    EXPECT_EQ(target.cp_size(), 4);
+    EXPECT_EQ(target.tp_group_, &target_tp);
+    EXPECT_TRUE(target.dcp_topology_.has_value());
+  }
+}
 
 TEST(CollectiveCommunicatorPolicyTest,
      PreservesLegacyKvSplitRankWithoutTopology) {

@@ -448,3 +448,10 @@ if(USE_DCU)
       hip::host
   )
 endif()
+
+cc_test(
+  NAME provider_contract_test
+  CPU_ONLY
+  SRCS provider_contract_test.cpp
+  DEPS :provider_contract :block :config :runtime GTest::gtest_main
+)

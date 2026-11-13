@@ -45,6 +45,11 @@ struct ReduceAsyncCtx {
 std::optional<ParallelArgs> get_dp_attn_parallel_args(
     const ParallelArgs& parallel_args);
 
+// Removes context/KV partitioning while retaining DP ownership. The shared
+// target embedding and LM head keep their own original communicators.
+ParallelArgs get_cp_independent_tp_parallel_args(
+    const ParallelArgs& parallel_args);
+
 torch::Tensor gather(const torch::Tensor& input,
                      ProcessGroup* process_group,
                      int32_t dim = -1);

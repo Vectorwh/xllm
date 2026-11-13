@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <optional>
+#include <unordered_set>
 
 #include "framework/kv_cache_transfer/cache_layout.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
@@ -112,6 +113,9 @@ class MooncakeKVCacheTransferDefault final
       int32_t kv_split_size) override;
 
  private:
+  bool prepare_draft_transfer_infos(
+      std::vector<TransferKVInfo>& transfer_kv_infos) const override;
+
   struct RegisteredBufferDesc {
     int64_t buf_id = 0;
     KVCacheTensorRole role;
@@ -129,6 +133,8 @@ class MooncakeKVCacheTransferDefault final
     // Registration-order descriptors for each layer. Shared DSA layers may
     // omit indexer buffers, so counts can vary by layer.
     std::vector<std::vector<RegisteredBufferDesc>> layers;
+    // Union across layers, captured from the actual registered buffers.
+    std::unordered_set<int32_t> group_ids;
     // Total buffers registered by this layout.
     int64_t total_buf_cnt = 0;
     // True after the corresponding KV cache memory has been registered.

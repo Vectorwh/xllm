@@ -29,6 +29,7 @@ limitations under the License.
 #include "framework/model_loader.h"
 #include "framework/parallel_state/process_group.h"
 #include "runtime/llm_worker_impl.h"
+#include "runtime/speculative_worker_utils.h"
 #include "util/timer.h"
 
 namespace xllm {
@@ -38,9 +39,8 @@ DSparkWorkerImpl::DSparkWorkerImpl(const ParallelArgs& parallel_args,
                                    const runtime::Options& options,
                                    WorkerType worker_type)
     : DFlashWorkerImpl(parallel_args, device, options, worker_type),
-      sampling_process_group_(parallel_args.tp_group_ != nullptr
-                                  ? parallel_args.tp_group_
-                                  : parallel_args.process_group_) {}
+      sampling_process_group_(speculative_worker::sampling_process_group(
+          draft_impl_->get_parallel_args())) {}
 
 DSparkWorkerImpl::~DSparkWorkerImpl() { retire_async_output(); }
 

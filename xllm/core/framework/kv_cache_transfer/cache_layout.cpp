@@ -42,6 +42,32 @@ bool multiply_overflows(uint64_t lhs, uint64_t rhs) {
   return lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs;
 }
 
+void coordinates_to_proto(const ParallelCoordinates& coordinates,
+                          proto::ParallelCoordinates* proto_coordinates) {
+  proto_coordinates->set_dp_rank(coordinates.dp_rank);
+  proto_coordinates->set_dp_size(coordinates.dp_size);
+  proto_coordinates->set_tp_rank(coordinates.tp_rank);
+  proto_coordinates->set_tp_size(coordinates.tp_size);
+  proto_coordinates->set_cp_rank(coordinates.cp_rank);
+  proto_coordinates->set_cp_size(coordinates.cp_size);
+  proto_coordinates->set_kv_split_rank(coordinates.kv_split_rank);
+  proto_coordinates->set_kv_split_size(coordinates.kv_split_size);
+}
+
+ParallelCoordinates coordinates_from_proto(
+    const proto::ParallelCoordinates& proto_coordinates) {
+  ParallelCoordinates coordinates;
+  coordinates.dp_rank = proto_coordinates.dp_rank();
+  coordinates.dp_size = proto_coordinates.dp_size();
+  coordinates.tp_rank = proto_coordinates.tp_rank();
+  coordinates.tp_size = proto_coordinates.tp_size();
+  coordinates.cp_rank = proto_coordinates.cp_rank();
+  coordinates.cp_size = proto_coordinates.cp_size();
+  coordinates.kv_split_rank = proto_coordinates.kv_split_rank();
+  coordinates.kv_split_size = proto_coordinates.kv_split_size();
+  return coordinates;
+}
+
 Status validate_coordinates(const ParallelCoordinates& coordinates) {
   if (coordinates.dp_size <= 0 || coordinates.tp_size <= 0 ||
       coordinates.cp_size <= 0 || coordinates.kv_split_size <= 0) {
@@ -251,6 +277,25 @@ Status validate_worker_cache_layout(const WorkerCacheLayoutManifest& manifest) {
   if (!coordinate_status.ok()) {
     return coordinate_status;
   }
+  if (manifest.draft_coordinates.has_value()) {
+    const ParallelCoordinates& draft = *manifest.draft_coordinates;
+    const ParallelCoordinates& main = manifest.coordinates;
+    const Status draft_status = validate_coordinates(draft);
+    if (!draft_status.ok()) {
+      return draft_status;
+    }
+    const int64_t main_width =
+        static_cast<int64_t>(main.tp_size) * main.cp_size;
+    const int64_t draft_width =
+        static_cast<int64_t>(draft.tp_size) * draft.cp_size;
+    if (draft.dp_size != main.dp_size || draft.dp_rank != main.dp_rank ||
+        draft_width != main_width ||
+        static_cast<int64_t>(draft.cp_rank) * draft.tp_size + draft.tp_rank !=
+            static_cast<int64_t>(main.cp_rank) * main.tp_size + main.tp_rank) {
+      return invalid(
+          "draft coordinates must preserve worker identity and DP domain");
+    }
+  }
   if (manifest.tensors.empty()) {
     return invalid("cache layout must contain at least one tensor");
   }
@@ -310,7 +355,12 @@ Status validate_worker_cache_layout(const WorkerCacheLayoutManifest& manifest) {
       return invalid("cache tensor contains an unknown shard enum value");
     }
     for (const LogicalSpan& span : tensor.shard.spans) {
-      if (span.owner_tp_rank >= manifest.coordinates.tp_size) {
+      const ParallelCoordinates& coordinates =
+          tensor.cache_namespace == CacheNamespace::SPEC_DRAFT &&
+                  manifest.draft_coordinates.has_value()
+              ? *manifest.draft_coordinates
+              : manifest.coordinates;
+      if (span.owner_tp_rank >= coordinates.tp_size) {
         return invalid("logical span owner is outside source TP size");
       }
       const Status span_status = validate_span(span, tensor);
@@ -340,16 +390,13 @@ void cache_layout_to_proto(const WorkerCacheLayoutManifest& manifest,
   proto_manifest->set_addr(manifest.addr);
   proto_manifest->set_listen_port(manifest.listen_port);
 
-  proto::ParallelCoordinates* coordinates =
-      proto_manifest->mutable_coordinates();
-  coordinates->set_dp_rank(manifest.coordinates.dp_rank);
-  coordinates->set_dp_size(manifest.coordinates.dp_size);
-  coordinates->set_tp_rank(manifest.coordinates.tp_rank);
-  coordinates->set_tp_size(manifest.coordinates.tp_size);
-  coordinates->set_cp_rank(manifest.coordinates.cp_rank);
-  coordinates->set_cp_size(manifest.coordinates.cp_size);
-  coordinates->set_kv_split_rank(manifest.coordinates.kv_split_rank);
-  coordinates->set_kv_split_size(manifest.coordinates.kv_split_size);
+  coordinates_to_proto(manifest.coordinates,
+                       proto_manifest->mutable_coordinates());
+
+  if (manifest.draft_coordinates.has_value()) {
+    coordinates_to_proto(*manifest.draft_coordinates,
+                         proto_manifest->mutable_draft_coordinates());
+  }
 
   proto_manifest->mutable_tensors()->Reserve(
       static_cast<int32_t>(manifest.tensors.size()));
@@ -403,16 +450,13 @@ Status cache_layout_from_proto(
   }
   manifest->listen_port = static_cast<uint16_t>(proto_manifest.listen_port());
 
-  const proto::ParallelCoordinates& proto_coordinates =
-      proto_manifest.coordinates();
-  manifest->coordinates.dp_rank = proto_coordinates.dp_rank();
-  manifest->coordinates.dp_size = proto_coordinates.dp_size();
-  manifest->coordinates.tp_rank = proto_coordinates.tp_rank();
-  manifest->coordinates.tp_size = proto_coordinates.tp_size();
-  manifest->coordinates.cp_rank = proto_coordinates.cp_rank();
-  manifest->coordinates.cp_size = proto_coordinates.cp_size();
-  manifest->coordinates.kv_split_rank = proto_coordinates.kv_split_rank();
-  manifest->coordinates.kv_split_size = proto_coordinates.kv_split_size();
+  manifest->coordinates = coordinates_from_proto(proto_manifest.coordinates());
+
+  manifest->draft_coordinates.reset();
+  if (proto_manifest.has_draft_coordinates()) {
+    manifest->draft_coordinates =
+        coordinates_from_proto(proto_manifest.draft_coordinates());
+  }
 
   manifest->tensors.clear();
   manifest->tensors.reserve(static_cast<size_t>(proto_manifest.tensors_size()));

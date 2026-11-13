@@ -86,6 +86,27 @@ std::optional<ParallelArgs> get_dp_attn_parallel_args(
                       parallel_args.dp_size());
 }
 
+ParallelArgs get_cp_independent_tp_parallel_args(
+    const ParallelArgs& parallel_args) {
+  CHECK_GT(parallel_args.dp_size(), 0);
+  CHECK_GT(parallel_args.world_size(), 0);
+  CHECK_EQ(parallel_args.world_size() % parallel_args.dp_size(), 0);
+  ProcessGroup* tp_cp_group = parallel_args.tp_cp_group_;
+  CHECK(tp_cp_group != nullptr)
+      << "CP-independent tensor parallelism requires a TP x CP group.";
+  const int32_t tp_size = parallel_args.world_size() / parallel_args.dp_size();
+  CHECK_EQ(tp_cp_group->world_size(), tp_size);
+  CHECK_EQ(tp_cp_group->rank(), parallel_args.rank() % tp_size);
+
+  ParallelArgs result = parallel_args;
+  result.cp_size(1).kv_split_size(1).tp_size(tp_size).layerwise_split_size(1);
+  result.tp_group_ = tp_cp_group;
+  result.cp_group_ = nullptr;
+  result.dcp_group_ = nullptr;
+  result.dcp_topology_.reset();
+  return result;
+}
+
 torch::Tensor gather(const torch::Tensor& input,
                      ProcessGroup* process_group,
                      int32_t dim) {

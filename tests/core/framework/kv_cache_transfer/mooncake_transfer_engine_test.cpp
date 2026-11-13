@@ -2103,6 +2103,54 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 #endif
 
+TEST(MooncakeKVCacheTransferDefaultTest, RegistersDraftTp8BesideMainCp4Tp2) {
+  for (int32_t rank = 0; rank < 8; ++rank) {
+    auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+        /*listen_port=*/0, torch::Device(torch::kCPU));
+    MooncakeKVCacheTransferDefault transfer(
+        0, 0, torch::Device(torch::kCPU), "qwen3", std::move(engine));
+    transfer.addr_ = "draft-tp8-rank-" + std::to_string(rank);
+    ModelArgs args;
+    args.model_type("qwen3").n_layers(1).n_heads(8).n_kv_heads(8).head_dim(2);
+    ParallelArgs main(rank, 8, 1, 4, nullptr, 1);
+    main.kv_split_size(1);
+#if defined(USE_MLU) || defined(USE_ILU)
+    const std::vector<int64_t> main_shape = {2, 4, 16, 2};
+    const std::vector<int64_t> draft_shape = {2, 1, 16, 2};
+#else
+    const std::vector<int64_t> main_shape = {2, 16, 4, 2};
+    const std::vector<int64_t> draft_shape = {2, 16, 1, 2};
+#endif
+    std::vector<KVCache> main_caches;
+    main_caches.emplace_back(
+        KVCacheTensors{torch::zeros(main_shape), torch::zeros(main_shape)});
+    transfer.configure_cache_layout(main, args, 16, false);
+    transfer.register_kv_cache(main_caches, KVCacheShape(), torch::kFloat32);
+    ParallelArgs draft(rank, 8, 1, 1, nullptr, 1);
+    draft.kv_split_size(1);
+    std::vector<KVCache> draft_caches;
+    draft_caches.emplace_back(
+        KVCacheTensors{torch::zeros(draft_shape), torch::zeros(draft_shape)});
+    transfer.configure_cache_layout(draft, args, 16, true);
+    transfer.register_kv_cache_spec(
+        draft_caches, KVCacheShape(), torch::kFloat32);
+    const WorkerCacheLayoutManifest& manifest = transfer.local_cache_layout_;
+    ASSERT_TRUE(validate_worker_cache_layout(manifest).ok());
+    EXPECT_EQ(manifest.coordinates.tp_size, 2);
+    EXPECT_EQ(manifest.coordinates.cp_size, 4);
+    ASSERT_TRUE(manifest.draft_coordinates.has_value());
+    EXPECT_EQ(manifest.draft_coordinates->tp_size, 8);
+    EXPECT_EQ(manifest.draft_coordinates->tp_rank, rank);
+    for (const CacheTensorManifest& tensor : manifest.tensors) {
+      if (tensor.cache_namespace != CacheNamespace::SPEC_DRAFT) {
+        continue;
+      }
+      ASSERT_FALSE(tensor.shard.spans.empty());
+      EXPECT_EQ(tensor.shard.spans[0].owner_tp_rank, rank);
+    }
+  }
+}
+
 TEST(MooncakeKVCacheTransferDefaultTest,
      Glm5NextTransfersMainAndDraftPagesAndRequestState) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
@@ -2377,6 +2425,134 @@ TEST(MooncakeKVCacheTransferDefaultTest, PullRejectsInvalidMappings) {
   EXPECT_FALSE(
       transfer.pull_kv_blocks(/*src_cluster_id=*/1, "remote", {wrong_group}));
   EXPECT_TRUE(engine_observer->move_calls.empty());
+}
+
+// Exercise registration and the public async PUSH validation path without a
+// device or peer. The destination DP rank is outside the destination instance,
+// so merge_kv_blocks drops it only AFTER both mapping validation sites. A
+// successful validation therefore returns no tasks, while a rejected mapping
+// returns the request's failure. This does not test network delivery.
+class DraftKvPushMappingTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+        /*listen_port=*/0, torch::Device(torch::kCPU));
+    transfer_ = std::make_unique<MooncakeKVCacheTransferDefault>(
+        /*device_id=*/0,
+        /*listen_port=*/0,
+        torch::Device(torch::kCPU),
+        /*model_type=*/"deepseek_v41",
+        std::move(engine));
+    main_caches_.reserve(1);
+    DeepSeekV4KVCacheTensors main_tensors;
+    main_tensors.swa_cache = torch::zeros({8, 3});
+    main_tensors.key_cache = torch::zeros({8, 2});
+    main_tensors.compressed_block_type = BlockType::C4;
+    main_caches_.emplace_back(main_tensors);
+    transfer_->register_kv_cache(main_caches_, KVCacheShape(), torch::kFloat32);
+
+    info_ = make_info(/*dst_dp_size=*/1,
+                      /*dst_tp_size=*/1,
+                      /*dst_dp_rank=*/1);
+    info_.remote_instance_info.kv_split_size = 1;
+    info_.mappings[0].group_id = cache_group_id(BlockType::SWA);
+    info_.mappings[0].local_ids = {1};
+    info_.mappings[0].remote_ids = {2};
+    info_.mappings[0].remote_shared_num = 1;
+    KVTransferMapping compressed;
+    compressed.group_id = cache_group_id(BlockType::C4);
+    compressed.local_ids = {3};
+    compressed.remote_ids = {4, 5, 6, 7};
+    info_.mappings.emplace_back(std::move(compressed));
+  }
+
+  void register_draft(bool with_compressed_layer) {
+    draft_caches_.reserve(with_compressed_layer ? 2 : 1);
+    DeepSeekV4KVCacheTensors draft_tensors;
+    draft_tensors.swa_cache = torch::zeros({8, 3});
+    draft_caches_.emplace_back(draft_tensors);
+    if (with_compressed_layer) {
+      draft_tensors.key_cache = torch::zeros({8, 2});
+      draft_tensors.compressed_block_type = BlockType::C4;
+      draft_caches_.emplace_back(draft_tensors);
+    }
+    transfer_->register_kv_cache_spec(
+        draft_caches_, KVCacheShape(), torch::kFloat32);
+  }
+
+  std::vector<KVTransferTaskResult> push(bool is_spec_draft,
+                                         int32_t kv_split_size) {
+    ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                           /*world_size=*/4,
+                                           /*dp_size=*/1);
+    parallel_args.kv_split_size(kv_split_size);
+    return std::move(
+               transfer_->push_kv_blocks_async({info_},
+                                               parallel_args,
+                                               /*layer_synchronizer=*/nullptr,
+                                               is_spec_draft))
+        .get();
+  }
+
+  void expect_draft_failure() {
+    const auto results = push(/*is_spec_draft=*/true, /*kv_split_size=*/1);
+    ASSERT_EQ(results.size(), 1U);
+    EXPECT_EQ(results[0].error_code, KVTransferErrorCode::FAILED);
+    EXPECT_EQ(results[0].request_ids,
+              (std::vector<std::string>{info_.request_id}));
+  }
+
+  std::unique_ptr<MooncakeKVCacheTransferDefault> transfer_;
+  std::vector<KVCache> main_caches_;
+  std::vector<KVCache> draft_caches_;
+  TransferKVInfo info_;
+};
+
+TEST_F(DraftKvPushMappingTest, UnsplitDraftIgnoresTargetOnlyCompressedGroups) {
+  register_draft(/*with_compressed_layer=*/false);
+  EXPECT_TRUE(push(/*is_spec_draft=*/true, /*kv_split_size=*/1).empty());
+  // Preparing the asynchronous draft view must not mutate target metadata.
+  ASSERT_EQ(info_.mappings.size(), 2U);
+  EXPECT_EQ(info_.mappings[0].remote_shared_num, 1U);
+  EXPECT_EQ(info_.mappings[1].local_ids, (std::vector<uint64_t>{3}));
+  EXPECT_EQ(info_.mappings[1].remote_ids, (std::vector<uint64_t>{4, 5, 6, 7}));
+  EXPECT_TRUE(push(/*is_spec_draft=*/false, /*kv_split_size=*/4).empty());
+  // MAIN still validates its compressed group instead of filtering it away.
+  EXPECT_FALSE(push(/*is_spec_draft=*/false, /*kv_split_size=*/1).empty());
+}
+
+TEST_F(DraftKvPushMappingTest, RejectsUnregisteredDraft) {
+  info_.mappings.pop_back();
+  expect_draft_failure();
+}
+
+TEST_F(DraftKvPushMappingTest, RejectsMissingRequiredDraftGroup) {
+  register_draft(/*with_compressed_layer=*/false);
+  info_.mappings.erase(info_.mappings.begin());
+  expect_draft_failure();
+}
+
+TEST_F(DraftKvPushMappingTest, RejectsMismatchedRequiredDraftGroup) {
+  register_draft(/*with_compressed_layer=*/false);
+  info_.mappings[0].remote_ids.emplace_back(3);
+  expect_draft_failure();
+}
+
+TEST_F(DraftKvPushMappingTest, RejectsDuplicateRequiredDraftGroup) {
+  register_draft(/*with_compressed_layer=*/false);
+  info_.mappings.emplace_back(info_.mappings[0]);
+  expect_draft_failure();
+}
+
+TEST_F(DraftKvPushMappingTest, KeepsCompressedGroupsRegisteredByLaterLayers) {
+  register_draft(/*with_compressed_layer=*/true);
+  // A compressed group actually owned by the draft cannot be discarded to
+  // make a width-one transfer appear valid. A sharded MTP-style draft keeps
+  // the original width-four mapping and must still pass.
+  expect_draft_failure();
+  EXPECT_TRUE(push(/*is_spec_draft=*/true, /*kv_split_size=*/4).empty());
+  info_.mappings.pop_back();
+  expect_draft_failure();
 }
 
 #if defined(USE_NPU)
