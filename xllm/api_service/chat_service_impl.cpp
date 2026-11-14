@@ -32,6 +32,7 @@ limitations under the License.
 
 #include "api_service/mm_service_utils.h"
 #include "api_service/request_admission.h"
+#include "api_service/serving_mode.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
 #include "core/common/instance_name.h"
@@ -486,12 +487,19 @@ bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
   return call->write_and_finish(response);
 }
 
-std::vector<Message> chat_messages_from_proto(
-    const proto::ChatRequest& request) {
+std::vector<Message> chat_messages_from_proto(const proto::ChatRequest& request,
+                                              ServingMode mode) {
   std::vector<Message> messages;
   messages.reserve(request.messages_size());
   for (const auto& message : request.messages()) {
-    messages.emplace_back(message.role(), message.content());
+    if (mode == ServingMode::VLM) {
+      MMContentVec contents;
+      contents.reserve(1);
+      contents.emplace_back(/*type=*/"text", message.content());
+      messages.emplace_back(message.role(), contents);
+    } else {
+      messages.emplace_back(message.role(), message.content());
+    }
     auto& msg = messages.back();
     if (message.has_tool_call_id()) {
       msg.tool_call_id = message.tool_call_id();
@@ -675,7 +683,8 @@ void ChatServiceImpl::process_async_rpc_impl(
     req_output.log_request_status();
     return master->handle_rpc_response(req_output);
   };
-  std::vector<Message> messages = chat_messages_from_proto(*request);
+  std::vector<Message> messages =
+      chat_messages_from_proto(*request, /*mode=*/ServingMode::LLM);
 
   Status validation_status = request_params.validate_multimodal_input();
   if (!validation_status.ok()) {
@@ -959,7 +968,8 @@ void MMChatServiceImpl::process_async_rpc_impl(
   }
   request_params.timing = std::make_shared<RequestTiming>();
   request_params.timing->record_arrival(arrival_time);
-  std::vector<Message> messages = chat_messages_from_proto(*request);
+  std::vector<Message> messages =
+      chat_messages_from_proto(*request, /*mode=*/ServingMode::VLM);
   rate_limit_guard.dismiss();
   master_->handle_request(std::move(messages),
                           std::move(request_params),
