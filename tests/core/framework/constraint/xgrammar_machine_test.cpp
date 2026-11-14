@@ -41,7 +41,12 @@ std::shared_ptr<XGrammarConstraintMachine> make_machine() {
     ADD_FAILURE() << error;
     return nullptr;
   }
-  return wrap_xgrammar_machine(grammar);
+  // Carry the source as the spec so snapshots identify the grammar
+  // cross-process, exactly like the request factory wires it.
+  GrammarSpec spec;
+  spec.type = GrammarSpec::Type::REGEX;
+  spec.source = "[A-Z]{2}-[0-9]{4}";
+  return wrap_xgrammar_machine(std::move(grammar), spec);
 }
 
 TEST(XGrammarMachineTest, InitialStateAcceptsRegexPrefix) {
@@ -200,13 +205,121 @@ TEST(XGrammarMachineTest, FrozenStateRoundTripsItsInvalidFlag) {
   EXPECT_FALSE(machine->can_accept(restored, 0));
 }
 
-TEST(XGrammarMachineTest, MachineLevelSnapshotDoesNotAdvertiseSpecSupport) {
-  // The machine-level snapshot/restore above round-trips token history, but
-  // the batch channel does not carry xgrammar spec snapshots yet (G9): the
-  // false default makes the worker preserve the live state on an empty
-  // snapshot instead of resetting the row to unconstrained.
+TEST(XGrammarMachineTest, SnapshotAdvertisesSpecSupportAndCarriesIt) {
+  // G9: the machine-level snapshot carries the grammar spec so a
+  // cross-process receiver can rebuild the exact grammar and replay; the
+  // support flag is what routes rows through the snapshot channel instead
+  // of the live-state preservation fallback.
   std::shared_ptr<XGrammarConstraintMachine> machine = make_machine();
-  EXPECT_FALSE(machine->supports_spec_snapshot());
+  EXPECT_TRUE(machine->supports_spec_snapshot());
+  ConstraintState state = machine->initial_state(false);
+  const ConstraintSnapshot snap = machine->snapshot(state);
+  EXPECT_TRUE(snap.enabled);
+  // make_machine compiles the REGEX source "[A-Z]{2}-[0-9]{4}", so the
+  // spec rides along with that exact source.
+  ASSERT_NE(snap.grammar_spec, nullptr);
+  EXPECT_FALSE(snap.grammar_spec->empty());
+  EXPECT_EQ(snap.grammar_spec->source, "[A-Z]{2}-[0-9]{4}");
+}
+
+TEST(XGrammarMachineTest, SnapshotRebuildAcrossMachinesRoundTrips) {
+  // G9 core semantics: a snapshot from machine A (built with a spec)
+  // carries the grammar identity, so machine B - compiled independently
+  // from the same spec, like a decode worker - restores to the exact same
+  // FSM state: identical allowed bitmask and fingerprint.
+  std::shared_ptr<XGrammarConstraintMachine> source = make_machine();
+  ASSERT_NE(source, nullptr);
+  ConstraintState state = source->initial_state(false);
+  ASSERT_TRUE(source->advance(state, 0 /* 'A' */, HaltPolicy::RESPECT));
+  const ConstraintSnapshot snap = source->snapshot(state);
+  ASSERT_TRUE(snap.enabled);
+  ASSERT_NE(snap.grammar_spec, nullptr);
+  EXPECT_EQ(snap.grammar_spec->type, GrammarSpec::Type::REGEX);
+  EXPECT_EQ(snap.grammar_spec->source, "[A-Z]{2}-[0-9]{4}");
+  EXPECT_EQ(snap.token_ids, std::vector<int32_t>({0}));
+
+  // The receiver rebuilds from the spec (fresh compiler, like a worker).
+  auto compiler = std::make_unique<XGrammarCompiler>(
+      std::vector<std::string>{"A", "B", "-", "1", "x", "", "{", "}"},
+      /*model_vocab_size=*/32,
+      std::vector<int32_t>{kStopTokenId},
+      /*cache_max_memory_bytes=*/0);
+  std::string error;
+  auto grammar = compiler->compile_regex(snap.grammar_spec->source, error);
+  ASSERT_NE(grammar, nullptr) << error;
+  auto receiver = wrap_xgrammar_machine(grammar, *snap.grammar_spec);
+  ConstraintState restored = receiver->restore(snap);
+  EXPECT_TRUE(restored.is_valid());
+  EXPECT_EQ(receiver->fingerprint(restored), source->fingerprint(state));
+  EXPECT_EQ(receiver->allowed_bitmask(restored),
+            source->allowed_bitmask(state));
+  // The restored state advances identically.
+  ConstraintState restored_copy = restored;
+  ASSERT_TRUE(
+      receiver->advance(restored_copy, 1 /* 'B' */, HaltPolicy::RESPECT));
+  EXPECT_TRUE(receiver->can_accept(restored_copy, 2 /* '-' */));
+}
+
+TEST(XGrammarMachineTest, FrozenSnapshotStaysFrozenAcrossRebuild) {
+  // A RESPECT freeze must survive a cross-machine rebuild: the receiver
+  // restores the invalid flag instead of replaying the clean history back
+  // to a valid matcher, and the worker keeps the row (all-deny mask)
+  // instead of failing the request.
+  std::shared_ptr<XGrammarConstraintMachine> source = make_machine();
+  ASSERT_NE(source, nullptr);
+  ConstraintState state = source->initial_state(false);
+  // Freeze through a RESPECT rejection.
+  ASSERT_FALSE(
+      source->advance(state, 5 /* stop mid-pattern */, HaltPolicy::RESPECT));
+  EXPECT_FALSE(source->is_valid(state));
+  const ConstraintSnapshot snap = source->snapshot(state);
+  EXPECT_TRUE(snap.invalid);
+  ASSERT_NE(snap.grammar_spec, nullptr);
+
+  auto compiler = std::make_unique<XGrammarCompiler>(
+      std::vector<std::string>{"A", "B", "-", "1", "x", "", "{", "}"},
+      /*model_vocab_size=*/32,
+      std::vector<int32_t>{kStopTokenId},
+      /*cache_max_memory_bytes=*/0);
+  std::string error;
+  auto grammar = compiler->compile_regex(snap.grammar_spec->source, error);
+  ASSERT_NE(grammar, nullptr) << error;
+  auto receiver = wrap_xgrammar_machine(grammar, *snap.grammar_spec);
+  ConstraintState restored = receiver->restore(snap);
+  EXPECT_TRUE(restored.initialized());
+  EXPECT_FALSE(receiver->is_valid(restored));
+  // The frozen state rejects everything, including grammar-legal tokens.
+  EXPECT_FALSE(receiver->can_accept(restored, 0));
+}
+
+TEST(XGrammarMachineTest, StrictJsonSchemaSpecRoundTrips) {
+  // strict participates in the machine-cache key and the compile flags, so
+  // its round trip must be pinned: a strict spec rebuilds a strict grammar
+  // with the same fingerprint.
+  auto compiler = std::make_unique<XGrammarCompiler>(
+      std::vector<std::string>{"A", "B", "-", "1", "x", "", "{", "}"},
+      /*model_vocab_size=*/32,
+      std::vector<int32_t>{kStopTokenId},
+      /*cache_max_memory_bytes=*/0);
+  std::string error;
+  GrammarSpec spec;
+  spec.type = GrammarSpec::Type::JSON_SCHEMA;
+  spec.source = R"({"type":"object"})";
+  spec.strict = true;
+  auto grammar = compiler->compile_json_schema(spec.source, spec.strict, error);
+  ASSERT_NE(grammar, nullptr) << error;
+  auto source = wrap_xgrammar_machine(grammar, spec);
+  ConstraintState state = source->initial_state(false);
+
+  const ConstraintSnapshot snap = source->snapshot(state);
+  ASSERT_NE(snap.grammar_spec, nullptr);
+  EXPECT_EQ(snap.grammar_spec->type, GrammarSpec::Type::JSON_SCHEMA);
+  EXPECT_TRUE(snap.grammar_spec->strict);
+
+  auto receiver = wrap_xgrammar_machine(grammar, *snap.grammar_spec);
+  ConstraintState restored = receiver->restore(snap);
+  EXPECT_TRUE(restored.is_valid());
+  EXPECT_EQ(receiver->fingerprint(restored), source->fingerprint(state));
 }
 
 TEST(XGrammarMachineTest, DraftValidationAndVerifyWorkOnXgrammarStates) {

@@ -16,17 +16,77 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "core/framework/constraint/snapshot.h"
+#include "core/framework/constraint/xgrammar_machine.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/sampling/xgrammar_constraint.h"
+#include "core/framework/tokenizer/tokenizer.h"
+
 namespace xllm {
+
+// Holder for the worker- and service-side xgrammar machine pool: compiles
+// per-request grammar specs through a lazily built model-scoped compiler
+// (mirroring the request factory's construction) and caches the stateless
+// machines by spec, so snapshot restores and PD request migrations rebuild
+// the exact grammar cheaply. Thread-safe.
+class XGrammarMachineCache final {
+ public:
+  // `key_of` overrides the cache key for tests that need to force the hash
+  // collision path deterministically; production callers omit it and get the
+  // canonical fnv1a spec key.
+  XGrammarMachineCache(
+      const Tokenizer& tokenizer,
+      ModelArgs model_args,
+      std::function<uint64_t(const GrammarSpec&)> key_of = nullptr);
+
+  // Returns the machine for the spec; nullptr + error on compile failure
+  // or in builds without USE_XGRAMMAR.
+  //
+  // Entries hold weak references: live rows keep their machine alive
+  // through the state's aliasing shared_ptr, and once a request finishes
+  // its entry expires with the machine, so the compiler's own size-bounded
+  // cache (not this map) governs the compiled-grammar memory. The map key
+  // is a 64-bit hash of the spec (no per-step source copies); colliding
+  // hashes share a bucket whose rows each verify against the stored spec,
+  // so a collision can neither serve another request's grammar nor skip
+  // caching behind a per-request recompile.
+  std::shared_ptr<XGrammarConstraintMachine> get(const GrammarSpec& spec,
+                                                 std::string& error);
+
+ private:
+  struct CacheEntry final {
+    GrammarSpec spec;  // verifies the hash hit
+    std::weak_ptr<XGrammarConstraintMachine> machine;
+  };
+
+  const Tokenizer& tokenizer_;
+  ModelArgs model_args_;
+  std::mutex mutex_;
+  std::unique_ptr<XGrammarCompiler> compiler_;
+  // Key override for tests that force the collision path; empty in
+  // production, where the canonical fnv1a spec key applies.
+  std::function<uint64_t(const GrammarSpec&)> key_of_;
+  // One bucket per 64-bit key; each row is one spec sharing that hash.
+  std::unordered_map<uint64_t, std::vector<CacheEntry>> machines_;
+};
 
 // Runtime feature switches that gate the xgrammar structured-output backend.
 // Mirrors the engine config so the support check is a pure, testable function.
 struct XGrammarSupportInputs final {
-  bool enable_graph = false;
-  bool enable_prefill_piecewise_graph = false;
-  bool enable_disagg_pd = false;
+  // Regular disagg PD passed the real cross-instance verification (1P1D,
+  // production-aligned Mooncake: the grammar spec rides the KV first
+  // generation handoff and the decode side rebuilds the machine and applies
+  // the mask per token), so it is no longer gated. PD OOC stays fail-closed:
+  // pd_ooc_scheduler does not populate the grammar fields on its allocation
+  // requests yet, and that path has no cross-instance verification.
+  bool enable_pd_ooc = false;
   bool enable_service_routing = false;
   bool enable_prefix_cache = false;
   // Speculative decoding is supported only for the algorithms migrated to the

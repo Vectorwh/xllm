@@ -26,6 +26,7 @@ limitations under the License.
 #include "common/message.h"
 #include "common/options.h"
 #include "common/rate_limiter.h"
+#include "core/framework/constraint/snapshot.h"
 #include "core/framework/sampling/xgrammar_constraint.h"
 #include "framework/chat_template/chat_template.h"
 #include "framework/model/model_args.h"
@@ -121,8 +122,12 @@ class LLMRequestFactory final {
       std::optional<ChatTemplateGenerationMode> generation_mode,
       const OutputCallback& callback);
 
+  // Compiles the per-request grammar; on success `spec` carries the exact
+  // source the grammar was built from, so snapshot receivers rebuild an
+  // equivalent grammar (G9).
   std::shared_ptr<const CompiledXGrammar> compile_response_format(
       const RequestParams& sp,
+      GrammarSpec& spec,
       std::string& error);
 
   std::shared_ptr<const JsonObjectGrammar> get_json_object_grammar(

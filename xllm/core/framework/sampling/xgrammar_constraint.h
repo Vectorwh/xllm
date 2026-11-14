@@ -32,6 +32,9 @@ class GrammarMatcher;
 
 namespace xllm {
 
+class Tokenizer;
+class ModelArgs;
+
 // Upstream grammar handles share immutable compilation data.
 using CompiledXGrammar = xgrammar::CompiledGrammar;
 
@@ -43,6 +46,17 @@ class XGrammarCompiler final {
                    const std::vector<int32_t>& stop_token_ids,
                    int64_t cache_max_memory_bytes);
   ~XGrammarCompiler();
+
+  // Single owner of the model-scoped construction and validation: the
+  // request factory and the worker-side machine cache both build through
+  // it, so the vocabulary bounds and stop-token assembly cannot drift.
+  // Returns nullptr with `error` set when the tokenizer vocabulary or the
+  // model arguments do not support grammar compilation.
+  static std::unique_ptr<XGrammarCompiler> create(
+      const Tokenizer& tokenizer,
+      const ModelArgs& model_args,
+      int64_t cache_max_memory_bytes,
+      std::string& error);
 
   std::shared_ptr<const CompiledXGrammar> compile_json_schema(
       const std::string& schema,

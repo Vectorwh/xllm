@@ -19,6 +19,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/constraint/snapshot.h"
 #include "core/framework/constraint/state_machine.h"
 #include "core/framework/sampling/xgrammar_constraint.h"
 
@@ -35,7 +36,12 @@ class XGrammarConstraintMachine final
   // Construct through wrap_xgrammar_machine only: states embed the machine
   // via shared_from_this, so a stack or directly-owned instance is unusable.
   friend std::shared_ptr<XGrammarConstraintMachine> wrap_xgrammar_machine(
-      std::shared_ptr<const CompiledXGrammar> grammar);
+      std::shared_ptr<const CompiledXGrammar> grammar,
+      GrammarSpec spec);
+
+  // The compiled grammar the machine wraps; request reconstruction sites
+  // hand it to the per-sequence matcher constructor alongside the machine.
+  std::shared_ptr<const CompiledXGrammar> grammar() const { return grammar_; }
 
   ConstraintState initial_state(bool reasoning_phase) const override;
   ConstraintState restore(const ConstraintSnapshot& snapshot) const override;
@@ -59,6 +65,10 @@ class XGrammarConstraintMachine final
   ConstraintSnapshot snapshot(const ConstraintState& state) const override;
   std::string error_detail(const ConstraintState& state) const override;
 
+  // Snapshots round-trip through the per-request grammar spec: receivers
+  // rebuild the exact grammar from it and replay the committed history.
+  bool supports_spec_snapshot() const override { return true; }
+
   // Vocabulary row width from the compiled grammar's tokenizer info.
   bool fill_allowed_bitmask(const ConstraintState& state,
                             int32_t* row,
@@ -71,31 +81,40 @@ class XGrammarConstraintMachine final
 
  private:
   explicit XGrammarConstraintMachine(
-      std::shared_ptr<const CompiledXGrammar> grammar);
+      std::shared_ptr<const CompiledXGrammar> grammar,
+      GrammarSpec spec);
 
   static const XGrammarState& cast(const ConstraintState& state);
   static XGrammarState& cast(ConstraintState& state);
 
   std::shared_ptr<const CompiledXGrammar> grammar_;
+  // Immutable grammar identity shared with every snapshot this machine
+  // emits; the source can reach kMaxSourceBytes, so copies of a snapshot
+  // must move a pointer instead of the payload.
+  std::shared_ptr<const GrammarSpec> spec_;
   uint64_t grammar_id_ = 0;
 };
 
 #if defined(USE_XGRAMMAR)
+// `spec` is a sink parameter: pass an lvalue to copy it once into the
+// machine's retained identity, or std::move an owned spec to avoid the copy.
 inline std::shared_ptr<XGrammarConstraintMachine> wrap_xgrammar_machine(
-    std::shared_ptr<const CompiledXGrammar> grammar) {
+    std::shared_ptr<const CompiledXGrammar> grammar,
+    GrammarSpec spec = GrammarSpec{}) {
   if (grammar == nullptr) {
     return nullptr;
   }
   // Plain new: make_shared's internal construction is not covered by the
   // friend declaration guarding the private constructor.
   return std::shared_ptr<XGrammarConstraintMachine>(
-      new XGrammarConstraintMachine(std::move(grammar)));
+      new XGrammarConstraintMachine(std::move(grammar), std::move(spec)));
 }
 #else
 // The adapter sources build only under USE_XGRAMMAR; the null wrap keeps
 // always-compiled callers linkable.
 inline std::shared_ptr<XGrammarConstraintMachine> wrap_xgrammar_machine(
-    std::shared_ptr<const CompiledXGrammar> grammar) {
+    std::shared_ptr<const CompiledXGrammar> grammar,
+    GrammarSpec spec = GrammarSpec{}) {
   return nullptr;
 }
 #endif

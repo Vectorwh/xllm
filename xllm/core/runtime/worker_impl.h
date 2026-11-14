@@ -26,6 +26,11 @@ limitations under the License.
 #include "common/types.h"
 #include "executor.h"
 #include "forward_params.h"
+#if defined(USE_XGRAMMAR)
+// The machine cache member below needs the full type; OFF builds keep the
+// include graph of this widely-included header unchanged.
+#include "framework/constraint/xgrammar_support.h"
+#endif
 #include "framework/eplb/eplb_executor.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
@@ -148,6 +153,13 @@ class WorkerImpl {
   // Lazily create (or return) the worker-local JSON grammar. Thread-safe.
   std::shared_ptr<const JsonObjectGrammar> ensure_json_object_grammar(
       bool reasoning_enabled);
+
+#if defined(USE_XGRAMMAR)
+  // Worker-side pool of xgrammar machines keyed by the per-request grammar
+  // spec: cross-process snapshot restores rebuild the exact grammar through
+  // it. Lazily created on the first spec-carrying arrival.
+  std::unique_ptr<XGrammarMachineCache> xgrammar_machines_;
+#endif
 
   // Internal helper shared by worker pipelines before model execution.
   virtual void apply_kv_block_swaps(const ModelInputParams& input_params);

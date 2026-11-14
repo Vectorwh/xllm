@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/constraint/snapshot.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/request/request_timing_proto.h"
 #include "disagg_pd.pb.h"
@@ -200,7 +201,8 @@ void send_reservation_release(const std::string& req_id,
 }  // namespace
 
 bool is_permanent_rejection(int32_t status_code) {
-  return status_code == kDecodeAddNewPromptTooLongStatusCode;
+  return status_code == kDecodeAddNewPromptTooLongStatusCode ||
+         status_code == kDecodeConstraintRejectedStatusCode;
 }
 
 bool exceeds_decode_capacity(size_t num_prompt_tokens,
@@ -802,6 +804,13 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_json_object(requests[i]->state().sampling_param.json_object);
       req->set_json_reasoning_enabled(
           requests[i]->state().json_reasoning_enabled);
+      // G9: the per-request grammar identity rides the migrated request so
+      // the decode instance rebuilds the exact constraint instead of
+      // decoding the row unconstrained.
+      const GrammarSpec& spec = requests[i]->state().xgrammar_spec;
+      req->set_grammar_type(static_cast<int32_t>(spec.type));
+      req->set_grammar_source(spec.source);
+      req->set_grammar_strict(spec.strict);
       //*reqs.mutable_reqs()->Add() = req;
     }
     if (!valid_requests) {
@@ -856,6 +865,15 @@ void DisaggPDScheduler::dispatch_requests() {
     for (size_t i = 0; i < requests.size(); ++i) {
       if (resps.resps()[i].status_code() != 200) {
         if (discard_cancelled_dispatch_request(requests[i])) {
+          continue;
+        }
+        if (resps.resps()[i].status_code() ==
+            kDecodeConstraintRejectedStatusCode) {
+          reject_unreconcilable_kv_split(
+              requests[i],
+              selected_instance,
+              "cannot restore the forwarded structured-output constraint",
+              /*release_prefill_blocks=*/true);
           continue;
         }
         if (is_permanent_rejection(resps.resps()[i].status_code())) {

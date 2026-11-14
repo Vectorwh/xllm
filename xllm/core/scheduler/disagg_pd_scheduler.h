@@ -42,6 +42,8 @@ limitations under the License.
 namespace xllm {
 
 inline constexpr int32_t kDecodeAddNewPromptTooLongStatusCode = 413;
+// An unsupported/malformed forwarded constraint cannot succeed on retry.
+inline constexpr int32_t kDecodeConstraintRejectedStatusCode = 422;
 
 bool is_permanent_rejection(int32_t status_code);
 

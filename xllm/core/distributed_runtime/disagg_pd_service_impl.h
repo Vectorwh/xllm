@@ -20,6 +20,7 @@ limitations under the License.
 #include <string>
 
 #include "disagg_pd.pb.h"
+#include "framework/constraint/xgrammar_support.h"
 #include "framework/sampling/json_object_grammar.h"
 #include "runtime/xservice_client.h"
 
@@ -55,7 +56,15 @@ class DisaggPDServiceImpl {
                       proto::CancelRequestResponse* response);
 
  protected:
-  std::shared_ptr<Request> generate_request(const proto::DisaggRequest& req);
+  // Rebuilds the request for the decode instance. On a nullptr return,
+  // `constraint_rejected` (optional) reports whether the failure was a
+  // structured-output constraint rebuild failure: the migration cannot be
+  // retried into a valid decode, so the caller reports a permanent 422 for
+  // it while every other nullptr path (config, multimodal metadata, ...)
+  // stays a generic decode error.
+  std::shared_ptr<Request> generate_request(
+      const proto::DisaggRequest& req,
+      bool* constraint_rejected = nullptr);
 
   std::shared_ptr<const JsonObjectGrammar> get_json_object_grammar(
       bool reasoning_enabled,
@@ -67,6 +76,11 @@ class DisaggPDServiceImpl {
   std::mutex json_object_grammar_mutex_;
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;
   std::shared_ptr<const JsonObjectGrammar> json_reasoning_grammar_;
+#if defined(USE_XGRAMMAR)
+  // Decode-side pool of xgrammar machines for migrated requests: rebuilds
+  // the exact per-request grammar from the shipped spec (G9).
+  std::unique_ptr<XGrammarMachineCache> xgrammar_machines_;
+#endif
 };
 
 }  // namespace xllm

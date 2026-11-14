@@ -19,6 +19,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>

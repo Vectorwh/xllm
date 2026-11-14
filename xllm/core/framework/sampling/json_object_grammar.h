@@ -34,6 +34,7 @@ limitations under the License.
 namespace xllm {
 class ConstraintState;
 }
+#include "core/framework/constraint/snapshot.h"
 #include "core/framework/tokenizer/tokenizer.h"
 
 namespace xllm {
@@ -61,6 +62,11 @@ struct JsonObjectGrammarSnapshot final {
   // Frozen (halted) states round-trip their invalid flag so a RESPECT
   // freeze survives snapshot/restore instead of replaying back to valid.
   bool invalid = false;
+  // Grammar identity for per-request grammars (xgrammar); null means the
+  // builtin fixed grammar, which receivers construct at init. Immutable and
+  // shared with the machine's retained spec so per-step snapshot copies stay
+  // pointer-sized instead of duplicating the source.
+  std::shared_ptr<const GrammarSpec> grammar_spec;
 };
 
 class JsonObjectGrammarState final {

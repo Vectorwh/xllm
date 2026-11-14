@@ -86,6 +86,7 @@ limitations under the License.
 #include "core/runtime/draft_model_config.h"
 #include "core/runtime/py_runtime_module.h"
 #include "core/runtime/worker_rendezvous.h"
+#include "framework/constraint/xgrammar_support.h"
 #include "framework/eplb/eplb_utils.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
@@ -1627,6 +1628,48 @@ void WorkerImpl::restore_json_object_states(ForwardInput& input) {
       } else {
         states.emplace_back();
       }
+      continue;
+    }
+
+    // Null means no per-request grammar; a non-null spec whose source is
+    // empty cannot come from a compiled machine, so treat it like the
+    // builtin rows below rather than feeding the cache an invalid spec.
+    if (snapshot.grammar_spec != nullptr && !snapshot.grammar_spec->empty()) {
+#if defined(USE_XGRAMMAR)
+      // Per-request grammar (xgrammar): rebuild the machine from the
+      // spec, replay the committed history, and keep the frozen flag.
+      XGrammarMachineCache* cache = nullptr;
+      {
+        // Publish the cache once; execute RPCs can prepare inputs in parallel.
+        std::lock_guard<std::mutex> lock(json_object_grammar_mutex_);
+        if (xgrammar_machines_ == nullptr) {
+          xgrammar_machines_ = std::make_unique<XGrammarMachineCache>(
+              *tokenizer_, context_.get_model_args());
+        }
+        cache = xgrammar_machines_.get();
+      }
+      std::string error;
+      std::shared_ptr<XGrammarConstraintMachine> machine =
+          cache->get(*snapshot.grammar_spec, error);
+      if (machine == nullptr) {
+        fail_row("failed to rebuild the constraint grammar: " + error);
+        continue;
+      }
+      ConstraintState state =
+          machine->restore(to_constraint_snapshot(snapshot));
+      if (!state.initialized() || (!snapshot.invalid && !state.is_valid())) {
+        // Preserve an explicitly frozen snapshot, but reject a replay that
+        // became invalid despite a sender claiming a valid state.
+        fail_row("serialized constraint state is invalid");
+        continue;
+      }
+      states.push_back(std::move(state));
+#else
+      // A producing build with USE_XGRAMMAR sent a per-request grammar; this
+      // build cannot restore it, so refuse the row instead of decoding it
+      // unconstrained.
+      fail_row("constraint grammar requires a build with USE_XGRAMMAR");
+#endif
       continue;
     }
 

@@ -38,8 +38,10 @@ ConstraintState wrap(const XGrammarConstraintMachine& machine,
 }  // namespace
 
 XGrammarConstraintMachine::XGrammarConstraintMachine(
-    std::shared_ptr<const CompiledXGrammar> grammar)
-    : grammar_(std::move(grammar)) {
+    std::shared_ptr<const CompiledXGrammar> grammar,
+    GrammarSpec spec)
+    : grammar_(std::move(grammar)),
+      spec_(std::make_shared<const GrammarSpec>(std::move(spec))) {
   CHECK(grammar_ != nullptr) << "xgrammar constraint machine needs a grammar";
   // Serialize once per grammar: initial/restore/replay construct states on the
   // draft hot path and reuse this cached id instead of re-serializing.
@@ -160,6 +162,12 @@ ConstraintSnapshot XGrammarConstraintMachine::snapshot(
   out.reasoning_enabled = false;
   out.token_ids = cast(state).accepted_tokens();
   out.invalid = !cast(state).is_valid();
+  // Carry the grammar identity so a cross-process receiver can rebuild the
+  // exact grammar (the upstream cache makes recompiling the same source
+  // cheap) before replaying the history. The retained spec is shared by
+  // pointer: snapshots are copied per decode step and must not duplicate
+  // the (up to kMaxSourceBytes) source.
+  out.grammar_spec = spec_;
   return out;
 }
 

@@ -18,12 +18,16 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
 
+#include "core/framework/constraint/snapshot.h"
+#include "core/framework/model/model_args.h"
 #include "core/framework/sampling/fnv1a.h"
+#include "core/framework/tokenizer/tokenizer.h"
 
 #if defined(USE_XGRAMMAR)
 #include <xgrammar/xgrammar.h>
@@ -79,6 +83,10 @@ std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_json_schema(
     const std::string& schema,
     bool strict_mode,
     std::string& error) {
+  if (!GrammarSpec::source_within_limit(schema)) {
+    error = "grammar source exceeds the packed transport limit";
+    return nullptr;
+  }
   return compile_grammar(
       [&] {
         return compiler_->CompileJSONSchema(schema,
@@ -94,6 +102,10 @@ std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_json_schema(
 std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_regex(
     const std::string& regex,
     std::string& error) {
+  if (!GrammarSpec::source_within_limit(regex)) {
+    error = "grammar source exceeds the packed transport limit";
+    return nullptr;
+  }
   return compile_grammar(
       [&] { return compiler_->CompileRegex(regex); }, mutex_, error);
 }
@@ -257,5 +269,53 @@ std::vector<uint32_t> XGrammarState::allowed_bitmask() const {
 
 XGrammarCompiler::~XGrammarCompiler() = default;
 XGrammarState::~XGrammarState() = default;
+
+// static
+std::unique_ptr<XGrammarCompiler> XGrammarCompiler::create(
+    const Tokenizer& tokenizer,
+    const ModelArgs& model_args,
+    int64_t cache_max_memory_bytes,
+    std::string& error) {
+#if !defined(USE_XGRAMMAR)
+  error = "XGrammar support was not built; configure with USE_XGRAMMAR=ON";
+  return nullptr;
+#else
+  std::vector<std::string> pieces;
+  if (!tokenizer.get_constraint_vocab(&pieces)) {
+    error = "tokenizer provides no constraint vocabulary";
+    return nullptr;
+  }
+  const int64_t model_vocab_size = model_args.vocab_size();
+  if (model_vocab_size <= 0 ||
+      model_vocab_size > std::numeric_limits<int32_t>::max() ||
+      model_vocab_size < static_cast<int64_t>(pieces.size())) {
+    error = "invalid model vocabulary: model_vocab_size=" +
+            std::to_string(model_vocab_size) +
+            ", tokenizer_vocab_size=" + std::to_string(pieces.size()) +
+            "; expected tokenizer_vocab_size <= model_vocab_size <= " +
+            std::to_string(std::numeric_limits<int32_t>::max());
+    return nullptr;
+  }
+  pieces.resize(static_cast<size_t>(model_vocab_size));
+  std::vector<int32_t> stops(model_args.stop_token_ids().begin(),
+                             model_args.stop_token_ids().end());
+  const int32_t eos_token_id = model_args.eos_token_id();
+  if (eos_token_id >= 0) {
+    stops.emplace_back(eos_token_id);
+  }
+  for (const int32_t stop_id : stops) {
+    if (stop_id < 0 || stop_id >= model_vocab_size) {
+      error = "stop token id out of range: stop_id=" + std::to_string(stop_id) +
+              ", model_vocab_size=" + std::to_string(model_vocab_size);
+      return nullptr;
+    }
+  }
+  return std::unique_ptr<XGrammarCompiler>(
+      new XGrammarCompiler(std::move(pieces),
+                           model_vocab_size,
+                           std::move(stops),
+                           cache_max_memory_bytes));
+#endif
+}
 
 }  // namespace xllm

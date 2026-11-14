@@ -18,6 +18,9 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <future>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -60,37 +63,15 @@ TEST(XGrammarSupportTest, ZeroSpeculativeTokensNeverGates) {
   EXPECT_TRUE(xgrammar_unsupported_features(inputs).empty());
 }
 
-TEST(XGrammarSupportTest, GraphStaysGated) {
+TEST(XGrammarSupportTest, DisaggPdIsSupportedAfterCrossInstanceVerification) {
+  // Regular disagg PD passed the real 1P1D cross-instance verification
+  // (grammar spec on the KV first generation, per-token FSM mask on the
+  // decode side), so it no longer contributes an unsupported feature.
+  // PD OOC stays gated until its scheduler populates the grammar fields.
   XGrammarSupportInputs inputs;
-  inputs.enable_graph = true;
-  const auto unsupported = xgrammar_unsupported_features(inputs);
-  ASSERT_EQ(unsupported.size(), 1u);
-  EXPECT_TRUE(contains(unsupported, "graph"));
-}
-
-TEST(XGrammarSupportTest, GraphGatesEvenWithSpeculativeUnlocked) {
-  // A channel-migrated speculative algorithm is supported, but enabling graph
-  // must still gate: the draft-side graph is safe, the target-side is not.
-  XGrammarSupportInputs inputs;
-  inputs.num_speculative_tokens = 3;
-  inputs.speculative_algorithm = "MTP";
-  inputs.enable_graph = true;
-  const auto unsupported = xgrammar_unsupported_features(inputs);
-  ASSERT_EQ(unsupported.size(), 1u);
-  EXPECT_TRUE(contains(unsupported, "graph"));
-}
-
-TEST(XGrammarSupportTest, PiecewiseGraphStaysGated) {
-  XGrammarSupportInputs inputs;
-  inputs.enable_prefill_piecewise_graph = true;
-  EXPECT_TRUE(contains(xgrammar_unsupported_features(inputs),
-                       "prefill_piecewise_graph"));
-}
-
-TEST(XGrammarSupportTest, DisaggPdStaysGated) {
-  XGrammarSupportInputs inputs;
-  inputs.enable_disagg_pd = true;
-  EXPECT_TRUE(contains(xgrammar_unsupported_features(inputs), "disagg_pd"));
+  EXPECT_TRUE(xgrammar_unsupported_features(inputs).empty());
+  inputs.enable_pd_ooc = true;
+  EXPECT_TRUE(contains(xgrammar_unsupported_features(inputs), "pd_ooc"));
 }
 
 TEST(XGrammarSupportTest, ServiceRoutingStaysGated) {
@@ -107,15 +88,13 @@ TEST(XGrammarSupportTest, PrefixCacheStaysGated) {
 }
 
 TEST(XGrammarSupportTest, OnlyTheGatedFeaturesAreReported) {
-  // Speculative decoding and schedule overlap are not inputs (they never
-  // gate), so enabling graph and PD surfaces exactly those two.
+  // Graph flags no longer participate. With PD disabled, routing alone
+  // contributes an unsupported feature.
   XGrammarSupportInputs inputs;
-  inputs.enable_graph = true;
-  inputs.enable_disagg_pd = true;
+  inputs.enable_service_routing = true;
   const auto unsupported = xgrammar_unsupported_features(inputs);
-  EXPECT_EQ(unsupported.size(), 2u);
-  EXPECT_TRUE(contains(unsupported, "graph"));
-  EXPECT_TRUE(contains(unsupported, "disagg_pd"));
+  EXPECT_EQ(unsupported.size(), 1u);
+  EXPECT_TRUE(contains(unsupported, "service_routing"));
 }
 
 TEST(XGrammarSupportTest, ChunkedPrefillStaysSupportedWithSpeculation) {
@@ -143,15 +122,147 @@ TEST(XGrammarSupportTest, ChunkedPrefillStaysSupportedWithSpeculation) {
 
 TEST(XGrammarSupportTest, AllGatedFeaturesAreListedTogether) {
   XGrammarSupportInputs inputs;
-  inputs.enable_graph = true;
-  inputs.enable_prefill_piecewise_graph = true;
-  inputs.enable_disagg_pd = true;
+  inputs.enable_pd_ooc = true;
   inputs.enable_service_routing = true;
   inputs.enable_prefix_cache = true;
-  // Five gated features (chunked_prefill is supported); speculative and
-  // overlap are not among them.
-  EXPECT_EQ(xgrammar_unsupported_features(inputs).size(), 5u);
+  EXPECT_EQ(xgrammar_unsupported_features(inputs).size(), 3u);
 }
+
+class CacheTestTokenizer final : public Tokenizer {
+ public:
+  size_t vocab_size() const override { return 6; }
+  bool get_constraint_vocab(std::vector<std::string>* pieces) const override {
+    *pieces = {"A", "B", "-", "1", "x", ""};
+    return true;
+  }
+};
+
+ModelArgs cache_test_model_args() {
+  ModelArgs args;
+  args.vocab_size(32).eos_token_id(5);
+  return args;
+}
+
+TEST(XGrammarSupportTest, InvalidSpecRejectedBeforeCompilation) {
+  CacheTestTokenizer tokenizer;
+  XGrammarMachineCache cache(tokenizer, cache_test_model_args());
+  GrammarSpec spec;
+  spec.type = static_cast<GrammarSpec::Type>(-1);
+  spec.source = "A";
+  std::string error;
+  EXPECT_EQ(cache.get(spec, error), nullptr);
+  EXPECT_FALSE(error.empty());
+}
+
+#if defined(USE_XGRAMMAR)
+TEST(XGrammarSupportTest, ConcurrentColdMissesKeepOneCompilerAlive) {
+  CacheTestTokenizer tokenizer;
+  XGrammarMachineCache cache(tokenizer, cache_test_model_args());
+  std::vector<std::future<std::shared_ptr<XGrammarConstraintMachine>>> futures;
+  futures.reserve(8);
+  for (int32_t i = 0; i < 8; ++i) {
+    futures.emplace_back(std::async(std::launch::async, [&cache, i] {
+      GrammarSpec spec;
+      spec.type = GrammarSpec::Type::REGEX;
+      spec.source = i % 2 == 0 ? "A" : "B";
+      std::string error;
+      return cache.get(spec, error);
+    }));
+  }
+  std::vector<std::shared_ptr<XGrammarConstraintMachine>> machines;
+  machines.reserve(futures.size());
+  for (auto& future : futures) {
+    machines.emplace_back(future.get());
+    ASSERT_NE(machines.back(), nullptr);
+  }
+  for (size_t i = 0; i < machines.size(); ++i) {
+    EXPECT_EQ(machines[i], machines[i % 2]);
+    ConstraintState state = machines[i]->initial_state(false);
+    EXPECT_TRUE(machines[i]->can_accept(state, static_cast<int32_t>(i % 2)));
+  }
+}
+
+TEST(XGrammarSupportTest, FinishedRowsReleaseCachedMachines) {
+  CacheTestTokenizer tokenizer;
+  XGrammarMachineCache cache(tokenizer, cache_test_model_args());
+  GrammarSpec spec;
+  spec.type = GrammarSpec::Type::REGEX;
+  spec.source = "A";
+  std::string error;
+  auto machine = cache.get(spec, error);
+  ASSERT_NE(machine, nullptr) << error;
+  std::weak_ptr<XGrammarConstraintMachine> weak = machine;
+  ConstraintState state = machine->initial_state(false);
+  machine.reset();
+  EXPECT_FALSE(weak.expired());
+  state = ConstraintState();
+  EXPECT_TRUE(weak.expired());
+  EXPECT_NE(cache.get(spec, error), nullptr);
+}
+
+TEST(XGrammarSupportTest, HashCollidingSpecsAreCachedNotRecompiled) {
+  CacheTestTokenizer tokenizer;
+  // Force every spec onto one key so the two sources collide the way two
+  // distinct grammars would under a real 64-bit fnv1a collision; a real
+  // collision cannot be constructed from printable regex sources in a
+  // test, so the key override stands in for it.
+  XGrammarMachineCache collided_cache(tokenizer,
+                                      cache_test_model_args(),
+                                      [](const GrammarSpec&) { return 42; });
+  GrammarSpec first;
+  first.type = GrammarSpec::Type::REGEX;
+  first.source = "A";
+  GrammarSpec second;
+  second.type = GrammarSpec::Type::REGEX;
+  second.source = "B";
+  std::string error;
+  auto first_machine = collided_cache.get(first, error);
+  ASSERT_NE(first_machine, nullptr) << error;
+  auto second_machine = collided_cache.get(second, error);
+  ASSERT_NE(second_machine, nullptr) << error;
+  // A collision must not serve another request's grammar...
+  EXPECT_NE(first_machine, second_machine);
+  // ...and must not fall back to a per-request recompile either.
+  EXPECT_EQ(collided_cache.get(first, error), first_machine);
+  EXPECT_EQ(collided_cache.get(second, error), second_machine);
+}
+
+TEST(XGrammarSupportTest, CompilerRejectsOversizedSourcesAndVocabulary) {
+  CacheTestTokenizer tokenizer;
+  ModelArgs args = cache_test_model_args();
+  args.vocab_size(static_cast<int64_t>(std::numeric_limits<int32_t>::max()) +
+                  1);
+  std::string error;
+  EXPECT_EQ(XGrammarCompiler::create(tokenizer, args, /*cache_bytes=*/0, error),
+            nullptr);
+  args = cache_test_model_args();
+  args.stop_token_ids({static_cast<int32_t>(args.vocab_size())});
+  EXPECT_EQ(XGrammarCompiler::create(tokenizer, args, /*cache_bytes=*/0, error),
+            nullptr);
+  EXPECT_FALSE(error.empty());
+  args = cache_test_model_args();
+  auto compiler =
+      XGrammarCompiler::create(tokenizer, args, /*cache_bytes=*/0, error);
+  ASSERT_NE(compiler, nullptr) << error;
+  const std::string oversized(GrammarSpec::kMaxSourceBytes + 1, 'A');
+  EXPECT_EQ(compiler->compile_regex(oversized, error), nullptr);
+  EXPECT_FALSE(error.empty());
+  EXPECT_EQ(compiler->compile_json_schema(oversized, /*strict=*/true, error),
+            nullptr);
+  EXPECT_FALSE(error.empty());
+}
+#else
+TEST(XGrammarSupportTest, CompilerFactoryFailsExplicitlyWithoutXgrammar) {
+  CacheTestTokenizer tokenizer;
+  std::string error;
+  EXPECT_EQ(XGrammarCompiler::create(tokenizer,
+                                     cache_test_model_args(),
+                                     /*cache_bytes=*/0,
+                                     error),
+            nullptr);
+  EXPECT_FALSE(error.empty());
+}
+#endif
 
 }  // namespace
 }  // namespace xllm

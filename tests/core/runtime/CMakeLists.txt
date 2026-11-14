@@ -1,5 +1,22 @@
 include(cc_test)
 
+# The host descriptor codec and admission classification need no device setup.
+# Keep their regressions separate from process-global NPU test initialization.
+cc_test(
+  NAME constraint_snapshot_transport_test
+  CPU_ONLY
+  SRCS constraint_snapshot_transport_test.cpp
+  DEPS :runtime :scheduler :config GTest::gtest_main
+)
+target_link_libraries(constraint_snapshot_transport_test PRIVATE
+  Python::Python
+  $<$<BOOL:${USE_NPU}>:torch_npu>
+  $<$<BOOL:${USE_NPU}>:torch_python>
+  $<$<BOOL:${USE_NPU}>:ascendcl>
+  $<$<BOOL:${USE_NPU}>:hccl>
+  $<$<BOOL:${USE_NPU}>:c_sec>
+  $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 cc_test(
   NAME xservice_client_test
   CPU_ONLY

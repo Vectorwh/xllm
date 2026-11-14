@@ -454,21 +454,20 @@ void validate_config(const std::string& model_type) {
         << "XGrammar requires one visible NPU, nnodes=1, node_rank=0, "
            "dp_size=1, cp_size=1 and tp_size<=1";
     XGrammarSupportInputs support_inputs;
-    support_inputs.enable_graph = execution_config.enable_graph();
-    support_inputs.enable_prefill_piecewise_graph =
-        execution_config.enable_prefill_piecewise_graph();
+    support_inputs.enable_pd_ooc = disagg_pd_config.enable_pd_ooc();
     support_inputs.num_speculative_tokens =
         speculative_config.num_speculative_tokens();
     support_inputs.speculative_algorithm =
         speculative_config.speculative_algorithm();
-    support_inputs.enable_disagg_pd = disagg_pd_config.enable_disagg_pd();
     support_inputs.enable_service_routing =
         distributed_config.enable_service_routing();
     support_inputs.enable_prefix_cache = kv_cache_config.enable_prefix_cache();
     const std::vector<std::string> unsupported =
         xgrammar_unsupported_features(support_inputs);
-    // Speculative decoding and schedule overlap are supported since the
-    // constraint state-machine migration; the rest stay gated until verified.
+    // Speculative decoding, schedule overlap, graph, and prefill piecewise
+    // graph are supported since the constraint state-machine migration (the
+    // eager sampler applies the constraint mask outside the captured graph);
+    // the rest stay gated until verified.
     CHECK(unsupported.empty())
         << "XGrammar does not yet support these enabled features: "
         << absl::StrJoin(unsupported, ", ")

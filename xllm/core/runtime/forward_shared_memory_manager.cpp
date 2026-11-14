@@ -19,6 +19,7 @@ limitations under the License.
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -124,7 +125,12 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // v7: each snapshot also gains constrained_without_snapshot (refuse a
 // constraint that could not be serialized), and the per-shard
 // dp_global_json_object_active vector is gone from the parallel section.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000007ULL;
+// v8: every snapshot gains its grammar identity (type, strict, source
+// length, source bytes) after the invalid flag, so per-request grammars
+// (xgrammar) restore cross-process by rebuilding from the source instead
+// of refusing; a v7 reader would misparse the tail of the descriptor
+// after the first snapshot.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000008ULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -700,6 +706,20 @@ void write_json_object_state_snapshots(
     write_data(cursor, snapshot.constrained_without_snapshot);
     write_vector(cursor, snapshot.token_ids);
     write_data(cursor, snapshot.invalid);
+    // v8 grammar identity: an empty source serializes as a zero length. A
+    // null spec (builtin rows) writes the same default fields, so the wire
+    // form does not depend on the in-memory holder being shared.
+    const GrammarSpec* spec = snapshot.grammar_spec.get();
+    write_data(
+        cursor,
+        static_cast<int8_t>(spec == nullptr ? GrammarSpec::Type::JSON_SCHEMA
+                                            : spec->type));
+    write_data(cursor, spec != nullptr && spec->strict);
+    if (spec == nullptr) {
+      write_string(cursor, std::string());
+    } else {
+      write_string(cursor, spec->source);
+    }
   }
 }
 
@@ -1291,6 +1311,7 @@ struct ReadContext final {
   const char* descriptor_cursor;
   const char* tensor_cursor;
   DeviceBufferSession* device_session = nullptr;
+  const char* descriptor_end = nullptr;
 };
 
 inline uint64_t get_tensor_payload_bytes(const torch::Tensor& tensor) {
@@ -1674,6 +1695,51 @@ void read_json_object_state_snapshots(
     read_data(context, snapshot.constrained_without_snapshot);
     read_vector(context, snapshot.token_ids);
     read_data(context, snapshot.invalid);
+    // v8 grammar identity. The type must land on a defined enum value and
+    // the source length on a sane bound BEFORE any allocation: both come
+    // from the shared descriptor, and a corrupt or misaligned value would
+    // otherwise either route to an undefined enum branch or trigger a
+    // length-driven huge assign. Fail loudly like the format-tag check -
+    // this is descriptor corruption, not a request-level condition.
+    constexpr size_t kGrammarSpecHeaderBytes =
+        sizeof(int8_t) + sizeof(bool) + sizeof(uint64_t);
+    CHECK(context.descriptor_end != nullptr);
+    CHECK_LE(context.descriptor_cursor, context.descriptor_end);
+    CHECK_GE(
+        static_cast<size_t>(context.descriptor_end - context.descriptor_cursor),
+        kGrammarSpecHeaderBytes)
+        << "grammar spec header exceeds descriptor";
+    int8_t type = 0;
+    read_data(context, type);
+    CHECK(type == static_cast<int8_t>(GrammarSpec::Type::JSON_SCHEMA) ||
+          type == static_cast<int8_t>(GrammarSpec::Type::REGEX))
+        << "grammar_spec.type out of range: " << type;
+    bool strict = false;
+    read_data(context, strict);
+    uint64_t source_len = 0;
+    read_data(context, source_len);
+    // Production schemas and regexes are KB-scale; 16 MiB is a generous
+    // ceiling that still rejects a misaligned length word.
+    CHECK_LE(source_len, GrammarSpec::kMaxSourceBytes)
+        << "grammar_spec.source length out of range: " << source_len;
+    CHECK_LE(source_len,
+             static_cast<uint64_t>(context.descriptor_end -
+                                   context.descriptor_cursor))
+        << "grammar source exceeds descriptor";
+    // input_read may reuse ForwardInput: assigning a fresh spec (null for an
+    // empty source) must not retain a previous request's grammar after
+    // snapshots.resize preserves the entry.
+    if (source_len == 0) {
+      snapshot.grammar_spec = nullptr;
+    } else {
+      GrammarSpec spec;
+      spec.type = static_cast<GrammarSpec::Type>(type);
+      spec.strict = strict;
+      spec.source.assign(context.descriptor_cursor, source_len);
+      advance_descriptor_cursor(context, source_len);
+      snapshot.grammar_spec =
+          std::make_shared<const GrammarSpec>(std::move(spec));
+    }
   }
 }
 
@@ -2543,7 +2609,10 @@ inline void deserialize_forward_input_payload(
   DeviceBufferSession device_session;
   const char* descriptor_base = buffer;
   const char* tensor_arena_base = payload_base + layout.tensor_arena_offset;
-  ReadContext context{descriptor_base, tensor_arena_base, &device_session};
+  ReadContext context{descriptor_base,
+                      tensor_arena_base,
+                      &device_session,
+                      descriptor_base + layout.descriptor_bytes};
   initialize_device_buffer_session(context,
                                    forward_input,
                                    device,

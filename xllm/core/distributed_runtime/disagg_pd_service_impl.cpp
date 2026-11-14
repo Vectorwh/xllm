@@ -60,7 +60,17 @@ DisaggPDServiceImpl::get_json_object_grammar(bool reasoning_enabled,
 }
 
 std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
-    const proto::DisaggRequest& req) {
+    const proto::DisaggRequest& req,
+    bool* constraint_rejected) {
+  // Only a structured-output constraint rebuild failure is unreconcilable
+  // for this migration; mark it so the caller can pick the permanent
+  // status instead of a retryable one. Nullptr-safe for callers that do
+  // not care about the failure class.
+  const auto note_constraint_rejection = [constraint_rejected]() {
+    if (constraint_rejected != nullptr) {
+      *constraint_rejected = true;
+    }
+  };
   // best_of > 1 in disaggregated PD requires prefix cache on the decode
   // instance: only the first sequence's KV is pulled from prefill, and
   // the remaining best_of-1 sequences are expanded locally and reuse the
@@ -167,7 +177,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   }
   req_state.include_stop_str_in_output = req.include_stop_str_in_output();
 
-  if (json_object) {
+  if (json_object && req.grammar_source().empty()) {
     if (!ServiceConfig::get_instance().enable_json_object_output()) {
       // Match the single-instance flag semantics: json_object requests are
       // accepted without the constraint when this instance disables it.
@@ -193,6 +203,53 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
       req_state.constraint_machine =
           wrap_builtin_machine(req_state.json_object_grammar);
     }
+  }
+
+  // The allocation request precedes prefill's first sampled token. Rebuild
+  // the same grammar before that token arrives and is committed on decode.
+  if (!req.grammar_source().empty()) {
+#if defined(USE_XGRAMMAR)
+    if (!ServiceConfig::get_instance().use_xgrammar()) {
+      LOG(ERROR) << "Migrated xgrammar constraint requires the xgrammar backend"
+                 << ", request_id=" << req.req_id();
+      note_constraint_rejection();
+      return nullptr;
+    }
+    XGrammarMachineCache* cache = nullptr;
+    {
+      // Admission RPCs may run concurrently; never replace a published cache.
+      std::lock_guard<std::mutex> lock(json_object_grammar_mutex_);
+      if (xgrammar_machines_ == nullptr) {
+        xgrammar_machines_ = std::make_unique<XGrammarMachineCache>(
+            *engine_->tokenizer(), engine_->model_args());
+      }
+      cache = xgrammar_machines_.get();
+    }
+    GrammarSpec spec;
+    spec.type = static_cast<GrammarSpec::Type>(req.grammar_type());
+    spec.source = req.grammar_source();
+    spec.strict = req.grammar_strict();
+    std::string grammar_error;
+    std::shared_ptr<XGrammarConstraintMachine> machine =
+        cache->get(spec, grammar_error);
+    if (machine == nullptr) {
+      LOG(ERROR) << "Failed to rebuild xgrammar constraint: " << grammar_error
+                 << ", request_id=" << req.req_id();
+      note_constraint_rejection();
+      return nullptr;
+    }
+    req_state.xgrammar_spec = std::move(spec);
+    req_state.constraint_machine = machine;
+    // The per-sequence matcher construction reads the compiled grammar;
+    // expose it from the machine-wrapped grammar.
+    req_state.xgrammar_constraint = machine->grammar();
+#else
+    // A build without xgrammar must not silently discard the incoming spec.
+    LOG(ERROR) << "Migrated constraint requires a build with USE_XGRAMMAR"
+               << ", request_id=" << req.req_id();
+    note_constraint_rejection();
+    return nullptr;
+#endif
   }
 
   req_state.pd_reservation_id = req.reservation_id();
@@ -233,9 +290,14 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
     auto resp = response->add_resps();
     resp->set_req_id(req.req_id());
 
-    auto new_request = generate_request(req);
+    bool constraint_rejected = false;
+    auto new_request = generate_request(req, &constraint_rejected);
     if (new_request == nullptr) {
-      resp->set_status_code(500);
+      // Only a constraint-rebuild failure is unreconcilable for the
+      // migrated request (the prefill side releases its blocks instead of
+      // retrying); unrelated nullptr failures are generic decode errors.
+      resp->set_status_code(
+          constraint_rejected ? kDecodeConstraintRejectedStatusCode : 500);
       continue;
     }
 

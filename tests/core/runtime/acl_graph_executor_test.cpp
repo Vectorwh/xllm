@@ -25,6 +25,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,8 @@ limitations under the License.
 #include "core/framework/parallel_state/npu_dp_ep_padding.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
+#include "core/framework/sampling/json_object_grammar.h"
+#include "core/framework/sampling/sampler.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/layers/common/attention_metadata.h"
@@ -3588,6 +3591,141 @@ TEST_F(AclGraphExecutorTest, GraphExecutorUsesFirstFullAttentionKvCache) {
                               graph_model_output.hidden_states,
                               /*rtol=*/1e-5,
                               /*atol=*/1e-6));
+}
+
+TEST_F(AclGraphExecutorTest, GraphReplaySamplingRespectsConstraintMask) {
+  // The graph executors capture only the model forward; the LM-head
+  // projection and the constrained sampler run eagerly on the replayed
+  // output (llm_worker_impl calls model_->logits then sampler_->forward
+  // after the replay). This pins the composition end to end: the mask the
+  // batch builder installs constrains tokens sampled from graph-produced
+  // logits, a replayed step with an advanced state rebuilds the mask and
+  // keeps constraining, and the unconstrained row is untouched by the mask.
+  constexpr uint32_t batch_size = 2;
+  sequences_.clear();
+  auto batch = std::make_unique<Batch>();
+
+  std::vector<std::string> pieces(model_args_.vocab_size(), "x");
+  pieces[static_cast<size_t>('{')] = "{";
+  pieces[static_cast<size_t>('}')] = "}";
+  // Stop tokens: a real grammar derives them from the tokenizer; any id
+  // outside the structural pair keeps the toy grammar terminal-simple.
+  const std::unordered_set<int32_t> stop_ids{2};
+
+  SequenceParams constrained_params = seq_params_;
+  constrained_params.request_id = "req-graph-constrained";
+  constrained_params.json_object_grammar =
+      std::make_shared<const JsonObjectGrammar>(pieces, stop_ids);
+  SequenceParams plain_params = seq_params_;
+  plain_params.request_id = "req-graph-plain";
+
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    const bool constrained = (i == 0);
+    sequences_.emplace_back(i,
+                            std::vector<int32_t>{1, 3, 5, 7},
+                            input_embedding_,
+                            mm_data_,
+                            fake_decoder_,
+                            constrained ? constrained_params : plain_params);
+    auto& sequence = sequences_.back();
+    sequence.kv_state().add_blocks(BlockType::KV, block_manager_->allocate(2));
+    sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
+    // The setup commit must stay inside the grammar or the sequence fails
+    // at batch time; the plain row has no such constraint.
+    sequence.append_token(constrained ? static_cast<int64_t>('{') : 100 + i);
+    batch->add(&sequence);
+  }
+
+  // Fixed eager LM-head projection [hidden, vocab]: the graph replay
+  // reproduces the captured hidden states, so a fixed projection gives
+  // deterministic logits per step, like a tied-embedding model.
+  torch::manual_seed(7);
+  const torch::Tensor lm_head = torch::randn(
+      {model_args_.hidden_size(), model_args_.vocab_size()},
+      torch::TensorOptions().dtype(torch::kFloat32).device(*device_));
+
+  auto graph_executor = std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+
+  for (int32_t step = 0; step < 2; ++step) {
+    auto forward_input = batch->prepare_forward_input(
+        options_.num_decoding_tokens(), 0, model_args_);
+    ASSERT_TRUE(forward_input.sampling_params.filter_bitmask.defined())
+        << "the batch builder must install the constraint mask";
+    forward_input = forward_input.to(*device_, torch::kFloat32);
+    forward_input.input_params.enable_graph = true;
+    forward_input.input_params.attn_metadata =
+        std::make_shared<layer::AttentionMetadata>();
+
+    auto graph_model_output = graph_executor->run({forward_input.token_ids},
+                                                  {forward_input.positions},
+                                                  kv_caches_,
+                                                  {forward_input.input_params});
+    ASSERT_TRUE(graph_model_output.hidden_states.defined());
+    // Pin that this step actually went through the ACL graph capture (the
+    // executor silently falls back to eager on several shapes; a fallback
+    // would still sample the masked logits, so only this assertion
+    // distinguishes the graph-replay composition).
+    auto* simple_model = dynamic_cast<SimpleCausalLM*>(model_.get());
+    ASSERT_NE(simple_model, nullptr);
+    EXPECT_TRUE(simple_model->last_forward_enabled_graph())
+        << "the graph path must engage, not fall back to eager";
+
+    // Eager post-replay pipeline: LM-head projection then the constrained
+    // sampler, both on the replayed output.
+    torch::Tensor logits = graph_model_output.hidden_states.matmul(lm_head);
+    // The mask application writes the masked logits in place (add_-inf on
+    // forbidden columns), so the mask-free reference must draw on a clone
+    // taken before the constrained pass - otherwise the reference sees the
+    // already-masked logits and the redirect check degenerates.
+    torch::Tensor bare_logits = logits.clone();
+    SampleOutput sample_output =
+        Sampler().forward(logits, forward_input.sampling_params);
+    const torch::Tensor tokens = sample_output.next_tokens.to(torch::kCPU);
+
+    // Row 0: the mask must keep the sample inside the live grammar's
+    // allowed set (the random LM head's argmax over a 1000-wide vocab lands
+    // in the two structural tokens only by a freak accident, so membership
+    // proves the mask did the constraining).
+    ASSERT_EQ(tokens.size(0), 2);
+    const auto* live_state = sequences_[0].json_object_state();
+    ASSERT_NE(live_state, nullptr);
+    const auto allowed = live_state->grammar()->allowed_token_ids(*live_state);
+    const int32_t sampled = tokens[0].item<int32_t>();
+    EXPECT_NE(std::find(allowed.begin(), allowed.end(), sampled), allowed.end())
+        << "the masked sample must stay inside the grammar";
+
+    // Row 1: the unconstrained row's all-allow mask must not change the
+    // sample, so it matches a mask-free reference draw; and the reference
+    // row 0 shows the bare argmax the mask redirected away from.
+    SamplingParameters reference = forward_input.sampling_params;
+    reference.filter_bitmask = torch::Tensor();
+    SampleOutput reference_output = Sampler().forward(bare_logits, reference);
+    const torch::Tensor reference_tokens =
+        reference_output.next_tokens.to(torch::kCPU);
+    EXPECT_EQ(tokens[1].item<int32_t>(), reference_tokens[1].item<int32_t>())
+        << "the all-allow mask row must not perturb the plain row";
+    const int32_t bare_row0 = reference_tokens[0].item<int32_t>();
+    if (std::find(allowed.begin(), allowed.end(), bare_row0) == allowed.end()) {
+      EXPECT_NE(sampled, bare_row0)
+          << "the mask must redirect a grammar-violating argmax";
+    }
+
+    // Commit the constrained token so the next step replays with an
+    // advanced grammar state and a rebuilt mask. append_token runs the
+    // grammar commit path; a mask-violating token would fail the sequence
+    // instead of advancing the state.
+    const int32_t committed = tokens[0].item<int32_t>();
+    const size_t committed_before = live_state->snapshot().token_ids.size();
+    sequences_[0].append_token(committed);
+    const auto* state_after = sequences_[0].json_object_state();
+    ASSERT_NE(state_after, nullptr);
+    EXPECT_EQ(state_after->snapshot().token_ids.size(), committed_before + 1)
+        << "the grammar state must advance exactly once per commit";
+    // The builder consumes the processed tokens into the KV count, so both
+    // rows must commit their sampled token to have work at the next step.
+    sequences_[1].append_token(tokens[1].item<int32_t>());
+  }
 }
 
 }  // namespace xllm

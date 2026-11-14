@@ -16,6 +16,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <string>
@@ -247,7 +248,14 @@ class DSparkWorkerImplTestPeer final {
         size_t vocab_size() const override { return 40; }
         bool get_constraint_vocab(
             std::vector<std::string>* pieces) const override {
+          // Real pieces for ids 0-7 so cross-process grammar rebuilds
+          // (the worker-local XGrammarMachineCache) compile a usable
+          // matcher; the rest stay empty padding up to the 40-wide model
+          // vocabulary.
+          static const std::vector<std::string> kLead = {
+              "A", "B", "-", "1", "x", "", "{", "}"};
           pieces->assign(40, std::string());
+          std::copy(kLead.begin(), kLead.end(), pieces->begin());
           return true;
         }
       };
@@ -815,6 +823,62 @@ TEST(DSparkDecodeStepTest, ConstrainedRowWithoutSnapshotDecodesDenied) {
   ASSERT_EQ(mask.sizes(), torch::IntArrayRef({1, 2}));
   EXPECT_TRUE(torch::equal(mask[0], torch::zeros_like(mask[0])));
 }
+
+#if defined(USE_XGRAMMAR)
+TEST(DSparkDecodeStepTest, CrossProcessXgrammarRowRestoresFromSpec) {
+  // G9: a cross-process arrival carries the per-request grammar spec in the
+  // snapshot, so the worker rebuilds the exact grammar, replays the
+  // committed history, and the row decodes constrained - no deny, no error.
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true).num_speculative_tokens(15);
+  DSparkWorkerImpl worker(
+      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
+  DSparkWorkerImplTestPeer::install_restore_dependencies(worker);
+
+  ForwardInput input;
+  input.sample_sequence_ids = {"cross-process-xgrammar"};
+  input.json_object_state_snapshots.resize(1);
+  auto& snapshot = input.json_object_state_snapshots[0];
+  snapshot.enabled = true;
+  GrammarSpec spec;
+  spec.type = GrammarSpec::Type::REGEX;
+  spec.source = "[A-Z]{2}-[0-9]{4}";
+  snapshot.grammar_spec = std::make_shared<const GrammarSpec>(std::move(spec));
+  // One committed token: 'A' (id 0) is an acceptable regex prefix.
+  snapshot.token_ids = {0};
+
+  // The restore clears the snapshots vector, so keep the shared spec by
+  // pointer before the first call (the reference would dangle after the
+  // clear); reusing it below also pins that repeated restores share, not
+  // copy, the grammar identity.
+  std::shared_ptr<const GrammarSpec> spec_copy = snapshot.grammar_spec;
+  DSparkWorkerImplTestPeer::restore_states(worker, input);
+  EXPECT_TRUE(input.json_object_errors.empty());
+  ASSERT_EQ(input.json_object_states.size(), 1u);
+  const ConstraintState& state = input.json_object_states.front();
+  EXPECT_TRUE(state.initialized());
+  EXPECT_TRUE(state.is_valid());
+  // The replayed matcher accepts the next token of the prefix ('B').
+  EXPECT_TRUE(state.machine()->can_accept(state, 1));
+  // A repeated restore (next step of the same request) hits the cached
+  // machine and restores the advanced history.
+  input.json_object_state_snapshots.resize(1);
+  auto& snapshot2 = input.json_object_state_snapshots[0];
+  snapshot2.enabled = true;
+  snapshot2.grammar_spec = spec_copy;
+  snapshot2.token_ids = {0, 1};
+  DSparkWorkerImplTestPeer::restore_states(worker, input);
+  EXPECT_TRUE(input.json_object_errors.empty());
+  ASSERT_EQ(input.json_object_states.size(), 1u);
+  EXPECT_TRUE(input.json_object_states.front().is_valid());
+  EXPECT_TRUE(input.json_object_states.front().machine()->can_accept(
+      input.json_object_states.front(), 2 /* '-' */));
+}
+#endif
 
 TEST(DSparkDecodeStepTest, ConstrainedRowsKeepDraftPrelaunchEligible) {
   Device device(0);

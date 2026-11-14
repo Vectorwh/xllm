@@ -108,7 +108,9 @@ TEST(BatchTransportTest, PackedMediaIdentity) {
   uint64_t tag = 0;
   ASSERT_GE(packed.payload().size(), sizeof(tag));
   std::memcpy(&tag, packed.payload().data(), sizeof(tag));
-  EXPECT_EQ(tag, 0x584C4C4D00000007ULL);
+  // The RAW-input format tag moved to v8 when per-sequence constraint
+  // snapshots joined the packed payload (kRawInputFormatTag).
+  EXPECT_EQ(tag, 0x584C4C4D00000008ULL);
   proto::ForwardInput envelope;
   *envelope.mutable_packed_input() = packed;
   proto::ForwardInput received;

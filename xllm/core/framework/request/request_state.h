@@ -25,6 +25,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/constraint/snapshot.h"
 #include "core/framework/constraint/state_machine.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/request/request_timing.h"
@@ -223,6 +224,10 @@ class RequestState final {
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar;
   std::shared_ptr<ConstraintStateMachine> constraint_machine;
   std::shared_ptr<const CompiledXGrammar> xgrammar_constraint;
+  // Grammar identity of the xgrammar constraint (empty for builtin and
+  // unconstrained rows): the PD scheduler ships it with the migrated
+  // request so the decode instance rebuilds the exact grammar (G9).
+  GrammarSpec xgrammar_spec;
   bool json_reasoning_enabled = false;
 };
 

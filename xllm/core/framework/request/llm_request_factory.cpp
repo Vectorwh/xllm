@@ -65,37 +65,16 @@ LLMRequestFactory::LLMRequestFactory(const Tokenizer* tokenizer,
   CHECK(options_ != nullptr);
   CHECK(rate_limiter_ != nullptr);
   if (enable_xgrammar_output_) {
-    std::vector<std::string> pieces;
-    if (!tokenizer_->get_constraint_vocab(&pieces)) {
-      LOG(ERROR) << "XGrammar requires a valid ByteLevel tokenizer vocabulary; "
-                    "structured output requests will be rejected";
-      return;
+    std::string error;
+    xgrammar_compiler_ = XGrammarCompiler::create(
+        *tokenizer_,
+        *model_args_,
+        ServiceConfig::get_instance().xgrammar_cache_max_memory_bytes(),
+        error);
+    if (xgrammar_compiler_ == nullptr) {
+      LOG(ERROR) << "XGrammar initialization failed (" << error
+                 << "); structured output requests will be rejected";
     }
-    const int64_t model_vocab_size = model_args_->vocab_size();
-    if (model_vocab_size <= 0 ||
-        model_vocab_size > std::numeric_limits<int32_t>::max() ||
-        model_vocab_size < static_cast<int64_t>(pieces.size())) {
-      LOG(ERROR) << "Invalid XGrammar model vocabulary: model_vocab_size="
-                 << model_vocab_size
-                 << ", tokenizer_vocab_size=" << pieces.size()
-                 << "; expected tokenizer_vocab_size <= model_vocab_size <= "
-                 << std::numeric_limits<int32_t>::max()
-                 << " and model_vocab_size > 0; structured output requests "
-                    "will be rejected";
-      return;
-    }
-    pieces.resize(static_cast<size_t>(model_vocab_size));
-    std::vector<int32_t> stops(model_args_->stop_token_ids().begin(),
-                               model_args_->stop_token_ids().end());
-    const int32_t eos_token_id = model_args_->eos_token_id();
-    if (eos_token_id >= 0) {
-      stops.emplace_back(eos_token_id);
-    }
-    xgrammar_compiler_ = std::make_unique<XGrammarCompiler>(
-        pieces,
-        model_vocab_size,
-        stops,
-        ServiceConfig::get_instance().xgrammar_cache_max_memory_bytes());
   }
 }
 
@@ -312,6 +291,7 @@ bool LLMRequestFactory::apply_json_object_grammar(
 
 std::shared_ptr<const CompiledXGrammar>
 LLMRequestFactory::compile_response_format(const RequestParams& sp,
+                                           GrammarSpec& spec,
                                            std::string& error) {
   if (sp.response_format == ResponseFormatType::NONE) {
     return nullptr;
@@ -352,14 +332,18 @@ LLMRequestFactory::compile_response_format(const RequestParams& sp,
     }
   }
   if (sp.response_format == ResponseFormatType::REGEX) {
-    return xgrammar_compiler_->compile_regex(sp.response_format_regex, error);
+    spec.type = GrammarSpec::Type::REGEX;
+    spec.source = sp.response_format_regex;
+    return xgrammar_compiler_->compile_regex(spec.source, error);
   }
   const bool json_object =
       sp.response_format == ResponseFormatType::JSON_OBJECT;
+  spec.type = GrammarSpec::Type::JSON_SCHEMA;
+  spec.strict = !json_object && sp.response_format_strict;
+  spec.source =
+      json_object ? R"({"type":"object"})" : sp.response_format_schema;
   return xgrammar_compiler_->compile_json_schema(
-      json_object ? R"({"type":"object"})" : sp.response_format_schema,
-      !json_object && sp.response_format_strict,
-      error);
+      spec.source, spec.strict, error);
 }
 
 std::shared_ptr<Request> LLMRequestFactory::create(
@@ -386,7 +370,9 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   }
 
   std::string grammar_error;
-  auto xgrammar_constraint = compile_response_format(sp, grammar_error);
+  GrammarSpec response_format_spec;
+  auto xgrammar_constraint =
+      compile_response_format(sp, response_format_spec, grammar_error);
   if (!grammar_error.empty()) {
     callback(
         {Status::invalid_parameter(std::move(grammar_error), "response_format"),
@@ -538,8 +524,16 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   }
   req_state.xgrammar_constraint = std::move(xgrammar_constraint);
   if (req_state.constraint_machine == nullptr) {
-    req_state.constraint_machine =
-        wrap_xgrammar_machine(req_state.xgrammar_constraint);
+    // The spec rides the machine so its snapshots identify the grammar
+    // cross-process: a decode worker rebuilds the exact source and replays
+    // the committed history (G9). It is the one compile_response_format
+    // built the grammar from, so the rebuilt grammar is equivalent by
+    // construction. The member keeps a copy for the PD scheduler's proto
+    // fill; passing that lvalue to the by-value sink is exactly one more
+    // copy into the machine's retained identity.
+    req_state.xgrammar_spec = std::move(response_format_spec);
+    req_state.constraint_machine = wrap_xgrammar_machine(
+        req_state.xgrammar_constraint, req_state.xgrammar_spec);
     // A compiled xgrammar constraint without its machine means the build
     // lacks USE_XGRAMMAR support; Sequence would dereference the null
     // machine on its first grammar_id() read. Unreachable through

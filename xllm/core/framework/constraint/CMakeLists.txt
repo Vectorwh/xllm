@@ -15,12 +15,11 @@ set(CONSTRAINT_HDRS draft_validation.h
                     xgrammar_machine.h
                     xgrammar_support.h
 )
-set(CONSTRAINT_DEPS :json_object_grammar :config glog::glog)
+set(CONSTRAINT_DEPS :json_object_grammar :xgrammar_constraint :config glog::glog)
 if(USE_XGRAMMAR)
   # XGrammarConstraintMachine constructs matchers, so it needs the compiled
   # backend; without USE_XGRAMMAR the adapter sources stay out of the build.
   list(APPEND CONSTRAINT_SRCS xgrammar_machine.cpp)
-  list(APPEND CONSTRAINT_DEPS :xgrammar_constraint)
 endif()
 cc_library(
   NAME

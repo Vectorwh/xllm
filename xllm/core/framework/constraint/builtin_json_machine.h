@@ -33,6 +33,7 @@ inline ConstraintSnapshot to_constraint_snapshot(
   out.reasoning_enabled = s.reasoning_enabled;
   out.token_ids = s.token_ids;
   out.invalid = s.invalid;
+  out.grammar_spec = s.grammar_spec;
   return out;
 }
 
@@ -44,6 +45,7 @@ inline JsonObjectGrammarSnapshot to_grammar_snapshot(
   out.reasoning_enabled = s.reasoning_enabled;
   out.token_ids = s.token_ids;
   out.invalid = s.invalid;
+  out.grammar_spec = s.grammar_spec;
   return out;
 }
 

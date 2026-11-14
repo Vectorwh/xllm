@@ -1901,9 +1901,10 @@ TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
       /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
 }
 
-TEST(DisaggPDSchedulerTest, OnlyOversizedDecodeResponseIsTerminal) {
+TEST(DisaggPDSchedulerTest, PermanentConstraintRejectionDoesNotRetry) {
   EXPECT_FALSE(is_permanent_rejection(/*status_code=*/404));
   EXPECT_TRUE(is_permanent_rejection(kDecodeAddNewPromptTooLongStatusCode));
+  EXPECT_TRUE(is_permanent_rejection(kDecodeConstraintRejectedStatusCode));
   EXPECT_FALSE(is_permanent_rejection(/*status_code=*/500));
 }
 

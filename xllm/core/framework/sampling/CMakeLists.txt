@@ -9,6 +9,7 @@ cc_library(
   SRCS
     xgrammar_constraint.cpp
   DEPS
+    :tokenizer
     glog::glog
     torch
     $<$<BOOL:${USE_XGRAMMAR}>:xgrammar>
