@@ -2968,8 +2968,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   ASSERT_EQ(pipe(child_to_parent), 0);
   ScopedSigpipeIgnore sigpipe_guard;
   xllm::tests::ScopedEnvironmentVariable hccl_base_port("HCCL_IF_BASE_PORT");
-  ASSERT_TRUE(
-      hccl_base_port.set(std::to_string(remote_hccl_ports.base_port())));
+  ASSERT_TRUE(hccl_base_port.set(
+      std::to_string(remote_hccl_ports.base_port()).c_str()));
 
   ASSERT_EQ(setenv(kPeerCommandFdEnv,
                    std::to_string(parent_to_child[0]).c_str(),
@@ -3005,7 +3005,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
     _exit(127);
   }
 
-  ASSERT_TRUE(hccl_base_port.set(std::to_string(local_hccl_ports.release())));
+  ASSERT_TRUE(
+      hccl_base_port.set(std::to_string(local_hccl_ports.release()).c_str()));
   local_rpc_ports.release();
 
   unsetenv(kPeerCommandFdEnv);

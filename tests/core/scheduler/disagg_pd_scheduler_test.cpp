@@ -1628,7 +1628,8 @@ TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
           mode == "PULL" ? std::vector{source}
                          : std::vector<KVTransferMapping>{},
           1,
-          0);
+          0,
+          /*prefill_text_withheld=*/false);
     });
     if (mode == "PULL") {
       EXPECT_EQ(started.wait_for(std::chrono::seconds(5)),
