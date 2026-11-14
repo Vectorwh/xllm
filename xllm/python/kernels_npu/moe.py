@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 import torch_npu
 
 from xllm.python.kernels_npu.constants import FRACTAL_NZ_FORMAT
+from xllm.python.kernels_npu.weight_layout import format_cast_nz
 
 # Absolute import (not a relative one): several test suites load this
 # module by file path, where relative imports have no package context.
@@ -36,11 +38,6 @@ from xllm.python.kernels_npu.mxfp import (
 # The installed torch_npu runtime uses 1 for int8. Keep this named instead of
 # using a magic value at the call site.
 _TORCH_INT8_DTYPE = 1
-
-
-def _enable_internal_format() -> None:
-    """Enable private NPU formats before casting grouped-MoE weights."""
-    torch.npu.config.allow_internal_format = True
 
 
 def has_dispatch_ffn_combine() -> bool:
@@ -212,17 +209,10 @@ def prepare_grouped_moe_weights(
     Returns:
         The two weights in the fractal-NZ format the grouped kernels expect.
     """
-    _enable_internal_format()
     return (
-        torch_npu.npu_format_cast(w13, FRACTAL_NZ_FORMAT),
-        torch_npu.npu_format_cast(w2, FRACTAL_NZ_FORMAT),
+        format_cast_nz(w13),
+        format_cast_nz(w2),
     )
-
-
-def format_cast_nz(weight: torch.Tensor) -> torch.Tensor:
-    """Cast a single weight tensor to fractal-NZ format."""
-    _enable_internal_format()
-    return torch_npu.npu_format_cast(weight, FRACTAL_NZ_FORMAT)
 
 
 @torch.library.custom_op("xllm_python::grouped_moe", mutates_args=())
@@ -353,8 +343,7 @@ def _group_gemm(
     return outputs[0]
 
 
-@torch.library.custom_op("xllm_python::grouped_moe_bf16", mutates_args=())
-def grouped_moe_bf16(
+def grouped_moe_bf16_staged(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -363,8 +352,10 @@ def grouped_moe_bf16(
     num_total_experts: int,
     start_expert_id: int,
     num_experts_per_rank: int,
+    before_gmm2: Callable[[], None] | None = None,
+    before_combine: Callable[[], None] | None = None,
 ) -> torch.Tensor:
-    """Run Qwen3.5 BF16 experts with BF16 routing weights and INT32 expert IDs."""
+    """Run BF16 experts, exposing the shared branch's launch milestones."""
     active_expert_range = [
         start_expert_id,
         start_expert_id + num_experts_per_rank,
@@ -395,6 +386,8 @@ def grouped_moe_bf16(
     from xllm.python import kernels as _kernels
 
     activated = _kernels.silu_and_mul(gate_up)
+    if before_gmm2 is not None:
+        before_gmm2()
     expert_output = _group_gemm(
         x=activated,
         weight=w2,
@@ -406,12 +399,49 @@ def grouped_moe_bf16(
         group_list_type=1,
         output_dtype=hidden_states.dtype,
     )
-    local_expert_mask = (topk_ids >= active_expert_range[0]) & (topk_ids < active_expert_range[1])
-    local_topk_weights = topk_weights * local_expert_mask
+    if before_combine is not None:
+        before_combine()
+    has_remote_experts = num_experts_per_rank != num_total_experts
+    if has_remote_experts:
+        # Mode 3 consumes the gather map unchanged and skips -1 routes. The
+        # view is metadata only: row offsets still address the flat FFN buffer.
+        return torch_npu.npu_moe_finalize_routing(
+            expert_output.view(topk_ids.shape[1], hidden_states.shape[0], hidden_states.shape[1]),
+            None,
+            None,
+            None,
+            topk_weights,
+            expanded_row_idx,
+            None,
+            drop_pad_mode=3,
+        )
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=expert_output,
-        sorted_indices=expanded_row_idx.abs(),
-        probs=local_topk_weights,
+        sorted_indices=expanded_row_idx,
+        probs=topk_weights,
+    )
+
+
+@torch.library.custom_op("xllm_python::grouped_moe_bf16", mutates_args=())
+def grouped_moe_bf16(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    num_total_experts: int,
+    start_expert_id: int,
+    num_experts_per_rank: int,
+) -> torch.Tensor:
+    return grouped_moe_bf16_staged(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13,
+        w2,
+        num_total_experts,
+        start_expert_id,
+        num_experts_per_rank,
     )
 
 
@@ -1583,11 +1613,14 @@ def moe_fused_topk(
     """
     if scoring_func != "softmax":
         raise NotImplementedError("NPU moe_fused_topk currently supports softmax routing only")
-    return torch.ops.xllm_ops.moe_gating_top_k_softmax(
+    weights, expert_ids, _ = torch_npu.npu_moe_gating_top_k_softmax_v2(
         gating_output,
-        topk,
-        renormalize,
+        k=topk,
+        finished=None,
+        renorm=1 if renormalize else 0,
+        output_softmax=False,
     )
+    return weights, expert_ids
 
 
 def cutlass_fused_moe(
@@ -1976,6 +2009,8 @@ def _moe_gmm2_combine_fake(
 
 
 __all__ = [
+    "grouped_moe_bf16",
+    "grouped_moe_bf16_staged",
     "ep_moe_bf16_alltoall",
     "ep_moe_w8a8",
     "dequant_swiglu_quant",

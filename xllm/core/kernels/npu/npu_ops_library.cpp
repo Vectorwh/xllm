@@ -76,19 +76,6 @@ std::tuple<torch::Tensor, torch::Tensor> fused_add_gemma_rms_norm_npu(
   return std::make_tuple(normed, residual_sum);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> moe_gating_top_k_softmax_npu(
-    const torch::Tensor& input,
-    int64_t topk,
-    bool normalize) {
-  auto [topk_weights, topk_ids] =
-      xllm::kernel::npu::apply_moe_gating_topk_softmax(
-          input,
-          /*finished=*/std::nullopt,
-          static_cast<int>(topk),
-          normalize);
-  return std::make_tuple(topk_weights.contiguous(), topk_ids.contiguous());
-}
-
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 split_qkv_rmsnorm_mrope_npu(const torch::Tensor& qkvg,
                             const torch::Tensor& q_weight,
@@ -860,9 +847,6 @@ TORCH_LIBRARY(xllm_ops, m) {
       "float eps) -> (Tensor, Tensor)");
   m.def("l2_norm(Tensor input, float eps) -> Tensor");
   m.def(
-      "moe_gating_top_k_softmax(Tensor input, int topk, bool normalize) -> "
-      "(Tensor, Tensor)");
-  m.def(
       "split_qkv_rmsnorm_mrope(Tensor qkvg, Tensor q_weight, Tensor k_weight, "
       "Tensor cos_sin, Tensor gather_pattern, float eps, int num_q_heads, int "
       "num_kv_heads, int head_size) -> (Tensor, Tensor, Tensor, Tensor)");
@@ -1179,8 +1163,6 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("fused_add_gemma_rms_norm",
          TORCH_FN(xllm::fused_add_gemma_rms_norm_npu));
   m.impl("l2_norm", TORCH_FN(xllm::l2_norm_npu));
-  m.impl("moe_gating_top_k_softmax",
-         TORCH_FN(xllm::moe_gating_top_k_softmax_npu));
   m.impl("split_qkv_rmsnorm_mrope",
          TORCH_FN(xllm::split_qkv_rmsnorm_mrope_npu));
   m.impl("chunk_gated_delta_rule", TORCH_FN(xllm::chunk_gated_delta_rule_npu));

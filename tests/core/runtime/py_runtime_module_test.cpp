@@ -23,12 +23,15 @@ limitations under the License.
 #include <chrono>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/state_dict/state_dict.h"
+#include "core/layers/common/attention_metadata.h"
+#include "core/runtime/py_attention_metadata.h"
 #include "core/runtime/py_input_batch.h"
 #include "models/py_model_helper.h"
 #include "platform/npu/device_capture_lock.h"
@@ -177,6 +180,44 @@ TEST_F(PyRuntimeModuleTest, ExposesInputBatchMetadata) {
   EXPECT_EQ(view.attr("num_tokens").cast<int64_t>(), 3);
   EXPECT_EQ(view.attr("num_scheduled_tokens").cast<std::vector<int32_t>>(),
             (std::vector<int32_t>{1, 2}));
+}
+
+TEST_F(PyRuntimeModuleTest,
+       ExposesPreparedLinearStateReadsWithoutModelDispatch) {
+  py::gil_scoped_acquire gil;
+  py::module_::import("torch");
+  ensure_xllm_runtime_module();
+  ModelInputParams params;
+  params.embedding.linear_state_ids = {3};
+  params.embedding.linear_state_read_ids = {2};
+  params.embedding.linear_state_indices = torch::tensor({3}, torch::kInt32);
+  params.embedding.linear_state_read_indices =
+      torch::tensor({2}, torch::kInt32);
+  auto metadata = std::make_shared<layer::AttentionMetadata>();
+  for (bool is_spec_verify : {false, true}) {
+    params.is_spec_verify = is_spec_verify;
+    params.embedding.linear_state_read_indices =
+        params.embedding.linear_state_indices;
+    PyAttentionMetadataView legacy(metadata, params);
+    EXPECT_TRUE(legacy.linear_state_read_indices().is_none());
+
+    params.embedding.linear_state_read_indices =
+        torch::tensor({2}, torch::kInt32);
+    PyAttentionMetadataView prepared(metadata, params);
+    EXPECT_TRUE(
+        prepared.linear_state_read_indices().cast<torch::Tensor>().is_same(
+            params.embedding.linear_state_read_indices));
+    // Equal warmup values must still retain independent graph input buffers.
+    params.embedding.linear_state_read_indices =
+        params.embedding.linear_state_indices.clone();
+    PyAttentionMetadataView warmup(metadata, params);
+    EXPECT_FALSE(warmup.linear_state_read_indices().is_none());
+  }
+  EXPECT_TRUE(params.to(torch::kCPU)
+                  .embedding.linear_state_read_indices.is_same(
+                      params.embedding.linear_state_read_indices));
+  params.clear_linear_attention_state();
+  EXPECT_FALSE(params.embedding.linear_state_read_indices.defined());
 }
 
 TEST_F(PyRuntimeModuleTest, RegistersWeightLoaderAndReadsStateDict) {

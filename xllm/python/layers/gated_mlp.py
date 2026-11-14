@@ -80,5 +80,14 @@ class GatedMLP(nn.Module):
     def process_weights_after_loading(self) -> None:
         self.down_proj.process_weights_after_loading()
 
+    def forward_gate_up(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.gate_up_proj(hidden_states)
+
+    def forward_activation(self, gate_up: torch.Tensor) -> torch.Tensor:
+        return kernels.silu_and_mul(gate_up)
+
+    def forward_down(self, activated: torch.Tensor) -> torch.Tensor:
+        return self.down_proj.forward_local(activated)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(kernels.silu_and_mul(self.gate_up_proj(hidden_states)))
+        return self.down_proj(self.forward_activation(self.forward_gate_up(hidden_states)))

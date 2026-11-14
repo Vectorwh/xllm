@@ -481,7 +481,7 @@ class Qwen3_5GdnMetadataBuilder:
         metadata: AttentionMetadata,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        read_indices, write_indices = resolve_linear_state_io_indices(metadata)
+        read_indices, write_indices = resolve_linear_state_io_indices(metadata, supports_distinct_slots=True)
         if read_indices is None or write_indices is None:
             raise RuntimeError("Qwen3.5 GDN requires read/write state indices")
         if read_indices.dim() != 1 or write_indices.shape != read_indices.shape:

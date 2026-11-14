@@ -108,19 +108,6 @@ def _fused_add_gemma_rms_norm_fake(
     return torch.empty_like(input), torch.empty_like(residual)
 
 
-def _moe_gating_top_k_softmax_fake(
-    input: torch.Tensor,
-    topk: int,
-    normalize: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del normalize
-    output_shape = (*input.shape[:-1], topk)
-    return (
-        input.new_empty(output_shape),
-        input.new_empty(output_shape, dtype=torch.int32),
-    )
-
-
 def _split_qkv_rmsnorm_mrope_fake(
     qkvg: torch.Tensor,
     q_weight: torch.Tensor,
@@ -1435,7 +1422,6 @@ register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::rms_norm_gated", _rms_norm_gated_fake)
 register_fake("xllm_ops::fused_add_gemma_rms_norm", _fused_add_gemma_rms_norm_fake)
 register_fake("xllm_ops::l2_norm", _l2_norm_fake)
-register_fake("xllm_ops::moe_gating_top_k_softmax", _moe_gating_top_k_softmax_fake)
 register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake)
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
 register_fake("xllm_ops::mega_gdn_prefill", _mega_gdn_prefill_fake)

@@ -23,6 +23,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from xllm.python import kernels
 from xllm.python.layers import ColumnParallelLinear, HiddenParallelEmbedding
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.qwen3_5.common import PartialRotaryEmbedding
@@ -487,3 +488,9 @@ class Qwen3_5ForCausalLM(PyModelBase):
             tie_word_embeddings=self.cfg.tie_word_embeddings,
             embed_fallback=True,
         )
+        if self.device.type not in ("npu", "privateuseone") or self.dtype != torch.bfloat16:
+            return
+        # Only the target model requests NZ; MTP keeps its existing load path.
+        self.lm_head.weight.data = kernels.prepare_weights_nz(self.lm_head.weight.data)
+        for layer in self.model.layers:
+            layer.prepare_weights_nz()

@@ -146,3 +146,17 @@ def test_read_indices_require_write_indices() -> None:
 
     with pytest.raises(RuntimeError, match="require write indices"):
         _resolve_linear_state_io_indices(_metadata(None, read_indices, is_prefill=True))
+
+
+@pytest.mark.parametrize("is_spec_verify", [False, True])
+def test_capable_backend_accepts_distinct_decode_slots(is_spec_verify: bool) -> None:
+    from xllm.python.attention.backend import resolve_linear_state_io_indices
+
+    read_indices = torch.tensor([2, 5], dtype=torch.int32)
+    write_indices = torch.tensor([3, 7], dtype=torch.int32)
+    metadata = _metadata(write_indices, read_indices, is_prefill=False, is_spec_verify=is_spec_verify)
+
+    actual_read, actual_write = resolve_linear_state_io_indices(metadata, supports_distinct_slots=True)
+
+    assert actual_read is read_indices
+    assert actual_write is write_indices

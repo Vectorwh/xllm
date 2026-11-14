@@ -312,9 +312,17 @@ PyAttentionMetadataView::PyAttentionMetadataView(
     }
 #endif
   }
+  bool reads_distinct_state = false;
+#if defined(USE_NPU)
+  reads_distinct_state = params.embedding.linear_state_read_indices.defined() &&
+                         !params.embedding.linear_state_read_indices.is_same(
+                             params.embedding.linear_state_indices);
+#endif
   if (!params.embedding.linear_state_read_ids.empty() &&
-      (metadata_->is_prefill || metadata_->is_chunked_prefill) &&
-      params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) {
+      (reads_distinct_state ||
+       ((metadata_->is_prefill || metadata_->is_chunked_prefill) &&
+        params.meta.batch_forward_type.no_decode() &&
+        !params.is_spec_verify))) {
     CHECK(linear_state_indices_.defined());
     CHECK_EQ(params.embedding.linear_state_read_ids.size(),
              params.embedding.linear_state_ids.size());

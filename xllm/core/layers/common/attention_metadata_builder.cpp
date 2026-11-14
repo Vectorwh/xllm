@@ -315,7 +315,8 @@ AttentionMetadata build_attention_metadata(
   if (attn_metadata.kv_cu_seq_lens.defined() &&
       attn_metadata.kv_cu_seq_lens.numel() == params.meta.num_sequences) {
     torch::Tensor kv_seq_lens = attn_metadata.kv_cu_seq_lens.to(torch::kInt32);
-    torch::Tensor kv_cumsum = torch::cumsum(kv_seq_lens, /*dim=*/0);
+    torch::Tensor kv_cumsum =
+        torch::cumsum(kv_seq_lens, /*dim=*/0, torch::kInt32);
     attn_metadata.kv_cu_seq_lens = torch::cat(
         {torch::zeros({1}, kv_seq_lens.options()), kv_cumsum}, /*dim=*/0);
   }

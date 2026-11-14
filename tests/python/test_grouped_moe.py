@@ -36,29 +36,6 @@ def _load_npu_moe_module():
     return module
 
 
-def _load_npu_custom_op_module(monkeypatch: pytest.MonkeyPatch):
-    class RegisteredOpNamespace:
-        def __getattr__(self, _name: str) -> object:
-            return object()
-
-    def ignore_fake_registration(_qualname: str):
-        return lambda fake_impl: fake_impl
-
-    monkeypatch.setattr(
-        torch.ops,
-        "xllm_ops",
-        RegisteredOpNamespace(),
-        raising=False,
-    )
-    monkeypatch.setattr(torch.library, "register_fake", ignore_fake_registration)
-    path = _REPO_ROOT / "xllm/python/kernels_npu/_custom_op.py"
-    spec = importlib.util.spec_from_file_location("pr5_npu_custom_op", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.mark.parametrize("execution_path", ("grouped", "expert", "split"))
 @pytest.mark.parametrize("routing_dtype", (torch.bfloat16, torch.float32))
 def test_grouped_moe_uses_caller_prepared_dtypes(
@@ -268,21 +245,23 @@ def test_selected_expert_moe_rejects_an_invalid_active_range() -> None:
         )
 
 
+@pytest.mark.parametrize("ep_size", (1, 2))
 def test_qwen35_bf16_grouped_moe_uses_native_layout(
     monkeypatch: pytest.MonkeyPatch,
+    ep_size: int,
 ) -> None:
     from xllm.python import kernels
 
     moe = _load_npu_moe_module()
 
     hidden = torch.empty(3, 16, dtype=torch.bfloat16)
-    topk_weights = torch.ones(3, 2, dtype=torch.bfloat16)
-    topk_ids = torch.tensor([[4, 0], [5, 9], [7, 6]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5], [0.75, 0.25]], dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[4, 0], [5, 1], [7, 6]] if ep_size > 1 else [[0, 1], [1, 2], [3, 2]], dtype=torch.int32)
     w13 = torch.empty(4, 16, 32, dtype=torch.bfloat16)
     w2 = torch.empty(4, 16, 16, dtype=torch.bfloat16)
     expanded = torch.empty(6, 16, dtype=torch.bfloat16)
-    row_ids = torch.arange(6, dtype=torch.int32)
-    expert_tokens = torch.tensor([1, 3, 5, 6], dtype=torch.int64)
+    row_ids = torch.tensor([0, -1, 1, -1, 3, 2] if ep_size > 1 else [0, 1, 2, 3, 5, 4], dtype=torch.int32)
+    expert_tokens = torch.tensor([1, 1, 1, 1] if ep_size > 1 else [1, 2, 2, 1], dtype=torch.int64)
     gate_up = torch.cat(
         (
             torch.zeros(6, 16, dtype=torch.bfloat16),
@@ -290,11 +269,37 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
         ),
         dim=-1,
     )
-    expert_output = torch.empty(6, 16, dtype=torch.bfloat16)
-    expected = torch.empty_like(hidden)
+    expert_output = torch.arange(6 * 16, dtype=torch.bfloat16).reshape(6, 16)
+    if ep_size > 1:
+        expected = torch.stack(
+            (expert_output[0] * 0.25, expert_output[1] * 0.5, expert_output[3] * 0.75 + expert_output[2] * 0.25)
+        )
+    else:
+        expected = torch.stack(
+            (
+                expert_output[0] * 0.25 + expert_output[1] * 0.75,
+                expert_output[2] * 0.5 + expert_output[3] * 0.5,
+                expert_output[5] * 0.75 + expert_output[4] * 0.25,
+            )
+        )
+
+    def finalize_reference(*args: object, **kwargs: object) -> torch.Tensor:
+        # CANN FinalizeRoutingV2 mode 3: row_map[token*K+k] is a flat
+        # expanded-row offset; -1 routes contribute zero. Accumulate in FP32.
+        assert kwargs["drop_pad_mode"] == 3
+        expanded, probabilities, indices = args[0], args[4], args[5]
+        assert isinstance(expanded, torch.Tensor)
+        assert isinstance(probabilities, torch.Tensor)
+        assert isinstance(indices, torch.Tensor)
+        gathered = expanded.reshape(-1, 16).index_select(0, indices.clamp_min(0).long())
+        weighted = gathered.float().view(3, 2, 16) * probabilities.float().unsqueeze(-1)
+        weighted.masked_fill_(indices.view(3, 2, 1) < 0, 0)
+        return weighted.sum(dim=1).type_as(expanded)
+
     init_routing = MagicMock(return_value=(expanded, row_ids, expert_tokens, torch.empty(0)))
     group_gemm = MagicMock(side_effect=(gate_up, expert_output))
     token_unpermute = MagicMock(return_value=expected)
+    finalize_routing = MagicMock(side_effect=finalize_reference)
     silu_and_mul = MagicMock(return_value=torch.zeros(6, 16, dtype=torch.bfloat16))
     monkeypatch.setattr(moe, "_group_gemm", group_gemm)
     monkeypatch.setattr(
@@ -308,6 +313,7 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
         token_unpermute,
     )
     monkeypatch.setattr(kernels, "silu_and_mul", silu_and_mul, raising=False)
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_finalize_routing", finalize_routing, raising=False)
 
     with monkeypatch.context() as cast_guard:
         cast_guard.setattr(
@@ -321,13 +327,13 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
             topk_ids,
             w13,
             w2,
-            16,
-            4,
+            4 * ep_size,
+            0 if ep_size == 1 else 4,
             4,
         )
 
-    assert result is expected
-    assert init_routing.call_args.kwargs["active_expert_range"] == [4, 8]
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert init_routing.call_args.kwargs["active_expert_range"] == ([0, 4] if ep_size == 1 else [4, 8])
     assert init_routing.call_args.kwargs["quant_mode"] == -1
     assert group_gemm.call_count == 2
     first_gemm = group_gemm.call_args_list[0].kwargs
@@ -341,10 +347,16 @@ def test_qwen35_bf16_grouped_moe_uses_native_layout(
         second_gemm["x"],
         torch.zeros(6, 16, dtype=torch.bfloat16),
     )
-    torch.testing.assert_close(
-        token_unpermute.call_args.kwargs["probs"],
-        torch.tensor([[1, 0], [1, 0], [1, 1]], dtype=torch.bfloat16),
-    )
+    if ep_size > 1:
+        token_unpermute.assert_not_called()
+        args = finalize_routing.call_args.args
+        assert args[0].shape == (2, 3, 16)
+        assert args[4] is topk_weights and args[5] is row_ids
+        assert finalize_routing.call_args.kwargs["drop_pad_mode"] == 3
+    else:
+        finalize_routing.assert_not_called()
+        assert token_unpermute.call_args.kwargs["probs"] is topk_weights
+        assert token_unpermute.call_args.kwargs["sorted_indices"] is row_ids
 
 
 @pytest.mark.parametrize("routing_dtype", (torch.float32, torch.bfloat16))
@@ -442,10 +454,10 @@ def test_npu_softmax_topk_uses_graph_safe_native_op(
     logits = torch.zeros(2, 4, dtype=torch.bfloat16)
     weights = torch.tensor([[0.3, 0.2], [0.4, 0.1]], dtype=torch.bfloat16)
     expert_ids = torch.tensor([[1, 3], [0, 2]], dtype=torch.int32)
-    native_topk = MagicMock(return_value=(weights, expert_ids))
+    native_topk = MagicMock(return_value=(weights, expert_ids, torch.empty(0)))
     monkeypatch.setattr(
-        torch.ops.xllm_ops,
-        "moe_gating_top_k_softmax",
+        moe.torch_npu,
+        "npu_moe_gating_top_k_softmax_v2",
         native_topk,
         raising=False,
     )
@@ -457,29 +469,9 @@ def test_npu_softmax_topk_uses_graph_safe_native_op(
         "softmax",
     )
 
-    native_topk.assert_called_once_with(logits, 2, renormalize)
+    native_topk.assert_called_once_with(logits, k=2, finished=None, renorm=int(renormalize), output_softmax=False)
     torch.testing.assert_close(actual_weights, weights)
     torch.testing.assert_close(actual_ids, expert_ids)
-
-
-def test_npu_softmax_topk_fake_preserves_bfloat16_dtype(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    custom_op = _load_npu_custom_op_module(monkeypatch)
-    logits = torch.empty((2, 4), dtype=torch.bfloat16, device="meta")
-
-    weights, expert_ids = custom_op._moe_gating_top_k_softmax_fake(
-        logits,
-        topk=2,
-        normalize=True,
-    )
-
-    assert weights.shape == (2, 2)
-    assert weights.dtype == torch.bfloat16
-    assert weights.device.type == "meta"
-    assert expert_ids.shape == (2, 2)
-    assert expert_ids.dtype == torch.int32
-    assert expert_ids.device.type == "meta"
 
 
 def test_grouped_matmul_swiglu_quant_v2_requests_int8_output(
@@ -529,10 +521,13 @@ def test_moe_weight_format_cast_enables_internal_format(
         return weight
 
     monkeypatch.setattr(moe.torch_npu, "npu_format_cast", format_cast)
+    monkeypatch.setattr(moe.torch_npu, "get_npu_format", MagicMock(side_effect=(2, 29)))
 
     weight = torch.empty(2, 4, 8, dtype=torch.int8)
     assert moe.format_cast_nz(weight) is weight
     assert config.allow_internal_format is True
+    assert calls == [(weight, 29)]
+    assert moe.format_cast_nz(weight) is weight
     assert calls == [(weight, 29)]
 
 

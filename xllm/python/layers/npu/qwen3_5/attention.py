@@ -181,6 +181,15 @@ class NpuQwen3_5Attention(nn.Module):
         load_gqa_fused_attention(self, state, context, self.cfg.n_kv_heads)
         self._finish_loading()
 
+    def prepare_weights_nz(self) -> None:
+        """Pack projections after checkpoint loading and Q/G row reordering.
+
+        The target-model load path gates on NPU device and BF16 dtype before
+        calling; the packing itself is unconditional.
+        """
+        self.qkv_proj.weight.data = kernels.prepare_weights_nz(self.qkv_proj.weight.data)
+        self.o_proj.weight.data = kernels.prepare_weights_nz(self.o_proj.weight.data)
+
     def _get_mrope_cos_sin(self, positions: torch.Tensor) -> torch.Tensor:
         context = get_forward_context_or_none()
         if context is None:

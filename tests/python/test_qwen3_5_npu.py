@@ -71,6 +71,7 @@ from xllm.python.model_executor.forward_context import (
     forward_context,
 )
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
+from xllm.python.models import qwen3_5
 from xllm.python.models.qwen3_5 import Qwen3_5Config
 
 kernels.gemma_rms_norm = _gemma_rms_norm
@@ -107,6 +108,61 @@ def _gdn_config(**overrides: object) -> Qwen3_5Config:
     }
     values.update(overrides)
     return _config(**values)
+
+
+@pytest.mark.parametrize("use_moe", [False, True])
+def test_qwen35_nz_preparation_only_selects_npu_bf16_linear_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    use_moe: bool,
+) -> None:
+    monkeypatch.setattr(qwen3_5, "get_qwen3_5_decoder_layer_class", lambda _device: NpuQwen3_5DecoderLayer)
+    cfg = _config(
+        num_hidden_layers=2,
+        layer_types=["full_attention", "linear_attention"],
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        num_experts=4 if use_moe else 0,
+    )
+    model = qwen3_5.Qwen3_5ForCausalLM({**vars(cfg), "device": "cpu", "dtype": "bfloat16"})
+    caster = MagicMock(side_effect=lambda weight: weight.clone())
+    monkeypatch.setattr(kernels, "prepare_weights_nz", caster, raising=False)
+    monkeypatch.setattr(qwen3_5, "load_causal_lm_weights", lambda *args, **kwargs: None)
+    # Shared decoder loading, including MTP, does not request extra NZ casts.
+    for layer in model.model.layers:
+        layer.mlp.process_weights_after_loading()
+    caster.assert_not_called()
+    model.load_weights([], 0, 1)
+    caster.assert_not_called()
+    model.device = torch.device("privateuseone")
+    model.dtype = torch.float16
+    model.load_weights([], 0, 1)
+    caster.assert_not_called()
+
+    model.dtype = torch.bfloat16
+    weights = dict(model.named_parameters())
+    pointers = {weight.data_ptr(): name for name, weight in weights.items()}
+    model.load_weights([], 0, 1)
+    expected = {"lm_head.weight", "model.layers.0.self_attn.qkv_proj.weight", "model.layers.0.self_attn.o_proj.weight"}
+    if use_moe:
+        suffixes = (
+            "experts.gate.weight",
+            "experts.w13",
+            "experts.w2",
+            "shared_expert.gate_up_proj.weight",
+            "shared_expert.down_proj.weight",
+        )
+    else:
+        suffixes = ("gate_up_proj.weight", "down_proj.weight")
+    expected.update(f"model.layers.{layer_id}.mlp.{suffix}" for layer_id in range(2) for suffix in suffixes)
+    assert {pointers[call.args[0].data_ptr()] for call in caster.call_args_list} == expected
+    unchanged = (
+        name
+        for name in weights
+        if name.startswith("model.layers.1.linear_attn.")
+        or name in ("model.embed_tokens.weight", "model.norm.weight", "model.layers.0.mlp.shared_expert_gate.weight")
+    )
+    for name in unchanged:
+        assert pointers[weights[name].data_ptr()] == name
 
 
 def test_npu_decoder_factory_selects_privateuseone_backend() -> None:
@@ -1134,7 +1190,9 @@ def test_npu_moe_uses_direct_ep_when_capacity_exceeds_limit(
 
 
 @pytest.mark.parametrize(("sp", "lv2"), [(False, False), (False, True), (True, False), (True, True)])
-def test_npu_shared_stream_is_initialized_only_for_lv2_sp(monkeypatch: pytest.MonkeyPatch, sp: bool, lv2: bool) -> None:
+def test_npu_shared_stream_is_initialized_for_all_npu_topologies(
+    monkeypatch: pytest.MonkeyPatch, sp: bool, lv2: bool
+) -> None:
     from xllm.python.layers.npu.qwen3_5 import moe as qwen_moe
 
     cfg = _config(tp_size=2, ep_size=2, moe_tp_size=1, sequence_parallel_enabled=sp)
@@ -1149,12 +1207,14 @@ def test_npu_shared_stream_is_initialized_only_for_lv2_sp(monkeypatch: pytest.Mo
 
     block.process_weights_after_loading()
 
-    if sp and lv2:
-        stream_factory.assert_called_once_with(block.experts.w13.device)
-        assert block._shared_stream is stream
-    else:
-        stream_factory.assert_not_called()
-        assert block._shared_stream is None
+    stream_factory.assert_not_called()
+    assert block._shared_stream is None
+    device = torch.device("privateuseone", 0)
+    with monkeypatch.context() as npu_device:
+        npu_device.setattr(torch.Tensor, "device", property(lambda tensor: device))
+        block.process_weights_after_loading()
+    stream_factory.assert_called_once_with(device)
+    assert block._shared_stream is stream
 
 
 def test_npu_lv2_persistent_mask_reaches_mc2_without_active_rows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1695,3 +1755,86 @@ def test_npu_moe_does_not_branch_on_dp_execution_phase(monkeypatch) -> None:
         (2, 3),
         0,
     )
+
+
+@pytest.mark.parametrize("reduce_shared,with_bias", [(False, False), (True, False), (True, True)])
+def test_shared_overlap_preserves_gate_and_reduction_order(
+    monkeypatch: pytest.MonkeyPatch, reduce_shared: bool, with_bias: bool
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from xllm.python.layers.linear import RowParallelLinear
+    from xllm.python.layers.npu.qwen3_5.moe import _SharedExpertExecution
+
+    active = ["main"]
+    operations: list[str] = []
+
+    class Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def wait_stream(self, stream: Stream) -> None:
+            operations.append(f"{self.name} waits {stream.name}")
+
+    main, auxiliary = Stream("main"), Stream("shared")
+
+    @contextmanager
+    def use_stream(stream: Stream) -> Iterator[None]:
+        previous = active[0]
+        active[0] = stream.name
+        yield
+        active[0] = previous
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Stream=Stream, current_stream=lambda device: main, stream=use_stream),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: None)
+    local = torch.tensor([[0.75390625, -1.2734375]], dtype=torch.bfloat16)
+    remote = torch.tensor([[0.3125, 0.70703125]], dtype=torch.bfloat16)
+    gate_input = torch.tensor([[0.703125]], dtype=torch.bfloat16)
+
+    def gate(hidden: torch.Tensor) -> torch.Tensor:
+        assert active[0] == "shared"
+        operations.append("gate")
+        return gate_input
+
+    def gate_up(hidden: torch.Tensor) -> torch.Tensor:
+        operations.append("gate_up")
+        return hidden
+
+    def down(hidden: torch.Tensor) -> torch.Tensor:
+        operations.append("down")
+        return local.clone()
+
+    def reduce(output: torch.Tensor) -> None:
+        assert active[0] == "main"
+        operations.append("reduce")
+        output.add_(remote)
+
+    monkeypatch.setattr(distributed, "tp_all_reduce", reduce)
+    projection = RowParallelLinear(2, 2, 2, bias=with_bias, dtype=torch.bfloat16, reduce_results=reduce_shared)
+    if with_bias:
+        projection.bias.data.fill_(0.25)
+    shared = SimpleNamespace(
+        forward_gate_up=gate_up,
+        forward_activation=lambda hidden: hidden,
+        forward_down=down,
+        down_proj=projection,
+    )
+    block = SimpleNamespace(_shared_stream=auxiliary, shared_expert=shared, shared_expert_gate=gate)
+    execution = _SharedExpertExecution(block, torch.zeros(1, 2, dtype=torch.bfloat16))
+    execution.gate_up()
+    execution.activate()
+    execution.down()
+    result = execution.finish()
+    expected = (local + remote) if reduce_shared else local
+    if with_bias:
+        expected = expected + 0.25
+    expected = expected * torch.sigmoid(gate_input)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert operations.index("gate") < operations.index("down")
+    assert ("reduce" in operations) == reduce_shared

@@ -887,7 +887,7 @@ void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
   reads_distinct_state =
       (is_python_model && is_glm5_next_target_model(args) &&
        params.meta.batch_forward_type.no_decode() && !params.is_spec_verify) ||
-      (!is_python_model && is_qwen_target);
+      is_qwen_target;
 #elif defined(USE_MLU)
   reads_distinct_state = is_glm5_next_target_model(context_.get_model_args()) &&
                          is_prefill && !params.is_spec_verify;
@@ -929,6 +929,14 @@ void WorkerImpl::prepare_linear_state_cache(ModelInputParams& params) {
                              reads_distinct_state,
                              accepted_rows,
                              conv_history_len);
+#if defined(USE_NPU)
+  if (!reads_distinct_state) {
+    // Restore has copied the source state into the live slot. Kernels now
+    // read that slot; keep the original host ids for cache bookkeeping.
+    params.embedding.linear_state_read_indices =
+        params.embedding.linear_state_indices;
+  }
+#endif
 #endif
 }
 

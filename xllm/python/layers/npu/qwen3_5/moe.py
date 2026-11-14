@@ -24,7 +24,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
-from xllm.python.layers.gated_mlp import GatedMLP
 from xllm.python.layers.moe_parallel import (
     Eplv2CommPolicy,
     dp_gather_tokens,
@@ -33,6 +32,8 @@ from xllm.python.layers.moe_parallel import (
     ep_reduce_scatter,
     reduce_and_scatter,
 )
+from xllm.python.kernels_npu.moe import grouped_moe_bf16_staged
+from xllm.python.layers.npu.gated_mlp import NpuGatedMLP
 from xllm.python.layers.npu.mega_moe_metadata import MegaMoeMetadata
 from xllm.python.layers.npu.qwen3_5.moe_metadata import MEGA_MOE_MAX_TOKENS, Qwen3_5MoeMetadata
 from xllm.python.layers.qwen3_5.common import Qwen3_5MoEConfig
@@ -50,6 +51,59 @@ def _pad_token_rows(tensor: torch.Tensor, token_capacity: int) -> torch.Tensor:
     if token_count == token_capacity:
         return tensor.contiguous()
     return F.pad(tensor, (0, 0, 0, token_capacity - token_count))
+
+
+class _SharedExpertExecution:
+    """Launch shared Cube/Vector phases alongside complementary routed work."""
+
+    def __init__(self, block: NpuQwen3_5SparseMoEBlock, hidden: torch.Tensor) -> None:
+        self._block = block
+        self._hidden = hidden
+        self._stream = cast(torch.npu.Stream, block._shared_stream)
+        self._gate_up: torch.Tensor | None = None
+        self._activated: torch.Tensor | None = None
+        self._output: torch.Tensor | None = None
+        self._gate: torch.Tensor | None = None
+
+    def gate_up(self) -> None:
+        current = torch.npu.current_stream(self._hidden.device)
+        stream = self._stream
+        stream.wait_stream(current)
+        self._hidden.record_stream(stream)
+        with torch.npu.stream(stream):
+            self._gate = self._block.shared_expert_gate(self._hidden)
+            self._gate_up = self._block.shared_expert.forward_gate_up(self._hidden)
+
+    def activate(self) -> None:
+        current = torch.npu.current_stream(self._hidden.device)
+        stream = self._stream
+        # Start shared Vector work at routed GMM2, after routed activation.
+        stream.wait_stream(current)
+        with torch.npu.stream(stream):
+            self._activated = self._block.shared_expert.forward_activation(cast(torch.Tensor, self._gate_up))
+            self._gate = torch.sigmoid(cast(torch.Tensor, self._gate))
+
+    def down(self) -> None:
+        current = torch.npu.current_stream(self._hidden.device)
+        stream = self._stream
+        # Keep shared Cube work behind routed GMM2 so it overlaps combine.
+        stream.wait_stream(current)
+        with torch.npu.stream(stream):
+            self._output = self._block.shared_expert.forward_down(cast(torch.Tensor, self._activated))
+
+    def finish(self) -> torch.Tensor:
+        current = torch.npu.current_stream(self._hidden.device)
+        current.wait_stream(self._stream)
+        output = cast(torch.Tensor, self._output)
+        gate = cast(torch.Tensor, self._gate)
+        output.record_stream(current)
+        gate.record_stream(current)
+        # Keep collectives on the caller stream, ordered after routed reductions.
+        # Preserve the original BF16 order: reduce Down first, then apply the
+        # replicated gate. Moving the multiply across all-reduce changes rounding.
+        projection = self._block.shared_expert.down_proj
+        output = projection.forward_reduce(output)
+        return output * gate
 
 
 class _NpuQwen3_5Experts(nn.Module):
@@ -136,6 +190,17 @@ class _NpuQwen3_5Experts(nn.Module):
             raise ValueError("Qwen3.5 EPLv2 communication group must match the expert weight partition")
         self._ep_group_name = group_name
 
+    def prepare_weights_nz(self) -> None:
+        """Pack the router gate and routed expert weights into fractal-NZ.
+
+        Routed experts are BF16 by construction (see ``__init__``), and the
+        target-model load path gates on NPU device and BF16 dtype before
+        calling; the packing itself is unconditional.
+        """
+        self.gate.weight.data = kernels.prepare_weights_nz(self.gate.weight.data)
+        self.w13.data = kernels.prepare_weights_nz(self.w13.data)
+        self.w2.data = kernels.prepare_weights_nz(self.w2.data)
+
     def _require_mega_moe_context(self) -> torch.Tensor:
         context = self._mega_moe_context
         if context is None:
@@ -195,19 +260,38 @@ class _NpuQwen3_5Experts(nn.Module):
             "softmax",
         )
 
-    def _forward_ep_level1(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_ep_level1(
+        self, hidden_states: torch.Tensor, shared_execution: _SharedExpertExecution | None = None
+    ) -> torch.Tensor:
         gathered_states, scatter_state = dp_gather_tokens(hidden_states, self.dp_size, self.dp_rank)
-        topk_weights, topk_ids = self._route(self.gate(gathered_states))
-        output = kernels.grouped_moe_bf16(
-            gathered_states,
-            topk_weights,
-            topk_ids,
-            self.w13,
-            self.w2,
-            self.num_experts,
-            self.start_expert,
-            self.local_experts,
-        )
+        router_logits = self.gate(gathered_states)
+        if shared_execution is not None:
+            shared_execution.gate_up()
+        topk_weights, topk_ids = self._route(router_logits)
+        if shared_execution is not None:
+            output = grouped_moe_bf16_staged(
+                gathered_states,
+                topk_weights,
+                topk_ids,
+                self.w13,
+                self.w2,
+                self.num_experts,
+                self.start_expert,
+                self.local_experts,
+                before_gmm2=shared_execution.activate,
+                before_combine=shared_execution.down,
+            )
+        else:
+            output = kernels.grouped_moe_bf16(
+                gathered_states,
+                topk_weights,
+                topk_ids,
+                self.w13,
+                self.w2,
+                self.num_experts,
+                self.start_expert,
+                self.local_experts,
+            )
         return reduce_and_scatter(
             output,
             scatter_state,
@@ -361,7 +445,7 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
             and cfg.tp_size == cfg.moe_tp_size
             and cfg.tp_size > 1
         )
-        self.shared_expert = GatedMLP(
+        self.shared_expert = NpuGatedMLP(
             cfg.hidden_size,
             cfg.shared_expert_intermediate_size,
             shared_tp_size,
@@ -454,8 +538,15 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
     def process_weights_after_loading(self) -> None:
         self.shared_expert.process_weights_after_loading()
         self.experts.process_weights_after_loading()
-        if self._comm_policy is not None and self._sequence_parallel_enabled:
+        # Shared computation is independent in both SP and non-SP layouts;
+        # forward selects the layout and performs its matching reductions.
+        if self.experts.w13.device.type in ("npu", "privateuseone"):
             self._shared_stream = shared_expert_stream(self.experts.w13.device)
+
+    def prepare_weights_nz(self) -> None:
+        """Pack the shared expert and routed expert weights into fractal-NZ."""
+        self.shared_expert.prepare_weights_nz()
+        self.experts.prepare_weights_nz()
 
     def validate_sp(
         self,
@@ -469,12 +560,23 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
     def _forward_shared_expert(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.shared_expert(hidden) * torch.sigmoid(self.shared_expert_gate(hidden))
 
+    def _forward_opaque_overlap(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        execution = _SharedExpertExecution(self, hidden)
+        execution.gate_up()
+        execution.activate()
+        execution.down()
+        routed = self.experts(hidden)
+        return routed, execution.finish()
+
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._comm_policy is not None and not self._sequence_parallel_enabled:
             layout = SpMetadata.from_execution_rows(hidden.shape[0], self.experts.tp_size, self.experts.tp_rank)
             hidden = sp_shard(hidden, layout)
-            output = self.experts(hidden) + self._forward_shared_expert(hidden)
-            return sp_all_gather(output, layout)
+            if self._shared_stream is not None:
+                routed, shared = self._forward_opaque_overlap(hidden)
+            else:
+                routed, shared = self.experts(hidden), self._forward_shared_expert(hidden)
+            return sp_all_gather(routed + shared, layout)
         if self._sequence_parallel_enabled:
             sp_metadata = cast(SpMetadata, get_execution_context(SpMetadata))
             if self._shared_stream is None:
@@ -491,8 +593,19 @@ class NpuQwen3_5SparseMoEBlock(nn.Module):
                 current.wait_stream(auxiliary)
                 shared.record_stream(current)
         else:
-            routed = self.experts(hidden)
-            shared = self._forward_shared_expert(hidden)
+            if self._shared_stream is not None:
+                # The level-1 route exposes routing, GMM2, and combine milestones.
+                # Opaque MegaMoe owns the whole routed phase, so overlap its
+                # independent shared branch without inventing inner milestones.
+                if self.experts._mega_moe_enabled:
+                    routed, shared = self._forward_opaque_overlap(hidden)
+                else:
+                    execution = _SharedExpertExecution(self, hidden)
+                    routed = self.experts._forward_ep_level1(hidden, execution)
+                    shared = execution.finish()
+            else:
+                routed = self.experts(hidden)
+                shared = self._forward_shared_expert(hidden)
         output = routed + shared
         if self._fused_reductions_enabled:
             distributed.tp_all_reduce(output)

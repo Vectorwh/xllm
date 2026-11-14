@@ -81,6 +81,15 @@ def _runner(model: nn.Module | None = None, max_batch: int = 8, **kwargs: Any) -
     )
 
 
+@pytest.mark.parametrize("lengths", [[], [32768, 32769], [2147483647, 1]])
+def test_generated_cumulative_lengths_use_int32(lengths: list[int]) -> None:
+    values = torch.tensor(lengths, dtype=torch.int32)
+    actual = DecodeAclGraphRunner._cumulative_lengths(values, None)
+    expected = torch.cat((torch.zeros(1, dtype=torch.int64), values.cumsum(0))).to(torch.int32)
+    assert actual.dtype == torch.int32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_draft_consumes_aligned_effective_shapes() -> None:
     width = 3
     runner = _runner(is_spec_draft=True, draft_query_width=width, capture_sizes=(width, 2 * width, 3 * width))

@@ -19,8 +19,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from xllm.python.layers.gated_mlp import GatedMLP
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
+from xllm.python.layers.npu.gated_mlp import NpuGatedMLP
 from xllm.python.layers.npu.layernorm import NpuGemmaRMSNorm
 from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
 from xllm.python.layers.npu.qwen3_5.gated_delta_net import NpuQwen3_5GatedDeltaNet
@@ -96,7 +96,7 @@ class NpuQwen3_5DecoderLayer(nn.Module):
                 comm_policy=comm_policy,
             )
         else:
-            self.mlp = GatedMLP(
+            self.mlp = NpuGatedMLP(
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 cfg.tp_size,
@@ -154,6 +154,16 @@ class NpuQwen3_5DecoderLayer(nn.Module):
             )
         self.mlp.load_weights(weights.with_prefix("mlp."), context)
         self.mlp.process_weights_after_loading()
+
+    def prepare_weights_nz(self) -> None:
+        """Request NZ packing for the target model's NPU weights.
+
+        Only the target model calls this after every layer has loaded; MTP
+        draft models keep the ``process_weights_after_loading`` layout path.
+        """
+        if self.layer_type == "full_attention":
+            self.self_attn.prepare_weights_nz()
+        self.mlp.prepare_weights_nz()
 
     def forward(
         self,

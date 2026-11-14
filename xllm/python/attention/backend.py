@@ -178,6 +178,8 @@ def build_speculative_ssm_state_indices(
 
 def resolve_linear_state_io_indices(
     metadata: AttentionMetadata,
+    *,
+    supports_distinct_slots: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Resolve linear-state read and live/write slots for one forward.
 
@@ -207,7 +209,7 @@ def resolve_linear_state_io_indices(
             f"read={tuple(read_indices.shape)}, write={tuple(write_indices.shape)}"
         )
     is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
-    if not is_prefill or getattr(metadata, "is_spec_verify", False):
+    if not supports_distinct_slots and (not is_prefill or getattr(metadata, "is_spec_verify", False)):
         if not torch.equal(read_indices, write_indices):
             raise RuntimeError("linear-state read/write separation is only supported for non-speculative prefill")
         # Canonicalize equal metadata to one object. Hot-path state users can

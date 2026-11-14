@@ -48,7 +48,7 @@ _EXPORTS = {
         "mega_gdn_mtp_decode",
         "mega_gdn_prefill",
     ),
-    "linear": ("prepare_quant_weight", "prepare_row_parallel_weight"),
+    "linear": ("prepare_quant_weight", "prepare_row_parallel_weight", "prepare_weights_nz"),
     "mla": (
         "deepseek_mla_preprocess_decode",
         "deepseek_mla_preprocess_decode_v2",
@@ -202,6 +202,7 @@ __all__ = [
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",
     "prepare_quant_weight",
+    "prepare_weights_nz",
     "deepseek_mla_preprocess_decode",
     "deepseek_mla_preprocess_decode_v2",
     "has_mla_preprocess_v2",
