@@ -41,8 +41,6 @@ limitations under the License.
 
 namespace xllm::npu::model {
 
-#define PrintTensor(tensor) print_tensor(tensor, #tensor, 10, true, false);
-
 class Qwen2_5_VisionBlockImpl : public torch::nn::Module {
  public:
   Qwen2_5_VisionBlockImpl(const ModelContext& context) {

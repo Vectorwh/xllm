@@ -91,7 +91,6 @@ bool run_batch_inference(const std::string& input_embedding_path,
                          const xllm::RequestParams& sp) {
   std::vector<torch::Tensor> input_embeddings;
   torch::Tensor input_embedding = xllm::load_tensor(input_embedding_path);
-  xllm::print_tensor(input_embedding, "input_embedding", -1, false, false);
   input_embeddings.emplace_back(input_embedding);
   input_embeddings.emplace_back(input_embedding);
   std::vector<std::string> prompts;

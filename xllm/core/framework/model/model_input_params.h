@@ -1186,26 +1186,12 @@ struct ModelInputParams {
               << attention.host.q_seq_lens;
     LOG(INFO) << "ModelInputParams: batch_forward_type is "
               << meta.batch_forward_type.to_string();
-    print_tensor(
-        attention.device.kv_seq_lens, "ModelInputParams: kv_seq_lens", 4);
-    print_tensor(
-        attention.device.q_seq_lens, "ModelInputParams: q_seq_lens", 4);
-    print_tensor(
-        attention.device.q_cu_seq_lens, "ModelInputParams: q_cu_seq_lens", 4);
-    print_tensor(attention.device.new_cache_slots,
-                 "ModelInputParams: new_cache_slots",
-                 4);
-    print_tensor(
-        attention.device.block_tables, "ModelInputParams: block_tables", 4);
     LOG(INFO) << "ModelInputParams: dp_global_token_nums is "
               << parallel.dp_global_token_nums
               << ", dp_is_decode: " << parallel.dp_is_decode;
     LOG(INFO) << "ModelInputParams: is_spec_verify is " << is_spec_verify
               << ", use_dflash_proposal_attention is "
               << use_dflash_proposal_attention;
-    print_tensor(num_accepted_tokens,
-                 "ModelInputParams: num_accepted_tokens",
-                 /*max_elements=*/4);
 
     if (const auto* onerec_xattn = onerec_xattention_params()) {
       LOG(INFO) << "ModelInputParams: has onerec_xattention_params";

@@ -19,11 +19,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <optional>
-#include <source_location>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -88,53 +86,6 @@ inline torch::Tensor load_tensor(std::string filename) {
   torch::IValue x = torch::pickle_load(f);
   torch::Tensor my_tensor = x.toTensor();
   return my_tensor;
-}
-
-inline void print_tensor(
-    const torch::Tensor& tensor,
-    const std::string& tensor_name = "tensor",
-    int num = 10,
-    bool part = true,
-    bool print_value = true,
-    const std::source_location& loc = std::source_location::current()) {
-  auto& log_stream =
-      google::LogMessage(
-          loc.file_name(), static_cast<int>(loc.line()), google::GLOG_INFO)
-          .stream();
-  if (!tensor.defined()) {
-    log_stream << tensor_name << ", Undefined tensor." << std::endl;
-    return;
-  }
-
-  log_stream << tensor_name << ": " << tensor.sizes()
-             << ", dtype: " << tensor.dtype() << ", device: " << tensor.device()
-             << std::endl;
-
-  if (!print_value) {
-    return;
-  }
-
-  if (part) {
-    const auto& flat_tensor = tensor.contiguous().view(-1);
-    int max_elements = std::min(static_cast<int>(flat_tensor.size(0)), num);
-    // const auto& front_elements = flat_tensor.slice(0, 0, max_elements);
-    const auto& front_elements =
-        flat_tensor.slice(0, 0, max_elements).to(torch::kCPU);
-    log_stream << "First " << max_elements << " elements: \n"
-               << front_elements << std::endl;
-
-    int back_num = flat_tensor.size(0) > num ? num : flat_tensor.size(0);
-    // const auto& back_elements = flat_tensor.slice(0, flat_tensor.size(0) -
-    // back_num, flat_tensor.size(0));
-    const auto& back_elements =
-        flat_tensor
-            .slice(0, flat_tensor.size(0) - back_num, flat_tensor.size(0))
-            .to(torch::kCPU);
-    log_stream << "Last " << back_num << " elements: \n"
-               << back_elements << std::endl;
-  } else {
-    log_stream << "All: \n" << tensor.to(torch::kCPU) << std::endl;
-  }
 }
 
 inline bool file_exists(const std::string& path) {
