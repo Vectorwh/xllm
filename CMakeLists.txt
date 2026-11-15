@@ -646,7 +646,7 @@ endif()
 
 if(USE_MUSA)
   add_definitions(-DUSE_MUSA)
-  add_compile_definitions(TORCH_CUDA=1)
+  add_compile_definitions(TORCH_CUDA=1 CCCL_DISABLE_NVFP8_SUPPORT)
   list(APPEND CMAKE_MODULE_PATH "${MUSA_PATH}/cmake")
   find_package(MUSA REQUIRED)
   # MUSA builds use the FlashInfer/Mate TVM-FFI path; MTTOplib is not needed.
@@ -709,6 +709,7 @@ if(USE_MUSA)
       ${MUSA_INCLUDE_DIRS}
       ${TorchMusa_INCLUDE_DIRS}
       ${tvm_ffi_INCLUDE_DIR}
+      ${_PYTHON_PLATLIB}
       ${MUSA_PATH}/include
       ${_TORCH_MUSA_ROOT}/share/torch_musa_codegen
       ${_TORCH_MUSA_ROOT}/share/generated_cuda_compatible/include

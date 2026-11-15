@@ -1,5 +1,16 @@
 include(cc_test)
 
+if(USE_MUSA)
+  cc_test(
+    NAME musa_graph_executor_test
+    SRCS musa_graph_executor_test.cpp
+    DEPS :runtime :cuda_kernels :platform :config torch_musa GTest::gtest_main glog::glog
+    RUN_SERIAL
+  )
+  target_link_libraries(musa_graph_executor_test PRIVATE
+    "$<LINK_GROUP:RESCAN,platform,config,util>")
+endif()
+
 # The host descriptor codec and admission classification need no device setup.
 # Keep their regressions separate from process-global NPU test initialization.
 cc_test(

@@ -23,6 +23,53 @@ namespace xllm {
 namespace weight {
 
 namespace {
+
+constexpr int64_t kBlockFp8Size = 128;
+
+torch::Tensor normalize_fp32_parameter_dtype(torch::Tensor tensor,
+                                             const torch::Tensor& weight) {
+  if (weight.scalar_type() == torch::kFloat32 &&
+      (tensor.scalar_type() == torch::kBFloat16 ||
+       tensor.scalar_type() == torch::kFloat16)) {
+    return tensor.to(torch::kFloat32);
+  }
+  return tensor;
+}
+
+torch::Tensor shard_block_fp8_scale(const torch::Tensor& scale,
+                                    int64_t dim,
+                                    int32_t rank,
+                                    int32_t world_size,
+                                    const std::vector<int64_t>& shard_rows) {
+  CHECK(scale.defined()) << "block-fp8 scale is undefined";
+  CHECK(dim == 0 || dim == 1) << "block-fp8 scale dim must be 0 or 1";
+  CHECK_GT(rank, -1);
+  CHECK_LT(rank, world_size);
+  CHECK(!shard_rows.empty()) << "block-fp8 scale partitions are empty";
+
+  std::vector<torch::Tensor> shards;
+  shards.reserve(shard_rows.size());
+  int64_t offset = 0;
+  for (int64_t rows : shard_rows) {
+    CHECK_GT(rows, 0) << "block-fp8 scale partition must be positive";
+    CHECK_EQ(rows % kBlockFp8Size, 0)
+        << "block-fp8 scale partition " << rows
+        << " is not aligned to block size " << kBlockFp8Size;
+    const int64_t blocks = rows / kBlockFp8Size;
+    CHECK_EQ(blocks % world_size, 0)
+        << "cannot shard " << blocks << " scale blocks across " << world_size
+        << " ranks";
+    const int64_t blocks_per_rank = blocks / world_size;
+    const int64_t start = offset + static_cast<int64_t>(rank) * blocks_per_rank;
+    shards.emplace_back(scale.slice(dim, start, start + blocks_per_rank));
+    offset += blocks;
+  }
+  CHECK_EQ(offset, scale.size(dim))
+      << "block-fp8 scale partitions cover " << offset << " blocks, tensor has "
+      << scale.size(dim);
+  return shards.size() == 1 ? shards.front() : torch::cat(shards, dim);
+}
+
 bool should_relax_quant_vector_shape_check(const std::string& name) {
   return name == "weight_scale" || name == "weight_offset";
 }
@@ -74,6 +121,19 @@ torch::Tensor get_checkpoint_expert_prefix(const torch::Tensor& weight,
 }
 }  // namespace
 
+std::vector<int64_t> block_fp8_scale_shard_sizes(
+    const std::vector<int64_t>& weight_shard_sizes) {
+  std::vector<int64_t> scale_shard_sizes;
+  scale_shard_sizes.reserve(weight_shard_sizes.size());
+  for (int64_t shard_size : weight_shard_sizes) {
+    CHECK_EQ(shard_size % kBlockFp8Size, 0)
+        << "block-fp8 weight shard " << shard_size
+        << " is not aligned to block size " << kBlockFp8Size;
+    scale_shard_sizes.emplace_back(shard_size / kBlockFp8Size);
+  }
+  return scale_shard_sizes;
+}
+
 void load_weight(const StateDict& state_dict,
                  const std::string& name,
                  torch::Tensor& weight,
@@ -81,8 +141,9 @@ void load_weight(const StateDict& state_dict,
   torch::NoGradGuard no_grad;
   const auto tensor = state_dict.get_tensor(name);
   if (tensor.defined()) {
+    const torch::Tensor loaded = normalize_fp32_parameter_dtype(tensor, weight);
     const auto reshaped_tensor =
-        reshape_quant_vector_if_compatible(name, weight, tensor);
+        reshape_quant_vector_if_compatible(name, weight, loaded);
     CHECK(!weight_is_loaded)
         << "weight already loaded, name: " << state_dict.prefix() << name;
     CHECK_EQ(weight.sizes(), reshaped_tensor.sizes())
@@ -129,9 +190,21 @@ void load_sharded_weight(const StateDict& state_dict,
                          int32_t rank,
                          int32_t world_size,
                          torch::Tensor& weight,
-                         bool& weight_is_loaded) {
-  const auto tensor =
-      state_dict.get_sharded_tensor(name, dim, rank, world_size);
+                         bool& weight_is_loaded,
+                         const std::vector<int64_t>* block_fp8_shard_rows) {
+  torch::Tensor tensor =
+      block_fp8_shard_rows == nullptr
+          ? state_dict.get_sharded_tensor(name, dim, rank, world_size)
+          : [&]() {
+              torch::Tensor full = state_dict.get_tensor(name);
+              return full.defined()
+                         ? shard_block_fp8_scale(full,
+                                                 dim,
+                                                 rank,
+                                                 world_size,
+                                                 *block_fp8_shard_rows)
+                         : full;
+            }();
   if (tensor.defined()) {
     const auto reshaped_tensor =
         reshape_quant_vector_if_compatible(name, weight, tensor);
@@ -173,7 +246,9 @@ void load_fused_weight(const StateDict& state_dict,
                        std::vector<torch::Tensor>& accumulated_tensors,
                        torch::Tensor& weight,
                        bool& weight_is_loaded,
-                       int32_t num_kv_head_replicas) {
+                       int32_t num_kv_head_replicas,
+                       const std::vector<int64_t>* block_fp8_shard_rows,
+                       bool block_fp8_scales_are_separate) {
   // return if the weight is already loaded
   if (weight_is_loaded) {
     return;
@@ -186,10 +261,13 @@ void load_fused_weight(const StateDict& state_dict,
                                       rank,
                                       world_size,
                                       accumulated_tensors,
-                                      num_kv_head_replicas);
+                                      num_kv_head_replicas,
+                                      block_fp8_shard_rows,
+                                      block_fp8_scales_are_separate);
 
   if (weight_is_loaded) {
-    const auto merged_weight = torch::cat(accumulated_tensors, /*dim=*/dim);
+    const torch::Tensor merged_weight = normalize_fp32_parameter_dtype(
+        torch::cat(accumulated_tensors, /*dim=*/dim), weight);
     const auto reshaped_weight =
         reshape_quant_vector_if_compatible(name, weight, merged_weight);
     CHECK_EQ(weight.sizes(), reshaped_weight.sizes())
@@ -207,7 +285,9 @@ bool load_tensor_list(const StateDict& state_dict,
                       int32_t rank,
                       int32_t world_size,
                       std::vector<torch::Tensor>& tensors,
-                      int32_t num_kv_head_replicas) {
+                      int32_t num_kv_head_replicas,
+                      const std::vector<int64_t>* block_fp8_shard_rows,
+                      bool block_fp8_scales_are_separate) {
   // resize the accumulated weight list if needed
   if (tensors.size() < prefixes.size()) {
     tensors.resize(prefixes.size());
@@ -234,6 +314,27 @@ bool load_tensor_list(const StateDict& state_dict,
     torch::Tensor tensor;
     if (dim < 0) {
       tensor = state_dict.get_tensor(tensor_name);
+    } else if (block_fp8_shard_rows != nullptr) {
+      tensor = state_dict.get_tensor(tensor_name);
+      if (tensor.defined()) {
+        // The caller specifies the checkpoint layout. Separate tensors each
+        // contain one projection; a fused tensor contains every partition.
+        if (block_fp8_scales_are_separate) {
+          CHECK_LT(i, block_fp8_shard_rows->size())
+              << "missing block-fp8 scale partition for " << tensor_name;
+          tensor = shard_block_fp8_scale(tensor,
+                                         dim,
+                                         tensor_rank,
+                                         tensor_world_size,
+                                         {(*block_fp8_shard_rows)[i]});
+        } else {
+          tensor = shard_block_fp8_scale(tensor,
+                                         dim,
+                                         tensor_rank,
+                                         tensor_world_size,
+                                         *block_fp8_shard_rows);
+        }
+      }
     } else {
       tensor = state_dict.get_sharded_tensor(
           tensor_name, dim, tensor_rank, tensor_world_size);
@@ -555,6 +656,46 @@ void load_merged_weight_v2(const StateDict& state_dict,
   CHECK_EQ(weight.sizes(), reshaped_weight.sizes())
       << "weight size mismatch for " << state_dict.prefix() << name;
   weight.copy_(reshaped_weight);
+  weight_is_loaded = true;
+}
+
+void load_merged_block_fp8_scale(const StateDict& state_dict,
+                                 const std::string& name,
+                                 int64_t dim,
+                                 int32_t rank,
+                                 int32_t world_size,
+                                 int32_t shard_tensor_count,
+                                 const std::vector<int64_t>& full_shard_rows,
+                                 const std::vector<int64_t>& scale_shard_sizes,
+                                 torch::Tensor& weight,
+                                 bool& weight_is_loaded) {
+  if (weight_is_loaded) {
+    return;
+  }
+  const torch::Tensor tensor = state_dict.get_tensor(name);
+  if (!tensor.defined()) {
+    return;
+  }
+  CHECK_EQ(shard_tensor_count, static_cast<int32_t>(full_shard_rows.size()))
+      << "block-fp8 partition count mismatch for " << state_dict.prefix()
+      << name;
+  CHECK_EQ(scale_shard_sizes.size(), full_shard_rows.size())
+      << "block-fp8 scale shard count mismatch for " << state_dict.prefix()
+      << name;
+
+  const torch::Tensor sharded =
+      shard_block_fp8_scale(tensor, dim, rank, world_size, full_shard_rows);
+  int64_t offset = 0;
+  for (int64_t shard_size : scale_shard_sizes) {
+    CHECK_GT(shard_size, 0);
+    offset += shard_size;
+  }
+  CHECK_EQ(offset, sharded.size(dim))
+      << "block-fp8 rank shards do not cover " << state_dict.prefix() << name;
+  const torch::Tensor merged = normalize_fp32_parameter_dtype(sharded, weight);
+  CHECK_EQ(weight.sizes(), merged.sizes())
+      << "block-fp8 scale size mismatch for " << state_dict.prefix() << name;
+  weight.copy_(merged);
   weight_is_loaded = true;
 }
 

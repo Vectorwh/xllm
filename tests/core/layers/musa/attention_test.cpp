@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdlib>
 
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/kernels/musa/musa_ops_api.h"
 #include "core/layers/musa/flashinfer_attention.h"
 
 namespace xllm::layer {
@@ -91,6 +92,44 @@ TEST(MusaAttentionTest, DispatchHonorsCompiledContractAndOverrides) {
         "");
   }
   // These fail before allocating workspace or loading any operator URI.
+  for (const bool prefill : {false, true}) {
+    EXPECT_DEATH(([&] {
+                   const torch::Tensor cu_q = torch::arange(33, torch::kInt32);
+                   const torch::Tensor kv_lens =
+                       torch::ones({32}, torch::kInt32);
+                   const auto get_metadata =
+                       prefill ? kernel::musa::fa3_prefill_scheduler_metadata
+                               : kernel::musa::fa3_decode_scheduler_metadata;
+                   get_metadata(torch::Device(torch::kCPU),
+                                32,
+                                12,
+                                2,
+                                256,
+                                256,
+                                1,
+                                1,
+                                -1,
+                                0,
+                                cu_q,
+                                kv_lens);
+                 }()),
+                 "MUSA FA3 metadata supports at most 31 sequences");
+  }
+  EXPECT_DEATH(
+      ([] {
+        AttentionMetadata metadata;
+        metadata.max_seq_len = 1;
+        torch::Tensor query = torch::zeros({1, 12, 256}, torch::kBFloat16);
+        torch::Tensor key = torch::zeros({1, 2, 256}, torch::kBFloat16);
+        torch::Tensor value = key.clone();
+        torch::Tensor output = torch::empty_like(query);
+        torch::Tensor cache_tensor =
+            torch::zeros({1, 128, 2, 256}, torch::kBFloat16);
+        KVCache cache(KVCacheTensors{cache_tensor, cache_tensor.clone()});
+        FlashInferAttentionImpl attention(12, 256, 0.0625f, 2, -1);
+        attention.forward(metadata, query, key, value, output, cache);
+      }()),
+      "MUSA FA3 paged attention requires --block_size=64");
   EXPECT_DEATH(([] {
                  CHECK_EQ(setenv("XLLM_USE_FA3_DECODE", "0", /*overwrite=*/1),
                           0);

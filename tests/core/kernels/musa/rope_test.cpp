@@ -16,6 +16,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include "core/kernels/musa/mrope.h"
 #include "core/kernels/ops_api.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
@@ -63,6 +64,62 @@ TEST(MusaRopeTest, MatchesReferenceWithAndWithoutKey) {
     } else {
       EXPECT_FALSE(params.k.defined());
     }
+  }
+}
+
+TEST(MusaRopeTest, PartialMropeMatchesReferenceForStridedPositions) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "No MUSA device available";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const torch::Tensor cache =
+      torch::arange(48, torch::kFloat32).view({4, 12}) / 64;
+  const torch::Tensor positions =
+      torch::tensor({{0, 1, 2}, {3, 2, 1}, {1, 0, 3}}, torch::kInt64);
+  const torch::Tensor query =
+      torch::arange(96, torch::kFloat32).view({3, 2, 16}) / 16;
+  const torch::Tensor key = query.slice(/*dim=*/1, 0, 1).clone() + 0.5;
+  for (const bool interleaved : {false, true}) {
+    SCOPED_TRACE(interleaved);
+    const torch::ScalarType dtype =
+        interleaved ? torch::kFloat16 : torch::kBFloat16;
+    const torch::Tensor typed_cache = cache.to(dtype).to(torch::kFloat32);
+    const torch::Tensor padded =
+        torch::zeros({3, 6}, torch::kInt64).to(device.unwrap());
+    torch::Tensor strided_positions = padded.slice(/*dim=*/1, 0, 6, 2);
+    strided_positions.copy_(positions.to(device.unwrap()));
+    torch::Tensor device_query = query.to(dtype).flatten(1).to(device.unwrap());
+    torch::Tensor device_key = key.to(dtype).flatten(1).to(device.unwrap());
+    const auto reference = [&](const torch::Tensor& input) {
+      torch::Tensor expected = input.to(dtype).to(torch::kFloat32);
+      const torch::Tensor source = expected.clone();
+      for (int64_t frequency = 0; frequency < 6; ++frequency) {
+        const int64_t axis = interleaved ? frequency % 3 : frequency / 2;
+        const torch::Tensor rows = typed_cache.index_select(0, positions[axis]);
+        const torch::Tensor cosine = rows.select(1, frequency).unsqueeze(1);
+        const torch::Tensor sine = rows.select(1, frequency + 6).unsqueeze(1);
+        expected.select(2, frequency)
+            .copy_(source.select(2, frequency) * cosine -
+                   source.select(2, frequency + 6) * sine);
+        expected.select(2, frequency + 6)
+            .copy_(source.select(2, frequency + 6) * cosine +
+                   source.select(2, frequency) * sine);
+      }
+      return expected.to(dtype).flatten(1);
+    };
+    musa::partial_mrope_embedding(strided_positions,
+                                  device_query,
+                                  device_key,
+                                  cache.to(dtype).to(device.unwrap()),
+                                  /*head_size=*/16,
+                                  /*rotary_dim=*/12,
+                                  /*mrope_section=*/{2, 2, 2},
+                                  interleaved);
+    EXPECT_TRUE(
+        torch::allclose(device_query.cpu(), reference(query), 0.01, 0.01));
+    EXPECT_TRUE(torch::allclose(device_key.cpu(), reference(key), 0.01, 0.01));
   }
 }
 

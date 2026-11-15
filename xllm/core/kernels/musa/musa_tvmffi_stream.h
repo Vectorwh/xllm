@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/torch.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
@@ -33,8 +34,18 @@ namespace ffi = tvm::ffi;
 
 namespace xllm::kernel::musa {
 
+// The pinned one-warp metadata recipe covers 31 sequences: the last lane
+// supplies the next cu_seqlens_q boundary. Graph padding counts as sequences.
+inline constexpr int64_t kFa3MaxBatchSize = 31;
+// The BF16 paged recipes use TME; other page sizes require LSU recipes.
+inline constexpr int64_t kFa3PagedKvPageSize = 64;
+
 // MATE 0.2.7 metadata consists of four arrays, each padded to a multiple of 4.
 inline int64_t fa3_scheduler_metadata_size(int64_t batch_size) {
+  CHECK_GT(batch_size, 0);
+  CHECK_LE(batch_size, kFa3MaxBatchSize)
+      << "MUSA FA3 metadata supports at most 31 sequences, including graph "
+         "padding; larger batches require multi-warp metadata operators";
   return ((batch_size + 3) / 4) * 16;
 }
 

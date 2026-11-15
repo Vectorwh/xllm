@@ -197,6 +197,23 @@ FlashInferAttentionImpl::forward(const AttentionMetadata& attn_metadata,
   torch::Tensor k_cache = kv_cache.get_k_cache();
   torch::Tensor v_cache = kv_cache.get_v_cache();
 
+  // Validate the compiled paged contract before writing projected K/V.
+  if (k_cache.defined()) {
+    CHECK_EQ(k_cache.dim(), 4);
+    CHECK(v_cache.defined());
+    CHECK_EQ(k_cache.sizes(), v_cache.sizes());
+    CHECK_EQ(k_cache.size(1), xllm::kernel::musa::kFa3PagedKvPageSize)
+        << "MUSA FA3 paged attention requires --block_size=64; other page "
+           "sizes require LSU operators not built by this profile";
+  }
+  if (is_decode || has_cached_prefix) {
+    CHECK(attn_metadata.q_cu_seq_lens.defined());
+    CHECK_LE(attn_metadata.q_cu_seq_lens.numel() - 1,
+             xllm::kernel::musa::kFa3MaxBatchSize)
+        << "MUSA FA3 metadata supports at most 31 sequences, including graph "
+           "padding; larger batches require multi-warp metadata operators";
+  }
+
   // Only reshape and store to cache if k_cache is properly initialized
   // For prefill without KV cache (e.g., LongCat text encoding), skip this step
   if (k_cache.defined() && k_cache.dim() >= 2) {

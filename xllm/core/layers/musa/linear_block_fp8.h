@@ -31,6 +31,8 @@ class StateDict;
 
 namespace xllm::layer::musa {
 
+inline constexpr int64_t kBlockFp8Size = 128;
+
 bool is_block_fp8_quant(const QuantArgs& quant_args);
 
 void check_quantization_supported(
@@ -46,8 +48,14 @@ void maybe_resolve_block_fp8_unquantized(
     const torch::TensorOptions& options,
     torch::Tensor& weight,
     bool& weight_is_loaded,
-    bool weight_scale_inv_is_loaded,
-    bool& block_fp8_resolved_unquantized);
+    bool& weight_scale_inv_is_loaded,
+    bool& block_fp8_resolved_unquantized,
+    const std::vector<torch::Tensor>* accumulated_weights = nullptr);
+
+void check_block_fp8_forward_ready(bool block_fp8_resolved_unquantized,
+                                   bool weight_is_loaded,
+                                   torch::ScalarType weight_dtype,
+                                   bool weight_scale_inv_is_loaded);
 
 void register_block_fp8_parameters(torch::nn::Module& module,
                                    int64_t out_features,

@@ -1,6 +1,15 @@
 include(cc_test)
 
 cc_test(
+  NAME musa_ops_api_test
+  SRCS ops_api_test.cpp
+  DEPS :kernels :platform :config torch_musa GTest::gtest_main glog::glog
+  RUN_SERIAL
+)
+target_link_libraries(musa_ops_api_test PRIVATE
+  "$<LINK_GROUP:RESCAN,platform,config,util>")
+
+cc_test(
   NAME musa_moe_test
   SRCS moe_test.cpp
   DEPS :cuda_kernels :platform :config torch_musa GTest::gtest_main glog::glog

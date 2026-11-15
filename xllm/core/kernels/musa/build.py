@@ -320,6 +320,7 @@ def _build_gdn_operator(recipe: dict[str, Any], library: Path) -> dict[str, Any]
         "seqlen_dtype": torch.int32,
         "accum_dtype": "float32",
     }
+    # CMake supplies its host C++ compiler through CXX, including for export.
     if recipe["kind"] == "gdn_prefill":
         kernel = tilelang_fused_chunk_gdn_prefill(
             **options,
@@ -343,14 +344,18 @@ def _build_gdn_operator(recipe: dict[str, Any], library: Path) -> dict[str, Any]
         raise RuntimeError(f"MUSA operator TIR signature mismatch: {recipe['name']}: {schema}")
     library.parent.mkdir(parents=True, exist_ok=True)
     cached_library = getattr(kernel.adapter, "libpath", None)
-    if cached_library is not None:
+    if cached_library is None:
+        # The TileLang disk cache can fail its atomic rename and still leave
+        # libpath unset. Export straight into the bundle workspace.
+        kernel.adapter.get_exportable_executable().export_library(str(library))
+    else:
         cached_path = Path(cached_library).resolve()
         cache_root = Path(os.environ["TILELANG_CACHE_DIR"]).resolve()
         if not cached_path.is_file() or not cached_path.is_relative_to(cache_root):
             raise RuntimeError(f"TileLang operator is not from this build's compiler cache: {cached_path}")
         shutil.copy2(cached_path, library)
-    else:
-        kernel.adapter.get_exportable_executable().export_library(str(library))
+    if not library.is_file():
+        raise RuntimeError(f"TileLang did not write {library}; cache library was {cached_library}")
     return schema
 
 
@@ -411,7 +416,14 @@ def _build_bundle(output: Path, build: Path, header: Path, jobs: int, check_only
     if not identity["cxx11_abi"]:
         raise RuntimeError("The pinned MUSA operator profile requires the C++11 ABI")
     bundle_id = aot_bundle.bundle_identity(identity)
-    os.environ["TILELANG_CACHE_DIR"] = str(build.resolve() / "tilelang" / bundle_id)
+    cache_dir = build.resolve() / "tilelang" / bundle_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "tmp").mkdir(parents=True, exist_ok=True)
+    os.environ["TILELANG_CACHE_DIR"] = str(cache_dir)
+    # TileLang writes the compiled library here before renaming it into the
+    # cache. The directory is not created by default, so the rename fails and
+    # the operator .so never lands in the bundle.
+    os.environ["TILELANG_TMP_DIR"] = str(cache_dir / "tmp")
     if check_only:
         if not (output / ".build.lock").is_file():
             raise RuntimeError(f"MUSA operator bundle has not been built: {output}")

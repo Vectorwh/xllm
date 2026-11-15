@@ -126,12 +126,6 @@ if(USE_MUSA)
   target_link_libraries(xllm PUBLIC atomic musa_python torch_cpu c10)
 endif()
 
-if(USE_MUSA)
-  target_link_options(xllm PRIVATE
-    "LINKER:--whole-archive,$<TARGET_FILE:runtime>,--no-whole-archive"
-  )
-endif()
-
 # install xllm
 install(TARGETS xllm RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 

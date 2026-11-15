@@ -87,5 +87,12 @@ TEST(StateDictUtilsTest, ReshapesMoeScaleInsidePhysicalExpertPrefix) {
                    torch::tensor({{1, 2}, {3, 4}, {-1, -1}}, torch::kFloat32)));
 }
 
+TEST(StateDictUtilsTest, BlockFp8ScaleShardSizesFollowExactBlockAlignment) {
+  const std::vector<int64_t> scale_sizes =
+      weight::block_fp8_scale_shard_sizes({256, 128, 512});
+  const std::vector<int64_t> expected = {2, 1, 4};
+  EXPECT_EQ(scale_sizes, expected);
+}
+
 }  // namespace
 }  // namespace xllm

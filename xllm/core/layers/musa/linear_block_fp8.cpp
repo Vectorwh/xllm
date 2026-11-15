@@ -28,7 +28,6 @@ namespace xllm::layer::musa {
 
 namespace {
 
-constexpr int64_t kBlockFp8Size = 128;
 constexpr int64_t kMatmulOutputBufMaxRows = 256;
 
 void check_block_fp8_weight_dtype(const torch::Tensor& weight) {
@@ -148,17 +147,50 @@ void maybe_resolve_block_fp8_unquantized(
     const torch::TensorOptions& options,
     torch::Tensor& weight,
     bool& weight_is_loaded,
-    bool weight_scale_inv_is_loaded,
-    bool& block_fp8_resolved_unquantized) {
+    bool& weight_scale_inv_is_loaded,
+    bool& block_fp8_resolved_unquantized,
+    const std::vector<torch::Tensor>* accumulated_weights) {
+  bool checkpoint_has_fp8_weight = false;
+  bool checkpoint_has_unquantized_weight = false;
+  const auto classify_weight = [&](const torch::Tensor& tensor) {
+    if (!tensor.defined()) {
+      return;
+    }
+    check_block_fp8_weight_dtype(tensor);
+    if (c10::isFloat8Type(tensor.scalar_type())) {
+      checkpoint_has_fp8_weight = true;
+    } else {
+      checkpoint_has_unquantized_weight = true;
+    }
+  };
   if (prefixes == nullptr) {
-    check_block_fp8_weight_dtype(state_dict.get_tensor("weight"));
+    classify_weight(state_dict.get_tensor("weight"));
   } else {
     for (const std::string& prefix : *prefixes) {
-      check_block_fp8_weight_dtype(state_dict.get_tensor(prefix + "weight"));
+      classify_weight(state_dict.get_tensor(prefix + "weight"));
     }
   }
+  if (accumulated_weights != nullptr) {
+    for (const torch::Tensor& tensor : *accumulated_weights) {
+      classify_weight(tensor);
+    }
+  }
+  if (weight_is_loaded) {
+    classify_weight(weight);
+  }
+  CHECK(!(checkpoint_has_fp8_weight && checkpoint_has_unquantized_weight))
+      << "MUSA fused linear does not support mixed FP8 and unquantized weights";
+  CHECK(!block_fp8_resolved_unquantized || !checkpoint_has_fp8_weight)
+      << "MUSA linear cannot load FP8 weights after resolving an unquantized "
+         "checkpoint";
 
   if (block_fp8_resolved_unquantized || weight_scale_inv_is_loaded) {
+    return;
+  }
+
+  // An FP8 checkpoint cannot be downgraded before its scale arrives. Only a
+  // genuinely unquantized checkpoint may use the BF16 parameter path.
+  if (checkpoint_has_fp8_weight) {
     return;
   }
 
@@ -178,6 +210,19 @@ void maybe_resolve_block_fp8_unquantized(
   block_fp8_resolved_unquantized = true;
   weight.set_data(torch::empty(weight.sizes(), options));
   weight_is_loaded = false;
+  // A prior quantized load can leave this flag true. The downgraded BF16
+  // weight has no valid scale, so the next forward must not require one.
+  weight_scale_inv_is_loaded = false;
+}
+
+void check_block_fp8_forward_ready(bool block_fp8_resolved_unquantized,
+                                   bool weight_is_loaded,
+                                   torch::ScalarType weight_dtype,
+                                   bool weight_scale_inv_is_loaded) {
+  CHECK(weight_is_loaded) << "weight is required for block-FP8 linear.";
+  CHECK(block_fp8_resolved_unquantized || !c10::isFloat8Type(weight_dtype) ||
+        weight_scale_inv_is_loaded)
+      << "weight_scale_inv is required for block-FP8 linear.";
 }
 
 void register_block_fp8_parameters(torch::nn::Module& module,

@@ -171,6 +171,11 @@ void fa3_decode(const torch::Tensor& query,
   CHECK_GT(batch_size, 0);
   CHECK_EQ(cu_seqlens_q.numel(), batch_size + 1);
   CHECK_EQ(page_table.size(0), batch_size);
+  CHECK_EQ(k_cache.dim(), 4);
+  CHECK_EQ(v_cache.dim(), 4);
+  CHECK_EQ(k_cache.size(1), kFa3PagedKvPageSize)
+      << "MUSA FA3 paged attention requires --block_size=64";
+  CHECK_EQ(k_cache.sizes(), v_cache.sizes());
   const int64_t expected_metadata_size =
       fa3_scheduler_metadata_size(batch_size);
   CHECK_EQ(scheduler_metadata.numel(), expected_metadata_size)
@@ -414,6 +419,8 @@ void fa3_prefill_paged(const torch::Tensor& query,
       << "fa3_prefill_paged: k_cache must be [blocks, page, heads, dim]";
   CHECK_EQ(v_cache.dim(), 4)
       << "fa3_prefill_paged: v_cache must be [blocks, page, heads, dim]";
+  CHECK_EQ(k_cache.size(1), kFa3PagedKvPageSize)
+      << "MUSA FA3 paged attention requires --block_size=64";
   CHECK_EQ(k_cache.sizes(), v_cache.sizes())
       << "fa3_prefill_paged: key/value cache shapes must match";
   CHECK_EQ(query.scalar_type(), torch::kBFloat16)

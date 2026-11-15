@@ -46,13 +46,13 @@ limitations under the License.
 
 namespace xllm::kernel {
 
-namespace {
 #if defined(USE_MUSA)
 namespace gpu_kernels = musa;
 #elif defined(USE_CUDA) || defined(USE_DCU)
 namespace gpu_kernels = cuda;
 #endif
 
+namespace {
 #if defined(USE_NPU)
 bool is_supported_initial_state_dtype(torch::ScalarType dtype) {
   return dtype == torch::kBFloat16 || dtype == torch::kFloat32;
@@ -242,7 +242,37 @@ void active(ActivationParams& params) {
 #elif defined(USE_NPU)
   params.output = npu::active(params.input, params.act_mode);
 #elif defined(USE_MUSA)
-  musa::active(params.output, params.input, params.act_mode, params.is_gated);
+  if (params.is_gated) {
+    musa::active(params.output, params.input, params.act_mode, true);
+    return;
+  }
+  CHECK(params.input.defined()) << "MUSA activation input is undefined";
+  CHECK(params.input.scalar_type() == torch::kFloat16 ||
+        params.input.scalar_type() == torch::kBFloat16 ||
+        params.input.scalar_type() == torch::kFloat32)
+      << "Ungated MUSA activation supports FP16, BF16 and FP32";
+  torch::Tensor output;
+  if (params.act_mode == "silu") {
+    output = torch::silu(params.input);
+  } else if (params.act_mode == "gelu") {
+    output = torch::gelu(params.input);
+  } else if (params.act_mode == "gelu_tanh" ||
+             params.act_mode == "gelu_pytorch_tanh") {
+    output = torch::gelu(params.input, /*approximate=*/"tanh");
+  } else {
+    LOG(FATAL) << "Unsupported ungated MUSA activation: " << params.act_mode;
+  }
+  if (params.output.defined()) {
+    CHECK_EQ(params.output.sizes(), output.sizes())
+        << "MUSA activation output size mismatch";
+    CHECK_EQ(params.output.scalar_type(), output.scalar_type())
+        << "MUSA activation output dtype mismatch";
+    CHECK_EQ(params.output.device(), output.device())
+        << "MUSA activation output device mismatch";
+    params.output.copy_(output);
+  } else {
+    params.output = output;
+  }
 #elif defined(USE_CUDA) || defined(USE_DCU)
   cuda::act_and_mul(params.output, params.input, params.act_mode);
 #elif defined(USE_ILU)
@@ -387,7 +417,47 @@ void fused_layernorm(FusedLayerNormParams& params) {
   if (params.beta.has_value() && params.mode != "layernorm") {
     params.output += params.beta.value();
   }
-#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_DCU)
+#elif defined(USE_MUSA)
+  if (params.mode == "layernorm") {
+    CHECK(params.beta.has_value()) << "LayerNorm requires beta";
+    if (params.residual.has_value() && params.residual_out.has_value() &&
+        params.residual_out->defined() && params.output.defined()) {
+      CHECK(!params.output.is_alias_of(params.residual_out.value()))
+          << "LayerNorm output and residual_out must not share storage";
+    }
+    torch::Tensor norm_input = params.input;
+    if (params.residual.has_value()) {
+      norm_input = params.input + params.residual.value();
+      if (params.residual_out.has_value() && params.residual_out->defined()) {
+        CHECK(params.residual_out->sizes() == norm_input.sizes())
+            << "LayerNorm residual_out size mismatch";
+        params.residual_out->copy_(norm_input);
+      } else {
+        params.residual_out = norm_input;
+      }
+    }
+    torch::Tensor norm_output = torch::layer_norm(norm_input,
+                                                  {params.input.size(-1)},
+                                                  params.weight,
+                                                  params.beta.value(),
+                                                  params.eps);
+    if (params.output.defined()) {
+      CHECK(params.output.sizes() == norm_output.sizes())
+          << "LayerNorm output size mismatch";
+      params.output.copy_(norm_output);
+    } else {
+      params.output = norm_output;
+    }
+  } else if (params.residual.has_value()) {
+    gpu_kernels::fused_add_rms_norm(
+        params.input, params.residual.value(), params.weight, params.eps);
+    params.output = params.input;
+    params.residual_out = params.residual;
+  } else {
+    gpu_kernels::rms_norm(
+        params.output, params.input, params.weight, params.eps);
+  }
+#elif defined(USE_CUDA) || defined(USE_DCU)
   if (params.residual.has_value()) {
     gpu_kernels::fused_add_rms_norm(
         params.input, params.residual.value(), params.weight, params.eps);

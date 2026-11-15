@@ -20,7 +20,9 @@ limitations under the License.
 #include <cmath>
 #include <tuple>
 
+#include "core/kernels/musa/mrope.h"
 #include "core/kernels/musa/musa_ops_api.h"
+#include "core/layers/musa/linear_block_fp8.h"
 #include "core/util/env_var.h"
 
 namespace xllm {
@@ -162,6 +164,17 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const torch::Tensor& mrope_cos_sin) {
+  const bool use_mrope = !mrope_section_.empty() && positions.dim() == 2;
+  if (use_mrope) {
+    CHECK_EQ(positions.size(0), 3) << "MRoPE requires three position axes";
+    CHECK_EQ(positions.size(1), hidden_states.size(0));
+  } else {
+    CHECK_EQ(positions.dim(), 1)
+        << "Ordinary RoPE requires one position per token; three-axis "
+           "positions "
+           "require mrope_section in the model configuration";
+    CHECK_EQ(positions.size(0), hidden_states.size(0));
+  }
   torch::Tensor qkv = qkv_proj_->forward(hidden_states);
   if (use_fused_qkv_) {
     torch::Tensor q_flat;
@@ -253,7 +266,21 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
       auto k_3d = k.view({T, num_kv_heads_, head_dim_});
       k = std::get<0>(k_norm_->forward(k_3d)).view({T, kv_size_});
 
-      rotary_emb_->forward(positions, q, k);
+      // Multimodal positions contain temporal, height and width rows. The
+      // ordinary partial rotary kernel consumes one position per token.
+      if (use_mrope) {
+        xllm::kernel::musa::partial_mrope_embedding(
+            positions,
+            q,
+            k,
+            rotary_emb_->get_cos_sin_cache(),
+            head_dim_,
+            rotary_dim_,
+            mrope_section_,
+            is_interleaved_);
+      } else {
+        rotary_emb_->forward(positions, q, k);
+      }
     }
   }
   torch::Tensor out =
@@ -271,19 +298,60 @@ void Qwen3NextAttentionImpl::load_state_dict(const StateDict& state_dict) {
 
   if (attn_output_gate_ && qkv_proj_->is_weight_loaded() &&
       !qkv_weight_reordered_) {
-    // Rearrange q_proj rows from per-head interleaved [q0,g0,q1,g1,...]
-    // to grouped [q0,q1,...,g0,g1,...] so forward output is [Q|G|K|V].
-    auto w = qkv_proj_->weight();
-    auto qg_rows = w.slice(0, 0, q_size_ * 2);
-    const int64_t hidden = w.size(1);
-    auto qg_3d = qg_rows.view({num_heads_, 2 * head_dim_, hidden});
-    auto q_part = qg_3d.slice(1, 0, head_dim_);
-    auto g_part = qg_3d.slice(1, head_dim_, 2 * head_dim_);
-    auto reordered = torch::cat(
-        {q_part.reshape({q_size_, hidden}), g_part.reshape({q_size_, hidden})},
-        0);
-    qg_rows.copy_(reordered);
-    qkv_weight_reordered_ = true;
+    // Scale storage exists as soon as the FP8 parameter is registered, but
+    // its checkpoint values can arrive in a later call. Reordering the rows
+    // before that is not idempotent, so wait until the real FP8 weight and
+    // its scale are both loaded. Keep loading the other tensors below.
+    torch::Tensor scale_inv = qkv_proj_->weight_scale_inv();
+    const bool weight_is_fp8 =
+        c10::isFloat8Type(qkv_proj_->weight().scalar_type());
+    const bool needs_block_fp8_scale =
+        weight_is_fp8 && scale_inv.defined() && scale_inv.numel() > 0;
+    const bool scale_ready =
+        !needs_block_fp8_scale || qkv_proj_->is_weight_scale_inv_loaded();
+    if (scale_ready) {
+      // Rearrange q_proj rows from per-head interleaved [q0,g0,q1,g1,...]
+      // to grouped [q0,q1,...,g0,g1,...] so forward output is [Q|G|K|V].
+      auto w = qkv_proj_->weight();
+      const int64_t blocks_per_head = head_dim_ / musa::kBlockFp8Size;
+      const int64_t qg_blocks = num_heads_ * 2 * blocks_per_head;
+      if (needs_block_fp8_scale) {
+        CHECK_EQ(head_dim_ % musa::kBlockFp8Size, 0)
+            << "Q/G scale reorder requires head_dim % 128 == 0";
+        CHECK_EQ(scale_inv.dim(), 2)
+            << "Q/G block-FP8 scales must be a two-dimensional block grid";
+        CHECK_GE(scale_inv.size(0), qg_blocks)
+            << "Q/G block-FP8 scales have fewer rows than the query/gate "
+               "blocks";
+        CHECK_EQ(scale_inv.size(1),
+                 (w.size(1) + musa::kBlockFp8Size - 1) / musa::kBlockFp8Size)
+            << "Q/G block-FP8 scale columns must cover the weight input blocks";
+      }
+      auto qg_rows = w.slice(0, 0, q_size_ * 2);
+      const int64_t hidden = w.size(1);
+      auto qg_3d = qg_rows.view({num_heads_, 2 * head_dim_, hidden});
+      auto q_part = qg_3d.slice(1, 0, head_dim_);
+      auto g_part = qg_3d.slice(1, head_dim_, 2 * head_dim_);
+      auto reordered = torch::cat({q_part.reshape({q_size_, hidden}),
+                                   g_part.reshape({q_size_, hidden})},
+                                  0);
+      qg_rows.copy_(reordered);
+      // The FP8 scale blocks must follow the same Q/G row permutation as the
+      // checkpoint weights, otherwise each row uses another head's scale.
+      if (needs_block_fp8_scale) {
+        torch::Tensor scale_rows = scale_inv.slice(/*dim=*/0, 0, qg_blocks);
+        torch::Tensor scale_heads = scale_rows.view(
+            {num_heads_, 2 * blocks_per_head, scale_inv.size(1)});
+        torch::Tensor q_scales =
+            scale_heads.slice(/*dim=*/1, 0, blocks_per_head)
+                .reshape({num_heads_ * blocks_per_head, scale_inv.size(1)});
+        torch::Tensor gate_scales =
+            scale_heads.slice(/*dim=*/1, blocks_per_head, 2 * blocks_per_head)
+                .reshape({num_heads_ * blocks_per_head, scale_inv.size(1)});
+        scale_rows.copy_(torch::cat({q_scales, gate_scales}, /*dim=*/0));
+      }
+      qkv_weight_reordered_ = true;
+    }
   }
 
   o_proj_->load_state_dict(state_dict.get_dict_with_prefix("o_proj."));

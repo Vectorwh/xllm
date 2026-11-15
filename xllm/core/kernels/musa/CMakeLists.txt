@@ -95,8 +95,10 @@ include_directories(${CMAKE_CURRENT_LIST_DIR}/../cuda/moe)
 
 set(_TORCH_MUSA_KERNEL_HDRS
   musa_ops_api.h
+  musa_ops_library.h
   musa_tvmffi_stream.h
   gdn_ops.h
+  mrope.h
   llm_decode_metadata_update.h
   ${CMAKE_CURRENT_LIST_DIR}/../cuda/moe/moe_topk.cuh
   ${CMAKE_CURRENT_LIST_DIR}/../cuda/moe/moe_topk_sigmoid_kernels.cuh
@@ -111,10 +113,12 @@ set(_TORCH_MUSA_KERNEL_SRCS
   gemma_norm.cu
   activation.cu
   rope.cu
+  mrope.cu
   gdn_state_commit.cu
   ../cuda/block_copy.cu
   ../cuda/norm.cu
   ../cuda/reshape_paged_cache.cu
+  musa_ops_library.cpp
   ../cuda/moe/moe_fused_topk.cu
   random_sample.cpp
   rejection_sample.cu
@@ -166,4 +170,3 @@ target_include_directories(cuda_kernels BEFORE PRIVATE
   "$<TARGET_PROPERTY:xllm_musa_ops,INTERFACE_INCLUDE_DIRECTORIES>")
 target_compile_options(cuda_kernels PRIVATE
   "$<$<COMPILE_LANGUAGE:CUDA>:${_XLLM_MUSIFY_COPTS}>")
-

@@ -179,15 +179,19 @@ struct IndexedTensorSnapshot {
 
 torch::Tensor get_linear_state_snapshot_indices(const ModelInputParams& params,
                                                 const torch::Device& device) {
+  torch::Tensor indices;
   if (params.embedding.linear_state_indices.defined()) {
-    return params.embedding.linear_state_indices.to(
+    indices = params.embedding.linear_state_indices.to(
+        torch::TensorOptions().dtype(torch::kLong).device(device));
+  } else {
+    CHECK(!params.embedding.linear_state_ids.empty())
+        << "MUSA graph capture requires linear state ids";
+    indices = torch::tensor(
+        params.embedding.linear_state_ids,
         torch::TensorOptions().dtype(torch::kLong).device(device));
   }
-  CHECK(!params.embedding.linear_state_ids.empty())
-      << "MUSA graph capture requires linear state ids";
-  return torch::tensor(
-      params.embedding.linear_state_ids,
-      torch::TensorOptions().dtype(torch::kLong).device(device));
+  // Padding rows do not own convolution or recurrent state.
+  return indices.masked_select(indices.ge(0));
 }
 
 std::vector<IndexedTensorSnapshot> snapshot_linear_attention_state(
@@ -253,8 +257,8 @@ MusaGraphPersistentParam::MusaGraphPersistentParam(
       {max_tokens_per_batch}, torch::dtype(torch::kInt).device(device));
   persistent_new_cache_slots_ = torch::zeros(
       {max_tokens_per_batch}, torch::dtype(torch::kInt).device(device));
-  persistent_linear_state_indices_ = torch::zeros(
-      {max_seqs_per_batch}, torch::dtype(torch::kInt).device(device));
+  persistent_linear_state_indices_ = torch::full(
+      {max_seqs_per_batch}, -1, torch::dtype(torch::kInt).device(device));
   persistent_kv_cache_tokens_nums_ = torch::zeros(
       {max_seqs_per_batch}, torch::dtype(torch::kInt).device(device));
   persistent_num_accepted_tokens_ = torch::ones(
@@ -530,12 +534,26 @@ std::optional<ModelInputParams> MusaGraphPersistentParam::update(
           ? std::min<int64_t>(params.num_accepted_tokens.numel(),
                               persistent_num_accepted_tokens_.numel())
           : 0;
-  const int64_t linear_state_batch_size =
-      params.embedding.linear_state_indices.defined()
-          ? std::min<int64_t>(params.embedding.linear_state_indices.numel(),
-                              persistent_linear_state_indices_.numel())
-          : std::min<int64_t>(params.embedding.linear_state_ids.size(),
-                              persistent_linear_state_indices_.numel());
+  const bool has_linear_state =
+      params.embedding.linear_state_indices.defined() ||
+      !params.embedding.linear_state_ids.empty();
+  const bool pad_linear_state = params.meta.batch_forward_type.is_decode() &&
+                                !params.is_spec_verify &&
+                                !is_rec_multi_round_mode();
+  const int64_t linear_state_rows = pad_linear_state && padded_num_tokens > 0
+                                        ? padded_num_tokens
+                                        : actual_batch_size;
+  if (has_linear_state && !is_rec_multi_round_mode()) {
+    CHECK_GE(linear_state_rows, actual_batch_size);
+    CHECK_GE(persistent_linear_state_indices_.numel(), linear_state_rows)
+        << "Linear state graph bucket exceeds persistent capacity";
+    const int64_t source_rows =
+        params.embedding.linear_state_indices.defined()
+            ? params.embedding.linear_state_indices.numel()
+            : static_cast<int64_t>(params.embedding.linear_state_ids.size());
+    CHECK_GE(source_rows, actual_batch_size)
+        << "Linear state indices must contain one value per active sequence";
+  }
 
   const bool use_llm_decode_fast_path = can_use_llm_decode_fast_path(
       tokens, positions, params, attn_metadata->fa3_metadata);
@@ -585,12 +603,10 @@ std::optional<ModelInputParams> MusaGraphPersistentParam::update(
       params_for_capture->embedding.input_embedding =
           persistent_embedding(padded_num_tokens);
     }
-    if (!params.embedding.linear_state_ids.empty()) {
-      params_for_capture->embedding.linear_state_ids =
-          params.embedding.linear_state_ids;
+    if (has_linear_state && !is_rec_multi_round_mode()) {
       params_for_capture->embedding.linear_state_indices =
           persistent_linear_state_indices(
-              static_cast<uint32_t>(linear_state_batch_size));
+              static_cast<uint32_t>(linear_state_rows));
     }
     if (params.attention.device.kv_cache_tokens_nums.defined()) {
       params_for_capture->attention.device.kv_cache_tokens_nums =
@@ -730,20 +746,28 @@ std::optional<ModelInputParams> MusaGraphPersistentParam::update(
         persistent_new_cache_slots(slot_mapping_tokens);
   }
 
-  if (!is_rec_multi_round_mode() &&
-      !params.embedding.linear_state_ids.empty()) {
+  if (!is_rec_multi_round_mode() && has_linear_state) {
+    torch::Tensor live_indices = persistent_linear_state_indices_.narrow(
+        /*dim=*/0, /*start=*/0, /*length=*/actual_batch_size);
     if (params.embedding.linear_state_indices.defined()) {
-      persistent_linear_state_indices_
-          .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_state_batch_size)
-          .copy_(params.embedding.linear_state_indices.slice(
-                     /*dim=*/0, /*start=*/0, /*end=*/linear_state_batch_size),
-                 /*non_blocking=*/true);
+      live_indices.copy_(
+          params.embedding.linear_state_indices.narrow(
+              /*dim=*/0, /*start=*/0, /*length=*/actual_batch_size),
+          /*non_blocking=*/true);
     } else {
+      live_indices.copy_(
+          torch::tensor(params.embedding.linear_state_ids, torch::kInt)
+              .narrow(/*dim=*/0, /*start=*/0, /*length=*/actual_batch_size)
+              .to(device_),
+          /*non_blocking=*/true);
+    }
+    if (linear_state_rows > actual_batch_size) {
+      // Replay retains the captured bucket shape, not the current live view.
       persistent_linear_state_indices_
-          .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_state_batch_size)
-          .copy_(torch::tensor(params.embedding.linear_state_ids, torch::kInt)
-                     .to(device_),
-                 /*non_blocking=*/true);
+          .narrow(/*dim=*/0,
+                  /*start=*/actual_batch_size,
+                  /*length=*/linear_state_rows - actual_batch_size)
+          .fill_(-1);
     }
   }
 
@@ -1106,8 +1130,8 @@ bool MusaGraph::capture(CausalLM* model,
   torch::Tensor linear_state_snapshot_indices;
   std::vector<IndexedTensorSnapshot> linear_state_snapshots;
   if (snapshot_linear_state) {
-    linear_state_snapshot_indices =
-        get_linear_state_snapshot_indices(params, persistent_param_.device());
+    linear_state_snapshot_indices = get_linear_state_snapshot_indices(
+        graph_params_opt.value(), persistent_param_.device());
     linear_state_snapshots = snapshot_linear_attention_state(
         kv_cache, linear_state_snapshot_indices);
   }

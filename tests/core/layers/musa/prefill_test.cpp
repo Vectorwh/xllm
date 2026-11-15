@@ -17,14 +17,153 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <limits>
+#include <string>
+#include <unordered_map>
+#include <utility>
 
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/state_dict/state_dict.h"
 #include "core/layers/musa/flashinfer_attention.h"
+#include "core/layers/musa/qwen3_next_attention.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 
 namespace xllm::layer {
 namespace {
+
+TEST(MusaPrefillTest, LoadsCheckpointShardsWithoutPrematureQgReorder) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "No MUSA device available";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  ProcessGroup group(/*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &group);
+  parallel.tp_group_ = &group;
+  ModelArgs args;
+  args.n_heads(12);
+  args.n_kv_heads(2);
+  args.head_dim(256);
+  args.hidden_size(256);
+  args.max_position_embeddings(128);
+  args.attn_output_gate(true);
+  args.partial_rotary_factor(0.25f);
+  QuantArgs quant;
+  quant.quant_method(kQuantMethodFp8);
+  quant.weight_block_size() = {128, 128};
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+  const torch::Tensor q =
+      (torch::floor(torch::arange(6144, torch::kFloat32) / 256) / 4)
+          .unsqueeze(1)
+          .expand({6144, 256})
+          .to(torch::kFloat8_e4m3fn)
+          .to(torch::kFloat32);
+  const torch::Tensor kv = torch::ones({512, 256}, torch::kFloat32);
+  const torch::Tensor q_scale =
+      torch::arange(96, torch::kFloat32).view({48, 2}) + 1;
+  const StateDict scales({{"q_proj.weight_scale_inv", q_scale},
+                          {"k_proj.weight_scale_inv", torch::ones({4, 2})},
+                          {"v_proj.weight_scale_inv", torch::full({4, 2}, 2)}});
+  const torch::Tensor expected_q = torch::cat(
+      {q.view({12, 512, 256}).slice(1, 0, 256).reshape({3072, 256}),
+       q.view({12, 512, 256}).slice(1, 256, 512).reshape({3072, 256})},
+      0);
+  const torch::Tensor expected_scale =
+      torch::cat({q_scale.view({12, 4, 2}).slice(1, 0, 2).reshape({24, 2}),
+                  q_scale.view({12, 4, 2}).slice(1, 2, 4).reshape({24, 2})},
+                 0);
+  // Weight-first FP8, scale-first FP8, and a BF16 checkpoint in FP8 config.
+  for (const int32_t scenario : {0, 1, 2}) {
+    SCOPED_TRACE(scenario);
+    Qwen3NextAttentionImpl attention(args, quant, parallel, options, 0);
+    const torch::ScalarType dtype =
+        scenario == 2 ? torch::kBFloat16 : torch::kFloat8_e4m3fn;
+    const StateDict weights({{"q_proj.weight", q.to(dtype)},
+                             {"k_proj.weight", kv.to(dtype)},
+                             {"v_proj.weight", kv.to(dtype)}});
+    const StateDict& first = scenario == 1 ? scales : weights;
+    std::unordered_map<std::string, torch::Tensor> first_shard(first.begin(),
+                                                               first.end());
+    first_shard.emplace("o_proj.weight", torch::full({256, 3072}, 3, options));
+    first_shard.emplace("q_norm.weight", torch::full({256}, 4, options));
+    first_shard.emplace("k_norm.weight", torch::full({256}, 5, options));
+    attention.load_state_dict(StateDict(std::move(first_shard)));
+    auto named = attention.named_parameters();
+    EXPECT_TRUE(torch::equal(named["o_proj.weight"],
+                             torch::full({256, 3072}, 3, options)));
+    EXPECT_TRUE(
+        torch::equal(named["q_norm.weight"], torch::full({256}, 4, options)));
+    EXPECT_TRUE(
+        torch::equal(named["k_norm.weight"], torch::full({256}, 5, options)));
+    if (scenario == 0) {
+      EXPECT_TRUE(torch::equal(
+          named["qkv_proj.weight"].slice(0, 0, 6144).to(torch::kFloat32), q));
+    }
+    attention.load_state_dict(scenario == 1 ? weights : scales);
+    attention.load_state_dict(weights);
+    attention.load_state_dict(scales);
+    named = attention.named_parameters();
+    EXPECT_EQ(named["qkv_proj.weight"].scalar_type(), dtype);
+    EXPECT_TRUE(torch::equal(
+        named["qkv_proj.weight"].slice(0, 0, 6144).to(torch::kFloat32),
+        expected_q));
+    EXPECT_TRUE(torch::equal(
+        named["qkv_proj.weight"].slice(0, 6144).to(torch::kFloat32),
+        torch::cat({kv, kv}, 0)));
+    if (scenario != 2) {
+      EXPECT_TRUE(torch::equal(
+          named["qkv_proj.weight_scale_inv"].slice(0, 0, 48), expected_scale));
+    }
+  }
+  for (const bool split_shards : {false, true}) {
+    EXPECT_DEATH(
+        ([&] {
+          Qwen3NextAttentionImpl attention(args, quant, parallel, options, 0);
+          const StateDict q_weight(
+              {{"q_proj.weight", q.to(torch::kFloat8_e4m3fn)}});
+          if (split_shards) {
+            attention.load_state_dict(q_weight);
+            attention.load_state_dict(
+                StateDict({{"k_proj.weight", kv.to(torch::kBFloat16)}}));
+          } else {
+            attention.load_state_dict(
+                StateDict({{"q_proj.weight", q.to(torch::kFloat8_e4m3fn)},
+                           {"k_proj.weight", kv.to(torch::kBFloat16)}}));
+          }
+        }()),
+        "mixed FP8 and unquantized weights");
+  }
+}
+
+TEST(MusaPrefillTest, ThreeAxisPositionsRequireMropeConfiguration) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "No MUSA device available";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  ProcessGroup group(/*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &group);
+  parallel.tp_group_ = &group;
+  ModelArgs args;
+  args.n_heads(12);
+  args.n_kv_heads(2);
+  args.head_dim(256);
+  args.hidden_size(256);
+  args.max_position_embeddings(128);
+  args.partial_rotary_factor(0.25f);
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+  Qwen3NextAttentionImpl attention(args, QuantArgs(), parallel, options, 0);
+  AttentionMetadata metadata;
+  KVCache cache;
+  EXPECT_DEATH(attention.forward(torch::zeros({3, 1}, torch::kInt64),
+                                 torch::zeros({1, 256}, options),
+                                 metadata,
+                                 cache,
+                                 torch::Tensor()),
+               "require mrope_section in the model configuration");
+}
 
 TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
   if (Platform::device_count() == 0) {

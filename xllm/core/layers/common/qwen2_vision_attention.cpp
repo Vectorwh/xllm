@@ -26,6 +26,7 @@ limitations under the License.
 #endif
 #include "kernels/ops_api.h"
 #include "layers/common/attention_metadata.h"
+#include "platform/platform.h"
 namespace xllm {
 namespace layer {
 
@@ -124,8 +125,7 @@ int32_t Qwen2VisionAttentionImpl::get_max_sequence_length(
 
 namespace {
 
-#if defined(USE_CUDA) || defined(USE_DCU)
-// Pure PyTorch scaled dot-product attention for Qwen2 vision.
+#if defined(USE_MUSA) || defined(USE_CUDA) || defined(USE_DCU)
 void compute_qwen2_vision_attention_torch(
     torch::Tensor& q,
     torch::Tensor& k,
@@ -133,38 +133,50 @@ void compute_qwen2_vision_attention_torch(
     torch::Tensor& output,
     const std::vector<int32_t>& cu_seq_len_vec,
     float scale) {
-  if (cu_seq_len_vec.size() < 2) return;
+  if (cu_seq_len_vec.size() < 2) {
+    return;
+  }
 
   const int32_t num_seqs = static_cast<int32_t>(cu_seq_len_vec.size()) - 1;
   for (int32_t i = 0; i < num_seqs; ++i) {
     int32_t start = cu_seq_len_vec[i];
     int32_t end = cu_seq_len_vec[i + 1];
     int32_t len = end - start;
-    if (len <= 0) continue;
+    if (len <= 0) {
+      continue;
+    }
 
-    // Current sequence: [len, heads, head_dim]
-    auto q_i = q.slice(/*dim=*/0, /*start=*/start, /*end=*/end);
-    auto k_i = k.slice(0, start, end);
-    auto v_i = v.slice(0, start, end);
+    // Current sequence: [len, H, D] -> [H, len, D]
+    const torch::Tensor q_i =
+        q.slice(/*dim=*/0, /*start=*/start, /*end=*/end).permute({1, 0, 2});
+    const torch::Tensor k_i =
+        k.slice(/*dim=*/0, /*start=*/start, /*end=*/end).permute({1, 0, 2});
+    const torch::Tensor v_i =
+        v.slice(/*dim=*/0, /*start=*/start, /*end=*/end).permute({1, 0, 2});
 
-    // [len, H, D] -> [H, len, D]
-    q_i = q_i.permute({1, 0, 2});
-    k_i = k_i.permute({1, 0, 2});
-    v_i = v_i.permute({1, 0, 2});
-
-    // Scaled dot-product attention per head.
-    auto q_scaled = q_i * scale;
-    auto k_t = k_i.transpose(1, 2);              // [H, D, len]
-    auto scores = torch::matmul(q_scaled, k_t);  // [H, len, len]
-    auto attn = torch::softmax(scores, /*dim=*/-1);
-    auto out_i = torch::matmul(attn, v_i);  // [H, len, D]
+    torch::Tensor out_i;
+    if constexpr (Platform::is_musa()) {
+      // Avoid materializing the quadratic score matrix on long images.
+      out_i = torch::scaled_dot_product_attention(q_i.unsqueeze(0),
+                                                  k_i.unsqueeze(0),
+                                                  v_i.unsqueeze(0),
+                                                  /*attn_mask=*/std::nullopt,
+                                                  /*dropout_p=*/0.0,
+                                                  /*is_causal=*/false,
+                                                  /*scale=*/scale)
+                  .squeeze(/*dim=*/0);
+    } else {
+      const torch::Tensor scores =
+          torch::matmul(q_i * scale, k_i.transpose(1, 2));
+      out_i = torch::matmul(torch::softmax(scores, /*dim=*/-1), v_i);
+    }
 
     // Back to [len, H, D] and write into output.
-    out_i = out_i.permute({1, 0, 2}).contiguous();
-    output.slice(/*dim=*/0, /*start=*/start, /*end=*/end).copy_(out_i);
+    output.slice(/*dim=*/0, /*start=*/start, /*end=*/end)
+        .copy_(out_i.permute({1, 0, 2}).contiguous());
   }
 }
-#endif  // defined(USE_CUDA) || defined(USE_DCU)
+#endif
 
 #if defined(USE_NPU)
 void compute_qwen_vision_attention_fused(
@@ -306,8 +318,8 @@ torch::Tensor Qwen2VisionAttentionImpl::forward(
                                    /*window_size_right=*/-1,
                                    /*compute_dtype=*/"half",
                                    /*return_lse=*/false);
-#elif defined(USE_CUDA) || defined(USE_DCU)
-  // CUDA/DCU path: use a pure PyTorch vision attention implementation that
+#elif defined(USE_CUDA) || defined(USE_DCU) || defined(USE_MUSA)
+  // Use a pure PyTorch vision attention implementation that
   // matches Transformers Qwen2.5-VL VisionAttention. FlashInfer's precompiled
   // AOT kernels in this project do not support head_dim=80, so we intentionally
   // do not call FlashInfer here and run attention entirely in PyTorch instead.
