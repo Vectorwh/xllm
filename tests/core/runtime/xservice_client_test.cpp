@@ -87,6 +87,8 @@ bool EtcdClient::register_instance(const std::string&,
   note_attempt();
   return registration_succeeds.load();
 }
+// Temporary until MR823: the linker pulls the real etcd_client without this.
+bool EtcdClient::withdraw_registration(const std::string&) { return true; }
 RegistrationLookupState EtcdClient::lookup_registration(const std::string&) {
   return RegistrationLookupState::kPresent;
 }
