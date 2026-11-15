@@ -1574,9 +1574,15 @@ void QKVParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
 #if defined(USE_MUSA)
   if (is_block_fp8) {
     if (!block_fp8_resolved_unquantized_) {
-      CHECK_EQ(world_size, 1)
-          << "block-fp8 merged QKV scale loading requires TP=1";
-      LOAD_WEIGHT(weight_scale_inv);
+      const std::vector<int64_t> block_fp8_scale_rows(shard_tensor_count,
+                                                      shard_size * world_size);
+      const std::vector<int64_t> block_fp8_scale_shard_sizes =
+          weight::block_fp8_scale_shard_sizes(
+              std::vector<int64_t>(shard_tensor_count, shard_size));
+      LOAD_MERGED_BLOCK_FP8_SCALE(weight_scale_inv,
+                                  0,
+                                  block_fp8_scale_rows,
+                                  block_fp8_scale_shard_sizes);
     }
   } else if (is_w8a8_quant(resolved_weight_quant_method_)) {
 #else

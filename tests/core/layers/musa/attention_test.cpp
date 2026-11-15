@@ -56,7 +56,7 @@ TEST(MusaAttentionTest, DispatchHonorsCompiledContractAndOverrides) {
           for (const bool decode : {false, true}) {
             const bool enabled =
                 decode ? setting.decode_enabled : setting.prefill_enabled;
-            for (const int64_t ratio : {6, 8}) {
+            for (const int64_t ratio : {3, 6, 8}) {
               CHECK_EQ(use_fa3_attention(256,
                                          ratio * 2,
                                          2,

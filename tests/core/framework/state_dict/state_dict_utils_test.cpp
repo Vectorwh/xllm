@@ -94,5 +94,31 @@ TEST(StateDictUtilsTest, BlockFp8ScaleShardSizesFollowExactBlockAlignment) {
   EXPECT_EQ(scale_sizes, expected);
 }
 
+TEST(StateDictUtilsTest, FusedBlockFp8ScalesReplicateKvHeadsPerProjection) {
+  const torch::Tensor scale = torch::arange(80, torch::kFloat32).view({40, 2});
+  const std::vector<int64_t> rows = {3072, 1024, 1024};
+  torch::Tensor loaded = torch::empty({7, 2}, torch::kFloat32);
+  bool is_loaded = false;
+  std::vector<torch::Tensor> accumulated;
+  weight::load_fused_weight(StateDict({{"weight_scale_inv", scale}}),
+                            {""},
+                            "weight_scale_inv",
+                            /*dim=*/0,
+                            /*rank=*/7,
+                            /*world_size=*/8,
+                            accumulated,
+                            loaded,
+                            is_loaded,
+                            /*num_kv_head_replicas=*/2,
+                            &rows,
+                            /*block_fp8_scales_are_separate=*/false);
+  EXPECT_TRUE(is_loaded);
+  EXPECT_TRUE(torch::equal(loaded,
+                           torch::cat({scale.narrow(0, 21, 3),
+                                       scale.narrow(0, 30, 2),
+                                       scale.narrow(0, 38, 2)},
+                                      0)));
+}
+
 }  // namespace
 }  // namespace xllm

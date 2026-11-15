@@ -36,20 +36,29 @@ constexpr int32_t kFa3TileN = 64;
 constexpr int64_t kFa3PrefillNumSplits = 1;
 
 const char* fa3_metadata_uri(int64_t gqa_ratio) {
-  CHECK(gqa_ratio == 6 || gqa_ratio == 8)
-      << "MUSA FA3 requires GQA ratio 6 or 8";
+  CHECK(gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8)
+      << "MUSA FA3 requires GQA ratio 3, 6 or 8";
+  if (gqa_ratio == 3) {
+    return aot::kFa3MetadataUriGqa3;
+  }
   return gqa_ratio == 6 ? aot::kFa3MetadataUriGqa6 : aot::kFa3MetadataUriGqa8;
 }
 
 std::string fa3_fwd_uri(int64_t gqa_ratio) {
-  CHECK(gqa_ratio == 6 || gqa_ratio == 8)
-      << "MUSA FA3 requires GQA ratio 6 or 8";
+  CHECK(gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8)
+      << "MUSA FA3 requires GQA ratio 3, 6 or 8";
+  if (gqa_ratio == 3) {
+    return aot::kFa3FwdUriGqa3;
+  }
   return gqa_ratio == 6 ? aot::kFa3FwdUriGqa6 : aot::kFa3FwdUriGqa8;
 }
 
 std::string fa3_prefill_fwd_uri(int64_t gqa_ratio) {
-  CHECK(gqa_ratio == 6 || gqa_ratio == 8)
-      << "MUSA FA3 requires GQA ratio 6 or 8";
+  CHECK(gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8)
+      << "MUSA FA3 requires GQA ratio 3, 6 or 8";
+  if (gqa_ratio == 3) {
+    return aot::kFa3PrefillFwdUriGqa3;
+  }
   return gqa_ratio == 6 ? aot::kFa3PrefillFwdUriGqa6
                         : aot::kFa3PrefillFwdUriGqa8;
 }
@@ -188,7 +197,7 @@ void fa3_decode(const torch::Tensor& query,
   const std::string uri = fa3_fwd_uri(gqa_ratio);
   TvmffiStreamGuard stream_guard(query.device());
 
-  // Both supported ratios use the freshly generated MATE 0.2.7 ABI.
+  // All supported ratios use the freshly generated MATE 0.2.7 ABI.
   auto fwd_result =
       get_function(uri, uri)(to_ffi_tensor(query),
                              to_ffi_tensor(k_cache),
@@ -282,8 +291,8 @@ void fa3_prefill(const torch::Tensor& query,
   CHECK_GT(key.size(-2), 0);
   CHECK_EQ(query.size(-2) % key.size(-2), 0);
   const int64_t gqa_ratio = query.size(-2) / key.size(-2);
-  CHECK(gqa_ratio == 6 || gqa_ratio == 8)
-      << "fa3_prefill: requires GQA ratio 6 or 8 (nq=" << query.size(-2)
+  CHECK(gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8)
+      << "fa3_prefill: requires GQA ratio 3, 6 or 8 (nq=" << query.size(-2)
       << ", nkv=" << key.size(-2) << ")";
   CHECK_EQ(output.sizes(), query.sizes())
       << "fa3_prefill: output shape must match query";
@@ -446,8 +455,8 @@ void fa3_prefill_paged(const torch::Tensor& query,
   CHECK_GT(k_cache.size(-2), 0);
   CHECK_EQ(query.size(-2) % k_cache.size(-2), 0);
   const int64_t gqa_ratio = query.size(-2) / k_cache.size(-2);
-  CHECK(gqa_ratio == 6 || gqa_ratio == 8)
-      << "fa3_prefill_paged: requires GQA ratio 6 or 8, got " << gqa_ratio;
+  CHECK(gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8)
+      << "fa3_prefill_paged: requires GQA ratio 3, 6 or 8, got " << gqa_ratio;
   CHECK_EQ(page_table.size(0), seqused_k.numel());
   CHECK_GT(seqused_k.numel(), 0);
   CHECK_EQ(cu_seqlens_q.dim(), 1);

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-PROFILE = "bf16_attention_h256_gqa6_8_gdn_h128_hq16_hv32_48_fp8_bmm_moe_decode_aot"
+PROFILE = "bf16_attention_h256_gqa3_6_8_gdn_h128_hq16_hv32_48_fp8_bmm_moe_decode_aot"
 SCHEMA_VERSION = 6
 PINNED_VERSIONS = {
     "mate": "0.2.7",
@@ -168,7 +168,7 @@ def _forward_config(ratio: int, mode: str) -> dict[str, Any]:
 
 def _operator_recipes() -> list[dict[str, Any]]:
     recipes = []
-    for ratio in (6, 8):
+    for ratio in (3, 6, 8):
         for mode, label in (("dense", "PrefillFwd"), ("decode", "Fwd")):
             recipes.append(
                 {

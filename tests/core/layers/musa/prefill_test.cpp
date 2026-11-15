@@ -31,6 +31,56 @@ limitations under the License.
 namespace xllm::layer {
 namespace {
 
+TEST(MusaPrefillTest, FusedQkvScalesFollowTensorParallelWeightPartitions) {
+  QuantArgs quant;
+  quant.quant_method(kQuantMethodFp8);
+  quant.weight_block_size() = {128, 128};
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+  const torch::Tensor weight = (torch::arange(3072, torch::kFloat32) / 512)
+                                   .unsqueeze(1)
+                                   .expand({3072, 256})
+                                   .to(torch::kFloat8_e4m3fn);
+  const torch::Tensor scale =
+      torch::arange(48, torch::kFloat32).view({24, 2}) + 1;
+  const StateDict weights({{"weight", weight}});
+  const StateDict scales({{"weight_scale_inv", scale}});
+  const auto weight_parts = weight.chunk(3, 0);
+  const auto scale_parts = scale.chunk(3, 0);
+  for (const int32_t world_size : {4, 8}) {
+    const int32_t rank = world_size - 1;
+    SCOPED_TRACE(world_size);
+    ProcessGroup group(rank, world_size, torch::Device(torch::kCPU));
+    ParallelArgs parallel(rank, world_size, &group);
+    parallel.tp_group_ = &group;
+    const torch::Tensor expected_weight =
+        torch::cat({weight_parts[0].chunk(world_size, 0)[rank],
+                    weight_parts[1].chunk(world_size, 0)[rank],
+                    weight_parts[2].chunk(world_size, 0)[rank]},
+                   0);
+    const torch::Tensor expected_scale =
+        torch::cat({scale_parts[0].chunk(world_size, 0)[rank],
+                    scale_parts[1].chunk(world_size, 0)[rank],
+                    scale_parts[2].chunk(world_size, 0)[rank]},
+                   0);
+    QKVParallelLinear qkv(/*hidden_size=*/256,
+                          /*num_heads=*/8 / world_size,
+                          /*num_kv_heads=*/8 / world_size,
+                          /*head_size=*/128,
+                          /*num_kv_head_replicas=*/1,
+                          /*bias=*/false,
+                          /*gather_output=*/false,
+                          parallel,
+                          options,
+                          quant);
+    // Exercise both delayed scale and delayed weight without separate cases.
+    qkv->load_state_dict(world_size == 4 ? weights : scales);
+    qkv->load_state_dict(world_size == 4 ? scales : weights);
+    EXPECT_TRUE(torch::equal(qkv->weight().to(torch::kFloat32),
+                             expected_weight.to(torch::kFloat32)));
+    EXPECT_TRUE(torch::equal(qkv->weight_scale_inv(), expected_scale));
+  }
+}
+
 TEST(MusaPrefillTest, LoadsCheckpointShardsWithoutPrematureQgReorder) {
   if (Platform::device_count() == 0) {
     GTEST_SKIP() << "No MUSA device available";
@@ -175,7 +225,7 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
   torch::manual_seed(758);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
-  for (const int64_t ratio : {6, 8}) {
+  for (const int64_t ratio : {3, 6, 8}) {
     SCOPED_TRACE(ratio);
     const int64_t heads = 2 * ratio;
     const torch::Tensor query =

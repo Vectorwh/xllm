@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "utils.h"
+#include "core/framework/state_dict/utils.h"
 
 #include <glog/logging.h>
 
@@ -40,27 +40,38 @@ torch::Tensor shard_block_fp8_scale(const torch::Tensor& scale,
                                     int64_t dim,
                                     int32_t rank,
                                     int32_t world_size,
-                                    const std::vector<int64_t>& shard_rows) {
+                                    const std::vector<int64_t>& shard_rows,
+                                    int32_t num_kv_head_replicas = 1) {
   CHECK(scale.defined()) << "block-fp8 scale is undefined";
   CHECK(dim == 0 || dim == 1) << "block-fp8 scale dim must be 0 or 1";
   CHECK_GT(rank, -1);
+  CHECK_GT(world_size, 0);
   CHECK_LT(rank, world_size);
+  CHECK_GT(num_kv_head_replicas, 0);
+  CHECK_EQ(world_size % num_kv_head_replicas, 0);
   CHECK(!shard_rows.empty()) << "block-fp8 scale partitions are empty";
 
   std::vector<torch::Tensor> shards;
   shards.reserve(shard_rows.size());
   int64_t offset = 0;
-  for (int64_t rows : shard_rows) {
+  for (size_t index = 0; index < shard_rows.size(); ++index) {
+    const int64_t rows = shard_rows[index];
     CHECK_GT(rows, 0) << "block-fp8 scale partition must be positive";
     CHECK_EQ(rows % kBlockFp8Size, 0)
         << "block-fp8 scale partition " << rows
         << " is not aligned to block size " << kBlockFp8Size;
     const int64_t blocks = rows / kBlockFp8Size;
-    CHECK_EQ(blocks % world_size, 0)
-        << "cannot shard " << blocks << " scale blocks across " << world_size
-        << " ranks";
-    const int64_t blocks_per_rank = blocks / world_size;
-    const int64_t start = offset + static_cast<int64_t>(rank) * blocks_per_rank;
+    const bool replicate_kv = index > 0 && num_kv_head_replicas > 1;
+    const int32_t tensor_rank =
+        replicate_kv ? rank / num_kv_head_replicas : rank;
+    const int32_t tensor_world_size =
+        replicate_kv ? world_size / num_kv_head_replicas : world_size;
+    CHECK_EQ(blocks % tensor_world_size, 0)
+        << "cannot shard " << blocks << " scale blocks across "
+        << tensor_world_size << " ranks";
+    const int64_t blocks_per_rank = blocks / tensor_world_size;
+    const int64_t start =
+        offset + static_cast<int64_t>(tensor_rank) * blocks_per_rank;
     shards.emplace_back(scale.slice(dim, start, start + blocks_per_rank));
     offset += blocks;
   }
@@ -330,9 +341,10 @@ bool load_tensor_list(const StateDict& state_dict,
         } else {
           tensor = shard_block_fp8_scale(tensor,
                                          dim,
-                                         tensor_rank,
-                                         tensor_world_size,
-                                         *block_fp8_shard_rows);
+                                         rank,
+                                         world_size,
+                                         *block_fp8_shard_rows,
+                                         num_kv_head_replicas);
         }
       }
     } else {

@@ -37,7 +37,8 @@ bool is_fa3_shape_supported(int64_t head_size,
     return false;
   }
   const int64_t gqa_ratio = num_heads / num_kv_heads;
-  return head_size == 256 && (gqa_ratio == 6 || gqa_ratio == 8);
+  return head_size == 256 &&
+         (gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8);
 }
 
 bool check_prefill_lengths(const AttentionMetadata& metadata,
@@ -116,7 +117,7 @@ bool use_fa3_attention(int64_t head_size,
   if (selected == 0) {
     return false;
   }
-  // Both compiled GQA ratios default to FA3 for prefill and decode.
+  // All compiled GQA ratios default to FA3 for prefill and decode.
   // The compiled profile is causal but not local, including window_left=0.
   // Explicit enablement cannot bypass the compiled attention contract.
   return window_left < 0 && dtype == torch::kBFloat16 &&
@@ -132,7 +133,7 @@ void check_fa3_attention(int64_t head_size,
   CHECK(use_fa3_attention(
       head_size, num_heads, num_kv_heads, dtype, is_decode, window_left))
       << "Unsupported MUSA attention configuration: this build requires FA3 "
-         "with bf16, head_dim=256, GQA=6/8 and no sliding window. "
+         "with bf16, head_dim=256, GQA=3/6/8 and no sliding window. "
          "XLLM_USE_FA3 and XLLM_USE_FA3_DECODE must not disable FA3; "
          "legacy FlashInfer FA2 operators are not built.";
 }
