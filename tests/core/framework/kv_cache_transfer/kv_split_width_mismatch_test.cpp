@@ -33,6 +33,7 @@ limitations under the License.
 // addressed the same destination block and the stripe-mate blocks were never
 // written. The fix keys the decision on the widths both sides declare.
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
@@ -67,6 +68,20 @@ namespace xllm {
 // (batch_input_builder.h), so it must live at namespace scope, not in the
 // anonymous namespace below. tests/core/framework/batch/batch_test.cpp defines
 // its own copy for its own binary; this TU is the only definition in this one.
+// validate_transfer_mappings is a protected static on KVCacheTransfer; a
+// derived class forwards it without an instance, which keeps the production
+// header free of test-only friends.
+class KVTransferValidatorProbe : public KVCacheTransfer {
+ public:
+  static bool validate(const std::vector<KVTransferMapping>& mappings,
+                       const std::string& request_id,
+                       int32_t kv_split_size,
+                       bool rank_local_mapping) {
+    return validate_transfer_mappings(
+        mappings, request_id, kv_split_size, rank_local_mapping);
+  }
+};
+
 class BatchInputBuilderTestPeer final {
  public:
   static TransferKVInfo build_step_transfer_info(
@@ -370,26 +385,15 @@ TEST(KvSplitWidthMismatchTest, EqualWidthPairKeepsRankLocalMapping) {
 
   // What the naive "false whenever the source is split" fix would do to this
   // pair: the builder expands the destination's four ids by the source's stride
-  // and trips its own coverage CHECK (batch_input_builder.cpp, "KV remote id
-  // coverage shortage"), so the transfer cannot be built at all. That CHECK is
-  // a process-fatal assertion, not a return value, so the path has to be driven
-  // out of process: the child must be killed by the assertion (SIGABRT), and
-  // its death message is checked to be that coverage CHECK so an unrelated
-  // crash cannot satisfy the clause.
-  EXPECT_EXIT(
-      {
-        for (int32_t kv_split_rank = 0; kv_split_rank < kSourceKvSplitSize;
-             ++kv_split_rank) {
-          (void)source_rank_destination_blocks(kv_split_rank,
-                                               /*rank_local_mapping=*/false,
-                                               kSourceLogicalBlockCount);
-        }
-        std::cout << "no coverage CHECK fired" << std::endl;
-        _exit(0);
-      },
-      ::testing::KilledBySignal(SIGABRT),
-      "KV remote id coverage shortage")
-      << "the guarded shape must not survive as a mapping";
+  // and runs out of remote ids. A destination list shorter than
+  // stride * source blocks (up to the stride - 1 blocks a partially filled tail
+  // legitimately lacks) is a real bookkeeping mismatch, not a partial tail, so
+  // it stays a process-fatal assertion instead of silently truncating the
+  // mapping and pushing a request with holes in it.
+  EXPECT_DEATH(source_rank_destination_blocks(/*kv_split_rank=*/0,
+                                              /*rank_local_mapping=*/false,
+                                              kSourceLogicalBlockCount),
+               "KV remote id coverage shortage");
 }
 
 // The classifier's own contract, including the fail-closed half: only equal
@@ -1129,6 +1133,404 @@ TEST(KvSplitWidthMismatchTest,
           << "resource=" << resource << ", page=" << page;
     }
   }
+}
+
+// A destination that hits its own prefix cache reports the blocks it already
+// holds (remote_shared_num), and the flat-KV response omits exactly those
+// leading blocks from `ids`. With a heterogeneous pair one source logical
+// block spans kv_split_size destination blocks, so the shared count must be
+// consumed in destination-block units: subtracting it from the source block
+// index before the stride multiplication shifted every following block by
+// (stride - 1) destination entries, which silently wrote the wrong blocks and
+// skipped real tokens. A prefix that ends inside one source block is legal and
+// must be handled stripe by stripe.
+//
+// The prefix crosses two more comparisons that must agree with that unit:
+//   * the dispatch cursor advances by floor(prefix / stride), so the builder
+//     may not demand that the cursor cover the remainder -- the two are
+//     unsatisfiable together whenever prefix % stride != 0, and the abort is
+//     data dependent (one remainder kills all prefill ranks);
+//   * "the destination already holds everything this step would push" is a
+//     destination-block test; comparing the prefix against map_end in source
+//     blocks claims a full hit once the prefix reaches 1/stride of the prompt
+//     and silently drops the remaining stripes.
+// shared = 6 and 7 below are exactly those regions (map_end = 4, stride = 2).
+TEST(KvSplitWidthMismatchTest,
+     SharedDestinationPrefixKeepsTheStridedMappingAligned) {
+  const uint32_t stride = static_cast<uint32_t>(kSourceKvSplitSize);
+
+  // Helper arithmetic: the prefix counts destination blocks.
+  EXPECT_EQ(source_blocks_in_remote_shared(0, stride), 0U);
+  EXPECT_EQ(source_blocks_in_remote_shared(1, stride), 0U)
+      << "a one-block prefix does not cover a whole source logical block";
+  EXPECT_EQ(source_blocks_in_remote_shared(stride, stride), 1U);
+  EXPECT_EQ(source_blocks_in_remote_shared(stride + 1, stride), 1U);
+  EXPECT_EQ(source_blocks_in_remote_shared(3, 1), 3U);
+  EXPECT_EQ(transfer_remote_stride(BlockType::KV, /*rank_local=*/false, stride),
+            static_cast<size_t>(stride));
+  EXPECT_EQ(transfer_remote_stride(BlockType::KV, /*rank_local=*/true, stride),
+            1U);
+  EXPECT_EQ(
+      transfer_remote_stride(BlockType::LINEAR, /*rank_local=*/false, stride),
+      1U);
+
+  for (uint32_t shared : {1U, 2U, 3U, 6U, 7U}) {
+    // The destination's list carries only the blocks it does NOT already hold.
+    const std::vector<uint64_t> remote_ids =
+        destination_block_ids(kDestinationBlockCount - shared);
+    BlockManager::Options options;
+    options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+    BlockManagerImpl manager(options);
+    Sequence sequence =
+        make_sequence(manager.allocate(kSourceLogicalBlockCount));
+    // The dispatch path moves the cursor when the destination reports its
+    // shared prefix, in source blocks: floor(prefix / stride). A request that
+    // spans several steps (or any request that already dispatched once) enters
+    // the builder with this cursor, which is what makes a ceil-side assertion
+    // unsatisfiable for every non-zero remainder.
+    sequence.kv_state().advance_transfer_block_idx(
+        source_blocks_in_remote_shared(shared, stride));
+
+    TransferKVInfo info;
+    info.request_id = "kv-split-shared-prefix";
+    info.rank_local_mapping = false;
+    KVTransferMapping mapping;
+    mapping.group_id = cache_group_id(BlockType::KV);
+    mapping.remote_ids = remote_ids;
+    mapping.remote_shared_num = shared;
+    info.mappings.emplace_back(std::move(mapping));
+
+    const TransferKVInfo step =
+        BatchInputBuilderTestPeer::build_step_transfer_info(
+            info,
+            &sequence,
+            /*seq_len=*/kSeqLen,
+            /*kv_split_size=*/stride);
+    ASSERT_FALSE(step.mappings.empty());
+    const KVTransferMapping& step_mapping = step.mappings.front();
+    // The step mapping still describes both lists positionally: whole blocks
+    // inside the prefix are dropped, the straddling block keeps only its
+    // unshared stripes.
+    EXPECT_EQ(step_mapping.local_ids.size() +
+                  source_blocks_in_remote_shared(shared, stride),
+              static_cast<size_t>(kSourceLogicalBlockCount))
+        << "shared=" << shared;
+    EXPECT_EQ(step_mapping.remote_ids.size(),
+              static_cast<size_t>(kDestinationBlockCount - shared))
+        << "shared=" << shared;
+
+    std::set<uint64_t> written;
+    size_t pushes = 0;
+    for (int32_t kv_split_rank = 0; kv_split_rank < kSourceKvSplitSize;
+         ++kv_split_rank) {
+      const std::vector<TransferKVInfo> filtered = filter_kv_split_infos(
+          kv_split_rank, kSourceKvSplitSize, std::vector<TransferKVInfo>{step});
+      if (filtered.empty()) {
+        continue;
+      }
+      const KVTransferMapping& rank_mapping = filtered.front().mappings.front();
+      EXPECT_EQ(rank_mapping.local_ids.size(), rank_mapping.remote_ids.size())
+          << "shared=" << shared << ", kv_split_rank=" << kv_split_rank;
+      pushes += rank_mapping.remote_ids.size();
+      for (const uint64_t remote_id : rank_mapping.remote_ids) {
+        EXPECT_TRUE(written.insert(remote_id).second)
+            << "shared=" << shared << ", kv_split_rank=" << kv_split_rank
+            << ": destination block " << remote_id
+            << " written by more than one shard rank";
+      }
+    }
+    // Every destination block the prefix does not cover is written exactly
+    // once, and the leading (already present) blocks are never written.
+    EXPECT_EQ(written.size(),
+              static_cast<size_t>(kDestinationBlockCount - shared))
+        << "shared=" << shared;
+    EXPECT_EQ(pushes, static_cast<size_t>(kDestinationBlockCount - shared))
+        << "shared=" << shared;
+    EXPECT_EQ(*written.begin(), kFirstDestinationBlockId)
+        << "the first pushed block must be the first block the destination "
+           "lacks; shared="
+        << shared;
+  }
+}
+
+// A request that needs more than one dispatch step drives the builder again
+// with the cursor the previous step left behind, while the destination's
+// shared count stays the same. The step mapping then starts at a block well
+// past floor(shared / stride), so a filter that derives the block from the
+// shared count shifts every stripe by the difference: it rewrites blocks an
+// earlier step already wrote and leaves the tail of the prompt unwritten.
+// Every destination block must be written exactly once across the whole
+// request, no matter how the steps are cut.
+// A grouped cache group (SWA / C4 / C128) keeps its full logical destination
+// table, so the builder emits absolute destination indices (remote_origin = 0)
+// and the step list starts at block_start * stride. The filter has to derive
+// the same base for a grouped group: with the flat-KV base it would shift every
+// read by shared % stride entries and pair each rank's stripe with the wrong
+// destination block (the blocks D is still missing would never be written).
+TEST(KvSplitWidthMismatchTest,
+     SharedDestinationPrefixKeepsGroupedMappingAligned) {
+  const uint32_t stride = static_cast<uint32_t>(kSourceKvSplitSize);
+  for (uint32_t shared : {1U, 2U, 3U, 6U, 7U}) {
+    const size_t block_start = source_blocks_in_remote_shared(shared, stride);
+    // Grouped responses preserve every row, including the blocks D already
+    // holds; only a flat KV response omits them.
+    const std::vector<uint64_t> remote_ids =
+        destination_block_ids(kDestinationBlockCount);
+
+    BlockManager::Options options;
+    options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+    BlockManagerImpl manager(options);
+    // A grouped group carries its own block list and its own cursor. Both
+    // managers outlive the sequence so every block is returned before their
+    // "all blocks freed" check runs.
+    BlockManager::Options group_options;
+    group_options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+    BlockManagerImpl group_manager(group_options);
+    Sequence sequence =
+        make_sequence(manager.allocate(kSourceLogicalBlockCount));
+    sequence.kv_state().add_blocks(
+        BlockType::C4, group_manager.allocate(kSourceLogicalBlockCount));
+    sequence.kv_state().advance_group_transfer_block_idx(BlockType::C4,
+                                                         block_start);
+
+    TransferKVInfo info;
+    info.request_id = "kv-split-shared-prefix-grouped";
+    info.rank_local_mapping = false;
+    KVTransferMapping mapping;
+    mapping.group_id = cache_group_id(BlockType::C4);
+    mapping.remote_ids = remote_ids;
+    mapping.remote_shared_num = shared;
+    info.mappings.emplace_back(std::move(mapping));
+
+    const TransferKVInfo step =
+        BatchInputBuilderTestPeer::build_step_transfer_info(
+            info,
+            &sequence,
+            /*seq_len=*/kSeqLen,
+            /*kv_split_size=*/stride);
+    ASSERT_FALSE(step.mappings.empty());
+    const KVTransferMapping& step_mapping = step.mappings.front();
+    EXPECT_EQ(step_mapping.local_block_start, block_start)
+        << "shared=" << shared;
+    EXPECT_EQ(
+        step_mapping.remote_ids.size(),
+        static_cast<size_t>(kDestinationBlockCount) - block_start * stride)
+        << "shared=" << shared;
+
+    std::set<uint64_t> written;
+    for (int32_t kv_split_rank = 0; kv_split_rank < kSourceKvSplitSize;
+         ++kv_split_rank) {
+      const std::vector<TransferKVInfo> filtered = filter_kv_split_infos(
+          kv_split_rank, kSourceKvSplitSize, std::vector<TransferKVInfo>{step});
+      if (filtered.empty()) {
+        continue;
+      }
+      const KVTransferMapping& rank_mapping = filtered.front().mappings.front();
+      ASSERT_EQ(rank_mapping.local_ids.size(), rank_mapping.remote_ids.size())
+          << "shared=" << shared;
+      for (size_t i = 0; i < rank_mapping.remote_ids.size(); ++i) {
+        // The kept source block block_start + i must carry the destination
+        // block its stripe writes, read from the absolute list position.
+        const uint64_t expected = kFirstDestinationBlockId +
+                                  (block_start + i) * stride +
+                                  static_cast<uint64_t>(kv_split_rank);
+        EXPECT_EQ(rank_mapping.remote_ids[i], expected)
+            << "shared=" << shared << ", kv_split_rank=" << kv_split_rank
+            << ", entry=" << i;
+        EXPECT_TRUE(written.insert(rank_mapping.remote_ids[i]).second)
+            << "shared=" << shared << ": destination block "
+            << rank_mapping.remote_ids[i] << " written twice";
+      }
+    }
+    EXPECT_EQ(
+        written.size(),
+        static_cast<size_t>(kDestinationBlockCount) - block_start * stride)
+        << "shared=" << shared;
+    EXPECT_EQ(*written.begin(), kFirstDestinationBlockId + block_start * stride)
+        << "the first pushed block must be the first block not already shared";
+  }
+}
+
+TEST(KvSplitWidthMismatchTest,
+     SharedDestinationPrefixStaysAlignedAcrossDispatchSteps) {
+  const uint32_t stride = static_cast<uint32_t>(kSourceKvSplitSize);
+  const uint32_t shared = 3;  // 3 % stride == 1: ends inside source block 1
+
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_sequence(manager.allocate(kSourceLogicalBlockCount));
+  sequence.kv_state().advance_transfer_block_idx(
+      source_blocks_in_remote_shared(shared, stride));
+
+  TransferKVInfo info;
+  info.request_id = "kv-split-shared-prefix-multi-step";
+  info.rank_local_mapping = false;
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.remote_ids = destination_block_ids(kDestinationBlockCount - shared);
+  mapping.remote_shared_num = shared;
+  info.mappings.emplace_back(std::move(mapping));
+
+  std::set<uint64_t> written;
+  size_t pushes = 0;
+  // First step exposes two of the four logical blocks, the second the rest.
+  for (const uint32_t step_blocks : {2U, 4U}) {
+    const TransferKVInfo step =
+        BatchInputBuilderTestPeer::build_step_transfer_info(
+            info,
+            &sequence,
+            /*seq_len=*/step_blocks * kSourceLogicalBlockSize,
+            /*kv_split_size=*/stride);
+    ASSERT_FALSE(step.mappings.empty());
+    for (int32_t kv_split_rank = 0; kv_split_rank < kSourceKvSplitSize;
+         ++kv_split_rank) {
+      const std::vector<TransferKVInfo> filtered = filter_kv_split_infos(
+          kv_split_rank, kSourceKvSplitSize, std::vector<TransferKVInfo>{step});
+      if (filtered.empty()) {
+        continue;
+      }
+      const KVTransferMapping& rank_mapping = filtered.front().mappings.front();
+      EXPECT_EQ(rank_mapping.local_ids.size(), rank_mapping.remote_ids.size())
+          << "step_blocks=" << step_blocks
+          << ", kv_split_rank=" << kv_split_rank;
+      pushes += rank_mapping.remote_ids.size();
+      for (const uint64_t remote_id : rank_mapping.remote_ids) {
+        EXPECT_TRUE(written.insert(remote_id).second)
+            << "step_blocks=" << step_blocks
+            << ", kv_split_rank=" << kv_split_rank << ": destination block "
+            << remote_id << " written twice";
+      }
+    }
+  }
+  // No gap and no overlap over the whole request: exactly the blocks the
+  // prefix does not cover, each written once.
+  EXPECT_EQ(written.size(),
+            static_cast<size_t>(kDestinationBlockCount - shared));
+  EXPECT_EQ(pushes, static_cast<size_t>(kDestinationBlockCount - shared));
+  EXPECT_EQ(*written.begin(), kFirstDestinationBlockId);
+  EXPECT_EQ(*written.rbegin(),
+            kFirstDestinationBlockId + (kDestinationBlockCount - shared) - 1);
+}
+
+// Reproduction of the field shape "the destination's prefix covers a whole
+// document and only the instruction line is new": source block = 512 tokens,
+// destination block = 128 tokens (stride 4), destination shared prefix =
+// 815 blocks = 104320 tokens exactly, prompt = 104320 + 72 tokens.
+//
+// Only ONE destination block is new, and it is covered by source block 203,
+// whose first 384 tokens are already on the destination. The mapping must
+// therefore deliver exactly that one destination block, from exactly one shard
+// rank, and it must not invent the other three stripes of the source block
+// (they have no destination block and no tokens).
+TEST(KvSplitWidthMismatchTest, PartialTailBlockDeliversOnlyTheExistingStripe) {
+  constexpr uint32_t kSourceBlockTokens = 512;  // 4 * 128
+  constexpr uint32_t kTailTokens = 72;
+  constexpr uint32_t kSharedBlocks = 815;  // destination blocks
+  constexpr uint32_t kStride = 4;
+  constexpr uint32_t kPromptTokens = kSharedBlocks * 128 + kTailTokens;
+  constexpr uint32_t kSourceBlocks =
+      (kPromptTokens + kSourceBlockTokens - 1) / kSourceBlockTokens;  // 204
+
+  BlockManager::Options options;
+  options.num_blocks(256).block_size(kSourceBlockTokens);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_sequence(manager.allocate(kSourceBlocks));
+  sequence.kv_state().advance_transfer_block_idx(
+      source_blocks_in_remote_shared(kSharedBlocks, kStride));  // 203
+
+  // The destination holds blocks [0, 815) and allocated one more (index 815).
+  const uint32_t kDestBlocks = kSharedBlocks + 1;
+  TransferKVInfo info;
+  info.request_id = "kv-split-partial-tail";
+  info.rank_local_mapping = false;
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.remote_ids = destination_block_ids(kDestBlocks - kSharedBlocks);
+  mapping.remote_shared_num = kSharedBlocks;
+  info.mappings.emplace_back(std::move(mapping));
+
+  const TransferKVInfo step =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          info,
+          &sequence,
+          /*seq_len=*/kPromptTokens,
+          /*kv_split_size=*/kStride);
+  ASSERT_FALSE(step.mappings.empty());
+  const KVTransferMapping& step_mapping = step.mappings.front();
+  EXPECT_EQ(step_mapping.local_ids.size(), 1U);
+  EXPECT_EQ(step_mapping.remote_ids.size(), 1U);
+  EXPECT_EQ(step_mapping.local_block_start, 203U);
+  EXPECT_EQ(step_mapping.remote_ids.front(), kFirstDestinationBlockId);
+
+  // Exactly one shard rank owns that block: the stripe whose offset inside
+  // source block 203 is 3 (blocks 812, 813, 814 are already on the
+  // destination, 815 is not).
+  for (int32_t kv_split_rank = 0; kv_split_rank < static_cast<int32_t>(kStride);
+       ++kv_split_rank) {
+    const std::vector<TransferKVInfo> filtered =
+        filter_kv_split_infos(kv_split_rank,
+                              static_cast<int32_t>(kStride),
+                              std::vector<TransferKVInfo>{step});
+    const bool owns_the_tail = kv_split_rank == 3;
+    ASSERT_EQ(filtered.empty(), !owns_the_tail)
+        << "kv_split_rank " << kv_split_rank << " must "
+        << (owns_the_tail ? "" : "not ") << "emit a mapping";
+    if (owns_the_tail) {
+      const KVTransferMapping& rank_mapping = filtered.front().mappings.front();
+      EXPECT_EQ(rank_mapping.local_ids.size(), rank_mapping.remote_ids.size());
+      EXPECT_EQ(rank_mapping.remote_ids.size(), 1U);
+    }
+  }
+}
+
+// The same tail two blocks long: 246 new tokens still need only two
+// destination blocks, while the stride expansion of the two source blocks that
+// cover them wants up to eight. This is the shape the push-side coverage
+// validator refused with "expected_remote_range=[5, 8]".
+TEST(KvSplitWidthMismatchTest, PartialTailBlockTwoBlocksReportsItsOwnRange) {
+  constexpr uint32_t kSourceBlockTokens = 512;
+  constexpr uint32_t kTailTokens = 246;
+  constexpr uint32_t kSharedBlocks = 815;
+  constexpr uint32_t kStride = 4;
+  constexpr uint32_t kPromptTokens = kSharedBlocks * 128 + kTailTokens;
+  constexpr uint32_t kSourceBlocks =
+      (kPromptTokens + kSourceBlockTokens - 1) / kSourceBlockTokens;
+
+  BlockManager::Options options;
+  options.num_blocks(256).block_size(kSourceBlockTokens);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_sequence(manager.allocate(kSourceBlocks));
+  sequence.kv_state().advance_transfer_block_idx(
+      source_blocks_in_remote_shared(kSharedBlocks, kStride));
+
+  const uint32_t kDestBlocks = (kPromptTokens + 127) / 128;  // 817
+  TransferKVInfo info;
+  info.request_id = "kv-split-partial-tail-two";
+  info.rank_local_mapping = false;
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.remote_ids = destination_block_ids(kDestBlocks - kSharedBlocks);
+  mapping.remote_shared_num = kSharedBlocks;
+  info.mappings.emplace_back(std::move(mapping));
+
+  const TransferKVInfo step =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          info,
+          &sequence,
+          /*seq_len=*/kPromptTokens,
+          /*kv_split_size=*/kStride);
+  const KVTransferMapping& step_mapping = step.mappings.front();
+  // Two destination blocks are new, so the step must ask for exactly two.
+  EXPECT_EQ(step_mapping.remote_ids.size(), 2U);
+  EXPECT_EQ(step_mapping.local_block_start, 203U);
+  // The push-side coverage gate must accept that span: two source blocks cover
+  // at most eight destination blocks and only two of them exist.
+  EXPECT_TRUE(KVTransferValidatorProbe::validate(step.mappings,
+                                                 step.request_id,
+                                                 static_cast<int32_t>(kStride),
+                                                 /*rank_local_mapping=*/false))
+      << "a partially covered tail must not be refused";
 }
 
 }  // namespace xllm

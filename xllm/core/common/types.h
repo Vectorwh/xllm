@@ -357,6 +357,14 @@ struct KVTransferMapping {
   // cache under this group. P uses this to compress its per-group transfer
   // cursor to the first block D actually needs (no shared -> zero, no-op).
   uint32_t remote_shared_num = 0;
+  // Source logical block index of local_ids[0] in a per-step mapping. The
+  // step builder emits only the blocks from the transfer cursor onward and
+  // drops the blocks the destination's shared prefix covers in full, so a
+  // consumer cannot recover which block a position stands for -- and under a
+  // strided (kv_split) pair it must know the block, not the position, to pick
+  // the destination stripe. Zero when unset, which is the from-block-zero
+  // case every full mapping already is.
+  uint64_t local_block_start = 0;
 };
 
 struct TransferKVInfo {

@@ -19,9 +19,11 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
@@ -34,9 +36,17 @@ class DcpIndexerEstimationTest : public ::testing::TestWithParam<int32_t> {
  protected:
   void SetUp() override {
     ParallelConfig::get_instance().kv_split_size(GetParam()).cp_size(4);
+    // These cases describe the replicated indexer geometry, which the Python
+    // executor still requires. The ATB/native graph allocates a single owner
+    // page per logical block instead (indexer_pages_per_block()).
+    saved_model_impl_ = ModelConfig::get_instance().model_impl();
+    ModelConfig::get_instance().model_impl("python");
   }
 
-  void TearDown() override { ParallelConfig::get_instance() = saved_config_; }
+  void TearDown() override {
+    ModelConfig::get_instance().model_impl(saved_model_impl_);
+    ParallelConfig::get_instance() = saved_config_;
+  }
 
   int64_t expected_factor() const {
 #if defined(USE_NPU)
@@ -48,6 +58,7 @@ class DcpIndexerEstimationTest : public ::testing::TestWithParam<int32_t> {
 
  private:
   ParallelConfig saved_config_ = ParallelConfig::get_instance();
+  std::string saved_model_impl_;
 };
 
 ModelArgs make_standard_args() {

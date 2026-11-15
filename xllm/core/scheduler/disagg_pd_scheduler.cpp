@@ -939,34 +939,11 @@ void DisaggPDScheduler::dispatch_requests() {
 
           sequence->kv_state().set_transfer_kv_info(std::move(info));
 
-          // Compress per-group transfer cursors to the D-side shared count.
-          // advance_group_transfer_block_idx is monotonic max, so this is a
-          // no-op if the group's remote_shared_num is 0 (SWA / LINEAR under
-          // DECODE, or D that got no prefix cache hit); when it is >0, P
-          // starts pushing at the first block D actually needs, skipping the
-          // shared prefix without touching P's own local shared_num.
-          const auto& mappings =
-              sequence->kv_state().transfer_kv_info()->mappings;
-          for (const KVTransferMapping& mapping : mappings) {
-            if (mapping.remote_shared_num == 0) {
-              continue;
-            }
-            const std::optional<BlockType> block_type =
-                block_type_from_cache_group_id(mapping.group_id);
-            if (!block_type.has_value()) {
-              LOG(ERROR) << "Unknown KV cache transfer group_id: "
-                         << mapping.group_id;
-              continue;
-            }
-            if (block_type.value() == BlockType::KV) {
-              sequence->kv_state().advance_transfer_block_idx(
-                  static_cast<size_t>(mapping.remote_shared_num));
-            } else {
-              sequence->kv_state().advance_group_transfer_block_idx(
-                  block_type.value(),
-                  static_cast<size_t>(mapping.remote_shared_num));
-            }
-          }
+          // Compress the per-group transfer cursors to the D-side shared
+          // count so this rank starts pushing at the first block D needs.
+          advance_transfer_cursor_to_shared_prefix(
+              sequence.get(),
+              static_cast<uint32_t>(instance_info_.kv_split_size));
         }
 
         // Retain the peer that actually accepted this RPC, even if discovery

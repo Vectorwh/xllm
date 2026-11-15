@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "common/types.h"
 #include "core/framework/kv_cache_transfer/kv_transfer_types.h"
+#include "framework/block/block.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/linear_attention_parallel.h"
@@ -100,6 +101,41 @@ KvSplitWidthPlan plan_kv_split_widths(int32_t src_kv_split_size,
 // The registration record (register_instance_info) and the push-side width
 // validation both call this, so the process declares and enforces one mode.
 int32_t declared_cp_index_write_mode();
+
+// Destination blocks one source logical block spans in a KV transfer. A
+// kv-split source keeps one rank-local stripe per logical block while an
+// unsplit destination stores every stripe as its own block, so one source
+// block interleaves with `kv_split_size` destination blocks. A rank-local
+// mapping (equal widths, or a destination whose allocation response preserved
+// this rank's blocks) keeps the 1:1 layout.
+inline size_t transfer_remote_stride(BlockType type,
+                                     bool rank_local_mapping,
+                                     uint32_t kv_split_size) {
+  const bool sharded =
+      is_kv_split_cache_block_type(type) && !rank_local_mapping;
+  return sharded && kv_split_size > 1 ? static_cast<size_t>(kv_split_size) : 1;
+}
+
+// Source logical blocks a D-side shared prefix already covers.
+// `remote_shared_num` counts DESTINATION blocks, so it must be divided by the
+// interleave stride before it can move a source-side cursor. A prefix that
+// ends inside a source block only covers the whole blocks before it: the
+// straddling block still has stripes the destination does not hold, and
+// BatchInputBuilder pushes those while skipping the stripes it does.
+inline size_t source_blocks_in_remote_shared(uint32_t remote_shared_num,
+                                             size_t remote_stride) {
+  return static_cast<size_t>(remote_shared_num) / remote_stride;
+}
+
+class Sequence;
+
+// Move a sequence's per-group transfer cursors up to the shared prefix the
+// destination just reported. The cursor only advances in whole source blocks,
+// so a prefix that ends inside one source block deliberately leaves that block
+// unadvanced: it still has stripes the destination does not hold, and the batch
+// input builder pushes exactly those stripes.
+void advance_transfer_cursor_to_shared_prefix(Sequence* sequence,
+                                              uint32_t kv_split_size);
 
 // Stable operator-facing name of a kCpIndexWriteMode* value ("unspecified",
 // "replicated", "sharded"); used by registration logs and rejection reasons.

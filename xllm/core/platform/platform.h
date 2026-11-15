@@ -66,18 +66,23 @@ class Platform final {
 
   static constexpr bool requires_unsplit_linear_state() { return is_mlu(); }
 
-  // Under KV splitting, each NPU rank retains the full indexer cache.
-  // Logical block B maps to index pages [B * split, (B + 1) * split).
-  // The replicated mode (the fixed default) writes
-  // every stripe's page at that natural row, so each rank's tensor is a
-  // physical full replica and any single transfer writer supplies every
-  // valid page. The sharded mode stores each rank's valid stripe at the
-  // FIRST page of the group (row B * split): the transfer plan's page-level
-  // overlap against a kv_split_size == 1 destination only ever reads page 0
-  // of a source resource, so that is where the owner's page must live.
-  static constexpr bool requires_dsa_indexer_cache_replication() {
-    return is_npu();
-  }
+  // Whether a rank must allocate the DSA indexer cache as a physical replica
+  // of every kv-split page (logical block B -> index pages
+  // [B * split, (B + 1) * split)) instead of a single owner page per block.
+  //
+  // The ATB (native) graph does not need the replica. NpuCpPlan::
+  // prepare_cache_slots() localizes every slot to its owner's physical page
+  // (logical_block_id * block_size + offset) and masks peer-owned slots with
+  // -1, so a rank only ever touches one index page per logical block; the
+  // remaining kv_split - 1 pages of the replicated pool are dead rows.
+  //
+  // The Python executor still needs it: its write mode
+  // (XLLM_CP_INDEX_WRITE_MODE, distributed_runtime/... kv_cache_transfer)
+  // addresses either the global slot rows (replicated, the default) or page *
+  // kv_split_size (sharded), and both geometries assume the expanded pool.
+  //
+  // This is a runtime decision because it follows the model implementation.
+  static bool requires_dsa_indexer_cache_replication();
 
   // Shared DSA layers reuse the previous full layer's top-k and never write
   // indexer cache, so those layers skip indexer-page allocation.

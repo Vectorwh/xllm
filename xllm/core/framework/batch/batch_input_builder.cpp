@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/framework/constraint/builtin_json_machine.h"
 #include "core/framework/constraint/output_rows.h"
 #include "core/framework/multimodal/mm_visitor.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
@@ -370,7 +371,6 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     }
 
     const bool is_flat_kv = block_type.value() == BlockType::KV;
-    const bool uses_kv_split = is_kv_split_cache_block_type(block_type.value());
     const size_t next_transfer_idx =
         is_flat_kv ? sequence->kv_state().next_transfer_block_idx()
                    : sequence->kv_state().next_group_transfer_block_idx(
@@ -378,25 +378,43 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t win_end =
         static_cast<size_t>(util::ceil_div(seq_len, block_size));
     const size_t map_end = std::min(win_end, local_ids.size());
-    const size_t remote_stride = uses_kv_split && !full_info.rank_local_mapping
-                                     ? static_cast<size_t>(kv_split_size)
-                                     : 1;
-    CHECK_GT(remote_stride, static_cast<size_t>(0));
+    const size_t remote_stride = transfer_remote_stride(
+        block_type.value(), full_info.rank_local_mapping, kv_split_size);
     const size_t remote_shared_num =
         static_cast<size_t>(full_mapping.remote_shared_num);
-    CHECK_GE(next_transfer_idx, remote_shared_num)
-        << "P transfer cursor slid below D-side shared prefix, request_id="
+    // The D-side shared prefix counts DESTINATION blocks while the transfer
+    // cursor counts source logical blocks, and one source block spans
+    // `remote_stride` destination blocks. The dispatch path advances the
+    // cursor by floor(prefix / stride) -- it can only move in whole source
+    // blocks -- so the invariant is stated in those units: a prefix that ends
+    // inside one source block leaves that block unadvanced on purpose, because
+    // it still has stripes the destination does not hold.
+    const size_t shared_source_blocks = source_blocks_in_remote_shared(
+        full_mapping.remote_shared_num, remote_stride);
+    CHECK_GE(next_transfer_idx, shared_source_blocks)
+        << "P transfer cursor lags the D-side shared prefix, request_id="
         << full_info.request_id << ", group_id=" << full_mapping.group_id
         << ", next_transfer_idx=" << next_transfer_idx
+        << ", shared_source_blocks=" << shared_source_blocks
+        << ", remote_stride=" << remote_stride
         << ", remote_shared_num=" << remote_shared_num;
 
     // Flat KV responses omit D-side shared blocks, while grouped responses
     // preserve their full logical tables (including SWA placeholders).
     const size_t remote_origin = is_flat_kv ? remote_shared_num : 0;
+    // Destination-block span this mapping covers. The remote list starts at
+    // the first block D does not already hold, and each source block spans
+    // `remote_stride` entries, so the prefix must be subtracted in
+    // destination-block units rather than in source-block units.
+    const size_t remote_span = map_end * remote_stride;
     const size_t remote_end =
-        map_end > remote_origin ? (map_end - remote_origin) * remote_stride : 0;
-    CHECK_GE(util::align_up(full_mapping.remote_ids.size(), remote_stride),
-             remote_end)
+        remote_span > remote_origin ? remote_span - remote_origin : 0;
+    // The last source block of a prompt can be partially filled, so the
+    // destination may legitimately hold up to remote_stride - 1 fewer blocks
+    // than this arithmetic span; anything past that slack means the response
+    // cannot cover what this step wants to push, which is a bookkeeping
+    // mismatch rather than a partial tail.
+    CHECK_GE(full_mapping.remote_ids.size() + remote_stride - 1, remote_end)
         << "KV remote id coverage shortage, request_id=" << full_info.request_id
         << ", group_id=" << full_mapping.group_id
         << ", remote_size=" << full_mapping.remote_ids.size()
@@ -419,7 +437,12 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     } else if (sequence_updates != nullptr) {
       sequence_updates->emplace_back(std::move(update));
     }
-    if (next_transfer_idx >= map_end || map_end <= remote_origin) {
+    // `remote_origin` counts destination blocks, so "the destination already
+    // holds everything this step would push" is a destination-block test.
+    // Comparing it against map_end (source blocks) would claim a full hit as
+    // soon as the prefix reached a quarter of the prompt and silently drop the
+    // remaining stripes.
+    if (next_transfer_idx >= map_end || remote_span <= remote_origin) {
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
@@ -438,8 +461,18 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
       const size_t remote_idxs_begin = remote_idxs.size();
       bool has_remote_sentinel = false;
       for (size_t offset = 0; offset < remote_stride; ++offset) {
-        const size_t remote_idx =
-            (local_idx - remote_origin) * remote_stride + offset;
+        // `remote_block` is the destination block this stripe writes, in the
+        // D side's own numbering: source block `local_idx` covers
+        // [local_idx * remote_stride, (local_idx + 1) * remote_stride).
+        // Subtracting the shared prefix before the stride multiplication
+        // would shift every following block by (stride - 1) entries whenever
+        // the prefix is non-zero, so subtract in destination-block units and
+        // skip the stripes D already holds.
+        const size_t remote_block = local_idx * remote_stride + offset;
+        if (remote_block < remote_origin) {
+          continue;
+        }
+        const size_t remote_idx = remote_block - remote_origin;
         if (remote_idx >= full_mapping.remote_ids.size()) {
           CHECK_GT(remote_stride, static_cast<size_t>(1));
           break;
@@ -457,6 +490,20 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
         step_mapping.remote_ids.resize(remote_ids_begin);
         remote_idxs.resize(remote_idxs_begin);
         continue;
+      }
+      if (step_mapping.remote_ids.size() == remote_ids_begin) {
+        // Every stripe of this block is inside the destination's shared
+        // prefix, so there is nothing to write and no destination block to
+        // pair with: keeping the local id would leave the two sides unequal.
+        continue;
+      }
+      if (step_mapping.local_ids.empty()) {
+        // Record which block the first emitted id stands for. The stride
+        // expansion makes positions meaningless on their own: the destination
+        // stripe that belongs to a position depends on the block index, which
+        // only this side knows because the cursor and the dropped shared
+        // prefix both shift it.
+        step_mapping.local_block_start = static_cast<uint64_t>(local_idx);
       }
       step_mapping.local_ids.emplace_back(
           static_cast<uint64_t>(local_ids[local_idx]));

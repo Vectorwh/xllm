@@ -2279,6 +2279,16 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   input.sampling_params.filter_bitmask =
       torch::tensor({{static_cast<int32_t>(-1)}},
                     torch::TensorOptions().dtype(torch::kInt32));
+  // Stride routing fields travel with the step mapping: a rank that only
+  // receives the shared-memory record rebuilds each destination stripe from
+  // remote_shared_num and local_block_start. Dropping them makes that rank
+  // derive a zero remote_base and push a source block's stripe into the wrong
+  // destination block, which surfaces as a silently wrong answer.
+  ASSERT_EQ(input.transfer_kv_infos.size(), 1u);
+  ASSERT_FALSE(input.transfer_kv_infos[0].mappings.empty());
+  input.transfer_kv_infos[0].mappings[0].remote_shared_num = 815;
+  input.transfer_kv_infos[0].mappings[0].local_block_start = 203;
+
   bool is_creator = false;
   auto shm_name =
       ForwardSharedMemoryManager::create_unique_name("batch_test_forward_input",
@@ -2304,6 +2314,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       find_mapping(round_trip.transfer_kv_infos[0], BlockType::KV);
   EXPECT_EQ(mapping.local_ids, (std::vector<uint64_t>{1}));
   EXPECT_EQ(mapping.remote_ids, (std::vector<uint64_t>{100}));
+  EXPECT_EQ(mapping.remote_shared_num, 815u);
+  EXPECT_EQ(mapping.local_block_start, 203u);
   // The shm record is the push-side defense's only view of the remote's
   // declarations; both fields must arrive verbatim (kCpIndexWriteModeSharded
   // is not proto3's 0, so a dropped field would read as Unspecified).

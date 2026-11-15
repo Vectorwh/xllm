@@ -130,7 +130,10 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // (xgrammar) restore cross-process by rebuilding from the source instead
 // of refusing; a v7 reader would misparse the tail of the descriptor
 // after the first snapshot.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000008ULL;
+// v9: each KVTransferMapping gains remote_shared_num and local_block_start
+// (stride routing under a D-side shared prefix), 12 bytes per mapping; a v8
+// reader would misparse every later mapping and the sections after them.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000009ULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -261,7 +264,9 @@ inline size_t get_kv_transfer_mappings_size(
   size_t total = type_size<uint64_t>;
   for (const KVTransferMapping& mapping : mappings) {
     total += type_size<int32_t> + get_vector_size(mapping.local_ids) +
-             get_vector_size(mapping.remote_ids);
+             get_vector_size(mapping.remote_ids) +
+             type_size<uint32_t> +  // remote_shared_num
+             type_size<uint64_t>;   // local_block_start
   }
   return total;
 }
@@ -907,6 +912,12 @@ inline void write_kv_transfer_mappings(
     write_data(buffer, mapping.group_id);
     write_vector(buffer, mapping.local_ids);
     write_vector(buffer, mapping.remote_ids);
+    // Stride routing fields: a non-scheduling rank rebuilds each destination
+    // stripe from remote_shared_num and local_block_start, so dropping them
+    // here sends the wrong stripe whenever the shared prefix ends inside a
+    // source block.
+    write_data(buffer, mapping.remote_shared_num);
+    write_data(buffer, mapping.local_block_start);
   }
 }
 
@@ -918,6 +929,8 @@ inline void write_kv_transfer_mappings(
     write_data(context.descriptor, mapping.group_id);
     write_vector(context.descriptor, mapping.local_ids);
     write_vector(context.descriptor, mapping.remote_ids);
+    write_data(context.descriptor, mapping.remote_shared_num);
+    write_data(context.descriptor, mapping.local_block_start);
   }
 }
 
@@ -1895,6 +1908,8 @@ inline void read_kv_transfer_mappings(
     read_data(buffer, mapping.group_id);
     read_vector(buffer, mapping.local_ids);
     read_vector(buffer, mapping.remote_ids);
+    read_data(buffer, mapping.remote_shared_num);
+    read_data(buffer, mapping.local_block_start);
   }
 }
 
@@ -1908,6 +1923,8 @@ inline void read_kv_transfer_mappings(
     read_data(context, mapping.group_id);
     read_vector(context, mapping.local_ids);
     read_vector(context, mapping.remote_ids);
+    read_data(context, mapping.remote_shared_num);
+    read_data(context, mapping.local_block_start);
   }
 }
 

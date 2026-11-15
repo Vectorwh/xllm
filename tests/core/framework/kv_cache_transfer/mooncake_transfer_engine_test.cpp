@@ -2716,7 +2716,12 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   TransferKVInfo info = make_info(/*dst_dp_size=*/1,
                                   /*dst_tp_size=*/1,
                                   /*dst_dp_rank=*/0);
-  info.mappings[0].remote_ids = {21, 22};
+  // Two source blocks but only one destination block: every source block that
+  // holds tokens must own at least one destination block, so this is short by
+  // construction. (A destination list of exactly two blocks is legitimate: the
+  // last source block of a prompt is usually partial, which is why the lower
+  // bound is local_count rather than max - split + 1.)
+  info.mappings[0].remote_ids = {21};
   ParallelArgs parallel_args = make_args(/*rank=*/0,
                                          /*world_size=*/2,
                                          /*dp_size=*/1);

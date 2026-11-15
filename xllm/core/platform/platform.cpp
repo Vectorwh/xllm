@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <mutex>
 
+#include "core/framework/config/model_config.h"
+
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
 #elif defined(USE_MLU)
@@ -111,6 +113,16 @@ bool Platform::is_support_sm100a() { return support_sm100a_; }
 bool Platform::is_support_sm100f() { return support_sm100f_; }
 
 bool Platform::is_support_sm120a() { return support_sm120a_; }
+
+bool Platform::requires_dsa_indexer_cache_replication() {
+  if (!is_npu()) {
+    return false;
+  }
+  // The ATB graph writes one owner page per logical block, so only the Python
+  // executor's write modes assume the expanded (replicated) index pool.
+  return ModelConfig::is_python_model_impl(
+      ModelConfig::get_instance().model_impl());
+}
 
 void Platform::init_capabilities(int32_t device_index) {
 #if defined(USE_CUDA)

@@ -22,8 +22,10 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
@@ -35,6 +37,28 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+// These cases describe the replicated indexer geometry: every kv-split rank
+// keeps its own index page per logical block. Pin the model implementation that
+// still requires it (the Python executor); the ATB/native graph localizes every
+// slot to one owner page per block instead, which cache_layout_builder_test
+// covers.
+class IndexerReplicationGuard final {
+ public:
+  IndexerReplicationGuard() {
+    saved_model_impl_ = ModelConfig::get_instance().model_impl();
+    ModelConfig::get_instance().model_impl("python");
+  }
+  ~IndexerReplicationGuard() {
+    ModelConfig::get_instance().model_impl(saved_model_impl_);
+  }
+
+  IndexerReplicationGuard(const IndexerReplicationGuard&) = delete;
+  IndexerReplicationGuard& operator=(const IndexerReplicationGuard&) = delete;
+
+ private:
+  std::string saved_model_impl_;
+};
 
 constexpr int32_t kKvSplitSize = 4;
 constexpr int64_t kBlockCount = 2;
@@ -150,6 +174,7 @@ void run_kv_round_trip(HierarchyKVCacheTransfer& transfer, uint64_t batch_id) {
 }
 
 TEST(KvSplitHostTransferTest, BuildsIndexedLayoutUnderKvSplit) {
+  const IndexerReplicationGuard indexer_guard;
   if (Platform::device_count() < 1) {
     GTEST_SKIP()
         << "An accelerator device is required for hierarchy KV transfer.";
@@ -185,6 +210,7 @@ TEST(KvSplitHostTransferTest, BuildsIndexedLayoutUnderKvSplit) {
 }
 
 TEST(KvSplitHostTransferTest, RoundTripCopiesAllIndexPagesPerBlock) {
+  const IndexerReplicationGuard indexer_guard;
   if (Platform::device_count() < 1) {
     GTEST_SKIP()
         << "An accelerator device is required for hierarchy KV transfer.";
@@ -306,6 +332,7 @@ TEST(KvSplitHostTransferTest, RoundTripReplicatedDraftPool) {
 // layout: view() cannot refold the interleaved physical tiling, and every
 // host/device copy through the folded view would mis-address rows.
 TEST(KvSplitHostTransferTest, FoldRejectsFractalNzCacheTensor) {
+  const IndexerReplicationGuard indexer_guard;
   if (Platform::device_count() < 1) {
     GTEST_SKIP()
         << "An accelerator device is required for hierarchy KV transfer.";

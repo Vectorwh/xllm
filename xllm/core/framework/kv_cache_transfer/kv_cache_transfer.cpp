@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "absl/strings/ascii.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/request/sequence.h"
 #include "util/env_var.h"
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
@@ -224,7 +225,19 @@ bool KVCacheTransfer::validate_transfer_mappings(
       return false;
     }
     const size_t max_remote_count = local_count * split_size;
-    const size_t min_remote_count = max_remote_count - split_size + 1;
+    // A fully covered source block spans split_size destination blocks, but the
+    // last source block of a prompt is usually partial: only the destination
+    // blocks that hold real tokens exist, and the builder stops at the end of
+    // the destination list. The honest lower bound is one destination block per
+    // source block -- a block that holds tokens always owns at least one -- not
+    // the tight `max - split + 1`, which rejected valid transfers (a 246-token
+    // tail across two source blocks asked for 2 destination blocks and was
+    // refused with expected_remote_range=[5, 8]). Width correctness is enforced
+    // by validate_kv_split_width_plan and the post-filter 1:1 check covers the
+    // per-rank shape; this gate rejects a mapping that claims more destination
+    // blocks than the stride can cover, or one that leaves a source block
+    // without any destination block.
+    const size_t min_remote_count = local_count;
     if (remote_count < min_remote_count || remote_count > max_remote_count) {
       LOG(ERROR) << "KV-split mapping remote coverage mismatch, request_id="
                  << request_id << ", group_id=" << mapping.group_id
@@ -323,10 +336,13 @@ folly::SemiFuture<bool> KVCacheTransfer::pull_kv_blocks_async(
 }
 
 // In KV-split mode, each block-scoped mapping's local_ids already contains
-// only this rank's physical blocks. remote_ids holds the full D-side block
-// entries; this rank maps local_ids[k] to
-// remote_ids[kv_split_rank + k * kv_split_size]. The function rebuilds
-// remote_ids accordingly and drops infos with no mappings.
+// only this rank's physical blocks. remote_ids holds the D-side block entries
+// for every rank, expanded by the source stride and starting at the first
+// destination block this mapping may write; this rank keeps the stripe it owns
+// of each block, i.e. the entry at
+// (local_block_start + k) * kv_split_size + kv_split_rank - remote_base, where
+// remote_base is the first destination block the step may write. The function
+// rebuilds remote_ids accordingly and drops infos with no mappings.
 std::vector<TransferKVInfo> filter_kv_split_infos(
     int32_t kv_split_rank,
     int32_t kv_split_size,
@@ -345,23 +361,55 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
           !is_kv_split_cache_block_type(block_type.value())) {
         continue;
       }
-      const std::vector<uint64_t> remote_ids = mapping.remote_ids;
-      mapping.remote_ids.clear();
-      size_t mapped_local = 0;
-      mapping.remote_ids.reserve(mapping.local_ids.size());
+      const std::vector<uint64_t>& remote_ids = mapping.remote_ids;
+      const size_t stride = static_cast<size_t>(kv_split_size);
+      const size_t shared = static_cast<size_t>(mapping.remote_shared_num);
+      // Positions alone do not identify a block: a per-step mapping starts at
+      // the transfer cursor and may have dropped whole blocks the shared
+      // prefix already covers, so the builder records the block index of
+      // local_ids[0]. A later dispatch step starts well past
+      // floor(shared / stride), and deriving the start from the shared count
+      // would shift every stripe by that difference. The list begins at the
+      // first stripe that is not shared, which is the same base the builder
+      // used when emitting it.
+      const size_t block_start = static_cast<size_t>(mapping.local_block_start);
+      // Where the emitted list starts depends on the cache group: a flat KV
+      // response omits the destination blocks D already holds (the builder
+      // subtracts remote_shared_num), while a grouped response keeps its full
+      // logical table and is emitted from block_start * stride with no
+      // subtraction. Using the flat base for a grouped group shifts every read
+      // by (shared - block_start * stride) = shared % stride entries and drops
+      // the stripes that straddle the prefix, so the pairs would carry the
+      // wrong destination block. One base per group kind keeps both in step
+      // with batch_input_builder's remote_origin.
+      const size_t remote_base = block_type.value() == BlockType::KV
+                                     ? std::max(block_start * stride, shared)
+                                     : block_start * stride;
+      std::vector<uint64_t> kept_local;
+      std::vector<uint64_t> kept_remote;
+      kept_local.reserve(mapping.local_ids.size());
+      kept_remote.reserve(mapping.local_ids.size());
       for (size_t k = 0; k < mapping.local_ids.size(); ++k) {
-        const size_t remote_idx = static_cast<size_t>(kv_split_rank) +
-                                  k * static_cast<size_t>(kv_split_size);
+        const size_t remote_block =
+            (block_start + k) * stride + static_cast<size_t>(kv_split_rank);
+        if (remote_block < remote_base) {
+          // This rank's stripe of the straddling block is already on the
+          // destination, so dropping the pair keeps both sides the same size.
+          continue;
+        }
+        const size_t remote_idx = remote_block - remote_base;
         if (remote_idx >= remote_ids.size()) {
           break;
         }
-        mapping.remote_ids.emplace_back(remote_ids[remote_idx]);
-        ++mapped_local;
+        kept_local.emplace_back(mapping.local_ids[k]);
+        kept_remote.emplace_back(remote_ids[remote_idx]);
       }
-      mapping.local_ids.resize(mapped_local);
+      mapping.local_ids = std::move(kept_local);
+      mapping.remote_ids = std::move(kept_remote);
     }
-    // local_ids[k] maps to remote_ids[kv_split_rank + k * kv_split_size]. When
-    // the strided remote index runs past the D-side block list (the prompt
+    // local_ids[k] maps to the destination stripe kv_split_rank of block
+    // local_block_start + k. When the strided remote index runs past the
+    // D-side block list (the prompt
     // spans multiple logical blocks and the last one is not full, which only
     // happens for kv_split_rank > 0), the loop above stops early. local_ids
     // must then be truncated to the blocks that actually got a remote target;
@@ -379,6 +427,44 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
     }
   }
   return filtered_kv_infos;
+}
+
+void advance_transfer_cursor_to_shared_prefix(Sequence* sequence,
+                                              uint32_t kv_split_size) {
+  if (sequence == nullptr) {
+    return;
+  }
+  const std::optional<TransferKVInfo>& transfer_info =
+      sequence->kv_state().transfer_kv_info();
+  if (!transfer_info.has_value()) {
+    return;
+  }
+  for (const KVTransferMapping& mapping : transfer_info->mappings) {
+    if (mapping.remote_shared_num == 0) {
+      // No shared prefix for this group: nothing to skip, and a no-op advance.
+      continue;
+    }
+    const std::optional<BlockType> block_type =
+        block_type_from_cache_group_id(mapping.group_id);
+    if (!block_type.has_value()) {
+      LOG(ERROR) << "Unknown KV cache transfer group_id: " << mapping.group_id;
+      continue;
+    }
+    const size_t source_shared = source_blocks_in_remote_shared(
+        mapping.remote_shared_num,
+        transfer_remote_stride(block_type.value(),
+                               transfer_info->rank_local_mapping,
+                               kv_split_size));
+    if (source_shared == 0) {
+      continue;
+    }
+    if (block_type.value() == BlockType::KV) {
+      sequence->kv_state().advance_transfer_block_idx(source_shared);
+    } else {
+      sequence->kv_state().advance_group_transfer_block_idx(block_type.value(),
+                                                            source_shared);
+    }
+  }
 }
 
 std::vector<std::string> KVCacheTransfer::rotate_dst_rank(

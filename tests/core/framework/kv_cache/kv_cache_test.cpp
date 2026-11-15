@@ -27,6 +27,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/block/block.h"
@@ -50,9 +51,17 @@ class DcpIndexerShapeTest : public ::testing::TestWithParam<int32_t> {
  protected:
   void SetUp() override {
     ParallelConfig::get_instance().kv_split_size(GetParam()).cp_size(4);
+    // These cases describe the replicated indexer geometry, which the Python
+    // executor still requires. The ATB/native graph allocates a single owner
+    // page per logical block instead (indexer_pages_per_block()).
+    saved_model_impl_ = ModelConfig::get_instance().model_impl();
+    ModelConfig::get_instance().model_impl("python");
   }
 
-  void TearDown() override { ParallelConfig::get_instance() = saved_config_; }
+  void TearDown() override {
+    ModelConfig::get_instance().model_impl(saved_model_impl_);
+    ParallelConfig::get_instance() = saved_config_;
+  }
 
   int64_t expected_factor() const {
 #if defined(USE_NPU)
@@ -64,6 +73,7 @@ class DcpIndexerShapeTest : public ::testing::TestWithParam<int32_t> {
 
  private:
   ParallelConfig saved_config_ = ParallelConfig::get_instance();
+  std::string saved_model_impl_;
 };
 
 std::vector<int64_t> shape_vec(const torch::Tensor& tensor) {

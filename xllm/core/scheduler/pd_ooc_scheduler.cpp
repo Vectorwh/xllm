@@ -1588,30 +1588,11 @@ void PDOOCScheduler::dispatch_requests() {
           info.remote_instance_info = *remote_record;
           sequence->kv_state().set_transfer_kv_info(std::move(info));
 
-          // Compress per-group transfer cursors to the D-side shared count.
-          // Monotonic max; no-op when a group's remote_shared_num is 0.
-          const auto& mappings =
-              sequence->kv_state().transfer_kv_info()->mappings;
-          for (const KVTransferMapping& mapping : mappings) {
-            if (mapping.remote_shared_num == 0) {
-              continue;
-            }
-            const std::optional<BlockType> block_type =
-                block_type_from_cache_group_id(mapping.group_id);
-            if (!block_type.has_value()) {
-              LOG(ERROR) << "Unknown KV cache transfer group_id: "
-                         << mapping.group_id;
-              continue;
-            }
-            if (block_type.value() == BlockType::KV) {
-              sequence->kv_state().advance_transfer_block_idx(
-                  static_cast<size_t>(mapping.remote_shared_num));
-            } else {
-              sequence->kv_state().advance_group_transfer_block_idx(
-                  block_type.value(),
-                  static_cast<size_t>(mapping.remote_shared_num));
-            }
-          }
+          // Compress the per-group transfer cursors to the D-side shared
+          // count so this rank starts pushing at the first block D needs.
+          advance_transfer_cursor_to_shared_prefix(
+              sequence.get(),
+              static_cast<uint32_t>(instance_info_.kv_split_size));
         }
 
         // push to request_queue_, and will be executed by engine.
@@ -2173,30 +2154,11 @@ void PDOOCScheduler::dispatch_offline_requests() {
         info.remote_instance_info = *remote_record;
         sequence->kv_state().set_transfer_kv_info(std::move(info));
 
-        // Compress per-group / flat transfer cursors to the D-side shared
-        // counts; see the online dispatch path above for the rationale.
-        const auto& mappings =
-            sequence->kv_state().transfer_kv_info()->mappings;
-        for (const KVTransferMapping& mapping : mappings) {
-          if (mapping.remote_shared_num == 0) {
-            continue;
-          }
-          const std::optional<BlockType> block_type =
-              block_type_from_cache_group_id(mapping.group_id);
-          if (!block_type.has_value()) {
-            LOG(ERROR) << "Unknown KV cache transfer group_id: "
-                       << mapping.group_id;
-            continue;
-          }
-          if (block_type.value() == BlockType::KV) {
-            sequence->kv_state().advance_transfer_block_idx(
-                static_cast<size_t>(mapping.remote_shared_num));
-          } else {
-            sequence->kv_state().advance_group_transfer_block_idx(
-                block_type.value(),
-                static_cast<size_t>(mapping.remote_shared_num));
-          }
-        }
+        // Compress the per-group transfer cursors to the D-side shared count;
+        // see the online dispatch path above for the rationale.
+        advance_transfer_cursor_to_shared_prefix(
+            sequence.get(),
+            static_cast<uint32_t>(instance_info_.kv_split_size));
       }
 
       // Move to transfer queue for KV cache transfer
