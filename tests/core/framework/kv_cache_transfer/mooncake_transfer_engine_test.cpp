@@ -737,6 +737,13 @@ class ScopedIntraHostNpuTransferEnv final {
   bool ok_ = false;
 };
 
+constexpr int32_t kHcclNpuSocketPortRangeSize = 64;
+
+std::string make_hccl_npu_socket_port_range(int32_t base_port) {
+  return std::to_string(base_port) + "-" +
+         std::to_string(base_port + kHcclNpuSocketPortRangeSize - 1);
+}
+
 constexpr int32_t kValidatePushCommand = 1;
 constexpr int32_t kPreparePullCommand = 2;
 constexpr int32_t kStopChildCommand = 3;
@@ -2961,6 +2968,12 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   // HCCL derives several listener ports from each process's base port.
   xllm::tests::ScopedPortRange local_hccl_ports(/*count=*/64);
   xllm::tests::ScopedPortRange remote_hccl_ports(/*count=*/64);
+  // HCCL_IF_BASE_PORT does not control NPU NIC sockets. Give each peer its
+  // own available range instead of letting both bind the default port 16666.
+  xllm::tests::ScopedPortRange local_hccl_npu_ports(
+      kHcclNpuSocketPortRangeSize);
+  xllm::tests::ScopedPortRange remote_hccl_npu_ports(
+      kHcclNpuSocketPortRangeSize);
   ASSERT_GT(local_listen_port, 0);
   ASSERT_GT(remote_listen_port, 0);
 
@@ -2972,6 +2985,12 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   xllm::tests::ScopedEnvironmentVariable hccl_base_port("HCCL_IF_BASE_PORT");
   ASSERT_TRUE(hccl_base_port.set(
       std::to_string(remote_hccl_ports.base_port()).c_str()));
+  xllm::tests::ScopedEnvironmentVariable hccl_npu_socket_port_range(
+      "HCCL_NPU_SOCKET_PORT_RANGE");
+  const std::string remote_hccl_npu_port_range =
+      make_hccl_npu_socket_port_range(remote_hccl_npu_ports.base_port());
+  ASSERT_TRUE(
+      hccl_npu_socket_port_range.set(remote_hccl_npu_port_range.c_str()));
 
   ASSERT_EQ(setenv(kPeerCommandFdEnv,
                    std::to_string(parent_to_child[0]).c_str(),
@@ -2992,6 +3011,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   remote_rpc_ports.release();
   remote_hccl_ports.release();
+  remote_hccl_npu_ports.release();
   const pid_t child_pid = fork();
   ASSERT_GE(child_pid, 0);
   if (child_pid == 0) {
@@ -3009,6 +3029,11 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   ASSERT_TRUE(
       hccl_base_port.set(std::to_string(local_hccl_ports.release()).c_str()));
+  local_hccl_npu_ports.release();
+  const std::string local_hccl_npu_port_range =
+      make_hccl_npu_socket_port_range(local_hccl_npu_ports.base_port());
+  ASSERT_TRUE(
+      hccl_npu_socket_port_range.set(local_hccl_npu_port_range.c_str()));
   local_rpc_ports.release();
 
   unsetenv(kPeerCommandFdEnv);
