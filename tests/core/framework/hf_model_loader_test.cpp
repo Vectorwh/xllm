@@ -17,10 +17,14 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/kv_cache/kv_cache_shape.h"
@@ -32,6 +36,7 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "core/util/model_config_utils.h"
+#include "core/util/scope_guard.h"
 #include "models/llm/deepseek_v41.h"
 #include "models/llm/glm5_next_mtp_args.h"
 #if defined(USE_MLU)
@@ -177,6 +182,31 @@ class GlmCheckpointLoader final : public ModelLoader {
 #endif
 
 }  // namespace
+
+#if defined(USE_NPU)
+TEST(HFModelLoaderTest, VideoPreprocessorPreservesModelFpsUnlessConfigured) {
+  char path[] = "/tmp/xllm-video-fps-XXXXXX";
+  ASSERT_NE(mkdtemp(path), nullptr);
+  const std::filesystem::path model_path(path);
+  SCOPE_GUARD([&] { std::filesystem::remove_all(model_path); });
+  std::ofstream(model_path / "config.json")
+      << R"({"model_type":"qwen3_omni_moe"})";
+  // Weight files are opened lazily; this test only loads configuration.
+  std::ofstream(model_path / "model.safetensors").close();
+
+  const std::vector<std::pair<std::string, double>> configurations = {
+      {R"({"video_max_pixels":65536})", 1.0},
+      {R"({"video_max_pixels":65536,"fps":2.5})", 2.5},
+      {R"({"video_processor":{"fps":3.0}})", 3.0},
+  };
+  for (const auto& [config, expected_fps] : configurations) {
+    SCOPED_TRACE(config);
+    std::ofstream(model_path / "preprocessor_config.json") << config;
+    const HFModelLoader loader(model_path.string());
+    EXPECT_DOUBLE_EQ(loader.model_args().mm_fps(), expected_fps);
+  }
+}
+#endif
 
 TEST(HFModelLoaderTest, SlidingAttentionUsesPagedKvClassification) {
   ModelArgs args;

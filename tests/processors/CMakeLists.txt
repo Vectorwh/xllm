@@ -81,3 +81,14 @@ cc_test(
     :processors
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    glm5_next_video_processor_test
+  CPU_ONLY
+  SRCS
+    glm5_next_video_processor_test.cpp
+  DEPS
+    :processors
+    GTest::gtest_main
+)

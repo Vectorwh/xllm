@@ -41,7 +41,6 @@ def test_model_merges_interleaved_modalities_by_scheduled_positions(model_class:
     model.model.embed_tokens = _text_embedding()
     model.language_model = model.model
     model.deepstack_num_level = 0
-    model._hidden_rot = None
     data = {
         "image|embedding": torch.tensor([[11.0, 12.0]]),
         "image|mask": torch.tensor([False, False, True, False]),
@@ -114,21 +113,20 @@ def test_qwen_empty_visual_chunk_preserves_text_and_zeroes_deepstack(deepstack_l
         ("video", "pixel_values_videos", "video_grid_thw"),
     ],
 )
-@pytest.mark.parametrize("rotated", [False, True])
-def test_glm_encoding_aligns_features_before_chunk_fusion(
-    modality: str, pixel_key: str, grid_key: str, rotated: bool
-) -> None:
+def test_glm_encoding_aligns_features_before_chunk_fusion(modality: str, pixel_key: str, grid_key: str) -> None:
     model = Glm5NextVLModel.__new__(Glm5NextVLModel)
     nn.Module.__init__(model)
     model.language_model = nn.Module()
     model.language_model.embed_tokens = _text_embedding()
-    model._hidden_rot = torch.tensor([[0.0, 1.0], [1.0, 0.0]]) if rotated else None
     model.encode = lambda pixels, grid: pixels
     features = torch.tensor([[11.0, 12.0], [21.0, 22.0], [31.0, 32.0]])
-    expected = features.flip(1) if rotated else features.clone()
+    # Exported merger weights already include the optional hidden rotation.
+    # Encoding must preserve their output rather than applying it twice.
+    expected = features.clone()
     outputs = model.encode_multimodal(
         {pixel_key: features, grid_key: torch.tensor([[1, 1, 1], [1, 1, 2]])}, {modality: [1, 2]}
     )
+    assert not hasattr(model, "_hidden_rot")
     encoded_items = outputs[f"{modality}|embedding"]
     torch.testing.assert_close(encoded_items[0], expected[:1])
     torch.testing.assert_close(encoded_items[1], expected[1:])
@@ -175,7 +173,6 @@ def test_empty_visual_chunk_preserves_text_embeddings() -> None:
 def test_vision_encoder_returns_full_items_in_modality_order(model_class: type[nn.Module]) -> None:
     model = model_class.__new__(model_class)
     nn.Module.__init__(model)
-    model._hidden_rot = None
     model.encode = lambda pixels, grid: pixels * grid[0, 0]
     images = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     videos = torch.tensor([[7.0, 8.0]])

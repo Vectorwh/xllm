@@ -2202,7 +2202,9 @@ class DecodeAclGraphRunner(BaseRunner):
 
     def _uses_compressed_kpool_tail(self) -> bool:
         return any(
-            cache.kpool_tail is not None and cache.kpool_tail.dim() == 4 and cache.kpool_tail.dtype == torch.bfloat16
+            cache.kpool_tail is not None
+            and cache.kpool_tail.dim() == 4
+            and cache.kpool_tail.dtype in (torch.bfloat16, torch.float32)
             for cache in self.layer_caches
         )
 

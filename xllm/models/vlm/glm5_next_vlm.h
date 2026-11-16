@@ -36,9 +36,17 @@ limitations under the License.
 
 namespace xllm {
 
-using Glm5NextVLMultimodalProcessor = MultimodalProcessor<GLM4VPromptProcessor,
-                                                          Qwen2VLImageProcessor,
-                                                          Glm4VVideoProcessor>;
+// Bind preprocessing policy at registration; all processing stays shared.
+class Glm5NextVideoProcessor final : public Glm4VVideoProcessor {
+ public:
+  explicit Glm5NextVideoProcessor(const ModelArgs& args)
+      : Glm4VVideoProcessor(args, SamplingMode::FIXED_FPS) {}
+};
+
+using Glm5NextVLMultimodalProcessor =
+    MultimodalProcessor<GLM4VPromptProcessor,
+                        Qwen2VLImageProcessor,
+                        Glm5NextVideoProcessor>;
 
 REGISTER_MULTIMODAL_PROCESSOR(glm5_next, Glm5NextVLMultimodalProcessor);
 

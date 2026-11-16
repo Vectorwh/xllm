@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "processors/glm4v_prompt_processor.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 
@@ -223,7 +224,7 @@ std::vector<double> GLM4VPromptProcessor::build_timestamps(
 
 std::string GLM4VPromptProcessor::format_timestamp_str(double timestamp) {
   char buffer[32];
-  std::snprintf(buffer, sizeof(buffer), "%.1f seconds", timestamp);
+  std::snprintf(buffer, sizeof(buffer), "%.1f seconds", std::floor(timestamp));
   return buffer;
 }
 

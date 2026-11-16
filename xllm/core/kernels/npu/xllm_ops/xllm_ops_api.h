@@ -246,6 +246,19 @@ torch::Tensor lightning_indexer_out(
     torch::Tensor& sparse_indices_out,
     torch::Tensor& sparse_values_out);
 
+torch::Tensor key_pool(const torch::Tensor& hidden_states,
+                       const torch::Tensor& key_weight,
+                       const torch::Tensor& gate_weight,
+                       const torch::Tensor& ape,
+                       torch::Tensor& state_cache,
+                       const torch::Tensor& block_table,
+                       const torch::Tensor& start_positions,
+                       const torch::Tensor& norm_weight,
+                       const torch::Tensor& norm_bias,
+                       const torch::Tensor& cu_seqlens,
+                       int64_t pool_size,
+                       double norm_epsilon);
+
 std::tuple<torch::Tensor, torch::Tensor> pool_key_indexer(
     const torch::Tensor& query,
     const torch::Tensor& pool_key,

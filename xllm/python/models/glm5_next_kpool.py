@@ -18,12 +18,13 @@ Uses ``F.embedding`` (a small [B, P, rate] index) to replace the flattened
 selected elements is identical (safe already clamped), only saving the
 construction of and random access into a 4.19M-element index tensor.
 Microbenchmark 2.50ms -> 0.05ms (B=1, T=32768, D=128, rate=4, npu:1).
-This module stays pure torch with no xllm dependency, so unit tests can load it directly.
+CPU tests can load the portable functions without importing NPU dependencies.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -85,6 +86,7 @@ def update_compressed_kpool(
     ape: torch.Tensor,
     rate: int,
     graph_mode: bool = False,
+    fused_states: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> None:
     """Complete compressed pools and then persist the current raw tail.
 
@@ -136,6 +138,74 @@ def update_compressed_kpool(
     if tail_cache.shape[2] < rate:
         raise ValueError("kPool tail capacity must cover one complete pool")
 
+    if (
+        fused_states is not None
+        and raw_k.device.type == "npu"
+        and query_lens
+        and query_lens[0] > 0
+        and all(length == query_lens[0] for length in query_lens)
+        and head_dim <= 128
+        and compressed_cache.is_contiguous()
+        and tail_cache.is_contiguous()
+        and block_table.is_contiguous()
+    ):
+        from xllm.python.kernels_npu.triton.kpool_compress import store_fused_kpool
+
+        store_fused_kpool(
+            raw_k,
+            gate_scores,
+            valid_rows,
+            tail_valid_rows,
+            positions,
+            compressed_cache,
+            tail_cache,
+            tail_read_ids,
+            tail_write_ids,
+            block_table,
+            query_lens[0],
+            rate,
+            list(fused_states),
+        )
+        return
+
+    _store_compressed_kpool_torch(
+        flat_k,
+        flat_gate,
+        flat_valid,
+        flat_tail_valid,
+        flat_positions,
+        compressed_cache,
+        tail_cache,
+        tail_read_ids,
+        tail_write_ids,
+        block_table,
+        query_lens,
+        ape,
+        rate,
+        graph_mode,
+        fused_states,
+    )
+
+
+def _store_compressed_kpool_torch(
+    flat_k: torch.Tensor,
+    flat_gate: torch.Tensor,
+    flat_valid: torch.Tensor,
+    flat_tail_valid: torch.Tensor,
+    flat_positions: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    tail_cache: torch.Tensor,
+    tail_read_ids: torch.Tensor,
+    tail_write_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    query_lens: Sequence[int],
+    ape: torch.Tensor,
+    rate: int,
+    graph_mode: bool = False,
+    fused_states: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> None:
+    """Store validated rows using the portable tensor implementation."""
+    head_dim = flat_k.shape[-1]
     pool_block_size = compressed_cache.shape[1]
     cache_flat = compressed_cache.reshape(-1, head_dim)
     tail_capacity = tail_cache.shape[2]
@@ -218,11 +288,19 @@ def update_compressed_kpool(
             & members_valid.all(dim=1)
         )
 
-        logits = gates.float() + ape.float()[None]
-        logits = logits.masked_fill(~members_valid[..., None], float("-inf"))
-        probabilities = torch.nan_to_num(torch.softmax(logits, dim=1)).to(keys.dtype)
-        products = (probabilities.float() * keys.float()).to(keys.dtype).float()
-        compressed = products.sum(1).to(compressed_cache.dtype)
+        if fused_states is None:
+            logits = gates.float() + ape.float()[None]
+            logits = logits.masked_fill(~members_valid[..., None], float("-inf"))
+            probabilities = torch.nan_to_num(torch.softmax(logits, dim=1)).to(compressed_cache.dtype)
+            products = (probabilities.float() * keys.float()).to(keys.dtype).float()
+            compressed = products.sum(1).to(compressed_cache.dtype)
+        else:
+            pooled = fused_states[request_idx][0]
+            relative_positions = torch.remainder(request_positions[0], rate) + torch.arange(
+                query_len, device=flat_positions.device
+            )
+            output_rows = torch.div(relative_positions + 1, rate, rounding_mode="floor") - 1
+            compressed = pooled.index_select(0, output_rows.clamp(0, pooled.shape[0] - 1))
 
         pool_ids = torch.div(request_positions.clamp_min(0), rate, rounding_mode="floor")
         logical_blocks = torch.div(pool_ids, pool_block_size, rounding_mode="floor")
@@ -278,36 +356,189 @@ def update_compressed_kpool(
         tail_rows = torch.remainder(stash_positions.clamp_min(0), tail_capacity)
         active_rows = (tail_write_id > 0) & (stash_positions >= 0)
         writes = active_rows & flat_tail_valid[stash_start:row_end]
-        old_keys = destination_tail[0].index_select(0, tail_rows)
-        old_gates = destination_tail[1].index_select(0, tail_rows)
-        destination_tail[0].index_copy_(
-            0,
-            tail_rows,
-            torch.where(
-                active_rows[:, None],
+        if graph_mode:
+            # Padded positions can alias an active row in the circular buffer.
+            # Read each destination after the preceding write so an inactive
+            # alias preserves its current value instead of restoring a stale
+            # snapshot from before this request.
+            for local_row in range(row_end - stash_start):
+                row = slice(local_row, local_row + 1)
+                tail_row = tail_rows[row]
+                active = active_rows[row, None]
+                write = writes[row, None]
+                source_row = slice(stash_start + local_row, stash_start + local_row + 1)
+                for channel, values, fill in ((0, flat_k, 0.0), (1, flat_gate, float("-inf"))):
+                    previous = destination_tail[channel].index_select(0, tail_row)
+                    current = values[source_row].to(tail_cache.dtype)
+                    value = torch.where(write, current, torch.full_like(current, fill))
+                    destination_tail[channel].index_copy_(0, tail_row, torch.where(active, value, previous))
+        else:
+            old_keys = destination_tail[0].index_select(0, tail_rows)
+            old_gates = destination_tail[1].index_select(0, tail_rows)
+            destination_tail[0].index_copy_(
+                0,
+                tail_rows,
                 torch.where(
-                    writes[:, None],
-                    flat_k[stash_start:row_end].to(tail_cache.dtype),
-                    torch.zeros_like(flat_k[stash_start:row_end], dtype=tail_cache.dtype),
+                    active_rows[:, None],
+                    torch.where(
+                        writes[:, None],
+                        flat_k[stash_start:row_end].to(tail_cache.dtype),
+                        torch.zeros_like(flat_k[stash_start:row_end], dtype=tail_cache.dtype),
+                    ),
+                    old_keys,
                 ),
-                old_keys,
-            ),
-        )
-        destination_tail[1].index_copy_(
-            0,
-            tail_rows,
-            torch.where(
-                active_rows[:, None],
+            )
+            destination_tail[1].index_copy_(
+                0,
+                tail_rows,
                 torch.where(
-                    writes[:, None],
-                    flat_gate[stash_start:row_end].to(tail_cache.dtype),
-                    torch.full_like(flat_gate[stash_start:row_end], float("-inf"), dtype=tail_cache.dtype),
+                    active_rows[:, None],
+                    torch.where(
+                        writes[:, None],
+                        flat_gate[stash_start:row_end].to(tail_cache.dtype),
+                        torch.full_like(flat_gate[stash_start:row_end], float("-inf"), dtype=tail_cache.dtype),
+                    ),
+                    old_gates,
                 ),
-                old_gates,
-            ),
-        )
+            )
+        if fused_states is not None:
+            # KeyPool retains normalized K in FP32. Keep that exact state for
+            # the next partial-pool completion, including historical members.
+            request_valid = flat_tail_valid[row_start:row_end] & (flat_positions[row_start:row_end] >= 0)
+            end_position = torch.where(request_valid, flat_positions[row_start:row_end], -1).amax() + 1
+            tail_length = torch.remainder(end_position, rate)
+            last_pool = end_position - tail_length
+            state_positions = last_pool + rate_offsets
+            state_rows = torch.remainder(state_positions, tail_capacity)
+            state = fused_states[request_idx][1]
+            live = (rate_offsets < tail_length) & (tail_write_id > 0)
+            for channel in range(2):
+                previous = destination_tail[channel].index_select(0, state_rows)
+                destination_tail[channel].index_copy_(
+                    0, state_rows, torch.where(live[:, None], state[channel], previous)
+                )
         tail_cache.index_copy_(0, tail_write_index, destination_tail.unsqueeze(0))
         row_start = row_end
+
+
+@lru_cache(maxsize=128)
+def _fused_kpool_metadata(
+    query_len: int, rate: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse immutable request geometry across layers and eager steps."""
+    offsets = torch.arange(rate, device=device)
+    table = torch.full((1, 1 + (query_len + rate - 1) // rate), 2, dtype=torch.int32, device=device)
+    table[:, 0] = 1
+    cu_seqlens = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    return offsets, table, cu_seqlens
+
+
+def prepare_fused_kpool_states(
+    hidden_states: torch.Tensor,
+    key_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    ape: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    tail_cache: torch.Tensor,
+    tail_read_ids: torch.Tensor,
+    positions: torch.Tensor,
+    query_lens: Sequence[int],
+    rate: int,
+    norm_epsilon: float,
+    *,
+    valid_rows: torch.Tensor | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Project contiguous requests with replayable, device-resident geometry.
+
+    Graph buckets may contain empty requests or a padded query suffix. Keep
+    one harmless token for empty CANN calls and gate every persistent write
+    using the original masks. No device value controls Python execution.
+    """
+    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_positions = positions.reshape(-1)
+    flat_valid = valid_rows.reshape(-1).to(torch.bool) if valid_rows is not None else None
+    head_dim = key_weight.shape[0]
+    key_weight = key_weight.contiguous()
+    gate_weight = gate_weight.to(hidden.dtype).contiguous()
+    ape = ape.float().contiguous()
+    norm_weight = norm_weight.float()
+    norm_bias = norm_bias.float()
+    if (
+        flat_valid is not None
+        and hidden.device.type == "npu"
+        and query_lens
+        and 0 < query_lens[0] <= 8
+        and all(length == query_lens[0] for length in query_lens)
+        and rate == 4
+        and head_dim <= 128
+        and tail_cache.is_contiguous()
+    ):
+        from xllm.python.kernels_npu.triton.kpool_compress import prepare_fused_kpool_graph
+
+        _, table, _ = _fused_kpool_metadata(query_lens[0], rate, hidden.device)
+        return prepare_fused_kpool_graph(
+            hidden.contiguous(),
+            key_weight,
+            gate_weight,
+            ape,
+            norm_weight,
+            norm_bias,
+            tail_cache,
+            tail_read_ids,
+            positions,
+            flat_valid,
+            query_lens[0],
+            rate,
+            norm_epsilon,
+            table,
+        )
+    states = torch.zeros((len(query_lens), 3, rate, 2 * head_dim), dtype=torch.float32, device=hidden.device)
+    results = []
+    row_start = 0
+    for request_idx, query_len in enumerate(query_lens):
+        if query_len == 0:
+            results.append((hidden.new_empty((0, head_dim)), tail_cache.new_empty((2, rate, head_dim))))
+            continue
+        row_end = row_start + query_len
+        if flat_valid is None:
+            offsets, table, cu_seqlens = _fused_kpool_metadata(query_len, rate, hidden.device)
+            actual_length = query_len
+        else:
+            offsets = torch.arange(rate, device=hidden.device)
+            table = torch.full((1, 1 + (query_len + rate - 1) // rate), 2, dtype=torch.int32, device=hidden.device)
+            table[:, 0] = 1
+            actual_length = flat_valid[row_start:row_end].sum(dtype=torch.int32)
+            cu_seqlens = torch.stack((torch.zeros_like(actual_length), actual_length.clamp_min(1)))
+        first_position = flat_positions[row_start].clamp_min(0)
+        start = torch.remainder(first_position, rate).to(torch.int32).reshape(1)
+        history_positions = first_position - start[0] + offsets
+        tail_id = tail_read_ids.reshape(-1)[request_idx].long().clamp(0, tail_cache.shape[0] - 1)
+        history = tail_cache.index_select(0, tail_id.reshape(1))[0]
+        history = history.index_select(1, torch.remainder(history_positions, tail_cache.shape[2]))
+        # Separate request-local scratch from persistent tail storage. CANN
+        # writes only the unfinished pool, while MTP retains a larger window.
+        state = states[request_idx]
+        state[1].copy_(history.permute(1, 0, 2).reshape(rate, 2 * head_dim))
+        pooled = torch.ops.xllm_ops.key_pool(
+            hidden[row_start:row_end].contiguous(),
+            key_weight,
+            gate_weight,
+            ape,
+            state,
+            table,
+            start,
+            norm_weight,
+            norm_bias,
+            cu_seqlens,
+            rate,
+            norm_epsilon,
+        )
+        final_block = torch.where(start[0] + actual_length <= rate, 1, 2).long().reshape(1)
+        tail = state.index_select(0, final_block)[0].reshape(rate, 2, head_dim).permute(1, 0, 2)
+        results.append((pooled, tail))
+        row_start = row_end
+    return results
 
 
 def append_causal_tail(

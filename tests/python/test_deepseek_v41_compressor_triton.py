@@ -328,7 +328,7 @@ def test_parity_ring_boundaries_and_padding(output_dtype: torch.dtype) -> None:
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_decode_pool_matches_serial_reference(layout: str, dtype: torch.dtype) -> None:
-    """Compare pooled rows bitwise with the existing vLLM-derived kernel.
+    """Compare pooled rows bitwise with the existing va-derived kernel.
 
     Read-after-read verification rows and wrapping duplicate slots must use
     this batch's preceding projection, while padded/null pages remain inert.

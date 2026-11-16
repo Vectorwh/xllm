@@ -26,9 +26,16 @@ limitations under the License.
 
 namespace xllm {
 
-class Glm4VVideoProcessor final : public VideoProcessor {
+class Glm4VVideoProcessor : public VideoProcessor {
  public:
-  explicit Glm4VVideoProcessor(const ModelArgs& args);
+  enum class SamplingMode {
+    DYNAMIC_FPS,
+    FIXED_FPS,
+  };
+
+  explicit Glm4VVideoProcessor(
+      const ModelArgs& args,
+      SamplingMode sampling_mode = SamplingMode::DYNAMIC_FPS);
 
   bool process(const torch::Tensor& origin_video,
                const VideoMetadata& metadata,
@@ -66,6 +73,8 @@ class Glm4VVideoProcessor final : public VideoProcessor {
   double rescale_factor_ = 0.00392156862745098;
 
   int32_t video_temporal_patch_size_ = 2;
+  SamplingMode sampling_mode_;
+  double target_fps_ = 2.0;
   bool do_sample_frame_ = true;
   int32_t min_frames_ = 4;
   int32_t max_frames_ = 768;

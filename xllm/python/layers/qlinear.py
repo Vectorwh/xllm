@@ -113,6 +113,22 @@ class QLinear(nn.Module):
         if self.use_w8a8:
             self._w8a8.process_weights_after_loading()
 
+    @property
+    def weight_scale(self) -> torch.Tensor:
+        """Expose per-output scales for dynamic W8A8 fused operations."""
+        assert self.use_w8a8 and self.kind == "dynamic", "requires dynamic W8A8"
+        return self._w8a8.weight_scale
+
+    def forward_accumulated(self, x_int8: torch.Tensor) -> torch.Tensor:
+        """Return INT32 accumulators for prequantized dynamic W8A8 input."""
+        assert self.use_w8a8 and self.kind == "dynamic", "requires dynamic W8A8"
+        return self._w8a8.forward_accumulated(x_int8)
+
+    def forward_quantized(self, x_int8: torch.Tensor, pertoken: torch.Tensor) -> torch.Tensor:
+        """Apply dynamic W8A8 to input carrying per-token quantization scales."""
+        assert self.use_w8a8 and self.kind == "dynamic", "requires dynamic W8A8"
+        return self._w8a8.forward_quantized(x_int8, pertoken)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_w8a8 is None:
             raise RuntimeError("QLinear.forward before resolve_quant")

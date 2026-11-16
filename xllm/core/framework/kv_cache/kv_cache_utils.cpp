@@ -263,13 +263,13 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
         get_npu_kv_cache_format(create_options.model_type());
     if (create_options.enable_kv_cache_huge_page_allocator()) {
       tensors.kpool_tail = alloc_npu_huge_page_tensor(
-          kv_cache_shape.kpool_tail_shape(), torch::kBFloat16, npu_format_type);
+          kv_cache_shape.kpool_tail_shape(), torch::kFloat32, npu_format_type);
       tensors.kpool_tail.zero_();
     } else {
       tensors.kpool_tail = at_npu::native::npu_format_cast(
           torch::zeros(
               kv_cache_shape.kpool_tail_shape(),
-              torch::dtype(torch::kBFloat16).device(create_options.device())),
+              torch::dtype(torch::kFloat32).device(create_options.device())),
           npu_format_type);
     }
     // A finite gate marks a circular-tail row as initialized. Invalid or

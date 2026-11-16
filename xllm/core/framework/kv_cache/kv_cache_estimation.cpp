@@ -42,6 +42,11 @@ namespace {
 
 constexpr int32_t kNzAlignment = 16;
 
+int64_t kpool_tail_element_bytes(const ModelArgs& args) {
+  return uses_npu_compressed_kpool_tail(args) ? sizeof(float)
+                                              : sizeof(uint16_t);
+}
+
 int64_t kv_cache_dtype_size(const std::string& kv_cache_dtype,
                             int64_t model_dtype_size) {
   if (kv_cache_dtype == "auto") {
@@ -606,7 +611,7 @@ Dsv4KVCacheEstimateCost estimate_dsv41_kv_cache_cost(
   const int64_t swa_bytes_per_plain_block = block_size * head_dim * dtype_size;
   // The ratio-2 compressor parks at most the trailing partial group, so its
   // fp32 kv/score ring is fixed to kDsv41CompressStateRows rows per block
-  // (matching vllm-ascend's STATE_RING_ROWS), independent of the engine block
+  // (matching va's STATE_RING_ROWS), independent of the engine block
   // size. Keep this in lockstep with the V4.1 allocation in
   // deepseek_v4_kv_cache_impl.cpp.
   const int64_t swa_bytes_per_c2_block =
@@ -924,8 +929,9 @@ SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
   // window, even when its standalone estimate needs fewer slots or tokens.
   const int64_t draft_tail_len =
       std::max<int64_t>(target_cap.kpool_tail_len(), draft_args.index_kpool());
-  const int64_t draft_slot_bytes = 2 * static_cast<int64_t>(sizeof(uint16_t)) *
-                                   draft_tail_len * draft_args.index_head_dim();
+  const int64_t tail_element_bytes = kpool_tail_element_bytes(draft_args);
+  const int64_t draft_slot_bytes =
+      2 * tail_element_bytes * draft_tail_len * draft_args.index_head_dim();
   draft_cap.num_linear_state_blocks(target_cap.num_linear_state_blocks())
       .kpool_tail_len(draft_tail_len)
       .kpool_tail_slot_size(draft_slot_bytes)
@@ -1078,7 +1084,8 @@ KVCacheCapacity estimate_kv_cache_capacity(
           num_speculative_tokens > 0 ? 2 * (num_speculative_tokens + 1) : 0;
       kv_cache_cap.kpool_tail_len(model_args.index_kpool() + window);
     }
-    kv_cache_cap.kpool_tail_slot_size(2 * sizeof(uint16_t) *
+    const int64_t tail_element_bytes = kpool_tail_element_bytes(model_args);
+    kv_cache_cap.kpool_tail_slot_size(2 * tail_element_bytes *
                                       kv_cache_cap.kpool_tail_len() *
                                       model_args.index_head_dim());
   }

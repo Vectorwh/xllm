@@ -20,6 +20,29 @@ import pytest
 import torch
 
 import xllm.python.models.glm5_next as glm5_next
+from xllm.python.models.glm5_next_vl import Glm5NextVisionConfig, Glm5NextVisionModel
+
+
+@torch.inference_mode()
+def test_vision_final_norm_uses_trained_epsilon() -> None:
+    config = Glm5NextVisionConfig(
+        depth=1,
+        hidden_size=16,
+        num_heads=1,
+        out_hidden_size=16,
+        intermediate_size=32,
+        projection_intermediate_size=32,
+        rms_norm_eps=1e-5,
+    )
+    model = Glm5NextVisionModel(config, dtype=torch.float32, device=torch.device("cpu"))
+    value = torch.full((2, 1, 16), 1e-3)
+    model.post_layernorm.weight.copy_(torch.linspace(-1, 1, 16))
+
+    output = model.post_layernorm(value)
+    expected = value / torch.sqrt(value.square().mean(-1, keepdim=True) + config.rms_norm_eps)
+    expected = expected * model.post_layernorm.weight
+
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])

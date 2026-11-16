@@ -21,10 +21,10 @@ mirroring the qwen3_vl.py structure. The LLM backbone is imported from
 ``glm5_next.py``.
 
 Vision tower (GlmOcr-based):
-  - ``VisionPatchEmbed``: 3D-conv patch projection (no bias).
+  - ``VisionPatchEmbed``: 3D-conv patch projection.
   - ``VisionRotaryEmbedding``: RoPE inv_freq table (half head_dim).
   - ``VisionAttention``: MHA with QK-RMSNorm + RoPE, varlen via cu_seqlens.
-  - ``VisionMLP``: gated MLP (gate_proj / up_proj / down_proj).
+  - ``VisionMLP``: packed gate/up projection and row-parallel down projection.
   - ``VisionBlock``: pre-norm (RMSNorm) transformer block.
   - ``VisionPatchMerger``: proj + LayerNorm + gated MLP, with
     ``context_dim = projection_intermediate_size`` for GLM-5.3-Flash.
@@ -40,20 +40,21 @@ Data flow:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from xllm.python import distributed, kernels
 from xllm.python.layers import ColumnParallelLinear, RowParallelLinear
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.glm5_next import (
     Glm5NextConfig,
     Glm5NextForCausalLM,
     Glm5NextModel,
+    _glm5_next_swiglu,
 )
 from xllm.python.models.multimodal import (
     EncoderOutputs,
@@ -237,19 +238,21 @@ class Glm5NextVisionConfig:
 
 
 class VisionRMSNorm(nn.Module):
-    """RMSNorm matching ``GlmOcrRMSNorm`` (upcast to fp32, weight-only)."""
+    """Weighted RMSNorm with one rounding after FP32 normalization and scaling."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return kernels.fused_add_rms_norm(hidden_states, residual, self.weight, self.variance_epsilon)
+        return kernels.rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
 
 class VisionPatchEmbed(nn.Module):
@@ -282,6 +285,22 @@ class VisionPatchEmbed(nn.Module):
         return hidden_states
 
 
+class VisionPatchDownsample(nn.Conv2d):
+    """Project each spatial merge group with the checkpoint's flattened kernel."""
+
+    def __init__(self, cfg: Glm5NextVisionConfig) -> None:
+        super().__init__(
+            cfg.hidden_size,
+            cfg.out_hidden_size,
+            kernel_size=cfg.spatial_merge_size,
+            stride=cfg.spatial_merge_size,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        projected = F.linear(hidden_states.flatten(1), self.weight.flatten(1), self.bias)
+        return projected.view(-1, self.out_channels, 1, 1)
+
+
 class VisionRotaryEmbedding(nn.Module):
     """inv_freq table for the vision RoPE (half head_dim)."""
 
@@ -291,6 +310,18 @@ class VisionRotaryEmbedding(nn.Module):
         self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply(
+        self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        recurse: bool = True,
+    ) -> VisionRotaryEmbedding:
+        # Model.to(bfloat16) must not round the frequencies before multiplying
+        # by positions. Moving an already rounded table back to FP32 loses data.
+        inv_freq = self.inv_freq
+        super()._apply(fn, recurse)
+        self.inv_freq = inv_freq.to(device=self.inv_freq.device, dtype=torch.float32)
+        return self
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
         return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
@@ -317,6 +348,29 @@ def _apply_rotary_pos_emb_vision(
     return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
 
 
+class VisionRowParallelLinear(RowParallelLinear):
+    """Add the replicated bias once, inside rank zero's local GEMM."""
+
+    def __init__(
+        self,
+        in_features_per_partition: int,
+        out_features: int,
+        tp_size: int,
+        *,
+        tp_rank: int,
+        bias: bool,
+    ) -> None:
+        super().__init__(in_features_per_partition, out_features, tp_size, bias=bias)
+        self.tp_rank = tp_rank
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        bias = self.bias if self.tp_rank == 0 else None
+        output = F.linear(hidden_states, self.weight, bias)
+        if self.tp_size > 1:
+            distributed.tp_all_reduce(output)
+        return output
+
+
 class VisionAttention(nn.Module):
     """MHA with QK-RMSNorm + RoPE, varlen via ``cu_seqlens`` chunking.
 
@@ -324,7 +378,7 @@ class VisionAttention(nn.Module):
     each ``cu_seqlens`` chunk is attended independently (non-causal) and the
     outputs are concatenated. Matches the HF GlmOcr non-flash path.
 
-    TP sharding (mirrors vLLM ``Qwen2VisionAttention``):
+    TP sharding (mirrors va ``Qwen2VisionAttention``):
       - ``qkv``: :class:`ColumnParallelLinear` (output dim sharded, per-head).
         Each rank owns ``num_heads // tp_size`` heads of ALL THREE of q/k/v, so
         the per-partition output is ``3 * num_heads_local * head_dim``. The
@@ -361,10 +415,11 @@ class VisionAttention(nn.Module):
             gather_output=False,
             bias=cfg.attention_bias,
         )
-        self.proj = RowParallelLinear(
+        self.proj = VisionRowParallelLinear(
             self.num_heads_local * self.head_dim,
             self.dim,
             cfg.tp_size,
+            tp_rank=cfg.tp_rank,
             bias=cfg.attention_bias,
         )
         self.scaling = self.head_dim**-0.5
@@ -390,33 +445,15 @@ class VisionAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
-        # Varlen attention via per-chunk SDPA loop (matches HF
-        # transformers.models.glm_ocr bit-identically; the npu_fusion_attention
-        # fused path drifted ~0.998 on the full ViT so it is intentionally not
-        # used -- see the standalone precision harness in vit_precision/).
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
-
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        split_sizes = lengths.tolist()
-        q_chunks = torch.split(query_states, split_sizes, dim=2)
-        k_chunks = torch.split(key_states, split_sizes, dim=2)
-        v_chunks = torch.split(value_states, split_sizes, dim=2)
-
-        attn_outputs = []
-        for q, k, v in zip(q_chunks, k_chunks, v_chunks):
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-            )
-            attn_outputs.append(attn_out.transpose(1, 2))
-        attn_output = torch.cat(attn_outputs, dim=1)
-
+        attn_output = kernels.packed_infer_attention(
+            query_states.contiguous(),
+            key_states.contiguous(),
+            value_states.contiguous(),
+            actual_seq_lengths=cu_seqlens[1:].tolist(),
+            num_heads=self.num_heads_local,
+            num_key_value_heads=self.num_heads_local,
+            scale=self.scaling,
+        )
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
         return attn_output
@@ -425,7 +462,7 @@ class VisionAttention(nn.Module):
 class VisionMLP(nn.Module):
     """Gated MLP: down_proj(act_fn(gate_proj(x)) * up_proj(x)).
 
-    TP sharding (mirrors vLLM ``Qwen2VisionMLP``): ``gate_proj``/``up_proj``
+    TP sharding (mirrors va ``Qwen2VisionMLP``): packed gate/up outputs
     are :class:`ColumnParallelLinear` (intermediate dim sharded, each rank owns
     ``intermediate_size // tp_size`` channels); ``down_proj`` is
     :class:`RowParallelLinear` (input dim sharded, all-reduced to the full
@@ -439,22 +476,17 @@ class VisionMLP(nn.Module):
             f"vision intermediate_size {cfg.intermediate_size} not divisible by tp_size {cfg.tp_size}"
         )
         inter_local = cfg.intermediate_size // cfg.tp_size
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = ColumnParallelLinear(
             cfg.hidden_size,
-            inter_local,
+            2 * inter_local,
             cfg.tp_size,
             bias=bias,
         )
-        self.up_proj = ColumnParallelLinear(
-            cfg.hidden_size,
-            inter_local,
-            cfg.tp_size,
-            bias=bias,
-        )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = VisionRowParallelLinear(
             inter_local,
             cfg.hidden_size,
             cfg.tp_size,
+            tp_rank=cfg.tp_rank,
             bias=bias,
         )
         if cfg.hidden_act == "silu":
@@ -470,8 +502,10 @@ class VisionMLP(nn.Module):
         self.swiglu_limit = cfg.swiglu_limit
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(hidden_state)
-        up = self.up_proj(hidden_state)
+        gate_up = self.gate_up_proj(hidden_state)
+        if self.act_fn is F.silu:
+            return self.down_proj(_glm5_next_swiglu(gate_up, self.swiglu_limit))
+        gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(min=None, max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return self.down_proj(self.act_fn(gate) * up)
@@ -482,6 +516,7 @@ class VisionBlock(nn.Module):
 
     def __init__(self, cfg: Glm5NextVisionConfig) -> None:
         super().__init__()
+        # Block and final tower norms use the checkpoint's vision epsilon.
         self.norm1 = VisionRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.norm2 = VisionRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.attn = VisionAttention(cfg)
@@ -493,13 +528,13 @@ class VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
+        attn_output = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
+        normalized, residual = self.norm2(hidden_states, residual=attn_output)
+        return residual + self.mlp(normalized)
 
 
 class VisionPatchMerger(nn.Module):
@@ -510,15 +545,10 @@ class VisionPatchMerger(nn.Module):
     For GLM-5.3-Flash: ``dim = out_hidden_size``, ``context_dim =
     projection_intermediate_size``, ``bias = False``.
 
-    TP sharding (mirrors vLLM ``Qwen2VisionPatchMerger``): ``proj`` (dim->dim,
-    small) and ``post_projection_norm`` stay REPLICATED; ``gate_proj``/
-    ``up_proj`` are :class:`ColumnParallelLinear` (context_dim sharded, each
-    rank owns ``context_dim // tp_size`` channels); ``down_proj`` is
-    :class:`RowParallelLinear` (input dim sharded, all-reduced to the full
-    ``dim``). The all-reduced ``down_proj`` output is full-``dim`` so the merger
-    output can scatter into the LLM input embeds exactly as the replicated path.
-    At ``tp_size==1`` the parallel layers hold full weights and skip their
-    collectives, so the path is byte-identical to ``nn.Linear``.
+    The first projection is column-sharded and gathered before LayerNorm.
+    Gate/up are packed and column-sharded; down_proj is row-sharded and
+    reduced. These GEMM shapes and the bias placement are part of the BF16
+    arithmetic contract used by the GLM reference implementation.
     """
 
     def __init__(
@@ -529,15 +559,15 @@ class VisionPatchMerger(nn.Module):
         bias: bool = False,
         tp_size: int = 1,
         swiglu_limit: float = 10.0,
+        tp_rank: int = 0,
     ) -> None:
         super().__init__()
         assert context_dim % tp_size == 0, f"merger context_dim {context_dim} not divisible by tp_size {tp_size}"
-        self.proj = nn.Linear(dim, dim, bias=bias)
+        self.proj = ColumnParallelLinear(dim, dim // tp_size, tp_size, gather_output=True, bias=bias)
         self.post_projection_norm = nn.LayerNorm(dim)
         context_local = context_dim // tp_size
-        self.gate_proj = ColumnParallelLinear(dim, context_local, tp_size, bias=bias)
-        self.up_proj = ColumnParallelLinear(dim, context_local, tp_size, bias=bias)
-        self.down_proj = RowParallelLinear(context_local, dim, tp_size, bias=bias)
+        self.gate_up_proj = ColumnParallelLinear(dim, 2 * context_local, tp_size, bias=bias)
+        self.down_proj = VisionRowParallelLinear(context_local, dim, tp_size, tp_rank=tp_rank, bias=bias)
         self.act1 = nn.GELU()
         if hidden_act == "silu":
             self.act_fn = F.silu
@@ -551,8 +581,10 @@ class VisionPatchMerger(nn.Module):
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         hidden_state = self.proj(hidden_state)
         hidden_state = self.act1(self.post_projection_norm(hidden_state))
-        gate = self.gate_proj(hidden_state)
-        up = self.up_proj(hidden_state)
+        gate_up = self.gate_up_proj(hidden_state)
+        if self.act_fn is F.silu:
+            return self.down_proj(_glm5_next_swiglu(gate_up, self.swiglu_limit))
+        gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(min=None, max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
         return self.down_proj(self.act_fn(gate) * up)
@@ -614,7 +646,7 @@ class Glm5NextVisionModel(nn.Module):
         # GLM-5.3-Flash merger: context_dim from projection_intermediate_size if
         # set, else fall back to GlmOcr base (out_hidden_size * in_channels).
         # bias=False matches the SGLang adaptation. Pass tp_size so the
-        # gate/up/down projections shard per the vLLM Qwen2VisionPatchMerger map.
+        # gate/up/down projections shard per the va Qwen2VisionPatchMerger map.
         self.merger = VisionPatchMerger(
             dim=cfg.out_hidden_size,
             context_dim=cfg.merger_context_dim(),
@@ -622,13 +654,10 @@ class Glm5NextVisionModel(nn.Module):
             bias=False,
             tp_size=cfg.tp_size,
             swiglu_limit=cfg.swiglu_limit,
+            tp_rank=cfg.tp_rank,
         )
-        self.downsample = nn.Conv2d(
-            in_channels=cfg.hidden_size,
-            out_channels=cfg.out_hidden_size,
-            kernel_size=cfg.spatial_merge_size,
-            stride=cfg.spatial_merge_size,
-        )
+        self.downsample = VisionPatchDownsample(cfg)
+        # Keep the final norm consistent with the configured block norms.
         self.post_layernorm = VisionRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
         self.to(dtype=dtype, device=device)
@@ -654,7 +683,7 @@ class Glm5NextVisionModel(nn.Module):
         hidden_states = self.patch_embed(hidden_states)
         rotary_emb = self.rotary_pos_emb(position_ids)
         emb = torch.cat((rotary_emb, rotary_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (emb.cos().to(hidden_states.dtype), emb.sin().to(hidden_states.dtype))
 
         for blk in self.blocks:
             hidden_states = blk(
@@ -754,11 +783,19 @@ class Glm5NextVisionModel(nn.Module):
             # attn.qkv: ColumnParallelLinear — shard the merged qkv per-head.
             copy_in(p + "attn.qkv.weight", shard_qkv(load_tensor(p + "attn.qkv.weight")))
             # attn.proj: RowParallelLinear — shard the INPUT dim (dim 1); the
-            # bias is replicated (full out) and added once after all-reduce.
+            # The replicated output bias is included in rank zero's GEMM.
             copy_in(p + "attn.proj.weight", shard(load_tensor(p + "attn.proj.weight"), dim=1))
             # mlp.gate/up: ColumnParallelLinear — shard the intermediate (dim 0).
-            copy_in(p + "mlp.gate_proj.weight", shard(load_tensor(p + "mlp.gate_proj.weight"), dim=0))
-            copy_in(p + "mlp.up_proj.weight", shard(load_tensor(p + "mlp.up_proj.weight"), dim=0))
+            copy_in(
+                p + "mlp.gate_up_proj.weight",
+                torch.cat(
+                    (
+                        shard(load_tensor(p + "mlp.gate_proj.weight"), dim=0),
+                        shard(load_tensor(p + "mlp.up_proj.weight"), dim=0),
+                    ),
+                    dim=0,
+                ),
+            )
             # mlp.down_proj: RowParallelLinear — shard the input dim (dim 1);
             # bias replicated.
             copy_in(p + "mlp.down_proj.weight", shard(load_tensor(p + "mlp.down_proj.weight"), dim=1))
@@ -768,8 +805,16 @@ class Glm5NextVisionModel(nn.Module):
                 # RowParallel (proj, down_proj) biases are replicated.
                 copy_in(p + "attn.qkv.bias", shard_qkv(load_tensor(p + "attn.qkv.bias")))
                 copy_in(p + "attn.proj.bias", load_tensor(p + "attn.proj.bias"))
-                copy_in(p + "mlp.gate_proj.bias", shard(load_tensor(p + "mlp.gate_proj.bias"), dim=0))
-                copy_in(p + "mlp.up_proj.bias", shard(load_tensor(p + "mlp.up_proj.bias"), dim=0))
+                copy_in(
+                    p + "mlp.gate_up_proj.bias",
+                    torch.cat(
+                        (
+                            shard(load_tensor(p + "mlp.gate_proj.bias"), dim=0),
+                            shard(load_tensor(p + "mlp.up_proj.bias"), dim=0),
+                        ),
+                        dim=0,
+                    ),
+                )
                 copy_in(p + "mlp.down_proj.bias", load_tensor(p + "mlp.down_proj.bias"))
 
         # post_layernorm (RMSNorm, replicated).
@@ -779,14 +824,22 @@ class Glm5NextVisionModel(nn.Module):
         copy_in("downsample.weight", load_tensor("downsample.weight"))
         copy_in("downsample.bias", load_tensor("downsample.bias"))
 
-        # merger: proj (nn.Linear dim->dim) + post_projection_norm (LayerNorm)
-        # stay REPLICATED; gate/up (ColumnParallel) shard dim 0; down_proj
-        # (RowParallel) shards dim 1. bias=False for GLM-5.3-Flash so no biases.
-        copy_in("merger.proj.weight", load_tensor("merger.proj.weight"))
+        # Merger proj is column-sharded and gathered before LayerNorm; gate/up
+        # are packed from separately sharded checkpoint tensors. Down projection
+        # shards dim 1. The GLM merger has no projection biases.
+        copy_in("merger.proj.weight", shard(load_tensor("merger.proj.weight"), dim=0))
         copy_in("merger.post_projection_norm.weight", load_tensor("merger.post_projection_norm.weight"))
         copy_in("merger.post_projection_norm.bias", load_tensor("merger.post_projection_norm.bias"))
-        copy_in("merger.gate_proj.weight", shard(load_tensor("merger.gate_proj.weight"), dim=0))
-        copy_in("merger.up_proj.weight", shard(load_tensor("merger.up_proj.weight"), dim=0))
+        copy_in(
+            "merger.gate_up_proj.weight",
+            torch.cat(
+                (
+                    shard(load_tensor("merger.gate_proj.weight"), dim=0),
+                    shard(load_tensor("merger.up_proj.weight"), dim=0),
+                ),
+                dim=0,
+            ),
+        )
         copy_in("merger.down_proj.weight", shard(load_tensor("merger.down_proj.weight"), dim=1))
 
         # ViT RowParallelLinear: do NOT call ``process_weights_after_loading``
@@ -881,27 +934,9 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # (which default to float32 inside Glm5NextModel) are bf16 like the rest.
         self.to(device=device, dtype=dtype)
 
-        # Rotation-quantized checkpoints (QuaRot-style) fold a hidden-space
-        # orthogonal transform T into every LLM weight (embed/lm_head/linear
-        # matrices; norm weights are invariant), leaving the model functionally
-        # identical for TEXT but changing the hidden basis. The ViT is NOT
-        # rotated, so its image embeddings must be mapped into the rotated
-        # basis (image_embeds @ T) before being scattered into the LLM input —
-        # without this the LLM receives basis-mismatched image features and
-        # hallucinates. The transform ships with the checkpoint itself
-        # (optional/quarot.safetensors, key "global_rotation"): its presence
-        # declares the checkpoint rotation-quantized. Unrotated checkpoints
-        # (bf16) have no such file and skip this.
-        self._hidden_rot = None
-        _model_dir = config.get("model_path")
-        _rot_path = os.path.join(_model_dir, "optional", "quarot.safetensors") if _model_dir else None
-        if _rot_path and os.path.exists(_rot_path):
-            from safetensors.torch import load_file as _load_sf
-
-            _sd = _load_sf(_rot_path)
-            if "global_rotation" not in _sd:
-                raise RuntimeError(f"{_rot_path} has no 'global_rotation' key")
-            self._hidden_rot = _sd["global_rotation"].to(device=device, dtype=dtype)
+        # ModelSlim exports the hidden-space rotation in merger.down_proj.
+        # The optional QuaRot tensor is quantization metadata; applying it here
+        # would rotate image and video embeddings a second time.
 
     # ------------------------------------------------------------------
     # Connection logic: ViT → LLM
@@ -927,12 +962,7 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         return out.pooler_output
 
     def encode_multimodal(self, data: MultimodalData, token_counts: EncoderTokenCounts) -> EncoderOutputs:
-        return encode_batched_vision(self.encode, data, token_counts, transform=self._rotate_features)
-
-    def _rotate_features(self, features: torch.Tensor) -> torch.Tensor:
-        if self._hidden_rot is None:
-            return features
-        return features @ self._hidden_rot
+        return encode_batched_vision(self.encode, data, token_counts)
 
     def prepare_multimodal_inputs(self, input_ids: torch.Tensor, data: MultimodalData) -> MultimodalInputs:
         return MultimodalInputs(merge_multimodal_embeddings(self.language_model.embed_tokens(input_ids), data))
@@ -958,7 +988,7 @@ class Glm5NextVLModel(Glm5NextForCausalLM):
         # 1. Vision tower — TP-sharded per rank (reads self.cfg.tp_size /
         #    tp_rank set in __init__ from the flat ModelArgs). Conv + norms +
         #    merger.proj stay replicated; qkv/proj/gate/up/down shard per the
-        #    vLLM Qwen2-VL ViT map (see Glm5NextVisionModel.load_weights).
+        #    va Qwen2-VL ViT map (see Glm5NextVisionModel.load_weights).
         self.vision_model.load_weights(state_dicts, prefix="model.visual.")
 
         # 2. LLM + lm_head: delegate to the full Glm5NextForCausalLM loader

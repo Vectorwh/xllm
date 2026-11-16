@@ -254,9 +254,7 @@ def test_fg_batched_weights_reuse_storage_across_reloads() -> None:
 
 @pytest.mark.parametrize("batch_size,seq_len", [(1, 1), (1, 17), (3, 4)])
 @torch.inference_mode()
-def test_fg_batched_projection_matches_separate_inputs(
-    batch_size: int, seq_len: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_fg_projection_matches_separate_inputs(batch_size: int, seq_len: int) -> None:
     model, _ = _make_model(2, 1)
     attention = model.model.layers[0].self_attn
     projected = attention.in_proj_qkvbfg_a(torch.randn(batch_size, seq_len, model.cfg.hidden_size))
@@ -267,16 +265,7 @@ def test_fg_batched_projection_matches_separate_inputs(
         attention.forget_gate.raw_projection(forget_latent),
         attention.g_b_proj(output_latent).view(hidden_shape),
     )
-    bmm_calls = []
-    original_bmm = torch.bmm
-
-    def _bmm(inputs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        bmm_calls.append(inputs.shape)
-        return original_bmm(inputs, weights)
-
-    monkeypatch.setattr(torch, "bmm", _bmm)
     torch.testing.assert_close(attention._project_fg(latents), expected)
-    assert bmm_calls == [torch.Size((2, batch_size * seq_len, attention.head_dim))]
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 8])
@@ -408,6 +397,42 @@ def test_merged_qkv_strides_preserve_causal_conv_and_state(
 @pytest.fixture(scope="module")
 def npu_runtime() -> ModuleType:
     return pytest.importorskip("torch_npu")
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@pytest.mark.parametrize("seq_len", [1, 412])
+@torch.inference_mode()
+def test_fg_native_bf16_rounding_and_graph_replay(npu_runtime: ModuleType, seq_len: int) -> None:
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    config = glm5_next.Glm5NextConfig(hidden_size=32, kda_num_heads=64, kda_head_dim=128, tp_size=8)
+    attention = glm5_next.Glm5NextKdaAttention(config, 0, torch.bfloat16, device).to(
+        device=device, dtype=torch.bfloat16
+    )
+    generator = torch.Generator().manual_seed(42)
+    for weight in (attention.forget_gate.f_b_proj.weight, attention.g_b_proj.weight):
+        weight.copy_(torch.randn(weight.shape, generator=generator))
+    attention.process_weights_after_loading()
+    # Match the strided F/G slice of the merged QKV/B/F/G projection at TP8.
+    projected = torch.randn(1, seq_len, 3336, generator=generator).to(device=device, dtype=torch.bfloat16)
+    latents = projected[..., -256:]
+
+    def _reference() -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            functional.linear(latents[..., :128].reshape(-1, 128), attention.forget_gate.f_b_proj.weight),
+            functional.linear(latents[..., 128:].reshape(-1, 128), attention.g_b_proj.weight),
+        )
+
+    attention._project_fg(latents)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = attention._project_fg(latents)
+    graph.replay()
+    for _ in range(2):
+        for actual, expected in zip(output, _reference()):
+            torch.testing.assert_close(actual.reshape_as(expected), expected, rtol=0, atol=0)
+        latents.add_(0.125)
+        graph.replay()
 
 
 @pytest.fixture(scope="module")

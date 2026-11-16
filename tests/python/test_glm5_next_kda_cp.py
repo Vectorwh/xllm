@@ -1276,7 +1276,7 @@ def _forward_test_attention(enable_kda_cp: bool = True) -> glm5_next.Glm5NextKda
     )
     attention.input_projection_sizes = (3, 1, 2)
     attention.forget_gate = SimpleNamespace(
-        raw_projection=lambda hidden: hidden.unsqueeze(-1),
+        f_b_proj=lambda hidden: hidden,
         safe_gate_lower_bound=-5.0,
         gate_from_raw=lambda raw: -0.5 * torch.sigmoid(raw),
     )

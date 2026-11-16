@@ -47,11 +47,7 @@ from xllm.python.models.glm5_next_kpool import read_pools
 # The stub is removed again after the imports below so the rest of the
 # pytest session sees the true absence -- including glm5_next's own
 # module-level reference: its try/except binds either the real module or
-# None, and leaving it bound to the stub would make
-# ``_load_compact_kpool_update_op``'s ``torch_npu is None`` capability
-# check falsely pass on hosts without torch_npu, driving far-away failures
-# in the Triton kpool loader. Restoring None keeps the fresh-process
-# semantics for every later collector in the same session.
+# None. Restore that binding so later tests retain fresh-process semantics.
 try:
     import torch_npu  # noqa: F401
 
@@ -375,7 +371,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
         dim=-1,
     )
     attention.input_projection_sizes = (3, 1, 2)
-    attention.forget_gate = SimpleNamespace(raw_projection=lambda hidden: hidden.unsqueeze(-1) * 10)
+    attention.forget_gate = SimpleNamespace(f_b_proj=lambda hidden: hidden * 10)
     attention.g_b_proj = lambda hidden: hidden * 100
     attention._fg_b_weight = None
     attention.o_norm = MagicMock(side_effect=lambda core, gate: core + gate)
@@ -432,7 +428,7 @@ def test_kda_cp_one_keeps_full_postprocessing() -> None:
         dim=-1,
     )
     attention.input_projection_sizes = (3, 1, 2)
-    attention.forget_gate = SimpleNamespace(raw_projection=lambda hidden: hidden.unsqueeze(-1) * 10)
+    attention.forget_gate = SimpleNamespace(f_b_proj=lambda hidden: hidden * 10)
     attention.g_b_proj = lambda hidden: hidden * 100
     attention._fg_b_weight = None
     attention.o_norm = MagicMock(side_effect=lambda core, gate: core + gate)
@@ -971,8 +967,6 @@ def _make_simple_indexer() -> glm5_next.Glm5NextIndexer:
     indexer.index_kpool_compress = False
     indexer.index_kpool_always_select_tail = False
     indexer._uses_npu_compressed_tail = False
-    indexer._update_compact_kpool = None
-    indexer._compact_kpool_model_compatible = False
     indexer.softmax_scale = 1.0
     indexer.wq_b = nn.Linear(1, 1, bias=False)
     indexer.wk = nn.Linear(1, 1, bias=False)
@@ -981,7 +975,8 @@ def _make_simple_indexer() -> glm5_next.Glm5NextIndexer:
         with torch.no_grad():
             module.weight.fill_(1.0)
     indexer.k_norm = nn.Identity()
-    indexer.register_buffer("_wk_weights_weight", None, persistent=False)
+    indexer.register_buffer("_wk_weight", None, persistent=False)
+    indexer.register_buffer("_head_weight_f32", None, persistent=False)
     indexer.index_kpool_compress_ape = torch.zeros(1, 1)
     indexer.index_kpool_compress_gate = torch.zeros(1, 1)
     return indexer
@@ -1776,7 +1771,7 @@ def _make_kda_attention_for_cross_rank_test() -> glm5_next.Glm5NextKdaAttention:
         dim=-1,
     )
     attention.input_projection_sizes = (3, 1, 2)
-    attention.forget_gate = SimpleNamespace(raw_projection=lambda hidden: hidden.unsqueeze(-1) * 10)
+    attention.forget_gate = SimpleNamespace(f_b_proj=lambda hidden: hidden * 10)
     attention.g_b_proj = lambda hidden: hidden * 100
     attention._fg_b_weight = None
     attention.o_norm = MagicMock(side_effect=lambda core, gate: core + gate)
@@ -1787,7 +1782,7 @@ def _make_kda_attention_for_cross_rank_test() -> glm5_next.Glm5NextKdaAttention:
 def _make_kda_attention_for_handoff_test() -> glm5_next.Glm5NextKdaAttention:
     """Real ``Glm5NextKdaAttention`` driven through the real backend, unlike
     ``_make_kda_attention_for_cross_rank_test`` (mocked backend). Needs a real
-    ``forget_gate`` (``raw_projection``/``gate_from_raw``) and conv weights
+    ``forget_gate`` (``f_b_proj``/``gate_from_raw``) and conv weights
     because ``execute_linear`` calls them for real."""
     attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
     nn.Module.__init__(attention)
@@ -1810,7 +1805,7 @@ def _make_kda_attention_for_handoff_test() -> glm5_next.Glm5NextKdaAttention:
     )
     attention.input_projection_sizes = (3, 1, 2)
     attention.forget_gate = SimpleNamespace(
-        raw_projection=lambda hidden: hidden.unsqueeze(-1),
+        f_b_proj=lambda hidden: hidden,
         safe_gate_lower_bound=None,
         gate_from_raw=lambda raw: -0.5 * torch.sigmoid(raw),
     )
@@ -2355,8 +2350,6 @@ def _make_compressed_indexer() -> glm5_next.Glm5NextIndexer:
     indexer.index_kpool_compress = True
     indexer.index_kpool_always_select_tail = True
     indexer._uses_npu_compressed_tail = True
-    indexer._update_compact_kpool = None
-    indexer._compact_kpool_model_compatible = False
     indexer.index_kpool_compress_ape = torch.zeros(2, 1)
     return indexer
 

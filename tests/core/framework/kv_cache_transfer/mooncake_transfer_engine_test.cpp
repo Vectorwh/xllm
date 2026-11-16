@@ -711,18 +711,15 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 #if defined(USE_NPU)
-constexpr char kIntraHostNpuResourceConfig[] =
-    R"({"comm_resource_config.protocol_desc":"hccs:device"})";
-
-// Keep same-host NPU tests on HCCS with manual connection instead of depending
-// on RoCE device IPs or HIXL auto-connect probing. Construct before launching
-// child processes; their inherited environment stays pinned until scope exit.
+// Use the default HCCL resource discovery for same-host HCCS transfers.
+// An explicit global resource config selects HIXL endpoint discovery, which
+// requires device IPs even when the test only needs an intra-host connection.
+// Child processes inherit these settings until scope exit.
 class ScopedIntraHostNpuTransferEnv final {
  public:
   ScopedIntraHostNpuTransferEnv() {
-    ok_ = resource_config_.set(kIntraHostNpuResourceConfig) &&
-          intra_roce_.set("0") && intra_pcie_.set("0") &&
-          auto_connect_.set("0");
+    ok_ = resource_config_.set("") && intra_roce_.set("0") &&
+          intra_pcie_.set("0") && auto_connect_.set("0");
   }
 
   ScopedIntraHostNpuTransferEnv(const ScopedIntraHostNpuTransferEnv&) = delete;

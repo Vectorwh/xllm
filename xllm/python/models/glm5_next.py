@@ -43,14 +43,12 @@ reference forward).
 
 from __future__ import annotations
 
-import functools
-import importlib.util
 import math
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -64,7 +62,7 @@ except ImportError:
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.attention.kda_linear_attention import kda_cp_prefill_eligible
-from xllm.python.layers.moe import MoECore, clamped_silu_and_mul
+from xllm.python.layers.moe import MoECore, clamped_silu_and_mul, clamped_silu_and_mul_fp32
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.glm5_next_metadata import Glm5NextEplv2Metadata
 from xllm.python.model_executor.cp_utils import (
@@ -83,34 +81,6 @@ from xllm.python.model_executor.forward_context import (
     wait_for_layer_load,
 )
 
-
-@functools.cache
-def _load_compact_kpool_update_op() -> Callable[..., None] | None:
-    """Load the NPU-only compact KPool updater without affecting other backends."""
-    if torch_npu is None or importlib.util.find_spec("triton") is None:
-        return None
-    from xllm.python.kernels_npu.triton.kpool_compress import (
-        _launch_compact_kpool,
-    )
-
-    return _launch_compact_kpool
-
-
-def _compact_kpool_triton_query_len(
-    query_lens: Sequence[int],
-    rate: int,
-) -> int | None:
-    """Resolve a uniform width; the caller also checks compact-tail capacity."""
-    if not query_lens:
-        return None
-    query_len = int(query_lens[0])
-    if rate <= 0 or query_len <= 0:
-        return None
-    if any(int(length) != query_len for length in query_lens[1:]):
-        return None
-    return query_len
-
-
 # Per-chunk cap (bytes) for the indexer scores slab [B, sub, n_heads, n_pools]
 # in Glm5NextIndexer.select_topk. The unchunked tensor grows with n_pools
 # (= kv_len / index_kpool): 8 GiB at 32K context, 16 GiB at 64K — beyond the
@@ -128,6 +98,7 @@ _fused_kpool_warned = False
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.glm5_next_kpool import (
     append_causal_tail,
+    prepare_fused_kpool_states,
     read_pools,
     update_compressed_kpool,
 )
@@ -715,13 +686,13 @@ class Glm5NextKdaAttention(Attention):
         self.g_b_proj.weight.data = self._fg_b_weight[1]
 
     def _project_fg(self, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Batch the two distinct F/G inputs as in SGLang's batched linear."""
+        """Preserve the independent F/G GEMMs' native BF16 rounding."""
         hidden_shape = (*latents.shape[:2], self.num_heads_local, self.head_dim)
-        if self._fg_b_weight is None:
-            forget_latent, output_latent = latents.split(self.head_dim, dim=-1)
-            return self.forget_gate.raw_projection(forget_latent), self.g_b_proj(output_latent).view(hidden_shape)
-        projected = torch.bmm(latents.view(-1, 2, self.head_dim).transpose(0, 1), self._fg_b_weight.transpose(-1, -2))
-        return projected[0].view(hidden_shape), projected[1].view(hidden_shape)
+        forget_latent, output_latent = latents.reshape(-1, 2 * self.head_dim).split(self.head_dim, dim=-1)
+        return (
+            self.forget_gate.f_b_proj(forget_latent).view(hidden_shape),
+            self.g_b_proj(output_latent).view(hidden_shape),
+        )
 
     def forward(
         self,
@@ -967,6 +938,19 @@ def _kpool_logical_state_indices(
     return _collapse(read_indices), _collapse(write_indices)
 
 
+def _kpool_attention_mask_all_valid(attention_mask: torch.Tensor) -> bool:
+    """Read the shared indexer mask once per forward and token layout."""
+    context = get_forward_context_or_none()
+    if context is None:
+        return bool(attention_mask.all().item())
+    # Indexer masks are batch metadata shared by all layers. Keep the shape
+    # in the key so a trimmed real-token prefix cannot reuse a padded result.
+    key = (_kpool_attention_mask_all_valid, attention_mask.shape)
+    if key not in context.layer_shared_cache:
+        context.layer_shared_cache[key] = bool(attention_mask.all().item())
+    return cast(bool, context.layer_shared_cache[key])
+
+
 def _kpool_valid_rows(attention_mask: torch.Tensor, slot_mapping: torch.Tensor) -> torch.Tensor:
     """Exclude padding and speculative placeholder rows from KPool updates."""
     if slot_mapping.numel() != attention_mask.numel():
@@ -1008,18 +992,21 @@ class Glm5NextIndexer(nn.Module):
                     f"({self.index_kpool}); using the dense kPool indexer."
                 )
         self._uses_npu_compressed_tail = (
-            device.type in ("npu", "privateuseone")
+            device.type == "npu"
             and self.index_kpool > 1
             and self.index_kpool_compress
             and self.index_kpool_always_select_tail
         )
-        self._update_compact_kpool = _load_compact_kpool_update_op() if self._uses_npu_compressed_tail else None
         self.softmax_scale = self.head_dim**-0.5
         self.wq_b = nn.Linear(cfg.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(cfg.hidden_size, self.n_heads, bias=False)
-        self.register_buffer("_wk_weights_weight", None, persistent=False)
+        self.register_buffer("_wk_weight", None, persistent=False)
+        self.register_buffer("_head_weight_f32", None, persistent=False)
+        self.register_buffer("_kpool_norm_weight_f32", None, persistent=False)
+        self.register_buffer("_kpool_norm_bias_f32", None, persistent=False)
+        self.register_buffer("_kpool_ape_f32", None, persistent=False)
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=dtype, device=device)
         )
@@ -1028,27 +1015,49 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(self.head_dim, cfg.hidden_size, dtype=dtype, device=device)
         )
-        self._compact_kpool_model_compatible = (
-            self._update_compact_kpool is not None
-            and dtype == torch.bfloat16
-            and self.index_kpool_compress_ape.is_contiguous()
-        )
 
     def process_weights_after_loading(self) -> None:
-        prev_weight = self._wk_weights_weight
-        self._wk_weights_weight = None
-        if self.wk.weight.dtype != self.weights_proj.weight.dtype:
-            return
-        packed = torch.cat((self.wk.weight.detach(), self.weights_proj.weight.detach()), dim=0)
-        self._wk_weights_weight = _stable_pack(prev_weight, packed)
-        self.wk.weight.data = self._wk_weights_weight[: self.head_dim]
-        self.weights_proj.weight.data = self._wk_weights_weight[self.head_dim :]
+        self._head_weight_f32 = _stable_pack(
+            self._head_weight_f32, self.weights_proj.weight.detach().float().contiguous()
+        )
+        self._kpool_norm_weight_f32 = _stable_pack(
+            self._kpool_norm_weight_f32, self.k_norm.weight.detach().float().contiguous()
+        )
+        self._kpool_norm_bias_f32 = _stable_pack(
+            self._kpool_norm_bias_f32, self.k_norm.bias.detach().float().contiguous()
+        )
+        self._kpool_ape_f32 = _stable_pack(
+            self._kpool_ape_f32, self.index_kpool_compress_ape.detach().float().contiguous()
+        )
+        self._wk_weight = _stable_pack(self._wk_weight, self.wk.weight.detach().contiguous())
+        self.wk.weight.data = self._wk_weight
+
+    def _kpool_fp32_parameters(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reuse graph-stable FP32 parameters for compressed KPool updates."""
+        weight = self._kpool_norm_weight_f32
+        bias = self._kpool_norm_bias_f32
+        ape = self._kpool_ape_f32
+        return (
+            self.k_norm.weight.float() if weight is None else weight,
+            self.k_norm.bias.float() if bias is None else bias,
+            self.index_kpool_compress_ape.float() if ape is None else ape,
+        )
+
+    def _project_head_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The GLM KPool head weights use an FP32 GEMM followed by one BF16
+        # conversion. A BF16 projection changes score ties and therefore the
+        # order in which sparse attention accumulates the selected keys.
+        head_weight = self._head_weight_f32
+        if head_weight is None:
+            head_weight = self.weights_proj.weight.float()
+        return F.linear(hidden_states.float(), head_weight).to(hidden_states.dtype)
 
     def _project_key_weights(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._wk_weights_weight is None:
-            return self.wk(hidden_states), self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype))
-        projected = F.linear(hidden_states, self._wk_weights_weight)
-        return projected.split((self.head_dim, self.n_heads), dim=-1)
+        weights = self._project_head_weights(hidden_states)
+        if self._wk_weight is None:
+            return self.wk(hidden_states), weights
+        projected = F.linear(hidden_states, self._wk_weight)
+        return projected, weights
 
     def get_pooled_states(self, packed_states: torch.Tensor, key_valid: torch.Tensor):
         pool_keys, pool_indices, pool_valid = _kpool_pooled_states(
@@ -1313,11 +1322,7 @@ class Glm5NextIndexer(nn.Module):
                 else:
                     key_valid = packed_states[..., -1].gt(0)
 
-        weights = (
-            self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype))
-            if projected_weights is None
-            else projected_weights
-        )
+        weights = self._project_head_weights(hidden_states) if projected_weights is None else projected_weights
         if (
             self.index_kpool_compress
             and q.device.type == "npu"
@@ -1326,7 +1331,7 @@ class Glm5NextIndexer(nn.Module):
             and pool_block_table is not None
         ):
             try:
-                scaled_weights = (weights * (self.n_heads**-0.5)).to(q.dtype)
+                scaled_weights = (weights * (self.softmax_scale * self.n_heads**-0.5)).to(q.dtype)
                 fused_indices = self._select_topk_fused_pa(
                     q,
                     scaled_weights,
@@ -1528,7 +1533,7 @@ class Glm5NextIndexer(nn.Module):
             self._uses_npu_compressed_tail
             and ctx.kpool_tail is not None
             and ctx.kpool_tail.ndim == 4
-            and ctx.kpool_tail.dtype == torch.bfloat16
+            and ctx.kpool_tail.dtype in (torch.bfloat16, torch.float32)
         )
         kpool_query_lens = _kpool_update_query_lens(ctx, num_tokens) if uses_compressed_tail else None
         query_lens_device = getattr(ctx, "kpool_query_lens_device", None)
@@ -1558,10 +1563,12 @@ class Glm5NextIndexer(nn.Module):
         kpool_kv_lens = ctx.actual_seq_kv.reshape(-1).to(torch.int64)
         if kpool_query_lens is not None:
             kpool_block_table, kpool_kv_lens = _kpool_logical_rows(
-                kpool_block_table,
-                kpool_kv_lens,
-                kpool_query_lens,
-                query_lens_device,
+                kpool_block_table, kpool_kv_lens, kpool_query_lens, query_lens_device
+            )
+            if ctx.kpool_tail_read_indices is None or ctx.kpool_tail_write_indices is None:
+                raise RuntimeError("compressed kPool requires linear-state read/write indices")
+            kpool_tail_read_indices, kpool_tail_write_indices = _kpool_logical_state_indices(
+                ctx.kpool_tail_read_indices, ctx.kpool_tail_write_indices, kpool_query_lens, query_lens_device
             )
         # Shard-aware index cache (kv_split_size > 1 under CP): the write below
         # needs a page table expanded to one column per physical pool page,
@@ -1601,16 +1608,19 @@ class Glm5NextIndexer(nn.Module):
             # a table it immediately discards -- and the ctx stubs of the
             # non-compressed structural tests carry no localize hook.
             pool_write_block_table = ctx.localize_pool_block_table(kpool_block_table)
-            raw_k, gate_scores = self.get_kpool_states(hidden_states, key)
-            if uses_compressed_tail:
-                if ctx.kpool_tail_read_indices is None or ctx.kpool_tail_write_indices is None:
-                    raise RuntimeError("compressed kPool requires linear-state read/write indices")
-                kpool_tail_read_indices, kpool_tail_write_indices = _kpool_logical_state_indices(
-                    ctx.kpool_tail_read_indices,
-                    ctx.kpool_tail_write_indices,
-                    kpool_query_lens,
-                    query_lens_device,
+            if uses_compressed_tail and ctx.kpool_tail.dtype == torch.float32:
+                kpool_norm_weight, kpool_norm_bias, kpool_ape = self._kpool_fp32_parameters()
+                raw_k = F.layer_norm(
+                    key.float(),
+                    (self.head_dim,),
+                    kpool_norm_weight,
+                    kpool_norm_bias,
+                    self.k_norm.eps,
                 )
+                gate_scores = F.linear(hidden_states, self.index_kpool_compress_gate)
+            else:
+                raw_k, gate_scores = self.get_kpool_states(hidden_states, key)
+            if uses_compressed_tail:
                 slot_mapping = ctx.slot_mapping
                 if (
                     slot_mapping is not None
@@ -1632,49 +1642,42 @@ class Glm5NextIndexer(nn.Module):
                 # also excludes padding-slot and speculative-placeholder
                 # rows, which must not reach the tail on a plain launch.
                 kpool_tail_valid_rows = attention_mask.to(torch.bool) if ctx.has_kv_shard else kpool_valid_rows
-                triton_query_len = _compact_kpool_triton_query_len(kpool_query_lens, self.index_kpool)
-                # Decode/spec-verify resolves read/write to the same tensor. A
-                # distinct prefix-restore destination needs the torch path's
-                # explicit old-tail snapshot and copy semantics.
-                use_triton_update = (
-                    self._compact_kpool_model_compatible
-                    and ctx.kpool_cache_triton_compatible
-                    and triton_query_len is not None
-                    and kpool_tail_read_indices is kpool_tail_write_indices
-                    and ctx.kpool_tail.shape[2] >= self.index_kpool + triton_query_len - 1
-                )
-                if use_triton_update:
-                    self._update_compact_kpool(
-                        raw_k.contiguous(),
-                        gate_scores.contiguous(),
-                        kpool_valid_rows.contiguous(),
-                        kpool_tail_valid_rows.contiguous(),
-                        positions.contiguous(),
-                        ctx.index_cache,
-                        ctx.kpool_tail,
-                        kpool_tail_write_indices.contiguous(),
-                        pool_write_block_table.contiguous(),
-                        triton_query_len,
-                        self.index_kpool_compress_ape,
-                        self.index_kpool,
-                    )
-                else:
-                    update_compressed_kpool(
-                        raw_k,
-                        gate_scores,
-                        kpool_valid_rows,
-                        kpool_tail_valid_rows,
-                        positions,
-                        ctx.index_cache,
+                fused_states = None
+                if ctx.kpool_tail.dtype == torch.float32 and (
+                    in_acl_graph() or _kpool_attention_mask_all_valid(attention_mask)
+                ):
+                    fused_states = prepare_fused_kpool_states(
+                        hidden_states,
+                        self.wk.weight,
+                        self.index_kpool_compress_gate,
+                        kpool_ape,
+                        kpool_norm_weight,
+                        kpool_norm_bias,
                         ctx.kpool_tail,
                         kpool_tail_read_indices,
-                        kpool_tail_write_indices,
-                        pool_write_block_table,
+                        positions,
                         kpool_query_lens,
-                        self.index_kpool_compress_ape,
                         self.index_kpool,
-                        graph_mode=in_acl_graph(),
+                        self.k_norm.eps,
+                        valid_rows=attention_mask if in_acl_graph() else None,
                     )
+                update_compressed_kpool(
+                    raw_k,
+                    gate_scores,
+                    kpool_valid_rows,
+                    kpool_tail_valid_rows,
+                    positions,
+                    ctx.index_cache,
+                    ctx.kpool_tail,
+                    kpool_tail_read_indices,
+                    kpool_tail_write_indices,
+                    pool_write_block_table,
+                    kpool_query_lens,
+                    self.index_kpool_compress_ape,
+                    self.index_kpool,
+                    graph_mode=in_acl_graph(),
+                    fused_states=fused_states,
+                )
                 pool_cache = ctx.index_cache
                 if ctx.has_kv_shard:
                     # Refresh the read view after the write above: in sharded
@@ -2017,7 +2020,7 @@ class Glm5NextMlaAttention(Attention):
             self.indexer.process_weights_after_loading()
 
     def _project_qkv_a(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reuse the shared-input Q/KV-A linear layout used by vLLM-Ascend."""
+        """Reuse the shared-input Q/KV-A linear layout used by va."""
         # W8A8 can't fuse: each QLinear owns a per-tensor act scale and a repacked
         # int8 weight, so only the float path cats into the single GEMM below.
         if self._qkv_a_weight is None:
@@ -2131,6 +2134,13 @@ class Glm5NextMlaAttention(Attention):
 # ---------------------------------------------------------------------------
 # MLP (dense + MoE)
 # ---------------------------------------------------------------------------
+def _glm5_next_swiglu(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+    """Use the fused clipped SwiGLU arithmetic of the Ascend reference."""
+    if gate_up.device.type == "npu":
+        return kernels.clipped_swiglu(gate_up, limit)
+    return clamped_silu_and_mul_fp32(gate_up, limit)
+
+
 class Glm5NextMLP(nn.Module):
     def __init__(
         self,
@@ -2140,9 +2150,11 @@ class Glm5NextMLP(nn.Module):
         device: torch.device,
         skip_tp_reduce: bool = False,
         tp_override: int | None = None,
+        fused_quantization: bool = False,
     ) -> None:
         super().__init__()
         self.cfg = cfg
+        self.fused_quantization = fused_quantization
         self.skip_tp_reduce = skip_tp_reduce
         self.swiglu_limit = cfg.swiglu_limit
         # TP: column-parallel SwiGLU (gate_up sharded on the intermediate dim)
@@ -2184,8 +2196,29 @@ class Glm5NextMLP(nn.Module):
         _call_process_weights_after_loading(self.down_proj)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
-        out = self.down_proj(clamped_silu_and_mul(gate_up, self.swiglu_limit))
+        if (
+            self.fused_quantization
+            and x.device.type == "npu"
+            and self.gate_up_proj.use_w8a8
+            and self.down_proj.use_w8a8
+            and self.gate_up_proj.kind == self.down_proj.kind == "dynamic"
+        ):
+            quantized, scales = kernels.dynamic_quant(x.reshape(-1, x.shape[-1]))
+            accumulated = self.gate_up_proj.forward_accumulated(quantized)
+            quantized, scales = kernels.dequant_swiglu_quant(
+                accumulated,
+                self.gate_up_proj.weight_scale.float(),
+                scales,
+                swiglu_mode=1,
+                clamp_limit=self.swiglu_limit,
+                glu_alpha=1.0,
+                glu_bias=0.0,
+            )
+            out = self.down_proj.forward_quantized(quantized, scales)
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+        else:
+            gate_up = self.gate_up_proj(x)
+            out = self.down_proj(_glm5_next_swiglu(gate_up, self.swiglu_limit))
         if self.tp_size > 1 and not self.skip_tp_reduce:
             distributed.all_reduce_(out)
         return out
@@ -2458,6 +2491,7 @@ class Glm5NextMoE(MoECore, nn.Module):
             device,
             skip_tp_reduce=True,
             tp_override=cfg.moe_tp_size if cfg.expert_parallel_degree == 2 else None,
+            fused_quantization=True,
         )
 
     def process_weights_after_loading(self) -> None:
@@ -2503,7 +2537,7 @@ class Glm5NextMoE(MoECore, nn.Module):
             self._ep_dispatch_group_info = distributed.moe_ep_hccl_info(self.gate.weight.device)
             if self._ep_dispatch_group_info[1:] != (self.cfg.ep_rank, self.cfg.ep_size):
                 raise ValueError("GLM EPLv2 process group does not match the configured expert rank group")
-            if self.cfg.eplv2_shared_overlap and self.gate.weight.device.type in ("npu", "privateuseone"):
+            if self.cfg.eplv2_shared_overlap and self.gate.weight.device.type == "npu":
                 self._shared_stream = shared_expert_stream(self.gate.weight.device)
 
     @property
@@ -3096,11 +3130,11 @@ def _resolve_module(root: nn.Module, dotted: str) -> nn.Module:
 
 
 def _w8a8_shard_dims(fp_dim: Optional[int]) -> Optional[dict]:
-    """Static-W8A8 shard map for ``QLinear.load_w8a8`` from the fp shard dim.
+    """W8A8 shard map for ``QLinear.load_w8a8`` from the fp shard dim.
 
     - ``fp_dim is None`` (replicated, e.g. q_a_proj / kv_a_proj): no shard.
-    - ``fp_dim == 0`` (column-parallel, e.g. q_b_proj): weight + deq_scale +
-      quant_bias shard dim 0 (the W8A8 dequant/quant buffers are per-output).
+    - ``fp_dim == 0`` (column-parallel, e.g. q_b_proj): weight and per-output
+      scales, offsets and biases shard dim 0.
     - ``fp_dim == 1`` (row-parallel, e.g. o_proj): only the weight shards dim 1;
       deq_scale/quant_bias are unsharded (the output is gathered, not split).
     Mirrors deepseek_v32's ``load_weights`` shard-dim choices.
@@ -3109,7 +3143,7 @@ def _w8a8_shard_dims(fp_dim: Optional[int]) -> Optional[dict]:
         return None
     if fp_dim == 1:
         return {"weight": 1}
-    return {"weight": 0, "deq_scale": 0, "quant_bias": 0}
+    return {"weight": 0, "deq_scale": 0, "quant_bias": 0, "weight_scale": 0, "weight_offset": 0}
 
 
 def _call_process_weights_after_loading(module: nn.Module) -> None:
@@ -3258,20 +3292,23 @@ class Glm5NextForCausalLM(PyModelBase):
     ) -> None:
         """Probe fp-vs-w8a8 for a QLinear projection, resolve, and load.
 
-        ``fp_dim`` is the TP shard dim for the fp ``.weight`` (None = replicated,
-        0 = column-parallel, 1 = row-parallel). The w8a8 path routes static
-        projections through ``load_w8a8_into_qlinear``, which writes into the
-        QLinear's ``_w8a8`` submodule; dynamic ones never reach here (MLP uses
-        ``_load_mlp_fp_or_w8a8`` -> ``load_w8a8_mlp_into_qlinear``). The w8a8
-        branch is NOT exercised until real w8a8 checkpoints exist (Task 10); it
-        is written to match deepseek_v32's documented shard-dim contract.
+        ``fp_dim`` is the TP shard dim for the fp weight. Probe each projection
+        because ModelSlim visual checkpoints export attention with dynamic
+        per-channel scales, while older checkpoints use static input scales.
+        Both formats load into the QLinear submodule used by forward.
         """
         mod = _resolve_module(self, prefix + proj)
         assert isinstance(mod, QLinear), f"{prefix}{proj} is not a QLinear"
         if L.probe_quant(prefix, proj):
-            mod.resolve_quant(True)
+            has_static_scale = L.find(prefix + proj + ".deq_scale") is not None
+            has_dynamic_scale = L.find(prefix + proj + ".weight_scale") is not None
+            if has_static_scale and has_dynamic_scale:
+                raise ValueError(f"{prefix}{proj} carries both static and dynamic W8A8 scales")
+            quant_format = "dynamic" if has_dynamic_scale else "static"
+            mod.resolve_quant(True, quant_format=quant_format)
             shard_dims = _w8a8_shard_dims(fp_dim)
-            mod.load_w8a8(L, prefix, proj, shard_dims)
+            mod.load_w8a8(L, prefix, proj, shard_dims, quant_format=quant_format)
+            mod.process_weights_after_loading()
         else:
             mod.resolve_quant(False)
             L.load_fp(prefix + proj + ".weight", dim=fp_dim)

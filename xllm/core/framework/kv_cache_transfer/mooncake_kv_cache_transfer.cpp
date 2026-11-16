@@ -265,7 +265,7 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
                 << model_args.engram_max_ngram_size();
   }
   if (!is_spec_draft && uses_npu_compressed_kpool_tail(model_args)) {
-    fingerprint << "|compressed_kpool_tail:" << model_args.index_head_dim()
+    fingerprint << "|compressed_kpool_tail_fp32:" << model_args.index_head_dim()
                 << ":" << model_args.index_kpool() << ":"
                 << block_token_capacity;
   }

@@ -490,7 +490,7 @@ def _decode_pool_kernel(
     preceding = (others < row) & (other_pos == pos - 1) & (other_pos >= 0) & (other_block == block)
     previous_row = tl.max(tl.where(preceding, others, -1), 0)
     complete = live & (pos % 2 == 1)
-    # Both member loads use the same [2, width] reduction as vLLM's C2
+    # Both member loads use the same [2, width] reduction as va's C2
     # pooling. Mask ring addresses before loading reserved/padded rows.
     projection_row = tl.where(members == 1, row, tl.maximum(previous_row, 0))
     from_projection = (members == 1) | (previous_row >= 0)
@@ -575,7 +575,7 @@ def compressor_decode_from_projected(
     block_size: int,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Batch flattened single-token rows with vLLM's FP32 C2 pooling math.
+    """Batch flattened single-token rows with va's FP32 C2 pooling math.
 
     Verification rows may share a ring, so a completed pair first looks for
     its preceding member in this projection batch. All reads finish before

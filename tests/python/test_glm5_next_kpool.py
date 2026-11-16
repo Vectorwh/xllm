@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import glm5_next
 from xllm.python.models.glm5_next_kpool import update_compressed_kpool
 
@@ -34,23 +35,6 @@ def _indexer(device: torch.device) -> glm5_next.Glm5NextIndexer:
         index_kpool_compress=True,
     )
     return glm5_next.Glm5NextIndexer(config, 1, torch.bfloat16, device).to(device=device, dtype=torch.bfloat16)
-
-
-@pytest.mark.parametrize(
-    ("query_lens", "rate", "expected"),
-    [
-        ([], 4, None),
-        ([1, 1], 4, 1),
-        ([4, 4], 4, 4),
-        ([8, 8], 4, 8),
-        ([9, 9], 4, 9),
-        ([4, 8], 4, None),
-        ([0], 4, None),
-        ([1], 0, None),
-    ],
-)
-def test_compact_kpool_query_width_spans_multiple_pools(query_lens: list[int], rate: int, expected: int | None) -> None:
-    assert glm5_next._compact_kpool_triton_query_len(query_lens, rate) == expected
 
 
 def test_graph_kpool_prefix_drops_short_bucket_tail() -> None:
@@ -69,35 +53,63 @@ def test_graph_kpool_prefix_drops_short_bucket_tail() -> None:
         assert glm5_next._kpool_update_query_lens(ctx, 8) == [6]
 
 
+def test_kpool_mask_validity_is_shared_across_layers_but_not_forwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    mask = torch.tensor([[True, True, False]])
+    item = torch.Tensor.item
+    reads = []
+
+    def _item(value: torch.Tensor) -> bool:
+        reads.append(value)
+        return item(value)
+
+    monkeypatch.setattr(torch.Tensor, "item", _item)
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
+        for _ in range(3):
+            assert not glm5_next._kpool_attention_mask_all_valid(mask)
+            assert glm5_next._kpool_attention_mask_all_valid(mask[:, :2])
+    assert len(reads) == 2
+
+    mask[0, 0] = False
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
+        assert not glm5_next._kpool_attention_mask_all_valid(mask[:, :2])
+    assert len(reads) == 3
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4, 17])
 @torch.inference_mode()
-def test_indexer_merged_key_weights_projection_preserves_parameters(num_tokens: int) -> None:
+def test_indexer_key_weights_projection_preserves_parameters(num_tokens: int) -> None:
     torch.manual_seed(42)
     indexer = _indexer(torch.device("cpu"))
     hidden = torch.randn(1, num_tokens, 16, dtype=torch.bfloat16)
-    expected = indexer.wk(hidden), indexer.weights_proj(hidden)
+    expected = (
+        indexer.wk(hidden),
+        torch.nn.functional.linear(hidden.float(), indexer.weights_proj.weight.float()).to(hidden.dtype),
+    )
     indexer.process_weights_after_loading()
     torch.testing.assert_close(indexer._project_key_weights(hidden), expected, rtol=0, atol=0)
-    for weight in (indexer.wk.weight, indexer.weights_proj.weight):
-        assert weight.untyped_storage().data_ptr() == indexer._wk_weights_weight.untyped_storage().data_ptr()
+    assert indexer._wk_weight.shape == indexer.wk.weight.shape
+    assert indexer.wk.weight.data_ptr() == indexer._wk_weight.data_ptr()
     indexer.wk.weight.add_(0.01)
-    expected = indexer.wk(hidden), indexer.weights_proj(hidden)
+    expected = (
+        indexer.wk(hidden),
+        torch.nn.functional.linear(hidden.float(), indexer.weights_proj.weight.float()).to(hidden.dtype),
+    )
     indexer.process_weights_after_loading()
     torch.testing.assert_close(indexer._project_key_weights(hidden), expected, rtol=0, atol=0)
 
 
 @torch.inference_mode()
-def test_indexer_merged_key_weights_reuse_storage_across_reloads() -> None:
-    # A captured decode ACL graph records _wk_weights_weight's storage address,
+def test_indexer_key_weights_reuse_storage_across_reloads() -> None:
+    # A captured decode ACL graph records _wk_weight's storage address,
     # so a weight hot-reload must keep the packed buffer at a stable address
-    # instead of reallocating via torch.cat; otherwise replay reads stale
+    # instead of reallocating; otherwise replay reads stale
     # indexer weights and produces wrong top-k. Reproduces the reload path:
     # copy_in writes fresh weights into the existing .data storage, then
     # process_weights_after_loading re-packs.
     torch.manual_seed(42)
     indexer = _indexer(torch.device("cpu"))
     indexer.process_weights_after_loading()
-    captured = indexer._wk_weights_weight
+    captured = indexer._wk_weight
     captured_ptr = captured.data_ptr()
     generator = torch.Generator().manual_seed(7)
     for _ in range(2):
@@ -106,14 +118,14 @@ def test_indexer_merged_key_weights_reuse_storage_across_reloads() -> None:
         indexer.wk.weight.data.copy_(new_wk)
         indexer.weights_proj.weight.data.copy_(new_weights)
         indexer.process_weights_after_loading()
-        assert indexer._wk_weights_weight.data_ptr() == captured_ptr
-        torch.testing.assert_close(captured[: indexer.head_dim], new_wk, rtol=0, atol=0)
-        torch.testing.assert_close(captured[indexer.head_dim :], new_weights, rtol=0, atol=0)
+        assert indexer._wk_weight.data_ptr() == captured_ptr
+        torch.testing.assert_close(captured, new_wk, rtol=0, atol=0)
+        torch.testing.assert_close(indexer._head_weight_f32, new_weights.float(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("query_lengths", [[1, 1, 1], [2, 3, 1]])
 @torch.inference_mode()
-def test_indexer_paged_selection_reuses_merged_weights_for_varlen_queries(
+def test_indexer_paged_selection_reuses_packed_weights_for_varlen_queries(
     query_lengths: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     torch.manual_seed(42)
@@ -183,9 +195,12 @@ def test_indexer_mixed_projection_dtypes_keep_independent_calls() -> None:
     hidden = torch.randn(1, 4, 16, dtype=torch.bfloat16)
     indexer.process_weights_after_loading()
     indexer.weights_proj.float()
-    expected = indexer.wk(hidden), indexer.weights_proj(hidden.float())
+    expected = (
+        indexer.wk(hidden),
+        torch.nn.functional.linear(hidden.float(), indexer.weights_proj.weight.float()).to(hidden.dtype),
+    )
     indexer.process_weights_after_loading()
-    assert indexer._wk_weights_weight is None
+    assert indexer._wk_weight.shape == indexer.wk.weight.shape
     torch.testing.assert_close(indexer._project_key_weights(hidden), expected, rtol=0, atol=0)
 
 
@@ -222,6 +237,7 @@ def test_pool_selection_length_input_matches_dense_fallback() -> None:
         topk_output_width=4 + (4 - 1),
         softmax_scale=1.0,
     )
+    prefill_indexer._project_head_weights = prefill_indexer.weights_proj
     pool_data = (
         torch.zeros(2, 1, 2),
         torch.tensor([[[0, 1, 2, 3]], [[0, 1, 2, 3]]], dtype=torch.int64),
@@ -544,133 +560,6 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
     )
 
 
-@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
-@pytest.mark.parametrize("query_len", [1, 4, 7, 8, 9])
-@pytest.mark.parametrize("position_offset", [0, 1, 2, 3])
-@torch.inference_mode()
-def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_offset: int) -> None:
-    runtime = pytest.importorskip("torch_npu")
-    pytest.importorskip("triton")
-    from xllm.python.kernels_npu.triton.kpool_compress import (
-        update_compact_kpool,
-    )
-
-    torch.manual_seed(42)
-    rate = 4
-    head_dim = 128
-    first_positions = (position_offset, 28 + position_offset, 5)
-    num_requests = len(first_positions)
-    positions = torch.cat(
-        [torch.arange(start, start + query_len, dtype=torch.int64) for start in first_positions],
-    )
-    raw_k = torch.randn(num_requests * query_len, head_dim, dtype=torch.bfloat16)
-    gate_scores = torch.randn_like(raw_k)
-    valid_rows = torch.ones(num_requests * query_len, dtype=torch.bool)
-    valid_rows[0] = False
-    valid_rows[-query_len:] = False
-    ape = torch.randn(rate, head_dim, dtype=torch.bfloat16)
-    tail_ids = torch.tensor([1, 2, 0], dtype=torch.int32)
-    block_table = torch.tensor([[2, 0], [3, 1], [0, 0]], dtype=torch.int64)
-    compressed_cache = torch.zeros(4, 4, 1, head_dim, dtype=torch.bfloat16)
-    tail_cache = torch.randn(num_requests, 2, rate + query_len - 1, head_dim, dtype=torch.bfloat16)
-    tail_cache[0].zero_()
-
-    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
-    torch.npu.set_device(device)
-    device_raw_k = raw_k.to(device)
-    device_gate_scores = gate_scores.to(device)
-    device_valid_rows = valid_rows.to(device)
-    device_positions = positions.to(device)
-    device_tail_ids = tail_ids.to(device)
-    device_block_table = block_table.to(device)
-    device_ape = ape.to(device)
-    initial_cache = compressed_cache.to(device)
-    initial_tail = tail_cache.to(device)
-    expected_cache = initial_cache.clone()
-    expected_tail = initial_tail.clone()
-    update_compressed_kpool(
-        device_raw_k,
-        device_gate_scores,
-        device_valid_rows,
-        device_valid_rows,
-        device_positions,
-        expected_cache,
-        expected_tail,
-        device_tail_ids,
-        device_tail_ids,
-        device_block_table,
-        [query_len] * num_requests,
-        device_ape,
-        rate,
-        graph_mode=True,
-    )
-    actual_cache = initial_cache.clone()
-    actual_tail = initial_tail.clone()
-
-    def _update() -> None:
-        update_compact_kpool(
-            device_raw_k,
-            device_gate_scores,
-            device_valid_rows,
-            device_valid_rows,
-            device_positions,
-            actual_cache,
-            actual_tail,
-            device_tail_ids,
-            device_block_table,
-            query_len,
-            device_ape,
-            rate,
-        )
-
-    for _ in range(3):
-        actual_cache.copy_(initial_cache)
-        actual_tail.copy_(initial_tail)
-        _update()
-    torch.npu.synchronize()
-    graph = runtime.npu.NPUGraph()
-    actual_cache.copy_(initial_cache)
-    actual_tail.copy_(initial_tail)
-    with runtime.npu.graph(graph):
-        _update()
-    actual_cache.copy_(initial_cache)
-    actual_tail.copy_(initial_tail)
-    graph.replay()
-    torch.npu.synchronize()
-
-    torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
-    torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
-
-    # Replay with a partially accepted prefix, then a full-window advance.
-    # Both steps must read the live circular tail and write every new pool.
-    for accepted_prefix in (1, query_len):
-        device_positions.add_(accepted_prefix)
-        device_raw_k.mul_(0.75).add_(0.125)
-        device_gate_scores.mul_(0.5).sub_(0.25)
-        expected_cache = actual_cache.clone()
-        expected_tail = actual_tail.clone()
-        update_compressed_kpool(
-            device_raw_k,
-            device_gate_scores,
-            device_valid_rows,
-            device_valid_rows,
-            device_positions,
-            expected_cache,
-            expected_tail,
-            device_tail_ids,
-            device_tail_ids,
-            device_block_table,
-            [query_len] * num_requests,
-            device_ape,
-            rate,
-            graph_mode=True,
-        )
-        graph.replay()
-        torch.npu.synchronize()
-        torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
-        torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
-
-
 def test_tail_keeps_peer_tokens_valid_when_pool_mask_localizes_writes() -> None:
     """Sharded CP: the tail is a globally-valid replica, not owner-localized.
 
@@ -757,3 +646,112 @@ def test_tail_localized_mask_still_zeros_peer_tokens_when_requested() -> None:
     assert tail_cache[1, 1, 1, 0].item() == float("-inf")
     # ...while the valid row keeps its real state.
     torch.testing.assert_close(tail_cache[1, 0, 0, 0].item(), 1.0)
+
+
+@torch.inference_mode()
+def test_indexer_head_projection_keeps_fp32_weights_across_reloads() -> None:
+    indexer = _indexer(torch.device("cpu"))
+    indexer.process_weights_after_loading()
+    cached = indexer._head_weight_f32
+    assert cached.dtype == torch.float32
+    hidden = torch.randn(1, 17, 16).bfloat16()
+    for seed in (17, 23):
+        generator = torch.Generator().manual_seed(seed)
+        indexer.weights_proj.weight.copy_(torch.randn(indexer.weights_proj.weight.shape, generator=generator))
+        indexer.process_weights_after_loading()
+        assert indexer._head_weight_f32.data_ptr() == cached.data_ptr()
+        expected = torch.nn.functional.linear(hidden.float(), indexer.weights_proj.weight.float()).to(hidden.dtype)
+        actual = indexer._project_key_weights(hidden)[1]
+        assert actual.dtype == hidden.dtype
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_indexer_kpool_fp32_parameters_refresh_without_replacing_graph_storage() -> None:
+    indexer = _indexer(torch.device("cpu"))
+    indexer.process_weights_after_loading()
+    captured = indexer._kpool_fp32_parameters()
+    hidden = torch.randn(1, 8, indexer.head_dim)
+    for offset in (0.125, 0.25):
+        indexer.k_norm.weight.add_(offset)
+        indexer.k_norm.bias.add_(offset)
+        indexer.index_kpool_compress_ape.add_(offset)
+        indexer.process_weights_after_loading()
+        current = indexer._kpool_fp32_parameters()
+        originals = (indexer.k_norm.weight, indexer.k_norm.bias, indexer.index_kpool_compress_ape)
+        for previous, actual, original in zip(captured, current, originals):
+            assert actual.dtype == torch.float32
+            assert actual.data_ptr() == previous.data_ptr()
+            torch.testing.assert_close(actual, original.float(), rtol=0, atol=0)
+        expected = torch.nn.functional.layer_norm(
+            hidden, (indexer.head_dim,), indexer.k_norm.weight.float(), indexer.k_norm.bias.float(), indexer.k_norm.eps
+        )
+        actual = torch.nn.functional.layer_norm(hidden, (indexer.head_dim,), current[0], current[1], indexer.k_norm.eps)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@torch.inference_mode()
+def test_fp32_tail_store_preserves_native_dtype_gate_rows_on_graph_replay() -> None:
+    pytest.importorskip("torch_npu")
+    from xllm.python.kernels_npu.triton.kpool_compress import store_fused_kpool
+
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    torch.manual_seed(42)
+    rows, width, rate, head_dim = 2, 8, 4, 128
+    raw_k = torch.randn(rows * width, head_dim, device=device)
+    gates = torch.randn(rows * width, head_dim, device=device, dtype=torch.bfloat16)
+    valid = torch.ones(rows * width, device=device, dtype=torch.bool)
+    valid[0] = False
+    valid[-1] = False
+    positions = torch.cat((torch.arange(117, 125), torch.arange(120, 128))).to(device)
+    ids = torch.tensor([1, 2], device=device, dtype=torch.int32)
+    table = torch.tensor([[0, 1, 2, 3], [2, 3, 0, 1]], device=device, dtype=torch.int32)
+    initial_tail = torch.randn(3, 2, rate + width - 1, head_dim, device=device)
+    expected_tail, actual_tail = initial_tail.clone(), initial_tail.clone()
+    expected_cache = torch.zeros(4, 4, 1, head_dim, device=device, dtype=torch.bfloat16)
+    actual_cache = torch.zeros_like(expected_cache)
+    states = [
+        (torch.randn(3, head_dim, device=device, dtype=torch.bfloat16), torch.randn(2, rate, head_dim, device=device))
+        for _ in range(rows)
+    ]
+
+    def run(gate_rows: torch.Tensor, cache: torch.Tensor, tail: torch.Tensor) -> None:
+        cache.zero_()
+        tail.copy_(initial_tail)
+        store_fused_kpool(
+            raw_k,
+            gate_rows,
+            valid,
+            valid,
+            positions,
+            cache,
+            tail,
+            ids,
+            ids,
+            table,
+            width,
+            rate,
+            states,
+        )
+
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        run(gates.float(), expected_cache, expected_tail)
+        run(gates, actual_cache, actual_tail)
+        torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+        torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            run(gates, actual_cache, actual_tail)
+        gates.neg_()
+        raw_k.mul_(0.5)
+        graph.replay()
+        torch.npu.synchronize()
+        run(gates.float(), expected_cache, expected_tail)
+        torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+        torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
+    finally:
+        torch.use_deterministic_algorithms(deterministic)

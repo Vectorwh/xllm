@@ -163,6 +163,8 @@ TEST(KVCacheEstimationTest, UserIndexerCacheDtypeDirectlyControlsQuantization) {
   EXPECT_EQ(compressed_capacity.kpool_layout(),
             KPoolCacheLayout::COMPRESSED_WITH_TAIL);
   EXPECT_EQ(compressed_capacity.kpool_tail_len(), 7);
+  EXPECT_EQ(compressed_capacity.kpool_tail_slot_size(),
+            2 * static_cast<int64_t>(sizeof(float)) * 7 * 128);
 
   kpool_args.model_type("deepseek_v32").index_n_heads(1).index_head_dim(16);
   const KVCacheCapacity non_target_capacity =

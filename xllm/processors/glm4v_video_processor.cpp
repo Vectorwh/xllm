@@ -169,8 +169,9 @@ std::optional<Size> smart_resize_tokens(int32_t num_frames,
 
 }  // namespace
 
-Glm4VVideoProcessor::Glm4VVideoProcessor(const ModelArgs& args)
-    : VideoProcessor(args) {
+Glm4VVideoProcessor::Glm4VVideoProcessor(const ModelArgs& args,
+                                         SamplingMode sampling_mode)
+    : VideoProcessor(args), sampling_mode_(sampling_mode) {
   video_mean_ = torch::tensor(args.mm_video_normalize_mean(),
                               torch::dtype(torch::kFloat32));
   video_std_ = torch::tensor(args.mm_video_normalize_std(),
@@ -184,6 +185,9 @@ Glm4VVideoProcessor::Glm4VVideoProcessor(const ModelArgs& args)
   video_merge_size_ = args.mm_video_merge_size();
   video_min_tokens_ = args.mm_video_min_tokens();
   video_max_tokens_ = args.mm_video_max_tokens();
+  if (args.mm_fps() > 0.0) {
+    target_fps_ = args.mm_fps();
+  }
 
   if (do_rescale_ && do_normalize_) {
     video_mean_.mul_(1.0 / rescale_factor_);
@@ -211,27 +215,30 @@ torch::Tensor Glm4VVideoProcessor::sample_frames(
         std::round(static_cast<double>(max_frame_idx) / metadata.fps) + 1.0;
   }
 
-  constexpr double DYN_FPS_30 = 3.0;
-  constexpr double DYN_FPS_300 = 1.0;
-  constexpr double DYN_FPS_2400 = 0.5;
-  constexpr int32_t MAX_FRAME_COUNT_DYNAMIC = 640;
-  constexpr double MAX_DURATION = 2400.0;
-
-  const double effective_duration = std::min(duration, MAX_DURATION);
-
-  double target_fps = 0.0;
-  if (effective_duration <= 30.0) {
-    target_fps = DYN_FPS_30;
-  } else if (effective_duration <= 300.0) {
-    target_fps = DYN_FPS_300;
+  double target_fps = target_fps_;
+  int32_t extract_t = 0;
+  if (sampling_mode_ == SamplingMode::FIXED_FPS) {
+    constexpr int32_t kMaxFrameCount = 2048;
+    extract_t =
+        std::min(static_cast<int32_t>(duration * target_fps), kMaxFrameCount);
+    extract_t = std::max(extract_t, 1);
   } else {
-    target_fps = DYN_FPS_2400;
+    // Preserve the existing duration-dependent sampling policy.
+    constexpr double kMaxDuration = 2400.0;
+    constexpr int32_t kMaxFrameCount = 640;
+    const double effective_duration = std::min(duration, kMaxDuration);
+    if (effective_duration <= 30.0) {
+      target_fps = 3.0;
+    } else if (effective_duration <= 300.0) {
+      target_fps = 1.0;
+    } else {
+      target_fps = 0.5;
+    }
+    extract_t = std::min(
+        static_cast<int32_t>(effective_duration * target_fps *
+                             static_cast<double>(video_temporal_patch_size_)),
+        kMaxFrameCount);
   }
-
-  int32_t extract_t =
-      static_cast<int32_t>(effective_duration * target_fps *
-                           static_cast<double>(video_temporal_patch_size_));
-  extract_t = std::min(extract_t, MAX_FRAME_COUNT_DYNAMIC);
 
   const double duration_per_frame = 1.0 / metadata.fps;
   std::vector<double> timestamps(total_frames);
@@ -243,12 +250,23 @@ torch::Tensor Glm4VVideoProcessor::sample_frames(
   torch::Tensor frame_indices;
 
   if (total_frames < extract_t) {
-    frame_indices = torch::linspace(
-        0, total_frames - 1, extract_t, torch::dtype(torch::kLong));
+    if (sampling_mode_ == SamplingMode::FIXED_FPS) {
+      std::vector<int64_t> indices;
+      indices.reserve(extract_t);
+      for (int64_t i = 0; i < extract_t; ++i) {
+        indices.push_back(i * total_frames / extract_t);
+      }
+      frame_indices = torch::tensor(indices, torch::dtype(torch::kLong));
+    } else {
+      frame_indices = torch::linspace(
+          0, total_frames - 1, extract_t, torch::dtype(torch::kLong));
+    }
   } else {
     std::vector<int64_t> tmp;
     tmp.reserve(static_cast<size_t>(total_frames));
     double current_second = 0.0;
+    // Keep the temporal-patch-scaled walk and redistribute excess candidates
+    // uniformly below.
     const double inv_fps =
         1.0 / (static_cast<double>(video_temporal_patch_size_) * target_fps);
 

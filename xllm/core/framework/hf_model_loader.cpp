@@ -1100,7 +1100,7 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
       quant_args_.group_size() = v.value();
       explicit_quant_group_size = true;
     } else if (desc_model_quant_is_w4a8_dynamic && !explicit_quant_group_size) {
-      // Match vllm-ascend W4A8_DYNAMIC's default. A config value of 0 is still
+      // Match va W4A8_DYNAMIC's default. A config value of 0 is still
       // respected as the per-channel mode.
       quant_args_.group_size() = 256;
       explicit_quant_group_size = true;
@@ -1445,6 +1445,10 @@ bool HFModelLoader::load_video_preprocessor_args(
     // the token-budget smart_resize is used.
     args_.mm_video_min_tokens() = field_int("min_image_tokens", 0);
     args_.mm_video_max_tokens() = field_int("max_image_tokens", 0);
+    if (const auto* fps = resolve_field("fps");
+        fps != nullptr && fps->is_number()) {
+      args_.mm_fps() = fps->get<double>();
+    }
 
     // Qwen3-Omni per-frame pixel budget for video (pixel units).
     args_.mm_video_max_pixels() = field_int("video_max_pixels", 0);
