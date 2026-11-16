@@ -833,7 +833,26 @@ torch::Tensor cpu_attention(const torch::Tensor& hidden,
       .to(torch::kBFloat16);
 }
 
-TEST(DsaAttentionCharacterizationTest, MatchesIndependentTemporalBatching) {
+class DsaDeviceTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_threads_ = torch::get_num_threads();
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    torch::set_num_threads(1);
+  }
+  void TearDown() override { torch::set_num_threads(saved_threads_); }
+
+ private:
+  int32_t saved_threads_ = 1;
+};
+using DsaAttentionCharacterizationTest = DsaDeviceTest;
+using DsaSingleCardTest = DsaDeviceTest;
+using DsaRelayCharacterizationTest = DsaDeviceTest;
+using DsaQuantCacheCharacterizationTest = DsaDeviceTest;
+
+TEST_F(DsaAttentionCharacterizationTest, MatchesIndependentTemporalBatching) {
   for (const auto& param : std::vector<AttentionCase>{
            AttentionCase{.variant = DsaModelVariant::V32,
                          .phase = AttentionPhase::PREFILL,
@@ -915,7 +934,6 @@ TEST(DsaAttentionCharacterizationTest, MatchesIndependentTemporalBatching) {
                          .legacy = false,
                          .tokens = 8,
                          .hidden_scale = 1.0f}}) {
-    torch::set_num_threads(1);
     Device device(/*device_index=*/0);
     device.set_device();
     const auto options_ =
@@ -1080,8 +1098,7 @@ TEST(DsaAttentionCharacterizationTest, MatchesIndependentTemporalBatching) {
   }
 }
 
-TEST(DsaSingleCardTest, C12CompleteWeightsVerifyAndRun) {
-  torch::set_num_threads(1);
+TEST_F(DsaSingleCardTest, C12CompleteWeightsVerifyAndRun) {
   Device device(/*device_index=*/0);
   device.set_device();
   const auto options_ =
@@ -1132,8 +1149,7 @@ TEST(DsaSingleCardTest, C12CompleteWeightsVerifyAndRun) {
                "complete checkpoint CPU equation");
 }
 
-TEST(DsaSingleCardTest, C12SharedIgnoresIndexerCheckpoint) {
-  torch::set_num_threads(1);
+TEST_F(DsaSingleCardTest, C12SharedIgnoresIndexerCheckpoint) {
   Device device(/*device_index=*/0);
   device.set_device();
   const auto options_ =
@@ -1203,8 +1219,7 @@ TEST(DsaSingleCardTest, C12SharedIgnoresIndexerCheckpoint) {
       torch::equal(supplied_cache.get_k_cache(), absent_cache.get_k_cache()));
 }
 
-TEST(DsaSingleCardTest, DISABLED_C12FullMissingIndexerMustBeRejected) {
-  torch::set_num_threads(1);
+TEST_F(DsaSingleCardTest, DISABLED_C12FullMissingIndexerMustBeRejected) {
   Device device(/*device_index=*/0);
   device.set_device();
   const auto options_ =
@@ -1241,10 +1256,9 @@ TEST(DsaSingleCardTest, DISABLED_C12FullMissingIndexerMustBeRejected) {
   ASSERT_DEATH(full->verify_loaded_weights(), "indexer");
 }
 
-TEST(DsaRelayCharacterizationTest,
-     C4SparseFssfsMatchesFixedSelectionReference) {
+TEST_F(DsaRelayCharacterizationTest,
+       C4SparseFssfsMatchesFixedSelectionReference) {
   for (const auto& param : std::vector<bool>{false, true}) {
-    torch::set_num_threads(1);
     Device device(/*device_index=*/0);
     device.set_device();
     const auto options_ =
@@ -1460,9 +1474,8 @@ TEST(DsaRelayCharacterizationTest,
   }
 }
 
-TEST(DsaRelayCharacterizationTest, C4DummyDoesNotRequireUpstreamSelection) {
+TEST_F(DsaRelayCharacterizationTest, C4DummyDoesNotRequireUpstreamSelection) {
   for (const auto& param : std::vector<bool>{false, true}) {
-    torch::set_num_threads(1);
     Device device(/*device_index=*/0);
     device.set_device();
     const auto options_ =
@@ -1519,11 +1532,10 @@ TEST(DsaRelayCharacterizationTest, C4DummyDoesNotRequireUpstreamSelection) {
   }
 }
 
-TEST(DsaQuantCacheCharacterizationTest,
-     C6Int8PrefillThenDecodeMatchesBf16Cache) {
+TEST_F(DsaQuantCacheCharacterizationTest,
+       C6Int8PrefillThenDecodeMatchesBf16Cache) {
   for (const auto& param : std::vector<DsaModelVariant>{
            DsaModelVariant::V32, DsaModelVariant::GLM5}) {
-    torch::set_num_threads(1);
     Device device(/*device_index=*/0);
     device.set_device();
     const auto options_ =
@@ -1600,6 +1612,13 @@ TEST(DsaQuantCacheCharacterizationTest,
       ASSERT_NE(actual_capture.output(), nullptr);
       check_selection(*actual_capture.output(), prefix, rows);
       expect_close(output, expected, /*rtol=*/0.1, /*atol=*/0.02, tag);
+      const double reference_norm =
+          torch::norm(expected, 2.0, torch::kFloat32).item<double>();
+      ASSERT_GT(reference_norm, 0.0);
+      EXPECT_LE(
+          torch::norm(output - expected, 2.0, torch::kFloat32).item<double>() /
+              reference_norm,
+          0.1);
       const auto scale = quantized_cache.get_k_cache_scale();
       ASSERT_TRUE(scale.has_value());
       const torch::Tensor active_scale =

@@ -24,6 +24,7 @@
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/scheduler/scheduler_test_adapter.h"
 #include "distributed_runtime/engine.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "scheduler/async_response_processor.h"
@@ -235,10 +236,11 @@ class LinearPrefixExecutionEngine final : public FakeEngine {
   }
 };
 
-class TestContinuousScheduler final : public ContinuousScheduler {
+class TestContinuousScheduler final
+    : public scheduler_test::ContinuousSchedulerAdapter {
  public:
   TestContinuousScheduler(Engine* engine, const Options& options)
-      : ContinuousScheduler(engine, options) {}
+      : scheduler_test::ContinuousSchedulerAdapter(engine, options) {}
 
   void complete_request(const std::shared_ptr<Request>& request) {
     response_processor_->process_completed_request(request);
@@ -947,28 +949,6 @@ class CancelledOverlapEngine final : public FakeEngine {
   size_t completed_batches_ = 0;
 };
 
-class BlockedOverlapScheduler final : public ContinuousScheduler {
- public:
-  BlockedOverlapScheduler(Engine* engine,
-                          const Options& options,
-                          Sequence* sequence)
-      : ContinuousScheduler(engine, options) {
-    last_batch_.emplace_back(sequence);
-    is_first_step_ = false;
-  }
-
-  size_t prepare_calls() const { return prepare_calls_; }
-
- protected:
-  std::vector<Batch> prepare_batch() override {
-    ++prepare_calls_;
-    return std::vector<Batch>(1);
-  }
-
- private:
-  size_t prepare_calls_ = 0;
-};
-
 }  // namespace
 
 TEST(EnginePrefixCacheTest, DecodeLinearKeepsKvPrefixesAndReceiving) {
@@ -1247,7 +1227,7 @@ TEST(ContinuousSchedulerTest, LearnsPrefixesWithoutCachePublication) {
   auto request = generate_request_with_prompt_tokens(
       tokens, /*max_tokens=*/4, /*max_context_len=*/64);
   ASSERT_TRUE(scheduler.add_request(request));
-  auto batches = scheduler.prepare_batch_test();
+  auto batches = scheduler.prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
   EXPECT_EQ(batches.front().get_allowed_max_tokens().front(), 8u);
@@ -1440,7 +1420,7 @@ TEST(ContinuousSchedulerTest, DecodeLinearEnablesInBatchPrefixReuse) {
   auto second_request = generate_request_with_prompt_tokens(prompt, 4, 32);
   ASSERT_TRUE(scheduler.add_request(first_request));
   ASSERT_TRUE(scheduler.add_request(second_request));
-  auto batches = scheduler.prepare_batch_test();
+  auto batches = scheduler.prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 2u);
   Sequence* first_sequence = first_request->sequences().front().get();
@@ -1455,16 +1435,21 @@ TEST(ContinuousSchedulerTest, DecodeLinearEnablesInBatchPrefixReuse) {
 
 TEST(ContinuousSchedulerTest, DrainsInflightBatchBeforeRetryingBlockedQueue) {
   auto request = generate_request_with_prompt_tokens({1, 2, 3, 4}, 4, 30000);
+  request->state().output_func = [](const RequestOutput&) { return true; };
   OverlapDrainEngine engine;
   ContinuousScheduler::Options options =
       create_scheduler_options(1024, 16, 0, 1024, 1);
   options.enable_schedule_overlap(true);
-  BlockedOverlapScheduler scheduler(
-      &engine, options, request->sequences().front().get());
+  ContinuousScheduler scheduler(&engine, options);
+  ASSERT_TRUE(scheduler.add_request(request));
+  scheduler.step(absl::ZeroDuration());
+  request->set_cancel();
 
-  scheduler.step(absl::Seconds(5));
-
-  EXPECT_EQ(scheduler.prepare_calls(), 1u);
+  auto collected = std::async(
+      std::launch::async, [&scheduler] { scheduler.step(absl::Seconds(5)); });
+  const std::future_status status = collected.wait_for(std::chrono::seconds(1));
+  collected.get();
+  EXPECT_EQ(status, std::future_status::ready);
   EXPECT_EQ(engine.completed_batches(), 1u);
 }
 
@@ -1495,7 +1480,7 @@ TEST(ContinuousSchedulerTest, ResourceBlockedQueueRespectsSchedulingTimeout) {
     scheduled.get();
 
     ASSERT_EQ(status, std::future_status::ready);
-    EXPECT_TRUE(scheduler.get_running_requests().empty());
+    EXPECT_TRUE(scheduler.running_requests().empty());
     EXPECT_EQ(scheduler.get_waiting_requests_num(), 1u);
     EXPECT_GT(engine.blocked_allocation_calls(), 0u);
     // Each retry waits up to 1ms rather than spinning on a nonempty queue.
@@ -1530,8 +1515,8 @@ TEST(ContinuousSchedulerTest,
 
   EXPECT_EQ(status, std::future_status::ready);
   EXPECT_EQ(engine.blocked_allocation_calls(), 1u);
-  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
-  EXPECT_EQ(scheduler.get_running_requests().front(), request);
+  ASSERT_EQ(scheduler.running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.running_requests().front(), request);
   EXPECT_EQ(scheduler.get_waiting_requests_num(), 0u);
 }
 
@@ -1856,19 +1841,6 @@ INSTANTIATE_TEST_SUITE_P(FinishedAndCancelled,
                                            std::make_pair(true, false),
                                            std::make_pair(true, true)));
 
-TEST(ContinuousSchedulerFactoryTest,
-     ChunkedPrefillWithoutSPCreatesContinuousScheduler) {
-  ContinuousScheduler::Options opt =
-      create_scheduler_options(10000, 256, 0, 1024, 1);
-  opt.enable_chunked_prefill() = true;
-
-  auto engine = std::make_unique<FakeEngine>(32, 32);
-  auto scheduler = create_continuous_scheduler(engine.get(), opt);
-
-  // All non-PD paths now create ContinuousScheduler with BatchMode routing.
-  EXPECT_NE(dynamic_cast<ContinuousScheduler*>(scheduler.get()), nullptr);
-}
-
 TEST(ContinuousSchedulerTest,
      AdmissionRejectsMultipleCandidatesForLinearModels) {
   const std::vector<std::pair<int32_t, size_t>> sampling_modes = {
@@ -1948,7 +1920,7 @@ TEST(ContinuousSchedulerTest, PrefetchCompletesBeforeSchedulerQueueAdmission) {
   EXPECT_EQ(scheduler->scheduler_queue_size(), 0u);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
 
-  std::vector<Batch> batches = scheduler->prepare_batch_test();
+  std::vector<Batch> batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
   EXPECT_EQ(scheduler->scheduler_queue_size(), 0u);
@@ -1961,7 +1933,7 @@ TEST(ContinuousSchedulerTest, PrefetchCompletesBeforeSchedulerQueueAdmission) {
       MULTI_GAUGE_scheduler_queue_requests.get_stats({"ingress", "0"});
   ASSERT_NE(ingress, nullptr);
   EXPECT_DOUBLE_EQ(ingress->get_value(), 1.0);
-  batches = scheduler->prepare_batch_test();
+  batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
   EXPECT_EQ(batches.front()[0], request->sequences().front().get());
@@ -2053,7 +2025,7 @@ TEST_P(DeferredQueueMetricsTest,
     ASSERT_TRUE(scheduler.add_request(request));
   }
   requests.front()->set_cancel();
-  auto batches = scheduler.prepare_batch_test();
+  auto batches = scheduler.prepare();
   ASSERT_EQ(batches.front().size(), 1u);
   auto* deferred = MULTI_GAUGE_scheduler_queue_requests.get_stats(
       {GetParam() ? "unified" : "prefill", "417"});
@@ -2065,7 +2037,7 @@ TEST_P(DeferredQueueMetricsTest,
   for (auto& request : requests) {
     request->set_cancel();
   }
-  EXPECT_TRUE(scheduler.prepare_batch_test().front().empty());
+  EXPECT_TRUE(scheduler.prepare().front().empty());
   EXPECT_DOUBLE_EQ(deferred->get_value(), 0.0);
   EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
   scheduler.wait_for_responses();
@@ -2087,7 +2059,7 @@ TEST(ContinuousSchedulerTest, PendingIsLiveWithoutPreparingBatches) {
     EXPECT_EQ(bvar::Variable::describe_exposed(metric), "0");
     scheduler.incr_pending_requests(2);
     EXPECT_EQ(bvar::Variable::describe_exposed(metric), "2");
-    scheduler.prepare_batch_test();
+    scheduler.prepare();
     EXPECT_DOUBLE_EQ(GAUGE_VALUE(num_pending_requests), 2.0);
     scheduler.pause();
     scheduler.step(absl::ZeroDuration());
@@ -2147,7 +2119,7 @@ TEST(ContinuousSchedulerTest,
   ASSERT_TRUE(scheduler->add_request(completed));
   completed->sequences().front()->finish();
 
-  std::vector<Batch> batches = scheduler->prepare_batch_test();
+  std::vector<Batch> batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 2u);
@@ -2168,7 +2140,7 @@ TEST(ContinuousSchedulerTest,
   }
   scheduler->complete_request(completed);
   EXPECT_EQ(completed_outputs.load(), 1);
-  batches = scheduler->prepare_batch_test();
+  batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
@@ -2295,40 +2267,14 @@ TEST(ContinuousSchedulerTest,
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
 }
 
-TEST(ContinuousSchedulerFactoryTest,
-     ChunkedPrefillWithSPCreatesContinuousScheduler) {
-  ContinuousScheduler::Options opt =
-      create_scheduler_options(10000, 256, 0, 1024, 1);
-  opt.enable_chunked_prefill() = true;
-
-  auto engine = std::make_unique<FakeEngine>(32, 32);
-  auto scheduler = create_continuous_scheduler(engine.get(), opt);
-
-  // All non-PD paths now create ContinuousScheduler with BatchMode routing.
-  EXPECT_NE(dynamic_cast<ContinuousScheduler*>(scheduler.get()), nullptr);
-}
-
-TEST(ContinuousSchedulerFactoryTest,
-     ChunkedPrefillWithSPAndSpeculativeCreatesContinuousScheduler) {
-  ContinuousScheduler::Options opt =
-      create_scheduler_options(10000, 256, 4, 1024, 1);
-  opt.enable_chunked_prefill() = true;
-
-  auto engine = std::make_unique<FakeEngine>(32, 32);
-  auto scheduler = create_continuous_scheduler(engine.get(), opt);
-
-  // All non-PD paths now create ContinuousScheduler with BatchMode routing.
-  EXPECT_NE(dynamic_cast<ContinuousScheduler*>(scheduler.get()), nullptr);
-}
-
-TEST(ContinuousSchedulerFactoryTest,
-     ChunkedPrefillWithSPDoesNotBuildMixedBatch) {
+TEST(ContinuousSchedulerTest, ContextParallelPrefillDoesNotMixDecode) {
   ContinuousScheduler::Options opt = create_scheduler_options(8, 8, 0, 4, 1);
   opt.enable_chunked_prefill() = true;
   opt.cp_size() = 2;  // CP > 1 forces exclusive batch (no mix)
 
   auto engine = std::make_unique<FakeEngine>(32, 32);
-  auto scheduler = create_continuous_scheduler(engine.get(), opt);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
   ASSERT_NE(scheduler.get(), nullptr);
 
   auto requests = generate_request({2, 10},
@@ -2342,7 +2288,7 @@ TEST(ContinuousSchedulerFactoryTest,
     scheduler->add_request(req);
   }
 
-  auto batches = scheduler->prepare_batch_test();
+  auto batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1);
   ASSERT_EQ(batches[0].size(), 2);
   const auto& allowed_max_tokens = batches[0].get_allowed_max_tokens();
@@ -2351,7 +2297,7 @@ TEST(ContinuousSchedulerFactoryTest,
   make_request_decode_ready(requests[0]);
   set_chunk_kv(requests[1], allowed_max_tokens[1]);
 
-  batches = scheduler->prepare_batch_test();
+  batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1);
   ASSERT_EQ(batches[0].size(), 1);
 
@@ -2389,8 +2335,8 @@ TEST(ContinuousSchedulerTest, BeamStrictNoPartialScheduling) {
   ContinuousScheduler::Options opt =
       create_scheduler_options(2, 8, 0, 1024, 1, "fcfs");
   auto engine = std::make_unique<FakeEngine>(64, 32);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
-  EXPECT_TRUE(scheduler != nullptr);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
 
   auto req1 = generate_request({64},
                                {10},
@@ -2416,11 +2362,11 @@ TEST(ContinuousSchedulerTest, BeamStrictNoPartialScheduling) {
 
   scheduler->add_request(req1);
   scheduler->add_request(beam_req);
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   ASSERT_EQ(batch.size(), 1u);
   EXPECT_EQ(batch[0].size(), 1u);
   EXPECT_EQ(batch[0][0], req1->sequences()[0].get());
-  EXPECT_EQ(scheduler->get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler->running_requests().size(), 1u);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0u);
   EXPECT_NE(batch[0][0], beam_req->sequences()[0].get());
   EXPECT_NE(batch[0][0], beam_req->sequences()[1].get());
@@ -2482,7 +2428,8 @@ TEST(ContinuousSchedulerTest,
                                /*num_speculative_tokens=*/0,
                                /*max_tokens_per_chunk_for_prefill=*/8,
                                /*dp_size=*/1);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), options);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), options);
 
   auto scheduled_request =
       generate_request_with_prompt_tokens({1, 2, 3, 4, 5, 6, 7, 8}, 1, 30000);
@@ -2491,11 +2438,11 @@ TEST(ContinuousSchedulerTest,
   ASSERT_TRUE(scheduler->add_request(scheduled_request));
   ASSERT_TRUE(scheduler->add_request(deferred_request));
 
-  std::vector<Batch> batches = scheduler->prepare_batch_test();
+  std::vector<Batch> batches = scheduler->prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
   EXPECT_EQ(batches.front()[0], scheduled_request->sequences()[0].get());
-  EXPECT_EQ(scheduler->get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler->running_requests().size(), 1u);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 1u);
   EXPECT_FALSE(deferred_request->finished());
   EXPECT_EQ(
@@ -2551,7 +2498,7 @@ TEST(ContinuousSchedulerTest,
   ASSERT_TRUE(scheduler.add_request(scheduled_request));
   ASSERT_TRUE(scheduler.add_request(deferred_request));
 
-  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  std::vector<Batch> batches = scheduler.prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 2u);
   EXPECT_EQ(batches.front()[0], scheduled_sequence);
@@ -2573,7 +2520,7 @@ TEST(ContinuousSchedulerTest,
   // A takes the last private write slot. B must retain its completed source
   // without growing KV blocks or failing while this batch can still run A.
   batches.clear();
-  batches = scheduler.prepare_batch_test();
+  batches = scheduler.prepare();
   scheduler.wait_for_responses();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
@@ -2600,7 +2547,7 @@ TEST(ContinuousSchedulerTest,
 
   scheduled_request->set_cancel();
   batches.clear();
-  batches = scheduler.prepare_batch_test();
+  batches = scheduler.prepare();
   scheduler.wait_for_responses();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
@@ -2623,7 +2570,7 @@ TEST(ContinuousSchedulerTest,
 
   deferred_request->set_cancel();
   batches.clear();
-  batches = scheduler.prepare_batch_test();
+  batches = scheduler.prepare();
   scheduler.wait_for_responses();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
@@ -2675,7 +2622,7 @@ TEST(ContinuousSchedulerTest,
   ASSERT_TRUE(scheduler.add_request(scheduled_request));
   ASSERT_TRUE(scheduler.add_request(deferred_request));
 
-  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  std::vector<Batch> batches = scheduler.prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 2u);
   EXPECT_EQ(batches.front()[0], scheduled_sequence);
@@ -2692,7 +2639,7 @@ TEST(ContinuousSchedulerTest,
   set_chunk_kv(deferred_request, /*kv_tokens=*/4);
 
   batches.clear();
-  batches = scheduler.prepare_batch_test();
+  batches = scheduler.prepare();
   scheduler.wait_for_responses();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches.front().size(), 1u);
@@ -2719,13 +2666,13 @@ TEST(ContinuousSchedulerTest,
                                 scheduled_blocks.end());
   scheduled_request->set_cancel();
   batches.clear();
-  batches = scheduler.prepare_batch_test();
+  batches = scheduler.prepare();
   scheduler.wait_for_responses();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
   EXPECT_FALSE(scheduled_sequence->has_any_blocks());
   EXPECT_FALSE(deferred_sequence->has_any_blocks());
-  EXPECT_TRUE(scheduler.get_running_requests().empty());
+  EXPECT_TRUE(scheduler.running_requests().empty());
   EXPECT_EQ(scheduler.get_waiting_requests_num(), 0u);
   EXPECT_EQ(callback_count, 1);
   ASSERT_TRUE(callback_status.has_value());
@@ -2735,7 +2682,7 @@ TEST(ContinuousSchedulerTest,
           failures_before,
       2.0);
 
-  batches = scheduler.prepare_batch_test();
+  batches = scheduler.prepare();
   scheduler.wait_for_responses();
   ASSERT_EQ(batches.size(), 1u);
   EXPECT_TRUE(batches.front().empty());
@@ -2761,7 +2708,8 @@ TEST(ContinuousSchedulerTest,
       create_scheduler_options(1024, 16, 0, 1024, 1);
   auto engine =
       std::make_unique<FakeEngine>(32, 4, /*enable_prefix_cache=*/true);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
   BlockManagerPool* block_manager_pool = engine->block_manager_pool();
 
   constexpr size_t kBestOf = 4;
@@ -2780,7 +2728,7 @@ TEST(ContinuousSchedulerTest,
 
   scheduler->add_request(request);
 
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   EXPECT_EQ(batch.size(), 1);
   EXPECT_EQ(request->sequences().size(), kBestOf);
   EXPECT_EQ(batch[0].size(), kBestOf);
@@ -2813,7 +2761,8 @@ TEST(ContinuousSchedulerTest, PDDecodeBestOfOneSkipsExpansionAndShares) {
   // blocks into the prefix-cache table instead of the free list.
   auto engine =
       std::make_unique<FakeEngine>(32, 4, /*enable_prefix_cache=*/false);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
   BlockManagerPool* block_manager_pool = engine->block_manager_pool();
 
   ASSERT_TRUE(block_manager_pool->try_allocate(seq0));
@@ -2823,7 +2772,7 @@ TEST(ContinuousSchedulerTest, PDDecodeBestOfOneSkipsExpansionAndShares) {
 
   scheduler->add_request(request);
 
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   EXPECT_EQ(batch.size(), 1);
   EXPECT_EQ(request->sequences().size(), 1u);
   EXPECT_EQ(batch[0].size(), 1u);
@@ -2850,7 +2799,7 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
   make_request_decode_ready(request);
   scheduler->add_request(request);
 
-  std::vector<Batch> batch = scheduler->prepare_batch_test();
+  std::vector<Batch> batch = scheduler->prepare();
   ASSERT_EQ(batch.size(), 1u);
   ASSERT_EQ(batch[0].size(), 1u);
   EXPECT_LT(util::max(block_manager_pool->num_free_blocks()),
@@ -2865,7 +2814,7 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
   scheduler->step(absl::ZeroDuration());
 
   EXPECT_TRUE(request->cancelled());
-  EXPECT_TRUE(scheduler->get_running_requests().empty());
+  EXPECT_TRUE(scheduler->running_requests().empty());
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             free_blocks_before_cancel);
   batch.clear();
@@ -2876,38 +2825,60 @@ TEST(ContinuousSchedulerTest, RejectedStreamCancelsAtSchedulingBoundary) {
   scheduler->step(absl::ZeroDuration());
 
   EXPECT_TRUE(request->cancelled());
-  EXPECT_TRUE(scheduler->get_running_requests().empty());
+  EXPECT_TRUE(scheduler->running_requests().empty());
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
 }
 
 TEST(ContinuousSchedulerTest, EmptyOutputDoesNotPublishLegacyOrServerTtft) {
+  class OutputEngine final : public FakeEngine {
+   public:
+    OutputEngine() : FakeEngine(/*num_blocks=*/32, /*block_size=*/4) {}
+
+    void enable_output() { emit_output_ = true; }
+
+    ForwardOutput step(std::vector<Batch>& batches) override {
+      if (!emit_output_) {
+        return {};
+      }
+      for (Batch& batch : batches) {
+        for (Sequence* sequence : batch.get_sequences()) {
+          sequence->kv_state().set_kv_cache_tokens_num(sequence->num_tokens());
+          sequence->append_token(Token(65));
+        }
+        batch.record_core_output();
+      }
+      return {};
+    }
+
+   private:
+    bool emit_output_ = false;
+  };
+
   ContinuousScheduler::Options options =
       create_scheduler_options(1024, 16, 0, 1024, 1);
-  auto engine = std::make_unique<FakeEngine>(32, 4);
-  TestContinuousScheduler scheduler(engine.get(), options);
+  options.enable_schedule_overlap(false);
+  OutputEngine engine;
+  ContinuousScheduler scheduler(&engine, options);
   auto request = generate_request_with_prompt_tokens({1, 2}, 4, 32);
   request->state().output_func = [](const RequestOutput&) { return true; };
   request->state().timing->record_arrival(RequestTiming::Clock::now() -
                                           std::chrono::seconds(3));
   ASSERT_TRUE(scheduler.add_request(request));
-  ASSERT_FALSE(scheduler.prepare_batch_test()[0].empty());
   const int64_t count =
       HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
   const int64_t legacy_count =
       HISTOGRAM_time_to_first_token_latency_milliseconds.count();
-  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
-  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+  scheduler.step(absl::ZeroDuration());
+  scheduler.step(absl::ZeroDuration());
   EXPECT_FALSE(request->state().timing->snapshot().server_ttft.valid);
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             count);
   EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
             legacy_count);
-  auto& sequence = request->sequences().front();
-  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
-  sequence->append_token(Token(65));
-  request->state().timing->record_core_output(RequestTiming::Clock::now());
-  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+
+  engine.enable_output();
+  scheduler.step(absl::ZeroDuration());
   const auto sample = request->state().timing->snapshot().server_ttft;
   ASSERT_TRUE(sample.valid);
   EXPECT_GE(*sample.milliseconds, 3000.0);
@@ -2915,7 +2886,7 @@ TEST(ContinuousSchedulerTest, EmptyOutputDoesNotPublishLegacyOrServerTtft) {
             count + 1);
   EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
             legacy_count + 1);
-  scheduler.process_batch_output_test(/*enable_schedule_overlap=*/false);
+  scheduler.step(absl::ZeroDuration());
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             count + 1);
   EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
@@ -2923,16 +2894,29 @@ TEST(ContinuousSchedulerTest, EmptyOutputDoesNotPublishLegacyOrServerTtft) {
 }
 
 TEST(ContinuousSchedulerTest, FailedStreamReturnsStatusExactlyOnce) {
-  ContinuousScheduler::Options opt =
+  class FailingEngine final : public FakeEngine {
+   public:
+    FailingEngine() : FakeEngine(/*num_blocks=*/32, /*block_size=*/4) {}
+
+    ForwardOutput step(std::vector<Batch>& batches) override {
+      for (Batch& batch : batches) {
+        for (Sequence* sequence : batch.get_sequences()) {
+          sequence->fail(
+              Status(StatusCode::UNKNOWN, "json_object row mismatch"));
+        }
+      }
+      return {};
+    }
+  };
+
+  ContinuousScheduler::Options options =
       create_scheduler_options(1024, 16, 0, 1024, 1);
-  opt.enable_schedule_overlap() = false;
-  auto engine = std::make_unique<FakeEngine>(32, 4);
-  auto scheduler = std::make_unique<TestContinuousScheduler>(engine.get(), opt);
+  options.enable_schedule_overlap(false);
+  FailingEngine engine;
+  TestContinuousScheduler scheduler(&engine, options);
   auto request = generate_request_with_prompt_tokens({1, 2, 3, 4}, 4, 30000);
   request->state().stream = true;
   make_request_decode_ready(request);
-  scheduler->add_request(request);
-
   int32_t callback_count = 0;
   std::optional<Status> callback_status;
   request->state().output_func = [&](const RequestOutput& output) {
@@ -2940,26 +2924,17 @@ TEST(ContinuousSchedulerTest, FailedStreamReturnsStatusExactlyOnce) {
     callback_status = output.status;
     return true;
   };
-  std::vector<Batch> batch = scheduler->prepare_batch_test();
-  ASSERT_EQ(batch.size(), 1u);
-  ASSERT_EQ(batch[0].size(), 1u);
-
-  request->sequences()[0]->fail(
-      Status(StatusCode::UNKNOWN, "json_object row mismatch"));
-  scheduler->process_batch_output_test(/*enable_schedule_overlap=*/false);
-  scheduler->wait_for_responses();
+  ASSERT_TRUE(scheduler.add_request(request));
+  scheduler.step(absl::ZeroDuration());
   EXPECT_EQ(callback_count, 0);
-
-  (void)scheduler->prepare_batch_test();
-  scheduler->wait_for_responses();
-
+  scheduler.step(absl::ZeroDuration());
+  scheduler.wait_for_responses();
   EXPECT_EQ(callback_count, 1);
   ASSERT_TRUE(callback_status.has_value());
   EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
   EXPECT_EQ(callback_status->message(), "json_object row mismatch");
-
-  (void)scheduler->prepare_batch_test();
-  scheduler->wait_for_responses();
+  scheduler.step(absl::ZeroDuration());
+  scheduler.wait_for_responses();
   EXPECT_EQ(callback_count, 1);
 }
 
@@ -2991,7 +2966,7 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
     return std::vector<bool>{false, true};
   };
 
-  std::vector<Batch> batch = scheduler->prepare_batch_test();
+  std::vector<Batch> batch = scheduler->prepare();
   ASSERT_EQ(batch.size(), 1u);
   ASSERT_EQ(batch[0].size(), 2u);
   const size_t free_blocks_before_cancel =
@@ -3007,8 +2982,8 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
 
   EXPECT_TRUE(requests[0]->cancelled());
   EXPECT_FALSE(requests[1]->cancelled());
-  ASSERT_EQ(scheduler->get_running_requests().size(), 1u);
-  EXPECT_EQ(scheduler->get_running_requests()[0], requests[1]);
+  ASSERT_EQ(scheduler->running_requests().size(), 1u);
+  EXPECT_EQ(scheduler->running_requests()[0], requests[1]);
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             free_blocks_before_cancel);
   batch.clear();
@@ -3022,7 +2997,7 @@ TEST(ContinuousSchedulerTest, BatchRejectedStreamsCancelAtSchedulingBoundary) {
   EXPECT_FALSE(requests[1]->cancelled());
   scheduler->step(absl::ZeroDuration());
   EXPECT_TRUE(requests[1]->cancelled());
-  EXPECT_TRUE(scheduler->get_running_requests().empty());
+  EXPECT_TRUE(scheduler->running_requests().empty());
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             initial_free_blocks);
 }
@@ -3035,7 +3010,8 @@ TEST(ContinuousSchedulerTest, PauseResumeStateTransition) {
   ContinuousScheduler::Options opt =
       create_scheduler_options(10000, 256, 0, 1024, 1);
   auto engine = std::make_unique<FakeEngine>(block_num, block_size);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
 
   EXPECT_FALSE(scheduler->is_paused());
   scheduler->pause();
@@ -3058,9 +3034,9 @@ TEST(ContinuousSchedulerTest, PausePreemptsRunningAndFreesKVCache) {
   ContinuousScheduler::Options opt =
       create_scheduler_options(10000, 256, 0, 1024, 1);
   auto engine = std::make_unique<FakeEngine>(block_num, block_size);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
   BlockManagerPool* block_manager_pool = engine->block_manager_pool();
-  ASSERT_TRUE(scheduler != nullptr);
 
   auto requests = generate_request({127, 127},
                                    {10, 10},
@@ -3073,21 +3049,22 @@ TEST(ContinuousSchedulerTest, PausePreemptsRunningAndFreesKVCache) {
   for (auto req : requests) {
     scheduler->add_request(req);
   }
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   EXPECT_EQ(batch.size(), 1);
   EXPECT_EQ(batch[0].size(), 2);
   update_requests(running_requests);
 
-  EXPECT_EQ(scheduler->get_running_requests().size(), 2);
+  EXPECT_EQ(scheduler->running_requests().size(), 2);
   const size_t free_blocks_before =
       util::max(block_manager_pool->num_free_blocks());
 
   scheduler->pause();
-  scheduler->preempt_all_running_requests_test();
+  scheduler->step(absl::ZeroDuration());
+  EXPECT_TRUE(scheduler->wait_until_paused(/*timeout_ms=*/0));
 
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             free_blocks_before);
-  EXPECT_EQ(scheduler->get_running_requests().size(), 0);
+  EXPECT_EQ(scheduler->running_requests().size(), 0);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 2);
   batch.clear();
   EXPECT_GT(util::max(block_manager_pool->num_free_blocks()),
@@ -3103,8 +3080,8 @@ TEST(ContinuousSchedulerTest, ResumeReschedulesPreemptedRequests) {
   ContinuousScheduler::Options opt =
       create_scheduler_options(10000, 256, 0, 1024, 1);
   auto engine = std::make_unique<FakeEngine>(block_num, block_size);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
-  ASSERT_TRUE(scheduler != nullptr);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
 
   auto requests = generate_request({127, 127},
                                    {10, 10},
@@ -3117,22 +3094,23 @@ TEST(ContinuousSchedulerTest, ResumeReschedulesPreemptedRequests) {
   for (auto req : requests) {
     scheduler->add_request(req);
   }
-  (void)scheduler->prepare_batch_test();
+  (void)scheduler->prepare();
   update_requests(running_requests);
-  EXPECT_EQ(scheduler->get_running_requests().size(), 2);
+  EXPECT_EQ(scheduler->running_requests().size(), 2);
 
   scheduler->pause();
-  scheduler->preempt_all_running_requests_test();
-  EXPECT_EQ(scheduler->get_running_requests().size(), 0);
+  scheduler->step(absl::ZeroDuration());
+  EXPECT_TRUE(scheduler->wait_until_paused(/*timeout_ms=*/0));
+  EXPECT_EQ(scheduler->running_requests().size(), 0);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 2);
 
   scheduler->resume();
   EXPECT_FALSE(scheduler->is_paused());
 
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   EXPECT_EQ(batch.size(), 1);
   EXPECT_EQ(batch[0].size(), 2);
-  EXPECT_EQ(scheduler->get_running_requests().size(), 2);
+  EXPECT_EQ(scheduler->running_requests().size(), 2);
   EXPECT_EQ(scheduler->get_waiting_requests_num(), 0);
 
   (void)engine.release();
@@ -3146,9 +3124,9 @@ TEST(ContinuousSchedulerTest, PauseAbortCancelsRunningRequests) {
   ContinuousScheduler::Options opt =
       create_scheduler_options(10000, 256, 0, 1024, 1);
   auto engine = std::make_unique<FakeEngine>(block_num, block_size);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
   BlockManagerPool* block_manager_pool = engine->block_manager_pool();
-  ASSERT_TRUE(scheduler != nullptr);
 
   auto requests = generate_request({127, 127},
                                    {10, 10},
@@ -3164,21 +3142,23 @@ TEST(ContinuousSchedulerTest, PauseAbortCancelsRunningRequests) {
     req->state().output_func = [](const RequestOutput&) { return true; };
     scheduler->add_request(req);
   }
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   EXPECT_EQ(batch.size(), 1);
   EXPECT_EQ(batch[0].size(), 2);
   update_requests(running_requests);
 
-  EXPECT_EQ(scheduler->get_running_requests().size(), 2);
+  EXPECT_EQ(scheduler->running_requests().size(), 2);
   const size_t free_blocks_before =
       util::max(block_manager_pool->num_free_blocks());
 
-  scheduler->abort_all_running_requests_test();
+  scheduler->pause(ContinuousScheduler::PauseMode::ABORT);
+  scheduler->step(absl::ZeroDuration());
+  EXPECT_TRUE(scheduler->wait_until_paused(/*timeout_ms=*/0));
 
   EXPECT_EQ(util::max(block_manager_pool->num_free_blocks()),
             free_blocks_before);
-  EXPECT_EQ(scheduler->get_running_requests().size(), 0);  // running cleared
-  EXPECT_EQ(scheduler->get_waiting_requests_num(), 0);     // NOT requeued
+  EXPECT_EQ(scheduler->running_requests().size(), 0);   // running cleared
+  EXPECT_EQ(scheduler->get_waiting_requests_num(), 0);  // NOT requeued
   batch.clear();
   EXPECT_GT(util::max(block_manager_pool->num_free_blocks()),
             free_blocks_before);
@@ -3204,7 +3184,9 @@ TEST(ContinuousSchedulerTest,
         create_scheduler_options(1024, 16, 0, 1024, 1);
     auto engine =
         std::make_unique<FakeEngine>(32, 4, /*enable_prefix_cache=*/true);
-    auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+    auto scheduler =
+        std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+            engine.get(), opt);
 
     auto first_request =
         generate_request_with_prompt_tokens({1, 2, 3, 4, 5, 6, 7, 8}, 1, 30000);
@@ -3213,7 +3195,7 @@ TEST(ContinuousSchedulerTest,
     scheduler->add_request(first_request);
     scheduler->add_request(second_request);
 
-    auto batch = scheduler->prepare_batch_test();
+    auto batch = scheduler->prepare();
     EXPECT_EQ(batch.size(), 1);
     EXPECT_EQ(batch[0].size(), 2);
     EXPECT_EQ(first_request->sequences()[0]->kv_state().shared_blocks_num(
@@ -3273,7 +3255,9 @@ TEST(ContinuousSchedulerTest, InBatchCacheReusesPartialPrefixWithinSameBatch) {
         create_scheduler_options(1024, 16, 0, 1024, 1);
     auto engine =
         std::make_unique<FakeEngine>(64, 4, /*enable_prefix_cache=*/true);
-    auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
+    auto scheduler =
+        std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+            engine.get(), opt);
 
     auto first_request =
         generate_request_with_prompt_tokens(prompt_a, 1, 30000);
@@ -3282,7 +3266,7 @@ TEST(ContinuousSchedulerTest, InBatchCacheReusesPartialPrefixWithinSameBatch) {
     scheduler->add_request(first_request);
     scheduler->add_request(second_request);
 
-    auto batch = scheduler->prepare_batch_test();
+    auto batch = scheduler->prepare();
 
     Result r;
     r.batch_count = batch.size();
@@ -3362,8 +3346,8 @@ TEST(ContinuousSchedulerTest,
   // gives enable_mix_batch=false + enable_chunked_prefill=true.
   ContinuousScheduler::Options opt = create_scheduler_options(
       kMaxTokensPerBatch, 256, /*num_speculative_tokens=*/5, 1024, 1);
-  auto scheduler = std::make_unique<ContinuousScheduler>(engine.get(), opt);
-  ASSERT_TRUE(scheduler != nullptr);
+  auto scheduler = std::make_unique<scheduler_test::ContinuousSchedulerAdapter>(
+      engine.get(), opt);
 
   std::vector<int32_t> prefix_token_ids;
   prefix_token_ids.reserve(kPrefixLen);
@@ -3389,12 +3373,12 @@ TEST(ContinuousSchedulerTest,
       prompt_token_ids, /*max_tokens=*/10, /*max_context_len=*/30000);
   scheduler->add_request(request);
 
-  auto batch = scheduler->prepare_batch_test();
+  auto batch = scheduler->prepare();
   ASSERT_EQ(batch.size(), 1);
   ASSERT_EQ(batch[0].size(), 1);
 
-  auto running_requests = scheduler->get_running_requests();
-  auto budgets = scheduler->get_running_sequences_budgets();
+  auto running_requests = scheduler->running_requests();
+  auto budgets = scheduler->sequence_budgets();
   ASSERT_EQ(running_requests.size(), 1);
   ASSERT_EQ(budgets.size(), 1);
 

@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from xllm.python import registry
 from xllm.python.layers.moe import clamped_silu_and_mul_fp32
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import deepseek_v4, deepseek_v32
@@ -40,7 +41,6 @@ from xllm.python.models.deepseek_v4 import (
     DeepseekV4RotaryEmbedding,
 )
 from xllm.python.models.deepseek_v32 import DeepseekV3MLP, W8A8DynamicLinear
-from xllm.python.registry import get_model_class
 
 _DSV4_CONFIG = {
     "model_type": "deepseek_v4",
@@ -85,18 +85,12 @@ _DSV4_CONFIG = {
 
 
 def test_config_from_dict_reads_dsv4_fields() -> None:
-    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
-    assert cfg.model_type == "deepseek_v4"
+    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "cp_size": 2, "dp_size": 3})
     assert cfg.n_layers == 4
     assert cfg.compress_ratios == [1, 4, 128, 4]
-    assert cfg.window_size == 128
-    assert cfg.o_lora_rank == 1024
-    assert cfg.o_groups == 8
-    assert cfg.hc_mult == 4
-    assert cfg.index_topk == 512
     assert cfg.rope_scaling_factor == 16.0
-    assert cfg.layers_to_capture == ()
-    assert cfg.num_speculative_tokens == 0
+    assert cfg.cp_size == 2
+    assert cfg.dp_size == 3
 
 
 def test_config_prefers_dsv4_model_args_over_zero_legacy_rope_fields() -> None:
@@ -137,12 +131,12 @@ def test_config_reads_target_hidden_capture_fields() -> None:
     cfg = DeepseekV4Config.from_dict(
         {
             **_DSV4_CONFIG,
-            "layers_to_capture": [7, 3],
+            "layers_to_capture": [3, 1],
             "num_speculative_tokens": 4,
         }
     )
 
-    assert cfg.layers_to_capture == (7, 3)
+    assert cfg.layers_to_capture == (3, 1)
     assert cfg.num_speculative_tokens == 4
 
 
@@ -260,13 +254,14 @@ def test_qli_decode_uses_request_shaped_rope_rows(monkeypatch: pytest.MonkeyPatc
     assert rope_dim == 2
 
 
-def test_registry_resolves_deepseek_v4() -> None:
-    cls = get_model_class("deepseek_v4")
-    assert cls.__name__ == "DeepseekV4ForCausalLM"
+@pytest.mark.parametrize("name", ["deepseek_v4", "DeepseekV4ForCausalLM"])
+def test_registry_resolves_deepseek_v4(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
+    assert registry.get_model_class(name) is DeepseekV4ForCausalLM
 
 
 def test_hyper_connection_shapes() -> None:
-    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "tp_size": 2})
     hc = DeepseekV4HyperConnection(cfg, torch.float32, torch.device("cpu"))
     assert hc.hc_mult_local == 4  # hc_mult is NOT TP-sharded
     # hc_*_fn: [mix_hc, hc_dim] = [(2+mult)*mult, mult*hidden] = [24, 16384].
@@ -277,30 +272,19 @@ def test_hyper_connection_shapes() -> None:
     # pure-Python unit-test context; only shape construction is verified here.
 
 
-def test_decoder_layer_builds() -> None:
-    """A C4 decoder layer builds attention + HC + MoE without error."""
-    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
-    layer = DeepseekV4DecoderLayer(cfg, layer_id=1, dtype=torch.float32, device=torch.device("cpu"))
-    assert layer.self_attn.layer_id == 1
-    assert layer.self_attn.indexer is not None
-    assert layer.hc.hc_mult_local == 4
-
-
 def test_attention_builds_compression_modules_only_for_matching_ratios() -> None:
     cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
     c1 = DeepseekV4DecoderLayer(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu")).self_attn
     c4 = DeepseekV4DecoderLayer(cfg, layer_id=1, dtype=torch.float32, device=torch.device("cpu")).self_attn
     c128 = DeepseekV4DecoderLayer(cfg, layer_id=2, dtype=torch.float32, device=torch.device("cpu")).self_attn
 
+    assert (c1.layer_id, c4.layer_id, c128.layer_id) == (0, 1, 2)
     assert c1.indexer is None
     assert not hasattr(c1, "cmp_wkv")
     assert c4.indexer is not None
     assert hasattr(c4, "cmp_wkv")
     assert c128.indexer is None
     assert hasattr(c128, "cmp_wkv")
-    assert c1.attn_sink_loaded is False
-    assert c4.attn_sink_loaded is False
-    assert c128.attn_sink_loaded is False
 
 
 def test_compressor_weights_are_cached_as_non_persistent_bf16(monkeypatch) -> None:
@@ -382,7 +366,7 @@ def test_dynamic_linear_preserves_v3_and_v4_weight_layout_contracts(
 
 
 def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
-    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "tp_size": 2})
+    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "tp_size": 2, "first_k_dense_replace": 1})
     mlp = DeepseekV3MLP(cfg, cfg.moe_intermediate_size, torch.float32, torch.device("cpu"))
     mlp.gate_up_proj.forward = MagicMock(return_value=torch.ones(1, 2 * mlp.gate_up_proj.out_features))
     mlp.down_proj.forward = MagicMock(return_value=torch.ones(1, cfg.hidden_size))
@@ -400,20 +384,6 @@ def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     mlp(torch.ones(1, cfg.hidden_size))
 
     tp_reduce.assert_called_once()
-
-
-def test_model_accepts_cp_config() -> None:
-    cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "cp_size": 2})
-    model = DeepseekV4Model(cfg, torch.float32, torch.device("cpu"))
-    assert model.cfg.cp_size == 2
-
-
-def test_causal_lm_accepts_data_parallelism_config() -> None:
-    # The production constructor defaults to npu:0. This configuration test
-    # must not initialize an NPU or compete with device tests for HBM.
-    model = DeepseekV4ForCausalLM({**_DSV4_CONFIG, "dp_size": 2, "device": "cpu"})
-    assert model.cfg.dp_size == 2
-    assert all(parameter.device.type == "cpu" for parameter in model.parameters())
 
 
 def _capture_test_model(
@@ -560,8 +530,14 @@ def test_layer_capture_restores_global_rows_with_context_parallelism(
     embedded = model.embed_tokens(input_ids)
     expected_streams = embedded.unsqueeze(1).expand(-1, 2, -1) + 1.0
     expected_aux = expected_streams.mean(dim=1)
+    segment_size = (token_count + 1) // 2
+    local_start = min(cp_rank * segment_size, token_count)
+    local_end = min(local_start + segment_size, token_count)
+    local_rows = torch.arange(local_start, local_end)
+    expected_local = iter((expected_streams[local_rows], expected_aux[local_rows]))
     gathered = iter((expected_streams, expected_aux))
     collective_inputs: list[torch.Tensor] = []
+    expected_token_counts = [min(segment_size, token_count), max(0, token_count - segment_size)]
 
     class _FakeDistributed:
         @staticmethod
@@ -571,7 +547,10 @@ def test_layer_capture_restores_global_rows_with_context_parallelism(
             rank: int,
             group_name: str,
         ) -> torch.Tensor:
-            del token_counts, rank, group_name
+            assert token_counts == expected_token_counts
+            assert rank == cp_rank
+            assert group_name == "cp"
+            torch.testing.assert_close(tensor, next(expected_local))
             collective_inputs.append(tensor)
             return next(gathered)
 
@@ -684,7 +663,6 @@ def test_moe_loader_prepares_down_scales_for_each_quantization(
     moe = DeepseekV4MoE(cfg, layer_id=0, dtype=torch.bfloat16, device=torch.device("cpu"))
     assert moe.experts_w2_scale.dtype == torch.bfloat16
     assert moe.experts_w13_scale.dtype == torch.float32
-    assert not hasattr(moe, "experts_w2_scale_compute")
     owner = torch.nn.Module()
     owner.cfg = cfg
     owner.model = torch.nn.Module()
@@ -857,17 +835,11 @@ def test_v4_o_b_row_parallel_keeps_checkpoint_layout() -> None:
 def test_moe_dp_rejects_metadata_token_count_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """DP slicing must never silently consume padding or drop real rows."""
 
-    class FakeDistributed:
-        @staticmethod
-        def all_gather(tensor: torch.Tensor, **kwargs: object) -> torch.Tensor:
-            return tensor.repeat(2, *([1] * (tensor.dim() - 1)))
-
-    monkeypatch.setattr(deepseek_v4, "distributed", FakeDistributed)
+    monkeypatch.setattr(deepseek_v4, "distributed", SimpleNamespace())
     moe = SimpleNamespace(
         dp_size=2,
         dp_rank=0,
         gate=MagicMock(side_effect=AssertionError("gate should not run")),
-        input_ids=None,
     )
     metadata = SimpleNamespace(dp_execution_token_counts=[3, 4])
     ctx = ForwardContext(

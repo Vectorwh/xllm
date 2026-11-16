@@ -166,14 +166,18 @@ def test_source_rows_are_dispatched_once_and_shared_expert_is_not_reduced(
     module._w8a8_bias_topk = route
     calls = []
 
+    def assert_route(value: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> None:
+        torch.testing.assert_close(value[: source.shape[0]], source * 2)
+        expected_weights = value.new_tensor([0.25, 0.75]).expand(source.shape[0], 2)
+        torch.testing.assert_close(weights[: source.shape[0]], expected_weights)
+        assert indices[: source.shape[0]].tolist() == [[0, 3]] * source.shape[0]
+
     def experts(
         value: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, *args: object, **kwargs: object
     ) -> torch.Tensor:
         calls.append(value)
-        torch.testing.assert_close(value, source * 2)
-        # Remote experts must retain their real router weights until dispatch.
-        torch.testing.assert_close(weights[:, 1], torch.full((value.shape[0],), 0.75))
-        assert indices[:, 1].eq(3).all()
+        # Remote experts retain their full router weights until dispatch.
+        assert_route(value, weights, indices)
         mask = kwargs["x_active_mask"]
         assert mask.tolist() == [i < ep.active_rows for i in range(layout.local_rows)]
         return value * (0.25 + 0.75 * 4)
@@ -192,7 +196,7 @@ def test_source_rows_are_dispatched_once_and_shared_expert_is_not_reduced(
         assert dispatch_rows <= mega_capacity
         assert value.shape[0] == dispatch_rows
         calls.append(value)
-        torch.testing.assert_close(value[: source.shape[0]], source * 2)
+        assert_route(value, weights, indices)
         expected_mask = [i < ep.active_rows for i in range(dispatch_rows)]
         assert kwargs["x_active_mask"].tolist() == expected_mask
         return value * (0.25 + 0.75 * 4)
@@ -214,7 +218,7 @@ def test_source_rows_are_dispatched_once_and_shared_expert_is_not_reduced(
     ) -> torch.Tensor:
         calls.append(value)
         assert value.shape[0] == dispatch_rows
-        torch.testing.assert_close(value[: source.shape[0]], source * 2)
+        assert_route(value, weights, indices)
         assert mask.tolist() == [i < ep.active_rows for i in range(dispatch_rows)]
         assert group == "ep-test"
         assert max_output_size == dispatch_rows * 2 * cfg.ep_size
@@ -228,7 +232,13 @@ def test_source_rows_are_dispatched_once_and_shared_expert_is_not_reduced(
     # Restore the other TP owner's independently computed source rows.
     padded = torch.zeros(layout.padded_rows, 3)
     padded[:rows] = expected
-    monkeypatch.setattr(distributed, "tp_all_gather", lambda *args: padded, raising=False)
+
+    def gather(local: torch.Tensor, dim: int, tp_size: int) -> torch.Tensor:
+        assert dim == 0 and tp_size == cfg.tp_size
+        torch.testing.assert_close(local, sp_shard(expected, layout), rtol=0, atol=0)
+        return padded
+
+    monkeypatch.setattr(distributed, "tp_all_gather", gather, raising=False)
 
     class _Norm(nn.Module):
         def forward(self, value: torch.Tensor) -> torch.Tensor:

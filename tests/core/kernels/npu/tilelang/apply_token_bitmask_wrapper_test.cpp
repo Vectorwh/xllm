@@ -18,10 +18,6 @@ limitations under the License.
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/torch_npu.h>
 
-#include <chrono>
-#include <cstdint>
-#include <functional>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -91,56 +87,6 @@ torch::Tensor make_mask(int64_t rows,
     }
   }
   return mask;
-}
-
-double measure_npu_event_ms(const std::function<void()>& fn,
-                            int32_t device_id,
-                            int32_t warmup_iters,
-                            int32_t measure_iters) {
-  const aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  for (int32_t iter = 0; iter < warmup_iters; ++iter) {
-    fn();
-  }
-  CHECK_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS);
-
-  aclrtEvent start_event = nullptr;
-  aclrtEvent end_event = nullptr;
-  CHECK_EQ(aclrtCreateEvent(&start_event), ACL_SUCCESS);
-  CHECK_EQ(aclrtCreateEvent(&end_event), ACL_SUCCESS);
-  CHECK_EQ(aclrtRecordEvent(start_event, stream), ACL_SUCCESS);
-  for (int32_t iter = 0; iter < measure_iters; ++iter) {
-    fn();
-  }
-  CHECK_EQ(aclrtRecordEvent(end_event, stream), ACL_SUCCESS);
-  CHECK_EQ(aclrtSynchronizeEvent(end_event), ACL_SUCCESS);
-
-  float elapsed_ms = 0.0F;
-  CHECK_EQ(aclrtEventElapsedTime(&elapsed_ms, start_event, end_event),
-           ACL_SUCCESS);
-  CHECK_EQ(aclrtDestroyEvent(start_event), ACL_SUCCESS);
-  CHECK_EQ(aclrtDestroyEvent(end_event), ACL_SUCCESS);
-  return static_cast<double>(elapsed_ms) / measure_iters;
-}
-
-double measure_completed_wall_ms(const std::function<void()>& fn,
-                                 int32_t device_id,
-                                 int32_t warmup_iters,
-                                 int32_t measure_iters) {
-  const aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  for (int32_t iter = 0; iter < warmup_iters; ++iter) {
-    fn();
-  }
-  CHECK_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS);
-
-  const auto start = std::chrono::steady_clock::now();
-  for (int32_t iter = 0; iter < measure_iters; ++iter) {
-    fn();
-  }
-  CHECK_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS);
-  const auto end = std::chrono::steady_clock::now();
-  const auto elapsed =
-      std::chrono::duration<double, std::milli>(end - start).count();
-  return elapsed / measure_iters;
 }
 
 void run_parity_case(int64_t rows,
@@ -218,42 +164,6 @@ TEST_F(ApplyTokenBitmaskWrapperTest, RejectsInputsThatRequireFallback) {
   torch::Tensor bitmask = make_mask(1, 32, "all_allowed").to(device);
   ASSERT_FALSE(non_contiguous.is_contiguous());
   EXPECT_FALSE(can_apply_token_bitmask_inplace(non_contiguous, bitmask));
-}
-
-TEST_F(ApplyTokenBitmaskWrapperTest, ReportsCompletedDeviceTiming) {
-  constexpr int64_t kRows = 4;
-  constexpr int64_t kVocabSize = 150464;
-  const auto device = torch::Device("npu:0");
-  const auto options =
-      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  torch::Tensor input = torch::randn({kRows, kVocabSize}, options);
-  torch::Tensor bitmask =
-      make_mask(kRows, kVocabSize, "alternating").to(device);
-  torch::Tensor reference_logits = input.clone();
-  torch::Tensor fused_logits = input.clone();
-
-  const auto reference_fn = [&]() {
-    reference_logits.copy_(input);
-    reference_logits = apply_reference_on_device(reference_logits, bitmask);
-  };
-  const auto fused_fn = [&]() {
-    fused_logits.copy_(input);
-    apply_token_bitmask_inplace(fused_logits, bitmask);
-  };
-
-  const double reference_completed_ms =
-      measure_completed_wall_ms(reference_fn, device.index(), 2, 10);
-  const double fused_completed_ms =
-      measure_completed_wall_ms(fused_fn, device.index(), 2, 10);
-  const double fused_device_ms =
-      measure_npu_event_ms([&]() { fused_fn(); }, device.index(), 2, 10);
-
-  std::cout << "[apply_token_bitmask_wrapper_test] rows=" << kRows
-            << ", vocab=" << kVocabSize
-            << ", reference_completed_ms=" << reference_completed_ms
-            << ", fused_completed_ms=" << fused_completed_ms
-            << ", fused_device_ms=" << fused_device_ms << ", completed_speedup="
-            << reference_completed_ms / fused_completed_ms << "x" << std::endl;
 }
 
 }  // namespace

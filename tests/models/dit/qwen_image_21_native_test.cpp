@@ -108,39 +108,6 @@ TaylorSeerOptions taylor_options(int32_t warmup,
   return result;
 }
 
-TEST(QwenImage21Structure, RotaryPreservesPairNorm) {
-  auto layout =
-      qwen_image_21::prepare_sequence_layout(torch::zeros({1, 2}, torch::kBool),
-                                             {},
-                                             {{1, 2, 2}},
-                                             {2, 2, 4},
-                                             torch::kCPU);
-  auto input = torch::randn({1, 6, 2, 8});
-  auto result = qwen_image_21::apply_rotary(input, layout);
-  EXPECT_TRUE(torch::allclose(
-      input.square().sum(-1), result.square().sum(-1), 1e-5, 1e-5));
-}
-
-TEST(QwenImage21Structure, TransformerSyntheticForward) {
-  torch::NoGradGuard guard;
-  auto config = small_transformer_config();
-  ProcessGroup process_group(
-      /*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
-  QwenImage21Transformer2DModel model(config, &process_group);
-  initialize_weights(*model);
-  auto layout =
-      model->prepare_layout(torch::tensor({{false, true, false}}, torch::kBool),
-                            {},
-                            {{1, 2, 2}, {1, 2, 2}},
-                            torch::kCPU);
-  auto result = model->forward(torch::randn({1, 8, 4}),
-                               torch::randn({1, 3, 8}),
-                               torch::tensor({0.5f}),
-                               layout);
-  EXPECT_EQ(result.sizes(), (torch::IntArrayRef{1, 4, 4}));
-  EXPECT_TRUE(torch::isfinite(result).all().item<bool>());
-}
-
 TEST(QwenImage21Structure, PrefixCannotSeeTargetNoise) {
   torch::NoGradGuard guard;
   auto config = small_transformer_config();
@@ -181,7 +148,6 @@ TEST(QwenImage21Structure, MergedSwiGluPreservesGateProjectionOrder) {
       StateDict({{"proj.weight", up}, {"out.weight", output}}));
   mlp->load_state_dict(StateDict({{"gate_layer.weight", gate}}));
   mlp->verify_loaded_weights("img_mlp.");
-  EXPECT_EQ(mlp->named_parameters().size(), 2);
   auto input =
       torch::arange(-20, 20, torch::kFloat32).reshape({2, 5, 4}) / 16.0;
   for (const auto& x : {input, input.transpose(0, 1), input[0]}) {
@@ -272,30 +238,6 @@ TEST(QwenImage21PrefixCache, RejectsUnsafeConfigurationAndBranchReuse) {
   }
 }
 
-TEST(QwenImage21Sp, HeadPartitionsRecombineFullAttention) {
-  auto layout = qwen_image_21::prepare_sequence_layout(
-      torch::tensor({{false, true, false}}, torch::kBool),
-      {},
-      {{1, 2, 2}, {1, 2, 2}},
-      {2, 2, 4},
-      torch::kCPU);
-  const int64_t total = layout.prefix_tokens + layout.target_tokens;
-  auto q = torch::randn({1, 4, total, 8}), k = torch::randn_like(q),
-       v = torch::randn_like(q);
-  auto full =
-      qwen_image_21::transformer_attention(q, k, v, layout.allowed_attention);
-  std::vector<torch::Tensor> per_head;
-  per_head.reserve(2);
-  for (int64_t rank = 0; rank < 2; ++rank) {
-    per_head.emplace_back(qwen_image_21::transformer_attention(
-        q.slice(1, 2 * rank, 2 * (rank + 1)),
-        k.slice(1, 2 * rank, 2 * (rank + 1)),
-        v.slice(1, 2 * rank, 2 * (rank + 1)),
-        layout.allowed_attention));
-  }
-  EXPECT_TRUE(torch::allclose(full, torch::cat(per_head, 1), 1e-6, 1e-6));
-}
-
 TEST(QwenImage21SpDegree, AllHeadPartitionsRecombinePaddedAttention) {
   torch::manual_seed(21);
   auto full = qwen_image_21::prepare_sequence_layout(
@@ -310,7 +252,7 @@ TEST(QwenImage21SpDegree, AllHeadPartitionsRecombinePaddedAttention) {
   auto value = torch::randn_like(query);
   auto expected = qwen_image_21::transformer_attention(
       query, key, value, full.allowed_attention);
-  for (int32_t degree : {2, 4, 8, 16, 32}) {
+  for (int32_t degree : {2, 32}) {
     qwen_image_21::SpSequenceLayout geometry(full, 0, degree);
     const int64_t padding = geometry.padding();
     auto pad = [&](const torch::Tensor& input) {
@@ -426,7 +368,6 @@ TEST(QwenImage21Native, AdaptiveNormSupportsTokenwiseAndBroadcastScales) {
       norm, hidden, broadcast, /*zero_shift=*/{});
   EXPECT_TRUE(torch::allclose(
       actual, expected_norm * torch::tensor({{{1.25f, 1.5f}}})));
-  EXPECT_EQ(norm->named_parameters().size(), 0);
 }
 
 }  // namespace

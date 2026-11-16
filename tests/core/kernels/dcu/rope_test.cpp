@@ -18,10 +18,9 @@ limitations under the License.
 #include <torch/cuda.h>
 #include <torch/torch.h>
 
-#include <functional>
 #include <optional>
 #include <string>
-#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "kernels/cuda/cuda_ops_api.h"
@@ -66,17 +65,6 @@ std::pair<double, double> get_tolerance(torch::ScalarType dtype) {
     return {1e-2, 1e-2};
   }
   return {1e-5, 1e-5};
-}
-
-void expect_throws_c10(const std::function<void()>& fn) {
-  try {
-    fn();
-    FAIL() << "Expected c10::Error, but no exception was thrown.";
-  } catch (const c10::Error&) {
-    SUCCEED();
-  } catch (...) {
-    FAIL() << "Expected c10::Error, but got a different exception type.";
-  }
 }
 
 // CPU canonical reference on [T, H, D]

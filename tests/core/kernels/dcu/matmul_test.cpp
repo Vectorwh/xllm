@@ -159,8 +159,6 @@ std::vector<MatmulCase> Generate2DCases() {
   // in_features]
   const std::vector<MatmulCase> shapes = {
       {"SingleToken_256x256", {1, 256}, {256, 256}},
-      {"SingleToken_4096x4096", {1, 4096}, {4096, 4096}},
-      {"Batch8_4096x11008", {8, 4096}, {11008, 4096}},
       {"WithBias_Batch4_11008x4096", {4, 4096}, {11008, 4096}},
   };
   std::vector<MatmulCase> cases;
@@ -179,9 +177,10 @@ std::vector<MatmulCase> Generate3DCases() {
   const std::vector<torch::ScalarType> dtypes = {
       torch::kFloat32, torch::kFloat16, torch::kBFloat16};
   const std::vector<MatmulCase> shapes = {
-      {"Prefill_1x128x4096", {1, 128, 4096}, {4096, 4096}},
-      {"Prefill_4x11008x4096", {2, 4096, 4096}, {11008, 4096}},
-      {"Prefill_WithBias_2x11008x4096", {2, 8192, 4096}, {11008, 4096}, true},
+      // Retain one large reduction to cover tolerance scaling, and a compact
+      // 3D bias case for the separate leading-dimension/bias contract.
+      {"Prefill_2x4096x11008", {2, 4096, 4096}, {11008, 4096}},
+      {"Prefill_WithBias_2x8x11008", {2, 8, 4096}, {11008, 4096}, true},
   };
   std::vector<MatmulCase> cases;
   cases.reserve(shapes.size() * dtypes.size());

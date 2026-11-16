@@ -37,8 +37,6 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-class DeepseekV2SparseMoEBlockTestPeer;
-
 class DeepseekV32SparseMoEBlockImpl : public torch::nn::Module {
  public:
   struct ExecCfg {
@@ -113,8 +111,6 @@ class DeepseekV32SparseMoEBlockImpl : public torch::nn::Module {
   ParallelArgs parallel_args_;
   bool enable_deep_ep_ = false;
   FusedMoE moe_{nullptr};
-
-  friend class DeepseekV2SparseMoEBlockTestPeer;
 };
 
 TORCH_MODULE(DeepseekV32SparseMoEBlock);

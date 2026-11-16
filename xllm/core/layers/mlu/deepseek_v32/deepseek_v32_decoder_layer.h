@@ -39,8 +39,6 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-class DeepseekV2DecoderLayerTestPeer;
-
 class DeepseekV32DecoderLayerImpl : public torch::nn::Module {
  public:
   explicit DeepseekV32DecoderLayerImpl(const ModelContext& context,
@@ -132,7 +130,7 @@ class DeepseekV32DecoderLayerImpl : public torch::nn::Module {
                              const std::optional<DsaTopkState>* mtp_topk_input,
                              std::optional<DsaTopkState>* mtp_topk_output);
 
-  friend class DeepseekV2DecoderLayerTestPeer;
+  friend class DeepseekV32DecoderLayerTestPeer;
 
   // parallel args
   ParallelArgs parallel_args_;

@@ -57,8 +57,6 @@ class FixedStepsScheduler final : public ContinuousScheduler {
   void step(const absl::Duration& timeout) override;
 
  private:
-  friend class FixedStepsSchedulerTestPeer;
-
   void append_request_queue_metrics(
       std::vector<std::pair<std::string, size_t>>& queues) override;
 

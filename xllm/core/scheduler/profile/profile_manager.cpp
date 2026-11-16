@@ -120,11 +120,6 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
     if (should_profile_speculative_validate()) {
       profile_speculative_validate_time();
     }
-    // test accuracy
-    // eval_sequence_latency_prediction();
-    // eval_batch_latency_prediction("only_prefill");
-    // eval_batch_latency_prediction("only_decode");
-    // eval_batch_latency_prediction("mix");
   }
   if (options.enable_profile_token_budget()) {
     LOG(INFO) << "Starting profiliing token budget.";
@@ -161,143 +156,6 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   }
 #endif
 }
-
-// --------------------- for test only ---------------------------
-void ProfileManager::eval_sequence_latency_prediction() {
-  std::vector<double> pred_vec;
-  std::vector<double> target_vec;
-  int32_t token_step = 500;
-  int32_t prefix_step = 500;
-  int32_t upper_bound = 4000;
-
-  LOG(INFO) << "Starting testing sequence latency prediction";
-  for (int32_t token_length = token_step; token_length < upper_bound;
-       token_length += token_step) {
-    for (int32_t prefix_length = 0; prefix_length < token_length;
-         prefix_length += prefix_step) {
-      target_vec.emplace_back(run_request(token_length, prefix_length));
-      pred_vec.emplace_back(predict_step_time(token_length, prefix_length));
-    }
-  }
-
-  // print for debug
-  for (const auto& element : pred_vec) {
-    std::cout << static_cast<int32_t>(element) << " ";
-  }
-  std::cout << std::endl;
-  for (const auto& element : target_vec) {
-    std::cout << static_cast<int32_t>(element) << " ";
-  }
-  std::cout << std::endl;
-
-  double sum_error = 0.0;
-  double sum_percentage_error = 0.0;
-
-  for (size_t i = 0; i < pred_vec.size(); ++i) {
-    double error = std::abs(pred_vec[i] - target_vec[i]);
-    sum_error += error;
-    sum_percentage_error += error / std::abs(target_vec[i]);
-  }
-  double mae = sum_error / pred_vec.size();
-  double mape = (sum_percentage_error / pred_vec.size()) * 100.0;
-
-  LOG(INFO) << "Mean Absolute Error (MAE) of latency prediction: " << mae
-            << " ms";
-  LOG(INFO) << "Mean Absolute Percentage Error (MAPE) of latency prediction: "
-            << mape << " %";
-}
-void ProfileManager::eval_batch_latency_prediction(const std::string mode) {
-  std::vector<double> pred_vec;
-  std::vector<double> target_vec;
-
-  LOG(INFO) << "Starting testing batch latency prediction for " << mode;
-  if (mode == "only_prefill") {
-    int32_t max_batch_size = 10;
-    int32_t token_step = 500;
-    int32_t prefix_step = 500;
-    int32_t upper_bound = 4000;
-    for (int32_t token_length = token_step; token_length < upper_bound;
-         token_length += token_step) {
-      for (int32_t prefix_length = 0; prefix_length < token_length;
-           prefix_length += prefix_step) {
-        target_vec.emplace_back(
-            run_request(token_length, prefix_length, max_batch_size));
-        pred_vec.emplace_back(
-            predict_step_time(token_length, prefix_length, max_batch_size));
-      }
-    }
-  }
-  if (mode == "only_decode") {
-    int32_t max_batch_size = 200;
-    int32_t token_length = 500;
-    for (int32_t batch_size = 1; batch_size < max_batch_size; batch_size++) {
-      target_vec.emplace_back(
-          run_request(token_length, token_length - 1, batch_size));
-      pred_vec.emplace_back(
-          predict_step_time(token_length, token_length - 1, batch_size));
-    }
-  }
-  if (mode == "mix") {
-    if (!::xllm::SchedulerConfig::get_instance().enable_chunked_prefill()) {
-      LOG(WARNING) << "When chunked prefill is disabled, mixed prefill and "
-                      "decode scenarios will not be tested.";
-      return;
-    }
-    int32_t max_batch_size = 100;
-    int32_t max_prefill_cnt = 5;
-    int32_t token_length = 500;
-    for (int32_t batch_size = 50; batch_size <= max_batch_size;
-         batch_size += 10) {
-      for (int32_t prefill_cnt = 0; prefill_cnt <= max_prefill_cnt;
-           prefill_cnt++) {
-        std::vector<int32_t> token_length_vec;
-        std::vector<int32_t> prefix_length_vec;
-        token_length_vec.insert(
-            token_length_vec.end(), prefill_cnt, token_length);
-        prefix_length_vec.insert(prefix_length_vec.end(), prefill_cnt, 0);
-        // token_length_vec.insert(token_length_vec.end(), batch_size/5,
-        // token_length); prefix_length_vec.insert(prefix_length_vec.end(),
-        // batch_size/5, token_length-1);
-        token_length_vec.insert(
-            token_length_vec.end(), batch_size - prefill_cnt, token_length);
-        prefix_length_vec.insert(prefix_length_vec.end(),
-                                 batch_size - prefill_cnt,
-                                 token_length - 1);
-        target_vec.emplace_back(
-            run_request(token_length_vec, prefix_length_vec));
-        pred_vec.emplace_back(
-            predict_step_time(token_length_vec, prefix_length_vec));
-      }
-    }
-  }
-
-  // print for debug
-  for (const auto& element : pred_vec) {
-    std::cout << static_cast<int32_t>(element) << " ";
-  }
-  std::cout << std::endl;
-  for (const auto& element : target_vec) {
-    std::cout << static_cast<int32_t>(element) << " ";
-  }
-  std::cout << std::endl;
-
-  double sum_error = 0.0;
-  double sum_percentage_error = 0.0;
-
-  for (size_t i = 0; i < pred_vec.size(); ++i) {
-    double error = std::abs(pred_vec[i] - target_vec[i]);
-    sum_error += error;
-    sum_percentage_error += error / std::abs(target_vec[i]);
-  }
-  double mae = sum_error / pred_vec.size();
-  double mape = (sum_percentage_error / pred_vec.size()) * 100.0;
-
-  LOG(INFO) << "Mean Absolute Error (MAE) of latency prediction: " << mae
-            << " ms";
-  LOG(INFO) << "Mean Absolute Percentage Error (MAPE) of latency prediction: "
-            << mape << " %";
-}
-// -------------------------------------------------------------
 
 // ---------------------- dump to file-----------------------
 std::string ProfileManager::generate_filename(const std::string& file_suffix) {
@@ -352,7 +210,6 @@ void ProfileManager::dump_step_time_profile_to_file(
   outfile.close();
   LOG(INFO) << "Profile data saved to: " << filename;
 }
-// -------------------------------------------------------------
 
 void ProfileManager::profile_step_time(bool if_dump_to_file) {
   // get the maximum prefill token length
@@ -722,15 +579,6 @@ void ProfileManager::profile_token_budget() {
 
 bool ProfileManager::check_if_satisfy_slo(int32_t num_tokens,
                                           int32_t tpot_slo_ms) {
-  // int32_t prompt_tokens_per_batch = 1024;
-  // auto batch_size = num_tokens / prompt_tokens_per_batch;
-  // int32_t extra_token_length = num_tokens % prompt_tokens_per_batch;
-  // double batch_latency = 0;
-  // for (int32_t k = 0; k < profile_count_per_step_; k++) {
-  //   batch_latency +=
-  //       run_request(prompt_tokens_per_batch, 0, batch_size,
-  //       extra_token_length);
-  // }
   double batch_latency = 0;
   for (int32_t k = 0; k < profile_count_per_step_; k++) {
     batch_latency += run_request(num_tokens, 0, 1, 0);
@@ -1028,48 +876,6 @@ double ProfileManager::run_request(int32_t token_length,
   // build batch
   auto batches = BatchFactory::get_instance(options_.dp_size())
                      ->create_batches(requests, sequences, sequences_budget);
-
-  absl::Time start_time = absl::Now();
-  engine_->step(batches);
-  if (options_.enable_schedule_overlap()) {
-    engine_->update_last_step_result(batches);
-  }
-  double latency = absl::ToDoubleMilliseconds(absl::Now() - start_time);
-  for (auto& request : requests) {
-    request->sequences()[0]->reset();
-  }
-
-  return latency;
-}
-
-// currently for test only
-double ProfileManager::run_request(
-    const std::vector<int32_t>& token_length_vec,
-    const std::vector<int32_t>& prefix_length_vec) {
-  CHECK(token_length_vec.size() == prefix_length_vec.size());
-  std::vector<Sequence*> sequences;
-  std::vector<size_t> sequences_budget;
-  std::vector<std::shared_ptr<Request>> requests;
-  sequences.reserve(token_length_vec.size());
-  sequences_budget.reserve(token_length_vec.size());
-  requests.reserve(token_length_vec.size());
-
-  // batch sequences with the same kv cache and token length
-  for (int32_t i = 0; i < token_length_vec.size(); i++) {
-    // generate random token ids and request
-    int32_t token_length = token_length_vec[i];
-    int32_t prefix_length = prefix_length_vec[i];
-
-    std::shared_ptr<Request> request =
-        generate_single_request(token_length, prefix_length);
-    requests.emplace_back(request);
-    sequences.emplace_back(request->sequences()[0].get());
-    sequences_budget.emplace_back(token_length - prefix_length);
-  }
-  // build batch
-  auto batches =
-      BatchFactory::get_instance(options_.dp_size())
-          ->create_batches(requests, sequences, sequences_budget, nullptr);
 
   absl::Time start_time = absl::Now();
   engine_->step(batches);

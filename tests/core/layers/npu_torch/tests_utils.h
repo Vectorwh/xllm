@@ -43,11 +43,11 @@ inline c10::intrusive_ptr<c10d::Work> make_completed_work() {
   return c10::make_intrusive<CompletedWork>();
 }
 
-// Mock Backend for testing - minimal implementation for tp=1 tests
+// Backend stub returns completed work; it does not perform transport.
 class MockBackend final : public c10d::Backend {
  public:
   MockBackend(int64_t rank, int64_t world_size)
-      : c10d::Backend(rank, world_size), rank_(rank), world_size_(world_size) {}
+      : c10d::Backend(rank, world_size) {}
 
   c10::intrusive_ptr<c10d::Work> allreduce(
       std::vector<torch::Tensor>& tensors,
@@ -130,17 +130,9 @@ class MockBackend final : public c10d::Backend {
     return make_completed_work();
   }
 
-  int64_t getRank() const { return rank_; }
-
-  int64_t getSize() const { return world_size_; }
-
   void shutdown() override {
     // Mock implementation - do nothing
   }
-
- private:
-  int64_t rank_;
-  int64_t world_size_;
 };
 
 // Mock ProcessGroup for testing
@@ -150,7 +142,6 @@ class MockProcessGroup : public xllm::ProcessGroup {
                    int64_t rank = 0,
                    int64_t world_size = 1)
       : xllm::ProcessGroup(rank, world_size, device) {
-    // Initialize pg_ with a mock backend for testing
     pg_ = std::make_unique<MockBackend>(rank, world_size);
   }
 
@@ -168,14 +159,6 @@ class MockProcessGroup : public xllm::ProcessGroup {
                  std::vector<torch::Tensor>& outputs) override {
     allgather_input_dtypes_.emplace_back(input.scalar_type());
     outputs.resize(this->world_size());
-    if (!allgather_outputs_.empty()) {
-      CHECK_EQ(allgather_outputs_.size(), outputs.size())
-          << "mock allgather outputs size mismatch";
-      for (size_t i = 0; i < outputs.size(); ++i) {
-        outputs[i] = allgather_outputs_[i].clone();
-      }
-      return;
-    }
 
     // Mock implementation - just copy input to outputs
     for (size_t i = 0; i < this->world_size(); ++i) {
@@ -198,15 +181,6 @@ class MockProcessGroup : public xllm::ProcessGroup {
     CHECK_EQ(output.size(0), this->world_size())
         << "mock allgather_base_async world_size mismatch";
 
-    if (!allgather_outputs_.empty()) {
-      CHECK_EQ(allgather_outputs_.size(), static_cast<size_t>(output.size(0)))
-          << "mock allgather_base outputs size mismatch";
-      for (int64_t i = 0; i < output.size(0); ++i) {
-        output[i].copy_(allgather_outputs_[i]);
-      }
-      return make_completed_work();
-    }
-
     for (int64_t i = 0; i < output.size(0); ++i) {
       output[i].copy_(input);
     }
@@ -221,10 +195,6 @@ class MockProcessGroup : public xllm::ProcessGroup {
     output.copy_(input.slice(0, start, start + chunk_size));
   }
 
-  void set_allgather_outputs(std::vector<torch::Tensor> outputs) {
-    allgather_outputs_ = std::move(outputs);
-  }
-
   const std::vector<torch::ScalarType>& allgather_input_dtypes() const {
     return allgather_input_dtypes_;
   }
@@ -232,7 +202,6 @@ class MockProcessGroup : public xllm::ProcessGroup {
   void clear_allgather_input_dtypes() { allgather_input_dtypes_.clear(); }
 
  private:
-  std::vector<torch::Tensor> allgather_outputs_;
   std::vector<torch::ScalarType> allgather_input_dtypes_;
 };
 
@@ -247,28 +216,6 @@ void verify_tensor_close(const torch::Tensor& actual,
                          double rtol = 1e-5,
                          double atol = 1e-8);
 
-// Helper function to verify precision against expected output
-void verify_precision(const torch::Tensor& actual_output,
-                      const std::vector<float>& expected_values,
-                      double rtol = 1e-3,
-                      double atol = 1e-4);
-
-// Expect tensor's min, max, sum (computed in fp32) to match expected values
-// within tolerance. Uses atol + rtol * |expected| for each of min, max, sum.
-void expect_tensor_stats(const torch::Tensor& t,
-                         double expected_min,
-                         double expected_max,
-                         double expected_sum,
-                         double rtol = 1e-2,
-                         double atol = 1e-5);
-
-// Helper function to create default model arguments for testing
-ModelArgs create_default_model_args();
-
-// Helper function to create default quantization arguments for testing
-QuantArgs create_default_quant_args();
-
-// Helper function to create default parallel arguments for testing
 ParallelArgs create_default_parallel_args(
     std::unique_ptr<xllm::ProcessGroup>& mock_process_group);
 
@@ -279,17 +226,6 @@ torch::Tensor seeded_tensor(const std::string& key,
                             torch::IntArrayRef shape,
                             torch::ScalarType dtype = torch::kFloat,
                             torch::Device device = torch::Device(torch::kCPU));
-
-void append_w4a8_expert_weights(
-    std::unordered_map<std::string, torch::Tensor>& weight_dict,
-    const std::string& expert_prefix,
-    const std::string& seed_prefix,
-    int64_t hidden_size,
-    int64_t gate_up_intermediate_size,
-    int64_t down_qweight_intermediate_size,
-    int64_t down_scale_intermediate_size,
-    int64_t group_size,
-    const torch::Device& device);
 
 }  // namespace test
 }  // namespace layer

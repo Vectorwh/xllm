@@ -72,6 +72,8 @@ class PublicModelImplTest(unittest.TestCase):
         self.addCleanup(runtime.stop)
 
     def _construct(self, module_name: str, class_name: str, **kwargs: Any) -> Any:
+        model_type = "qwen3_vl" if module_name == "vlm" else "qwen3"
+        (self._model / "config.json").write_text(json.dumps({"model_type": model_type}))
         module = importlib.import_module(f"xllm.pybind.{module_name}")
         return getattr(module, class_name)(str(self._model), **kwargs)
 
@@ -89,6 +91,7 @@ class PublicModelImplTest(unittest.TestCase):
 
     def test_vision_chunk_budget_reaches_offline_vlm_master(self) -> None:
         parser = importlib.import_module("xllm.pybind.args").ArgumentParser().parser
+        (self._model / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
         self._export.get_model_backend.return_value = "vlm"
         for module_name, class_name in (("vlm", "VLM"), ("llm", "LLM")):
             for budget in (0, 2):
@@ -108,7 +111,7 @@ class PublicModelImplTest(unittest.TestCase):
                         )
                     options = self._export.VLMMaster.call_args.args[0]
                     self.assertEqual(options.max_vit_attention_units_per_chunk, budget)
-                    self._export.init_config_from_option.assert_called_with(options, "qwen3")
+                    self._export.init_config_from_option.assert_called_with(options, "qwen3_vl")
 
     def test_constructors_preserve_native_default(self) -> None:
         for module_name, class_name, master_name in (

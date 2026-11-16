@@ -104,7 +104,7 @@ TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {
   KVCacheCapacity capacity = estimate_kv_cache_capacity(model_args, options);
 
   EXPECT_EQ(capacity.num_linear_attention_layers(), 0);
-  EXPECT_EQ(capacity.num_linear_state_blocks(), 2);
+  EXPECT_EQ(capacity.n_blocks(), 128);
   EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 0);
 }
 

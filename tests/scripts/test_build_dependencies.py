@@ -198,32 +198,18 @@ class BuildDependenciesTest(unittest.TestCase):
         with mock.patch.object(
             utils,
             "_run_command",
-            side_effect=[
-                (True, "/repo\n", ""),
-                (True, "", ""),
-            ],
+            side_effect=[(True, "/repo\n", ""), (True, "", "")],
         ) as run:
             utils._ensure_git_safe_directory_or_exit("/repo/third_party/Mooncake")
 
-        run.assert_has_calls(
-            [
-                mock.call(
-                    ["git", "config", "--global", "--get-all", "safe.directory"],
-                    check=False,
-                ),
-                mock.call(
-                    [
-                        "git",
-                        "config",
-                        "--global",
-                        "--add",
-                        "safe.directory",
-                        "/repo/third_party/Mooncake",
-                    ],
-                    check=True,
-                ),
-            ]
+        add_call = mock.call(
+            ["git", "config", "--global", "--add", "safe.directory", "/repo/third_party/Mooncake"],
+            check=True,
         )
+        run.assert_has_calls(
+            [mock.call(["git", "config", "--global", "--get-all", "safe.directory"], check=False), add_call]
+        )
+        self.assertEqual(run.call_args_list.count(add_call), 1)
 
     def test_existing_mooncake_safe_directory_is_not_added_again(self) -> None:
         with mock.patch.object(

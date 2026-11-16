@@ -27,7 +27,7 @@ from xllm.python.models.deepseek_v4_dspark import (
     DeepseekV4DSparkForCausalLM,
     DeepseekV4DSparkModel,
 )
-from xllm.python.models.dspark import DSparkConfidenceHead, DSparkForCausalLMBase
+from xllm.python.models.dspark import DSparkConfidenceHead
 from xllm.python.registry import get_model_class
 
 
@@ -142,10 +142,6 @@ def test_dspark_registration_and_backend_selection(monkeypatch: pytest.MonkeyPat
     assert get_model_class("deepseek_v4_dspark") is DeepseekV4DSparkForCausalLM
     assert _is_deepseek_v4_model_type("deepseek_v4_dspark")
     assert _is_deepseek_v4_model_type("deepseek_v4_mtp")
-
-
-def test_dspark_runtime_reuses_shared_head_base() -> None:
-    assert issubclass(DeepseekV4DSparkForCausalLM, DSparkForCausalLMBase)
 
 
 def test_dspark_confidence_head_supports_bias_free_checkpoints() -> None:

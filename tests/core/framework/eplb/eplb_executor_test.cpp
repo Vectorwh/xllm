@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>

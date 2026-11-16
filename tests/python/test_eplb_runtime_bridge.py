@@ -13,32 +13,24 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from xllm.python.model_executor.execution_pipeline import SingleModelExecutionPipeline
+from tests.python.test_model_executor import StubAttentionBackend, _FakeModel
+from xllm.python.attention.backend import LayerCache
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.model_executor.forward_context import EplbRuntimeState
-from xllm.python.model_executor.runner import RunnerConfig
 from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
 
 
 def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
-    executor = object.__new__(ModelExecutor)
-    executor._static_kernel = None
-    executor._kv_bound = True
-    executor._restore_engram_history = None
-    executor._is_spec_draft = False
-    executor.layerwise_split_size = 1
-    executor.execution_pipeline = SingleModelExecutionPipeline(
-        torch.nn.Identity(), (), RunnerConfig(torch.device("cpu"))
-    )
-    executor.decode_graph_runner = None
-    executor._execution_metadata_builders = ()
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()):
+        executor = ModelExecutor(_FakeModel(), {}, max_seqs_per_batch=4)
+    executor.bind_kv_caches([LayerCache(torch.zeros(4, 1), torch.zeros(4, 1)) for _ in range(2)])
     executor.eager_runner = MagicMock()
-    executor.eager_runner.execute.return_value = torch.ones(1)
+    executor.eager_runner.execute.return_value = torch.ones(2, 1)
 
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)
     expert_load_data = torch.zeros((2, 4), dtype=torch.int64)
@@ -58,7 +50,7 @@ def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
     assert state.expert_load_data is expert_load_data
     assert state.decode_token_mask is decode_token_mask
     assert state.is_graph_warmup
-    torch.testing.assert_close(output, torch.ones(1))
+    torch.testing.assert_close(output, torch.ones(2, 1))
 
 
 def test_acl_graph_eplb_decode_mask_updates_persistent_storage() -> None:

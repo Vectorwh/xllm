@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,7 +27,7 @@ def test_graph_silu_uses_aten_path_without_changing_eager_execution(
 ) -> None:
     gate = torch.tensor([-2.0, 0.0, 2.0])
     native_silu = MagicMock(return_value=torch.full_like(gate, 7.0))
-    monkeypatch.setattr(deepseek_v4.torch_npu, "npu_silu", native_silu)
+    monkeypatch.setattr(deepseek_v4, "torch_npu", SimpleNamespace(npu_silu=native_silu))
 
     eager = deepseek_v4._silu_for_execution(gate)
     context = ForwardContext(

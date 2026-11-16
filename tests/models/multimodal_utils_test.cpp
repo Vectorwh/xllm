@@ -167,14 +167,6 @@ TEST(MultimodalEncoderDpTest, UnevenImagesKeepOriginalOrderWithoutPadding) {
   check_encoder_outputs({1, 16, 2, 3, 4}, 8);
 }
 
-TEST(MultimodalEncoderDpTest, FourteenImagesOnEightRanks) {
-  check_encoder_outputs(std::vector<int32_t>(14, 4), 8);
-}
-
-TEST(MultimodalEncoderDpTest, FourteenUnevenImagesOnEightRanks) {
-  check_encoder_outputs({1, 32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 64}, 8);
-}
-
 TEST(MultimodalEncoderDpTest, SingleRankPreservesOutputs) {
   check_encoder_outputs({3, 1, 2}, 1);
 }

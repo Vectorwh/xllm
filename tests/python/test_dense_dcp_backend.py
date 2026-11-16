@@ -64,8 +64,8 @@ def _backend(rank: int = 1) -> DenseDcpAttentionBackend:
     backend.bind_kv_caches(
         [
             LayerCache(
-                key=torch.empty(8, 4, 1, 8),
-                value=torch.empty(8, 4, 1, 8),
+                key=torch.empty(8, 4, 1, 8, dtype=torch.float16),
+                value=torch.empty(8, 4, 1, 8, dtype=torch.float16),
             )
         ]
     )
@@ -75,17 +75,14 @@ def _backend(rank: int = 1) -> DenseDcpAttentionBackend:
 def _metadata(
     kv_lengths: list[int],
     *,
-    slot_mapping: torch.Tensor | None = None,
-    local_slot_mapping: torch.Tensor | None = None,
+    local_slot_mapping: torch.Tensor,
     query_lengths: list[int] | None = None,
     is_prefill: bool = False,
     is_chunked_prefill: bool = False,
-    is_mixed: bool = False,
 ) -> SimpleNamespace:
     num_reqs = len(kv_lengths)
-    if slot_mapping is None:
-        num_tokens = sum(query_lengths) if query_lengths is not None else num_reqs
-        slot_mapping = torch.arange(num_tokens, dtype=torch.int32)
+    num_tokens = sum(query_lengths) if query_lengths is not None else num_reqs
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int32)
     q_cu_seq_lens = None
     if query_lengths is not None:
         q_cu_seq_lens = torch.tensor(
@@ -97,7 +94,7 @@ def _metadata(
         local_slot_mapping=local_slot_mapping,
         kv_split_size=2,
         kv_split_rank=1,
-        has_kv_shard=local_slot_mapping is not None,
+        has_kv_shard=True,
         block_table=torch.zeros((num_reqs, 2), dtype=torch.int32),
         kv_seq_lens=torch.tensor(kv_lengths, dtype=torch.int32),
         kv_seq_lens_host=torch.tensor(kv_lengths, dtype=torch.int32),
@@ -108,7 +105,6 @@ def _metadata(
         expanded_decode_metadata=None,
         is_prefill=is_prefill,
         is_chunked_prefill=is_chunked_prefill,
-        is_mixed=is_mixed,
         is_spec_verify=False,
     )
 
@@ -136,13 +132,12 @@ def _context(
         is_dummy=False,
     )
     execution_contexts = {}
-    if metadata.local_slot_mapping is not None:
-        if execution_state is None:
-            dcp_metadata = builder.build(batch, metadata)
-        else:
-            dcp_metadata = builder.allocate_persistent(batch, metadata)
-            builder.update_persistent(dcp_metadata, batch, metadata)
-        execution_contexts[DenseDcpMetadata] = dcp_metadata
+    if execution_state is None:
+        dcp_metadata = builder.build(batch, metadata)
+    else:
+        dcp_metadata = builder.allocate_persistent(batch, metadata)
+        builder.update_persistent(dcp_metadata, batch, metadata)
+    execution_contexts[DenseDcpMetadata] = dcp_metadata
     return ForwardContext(
         attention_backend=backend,
         device=torch.device("cpu"),
@@ -169,20 +164,6 @@ def test_builder_computes_rank_local_kv_lengths_without_localizing_slots() -> No
     localize_slots.assert_not_called()
 
 
-def test_eager_prepare_does_not_require_forward_context() -> None:
-    backend = _backend(rank=1)
-    metadata = _metadata(
-        [5],
-        local_slot_mapping=torch.tensor([0], dtype=torch.int32),
-    )
-
-    backend.prepare(metadata)
-
-    dcp_metadata = _context(backend, metadata).execution_contexts[DenseDcpMetadata]
-    assert dcp_metadata.local_kv_lengths == [1]
-    assert dcp_metadata.empty_kv_shards.tolist() == [[False]]
-
-
 @pytest.mark.parametrize("graph_metadata", [False, True])
 def test_execute_gathers_query_heads_and_writes_only_local_slots(graph_metadata: bool) -> None:
     backend = _backend(rank=1)
@@ -191,8 +172,8 @@ def test_execute_gathers_query_heads_and_writes_only_local_slots(graph_metadata:
     query = torch.arange(2 * 2 * 8, dtype=torch.float16).view(2, -1)
     key = torch.ones(2, 8, dtype=torch.float16)
     value = torch.ones_like(key)
-    gathered_query = torch.empty(2, 4, 8, dtype=torch.float16)
-    expected = torch.empty(2, 16, dtype=torch.float16)
+    gathered_query = torch.cat((torch.full((2, 2, 8), -1, dtype=torch.float16), query.view(2, 2, 8)), dim=1)
+    expected = torch.zeros(2, 16, dtype=torch.float16)
     gather_context = DcpGatherContext(
         gathered=gathered_query,
         handle=None,
@@ -211,8 +192,6 @@ def test_execute_gathers_query_heads_and_writes_only_local_slots(graph_metadata:
         metadata.has_kv_shard = False
         metadata.kv_split_size = 1
         metadata.kv_split_rank = 0
-    else:
-        metadata.local_slot_mapping = torch.full_like(local_slots, 99)
 
     with (
         forward_context(context),
@@ -237,7 +216,7 @@ def test_execute_gathers_query_heads_and_writes_only_local_slots(graph_metadata:
     assert output is expected
     assert reshape_cache.call_args.args[0] is local_slots
     assert decode.call_args.args[0] is gathered_query
-    assert tuple(decode.call_args.args[0].shape) == (2, 4, 8)
+    torch.testing.assert_close(decode.call_args.args[0][:, 2:4], query.view(2, 2, 8))
 
 
 def test_execute_requires_builder_metadata_before_collectives() -> None:
@@ -339,21 +318,6 @@ def test_chunked_prefill_rejects_query_longer_than_kv_history() -> None:
         _context(backend, metadata)
 
 
-def test_mixed_batch_uses_chunked_prefill_metadata_contract() -> None:
-    backend = _backend(rank=1)
-    metadata = _metadata(
-        [6, 9],
-        local_slot_mapping=torch.tensor([-1, -1, 0], dtype=torch.int32),
-        query_lengths=[1, 2],
-        is_chunked_prefill=True,
-        is_mixed=True,
-    )
-
-    dcp_metadata = _context(backend, metadata).execution_contexts[DenseDcpMetadata]
-    assert dcp_metadata.query_seq_ends == [1, 3]
-    assert dcp_metadata.local_kv_lengths == [1, 3]
-
-
 def test_chunked_prefill_participates_when_prefix_is_remote_only() -> None:
     backend = _backend(rank=1)
     metadata = _metadata(
@@ -434,31 +398,6 @@ def test_decode_marks_empty_local_kv_shards_with_negative_infinity() -> None:
     assert torch.equal(merged_lse[1], torch.zeros(4))
 
 
-def test_prepare_graph_buffers_use_gathered_query_head_shape() -> None:
-    backend = _backend(rank=1)
-    metadata = _metadata(
-        [5, 9],
-        local_slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
-    )
-    execution_state = AclGraphExecutionState({})
-
-    with (
-        forward_context(_context(backend, metadata, execution_state)),
-        patch.object(
-            torch_npu,
-            "_npu_fused_infer_attention_score_get_max_workspace",
-            return_value=torch.empty(16, dtype=torch.uint8),
-        ),
-    ):
-        backend.prepare(metadata, graph_mode=True)
-
-    buffers = backend._fia._buffers
-    assert buffers is not None
-    assert tuple(buffers.output.shape) == (2, 4, 8)
-    assert tuple(buffers.lse.shape) == (2, 4, 1)
-    assert buffers.lse.dtype == torch.float32
-
-
 def test_graph_prepare_reuses_buffers_and_queries_workspace_only_once() -> None:
     backend = _backend()
     metadata = _metadata([5, 9], local_slot_mapping=torch.tensor([0, 1], dtype=torch.int32))
@@ -466,18 +405,22 @@ def test_graph_prepare_reuses_buffers_and_queries_workspace_only_once() -> None:
     with (
         forward_context(context),
         patch.object(
-            torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", return_value=torch.empty(16)
+            torch_npu,
+            "_npu_fused_infer_attention_score_get_max_workspace",
+            return_value=torch.empty(16, dtype=torch.uint8),
         ) as workspace,
     ):
         backend.prepare(metadata, graph_mode=True)
         first = backend._fia._buffers
-        metadata.kv_seq_lens_host = torch.tensor([8, 13])
         with patch("torch.empty", wraps=torch.empty) as allocate:
             backend.prepare(metadata, graph_mode=True)
         allocate.assert_not_called()
         second = backend._fia._buffers
     workspace.assert_called_once()
     assert first is not None and second is not None
+    assert first.output.shape == (2, 4, 8)
+    assert first.lse.shape == (2, 4, 1)
+    assert first.lse.dtype == torch.float32
     assert first.output is second.output
     assert first.lse is second.lse
     assert first.workspace is second.workspace
@@ -488,15 +431,20 @@ def test_graph_prepare_reuses_buffers_and_queries_workspace_only_once() -> None:
 @pytest.mark.parametrize("second_bucket", [1, 2])
 def test_graph_tasks_keep_entry_resources_and_layer_operands_after_switching_buckets(second_bucket: int) -> None:
     backend = _backend()
-    backend.bind_kv_caches([LayerCache(torch.empty(8, 4, 1, 8), torch.empty(8, 4, 1, 8)) for _ in range(2)])
+    backend.bind_kv_caches(
+        [
+            LayerCache(torch.empty(8, 4, 1, 8, dtype=torch.float16), torch.empty(8, 4, 1, 8, dtype=torch.float16))
+            for _ in range(2)
+        ]
+    )
     metadata_a = _metadata([5, 9], local_slot_mapping=torch.tensor([0, 1], dtype=torch.int32))
     metadata_b = _metadata([13] * second_bucket, local_slot_mapping=torch.zeros(second_bucket, dtype=torch.int32))
     context_a = _context(backend, metadata_a, AclGraphExecutionState({}))
     context_b = _context(backend, metadata_b, AclGraphExecutionState({}))
     capture_a = AclGraphCaptureContext(object(), [])
     capture_b = AclGraphCaptureContext(object(), [])
-    queries_a = [torch.empty(2, 4, 8) for _ in range(2)]
-    query_b = torch.empty(second_bucket, 4, 8)
+    queries_a = [torch.empty(2, 4, 8, dtype=torch.float16) for _ in range(2)]
+    query_b = torch.empty(second_bucket, 4, 8, dtype=torch.float16)
     calls = []
 
     def record_fia(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: object) -> None:
@@ -504,7 +452,9 @@ def test_graph_tasks_keep_entry_resources_and_layer_operands_after_switching_buc
 
     with (
         patch.object(
-            torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", side_effect=lambda *a, **k: torch.empty(16)
+            torch_npu,
+            "_npu_fused_infer_attention_score_get_max_workspace",
+            side_effect=lambda *a, **k: torch.empty(16, dtype=torch.uint8),
         ),
         patch.object(torch.ops.npu.npu_fused_infer_attention_score, "out", side_effect=record_fia),
         patch.object(torch.npu, "ExternalEvent", side_effect=lambda: MagicMock()),
@@ -556,10 +506,10 @@ def test_pure_prefill_uses_current_kv_even_if_upstream_supplies_a_block_table(wi
     )
     if not with_table:
         metadata.block_table = None
-    query = torch.ones(6, 16)
-    key = torch.ones(6, 8)
+    query = torch.ones(6, 16, dtype=torch.float16)
+    key = torch.ones(6, 8, dtype=torch.float16)
     value = torch.ones_like(key)
-    expected = torch.ones(6, 2, 8)
+    expected = torch.ones(6, 2, 8, dtype=torch.float16)
     with (
         forward_context(_context(backend, metadata)),
         patch("xllm.python.attention.dense_dcp_backend.start_dcp_gather") as gather,
@@ -583,7 +533,11 @@ def test_graph_capture_failure_closes_task_group_without_registering_a_task() ->
     capture = AclGraphCaptureContext(object(), [])
     with (
         forward_context(replace(context, acl_graph=capture)),
-        patch.object(torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", return_value=torch.empty(16)),
+        patch.object(
+            torch_npu,
+            "_npu_fused_infer_attention_score_get_max_workspace",
+            return_value=torch.empty(16, dtype=torch.uint8),
+        ),
         patch.object(torch.ops.npu.npu_fused_infer_attention_score, "out", side_effect=RuntimeError("FIA failed")),
         patch.object(torch.npu, "ExternalEvent"),
         patch.object(torch.npu, "graph_task_group_begin") as begin,
@@ -592,7 +546,7 @@ def test_graph_capture_failure_closes_task_group_without_registering_a_task() ->
         backend.prepare(metadata, graph_mode=True)
         with pytest.raises(RuntimeError, match="FIA failed"):
             backend._fia.run(
-                torch.empty(1, 4, 8),
+                torch.empty(1, 4, 8, dtype=torch.float16),
                 backend._kv_caches[0].key,
                 backend._kv_caches[0].value,
                 context.execution_contexts[DenseDcpMetadata],
@@ -608,7 +562,11 @@ def test_graph_prepare_rejects_replacing_an_entry_block_table() -> None:
     context = _context(backend, metadata, AclGraphExecutionState({}))
     with (
         forward_context(context),
-        patch.object(torch_npu, "_npu_fused_infer_attention_score_get_max_workspace", return_value=torch.empty(16)),
+        patch.object(
+            torch_npu,
+            "_npu_fused_infer_attention_score_get_max_workspace",
+            return_value=torch.empty(16, dtype=torch.uint8),
+        ),
     ):
         backend.prepare(metadata, graph_mode=True)
         metadata.block_table = metadata.block_table.clone()

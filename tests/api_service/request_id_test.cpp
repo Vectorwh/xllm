@@ -37,9 +37,9 @@ limitations under the License.
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -48,6 +48,7 @@ limitations under the License.
 #include "api_service/non_stream_call.h"
 #include "api_service/rpc_request_metrics.h"
 #include "api_service/stream_call.h"
+#include "api_service/utils.h"
 #include "chat.pb.h"
 #include "completion.pb.h"
 #include "core/common/metrics.h"
@@ -293,6 +294,14 @@ TEST(RequestIdTest, BodyIsUsedWhenHeaderIsMissing) {
   EXPECT_EQ(call.get_x_request_id(), "body-id");
   ASSERT_NE(controller.http_response().GetHeader("x-request-id"), nullptr);
   EXPECT_EQ(*controller.http_response().GetHeader("x-request-id"), "body-id");
+
+  proto::ChatRequest chat_request;
+  chat_request.set_x_request_id("chat-body-id");
+  EXPECT_EQ(request_body_x_request_id(&chat_request), "chat-body-id");
+
+  proto::AnthropicMessagesRequest anthropic_request;
+  anthropic_request.set_x_request_id("anthropic-body-id");
+  EXPECT_EQ(request_body_x_request_id(&anthropic_request), "anthropic-body-id");
 }
 
 TEST(RequestIdTest, InvalidPrimaryHeaderFallsBackToSecondaryHeader) {
@@ -435,20 +444,6 @@ TEST(RequestIdTest, EarlyHttpIdSurvivesSetFailed) {
   ASSERT_NE(controller.http_response().GetHeader("x-request-id"), nullptr);
   EXPECT_EQ(*controller.http_response().GetHeader("x-request-id"),
             x_request_id);
-}
-
-TEST(RequestIdTest, ExtractsIdFromSupportedRequestBodies) {
-  proto::CompletionRequest completion;
-  completion.set_x_request_id("completion-id");
-  EXPECT_EQ(request_body_x_request_id(&completion), "completion-id");
-
-  proto::ChatRequest chat;
-  chat.set_x_request_id("chat-id");
-  EXPECT_EQ(request_body_x_request_id(&chat), "chat-id");
-
-  proto::AnthropicMessagesRequest anthropic;
-  anthropic.set_x_request_id("anthropic-id");
-  EXPECT_EQ(request_body_x_request_id(&anthropic), "anthropic-id");
 }
 
 using CompletionStreamCall =
@@ -739,35 +734,6 @@ TEST(TokenSubmissionTest, AbortedOwnerCannotAffectNewSubmission) {
   }
 }
 
-TEST(TokenSubmissionTest, CommitExceptionClearsStagedDelta) {
-  class ConnectedController final : public brpc::Controller {
-   public:
-    bool IsCanceled() const override { return false; }
-  } controller;
-  attach_http_socket(controller);
-  CallbackClosure done([] { throw std::runtime_error("stream-open failure"); });
-  proto::CompletionRequest request;
-  request.set_stream(true);
-  proto::CompletionResponse response;
-  TestableCompletionStreamCall call(&controller,
-                                    &done,
-                                    &request,
-                                    &response,
-                                    /*use_arena=*/true);
-  auto submission = call.token_submission();
-  response.add_choices()->set_text("uncommitted-token");
-  ASSERT_TRUE(call.write(response));
-  EXPECT_THROW(submission.commit(), std::runtime_error);
-
-  call.use_buffered_stream();
-  call.fail_writes();
-  // An empty delta must not attempt Write with the failed submission's bytes,
-  // even while that submission's scope is still alive.
-  auto empty = call.token_submission();
-  EXPECT_TRUE(empty.commit());
-  EXPECT_FALSE(call.is_disconnected());
-}
-
 TEST(StreamCallTest, InvalidPayloadLengthRejectsBeforeOpeningSse) {
   brpc::Controller controller;
   controller.http_request().SetHeader("Infer-Content-Length", "not-a-number");
@@ -828,6 +794,12 @@ class StreamTestService final : public proto::XllmAPIService {
                        google::protobuf::Closure* done) override {
     brpc::ClosureGuard done_guard(done);
     auto* http_controller = static_cast<brpc::Controller*>(controller);
+    const std::string mode = http_controller->request_attachment().to_string();
+    if (mode == "usage") {
+      write_usage<proto::CompletionRequest, proto::CompletionResponse>(
+          http_controller, done_guard.release());
+      return;
+    }
     std::unique_ptr<proto::CompletionRequest> request =
         std::make_unique<proto::CompletionRequest>();
     request->set_stream(true);
@@ -841,7 +813,6 @@ class StreamTestService final : public proto::XllmAPIService {
         /*use_arena=*/false,
         /*is_http_request=*/true);
 
-    const std::string mode = http_controller->request_attachment().to_string();
     const Status rejected =
         Status::invalid_parameter("invalid value", "temperature");
     if (mode == "hold" || mode == "hold_started") {
@@ -908,7 +879,43 @@ class StreamTestService final : public proto::XllmAPIService {
     }
   }
 
+  void ChatCompletionsHttp(google::protobuf::RpcController* controller,
+                           const proto::HttpRequest* /*request*/,
+                           proto::HttpResponse* /*response*/,
+                           google::protobuf::Closure* done) override {
+    write_usage<proto::ChatRequest, proto::ChatResponse>(
+        static_cast<brpc::Controller*>(controller), done);
+  }
+
  private:
+  template <typename Request, typename Response>
+  static void write_usage(brpc::Controller* controller,
+                          google::protobuf::Closure* done) {
+    constexpr bool kChat = std::is_same_v<Request, proto::ChatRequest>;
+    Request request;
+    request.set_stream(true);
+    Response response;
+    response.set_id(kChat ? "chatcmpl_usage" : "cmpl_usage");
+    response.set_object(kChat ? "chat.completion.chunk" : "text_completion");
+    response.set_created(kChat ? 456 : 123);
+    response.set_model("test_model");
+    Usage usage;
+    usage.num_prompt_tokens = kChat ? 64 : 1024;
+    usage.num_generated_tokens = kChat ? 8 : 32;
+    usage.num_total_tokens = kChat ? 72 : 1056;
+    usage.num_cached_tokens = kChat ? 0 : 512;
+    api_service::set_proto_usage(response.mutable_usage(), usage);
+    StreamCall<Request, Response> call(controller,
+                                       done,
+                                       &request,
+                                       &response,
+                                       /*use_arena=*/true,
+                                       /*is_http_request=*/true);
+    EXPECT_TRUE(call.write(response));
+    EXPECT_TRUE(call.write(response, /*empty_array_field=*/"choices"));
+    EXPECT_TRUE(call.finish());
+  }
+
   std::mutex mutex_;
   std::condition_variable changed_;
   CompletionStreamCall* held_call_ = nullptr;  // Guarded by mutex_.
@@ -920,7 +927,8 @@ class StreamHttpTest : public ::testing::Test {
   void SetUp() override {
     ASSERT_EQ(server_.AddService(&service_,
                                  brpc::SERVER_DOESNT_OWN_SERVICE,
-                                 "v1/completions => CompletionsHttp"),
+                                 "v1/completions => CompletionsHttp, "
+                                 "v1/chat/completions => ChatCompletionsHttp"),
               0);
     ASSERT_EQ(server_.Start("127.0.0.1:0", nullptr), 0);
     brpc::ChannelOptions options;
@@ -1000,11 +1008,71 @@ class StreamHttpTest : public ::testing::Test {
     EXPECT_TRUE(service_.observe_disconnect());
   }
 
+  void expect_usage_frames(const brpc::Controller& controller,
+                           const nlohmann::json& expected) {
+    ASSERT_FALSE(controller.Failed()) << controller.ErrorText();
+    ASSERT_EQ(controller.http_response().status_code(), 200);
+    EXPECT_EQ(controller.http_response().content_type(),
+              "text/event-stream; charset=utf-8");
+    std::string body = controller.response_attachment().to_string();
+    std::vector<nlohmann::json> frames;
+    frames.reserve(2);
+    for (int32_t index = 0; index < 2; ++index) {
+      ASSERT_EQ(body.find("data: "), 0u);
+      const size_t end = body.find("\n\n");
+      ASSERT_NE(end, std::string::npos);
+      frames.emplace_back(nlohmann::json::parse(body.substr(6, end - 6)));
+      body.erase(0, end + 2);
+    }
+    EXPECT_EQ(body, "data: [DONE]\n\n");
+    EXPECT_EQ(frames.front(), expected);
+    nlohmann::json with_choices = expected;
+    with_choices["choices"] = nlohmann::json::array();
+    EXPECT_EQ(frames.back(), with_choices);
+  }
+
  private:
   StreamTestService service_;
   brpc::Server server_;
   brpc::Channel channel_;
 };
+
+TEST_F(StreamHttpTest, CompletionUsageChunkKeepsEmptyChoices) {
+  brpc::Controller controller;
+  controller.request_attachment().append("usage");
+  send(&controller);
+  expect_usage_frames(controller,
+                      {{"id", "cmpl_usage"},
+                       {"object", "text_completion"},
+                       {"created", 123},
+                       {"model", "test_model"},
+                       {"usage",
+                        {{"prompt_tokens", 1024},
+                         {"completion_tokens", 32},
+                         {"total_tokens", 1056},
+                         {"prompt_tokens_details",
+                          {{"cached_tokens", 512}, {"audio_tokens", 0}}},
+                         {"completion_tokens_details",
+                          {{"reasoning_tokens", 0}, {"audio_tokens", 0}}}}}});
+}
+
+TEST_F(StreamHttpTest, ChatUsageChunkKeepsEmptyChoices) {
+  brpc::Controller controller;
+  send(&controller, "/v1/chat/completions");
+  expect_usage_frames(
+      controller,
+      {{"id", "chatcmpl_usage"},
+       {"object", "chat.completion.chunk"},
+       {"created", 456},
+       {"model", "test_model"},
+       {"usage",
+        {{"prompt_tokens", 64},
+         {"completion_tokens", 8},
+         {"total_tokens", 72},
+         {"prompt_tokens_details", {{"cached_tokens", 0}, {"audio_tokens", 0}}},
+         {"completion_tokens_details",
+          {{"reasoning_tokens", 0}, {"audio_tokens", 0}}}}}});
+}
 
 TEST_F(StreamHttpTest, SocketCloseBeforeSseIsDetectedWithoutWrites) {
   check_socket_disconnect(/*started=*/false, /*reset=*/false);

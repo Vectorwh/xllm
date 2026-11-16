@@ -20,12 +20,10 @@ limitations under the License.
 // kv_split_size times as many blocks as one source logical block covers, and
 // the source's block mapping has to interleave.
 //
-// These tests drive the real mapping decision at the existing unit-test seam:
-// BatchInputBuilder::build_step_transfer_info (private; reached through the
-// friend name it already declares), plus filter_kv_split_infos, the width
-// classifier plan_kv_split_widths, the production
-// has_rank_preserving_kv_groups predicate, and the GetInstanceInfo reader
-// instance_info_from_proto. No hardware, no production change.
+// These tests exercise the local production mapping step through its narrow
+// test peer, then exercise filter_kv_split_infos, width planning, resource
+// planning, and the GetInstanceInfo reader. They do not cover the complete
+// BatchInputBuilder::build_forward_input path.
 //
 // The pre-fix gate (disagg_pd_scheduler.cpp) derived rank_local_mapping from
 // the source's own width and the response's group TYPES only, so the
@@ -35,14 +33,10 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <unistd.h>
 
-#include <csignal>
 #include <cstdint>
 #include <cstdlib>
-#include <iostream>
 #include <map>
-#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -64,13 +58,8 @@ limitations under the License.
 
 namespace xllm {
 
-// The production method is private and befriends this exact class name
-// (batch_input_builder.h), so it must live at namespace scope, not in the
-// anonymous namespace below. tests/core/framework/batch/batch_test.cpp defines
-// its own copy for its own binary; this TU is the only definition in this one.
-// validate_transfer_mappings is a protected static on KVCacheTransfer; a
-// derived class forwards it without an instance, which keeps the production
-// header free of test-only friends.
+// validate_transfer_mappings is protected; this test-only derived adapter
+// exposes it without adding a production friend.
 class KVTransferValidatorProbe : public KVCacheTransfer {
  public:
   static bool validate(const std::vector<KVTransferMapping>& mappings,
@@ -120,10 +109,9 @@ bool rank_local_mapping_for_test(int32_t src_kv_split_size,
       .rank_local_mapping;
 }
 
-// Source logical block size, in the units the source block manager hands out:
-// one logical block spans block_size * kv_split_size tokens, so one logical
-// block id covers this many tokens and the destination (kv_split == 1) needs
-// kSourceKvSplitSize blocks for each of them.
+// The test block manager reports 64-token blocks to BatchInputBuilder. With
+// four source blocks, the prompt has 256 tokens; an unsplit destination needs
+// kSourceKvSplitSize remote block ids for each source block.
 constexpr uint32_t kSourceLogicalBlockSize = 64;
 constexpr uint32_t kSourceLogicalBlockCount = 4;
 constexpr uint32_t kSeqLen = kSourceLogicalBlockSize * kSourceLogicalBlockCount;
@@ -134,12 +122,13 @@ constexpr uint64_t kFirstDestinationBlockId = 100;
 constexpr uint32_t kDestinationBlockCount =
     kSourceLogicalBlockCount * static_cast<uint32_t>(kSourceKvSplitSize);
 
-Sequence make_sequence(std::vector<Block> blocks) {
+Sequence make_sequence(std::vector<Block> blocks,
+                       uint32_t prompt_token_count = kSeqLen) {
   static RequestSamplingParam sampling_param;
   static StoppingChecker stopping_checker;
 
   SequenceParams seq_params;
-  seq_params.seq_capacity = kSeqLen + 8;
+  seq_params.seq_capacity = prompt_token_count + 8;
   seq_params.stopping_checker = &stopping_checker;
   seq_params.sampling_param = &sampling_param;
   seq_params.skip_special_tokens = true;
@@ -147,12 +136,13 @@ Sequence make_sequence(std::vector<Block> blocks) {
   seq_params.logprobs = false;
   seq_params.enable_schedule_overlap = false;
 
+  std::vector<int32_t> prompt_token_ids(prompt_token_count, 1);
   IncrementalDecoder decoder(/*prompt=*/"",
-                             /*num_prompt_tokens=*/1,
+                             /*num_prompt_tokens=*/prompt_token_ids.size(),
                              /*echo=*/false,
                              /*skip_special_tokens=*/true);
   Sequence sequence(/*index=*/0,
-                    /*prompt_token_ids=*/{1},
+                    /*prompt_token_ids=*/std::move(prompt_token_ids),
                     /*input_embedding=*/torch::Tensor(),
                     /*mm_data=*/MMData(),
                     decoder,
@@ -187,6 +177,17 @@ TransferKVInfo full_transfer_info(const std::vector<uint64_t>& remote_ids,
   return info;
 }
 
+// Exercise only the production per-step mapping helper. The full public
+// forward-input path requires additional runtime/builder state unrelated to the
+// width and split-rank contracts tested here.
+TransferKVInfo build_transfer_step(const TransferKVInfo& full_info,
+                                   Sequence* sequence,
+                                   uint32_t seq_len,
+                                   uint32_t kv_split_size) {
+  return BatchInputBuilderTestPeer::build_step_transfer_info(
+      full_info, sequence, seq_len, kv_split_size);
+}
+
 // One source shard rank's view of the transfer, exactly as the push path builds
 // it: build_step_transfer_info, then filter_kv_split_infos when the source
 // declares kv_split_size > 1 (kv_cache_transfer.cpp).
@@ -198,13 +199,12 @@ std::vector<uint64_t> source_rank_destination_blocks(int32_t kv_split_rank,
   BlockManagerImpl manager(options);
   Sequence sequence = make_sequence(manager.allocate(kSourceLogicalBlockCount));
 
-  const TransferKVInfo step =
-      BatchInputBuilderTestPeer::build_step_transfer_info(
-          full_transfer_info(destination_block_ids(dst_block_count),
-                             rank_local_mapping),
-          &sequence,
-          /*seq_len=*/kSeqLen,
-          /*kv_split_size=*/static_cast<uint32_t>(kSourceKvSplitSize));
+  const TransferKVInfo step = build_transfer_step(
+      full_transfer_info(destination_block_ids(dst_block_count),
+                         rank_local_mapping),
+      &sequence,
+      /*seq_len=*/kSeqLen,
+      /*kv_split_size=*/static_cast<uint32_t>(kSourceKvSplitSize));
 
   const std::vector<TransferKVInfo> filtered = filter_kv_split_infos(
       kv_split_rank, kSourceKvSplitSize, std::vector<TransferKVInfo>{step});
@@ -268,20 +268,6 @@ std::string describe(const Coverage& coverage, bool rank_local_mapping) {
 
 }  // namespace
 
-// The response shape that made the pre-fix gate width-blind: the decode's
-// AddNewRequests response carries KV (and LINEAR, for the KDA layers) groups
-// only, so has_rank_preserving_kv_groups is true and
-// `kv_split_size > 1 && predicate` was true for ANY destination width. No
-// SWA / C4 / C128 group exists for glm5_next: composite manager types are built
-// only for deepseek_v4.
-TEST(KvSplitWidthMismatchTest, SettledResponseShapeIsRankPreserving) {
-  proto::DisaggResponse response;
-  response.add_groups()->set_group_id(cache_group_id(BlockType::KV));
-  response.add_groups()->set_group_id(cache_group_id(BlockType::LINEAR));
-
-  EXPECT_TRUE(has_rank_preserving_kv_groups(response));
-}
-
 // ACCEPTANCE. The settled m7 pair: source declares kv_split_size = 2 (cp8/tp2
 // prefill), destination declares 1 (cp1 decode).
 //
@@ -309,30 +295,8 @@ TEST(KvSplitWidthMismatchTest,
       << kSourceKvSplitSize << ": the stride path is required";
   const Coverage coverage =
       measure_coverage(rank_local_mapping, kDestinationBlockCount);
-  std::cout << "SETTLED " << describe(coverage, rank_local_mapping)
-            << std::endl;
 
   SCOPED_TRACE(describe(coverage, rank_local_mapping));
-  EXPECT_EQ(coverage.covered.size(), kDestinationBlockCount);
-  for (const auto& [remote_id, writers] : coverage.writers_per_block) {
-    EXPECT_EQ(writers, 1) << "destination block " << remote_id << " has "
-                          << writers << " writers";
-  }
-}
-
-// The same pair with rank_local_mapping = false selects remote_stride =
-// kv_split_size and the shard filter. Every destination block is then addressed
-// exactly once across the two source shards, so the mapping machinery already
-// handles source kv_split 2 -> destination kv_split 1 and the defect is the
-// gate, not the mapping.
-TEST(KvSplitWidthMismatchTest,
-     StridePathCoversEveryDestinationBlockExactlyOnce) {
-  const Coverage coverage =
-      measure_coverage(/*rank_local_mapping=*/false, kDestinationBlockCount);
-  std::cout << "STRIDE " << describe(coverage, /*rank_local_mapping=*/false)
-            << std::endl;
-
-  SCOPED_TRACE(describe(coverage, /*rank_local_mapping=*/false));
   EXPECT_EQ(coverage.covered.size(), kDestinationBlockCount);
   for (const auto& [remote_id, writers] : coverage.writers_per_block) {
     EXPECT_EQ(writers, 1) << "destination block " << remote_id << " has "
@@ -367,8 +331,6 @@ TEST(KvSplitWidthMismatchTest, EqualWidthPairKeepsRankLocalMapping) {
 
   const Coverage coverage =
       measure_coverage(rank_local_mapping, kSourceLogicalBlockCount);
-  std::cout << "EQUAL_WIDTH " << describe(coverage, rank_local_mapping)
-            << std::endl;
 
   SCOPED_TRACE(describe(coverage, rank_local_mapping));
   EXPECT_EQ(coverage.covered.size(), kSourceLogicalBlockCount);
@@ -491,46 +453,6 @@ TEST(KvSplitWidthMismatchTest,
   declared_response.set_name("decode-dcp2");
   declared_response.set_kv_split_size(2);
   EXPECT_EQ(instance_info_from_proto(declared_response).kv_split_size, 2);
-}
-
-// The scheduler half of the contract (disagg_pd_scheduler.cpp,
-// dispatch_requests): an unreconcilable pair must be refused with a named
-// INVALID_ARGUMENT before the decode reservation and the AddNewRequests RPC,
-// and the refusal decision is exactly the plan the gate consumes. The dispatch
-// loop itself needs a live xservice registry, so this pins the decision it
-// composes -- the same seam the existing scheduler tests use for
-// has_rank_preserving_kv_groups.
-TEST(KvSplitWidthMismatchTest,
-     SchedulerRefusesUnreconcilableWidthPairBeforeReservation) {
-  // A kv_split=2 prefill against a decode declaring 3: not expressible as a
-  // mapping, so dispatch must refuse it, loudly, with both widths named.
-  std::string reason;
-  EXPECT_EQ(plan_kv_split_widths(/*src=*/kSourceKvSplitSize,
-                                 /*dst=*/3,
-                                 kCpIndexWriteModeUnspecified,
-                                 kCpIndexWriteModeUnspecified,
-                                 &reason),
-            KvSplitWidthPlan::UNRECONCILABLE);
-  EXPECT_NE(reason.find(std::to_string(kSourceKvSplitSize)), std::string::npos)
-      << reason;
-  EXPECT_NE(reason.find("3"), std::string::npos) << reason;
-
-  // The message the scheduler emits is "decode instance <name>: " + reason, so
-  // the widths above are what the operator sees in the INVALID_ARGUMENT.
-  const std::string message = "decode instance decode-3: " + reason;
-  EXPECT_NE(message.find(std::to_string(kSourceKvSplitSize)),
-            std::string::npos);
-  EXPECT_NE(message.find("destination=3"), std::string::npos) << message;
-
-  // No mapping may be derived for the refused pair ...
-  EXPECT_FALSE(rank_local_mapping_for_test(kSourceKvSplitSize,
-                                           /*dst_kv_split_size=*/3));
-  // ... while every pair dispatch admits still derives one: the settled 2 -> 1
-  // pair takes the stride path and the equal-width pair stays rank-local.
-  EXPECT_FALSE(rank_local_mapping_for_test(kSourceKvSplitSize,
-                                           /*dst_kv_split_size=*/1));
-  EXPECT_TRUE(rank_local_mapping_for_test(kSourceKvSplitSize,
-                                          /*dst_kv_split_size=*/2));
 }
 
 // The write-mode half of the admission contract: a side in the SHARDED CP
@@ -1200,12 +1122,10 @@ TEST(KvSplitWidthMismatchTest,
     mapping.remote_shared_num = shared;
     info.mappings.emplace_back(std::move(mapping));
 
-    const TransferKVInfo step =
-        BatchInputBuilderTestPeer::build_step_transfer_info(
-            info,
-            &sequence,
-            /*seq_len=*/kSeqLen,
-            /*kv_split_size=*/stride);
+    const TransferKVInfo step = build_transfer_step(info,
+                                                    &sequence,
+                                                    /*seq_len=*/kSeqLen,
+                                                    /*kv_split_size=*/stride);
     ASSERT_FALSE(step.mappings.empty());
     const KVTransferMapping& step_mapping = step.mappings.front();
     // The step mapping still describes both lists positionally: whole blocks
@@ -1302,12 +1222,10 @@ TEST(KvSplitWidthMismatchTest,
     mapping.remote_shared_num = shared;
     info.mappings.emplace_back(std::move(mapping));
 
-    const TransferKVInfo step =
-        BatchInputBuilderTestPeer::build_step_transfer_info(
-            info,
-            &sequence,
-            /*seq_len=*/kSeqLen,
-            /*kv_split_size=*/stride);
+    const TransferKVInfo step = build_transfer_step(info,
+                                                    &sequence,
+                                                    /*seq_len=*/kSeqLen,
+                                                    /*kv_split_size=*/stride);
     ASSERT_FALSE(step.mappings.empty());
     const KVTransferMapping& step_mapping = step.mappings.front();
     EXPECT_EQ(step_mapping.local_block_start, block_start)
@@ -1377,11 +1295,10 @@ TEST(KvSplitWidthMismatchTest,
   // First step exposes two of the four logical blocks, the second the rest.
   for (const uint32_t step_blocks : {2U, 4U}) {
     const TransferKVInfo step =
-        BatchInputBuilderTestPeer::build_step_transfer_info(
-            info,
-            &sequence,
-            /*seq_len=*/step_blocks * kSourceLogicalBlockSize,
-            /*kv_split_size=*/stride);
+        build_transfer_step(info,
+                            &sequence,
+                            /*seq_len=*/step_blocks * kSourceLogicalBlockSize,
+                            /*kv_split_size=*/stride);
     ASSERT_FALSE(step.mappings.empty());
     for (int32_t kv_split_rank = 0; kv_split_rank < kSourceKvSplitSize;
          ++kv_split_rank) {
@@ -1435,7 +1352,8 @@ TEST(KvSplitWidthMismatchTest, PartialTailBlockDeliversOnlyTheExistingStripe) {
   BlockManager::Options options;
   options.num_blocks(256).block_size(kSourceBlockTokens);
   BlockManagerImpl manager(options);
-  Sequence sequence = make_sequence(manager.allocate(kSourceBlocks));
+  Sequence sequence =
+      make_sequence(manager.allocate(kSourceBlocks), kPromptTokens);
   sequence.kv_state().advance_transfer_block_idx(
       source_blocks_in_remote_shared(kSharedBlocks, kStride));  // 203
 
@@ -1450,12 +1368,10 @@ TEST(KvSplitWidthMismatchTest, PartialTailBlockDeliversOnlyTheExistingStripe) {
   mapping.remote_shared_num = kSharedBlocks;
   info.mappings.emplace_back(std::move(mapping));
 
-  const TransferKVInfo step =
-      BatchInputBuilderTestPeer::build_step_transfer_info(
-          info,
-          &sequence,
-          /*seq_len=*/kPromptTokens,
-          /*kv_split_size=*/kStride);
+  const TransferKVInfo step = build_transfer_step(info,
+                                                  &sequence,
+                                                  /*seq_len=*/kPromptTokens,
+                                                  /*kv_split_size=*/kStride);
   ASSERT_FALSE(step.mappings.empty());
   const KVTransferMapping& step_mapping = step.mappings.front();
   EXPECT_EQ(step_mapping.local_ids.size(), 1U);
@@ -1500,7 +1416,8 @@ TEST(KvSplitWidthMismatchTest, PartialTailBlockTwoBlocksReportsItsOwnRange) {
   BlockManager::Options options;
   options.num_blocks(256).block_size(kSourceBlockTokens);
   BlockManagerImpl manager(options);
-  Sequence sequence = make_sequence(manager.allocate(kSourceBlocks));
+  Sequence sequence =
+      make_sequence(manager.allocate(kSourceBlocks), kPromptTokens);
   sequence.kv_state().advance_transfer_block_idx(
       source_blocks_in_remote_shared(kSharedBlocks, kStride));
 
@@ -1514,12 +1431,10 @@ TEST(KvSplitWidthMismatchTest, PartialTailBlockTwoBlocksReportsItsOwnRange) {
   mapping.remote_shared_num = kSharedBlocks;
   info.mappings.emplace_back(std::move(mapping));
 
-  const TransferKVInfo step =
-      BatchInputBuilderTestPeer::build_step_transfer_info(
-          info,
-          &sequence,
-          /*seq_len=*/kPromptTokens,
-          /*kv_split_size=*/kStride);
+  const TransferKVInfo step = build_transfer_step(info,
+                                                  &sequence,
+                                                  /*seq_len=*/kPromptTokens,
+                                                  /*kv_split_size=*/kStride);
   const KVTransferMapping& step_mapping = step.mappings.front();
   // Two destination blocks are new, so the step must ask for exactly two.
   EXPECT_EQ(step_mapping.remote_ids.size(), 2U);

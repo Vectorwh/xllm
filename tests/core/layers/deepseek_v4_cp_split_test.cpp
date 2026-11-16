@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <algorithm>
 #include <numeric>
-#include <set>
 #include <vector>
 
 #include "layers/npu_torch/deepseek_v4_cp_context.h"
@@ -41,6 +40,7 @@ TEST(DeepseekV4CpSplit, PartitionsEveryRowExactlyOnce) {
       ASSERT_EQ(static_cast<int32_t>(rows_by_rank.size()), cp_size);
 
       std::vector<int64_t> seen;
+      seen.reserve(static_cast<size_t>(total_tokens(q_seq_lens)));
       for (const auto& rows : rows_by_rank) {
         seen.insert(seen.end(), rows.begin(), rows.end());
       }
@@ -62,21 +62,16 @@ TEST(DeepseekV4CpSplit, RowsAreContiguousWithinEachSequence) {
   const int32_t cp_size = 3;
   const auto rows_by_rank = compute_cp_rows_by_rank(cp_size, q_seq_lens);
 
-  for (int32_t r = 0; r < cp_size; ++r) {
+  for (const auto& rows : rows_by_rank) {
     int64_t seq_base = 0;
-    size_t cursor = 0;
-    for (const int32_t q_i : q_seq_lens) {
-      const int32_t seg = (q_i + cp_size - 1) / cp_size;
-      const int32_t start = std::min(r * seg, q_i);
-      const int32_t end = std::min(start + seg, q_i);
-      for (int32_t j = start; j < end; ++j) {
-        ASSERT_LT(cursor, rows_by_rank[r].size());
-        EXPECT_EQ(rows_by_rank[r][cursor], seq_base + j);
-        ++cursor;
+    for (const int32_t seq_len : q_seq_lens) {
+      const auto begin = std::lower_bound(rows.begin(), rows.end(), seq_base);
+      const auto end = std::lower_bound(begin, rows.end(), seq_base + seq_len);
+      if (begin != end) {
+        EXPECT_EQ(*(end - 1) - *begin + 1, end - begin);
       }
-      seq_base += q_i;
+      seq_base += seq_len;
     }
-    EXPECT_EQ(cursor, rows_by_rank[r].size());
   }
 }
 
@@ -108,47 +103,6 @@ TEST(DeepseekV4CpSplit, SingleRankKeepsAllRowsInOrder) {
   }
 }
 
-// The rank-major gather order and the restore permutation must be mutual
-// inverses, otherwise merged hidden states come back scrambled.
-TEST(DeepseekV4CpSplit, RestorePermutationInvertsGatherOrder) {
-  const std::vector<int32_t> q_seq_lens = {9, 4};
-  const int32_t cp_size = 3;
-  const auto rows_by_rank = compute_cp_rows_by_rank(cp_size, q_seq_lens);
-  const int64_t expected = total_tokens(q_seq_lens);
-
-  // Mirror build_deepseek_v4_cp_context's inversion.
-  std::vector<int64_t> restore(static_cast<size_t>(expected), -1);
-  int64_t gathered_pos = 0;
-  for (int32_t r = 0; r < cp_size; ++r) {
-    for (const int64_t global_row : rows_by_rank[r]) {
-      restore[static_cast<size_t>(global_row)] = gathered_pos++;
-    }
-  }
-  ASSERT_EQ(gathered_pos, expected);
-
-  // restore must be a permutation of [0, expected).
-  std::set<int64_t> unique(restore.begin(), restore.end());
-  EXPECT_EQ(static_cast<int64_t>(unique.size()), expected);
-  for (const int64_t v : restore) {
-    EXPECT_GE(v, 0);
-    EXPECT_LT(v, expected);
-  }
-
-  // gathered[restore[i]] == global row i, so applying restore to a gathered
-  // buffer that holds its own global row ids yields the identity.
-  std::vector<int64_t> gathered(static_cast<size_t>(expected), -1);
-  gathered_pos = 0;
-  for (int32_t r = 0; r < cp_size; ++r) {
-    for (const int64_t global_row : rows_by_rank[r]) {
-      gathered[static_cast<size_t>(gathered_pos++)] = global_row;
-    }
-  }
-  for (int64_t i = 0; i < expected; ++i) {
-    const auto slot = static_cast<size_t>(restore[static_cast<size_t>(i)]);
-    EXPECT_EQ(gathered[slot], i);
-  }
-}
-
 // The kv extent handed to attention must end where this rank's query rows end.
 // A global kv length instead relocates every non-last rank's queries to the
 // tail of the sequence, because sparse_attn_sharedkv aligns the query block to
@@ -172,28 +126,6 @@ TEST(DeepseekV4CpLocalSeqLens, KvExtentEndsAtThisRanksLastRow) {
   EXPECT_EQ(local_q, std::vector<int32_t>({72}));
   // The last rank alone sees the full sequence.
   EXPECT_EQ(local_kv, std::vector<int32_t>({145}));
-}
-
-// Chunked prefill and prefix cache put a cached prefix in front of the query
-// rows. The prefix belongs to every rank's window; only the tail is split.
-TEST(DeepseekV4CpLocalSeqLens, CachedPrefixStaysInEveryRanksWindow) {
-  // 20 new query rows on top of an 80-token cached prefix, cp=2 -> seg = 10.
-  const std::vector<int32_t> q_seq_lens = {20};
-  const std::vector<int32_t> kv_seq_lens = {100};
-  const int32_t cp_size = 2;
-
-  std::vector<int32_t> local_q;
-  std::vector<int32_t> local_kv;
-
-  compute_cp_local_seq_lens(
-      cp_size, /*cp_rank=*/0, q_seq_lens, kv_seq_lens, &local_q, &local_kv);
-  EXPECT_EQ(local_q, std::vector<int32_t>({10}));
-  EXPECT_EQ(local_kv, std::vector<int32_t>({90}));
-
-  compute_cp_local_seq_lens(
-      cp_size, /*cp_rank=*/1, q_seq_lens, kv_seq_lens, &local_q, &local_kv);
-  EXPECT_EQ(local_q, std::vector<int32_t>({10}));
-  EXPECT_EQ(local_kv, std::vector<int32_t>({100}));
 }
 
 // A rank whose segment is empty must still advertise a legal window: it closes

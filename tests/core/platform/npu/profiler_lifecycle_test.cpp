@@ -19,7 +19,9 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -142,10 +144,10 @@ sys.modules["torch_npu._C._profiler"] = native
 
 class NpuProfilerLifecycleTest : public ::testing::Test {
  protected:
-  void SetUp() override {
+  void initialize_python() {
     py::initialize_interpreter();
     py::exec(kFakeProfiler);
-    profiler_.reset(new NpuProfiler);
+    profiler_ = &NpuProfiler::get_instance();
     thread_state_ = PyEval_SaveThread();
     const int64_t timestamp =
         std::chrono::steady_clock::now().time_since_epoch().count();
@@ -154,10 +156,21 @@ class NpuProfilerLifecycleTest : public ::testing::Test {
                   "_" + std::to_string(timestamp));
   }
 
-  void TearDown() override {
-    profiler_.reset();
-    finalize_python();
-    std::filesystem::remove_all(directory_);
+  // Native failures poison the process-wide singleton. Exercise its public
+  // lifecycle in an exec-isolated child, including static destruction after
+  // Python finalization, rather than constructing a private test instance.
+  void run_isolated(const std::function<void()>& body) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        {
+          initialize_python();
+          body();
+          finalize_python();
+          std::filesystem::remove_all(directory_);
+          std::exit(HasFailure() ? EXIT_FAILURE : EXIT_SUCCESS);
+        },
+        ::testing::ExitedWithCode(EXIT_SUCCESS),
+        "");
   }
 
   void finalize_python() {
@@ -185,220 +198,252 @@ class NpuProfilerLifecycleTest : public ::testing::Test {
     return result;
   }
 
-  std::unique_ptr<NpuProfiler, void (*)(NpuProfiler*)> profiler_{
-      nullptr,
-      [](NpuProfiler* profiler) { delete profiler; }};
+  NpuProfiler* profiler_ = nullptr;  // Non-owning singleton in the child.
   PyThreadState* thread_state_ = nullptr;
   std::filesystem::path directory_;
 };
 
 TEST_F(NpuProfilerLifecycleTest, StopWithoutStartIsIdempotent) {
-  EXPECT_TRUE(profiler_->stop());
-  EXPECT_FALSE(profiler_->is_running());
-  EXPECT_TRUE(events().empty());
+  run_isolated([this] {
+    EXPECT_TRUE(profiler_->stop());
+    EXPECT_FALSE(profiler_->is_running());
+    EXPECT_TRUE(events().empty());
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, PropagatesInitFailure) {
-  set_failure("init");
-  EXPECT_FALSE(profiler_->start(directory_.string(), 0));
-  EXPECT_FALSE(profiler_->is_running());
+  run_isolated([this] {
+    set_failure("init");
+    EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+    EXPECT_FALSE(profiler_->is_running());
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, PropagatesStartFailureAndRejectsReuse) {
-  set_failure("start");
-  EXPECT_FALSE(profiler_->start(directory_.string(), 0));
-  EXPECT_FALSE(profiler_->is_running());
-  set_failure("");
-  EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  run_isolated([this] {
+    set_failure("start");
+    EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+    EXPECT_FALSE(profiler_->is_running());
+    set_failure("");
+    EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, PropagatesStopFailure) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  set_failure("stop");
-  EXPECT_FALSE(profiler_->stop());
-  EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    set_failure("stop");
+    EXPECT_FALSE(profiler_->stop());
+    EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, PropagatesFinalizeFailure) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  set_failure("finalize");
-  EXPECT_FALSE(profiler_->stop());
-  EXPECT_FALSE(profiler_->is_running());
-  EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    set_failure("finalize");
+    EXPECT_FALSE(profiler_->stop());
+    EXPECT_FALSE(profiler_->is_running());
+    EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, RejectsMissingTraceAndAllowsNewCapture) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  set_failure("analyse");
-  EXPECT_FALSE(profiler_->stop());
-  EXPECT_FALSE(profiler_->is_running());
-  EXPECT_FALSE(profiler_->stop());
-  set_failure("");
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  EXPECT_TRUE(profiler_->stop());
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    set_failure("analyse");
+    EXPECT_FALSE(profiler_->stop());
+    EXPECT_FALSE(profiler_->is_running());
+    EXPECT_FALSE(profiler_->stop());
+    set_failure("");
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    EXPECT_TRUE(profiler_->stop());
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, RejectsEmptyTrace) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  set_failure("empty_trace");
-  EXPECT_FALSE(profiler_->stop());
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    set_failure("empty_trace");
+    EXPECT_FALSE(profiler_->stop());
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, RepeatedCallsAndNewOutputDirectory) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  EXPECT_TRUE(profiler_->start(directory_.string(), 0));
-  EXPECT_TRUE(profiler_->stop());
-  EXPECT_TRUE(profiler_->stop());
-  const std::filesystem::path second = directory_ / "second";
-  ASSERT_TRUE(profiler_->start(second.string(), 7));
-  EXPECT_TRUE(profiler_->stop());
-  EXPECT_TRUE(std::filesystem::exists(
-      second /
-      "xllm_rank7_2_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json"));
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    EXPECT_TRUE(profiler_->start(directory_.string(), 0));
+    EXPECT_TRUE(profiler_->stop());
+    EXPECT_TRUE(profiler_->stop());
+    const std::filesystem::path second = directory_ / "second";
+    ASSERT_TRUE(profiler_->start(second.string(), 7));
+    EXPECT_TRUE(profiler_->stop());
+    EXPECT_TRUE(std::filesystem::exists(
+        second /
+        "xllm_rank7_2_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json"));
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, RejectsStopFromUnregisteredThread) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  auto foreign_stop =
-      std::async(std::launch::async, [this] { return profiler_->stop(); });
-  EXPECT_FALSE(foreign_stop.get());
-  EXPECT_TRUE(profiler_->is_running());
-  EXPECT_TRUE(profiler_->stop());
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    auto foreign_stop =
+        std::async(std::launch::async, [this] { return profiler_->stop(); });
+    EXPECT_FALSE(foreign_stop.get());
+    EXPECT_TRUE(profiler_->is_running());
+    EXPECT_TRUE(profiler_->stop());
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, ChildStopDoesNotStopOwner) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  std::promise<void> child_started;
-  auto child = std::async(std::launch::async, [this, &child_started] {
-    EXPECT_TRUE(profiler_->start(directory_.string(), 1));
-    EXPECT_TRUE(profiler_->start(directory_.string(), 1));
-    child_started.set_value();
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    std::promise<void> child_started;
+    auto child = std::async(std::launch::async, [this, &child_started] {
+      EXPECT_TRUE(profiler_->start(directory_.string(), 1));
+      EXPECT_TRUE(profiler_->start(directory_.string(), 1));
+      child_started.set_value();
+      EXPECT_TRUE(profiler_->stop());
+      EXPECT_TRUE(profiler_->stop());
+    });
+    child_started.get_future().get();
+    EXPECT_EQ(child.wait_for(std::chrono::milliseconds(25)),
+              std::future_status::timeout);
+    EXPECT_TRUE(profiler_->is_running());
     EXPECT_TRUE(profiler_->stop());
-    EXPECT_TRUE(profiler_->stop());
+    child.get();
+    EXPECT_EQ(events(),
+              (std::vector<std::string>{"init",
+                                        "start",
+                                        "enable_child",
+                                        "disable_child",
+                                        "stop",
+                                        "finalize"}));
   });
-  child_started.get_future().get();
-  EXPECT_EQ(child.wait_for(std::chrono::milliseconds(25)),
-            std::future_status::timeout);
-  EXPECT_TRUE(profiler_->is_running());
-  EXPECT_TRUE(profiler_->stop());
-  child.get();
-  EXPECT_EQ(events(),
-            (std::vector<std::string>{"init",
-                                      "start",
-                                      "enable_child",
-                                      "disable_child",
-                                      "stop",
-                                      "finalize"}));
 }
 
 TEST_F(NpuProfilerLifecycleTest, OwnerWaitsForChildCallbacksBeforeStopping) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  std::promise<void> child_started;
-  std::promise<void> stop_child;
-  auto stop_requested = stop_child.get_future();
-  auto child =
-      std::async(std::launch::async, [this, &child_started, &stop_requested] {
-        EXPECT_TRUE(profiler_->start(directory_.string(), 1));
-        child_started.set_value();
-        stop_requested.get();
-        EXPECT_TRUE(profiler_->stop());
-      });
-  child_started.get_future().get();
-  auto release_child = std::async(std::launch::async, [&stop_child] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    stop_child.set_value();
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    std::promise<void> child_started;
+    std::promise<void> stop_child;
+    auto stop_requested = stop_child.get_future();
+    auto child =
+        std::async(std::launch::async, [this, &child_started, &stop_requested] {
+          EXPECT_TRUE(profiler_->start(directory_.string(), 1));
+          child_started.set_value();
+          stop_requested.get();
+          EXPECT_TRUE(profiler_->stop());
+        });
+    child_started.get_future().get();
+    auto release_child = std::async(std::launch::async, [&stop_child] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      stop_child.set_value();
+    });
+    EXPECT_TRUE(profiler_->stop());
+    child.get();
+    release_child.get();
+    EXPECT_EQ(events(),
+              (std::vector<std::string>{"init",
+                                        "start",
+                                        "enable_child",
+                                        "disable_child",
+                                        "stop",
+                                        "finalize"}));
   });
-  EXPECT_TRUE(profiler_->stop());
-  child.get();
-  release_child.get();
-  EXPECT_EQ(events(),
-            (std::vector<std::string>{"init",
-                                      "start",
-                                      "enable_child",
-                                      "disable_child",
-                                      "stop",
-                                      "finalize"}));
 }
 
 TEST_F(NpuProfilerLifecycleTest, PropagatesChildEnableFailure) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  set_failure("enable_child");
-  auto child = std::async(std::launch::async, [this] {
-    return profiler_->start(directory_.string(), 1);
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    set_failure("enable_child");
+    auto child = std::async(std::launch::async, [this] {
+      return profiler_->start(directory_.string(), 1);
+    });
+    EXPECT_FALSE(child.get());
   });
-  EXPECT_FALSE(child.get());
 }
 
 TEST_F(NpuProfilerLifecycleTest, ConcurrentWorkersDetachBeforeGlobalStop) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  constexpr int32_t kChildCount = 3;
-  std::vector<std::promise<void>> started(kChildCount);
-  std::promise<void> stop_children;
-  const std::shared_future<void> stop_requested =
-      stop_children.get_future().share();
-  std::vector<std::future<bool>> children;
-  children.reserve(kChildCount);
-  for (int32_t child_rank = 0; child_rank < kChildCount; ++child_rank) {
-    children.emplace_back(std::async(
-        std::launch::async, [this, child_rank, &started, stop_requested] {
-          EXPECT_TRUE(profiler_->start(directory_.string(), child_rank + 1));
-          started[child_rank].set_value();
-          stop_requested.get();
-          return profiler_->stop();
-        }));
-  }
-  for (auto& start : started) {
-    start.get_future().get();
-  }
-  stop_children.set_value();
-  EXPECT_TRUE(profiler_->stop());
-  for (auto& child : children) {
-    EXPECT_TRUE(child.get());
-  }
-  const std::vector<std::string> actions = events();
-  EXPECT_EQ(std::count(actions.begin(), actions.end(), "enable_child"),
-            kChildCount);
-  EXPECT_EQ(std::count(actions.begin(), actions.end(), "disable_child"),
-            kChildCount);
-  ASSERT_GE(actions.size(), 2u);
-  EXPECT_EQ(actions[actions.size() - 2], "stop");
-  EXPECT_EQ(actions.back(), "finalize");
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    constexpr int32_t kChildCount = 3;
+    std::vector<std::promise<void>> started(kChildCount);
+    std::promise<void> stop_children;
+    const std::shared_future<void> stop_requested =
+        stop_children.get_future().share();
+    std::vector<std::future<bool>> children;
+    children.reserve(kChildCount);
+    for (int32_t child_rank = 0; child_rank < kChildCount; ++child_rank) {
+      children.emplace_back(std::async(
+          std::launch::async, [this, child_rank, &started, stop_requested] {
+            EXPECT_TRUE(profiler_->start(directory_.string(), child_rank + 1));
+            started[child_rank].set_value();
+            stop_requested.get();
+            return profiler_->stop();
+          }));
+    }
+    for (auto& start : started) {
+      start.get_future().get();
+    }
+    stop_children.set_value();
+    EXPECT_TRUE(profiler_->stop());
+    for (auto& child : children) {
+      EXPECT_TRUE(child.get());
+    }
+    const std::vector<std::string> actions = events();
+    EXPECT_EQ(std::count(actions.begin(), actions.end(), "enable_child"),
+              kChildCount);
+    EXPECT_EQ(std::count(actions.begin(), actions.end(), "disable_child"),
+              kChildCount);
+    ASSERT_GE(actions.size(), 2u);
+    EXPECT_EQ(actions[actions.size() - 2], "stop");
+    EXPECT_EQ(actions.back(), "finalize");
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, PropagatesChildDisableFailure) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  auto child = std::async(std::launch::async, [this] {
-    EXPECT_TRUE(profiler_->start(directory_.string(), 1));
-    set_failure("disable_child");
-    return profiler_->stop();
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    auto child = std::async(std::launch::async, [this] {
+      EXPECT_TRUE(profiler_->start(directory_.string(), 1));
+      set_failure("disable_child");
+      return profiler_->stop();
+    });
+    EXPECT_FALSE(child.get());
+    EXPECT_FALSE(profiler_->stop());
   });
-  EXPECT_FALSE(child.get());
-  EXPECT_FALSE(profiler_->stop());
 }
 
 TEST_F(NpuProfilerLifecycleTest, RejectsStartAfterPythonFinalization) {
-  finalize_python();
-  EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  run_isolated([this] {
+    finalize_python();
+    EXPECT_FALSE(profiler_->start(directory_.string(), 0));
+  });
 }
 
 TEST_F(NpuProfilerLifecycleTest, OwnerFailureIsReportedToChild) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  set_failure("finalize");
-  std::promise<void> child_started;
-  auto child = std::async(std::launch::async, [this, &child_started] {
-    EXPECT_TRUE(profiler_->start(directory_.string(), 1));
-    child_started.set_value();
-    return profiler_->stop();
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    set_failure("finalize");
+    std::promise<void> child_started;
+    auto child = std::async(std::launch::async, [this, &child_started] {
+      EXPECT_TRUE(profiler_->start(directory_.string(), 1));
+      child_started.set_value();
+      return profiler_->stop();
+    });
+    child_started.get_future().get();
+    EXPECT_FALSE(profiler_->stop());
+    EXPECT_FALSE(child.get());
   });
-  child_started.get_future().get();
-  EXPECT_FALSE(profiler_->stop());
-  EXPECT_FALSE(child.get());
 }
 
 TEST_F(NpuProfilerLifecycleTest, DestroysCachedObjectAfterPythonFinalization) {
-  ASSERT_TRUE(profiler_->start(directory_.string(), 0));
-  EXPECT_TRUE(profiler_->stop());
-  finalize_python();
+  run_isolated([this] {
+    ASSERT_TRUE(profiler_->start(directory_.string(), 0));
+    EXPECT_TRUE(profiler_->stop());
+    finalize_python();
+  });
 }
 
 }  // namespace xllm

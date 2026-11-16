@@ -56,7 +56,7 @@ torch::Tensor make_positions(int64_t num_tokens) {
 
 }  // namespace
 
-TEST(SequenceMropePositionsTest, CachesFullPositionsWhenWidthMatchesTokens) {
+TEST(SequenceMropePositionsTest, ValidatesCachedPositionsAgainstTokenWidth) {
   std::vector<int32_t> prompt = {5, 6, 7, 8, 9};
   Sequence seq = make_prefill_sequence(prompt);
   EXPECT_FALSE(seq.has_mrope_positions());
@@ -68,11 +68,6 @@ TEST(SequenceMropePositionsTest, CachesFullPositionsWhenWidthMatchesTokens) {
   seq.set_mrope_positions(positions);
   EXPECT_TRUE(seq.has_mrope_positions());
   EXPECT_TRUE(torch::equal(seq.mrope_positions(), positions));
-}
-
-TEST(SequenceMropePositionsTest, StaleWidthIsRejected) {
-  Sequence seq = make_prefill_sequence({1, 2, 3, 4});
-  const int64_t num_tokens = static_cast<int64_t>(seq.num_tokens());
   // A cache whose width does not match the current token count must be treated
   // as invalid so an interrupted/re-run sequence regenerates instead of slicing
   // a stale tensor.

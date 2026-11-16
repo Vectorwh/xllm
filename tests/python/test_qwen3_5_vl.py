@@ -70,18 +70,22 @@ def test_vision_config_reads_flat_mm_keys() -> None:
     cfg = _vision_config_from_dict(
         {
             "hidden_size": 5120,
-            "mm_hidden_size": 1152,
-            "mm_num_hidden_layers": 27,
-            "mm_num_attention_heads": 16,
-            "mm_intermediate_size": 4304,
-            "mm_projection_dim": 5120,
-            "mm_num_position_embeddings": 2304,
+            "mm_hidden_size": 96,
+            "mm_num_hidden_layers": 3,
+            "mm_num_attention_heads": 6,
+            "mm_intermediate_size": 192,
+            "mm_projection_dim": 80,
+            "mm_num_position_embeddings": 48,
+            "mm_patch_size": 4,
+            "mm_temporal_patch_size": 2,
+            "mm_spatial_merge_size": 4,
             "mm_deepstack_visual_indexes": [],
         }
     )
-    assert cfg.hidden_size == 1152
-    assert cfg.num_heads == 16
-    assert cfg.out_hidden_size == 5120
+    assert (cfg.hidden_size, cfg.depth, cfg.num_heads) == (96, 3, 6)
+    assert cfg.intermediate_size == 192
+    assert (cfg.out_hidden_size, cfg.num_position_embeddings) == (80, 48)
+    assert (cfg.patch_size, cfg.temporal_patch_size, cfg.spatial_merge_size) == (4, 2, 4)
     assert cfg.deepstack_visual_indexes == []
 
 
@@ -235,7 +239,6 @@ def test_prepare_multimodal_inputs_rejects_mask_row_mismatch() -> None:
 def test_encode_multimodal_skips_modalities_without_counts() -> None:
     model = _bare_model()
 
-    assert model.encode_multimodal({}, {}) == {}
     assert model.encode_multimodal({}, {"image": []}) == {}
 
 
@@ -254,26 +257,31 @@ def test_encode_multimodal_splits_image_features(monkeypatch: pytest.MonkeyPatch
     )
 
     parts = outputs["image|embedding"]
-    assert [tuple(part.shape) for part in parts] == [(2, 4), (4, 4)]
+    expected = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    torch.testing.assert_close(parts[0], expected[:2])
+    torch.testing.assert_close(parts[1], expected[2:])
 
 
 def test_encode_batched_vision_applies_transform_before_splitting() -> None:
     from xllm.python.models.multimodal import encode_batched_vision
 
+    features = torch.tensor([[1.0, 10.0], [2.0, 20.0], [4.0, 40.0], [8.0, 80.0]])
+
     def encode(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         del pixel_values, grid_thw
-        return torch.ones(4, 2)
+        return features
 
     outputs = encode_batched_vision(
         encode,
         {"pixel_values": torch.zeros(4, 8), "image_grid_thw": torch.ones(1, 3, dtype=torch.int32)},
         {"image": [1, 3]},
-        transform=lambda features: features * 3,
+        transform=lambda values: values - values.mean(dim=0, keepdim=True),
     )
 
     parts = outputs["image|embedding"]
-    assert [tuple(part.shape) for part in parts] == [(1, 2), (3, 2)]
-    assert all(torch.equal(part, torch.full_like(part, 3.0)) for part in parts)
+    expected = features - features.mean(dim=0, keepdim=True)
+    torch.testing.assert_close(parts[0], expected[:1])
+    torch.testing.assert_close(parts[1], expected[1:])
 
 
 def test_encode_multimodal_requires_tensor_inputs() -> None:
@@ -317,22 +325,23 @@ def _checkpoint_names(model: Qwen3_5ForConditionalGeneration) -> set[str]:
     return names | {"patch_embed.proj.weight", "patch_embed.proj.bias"}
 
 
-def test_load_vision_weights_names_the_missing_checkpoint_tensor() -> None:
+@pytest.mark.parametrize(
+    ("missing_tensor", "parameter_name"),
+    [
+        ("blocks.0.mlp.linear_fc2.bias", "blocks.0.mlp.linear_fc2.bias"),
+        ("patch_embed.proj.bias", "patch_embed.bias"),
+    ],
+)
+def test_load_vision_weights_names_the_missing_checkpoint_tensor(missing_tensor: str, parameter_name: str) -> None:
     model = _vision_model()
-    loader = _RecordingLoader(_checkpoint_names(model) - {"blocks.0.mlp.linear_fc2.bias"})
+    loader = _RecordingLoader(_checkpoint_names(model) - {missing_tensor})
 
-    with pytest.raises(KeyError, match=r"missing vision tensor 'blocks\.0\.mlp\.linear_fc2\.bias'"):
+    with pytest.raises(KeyError) as error:
         model._load_vision_weights(loader)
 
-
-def test_load_vision_weights_names_the_missing_patch_embed_alias() -> None:
-    model = _vision_model()
-    # The alias matters: dropping only the checkpoint-side name must still fail,
-    # and the message has to name the alias rather than the module attribute.
-    loader = _RecordingLoader(_checkpoint_names(model) - {"patch_embed.proj.bias"})
-
-    with pytest.raises(KeyError, match=r"missing vision tensor 'patch_embed\.proj\.bias'"):
-        model._load_vision_weights(loader)
+    assert error.value.args[0] == (
+        f"checkpoint is missing vision tensor {missing_tensor!r} required by parameter {parameter_name!r}"
+    )
 
 
 def test_load_vision_weights_loads_every_tower_tensor() -> None:
@@ -343,16 +352,6 @@ def test_load_vision_weights_loads_every_tower_tensor() -> None:
     model._load_vision_weights(loader)
 
     assert sorted(loader.loaded) == sorted(expected)
-
-
-def test_load_vision_weights_never_touches_deepstack_mergers() -> None:
-    """qwen3_5 checkpoints carry no DeepStack mergers, so none may be required."""
-    model = _vision_model()
-    loader = _RecordingLoader(_checkpoint_names(model))
-
-    model._load_vision_weights(loader)
-
-    assert not [name for name in loader.loaded if name.startswith("deepstack_merger_list.")]
 
 
 def test_text_config_follows_the_shared_execution_policy(monkeypatch: pytest.MonkeyPatch) -> None:

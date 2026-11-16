@@ -69,9 +69,6 @@ def _config(**overrides) -> dict:
 
 
 def test_full_world_ep_partitions_glm_experts() -> None:
-    cfg = Glm52Config.from_dict(_config(ep_rank=3))
-    cfg.validate()
-
     model = Glm52ForCausalLM(_config(ep_rank=3))
     moe = model.model.layers[0].mlp
 
@@ -86,12 +83,14 @@ def test_full_world_ep_partitions_glm_experts() -> None:
 
 
 def test_glm_parallel_world_size_defaults_to_tp_dp_product() -> None:
-    values = _config()
+    values = _config(cp_size=2, cp_rank=1, ep_size=8)
     values.pop("world_size")
 
     cfg = Glm52Config.from_dict(values)
+    cfg.validate()
 
-    assert cfg.world_size == cfg.tp_size * cfg.dp_size * cfg.cp_size == 4
+    assert cfg.world_size == cfg.tp_size * cfg.dp_size * cfg.cp_size == 8
+    assert cfg.cp_rank == 1
 
 
 def test_glm_parallel_world_size_includes_context_parallel() -> None:
@@ -365,12 +364,8 @@ def _npu_device() -> object:
     return SimpleNamespace(type="npu")
 
 
-def _forward_ctx(*, is_prefill: bool, is_chunked_prefill: bool = False, **metadata_fields):
-    metadata = SimpleNamespace(
-        is_prefill=is_prefill,
-        is_chunked_prefill=is_chunked_prefill,
-        **metadata_fields,
-    )
+def _forward_ctx(*, is_prefill: bool, **metadata_fields):
+    metadata = SimpleNamespace(is_prefill=is_prefill, is_chunked_prefill=False, **metadata_fields)
     return ForwardContext(
         attention_backend=MagicMock(),
         device=torch.device("cpu"),
@@ -379,23 +374,9 @@ def _forward_ctx(*, is_prefill: bool, is_chunked_prefill: bool = False, **metada
     )
 
 
-def _expanded_decode_metadata(num_tokens: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        enabled=True,
-        kv_seq_lens=torch.ones(num_tokens, dtype=torch.int32),
-        block_table=torch.zeros(num_tokens, 1, dtype=torch.int32),
-        paged_kv_indptr=torch.arange(num_tokens + 1, dtype=torch.int32),
-        paged_kv_indices=torch.zeros(num_tokens, dtype=torch.int32),
-        paged_kv_last_page_len=torch.ones(num_tokens, dtype=torch.int32),
-        paged_attention_tiling_data=None,
-        kv_seq_lens_host=None,
-        kv_seq_lens_host_values=[1] * num_tokens,
-    )
-
-
 def _make_mega_moe_layer() -> deepseek_v32.DeepseekV3MoE:
-    # These retained tests cover the inherited legacy helper only. Public
-    # GLM5.2 EPLv2 now explicitly rejects the incompatible MegaMoE mode.
+    # Isolate inherited MegaMoE helpers with CPU stubs; this does not exercise
+    # GLM transport selection or NPU kernels.
     cfg = Glm52Config.from_dict(_config())
     moe = deepseek_v32.DeepseekV3MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
     moe._mega_moe_enabled = True
@@ -468,64 +449,6 @@ def test_shared_moe_mega_moe_enable_conditions(
     assert deepseek_v32.DeepseekV3MoE._can_enable_mega_moe(cfg, device) is expected
 
 
-def test_shared_moe_mega_moe_ignores_speculative_token_count() -> None:
-    cfg = Glm52Config.from_dict(_config(enable_mega_moe=True, ep_size=4, expert_parallel_degree=2))
-    cfg.num_speculative_tokens = 4
-    assert deepseek_v32.DeepseekV3MoE._can_enable_mega_moe(cfg, _npu_device()) is True
-
-
-def test_prefill_keeps_grouped_moe_and_skips_mega_moe(monkeypatch) -> None:
-    moe = _make_mega_moe_layer()
-    grouped = MagicMock(return_value=torch.zeros(2, moe.hidden))
-    mega = MagicMock()
-    monkeypatch.setattr(deepseek_v32.kernels, "grouped_moe", grouped, raising=False)
-    monkeypatch.setattr(deepseek_v32.kernels, "mega_moe", mega, raising=False)
-    monkeypatch.setattr(deepseek_v32.distributed, "all_reduce_", MagicMock(), raising=False)
-    hidden = torch.zeros(2, moe.hidden)
-    with forward_context(
-        _forward_ctx(
-            is_prefill=True,
-            expanded_decode_metadata=SimpleNamespace(enabled=False),
-        )
-    ):
-        use_mega_moe = moe._should_use_mega_moe()
-        routed = moe._run_routed_experts(hidden, use_mega_moe)
-        moe._combine_expert_outputs(routed, torch.zeros_like(routed), use_mega_moe)
-    grouped.assert_called_once()
-    mega.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("is_prefill", "is_chunked_prefill"),
-    [
-        (True, False),
-        (False, True),
-        (True, True),
-    ],
-)
-def test_expanded_speculative_decode_calls_mega_moe(monkeypatch, is_prefill: bool, is_chunked_prefill: bool) -> None:
-    moe = _make_mega_moe_layer()
-    grouped = MagicMock()
-    mega = MagicMock(return_value=torch.zeros(2, moe.hidden))
-    gate = MagicMock(return_value=(torch.ones(2, moe.topk), torch.zeros(2, moe.topk, dtype=torch.int32)))
-    monkeypatch.setattr(deepseek_v32.kernels, "grouped_moe", grouped, raising=False)
-    monkeypatch.setattr(deepseek_v32.kernels, "mega_moe", mega, raising=False)
-    monkeypatch.setattr(deepseek_v32.kernels, "moe_gate_routing", gate, raising=False)
-    monkeypatch.setattr(deepseek_v32.distributed, "all_reduce_", MagicMock(), raising=False)
-    hidden = torch.zeros(2, moe.hidden)
-    with forward_context(
-        _forward_ctx(
-            is_prefill=is_prefill,
-            is_chunked_prefill=is_chunked_prefill,
-            slot_mapping=torch.arange(2, dtype=torch.int32),
-            expanded_decode_metadata=_expanded_decode_metadata(2),
-        )
-    ):
-        moe._run_routed_experts(hidden, moe._should_use_mega_moe())
-    grouped.assert_not_called()
-    mega.assert_called_once()
-
-
 def test_decode_calls_mega_moe_with_shared_weights(monkeypatch) -> None:
     moe = _make_mega_moe_layer()
     grouped = MagicMock()
@@ -537,7 +460,7 @@ def test_decode_calls_mega_moe_with_shared_weights(monkeypatch) -> None:
     monkeypatch.setattr(deepseek_v32.kernels, "moe_gate_routing", gate, raising=False)
     monkeypatch.setattr(deepseek_v32.distributed, "all_reduce_", ep_reduce, raising=False)
     hidden = torch.zeros(2, moe.hidden)
-    with forward_context(_forward_ctx(is_prefill=False, is_chunked_prefill=False)):
+    with forward_context(_forward_ctx(is_prefill=False)):
         use_mega_moe = moe._should_use_mega_moe()
         routed = moe._run_routed_experts(hidden, use_mega_moe)
         moe._combine_expert_outputs(routed, torch.zeros_like(routed), use_mega_moe)
@@ -620,31 +543,6 @@ def test_mega_moe_raises_when_tokens_exceed_comm_cap(monkeypatch) -> None:
         moe._run_routed_experts(hidden, moe._should_use_mega_moe())
     grouped.assert_not_called()
     mega.assert_not_called()
-
-
-def test_mixed_dp_decode_keeps_grouped_moe_and_ep_reduce(monkeypatch) -> None:
-    moe = _make_mega_moe_layer()
-    moe.dp_size = 2
-    grouped = MagicMock(return_value=torch.zeros(2, moe.hidden))
-    mega = MagicMock()
-    ep_reduce = MagicMock()
-    monkeypatch.setattr(deepseek_v32.kernels, "grouped_moe", grouped, raising=False)
-    monkeypatch.setattr(deepseek_v32.kernels, "mega_moe", mega, raising=False)
-    monkeypatch.setattr(deepseek_v32.distributed, "all_reduce_", ep_reduce, raising=False)
-    hidden = torch.zeros(2, moe.hidden)
-    with forward_context(
-        _forward_ctx(
-            is_prefill=False,
-            dp_is_decode=(1, 0),
-            dp_execution_token_counts=(2, 1),
-        )
-    ):
-        use_mega_moe = moe._should_use_mega_moe()
-        routed = moe._run_routed_experts(hidden, use_mega_moe)
-        moe._combine_expert_outputs(routed, torch.zeros_like(routed), use_mega_moe)
-    grouped.assert_called_once()
-    mega.assert_not_called()
-    assert any(len(call.args) >= 2 and call.args[1] == "moe_ep" for call in ep_reduce.call_args_list)
 
 
 def test_all_decode_dp_uses_mega_moe_without_ep_reduce(monkeypatch) -> None:

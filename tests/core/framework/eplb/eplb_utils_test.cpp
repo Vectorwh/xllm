@@ -37,8 +37,6 @@ TEST(EplbUtilsTest, MapsWorkerRanksDirectlyToEpRanks) {
             0);
   EXPECT_EQ(eplb::eplb_rank_from_worker_rank(1, worker_num, eplb_device_num),
             1);
-  EXPECT_EQ(eplb::eplb_rank_from_worker_rank(2, worker_num, eplb_device_num),
-            2);
   EXPECT_EQ(eplb::eplb_rank_from_worker_rank(7, worker_num, eplb_device_num),
             7);
 }

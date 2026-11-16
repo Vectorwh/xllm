@@ -252,6 +252,19 @@ TEST(MluMlaDecodeLseTest, SupportsInt8CacheAndUnequalBatchContexts) {
             torch::IntArrayRef({kBatchSize, kNumHeads, 1}));
   EXPECT_TRUE(torch::isfinite(output.to(torch::kFloat32)).all().item<bool>());
   EXPECT_TRUE(torch::isfinite(output_lse.value()).all().item<bool>());
+  const torch::Tensor actual_lse = output_lse->cpu();
+  for (int64_t batch = 0; batch < kBatchSize; ++batch) {
+    const int64_t context = batch == 0 ? 2 : 4;
+    const torch::Tensor keys =
+        cache_tensor[batch][0].cpu().narrow(0, 0, context).to(torch::kFloat32) *
+        0.01f;
+    const torch::Tensor scores =
+        torch::matmul(query[batch].cpu().to(torch::kFloat32),
+                      keys.transpose(0, 1)) *
+        scale;
+    const torch::Tensor expected_lse = torch::logsumexp(scores, -1, true);
+    EXPECT_TRUE(torch::allclose(actual_lse[batch], expected_lse, 1e-3, 1e-3));
+  }
 }
 
 }  // namespace

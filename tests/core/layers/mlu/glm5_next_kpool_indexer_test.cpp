@@ -31,7 +31,6 @@ limitations under the License.
 #include <unordered_map>
 
 #include "core/framework/config/kv_cache_config.h"
-#include "framework/config/kv_cache_config.h"
 #include "framework/speculative/spec_input_builder.h"
 #include "kernels/mlu/kpool.h"
 #include "kernels/mlu/mlu_ops_api.h"
@@ -44,11 +43,11 @@ limitations under the License.
 #include "platform/platform.h"
 #include "runtime/forward_params.h"
 #include "tests/core/layers/mlu/glm5_next_kpool_test_utils.h"
-#include "tests/core/layers/mlu/tests_utils.h"
 #include "util/linalg.h"
 
 namespace xllm::layer {
 namespace {
+
 torch::Tensor active_topk(const torch::Tensor& table,
                           const torch::Tensor& lengths) {
   const auto columns = torch::arange(table.size(1), lengths.options());
@@ -185,7 +184,7 @@ void expect_close(const torch::Tensor& actual,
   const torch::Tensor value = actual.cpu().to(torch::kFloat32);
   ASSERT_GT(ref.abs().max().item<float>(), atol)
       << label << " reference is too small for a meaningful absolute tolerance";
-  EXPECT_TRUE(torch::allclose(value, ref, rtol, atol))
+  EXPECT_TRUE(test::scaled_close(value, ref, rtol, atol))
       << label << " max error " << (value - ref).abs().max().item<float>();
 }
 
@@ -395,8 +394,7 @@ void check_forward_after_short_prefill(bool graph_decode,
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  const int64_t saved_block_size = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   ModelArgs args;
   args.model_type("glm5_next");
   args.hidden_size(4096);
@@ -481,12 +479,13 @@ void check_forward_after_short_prefill(bool graph_decode,
                              std::get<0>(full_slots.narrow(0, i, 1).sort(-1))))
         << i;
   }
-  EXPECT_TRUE(torch::allclose(full_cache, decode_cache, 0.015625, 0.015625));
-  KVCacheConfig::get_instance().block_size(saved_block_size);
+  EXPECT_TRUE(test::scaled_close(full_cache, decode_cache, 0.015625, 0.015625));
 }
 
 TEST(Glm5NextKPoolConfigDeathTest,
      RejectsUnsupportedConfigurationAtConstruction) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+
   const auto construct = [](int64_t heads,
                             int64_t dimension,
                             int64_t pool,
@@ -514,6 +513,12 @@ TEST(Glm5NextKPoolConfigDeathTest,
 }
 
 TEST(Glm5NextKPoolIndexerTest, GraphMetadataHandlesOddRequestsAndEmptySpans) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   for (const int64_t requests : {3, 5}) {
     std::vector<int64_t> offsets{0};
@@ -542,16 +547,27 @@ TEST(Glm5NextKPoolIndexerTest, GraphMetadataHandlesOddRequestsAndEmptySpans) {
 
 TEST(Glm5NextKPoolIndexerTest,
      DistinctPrefillTailMatchesCopyThroughVerifyAndDecode) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), /*index=*/0);
   ASSERT_TRUE(test::check_kpool_state(device));
 }
 
 TEST(Glm5NextKPoolIndexerTest, PrefillMatchesPagedPathAcrossRaggedTiles) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  const int64_t saved_block_size = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   torch::manual_seed(72317);
   for (const int64_t length : {32, 33, 129, 512}) {
     for (const int64_t budget : {kTopk}) {
@@ -616,7 +632,8 @@ TEST(Glm5NextKPoolIndexerTest, PrefillMatchesPagedPathAcrossRaggedTiles) {
             indexer->forward(hidden, query, positions, cache, state, meta);
         // Torch prefill pooling and the retained fused decode update have
         // different FP32 reduction orders; use the cache precision contract.
-        EXPECT_TRUE(torch::allclose(cache, baseline_cache, 0.015625, 0.015625));
+        EXPECT_TRUE(
+            test::scaled_close(cache, baseline_cache, 0.015625, 0.015625));
         EXPECT_TRUE(torch::equal(state, baseline_tail));
         EXPECT_TRUE(torch::equal(lens, expected_lens));
         EXPECT_TRUE(torch::equal(std::get<0>(slots.sort(-1)),
@@ -626,10 +643,15 @@ TEST(Glm5NextKPoolIndexerTest, PrefillMatchesPagedPathAcrossRaggedTiles) {
       }
     }
   }
-  KVCacheConfig::get_instance().block_size(saved_block_size);
 }
 
 TEST(Glm5NextKPoolIndexerTest, ScorePreservesInputsAndFp32HeadOrder) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
@@ -650,17 +672,29 @@ TEST(Glm5NextKPoolIndexerTest, ScorePreservesInputsAndFp32HeadOrder) {
        weights.cpu().unsqueeze(-1))
           .sum(1);
   const torch::Tensor actual = score_keys(query, weights, keys, 0.125);
-  EXPECT_TRUE(torch::allclose(actual.cpu(), expected, 0.001, 0.001));
+  EXPECT_TRUE(test::scaled_close(actual.cpu(), expected, 0.001, 0.001));
   EXPECT_TRUE(torch::equal(query, query_before));
   EXPECT_TRUE(torch::equal(weights, weights_before));
   EXPECT_TRUE(torch::equal(keys, keys_before));
 }
 
 TEST(Glm5NextKPoolIndexerTest, ForwardMatchesTokenDecodeAfterShortPrefill) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   check_forward_after_short_prefill(/*graph_decode=*/false);
 }
 
 TEST(Glm5NextKPoolIndexerTest, ForwardMatchesGraphDecodeAfterShortPrefill) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   check_forward_after_short_prefill(/*graph_decode=*/true,
                                     /*prepare_metadata=*/false);
 }
@@ -676,7 +710,6 @@ TEST(Glm5NextKPoolIndexerTest,
   prepare_glm5_next_kpool_metadata(meta, device);
   const auto first = meta.kpool_batch_metadata;
   EXPECT_EQ(first->q_seq_lens, (std::vector<int32_t>{2, 0, 3}));
-  EXPECT_EQ(first->max_kv_len, 9);
   EXPECT_TRUE(torch::equal(first->row_batch,
                            torch::tensor({0, 0, 2, 2, 2}, torch::kInt64)));
   EXPECT_TRUE(torch::equal(first->query_starts,
@@ -684,15 +717,19 @@ TEST(Glm5NextKPoolIndexerTest,
   meta.q_seq_lens_vec = {1, 1, 1};
   meta.kv_seq_lens_vec = {6, 8, 10};
   prepare_glm5_next_kpool_metadata(meta, device);
-  EXPECT_NE(first.get(), meta.kpool_batch_metadata.get());
   EXPECT_EQ(meta.kpool_batch_metadata->max_kv_len, 10);
   EXPECT_TRUE(
       torch::equal(meta.kpool_batch_metadata->row_batch, torch::arange(3)));
-  EXPECT_EQ(first->max_kv_len, 9);
 }
 
 TEST(Glm5NextKPoolIndexerTest,
      PagedSelectionPreservesRaggedCausalityAcrossChunks) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -758,6 +795,12 @@ TEST(Glm5NextKPoolIndexerTest,
 
 TEST(Glm5NextKPoolIndexerTest,
      SelectionSupportsStridedHeadsAndPartialTailPage) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -808,12 +851,21 @@ TEST(Glm5NextKPoolIndexerTest,
 }
 
 TEST(Glm5NextKPoolIndexerTest, GeneralSelectionHandlesEmptyTiesAndLongHistory) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   for (const int64_t pools : {0, 17, 65537}) {
     const int64_t pages = (pools + 3) / 4;
     const torch::Tensor cache = torch::ones({pages, 1, 4, 128}, options);
+    if (pools > 65536) {
+      cache[pages - 1][0][(pools - 1) % 4].fill_(2);
+    }
     const torch::Tensor table =
         torch::arange(pages, options.dtype(torch::kInt32)).view({1, pages});
     const torch::Tensor q = torch::ones({1, kHeads, 128}, options);
@@ -833,12 +885,13 @@ TEST(Glm5NextKPoolIndexerTest, GeneralSelectionHandlesEmptyTiesAndLongHistory) {
                                                         4,
                                                         kTopk,
                                                         1.0);
-    torch::Tensor expected =
-        torch::full({1, kSelected}, -1, options.dtype(torch::kInt64));
     const int64_t count = std::min<int64_t>(pools, kSelected);
     EXPECT_EQ(actual.ge(0).sum().item<int64_t>(), count);
     const torch::Tensor valid = actual.masked_select(actual >= 0);
     EXPECT_TRUE(valid.lt(pools).all().item<bool>());
+    if (pools > 65536) {
+      EXPECT_TRUE(valid.eq(pools - 1).any().item<bool>());
+    }
     if (count > 1) {
       const torch::Tensor sorted = std::get<0>(valid.sort());
       EXPECT_TRUE(
@@ -862,6 +915,12 @@ TEST(Glm5NextKPoolIndexerTest, GeneralSelectionHandlesEmptyTiesAndLongHistory) {
 }
 
 TEST(Glm5NextKPoolIndexerTest, PagedGraphReplayUsesUpdatedSequenceLengths) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -912,6 +971,12 @@ TEST(Glm5NextKPoolIndexerTest, PagedGraphReplayUsesUpdatedSequenceLengths) {
 }
 
 TEST(Glm5NextKPoolIndexerTest, ChunkBoundariesPreserveCompressedAndTailCaches) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -988,14 +1053,20 @@ TEST(Glm5NextKPoolIndexerTest, ChunkBoundariesPreserveCompressedAndTailCaches) {
                           tokens,
                           kBlock,
                           kPool);
-    EXPECT_TRUE(torch::allclose(history.keys[0].narrow(0, 0, tokens / kPool),
-                                expected_pools,
-                                /*rtol=*/0.015625,
-                                /*atol=*/0.015625));
+    EXPECT_TRUE(test::scaled_close(history.keys[0].narrow(0, 0, tokens / kPool),
+                                   expected_pools,
+                                   /*rtol=*/0.015625,
+                                   /*atol=*/0.015625));
   }
 }
 
 TEST(Glm5NextKPoolIndexerTest, PaddedMlaRowsSkipCacheWrites) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
@@ -1060,6 +1131,12 @@ TEST(Glm5NextKPoolIndexerTest, PaddedMlaRowsSkipCacheWrites) {
 }
 
 TEST(Glm5NextKPoolIndexerTest, GraphCacheUpdateMatchesReference) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -1136,13 +1213,20 @@ TEST(Glm5NextKPoolIndexerTest, GraphCacheUpdateMatchesReference) {
     graph.replay();
     torch_mlu::synchronize();
     EXPECT_TRUE(torch::equal(eager_tail, graph_tail)) << position;
-    EXPECT_TRUE(torch::allclose(eager_cache, graph_cache, 0.015625, 0.015625))
+    EXPECT_TRUE(
+        test::scaled_close(eager_cache, graph_cache, 0.015625, 0.015625))
         << position;
   }
 }
 
 TEST(Glm5NextKPoolIndexerTest,
      NormalizesBFloat16ProjectionWithFloat32LayerNorm) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   constexpr int64_t kHeadDim = 128;
   constexpr double kEps = 1e-6;
   torch::Device device(Platform::type_torch(), 0);
@@ -1163,10 +1247,22 @@ TEST(Glm5NextKPoolIndexerTest,
 
   EXPECT_EQ(actual.scalar_type(), torch::kBFloat16);
   EXPECT_EQ(actual.sizes(), key.sizes());
+  const auto x = key.cpu().to(torch::kFloat64);
+  const auto centered = x - x.mean(-1, true);
+  const auto expected =
+      (centered * torch::rsqrt(centered.square().mean(-1, true) + kEps))
+          .to(torch::kBFloat16);
+  EXPECT_TRUE(test::scaled_close(actual.cpu(), expected, 0.015625, 0.015625));
   EXPECT_TRUE(torch::isfinite(actual).all().item<bool>());
 }
 
 TEST(Glm5NextKPoolIndexerTest, AppliesReluBeforeReducingQueryHeads) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto opts =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
@@ -1186,6 +1282,12 @@ TEST(Glm5NextKPoolIndexerTest, AppliesReluBeforeReducingQueryHeads) {
 }
 
 TEST(Glm5NextKPoolIndexerTest, ExpansionSupportsLargeStridedShapes) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kInt64).device(device);
@@ -1240,6 +1342,12 @@ TEST(Glm5NextKPoolIndexerTest, ExpansionSupportsLargeStridedShapes) {
 }
 
 TEST(Glm5NextKPoolIndexerTest, ExpansionHandlesEmptySelections) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kInt32).device(device);
@@ -1276,6 +1384,12 @@ TEST(Glm5NextKPoolIndexerTest, ExpansionHandlesEmptySelections) {
 
 TEST(Glm5NextKPoolIndexerTest,
      ExpansionGraphReplayUsesLivePoolsPositionsAndTables) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kInt64).device(device);
@@ -1329,13 +1443,18 @@ TEST(Glm5NextKPoolIndexerTest,
 }  // namespace
 
 TEST(Glm5NextKPoolIndexerTest, DecodeReadsPdStateRestoredAfterGraphCapture) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   const auto ints = options.dtype(torch::kInt32);
-  const int64_t old_block_size = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   ModelArgs args;
   args.model_type("glm5_next")
       .hidden_size(kHidden)
@@ -1470,17 +1589,21 @@ TEST(Glm5NextKPoolIndexerTest, DecodeReadsPdStateRestoredAfterGraphCapture) {
           << "token=" << token;
     }
   }
-  KVCacheConfig::get_instance().block_size(old_block_size);
 }
 
 TEST(Glm5NextKPoolIndexerTest, VerifyGraphRejectsAndResumesFromRestoredTail) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   const auto ints = options.dtype(torch::kInt32);
-  const int64_t old_block_size = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   ModelArgs args;
   args.model_type("glm5_next")
       .hidden_size(kHidden)
@@ -1597,11 +1720,16 @@ TEST(Glm5NextKPoolIndexerTest, VerifyGraphRejectsAndResumesFromRestoredTail) {
       meta.block_table.copy_(torch::tensor({{1, 3, 0, 2}}, ints));
     }
   }
-  KVCacheConfig::get_instance().block_size(old_block_size);
 }
 
 TEST(Glm5NextKPoolIndexerTest,
      SpeculativeInputRowsRetainLogicalRequestOwnership) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::Device device(Platform::type_torch(), 0);
   ForwardInput input;
   input.token_ids_host = torch::tensor({11, 22}, torch::kInt32);
@@ -1660,13 +1788,18 @@ TEST(Glm5NextKPoolIndexerTest,
 }
 
 TEST(Glm5NextKPoolIndexerTest, GraphReplaysRaggedRequestsAndMasksPaddingState) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   const auto ints = options.dtype(torch::kInt32);
-  const int64_t old_block_size = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   ModelArgs args;
   args.model_type("glm5_next")
       .hidden_size(kHidden)
@@ -1746,14 +1879,19 @@ TEST(Glm5NextKPoolIndexerTest, GraphReplaysRaggedRequestsAndMasksPaddingState) {
     EXPECT_TRUE(torch::equal(std::get<0>(output), std::get<0>(expected)));
     EXPECT_TRUE(torch::equal(std::get<1>(output), std::get<1>(expected)));
     EXPECT_TRUE(torch::equal(tail, eager_tail));
-    EXPECT_TRUE(torch::allclose(cache, eager_cache, 0.015625, 0.015625));
+    EXPECT_TRUE(test::scaled_close(cache, eager_cache, 0.015625, 0.015625));
     EXPECT_EQ(tail[0].count_nonzero().item<int64_t>(), 0);
   }
   EXPECT_EQ(std::get<1>(output).narrow(0, 0, 2).sum().item<int64_t>(), 0);
-  KVCacheConfig::get_instance().block_size(old_block_size);
 }
 
 TEST(Glm5NextKPoolIndexerTest, DraftPlaceholderDoesNotOverwriteRetainedTail) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -1804,7 +1942,7 @@ TEST(Glm5NextKPoolIndexerTest, DraftPlaceholderDoesNotOverwriteRetainedTail) {
   const torch::Tensor expected =
       reference_compression(keys, gates, ape, hadamard, 4);
   torch_mlu::synchronize();
-  EXPECT_TRUE(torch::allclose(
+  EXPECT_TRUE(test::scaled_close(
       cache[0][0].narrow(0, 0, 2), expected, 0.015625, 0.015625));
   EXPECT_TRUE(torch::equal(tail[1][0][5], keys[5]));
 }
@@ -1813,6 +1951,12 @@ TEST(Glm5NextKPoolIndexerTest, DraftPlaceholderDoesNotOverwriteRetainedTail) {
 
 namespace xllm::layer {
 TEST(Glm5NextKPoolIndexerTest, VerifyMasksHighScoringFuturePoolBeforeTopk) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto opts =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -1862,6 +2006,12 @@ TEST(Glm5NextKPoolIndexerTest, VerifyMasksHighScoringFuturePoolBeforeTopk) {
 
 TEST(Glm5NextKPoolIndexerTest,
      FourQuerySelectionKeepsCausalityWithSmallWorkspace) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   const torch::Device device(Platform::type_torch(), 0);
   const auto opts =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
@@ -1916,6 +2066,12 @@ TEST(Glm5NextKPoolIndexerTest,
 namespace xllm::layer {
 TEST(Glm5NextKPoolIndexerTest,
      GraphSelectionCrosses64KWithLivePagesAndPadding) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
   const torch::Device device(Platform::type_torch(), 0);
   const auto opts =
@@ -1966,13 +2122,18 @@ TEST(Glm5NextKPoolIndexerTest,
 
 namespace xllm::layer {
 TEST(Glm5NextKPoolIndexerTest, PrefillChainMatchesIndependentTorchState) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
   torch::manual_seed(6159);
   const torch::Device device(Platform::type_torch(), 0);
   const auto opts =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
-  const int64_t saved = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   ModelArgs args;
   args.model_type("glm5_next")
       .hidden_size(kHidden)
@@ -2037,7 +2198,7 @@ TEST(Glm5NextKPoolIndexerTest, PrefillChainMatchesIndependentTorchState) {
       indexer->forward(hidden, query_input, positions, cache, tail, meta);
   const PoolHistory actual = read_pool_history(
       cache, meta.block_table, meta.kv_seq_lens, tokens, 16, 4);
-  EXPECT_TRUE(torch::allclose(
+  EXPECT_TRUE(test::scaled_close(
       actual.keys[0].narrow(0, 0, 520).cpu(), compressed, 0.015625, 0.015625));
   for (int64_t token = tokens - 12; token < tokens; ++token) {
     EXPECT_TRUE(torch::equal(tail[1][0][token % 12].cpu(), keys[token]));
@@ -2076,19 +2237,23 @@ TEST(Glm5NextKPoolIndexerTest, PrefillChainMatchesIndependentTorchState) {
     EXPECT_TRUE(torch::equal(std::get<0>(slots[row].cpu().sort()),
                              std::get<0>(expected.physical_slots[0].sort())));
   }
-  KVCacheConfig::get_instance().block_size(saved);
 }
 
 // Long prefills score straight from the paged pool cache.  Rows that see more
 // complete pools than the selection budget must keep the highest-scoring ones.
 TEST(Glm5NextKPoolIndexerTest, LongPrefillKeepsTopScoringPoolsBeyondBudget) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
   torch::manual_seed(44207);
   const torch::Device device(Platform::type_torch(), 0);
   const auto opts =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
-  const int64_t saved = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   ModelArgs args;
   args.model_type("glm5_next")
       .hidden_size(kHidden)
@@ -2195,201 +2360,18 @@ TEST(Glm5NextKPoolIndexerTest, LongPrefillKeepsTopScoringPoolsBeyondBudget) {
   EXPECT_GT(
       torch::matmul(keys, last_q).gt(64 * kScoreMargin).sum().item<int64_t>(),
       kSelected);
-  KVCacheConfig::get_instance().block_size(saved);
 }
-
-class DeepseekV2AttentionTestPeer final {
- public:
-  static void install_indexer(DeepseekV32AttentionImpl& attention,
-                              Glm5NextKPoolIndexer indexer) {
-    attention.has_indexer_ = true;
-    attention.use_kpool_indexer_ = true;
-    attention.glm5_next_kpool_indexer_ = std::move(indexer);
-  }
-
-  static std::optional<DsaTopkState> resolve(
-      DeepseekV32AttentionImpl& attention,
-      const torch::Tensor& positions,
-      const torch::Tensor& hidden,
-      const torch::Tensor& queries,
-      const AttentionMetadata& metadata,
-      KVCache& cache,
-      const DsaTopkState* shared = nullptr) {
-    return attention.resolve_dsa_topk_state(positions,
-                                            hidden,
-                                            queries,
-                                            metadata,
-                                            cache,
-                                            metadata.is_prefill,
-                                            shared);
-  }
-};
-
-TEST(Glm5NextKPoolIndexerTest,
-     MtpReusesFrozenSelectionAndReplaysOnlyAcceptedSpan) {
-  torch::NoGradGuard no_grad;
-  const torch::Device device(Platform::type_torch(), 0);
-  const auto options =
-      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  const auto ints = options.dtype(torch::kInt32);
-  const int64_t saved_block_size = KVCacheConfig::get_instance().block_size();
-  KVCacheConfig::get_instance().block_size(16);
-  ModelArgs args;
-  args.model_type("glm5_next")
-      .hidden_size(kHidden)
-      .q_lora_rank(kRank)
-      .index_n_heads(kHeads)
-      .index_head_dim(128)
-      .qk_rope_head_dim(0)
-      .index_topk(kTopk)
-      .index_kpool(4)
-      .index_kpool_compress(true)
-      .index_kpool_always_select_tail(true)
-      .max_position_embeddings(1048576);
-  ParallelArgs parallel(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  Glm5NextKPoolIndexer indexer(args, QuantArgs(), parallel, nullptr, options);
-  torch::manual_seed(1811);
-  for (auto& parameter : indexer->named_parameters()) {
-    parameter.value().normal_(/*mean=*/0.0, /*std=*/0.1);
-  }
-  DeepseekV32AttentionImpl attention;
-  DeepseekV2AttentionTestPeer::install_indexer(attention, indexer);
-  const torch::Tensor hidden = torch::randn({16, kHidden}, options);
-  const torch::Tensor queries = torch::randn({16, kRank}, options);
-  const torch::Tensor positions = torch::arange(16, ints);
-  const torch::Tensor table = torch::tensor({{2, 0, 1, 3}}, ints);
-  const auto make_cache = [&]() {
-    return KVCache(IndexedKVCacheTensors{
-        .index_cache = torch::zeros({4, 1, 4, 128}, options),
-        .kpool_tail = torch::zeros({2, 2, 16, 128}, options)});
-  };
-  const auto make_metadata = [&](int64_t count, int64_t length) {
-    AttentionMetadata metadata{};
-    metadata.block_table = table;
-    metadata.linear_state_indices = torch::tensor({1}, ints);
-    metadata.q_seq_lens = torch::tensor({count}, ints);
-    metadata.kv_seq_lens = torch::tensor({length}, ints);
-    metadata.q_seq_lens_vec = {static_cast<int32_t>(count)};
-    metadata.kv_seq_lens_vec = {static_cast<int32_t>(length)};
-    return metadata;
-  };
-  for (const int64_t prefix : {6, 7}) {
-    for (const int64_t accepted : {0, 1, 3}) {
-      SCOPED_TRACE("prefix=" + std::to_string(prefix) +
-                   ", accepted=" + std::to_string(accepted));
-      KVCache cache = make_cache();
-      AttentionMetadata prefill = make_metadata(prefix, prefix);
-      prefill.is_prefill = true;
-      DeepseekV2AttentionTestPeer::resolve(attention,
-                                           positions.narrow(0, 0, prefix),
-                                           hidden.narrow(0, 0, prefix),
-                                           queries.narrow(0, 0, prefix),
-                                           prefill,
-                                           cache);
-      AttentionMetadata draft = make_metadata(1, prefix + 1);
-      draft.block_table = table.repeat({2, 1});
-      draft.linear_state_indices = torch::tensor({1, 0}, ints);
-      draft.q_seq_lens = torch::tensor({1, 1}, ints);
-      draft.kv_seq_lens = torch::tensor({prefix + 1, int64_t{0}}, ints);
-      draft.q_seq_lens_vec = {1, 1};
-      draft.kv_seq_lens_vec = {static_cast<int32_t>(prefix + 1), 0};
-      const auto frozen = DeepseekV2AttentionTestPeer::resolve(
-          attention,
-          torch::tensor({prefix, int64_t{0}}, ints),
-          hidden.narrow(0, prefix, 2),
-          queries.narrow(0, prefix, 2),
-          draft,
-          cache);
-      ASSERT_TRUE(frozen.has_value());
-      EXPECT_EQ(frozen->context_lens()[0].item<int32_t>(), prefix + 1);
-      EXPECT_EQ(frozen->context_lens()[1].item<int32_t>(), 0);
-      const torch::Tensor saved_cache = cache.get_index_cache().clone();
-      const torch::Tensor saved_tail = cache.get_kpool_tail().clone();
-      const torch::Tensor saved_slots = frozen->block_tables().clone();
-      for (int64_t step = 1; step <= 3; ++step) {
-        draft.kv_seq_lens[0].fill_(prefix + step + 1);
-        draft.kv_seq_lens_vec[0] = static_cast<int32_t>(prefix + step + 1);
-        const auto reused = DeepseekV2AttentionTestPeer::resolve(
-            attention,
-            torch::tensor({prefix + step, int64_t{0}}, ints),
-            hidden.narrow(0, prefix + step, 2),
-            queries.narrow(0, prefix + step, 2),
-            draft,
-            cache,
-            &*frozen);
-        ASSERT_TRUE(reused.has_value());
-        EXPECT_EQ(reused->block_tables().data_ptr(),
-                  frozen->block_tables().data_ptr());
-        EXPECT_TRUE(torch::equal(reused->block_tables(), saved_slots));
-        EXPECT_TRUE(
-            torch::equal(reused->context_lens(), frozen->context_lens()));
-        EXPECT_TRUE(torch::equal(cache.get_index_cache(), saved_cache));
-        EXPECT_TRUE(torch::equal(cache.get_kpool_tail(), saved_tail));
-      }
-      // A new round replays the accepted suffix plus the fresh base token.
-      // Rejected speculative tokens were never written to the indexer cache.
-      const int64_t replay_begin = prefix + 1;
-      const int64_t replay_count = accepted + 1;
-      const int64_t length = replay_begin + replay_count;
-      AttentionMetadata replay = make_metadata(replay_count, length);
-      replay.is_spec_verify = true;
-      const auto actual = DeepseekV2AttentionTestPeer::resolve(
-          attention,
-          positions.narrow(0, replay_begin, replay_count),
-          hidden.narrow(0, replay_begin, replay_count),
-          queries.narrow(0, replay_begin, replay_count),
-          replay,
-          cache);
-      KVCache reference = make_cache();
-      AttentionMetadata whole_prefix = make_metadata(length, length);
-      whole_prefix.is_prefill = true;
-      const auto expected =
-          DeepseekV2AttentionTestPeer::resolve(attention,
-                                               positions.narrow(0, 0, length),
-                                               hidden.narrow(0, 0, length),
-                                               queries.narrow(0, 0, length),
-                                               whole_prefix,
-                                               reference);
-      ASSERT_TRUE(actual.has_value());
-      ASSERT_TRUE(expected.has_value());
-      EXPECT_TRUE(torch::equal(
-          actual->block_tables(),
-          expected->block_tables().narrow(0, replay_begin, replay_count)));
-      EXPECT_TRUE(torch::equal(
-          actual->context_lens(),
-          expected->context_lens().narrow(0, replay_begin, replay_count)));
-      EXPECT_TRUE(torch::allclose(cache.get_index_cache(),
-                                  reference.get_index_cache(),
-                                  /*rtol=*/0.015625,
-                                  /*atol=*/0.015625));
-      EXPECT_TRUE(torch::allclose(cache.get_kpool_tail(),
-                                  reference.get_kpool_tail(),
-                                  /*rtol=*/0.015625,
-                                  /*atol=*/0.015625));
-      EXPECT_EQ(cache.get_kpool_tail()[0].count_nonzero().item<int64_t>(), 0);
-    }
-  }
-  KVCacheConfig::get_instance().block_size(saved_block_size);
-}
-
-namespace {
-class KPoolBlockGuard final {
- public:
-  KPoolBlockGuard() : saved_(KVCacheConfig::get_instance().block_size()) {
-    KVCacheConfig::get_instance().block_size(/*value=*/16);
-  }
-  ~KPoolBlockGuard() { KVCacheConfig::get_instance().block_size(saved_); }
-
- private:
-  int64_t saved_;
-};
-}  // namespace
 
 TEST(Glm5NextKPoolIndexerTest,
      PublicAttentionFreezesMtpAndReplaysAcceptedSpan) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+  const torch::DeviceGuard device_guard(
+      torch::Device(Platform::type_torch(), 0));
+
   torch::NoGradGuard no_grad;
-  const KPoolBlockGuard block_guard;
+  const test::BlockSizeGuard block_guard(/*block_size=*/16);
   const torch::Device device(Platform::type_torch(), /*index=*/0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);

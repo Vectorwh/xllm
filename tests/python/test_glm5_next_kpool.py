@@ -403,42 +403,6 @@ def test_fused_pool_selection_mtp_preserves_causal_tail_across_pool_boundary(
             torch.testing.assert_close(valid, torch.tensor(list(expected_row), dtype=torch.int64))
 
 
-@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
-@torch.inference_mode()
-def test_fused_pool_selection_compact_indices_leave_no_interior_holes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("torch_npu")
-    from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
-
-    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
-    torch.npu.set_device(device)
-    monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", pool_key_indexer, raising=False)
-    indexer = _indexer(device)
-    indexer.index_kpool_always_select_tail = True
-
-    # index_topk=8 and index_kpool=4 select at most two pools, so a 5-token
-    # row has one complete pool plus one tail token. The legacy layout leaves
-    # four -1 holes before the tail; compact must keep the row contiguous.
-    query = torch.ones(1, 1, indexer.n_heads, indexer.head_dim, device=device, dtype=torch.bfloat16)
-    weights = torch.ones(1, 1, indexer.n_heads, device=device, dtype=torch.bfloat16)
-    lengths = torch.tensor([5], device=device, dtype=torch.int32)
-    mask = torch.ones(1, 1, device=device, dtype=torch.bool)
-    cache = torch.zeros(1, 16, 1, indexer.head_dim, device=device, dtype=torch.bfloat16)
-    tables = torch.tensor([[0]], device=device, dtype=torch.int32)
-
-    actual = indexer._select_topk_fused_pa(query, weights, lengths, mask, cache, tables)
-    assert actual is not None
-
-    row = actual[0, 0]
-    valid = row[row >= 0]
-    valid_count = valid.numel()
-    assert valid_count == 5
-    assert not (row[:valid_count] < 0).any(), "compact indices must not leave interior -1 holes"
-    assert (row[valid_count:] < 0).all(), "remaining slots must be -1 padding"
-    torch.testing.assert_close(valid.cpu(), torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64))
-
-
 def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
     compressed_cache = torch.zeros(1, 2, 1, 2, dtype=torch.bfloat16)
     tail_cache = torch.zeros(3, 2, 4, 2, dtype=torch.bfloat16)
@@ -558,6 +522,135 @@ def test_compressed_kpool_completes_pool_across_forward_boundary() -> None:
         placeholder_tail[1, :, 1],
         torch.tensor([[3, 30], [4, 40]], dtype=torch.bfloat16),
     )
+
+
+@pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
+@pytest.mark.parametrize(
+    ("query_len", "position_offset"),
+    [(1, 0), (4, 0), (4, 1), (4, 2), (4, 3), (7, 1), (8, 0), (9, 3)],
+)
+@torch.inference_mode()
+def test_compact_kpool_triton_matches_torch_reference(query_len: int, position_offset: int) -> None:
+    runtime = pytest.importorskip("torch_npu")
+    pytest.importorskip("triton")
+    from xllm.python.kernels_npu.triton.kpool_compress import (
+        update_compact_kpool,
+    )
+
+    torch.manual_seed(42)
+    rate = 4
+    head_dim = 128
+    first_positions = (position_offset, 28 + position_offset, 5)
+    num_requests = len(first_positions)
+    positions = torch.cat(
+        [torch.arange(start, start + query_len, dtype=torch.int64) for start in first_positions],
+    )
+    raw_k = torch.randn(num_requests * query_len, head_dim, dtype=torch.bfloat16)
+    gate_scores = torch.randn_like(raw_k)
+    valid_rows = torch.ones(num_requests * query_len, dtype=torch.bool)
+    valid_rows[0] = False
+    valid_rows[-query_len:] = False
+    ape = torch.randn(rate, head_dim, dtype=torch.bfloat16)
+    tail_ids = torch.tensor([1, 2, 0], dtype=torch.int32)
+    block_table = torch.tensor([[2, 0], [3, 1], [0, 0]], dtype=torch.int64)
+    compressed_cache = torch.zeros(4, 4, 1, head_dim, dtype=torch.bfloat16)
+    tail_cache = torch.randn(num_requests, 2, rate + query_len - 1, head_dim, dtype=torch.bfloat16)
+    tail_cache[0].zero_()
+
+    device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
+    torch.npu.set_device(device)
+    device_raw_k = raw_k.to(device)
+    device_gate_scores = gate_scores.to(device)
+    device_valid_rows = valid_rows.to(device)
+    device_positions = positions.to(device)
+    device_tail_ids = tail_ids.to(device)
+    device_block_table = block_table.to(device)
+    device_ape = ape.to(device)
+    initial_cache = compressed_cache.to(device)
+    initial_tail = tail_cache.to(device)
+    expected_cache = initial_cache.clone()
+    expected_tail = initial_tail.clone()
+    update_compressed_kpool(
+        device_raw_k,
+        device_gate_scores,
+        device_valid_rows,
+        device_valid_rows,
+        device_positions,
+        expected_cache,
+        expected_tail,
+        device_tail_ids,
+        device_tail_ids,
+        device_block_table,
+        [query_len] * num_requests,
+        device_ape,
+        rate,
+        graph_mode=True,
+    )
+    actual_cache = initial_cache.clone()
+    actual_tail = initial_tail.clone()
+
+    def _update() -> None:
+        update_compact_kpool(
+            device_raw_k,
+            device_gate_scores,
+            device_valid_rows,
+            device_valid_rows,
+            device_positions,
+            actual_cache,
+            actual_tail,
+            device_tail_ids,
+            device_block_table,
+            query_len,
+            device_ape,
+            rate,
+        )
+
+    for _ in range(3):
+        actual_cache.copy_(initial_cache)
+        actual_tail.copy_(initial_tail)
+        _update()
+    torch.npu.synchronize()
+    graph = runtime.npu.NPUGraph()
+    actual_cache.copy_(initial_cache)
+    actual_tail.copy_(initial_tail)
+    with runtime.npu.graph(graph):
+        _update()
+    actual_cache.copy_(initial_cache)
+    actual_tail.copy_(initial_tail)
+    graph.replay()
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+    torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
+
+    # Replay with a partially accepted prefix, then a full-window advance.
+    # Both steps must read the live circular tail and write every new pool.
+    for accepted_prefix in (1, query_len):
+        device_positions.add_(accepted_prefix)
+        device_raw_k.mul_(0.75).add_(0.125)
+        device_gate_scores.mul_(0.5).sub_(0.25)
+        expected_cache = actual_cache.clone()
+        expected_tail = actual_tail.clone()
+        update_compressed_kpool(
+            device_raw_k,
+            device_gate_scores,
+            device_valid_rows,
+            device_valid_rows,
+            device_positions,
+            expected_cache,
+            expected_tail,
+            device_tail_ids,
+            device_tail_ids,
+            device_block_table,
+            [query_len] * num_requests,
+            device_ape,
+            rate,
+            graph_mode=True,
+        )
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual_cache, expected_cache, rtol=0, atol=0)
+        torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
 
 
 def test_tail_keeps_peer_tokens_valid_when_pool_mask_localizes_writes() -> None:

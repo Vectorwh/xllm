@@ -65,6 +65,11 @@ Options make_options(bool enable_disagg_pd,
 }
 
 TEST(InstanceRoleUtilTest, PrefillRoleAloneIsNotThePdPrefillSide) {
+  Options default_options;
+  EXPECT_EQ(default_options.instance_role(), InstanceRole::DEFAULT);
+  EXPECT_FALSE(is_pd_prefill_role(default_options));
+  EXPECT_FALSE(is_pd_prefill_only(default_options));
+
   // Without disaggregated PD the continuous scheduler keeps decode on the same
   // instance whatever --instance_role says, so the role alone must not pass.
   for (const InstanceRole::RoleType role : kAllRoles) {
@@ -94,16 +99,6 @@ TEST(InstanceRoleUtilTest, OnlineOfflineColocationIsNotPrefillOnly) {
                                        /*enable_pd_ooc=*/true,
                                        InstanceRole::PREFILL);
   EXPECT_TRUE(is_pd_prefill_role(options));
-  EXPECT_FALSE(is_pd_prefill_only(options));
-}
-
-TEST(InstanceRoleUtilTest, DefaultOptionsAreNeverExempt) {
-  // Not const: Options has a defaulted (not user-provided) constructor and
-  // PROPERTY fields without in-class initializers, so GCC rejects
-  // default-initializing a const instance.
-  Options options;
-  EXPECT_EQ(options.instance_role(), InstanceRole::DEFAULT);
-  EXPECT_FALSE(is_pd_prefill_role(options));
   EXPECT_FALSE(is_pd_prefill_only(options));
 }
 

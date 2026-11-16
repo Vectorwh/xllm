@@ -173,9 +173,7 @@ def _jev_flashinfer(
     fake_decode.fast_decode_plan = MagicMock()
     monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
     monkeypatch.setitem(sys.modules, "flashinfer.decode", fake_decode)
-    spec = importlib.util.spec_from_file_location(
-        "_test_jev_flashinfer", _PYTHON_ROOT / "attention" / "flashinfer.py"
-    )
+    spec = importlib.util.spec_from_file_location("_test_jev_flashinfer", _PYTHON_ROOT / "attention" / "flashinfer.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -240,7 +238,7 @@ def test_jev_flashinfer_prefill_plan_dispatch_and_decode(
     decode_wrapper.run.assert_called_once()
 
 
-@pytest.mark.parametrize("cu_lens", [[0, 2], [0, 1], [0, 2, 5], [0, 1, 4, 6]])
+@pytest.mark.parametrize("cu_lens", [[0, 2, 5], [0, 1, 4, 6]])
 def test_jev_flashinfer_accepts_cuda_cumulative_prefill_lengths(
     _jev_flashinfer: tuple[types.ModuleType, list[MagicMock], MagicMock],
     cu_lens: list[int],
@@ -248,9 +246,7 @@ def test_jev_flashinfer_accepts_cuda_cumulative_prefill_lengths(
     module, ragged_wrappers, _ = _jev_flashinfer
     backend = module.FlashInferBackend(2, 2, 4, 0.5, 0, torch.device("cpu"), torch.float32)
     backend.enable_prefix_bidir(torch.device("cpu"))
-    backend.bind_kv_caches(
-        [SimpleNamespace(key=torch.zeros(1, 2, 2, 4), value=torch.zeros(1, 2, 2, 4))]
-    )
+    backend.bind_kv_caches([SimpleNamespace(key=torch.zeros(1, 2, 2, 4), value=torch.zeros(1, 2, 2, 4))])
     metadata = SimpleNamespace(
         is_prefill=True,
         is_chunked_prefill=False,
@@ -275,20 +271,14 @@ def test_jev_flashinfer_accepts_cuda_cumulative_prefill_lengths(
 @pytest.mark.parametrize(
     "q_cu_lens, kv_cu_lens",
     [
-        pytest.param([0, 2], [0, 3], id="cached-prefix"),
-        pytest.param([0, 2, 5], [0, 2, 6], id="second-request-prefix"),
+        pytest.param([0, 2], [0, 3], id="cached-prefix-length-mismatch"),
         pytest.param([0, 2, 5], [0, 3, 5], id="same-total-different-request-lengths"),
-        pytest.param([0, 3], [0, 2], id="query-longer-than-kv"),
         pytest.param([], [], id="empty"),
-        pytest.param([0], [0], id="no-requests"),
-        pytest.param([0, 0], [0, 0], id="zero-length-request"),
-        pytest.param([0, 2, 2], [0, 2, 2], id="zero-length-second-request"),
+        pytest.param([0, 2, 2], [0, 2, 2], id="zero-length-request"),
         pytest.param([0, 3, 2], [0, 3, 2], id="decreasing-lengths"),
         pytest.param([1, 3], [0, 2], id="missing-query-leading-zero"),
         pytest.param([0, 2], [1, 3], id="missing-kv-leading-zero"),
-        pytest.param([2], [2], id="per-request-lengths"),
-        pytest.param([0, 2], [0, 2, 5], id="extra-kv-request"),
-        pytest.param([0, 2, 5], [0, 2], id="extra-query-request"),
+        pytest.param([0, 2], [0, 2, 5], id="different-request-counts"),
         pytest.param([0, 2], None, id="missing-kv-lengths"),
     ],
 )

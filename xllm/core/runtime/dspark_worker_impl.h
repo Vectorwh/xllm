@@ -60,8 +60,6 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
       const ForwardInput& input) const override;
 
  private:
-  friend class DSparkWorkerImplTestPeer;
-
   bool can_prelaunch_draft_for_init(bool supports_device_inputs) const;
   bool can_prelaunch_draft_for_this_step(const ForwardInput& input) const;
   DraftBlock run_decode_draft_from_pending(const ForwardInput& input,

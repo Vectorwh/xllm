@@ -230,15 +230,6 @@ TEST(RequestCommittedUsageTest, CancelledPlaceholdersDoNotCountAsOutput) {
   EXPECT_EQ(output.usage->num_generated_tokens, 0);
 }
 
-TEST(RequestCommittedUsageTest, NonOverlapCountsEveryRealToken) {
-  auto request = make_usage_request(/*max_tokens=*/1, /*overlap=*/false);
-  request->sequences().front()->append_token(Token(65));
-  UsageTokenizer tokenizer;
-  const RequestOutput output = request->generate_output(tokenizer);
-  ASSERT_TRUE(output.usage.has_value());
-  EXPECT_EQ(output.usage->num_generated_tokens, 1);
-}
-
 TEST(RequestTimingIntegrationTest, MultiSequenceEndsAfterLastSequence) {
   auto request = make_usage_request(/*max_tokens=*/1,
                                     /*overlap=*/false,
@@ -376,6 +367,7 @@ TEST_P(RequestGeneratedTokenUsageTest, CountsOnlyCommittedTokens) {
 INSTANTIATE_TEST_SUITE_P(OverlapPlaceholders,
                          RequestGeneratedTokenUsageTest,
                          ::testing::Values(std::make_tuple(false, 0, 0),
+                                           std::make_tuple(false, 1, 0),
                                            std::make_tuple(false, 2, 0),
                                            std::make_tuple(true, 0, 0),
                                            std::make_tuple(true, 0, 1),

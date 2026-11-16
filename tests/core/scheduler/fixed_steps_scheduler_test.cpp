@@ -18,8 +18,6 @@ limitations under the License.
 #include <absl/time/time.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <chrono>
 #include <optional>
 #include <string>
 
@@ -31,17 +29,6 @@ limitations under the License.
 #include "framework/request/rec_type.h"
 
 namespace xllm {
-
-class FixedStepsSchedulerTestPeer final {
- public:
-  static void prefetch(FixedStepsScheduler& scheduler) {
-    scheduler.prefetch_request(std::chrono::steady_clock::now());
-  }
-
-  static void report_queues(FixedStepsScheduler& scheduler) {
-    scheduler.report_request_queue_metrics();
-  }
-};
 
 namespace {
 
@@ -94,6 +81,7 @@ class FakeEngine : public Engine {
   }
   ForwardOutput step(std::vector<Batch>& batch) override {
     for (Batch& item : batch) {
+      executed_batch_sizes_.emplace_back(item.get_sequences().size());
       for (Sequence* sequence : item.get_sequences()) {
         if (sequence->has_linear_state_slot()) {
           EXPECT_EQ(sequence->kv_state().num_blocks(BlockType::LINEAR), 1u);
@@ -122,7 +110,12 @@ class FakeEngine : public Engine {
   }
   bool init() override { return true; }
 
+  const std::vector<size_t>& executed_batch_sizes() const {
+    return executed_batch_sizes_;
+  }
+
  private:
+  std::vector<size_t> executed_batch_sizes_;
   std::unique_ptr<Tokenizer> fake_tokenizer_;
   std::unique_ptr<BlockManagerPool> fake_block_manager_;
 };
@@ -200,15 +193,6 @@ std::vector<std::shared_ptr<Request>> GenRequests(
 
 }  // namespace
 
-TEST(FixedStepsSchedulerTest, AddRequestSuccess) {
-  auto engine = std::make_unique<FakeEngine>(32, 32);
-  auto opt = CreateOptions();
-  FixedStepsScheduler scheduler(engine.get(), opt);
-  auto requests = GenRequests({64}, {10}, RecType::kOneRec);
-  std::shared_ptr<Request> req = requests[0];
-  EXPECT_TRUE(scheduler.add_request(req));
-}
-
 TEST(FixedStepsSchedulerTest,
      InternalRoundsAndRetainedBatchObserveAllRequests) {
   class GeneratingEngine final : public FakeEngine {
@@ -273,106 +257,6 @@ TEST(FixedStepsSchedulerTest,
   }
 }
 
-TEST(FixedStepsSchedulerTest, PrepareBatchEmptyWhenNoRequests) {
-  ScopedConfigValue<bool> prefix_cache(
-      KVCacheConfig::get_instance().enable_prefix_cache(), false);
-  auto engine = std::make_unique<FakeEngine>(32, 32);
-  auto opt = CreateOptions();
-  FixedStepsScheduler scheduler(engine.get(), opt);
-  ContinuousScheduler* base = &scheduler;
-  std::vector<Batch> batches = base->prepare_batch_test();
-  EXPECT_FALSE(batches.empty());
-  EXPECT_TRUE(batches[0].empty());
-}
-
-class PrefetchedQueueMetricsTest : public ::testing::TestWithParam<bool> {};
-
-TEST_P(PrefetchedQueueMetricsTest, WaitingEndsOnSelectionOrCancellation) {
-  ScopedConfigValue<bool> prefix_cache(
-      KVCacheConfig::get_instance().enable_prefix_cache(), false);
-  FakeEngine engine(32, 32);
-  auto options = CreateOptions();
-  options.server_idx(431);
-  auto* ingress =
-      MULTI_GAUGE_scheduler_queue_requests.get_stats({"ingress", "431"});
-  auto* prefetched = MULTI_GAUGE_scheduler_queue_requests.get_stats(
-      {"fixed_prefetched", "431"});
-  auto* waiting = MULTI_GAUGE_scheduler_waiting_requests.get_stats({"431"});
-  ASSERT_NE(ingress, nullptr);
-  ASSERT_NE(prefetched, nullptr);
-  ASSERT_NE(waiting, nullptr);
-  {
-    FixedStepsScheduler scheduler(&engine, options);
-    auto requests = GenRequests({64}, {10}, RecType::kOneRec);
-    requests.front()->state().output_func = [](const RequestOutput&) {
-      return true;
-    };
-    ASSERT_TRUE(scheduler.add_request(requests.front()));
-    FixedStepsSchedulerTestPeer::report_queues(scheduler);
-    EXPECT_DOUBLE_EQ(ingress->get_value(), 1.0);
-    FixedStepsSchedulerTestPeer::prefetch(scheduler);
-    EXPECT_DOUBLE_EQ(ingress->get_value(), 0.0);
-    EXPECT_DOUBLE_EQ(prefetched->get_value(), 1.0);
-    EXPECT_DOUBLE_EQ(waiting->get_value(), 1.0);
-    if (GetParam()) {
-      requests.front()->set_cancel();
-    }
-    EXPECT_EQ(scheduler.prepare_batch_test().front().empty(), GetParam());
-    EXPECT_DOUBLE_EQ(prefetched->get_value(), 0.0);
-    EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
-    requests.front()->set_cancel();
-    scheduler.prepare_batch_test();
-    auto remaining = GenRequests({32}, {10}, RecType::kOneRec);
-    ASSERT_TRUE(scheduler.add_request(remaining.front()));
-    FixedStepsSchedulerTestPeer::prefetch(scheduler);
-  }
-  EXPECT_DOUBLE_EQ(prefetched->get_value(), 0.0);
-  EXPECT_DOUBLE_EQ(waiting->get_value(), 0.0);
-}
-
-INSTANTIATE_TEST_SUITE_P(TerminalStates,
-                         PrefetchedQueueMetricsTest,
-                         ::testing::Bool());
-
-TEST(FixedStepsSchedulerTest, ReportsBlockCountsInsteadOfRankCount) {
-  ScopedConfigValue<bool> prefix_cache(
-      KVCacheConfig::get_instance().enable_prefix_cache(), false);
-  auto engine = std::make_unique<FakeEngine>(32, 32);
-  int32_t dp_rank = -1;
-  auto held_blocks =
-      engine->block_manager_pool()->allocate(/*num_tokens=*/64, dp_rank);
-  ASSERT_EQ(dp_rank, 0);
-  ASSERT_EQ(held_blocks.size(), 2u);
-  auto opt = CreateOptions();
-  FixedStepsScheduler scheduler(engine.get(), opt);
-  ContinuousScheduler* base = &scheduler;
-  base->prepare_batch_test();
-
-  const std::vector<size_t> free_blocks =
-      engine->block_manager_pool()->num_free_blocks();
-  const std::vector<size_t> used_blocks =
-      engine->block_manager_pool()->num_used_blocks();
-  const std::vector<size_t> prefix_blocks =
-      engine->block_manager_pool()->num_blocks_in_prefix_cache();
-  ASSERT_EQ(free_blocks.size(), 1u);
-  ASSERT_EQ(used_blocks.size(), 1u);
-  ASSERT_EQ(prefix_blocks.size(), 1u);
-  EXPECT_GT(free_blocks[0], 1u);
-  EXPECT_GT(used_blocks[0], 1u);
-  EXPECT_DOUBLE_EQ(GAUGE_num_free_blocks.get_value(),
-                   static_cast<double>(free_blocks[0]));
-  EXPECT_DOUBLE_EQ(GAUGE_num_used_blocks.get_value(),
-                   static_cast<double>(used_blocks[0]));
-  EXPECT_DOUBLE_EQ(GAUGE_num_blocks_in_prefix_cache.get_value(),
-                   static_cast<double>(prefix_blocks[0]));
-  EXPECT_DOUBLE_EQ(GAUGE_kv_cache_utilization_perc.get_value(),
-                   engine->block_manager_pool()->kv_cache_utilization());
-  EXPECT_DOUBLE_EQ(
-      GAUGE_kv_cache_max_utilization_perc.get_value(),
-      engine->block_manager_pool()->kv_cache_utilization_per_dp().front() *
-          100.0);
-}
-
 TEST(FixedStepsSchedulerTest, ReportsBlockCountsAcrossMultipleRanks) {
   ScopedConfigValue<bool> prefix_cache(
       KVCacheConfig::get_instance().enable_prefix_cache(), true);
@@ -406,8 +290,7 @@ TEST(FixedStepsSchedulerTest, ReportsBlockCountsAcrossMultipleRanks) {
                            /*max_seqs_per_batch=*/256,
                            /*dp_size=*/2);
   FixedStepsScheduler scheduler(engine.get(), opt);
-  ContinuousScheduler* base = &scheduler;
-  base->prepare_batch_test();
+  scheduler.step(absl::ZeroDuration());
 
   const std::vector<size_t> free_blocks = block_manager_pool->num_free_blocks();
   const std::vector<size_t> used_blocks = block_manager_pool->num_used_blocks();
@@ -465,8 +348,7 @@ TEST(FixedStepsSchedulerTest, ReportsFullHotRankAsOneHundredPercent) {
                                /*max_seqs_per_batch=*/256,
                                /*dp_size=*/2);
   FixedStepsScheduler scheduler(engine.get(), options);
-  ContinuousScheduler* base = &scheduler;
-  base->prepare_batch_test();
+  scheduler.step(absl::ZeroDuration());
 
   EXPECT_DOUBLE_EQ(GAUGE_VALUE(kv_cache_utilization_perc), 0.0);
   EXPECT_DOUBLE_EQ(GAUGE_VALUE(kv_cache_max_utilization_perc), 100.0);
@@ -512,63 +394,12 @@ TEST(FixedStepsSchedulerTest, ReportsIndependentKvAndLinearUtilization) {
   EXPECT_DOUBLE_EQ(linear_gauge->get_value(), 100.0 / 7.0);
 
   pool->deallocate(active);
-}
-
-TEST(FixedStepsSchedulerTest, ReportsUpdatedUtilizationAcrossSteps) {
-  auto engine = std::make_unique<FakeEngine>(/*num_blocks=*/5,
-                                             /*block_size=*/1);
-  BlockManagerPool* pool = engine->block_manager_pool();
   report_kv_cache_metrics(*pool);
-
-  auto requests = GenRequests({2}, {2}, RecType::kNone);
-  Sequence* active = requests.front()->sequences().front().get();
-  active->set_dp_rank(0);
-  ASSERT_TRUE(pool->try_allocate(active));
-  report_kv_cache_metrics(*pool);
-
-  auto* dp_gauge = MULTI_GAUGE_kv_cache_dp_utilization_perc.get_stats({"0"});
-  auto* kv_gauge =
-      MULTI_GAUGE_block_type_dp_utilization_perc.get_stats({"kv", "0"});
-  ASSERT_NE(dp_gauge, nullptr);
-  ASSERT_NE(kv_gauge, nullptr);
-  EXPECT_DOUBLE_EQ(dp_gauge->get_value(), 50.0);
-  EXPECT_DOUBLE_EQ(kv_gauge->get_value(), 50.0);
-
-  pool->deallocate(active);
-  report_kv_cache_metrics(*pool);
-  EXPECT_DOUBLE_EQ(dp_gauge->get_value(), 0.0);
   EXPECT_DOUBLE_EQ(kv_gauge->get_value(), 0.0);
+  EXPECT_DOUBLE_EQ(linear_gauge->get_value(), 0.0);
 }
 
-TEST(FixedStepsSchedulerTest, PrepareBatchOneRecSchedulesRequest) {
-  ScopedConfigValue<bool> prefix_cache(
-      KVCacheConfig::get_instance().enable_prefix_cache(), false);
-  ScopedConfigValue<double> memory_threshold(
-      SchedulerConfig::get_instance()
-          .prefill_scheduling_memory_usage_threshold(),
-      1.0);
-  auto engine = std::make_unique<FakeEngine>(64, 32);
-  auto opt = CreateOptions(10000, 256);
-  FixedStepsScheduler scheduler(engine.get(), opt);
-  auto requests = GenRequests({64, 64}, {10, 10}, RecType::kOneRec);
-  for (auto& req : requests) {
-    scheduler.add_request(req);
-  }
-  ContinuousScheduler* base = &scheduler;
-  std::vector<Batch> batches = base->prepare_batch_test();
-  EXPECT_FALSE(batches.empty());
-  bool has_non_empty = false;
-  for (const auto& b : batches) {
-    if (!b.empty()) {
-      has_non_empty = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(has_non_empty);
-  EXPECT_EQ(base->get_running_requests().size(), 2u);
-}
-
-TEST(FixedStepsSchedulerTest, PrepareBatchRespectsTokenBudget) {
+TEST(FixedStepsSchedulerTest, StepRespectsBatchBudget) {
   ScopedConfigValue<bool> prefix_cache(
       KVCacheConfig::get_instance().enable_prefix_cache(), false);
   ScopedConfigValue<double> memory_threshold(
@@ -579,15 +410,16 @@ TEST(FixedStepsSchedulerTest, PrepareBatchRespectsTokenBudget) {
   auto opt = CreateOptions(50, 1);
   FixedStepsScheduler scheduler(engine.get(), opt);
   auto requests = GenRequests({40, 40}, {10, 10}, RecType::kOneRec);
-  for (auto& req : requests) {
-    scheduler.add_request(req);
+  for (auto& request : requests) {
+    ASSERT_TRUE(scheduler.add_request(request));
   }
-  ContinuousScheduler* base = &scheduler;
-  base->prepare_batch_test();
-  EXPECT_LE(base->get_running_requests().size(), 1u);
+  scheduler.step(absl::ZeroDuration());
+  ASSERT_EQ(engine->executed_batch_sizes().size(), 1u);
+  EXPECT_EQ(engine->executed_batch_sizes().front(), 1u);
+  EXPECT_EQ(scheduler.get_waiting_requests_num(), 1u);
 }
 
-TEST(FixedStepsSchedulerTest, StepCompletesWithRequest) {
+TEST(FixedStepsSchedulerTest, StepSchedulesRecBatchWithRequiredResources) {
   ScopedConfigValue<bool> prefix_cache(
       KVCacheConfig::get_instance().enable_prefix_cache(), false);
   ScopedConfigValue<double> memory_threshold(
@@ -599,11 +431,17 @@ TEST(FixedStepsSchedulerTest, StepCompletesWithRequest) {
     auto engine = std::make_unique<FakeEngine>(64, 32, linear_state);
     auto opt = CreateOptions(10000, 256);
     FixedStepsScheduler scheduler(engine.get(), opt);
-    auto requests = GenRequests({32}, {10}, rec_type);
-    scheduler.add_request(requests[0]);
-    EXPECT_NO_THROW(scheduler.step(absl::Milliseconds(500)));
-    EXPECT_EQ(requests[0]->sequences()[0]->has_linear_state_slot(),
-              linear_state);
+    auto requests = GenRequests({32, 32}, {10, 10}, rec_type);
+    for (auto& request : requests) {
+      ASSERT_TRUE(scheduler.add_request(request));
+    }
+    scheduler.step(absl::ZeroDuration());
+    ASSERT_EQ(engine->executed_batch_sizes().size(), 1u);
+    EXPECT_EQ(engine->executed_batch_sizes().front(), 2u);
+    for (const auto& request : requests) {
+      EXPECT_EQ(request->sequences().front()->has_linear_state_slot(),
+                linear_state);
+    }
   }
 }
 

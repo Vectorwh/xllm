@@ -136,14 +136,15 @@ def test_pool_wiring_contract(monkeypatch: pytest.MonkeyPatch, output_dtype: tor
 
 
 def test_pool_declines_safely(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A declining op (exception / no cores / empty rows) yields None."""
+    """Pre-write failure, absent cores and empty rows decline the optional pool."""
     kv = torch.randn(4, WIDTH, dtype=torch.float32)
     scores = torch.randn_like(kv)
     kv_state = torch.zeros(2, RING_ROWS, WIDTH, dtype=torch.float32)
     score_state = torch.zeros_like(kv_state)
     calls: list = []
 
-    def _raise(*args, **kwargs):
+    def _raise(*args: object, **kwargs: object) -> None:
+        # This injected failure performs no writes; it is not a rollback oracle.
         raise RuntimeError("boom")
 
     raising = SimpleNamespace(compressor_from_projected=_raise, _cube_core_num=lambda: 8)

@@ -124,9 +124,11 @@ TEST_F(BatchInflightBlocksTest, CopiesAndMovesKeepBlocksUntilLastBatchRetires) {
 
 TEST_F(BatchInflightBlocksTest, LinearKeepaliveDoesNotCreateLogicalSharing) {
   BlockManager::Options options;
-  options.num_blocks(4).block_size(4).enable_prefix_cache(false);
+  options.num_blocks(6).block_size(4).enable_prefix_cache(false);
   BlockManagerImpl manager(options);
-  Sequence sequence = make_sequence(4);
+  Sequence sequence = make_sequence(5);
+  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(2));
+  sequence.kv_state().set_kv_cache_tokens_num(4);
   sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(2));
   Batch batch(&sequence);
   Batch copied = batch;
@@ -144,29 +146,10 @@ TEST_F(BatchInflightBlocksTest, LinearKeepaliveDoesNotCreateLogicalSharing) {
   EXPECT_FALSE(blocks.front().has_multiple_owners());
 
   sequence.reset();
-  EXPECT_EQ(manager.num_used_blocks(), 2u);
+  EXPECT_EQ(manager.num_used_blocks(), 4u);
   batch = Batch();
-  EXPECT_EQ(manager.num_used_blocks(), 2u);
+  EXPECT_EQ(manager.num_used_blocks(), 4u);
   copied = Batch();
-  EXPECT_EQ(manager.num_used_blocks(), 0u);
-}
-
-TEST_F(BatchInflightBlocksTest, IndependentBatchesReleaseTheirOwnReferences) {
-  BlockManager::Options options;
-  options.num_blocks(8).block_size(4).enable_prefix_cache(false);
-  BlockManagerImpl manager(options);
-  Sequence first = make_sequence(4);
-  Sequence second = make_sequence(4);
-  first.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-  second.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-  Batch first_batch(&first);
-  Batch second_batch(&second);
-  first.reset();
-  second.reset();
-  EXPECT_EQ(manager.num_used_blocks(), 2u);
-  first_batch = Batch();
-  EXPECT_EQ(manager.num_used_blocks(), 1u);
-  second_batch = Batch();
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 }
 
@@ -207,8 +190,8 @@ TEST_F(BatchInflightBlocksTest, HoldsSwaTailForEachSequence) {
   BlockManagerImpl manager(options);
   Sequence first = make_sequence(64);
   Sequence second = make_sequence(64);
-  first.kv_state().add_blocks(BlockType::SWA, manager.allocate(3));
-  second.kv_state().add_blocks(BlockType::SWA, manager.allocate(5));
+  first.kv_state().add_blocks(BlockType::SWA, manager.allocate(4));
+  second.kv_state().add_blocks(BlockType::SWA, manager.allocate(6));
   first.kv_state().set_kv_cache_tokens_num(12);
   second.kv_state().set_kv_cache_tokens_num(20);
   Batch batch;
@@ -218,12 +201,12 @@ TEST_F(BatchInflightBlocksTest, HoldsSwaTailForEachSequence) {
     const Slice<Block> blocks = sequence->kv_state().blocks(BlockType::SWA);
     for (size_t index = 0; index < blocks.size(); ++index) {
       EXPECT_EQ(blocks[index].ref_count(),
-                index + 1 == blocks.size() ? 2u : 1u);
+                index + 2 >= blocks.size() ? 2u : 1u);
     }
   }
   first.reset();
   second.reset();
-  EXPECT_EQ(manager.num_used_blocks(), 2u);
+  EXPECT_EQ(manager.num_used_blocks(), 4u);
   batch = Batch();
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 }

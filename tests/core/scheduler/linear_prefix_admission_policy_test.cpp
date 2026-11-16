@@ -23,7 +23,6 @@ limitations under the License.
 #include <chrono>
 #include <cstdint>
 #include <future>
-#include <latch>
 #include <memory>
 #include <random>
 #include <thread>
@@ -32,7 +31,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/framework/block/block_manager_pool_test_peer.h"
+#include "core/framework/block/block_manager_test_access.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/prefix_cache/block_hasher.h"
 #include "core/framework/request/sequence.h"
@@ -727,23 +726,13 @@ TEST_F(LinearPrefixCheckpointTest, SequenceResetPreservesCheckpointDecision) {
   }
 }
 
-TEST_F(LinearPrefixCheckpointTest, SequenceCopyPreservesCheckpointDecision) {
-  for (const size_t checkpoint : {0u, 8u}) {
-    Sequence sequence = make_sequence(0, make_hot_front_prompt(2));
-    sequence.set_linear_prefix_checkpoint_tokens(checkpoint);
-    Sequence sibling(sequence, 1);
-    ASSERT_TRUE(sibling.linear_prefix_checkpoint_tokens().has_value());
-    EXPECT_EQ(sibling.linear_prefix_checkpoint_tokens().value(), checkpoint);
-  }
-}
-
 TEST_F(LinearPrefixCheckpointTest,
        PublishesHotFrontCheckpointBeforeDivergentTail) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
   BlockManagerPool::Options options = make_linear_state_pool_options(32);
   options.num_blocks(64);
-  BlockManagerPool pool(options, 1);
+  block_test::TestBlockManagerPool pool(options, 1);
   auto make_prompt = [](int32_t suffix) {
     return make_hot_front_prompt(suffix, /*prompt_tokens=*/43);
   };
@@ -781,7 +770,7 @@ TEST_F(LinearPrefixCheckpointTest,
 TEST_F(LinearPrefixCheckpointTest, HotFrontIncludesBlockAlignedShortSuffix) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   for (int32_t suffix = 2; suffix <= 5; ++suffix) {
     Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
     ASSERT_TRUE(prefill_prompt(pool, observed));
@@ -794,7 +783,7 @@ TEST_F(LinearPrefixCheckpointTest, HotFrontIncludesBlockAlignedShortSuffix) {
 
 TEST_F(LinearPrefixCheckpointTest,
        IdenticalCompletedPromptsDoNotCreateCheckpoint) {
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   for (int32_t request_index = 0; request_index < 2; ++request_index) {
     Sequence observed = make_sequence(request_index, make_hot_front_prompt(2));
     ASSERT_TRUE(prefill_prompt(pool, observed));
@@ -808,7 +797,7 @@ TEST_F(LinearPrefixCheckpointTest,
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(),
       /*value=*/16);
-  BlockManagerPool pool(
+  block_test::TestBlockManagerPool pool(
       make_linear_state_pool_options(/*linear_state_num_slots=*/32),
       /*dp_size=*/1);
   for (int32_t suffix : {2, 3, 4, 5}) {
@@ -833,8 +822,7 @@ TEST_F(LinearPrefixCheckpointTest,
   EXPECT_EQ(probe.linear_prefix_checkpoint_tokens().value(), 8u);
   pool.allocate_shared(&probe);
   EXPECT_EQ(probe.kv_cache_tokens_num(), 8u);
-  BlockManagerPoolTestPeer::linear_leaf(pool, /*dp_rank=*/0)
-      ->reset_prefix_cache();
+  block_test::linear_leaf(pool, /*dp_rank=*/0)->reset_prefix_cache();
   EXPECT_EQ(policy_->plan_checkpoint(&probe), 8u);
   probe.reset();
   EXPECT_EQ(policy_->plan_checkpoint(&probe), 8u);
@@ -843,7 +831,7 @@ TEST_F(LinearPrefixCheckpointTest,
 TEST_F(LinearPrefixCheckpointTest, HotFrontPredictionSurvivesKvEviction) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   for (int32_t suffix = 2; suffix <= 5; ++suffix) {
     Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
     ASSERT_TRUE(prefill_prompt(pool, observed));
@@ -851,8 +839,7 @@ TEST_F(LinearPrefixCheckpointTest, HotFrontPredictionSurvivesKvEviction) {
   Sequence before_eviction = make_sequence(6, make_hot_front_prompt(6));
   EXPECT_EQ(policy_->plan_checkpoint(&before_eviction), 8u);
 
-  BlockManager* kv_leaf =
-      BlockManagerPoolTestPeer::leaf_of(pool, 0, BlockType::KV);
+  BlockManager* kv_leaf = block_test::leaf_of(pool, 0, BlockType::KV);
   ASSERT_NE(kv_leaf, nullptr);
   kv_leaf->reset_prefix_cache();
 
@@ -871,7 +858,7 @@ TEST_F(LinearPrefixCheckpointTest,
       &SchedulerConfig::get_instance().enable_chunked_prefill(), false);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   for (int32_t suffix = 2; suffix <= 5; ++suffix) {
     Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
     ASSERT_TRUE(prefill_prompt(pool, observed));
@@ -882,7 +869,7 @@ TEST_F(LinearPrefixCheckpointTest,
 
 TEST_F(LinearPrefixCheckpointTest,
        PredictionRequiresHotBranchNotResidentBlocks) {
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   Sequence producer = make_sequence(0, make_hot_front_prompt(2));
   ASSERT_TRUE(prefill_prompt(pool, producer));
   EXPECT_TRUE(producer.linear_prefix_checkpoint_tokens().has_value());
@@ -899,8 +886,7 @@ TEST_F(LinearPrefixCheckpointTest,
   EXPECT_FALSE(hot_probe.kv_state().prefix_cache_matched());
   EXPECT_EQ(hot_probe.kv_cache_tokens_num(), 0u);
 
-  BlockManagerPoolTestPeer::leaf_of(pool, 0, BlockType::KV)
-      ->reset_prefix_cache();
+  block_test::leaf_of(pool, 0, BlockType::KV)->reset_prefix_cache();
   Sequence missing = make_sequence(7, make_hot_front_prompt(7));
   EXPECT_EQ(policy_->plan_checkpoint(&missing), 8u);
 }
@@ -915,7 +901,7 @@ TEST_F(LinearPrefixCheckpointTest, HotFilterCapacityAndThresholdAreInjected) {
             .chunk_size = 16,
             .max_entries = limit_capacity ? 1u : 64u,
             .min_distinct_successors = limit_capacity ? 2u : 3u});
-    BlockManagerPool pool(options, 1);
+    block_test::TestBlockManagerPool pool(options, 1);
     for (int32_t suffix = 2; suffix <= 3; ++suffix) {
       Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
       ASSERT_TRUE(prefill_prompt(pool, observed));
@@ -934,7 +920,7 @@ TEST_F(LinearPrefixCheckpointTest, RepeatedPlanningDoesNotAdmitOnePromptTwice) {
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
   BlockManagerPool::Options options = make_linear_state_pool_options(32);
   options.num_blocks(64);
-  BlockManagerPool pool(options, 1);
+  block_test::TestBlockManagerPool pool(options, 1);
   std::vector<int32_t> tokens =
       make_hot_front_prompt(/*suffix=*/2, /*prompt_tokens=*/40);
   Sequence observed = make_sequence(0, tokens);
@@ -952,7 +938,7 @@ TEST_F(LinearPrefixCheckpointTest, RepeatedPlanningDoesNotAdmitOnePromptTwice) {
 TEST_F(LinearPrefixCheckpointTest, StatisticsResetPreservesHotFrontDecision) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   std::vector<int32_t> tokens = make_hot_front_prompt(/*suffix=*/2);
   for (int32_t suffix : {2, 3, 4, 5}) {
     Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
@@ -975,7 +961,7 @@ TEST_F(LinearPrefixCheckpointTest,
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(),
       /*value=*/16);
-  BlockManagerPool pool(
+  block_test::TestBlockManagerPool pool(
       make_linear_state_pool_options(/*linear_state_num_slots=*/32),
       /*dp_size=*/1);
   const std::vector<int32_t> tokens = make_hot_front_prompt(/*suffix=*/2);
@@ -1009,7 +995,8 @@ TEST_F(LinearPrefixCheckpointTest,
 TEST_F(LinearPrefixCheckpointTest, HotFrontObservationsCombineAcrossDpRanks) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), /*dp_size=*/2);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32),
+                                        /*dp_size=*/2);
   for (size_t round = 0; round < 4; ++round) {
     for (int32_t dp_rank = 0; dp_rank < 2; ++dp_rank) {
       const std::vector<int32_t> tokens =
@@ -1037,7 +1024,7 @@ TEST_F(LinearPrefixCheckpointTest,
       kChunkSize);
   BlockManagerPool::Options options =
       make_linear_state_pool_options(kLinearSlots);
-  BlockManagerPool pool(options, kDpSize);
+  block_test::TestBlockManagerPool pool(options, kDpSize);
   for (int32_t observation = 0; observation < 4; ++observation) {
     Sequence observed =
         make_sequence(observation, make_hot_front_prompt(observation + 2));
@@ -1061,7 +1048,7 @@ TEST_F(LinearPrefixCheckpointTest,
       kChunkSize);
   BlockManagerPool::Options options =
       make_linear_state_pool_options(kLinearSlots);
-  BlockManagerPool pool(options, kDpSize);
+  block_test::TestBlockManagerPool pool(options, kDpSize);
   for (int32_t suffix : {2, 3, 4, 5}) {
     Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
     observed.set_dp_rank(0);
@@ -1099,7 +1086,7 @@ TEST_F(LinearPrefixCheckpointTest, SharedHotFrontDecisionSurvivesDpRankChange) {
       kChunkSize);
   BlockManagerPool::Options options =
       make_linear_state_pool_options(kLinearSlots);
-  BlockManagerPool pool(options, kDpSize);
+  block_test::TestBlockManagerPool pool(options, kDpSize);
   Sequence probe = make_sequence(4, make_hot_front_prompt(6));
   probe.set_dp_rank(0);
   EXPECT_EQ(policy_->plan_checkpoint(&probe), 0u);
@@ -1123,7 +1110,8 @@ TEST_F(LinearPrefixCheckpointTest,
        HotFrontPlanUsesDeepestSharedPrefixAcrossDpRanks) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), /*dp_size=*/2);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32),
+                                        /*dp_size=*/2);
   for (int32_t dp_rank = 0; dp_rank < 2; ++dp_rank) {
     const size_t shared_tokens = dp_rank == 0 ? 8 : 4;
     for (int32_t suffix : {2, 3, 4, 5}) {
@@ -1151,7 +1139,7 @@ TEST_F(LinearPrefixCheckpointTest,
 TEST_F(LinearPrefixCheckpointTest, RepeatedPlanningObservesPromptOnlyOnce) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   std::vector<int32_t> tokens = make_hot_front_prompt(/*suffix=*/2);
   Sequence observed = make_sequence(0, tokens);
   EXPECT_EQ(policy_->plan_checkpoint(&observed), 0u);
@@ -1169,73 +1157,10 @@ TEST_F(LinearPrefixCheckpointTest, RepeatedPlanningObservesPromptOnlyOnce) {
 }
 
 TEST_F(LinearPrefixCheckpointTest,
-       PlannedSiblingRetainsDecisionAfterStatisticsReset) {
-  Sequence observed =
-      make_sequence(/*index=*/0, make_hot_front_prompt(/*suffix=*/2));
-  EXPECT_EQ(policy_->plan_checkpoint(&observed), 0u);
-  Sequence sibling(observed, /*index=*/1);
-  policy_->reset();
-  for (int32_t suffix = 2; suffix <= 5; ++suffix) {
-    Sequence fresh = make_sequence(suffix, make_hot_front_prompt(suffix));
-    EXPECT_EQ(policy_->plan_checkpoint(&fresh), 0u);
-  }
-  EXPECT_EQ(policy_->plan_checkpoint(&sibling), 0u);
-  Sequence probe = make_sequence(6, make_hot_front_prompt(6));
-  EXPECT_EQ(policy_->plan_checkpoint(&probe), 8u);
-}
-
-TEST_F(LinearPrefixCheckpointTest,
-       ConcurrentPlannedSiblingsDoNotReobservePrompt) {
-  policy_ = std::make_unique<LinearPrefixAdmissionPolicy>(
-      4,
-      LinearPrefixAdmissionPolicy::Options{.chunk_size = 16,
-                                           .min_distinct_successors = 3});
-  Sequence original =
-      make_sequence(/*index=*/1, make_hot_front_prompt(/*suffix=*/3));
-  EXPECT_EQ(policy_->plan_checkpoint(&original), 0u);
-  policy_->reset();
-  constexpr size_t kNumSiblings = 8;
-  std::vector<std::unique_ptr<Sequence>> siblings;
-  siblings.reserve(kNumSiblings);
-  for (size_t index = 0; index < kNumSiblings; ++index) {
-    siblings.emplace_back(std::make_unique<Sequence>(original, index + 2));
-  }
-
-  std::latch ready(kNumSiblings);
-  std::latch start(/*expected=*/1);
-  std::vector<std::thread> workers;
-  workers.reserve(kNumSiblings);
-  for (const auto& sibling : siblings) {
-    workers.emplace_back([this, &ready, &start, sequence = sibling.get()] {
-      ready.count_down();
-      start.wait();
-      EXPECT_EQ(policy_->plan_checkpoint(sequence), 0u);
-    });
-  }
-  ready.wait();
-  start.count_down();
-  for (auto& worker : workers) {
-    worker.join();
-  }
-
-  Sequence probe =
-      make_sequence(kNumSiblings + 2, make_hot_front_prompt(/*suffix=*/4));
-  EXPECT_EQ(policy_->plan_checkpoint(&probe), 0u);
-  Sequence independent =
-      make_sequence(kNumSiblings + 3, make_hot_front_prompt(/*suffix=*/5));
-  EXPECT_EQ(policy_->plan_checkpoint(&independent), 0u);
-  Sequence third = make_sequence(kNumSiblings + 4, make_hot_front_prompt(6));
-  EXPECT_EQ(policy_->plan_checkpoint(&third), 0u);
-  Sequence hot_probe =
-      make_sequence(kNumSiblings + 5, make_hot_front_prompt(7));
-  EXPECT_EQ(policy_->plan_checkpoint(&hot_probe), 8u);
-}
-
-TEST_F(LinearPrefixCheckpointTest,
        UnfinishedPromptsContributeSuccessorsDuringPlanning) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   for (int32_t suffix = 2; suffix <= 5; ++suffix) {
     Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
     EXPECT_EQ(policy_->plan_checkpoint(&observed), 0u);
@@ -1254,7 +1179,7 @@ TEST_F(LinearPrefixCheckpointTest,
        HotFrontDecisionStaysStableAcrossSequenceReset) {
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
+  block_test::TestBlockManagerPool pool(make_linear_state_pool_options(32), 1);
   std::vector<int32_t> tokens = make_hot_front_prompt(/*suffix=*/2);
   std::fill(tokens.begin() + 8, tokens.end(), 6);
   Sequence probe = make_sequence(6, tokens);
@@ -1282,101 +1207,6 @@ TEST_F(LinearPrefixCheckpointTest,
   EXPECT_EQ(policy_->plan_checkpoint(&probe), 0u);
   ASSERT_TRUE(probe.linear_prefix_checkpoint_tokens().has_value());
   EXPECT_EQ(probe.linear_prefix_checkpoint_tokens().value(), 0u);
-}
-
-TEST_F(LinearPrefixCheckpointTest, BeamSiblingsDoNotAddDuplicateSuccessors) {
-  ScopedValue<int32_t> chunk_guard(
-      &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
-  std::vector<int32_t> tokens = make_hot_front_prompt(/*suffix=*/2);
-  Sequence first = make_sequence(0, tokens);
-  EXPECT_EQ(policy_->plan_checkpoint(&first), 0u);
-  Sequence sibling(first, 1);
-  for (Sequence* observed : {&first, &sibling}) {
-    EXPECT_EQ(policy_->plan_checkpoint(observed), 0u);
-    ASSERT_TRUE(pool.allocate(observed, tokens.size()));
-    observed->kv_state().set_kv_cache_tokens_num(tokens.size());
-    pool.deallocate(observed);
-  }
-  std::fill(tokens.begin() + 8, tokens.end(), 3);
-  Sequence cold_probe = make_sequence(2, tokens);
-  EXPECT_EQ(policy_->plan_checkpoint(&cold_probe), 0u);
-  Sequence independent = make_sequence(3, tokens);
-  ASSERT_TRUE(prefill_prompt(pool, independent));
-  for (int32_t suffix : {4, 5}) {
-    Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
-    ASSERT_TRUE(prefill_prompt(pool, observed));
-  }
-  std::fill(tokens.begin() + 8, tokens.end(), 6);
-  Sequence hot_probe = make_sequence(6, tokens);
-  EXPECT_EQ(policy_->plan_checkpoint(&hot_probe), 8u);
-
-  pool.reset_prefix_cache();
-  policy_->reset();
-  for (Sequence* observed : {&first, &sibling}) {
-    ASSERT_TRUE(prefill_prompt(pool, *observed));
-  }
-  Sequence fresh = make_sequence(/*index=*/7, tokens);
-  ASSERT_TRUE(prefill_prompt(pool, fresh));
-  for (int32_t suffix : {4, 5}) {
-    Sequence observed =
-        make_sequence(suffix + 4, make_hot_front_prompt(suffix));
-    ASSERT_TRUE(prefill_prompt(pool, observed));
-  }
-  hot_probe.reset();
-  EXPECT_EQ(policy_->plan_checkpoint(&hot_probe), 8u);
-  Sequence fresh_probe = make_sequence(10, make_hot_front_prompt(7));
-  EXPECT_EQ(policy_->plan_checkpoint(&fresh_probe), 0u);
-}
-
-TEST_F(LinearPrefixCheckpointTest, ParallelSamplesDoNotAddDuplicateSuccessors) {
-  ScopedValue<int32_t> chunk_guard(
-      &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 16);
-  BlockManagerPool pool(make_linear_state_pool_options(32), 1);
-  std::vector<int32_t> tokens = make_hot_front_prompt(/*suffix=*/2);
-  SequenceParams params;
-  params.seq_capacity = 20;
-  params.best_of = 2;
-  params.sampling_param = &sampling_param_;
-  params.stopping_checker = &stopping_checker_;
-  SequencesGroup group("prompt", tokens, torch::Tensor(), MMData(), params);
-  ASSERT_TRUE(group.expand_sequences(false));
-  ASSERT_EQ(group.sequences().size(), 2u);
-  for (const auto& observed : group.sequences()) {
-    EXPECT_EQ(policy_->plan_checkpoint(observed.get()), 0u);
-    ASSERT_TRUE(pool.allocate(observed.get(), tokens.size()));
-    observed->kv_state().set_kv_cache_tokens_num(tokens.size());
-    pool.deallocate(observed.get());
-  }
-  std::fill(tokens.begin() + 8, tokens.end(), 3);
-  Sequence cold_probe = make_sequence(2, tokens);
-  EXPECT_EQ(policy_->plan_checkpoint(&cold_probe), 0u);
-  Sequence independent = make_sequence(3, tokens);
-  ASSERT_TRUE(prefill_prompt(pool, independent));
-  for (int32_t suffix : {4, 5}) {
-    Sequence observed = make_sequence(suffix, make_hot_front_prompt(suffix));
-    ASSERT_TRUE(prefill_prompt(pool, observed));
-  }
-  std::fill(tokens.begin() + 8, tokens.end(), 6);
-  Sequence hot_probe = make_sequence(6, tokens);
-  EXPECT_EQ(policy_->plan_checkpoint(&hot_probe), 8u);
-
-  pool.reset_prefix_cache();
-  policy_->reset();
-  for (const auto& observed : group.sequences()) {
-    ASSERT_TRUE(prefill_prompt(pool, *observed));
-  }
-  Sequence fresh = make_sequence(/*index=*/7, tokens);
-  ASSERT_TRUE(prefill_prompt(pool, fresh));
-  for (int32_t suffix : {4, 5}) {
-    Sequence observed =
-        make_sequence(suffix + 4, make_hot_front_prompt(suffix));
-    ASSERT_TRUE(prefill_prompt(pool, observed));
-  }
-  hot_probe.reset();
-  EXPECT_EQ(policy_->plan_checkpoint(&hot_probe), 8u);
-  Sequence fresh_probe = make_sequence(10, make_hot_front_prompt(7));
-  EXPECT_EQ(policy_->plan_checkpoint(&fresh_probe), 0u);
 }
 
 TEST_F(LinearPrefixCheckpointTest,
@@ -1423,7 +1253,7 @@ TEST_F(LinearPrefixCheckpointTest, MtpHotFrontExcludesUnavailableLookahead) {
        {BlockHasherType::MTP_TEXT, BlockHasherType::MTP_MM}) {
     BlockManagerPool::Options options = make_linear_state_pool_options(32);
     options.hasher_type(hasher_type);
-    BlockManagerPool pool(options, 1);
+    block_test::TestBlockManagerPool pool(options, 1);
     policy_ = std::make_unique<LinearPrefixAdmissionPolicy>(
         4,
         LinearPrefixAdmissionPolicy::Options{.chunk_size = 16,

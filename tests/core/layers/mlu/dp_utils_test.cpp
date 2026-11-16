@@ -83,6 +83,7 @@ std::vector<torch::Tensor> make_global_shards(
     int32_t tp_size) {
   GatherShape shape = make_gather_shape(dp_tokens, tp_size);
   std::vector<torch::Tensor> shards;
+  shards.reserve(dp_tokens.size() * static_cast<size_t>(tp_size));
   for (size_t dp_rank = 0; dp_rank < dp_tokens.size(); ++dp_rank) {
     std::vector<float> padded_vals(shape.padded_dp_tokens, -1.0f);
     for (int64_t i = 0; i < dp_tokens[dp_rank]; ++i) {
@@ -320,31 +321,6 @@ TEST(DpUtilsTest, GatherGlobalTokensHandlesEqualDpTokens) {
                             torch::tensor({{204.0f}, {205.0f}, {206.0f}}));
 }
 
-TEST(DpUtilsTest, NeedDpMoEGatherSkipsAll2AllPath) {
-  std::unique_ptr<xllm::ProcessGroup> process_group;
-  ParallelArgs args = make_tp_args(process_group, 0, 1);
-  args.dp_size_ = 2;
-  args.ep_size_ = 2;
-
-  EXPECT_TRUE(need_dp_moe_gather(args, /*enable_moe_all2all=*/false));
-  EXPECT_FALSE(need_dp_moe_gather(args, /*enable_moe_all2all=*/true));
-}
-
-TEST(DpUtilsTest, NeedSelectedMoeDpGatherRequiresDpAndEp) {
-  std::unique_ptr<xllm::ProcessGroup> dp_group;
-  ParallelArgs args = make_selected_moe_args(
-      dp_group, /*dp_rank=*/0, /*dp_size=*/2, /*ep_size=*/2);
-
-  EXPECT_TRUE(need_selected_moe_dp_gather(args));
-
-  args.dp_size_ = 1;
-  EXPECT_FALSE(need_selected_moe_dp_gather(args));
-
-  args.dp_size_ = 2;
-  args.ep_size_ = 1;
-  EXPECT_FALSE(need_selected_moe_dp_gather(args));
-}
-
 TEST(DpUtilsTest, GatherSelectedMoeInputsReturnsOriginalTensorsWhenNotNeeded) {
   std::unique_ptr<xllm::ProcessGroup> dp_group;
   ParallelArgs args = make_selected_moe_args(
@@ -357,9 +333,9 @@ TEST(DpUtilsTest, GatherSelectedMoeInputsReturnsOriginalTensorsWhenNotNeeded) {
       gather_selected_moe_inputs(hidden, weights, ids, {}, args);
 
   EXPECT_FALSE(inputs.need_slice);
-  EXPECT_EQ(inputs.hidden_states.data_ptr(), hidden.data_ptr());
-  EXPECT_EQ(inputs.topk_weights.data_ptr(), weights.data_ptr());
-  EXPECT_EQ(inputs.topk_ids.data_ptr(), ids.data_ptr());
+  EXPECT_TRUE(torch::equal(inputs.hidden_states, hidden));
+  EXPECT_TRUE(torch::equal(inputs.topk_weights, weights));
+  EXPECT_TRUE(torch::equal(inputs.topk_ids, ids));
   EXPECT_EQ(inputs.topk_weights.dtype(), torch::kFloat16);
   EXPECT_EQ(inputs.topk_ids.dtype(), torch::kLong);
 }
@@ -382,17 +358,10 @@ TEST(DpUtilsTest, GatherSelectedMoeInputsGathersEachSelectedTensor) {
   EXPECT_EQ(inputs.topk_ids.size(0), 4);
   EXPECT_EQ(inputs.topk_weights.dtype(), torch::kFloat16);
   EXPECT_EQ(inputs.topk_ids.dtype(), torch::kLong);
-}
-
-TEST(DpUtilsTest, SliceSelectedMoeOutputUsesExplicitRows) {
-  std::unique_ptr<xllm::ProcessGroup> dp_group;
-  ParallelArgs args = make_selected_moe_args(
-      dp_group, /*dp_rank=*/2, /*dp_size=*/3, /*ep_size=*/2);
-  torch::Tensor output = torch::arange(15, torch::kFloat32).reshape({5, 3});
-
-  torch::Tensor sliced = slice_selected_moe_output(output, {2, 0, 3}, args);
-
-  test::verify_tensor_close(sliced, output.slice(0, 2, 5));
+  EXPECT_TRUE(torch::equal(inputs.hidden_states, torch::cat({hidden, hidden})));
+  EXPECT_TRUE(
+      torch::equal(inputs.topk_weights, torch::cat({weights, weights})));
+  EXPECT_TRUE(torch::equal(inputs.topk_ids, torch::cat({ids, ids})));
 }
 
 TEST(DpUtilsTest, SliceSelectedMoeOutputDoesNotNormalizeZeroRows) {

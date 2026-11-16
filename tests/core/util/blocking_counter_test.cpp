@@ -13,85 +13,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "blocking_counter.h"
+#include "core/util/blocking_counter.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
-#include "util/threadpool.h"
+#include "core/util/threadpool.h"
 
 namespace xllm {
-
-TEST(BlockingCounterTest, BasicTest) {
-  BlockingCounter counter(1);
-  counter.decrement_count();
-  counter.wait();
-  EXPECT_TRUE(true);
-}
-
-TEST(BlockingCounterTest, TwoThreadTest) {
-  ThreadPool threadpool(1);
-  BlockingCounter counter(2);
-
-  std::atomic<int32_t> called{0};
-  threadpool.schedule([&counter, &called]() {
-    ++called;
-    counter.decrement_count();
-  });
-  ++called;
-  counter.decrement_count();
-  counter.wait();
-  EXPECT_EQ(2, called.load());
-}
+namespace {
 
 TEST(BlockingCounterTest, MultiThreadTest) {
-  ThreadPool threadpool(4);
   BlockingCounter counter(5);
-
   std::atomic<int32_t> called{0};
-  threadpool.schedule([&counter, &called]() {
-    ++called;
-    counter.decrement_count();
-  });
-  threadpool.schedule([&counter, &called]() {
-    ++called;
-    counter.decrement_count();
-  });
-  threadpool.schedule([&counter, &called]() {
-    ++called;
-    counter.decrement_count();
-  });
-  threadpool.schedule([&counter, &called]() {
-    ++called;
-    counter.decrement_count();
-  });
+  ThreadPool pool(4);
+  for (int32_t index = 0; index < 4; ++index) {
+    pool.schedule([&counter, &called] {
+      ++called;
+      counter.decrement_count();
+    });
+  }
   ++called;
   counter.decrement_count();
-
-  counter.wait();
-  EXPECT_EQ(5, called.load());
+  EXPECT_TRUE(counter.wait_for(std::chrono::seconds(5)));
+  EXPECT_EQ(called.load(), 5);
 }
 
 TEST(BlockingCounterTest, WaitTimeoutTest) {
-  ThreadPool threadpool(2);
-  BlockingCounter counter(3);
-
-  std::atomic<int32_t> called{0};
-  threadpool.schedule([&counter, &called]() {
-    ++called;
-    counter.decrement_count();
-  });
-
-  ++called;
+  BlockingCounter counter(1);
+  EXPECT_FALSE(counter.wait_for(std::chrono::milliseconds(1)));
   counter.decrement_count();
-
-  const std::chrono::milliseconds timeout(100);
-  EXPECT_FALSE(counter.wait_for(timeout));
-  counter.decrement_count();
+  EXPECT_TRUE(counter.wait_for(std::chrono::milliseconds(0)));
   counter.wait();
-  EXPECT_EQ(2, called.load());
 }
 
+}  // namespace
 }  // namespace xllm

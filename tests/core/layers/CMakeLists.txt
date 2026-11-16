@@ -108,6 +108,7 @@ if(USE_MUSA)
 endif()
 
 if(USE_NPU)
+  add_subdirectory(npu)
   cc_test(
     NAME
       attention_mask_test

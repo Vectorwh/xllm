@@ -32,8 +32,6 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-class SparseMoEBlockTestPeer;
-
 class SparseMoEBlockImpl final : public torch::nn::Module {
  public:
   SparseMoEBlockImpl() = default;
@@ -80,8 +78,6 @@ class SparseMoEBlockImpl final : public torch::nn::Module {
   ParallelArgs parallel_args_;
   bool enable_deep_ep_ = false;
   FusedMoE moe_{nullptr};
-
-  friend class SparseMoEBlockTestPeer;
 };
 
 TORCH_MODULE(SparseMoEBlock);

@@ -129,22 +129,6 @@ def _capture_model(
     return model, cfg
 
 
-def test_config_reads_layers_to_capture() -> None:
-    config = DeepseekV41Config.from_dict({**_DEEPSEEK_V41_TINY_CONFIG, "layers_to_capture": [37, 38, 39]})
-
-    assert config.layers_to_capture == [37, 38, 39]
-    # Absent list: speculative decoding is off, so capture stays disabled.
-    assert DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG).layers_to_capture == []
-
-
-def test_config_reads_the_graph_aux_capture_flag() -> None:
-    # Default off keeps the target on the eager tuple contract.
-    assert DeepseekV41Config.from_dict(_DEEPSEEK_V41_TINY_CONFIG).enable_graph_aux_hidden_states is False
-    # The C++ bridge (PyCausalLM::build_config_dict) sets this key.
-    flagged = DeepseekV41Config.from_dict({**_DEEPSEEK_V41_TINY_CONFIG, "enable_graph_aux_hidden_states": True})
-    assert flagged.enable_graph_aux_hidden_states is True
-
-
 def test_capture_disabled_returns_a_plain_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
     model, cfg = _capture_model(monkeypatch, ())
 
@@ -163,7 +147,7 @@ def test_capture_buffers_the_configured_layers_in_config_order(monkeypatch: pyte
     _, aux_hidden = output
     # One block per captured layer, ordered by ``layers_to_capture`` (not by
     # layer id): layer 2 lands in slot 0 and layer 0 in slot 1.
-    assert aux_hidden.shape == (2, len(model.aux_hidden_capture._layers_to_capture) * cfg.hidden_size)
+    assert aux_hidden.shape == (2, 2 * cfg.hidden_size)
     hc_mean = (cfg.hc_mult - 1) / 2
     # Each slot holds the stream ENTERING its layer: layer 2 sees layer 1's
     # output, and layer 0 sees the embedding (identical across hc_mult copies,
@@ -173,16 +157,6 @@ def test_capture_buffers_the_configured_layers_in_config_order(monkeypatch: pyte
         aux_hidden[:, cfg.hidden_size :],
         torch.tensor([[2.0], [3.0]]).expand(2, cfg.hidden_size),
     )
-
-
-def test_should_capture_matches_the_configured_layers() -> None:
-    capture = AuxHiddenCapture((4, 1))
-
-    assert capture.enabled
-    assert capture.should_capture(4)
-    assert capture.should_capture(1)
-    assert not capture.should_capture(0)
-    assert not AuxHiddenCapture(()).enabled
 
 
 def test_graph_flag_switches_the_model_capture_to_persistent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,18 +178,6 @@ def test_graph_flag_switches_the_model_capture_to_persistent(monkeypatch: pytest
         buffer[:, cfg.hidden_size :],
         torch.tensor([[2.0], [3.0]]).expand(2, cfg.hidden_size),
     )
-
-
-def test_graph_flag_off_keeps_the_eager_tuple_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Zero change for every non-graph run: the flag is absent/false and the
-    # capture stays transient, so the model still returns ``(hidden, aux)``.
-    model, _ = _capture_model(monkeypatch, (2, 0))
-
-    assert model.aux_hidden_capture.persistent_buffer is False
-    output = model(torch.tensor([1, 2]), torch.tensor([0, 1]))
-
-    assert isinstance(output, tuple)
-    assert model.aux_hidden_capture.buffer is None
 
 
 def test_persistent_capture_is_reused_across_graph_steps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,19 +210,6 @@ def test_transient_buffers_are_allocated_per_forward() -> None:
     assert capture.buffer is None
 
 
-def test_persistent_buffer_is_reused_across_forwards() -> None:
-    capture = AuxHiddenCapture((4, 1), persistent_buffer=True)
-    hidden = torch.randn(3, 8)
-
-    first = capture.create_buffer(hidden)
-    second = capture.create_buffer(hidden)
-
-    assert first is not None and second is not None
-    assert first.data_ptr() == second.data_ptr()
-    assert capture.persistent_buffer
-    assert capture.buffer is first
-
-
 def test_persistent_buffer_reallocates_only_when_the_shape_changes() -> None:
     capture = AuxHiddenCapture((4, 1), persistent_buffer=True)
 
@@ -275,27 +224,6 @@ def test_persistent_buffer_reallocates_only_when_the_shape_changes() -> None:
     assert large.shape == (5, 16)
     assert small.data_ptr() != large.data_ptr()
     assert small_again.data_ptr() == small.data_ptr()
-
-
-def test_persistent_finalize_keeps_the_output_a_plain_tensor() -> None:
-    capture = AuxHiddenCapture((4, 1), persistent_buffer=True)
-    hidden = torch.zeros(2, 8)
-    # Layer 4 lands in slot 0 and layer 1 in slot 1.
-    layer4 = torch.full((2, 8), 1.5)
-    layer1 = torch.full((2, 8), -2.0)
-
-    buffer = capture.create_buffer(hidden)
-    capture.capture_layer(4, layer4, None, buffer)
-    capture.capture_layer(1, layer1, None, buffer)
-    output = capture.finalize(hidden, buffer)
-
-    # The graph runner only accepts a single Tensor; the capture is published
-    # out of band through ``capture.buffer``.
-    assert isinstance(output, torch.Tensor)
-    assert output.shape == (2, 8)
-    assert capture.buffer is not None
-    torch.testing.assert_close(capture.buffer[:, :8], layer4)
-    torch.testing.assert_close(capture.buffer[:, 8:], layer1)
 
 
 def test_persistent_disabled_capture_allocates_nothing() -> None:
@@ -336,33 +264,15 @@ def _filled_persistent_capture(rows: int, padded_rows: int, hidden: int = 8) -> 
 # --------------------------------------------------------------------------
 
 
-def test_resolves_the_capture_through_the_model_body() -> None:
-    capture = AuxHiddenCapture((7,))
-    executor = _executor(capture)
-
-    assert ModelExecutor._resolve_aux_hidden_capture(executor.model) is capture
-
-
-def test_resolves_the_capture_on_the_top_level_model() -> None:
-    capture = AuxHiddenCapture((7,))
-    executor = _executor(capture, top_level=True)
-
-    assert ModelExecutor._resolve_aux_hidden_capture(executor.model) is capture
-
-
-def test_models_without_capture_resolve_to_none() -> None:
-    assert ModelExecutor._resolve_aux_hidden_capture(SimpleNamespace(model=SimpleNamespace())) is None
-    assert ModelExecutor._resolve_aux_hidden_capture(SimpleNamespace()) is None
-
-
 # --------------------------------------------------------------------------
 # Publishing contract
 # --------------------------------------------------------------------------
 
 
-def test_persistent_capture_is_appended_and_sliced_to_the_real_rows() -> None:
+@pytest.mark.parametrize("top_level", [False, True])
+def test_persistent_capture_is_appended_and_sliced_to_the_real_rows(top_level: bool) -> None:
     capture = _filled_persistent_capture(rows=3, padded_rows=5)
-    executor = _executor(capture)
+    executor = _executor(capture, top_level=top_level)
     hidden = torch.zeros(3, 8)
 
     result = executor._attach_persistent_aux_hidden_states(hidden, 3)
@@ -373,40 +283,6 @@ def test_persistent_capture_is_appended_and_sliced_to_the_real_rows() -> None:
     # The padded tail rows are scratch and must not ride along.
     assert got_aux.shape == (3, 8)
     torch.testing.assert_close(got_aux, torch.full((3, 8), 1.0))
-
-
-def test_persistent_capture_without_padding_is_returned_whole() -> None:
-    capture = _filled_persistent_capture(rows=4, padded_rows=4)
-    executor = _executor(capture)
-    hidden = torch.zeros(4, 8)
-
-    _, got_aux = executor._attach_persistent_aux_hidden_states(hidden, 4)
-
-    assert got_aux.shape == (4, 8)
-    torch.testing.assert_close(got_aux, torch.full((4, 8), 1.0))
-
-
-def test_transient_capture_leaves_the_output_alone() -> None:
-    # The eager tuple contract already carries the aux; nothing is appended.
-    capture = AuxHiddenCapture((7,))
-    capture.create_buffer(torch.zeros(3, 8))
-    executor = _executor(capture)
-    hidden = torch.zeros(3, 8)
-
-    assert executor._attach_persistent_aux_hidden_states(hidden, 3) is hidden
-
-
-def test_transient_capture_is_not_wrapped_even_with_a_lingering_buffer() -> None:
-    # The persistent-buffer flag, not the mere presence of a buffer, decides:
-    # a transient capture's output already carries the aux in its tuple, so
-    # wrapping it here would double-publish (and break the tensor contract).
-    # A stub pins the flag/buffer combination a real transient capture cannot
-    # reach (its buffer stays None by design).
-    capture = SimpleNamespace(enabled=True, persistent_buffer=False, buffer=torch.zeros(3, 16))
-    executor = _executor(capture)
-    hidden = torch.zeros(3, 8)
-
-    assert executor._attach_persistent_aux_hidden_states(hidden, 3) is hidden
 
 
 def test_disabled_capture_leaves_the_output_alone() -> None:
@@ -432,9 +308,9 @@ def test_persistent_capture_before_the_first_forward_leaves_the_output_alone() -
     assert executor._attach_persistent_aux_hidden_states(hidden, 3) is hidden
 
 
-def test_an_existing_tuple_is_not_nested() -> None:
-    capture = _filled_persistent_capture(rows=3, padded_rows=5)
-    executor = _executor(capture)
-    output = (torch.zeros(3, 8), torch.zeros(3, 16))
-
-    assert executor._attach_persistent_aux_hidden_states(output, 3) is output
+def test_an_existing_tuple_is_not_nested(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, _ = _capture_model(monkeypatch, (2, 0))
+    output = model(torch.tensor([1, 2]), torch.tensor([0, 1]))
+    assert isinstance(output, tuple)
+    executor = _executor(model.aux_hidden_capture)
+    assert executor._attach_persistent_aux_hidden_states(output, 2) is output

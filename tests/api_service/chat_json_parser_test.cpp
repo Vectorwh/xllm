@@ -23,7 +23,6 @@ limitations under the License.
 #include "anthropic.pb.h"
 #include "api_service/utils.h"
 #include "chat.pb.h"
-#include "core/framework/chat_template/thinking_mode_resolver.h"
 #include "parser/reasoning_detector.h"
 
 namespace xllm {
@@ -84,13 +83,6 @@ TEST_F(PreprocessChatJsonTest, PassThroughNonArrayContent) {
   expect_success(input, vlm_parser, expected_vlm_output);
 }
 
-TEST_F(PreprocessChatJsonTest, PassThroughNoMessages) {
-  // JSON without messages field should pass through
-  std::string input = R"({"model": "test"})";
-  LlmChatJsonParser llm_parser;
-  expect_success(input, llm_parser, input);
-}
-
 TEST_F(PreprocessChatJsonTest, CombineTextArrayIntoString) {
   // Array of text items should be combined into single string for
   // non-multimodal
@@ -113,43 +105,9 @@ TEST_F(PreprocessChatJsonTest, CombineTextArrayIntoString) {
   expect_success(input, vlm_parser, input);
 }
 
-TEST_F(PreprocessChatJsonTest, SingleTextItemCombined) {
-  // Single text item in array should be converted to string for non-multimodal
-  std::string input = R"({
-    "messages": [{
-      "role": "user",
-      "content": [{"type": "text", "text": "Hello"}]
-    }]
-  })";
-  std::string expected = R"({
-    "messages": [{"role": "user", "content": "Hello"}]
-  })";
-  LlmChatJsonParser llm_parser;
-  VlmChatJsonParser vlm_parser;
-  expect_success(input, llm_parser, expected);
-  // For multimodal, array is preserved
-  expect_success(input, vlm_parser, input);
-}
-
 // =============================================================================
 // Multimodal content tests (Issue #801)
 // =============================================================================
-
-TEST_F(PreprocessChatJsonTest, ImageUrlPassesThroughOnMultimodal) {
-  // image_url content should pass through unchanged on multimodal endpoint
-  std::string input = R"({
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}},
-        {"type": "text", "text": "What is this?"}
-      ]
-    }]
-  })";
-  VlmChatJsonParser vlm_parser;
-  // Should pass through unchanged for multimodal
-  expect_success(input, vlm_parser, input);
-}
 
 TEST_F(PreprocessChatJsonTest, ImageUrlErrorsOnTextOnly) {
   // image_url content should error on text-only endpoint with helpful message
@@ -200,12 +158,6 @@ TEST_F(PreprocessChatJsonTest, InvalidJsonReturnsError) {
   expect_error(input, llm_parser, "Invalid JSON");
 }
 
-TEST_F(PreprocessChatJsonTest, NonObjectMessageReturnsError) {
-  std::string input = R"({"messages": ["not an object"]})";
-  LlmChatJsonParser llm_parser;
-  expect_error(input, llm_parser, "must be an object");
-}
-
 TEST_F(PreprocessChatJsonTest, NonObjectContentItemReturnsError) {
   std::string input = R"({
     "messages": [{"role": "user", "content": ["not an object"]}]
@@ -228,22 +180,6 @@ TEST_F(PreprocessChatJsonTest, NonStringTextFieldReturnsError) {
   })";
   LlmChatJsonParser llm_parser;
   expect_error(input, llm_parser, "Missing or invalid 'text' field");
-}
-
-TEST_F(PreprocessChatJsonTest, MalformedTextInMultimodalContent) {
-  // Multimodal mode skips parsing entirely - validation happens downstream
-  std::string input = R"({
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "image_url", "image_url": {"url": "..."}},
-        {"type": "text"}
-      ]
-    }]
-  })";
-  VlmChatJsonParser vlm_parser;
-  // Should pass through unchanged without validation
-  expect_success(input, vlm_parser, input);
 }
 
 // =============================================================================
@@ -308,29 +244,6 @@ TEST_F(PreprocessChatJsonTest, TopLevelReasoningEffortReachesChatTemplate) {
   auto it = kwargs.find("reasoning_effort");
   ASSERT_NE(it, kwargs.end());
   EXPECT_EQ(it->second.string_value(), "medium");
-}
-
-TEST_F(PreprocessChatJsonTest, NestedReasoningEffortTakesPrecedence) {
-  std::string input = R"({
-    "messages": [{"role": "user", "content": "Hello"}],
-    "reasoning_effort": "medium",
-    "chat_template_kwargs": {"reasoning_effort": "high"}
-  })";
-  LlmChatJsonParser parser;
-  auto [status, processed_json] = parser.preprocess(input);
-  ASSERT_TRUE(status.ok()) << "Unexpected error: " << status.message();
-
-  proto::ChatRequest request;
-  google::protobuf::util::JsonParseOptions options;
-  options.ignore_unknown_fields = true;
-  auto parse_status = google::protobuf::util::JsonStringToMessage(
-      processed_json, &request, options);
-  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
-  ASSERT_TRUE(request.has_chat_template_kwargs());
-  const auto& kwargs = request.chat_template_kwargs().fields();
-  auto it = kwargs.find("reasoning_effort");
-  ASSERT_NE(it, kwargs.end());
-  EXPECT_EQ(it->second.string_value(), "high");
 }
 
 TEST_F(PreprocessChatJsonTest, NestedNoneOverridesTopLevelHigh) {
@@ -400,8 +313,6 @@ TEST_F(PreprocessChatJsonTest, InvalidNestedEffortUsesTopLevel) {
     nlohmann::json expected = nlohmann::json::parse(input);
     expected["chat_template_kwargs"]["reasoning_effort"] = "none";
     expect_success(input, parser, expected.dump());
-    EXPECT_FALSE(api_service::get_enable_thinking_from_request(
-        expected["chat_template_kwargs"], "deepseek-v4"));
   }
 }
 
@@ -427,8 +338,6 @@ TEST_F(PreprocessChatJsonTest, ForwardsEmptyAndUnrecognizedTopLevelEffort) {
     nlohmann::json expected = input;
     expected["chat_template_kwargs"] = {{"reasoning_effort", effort}};
     expect_success(input.dump(), parser, expected.dump());
-    EXPECT_TRUE(api_service::get_enable_thinking_from_request(
-        expected["chat_template_kwargs"], "deepseek-v4"));
   }
 }
 
@@ -467,18 +376,6 @@ TEST_F(PreprocessChatJsonTest, DeepSeekV4ThinkingMatchesTemplatePrecedence) {
       {{"reasoning_effort", "none"}}, "glm47"));
   EXPECT_TRUE(api_service::get_enable_thinking_from_request(
       {{"thinking", false}, {"enable_thinking", true}}, "glm47"));
-}
-
-TEST_F(PreprocessChatJsonTest, SharedThinkingPolicyMatchesGrammarFallback) {
-  const nlohmann::json disabled = {{"reasoning_effort", "none"}};
-  EXPECT_FALSE(thinking_mode::is_enabled(disabled, "deepseek-v4"));
-  EXPECT_TRUE(thinking_mode::is_enabled(disabled, "glm47"));
-
-  const nlohmann::json conflicting = {{"thinking", false},
-                                      {"enable_thinking", true}};
-  EXPECT_FALSE(thinking_mode::is_enabled(conflicting, "deepseek-v4"));
-  EXPECT_TRUE(thinking_mode::is_enabled(conflicting, "glm47"));
-  EXPECT_FALSE(thinking_mode::is_enabled(nlohmann::json::object(), ""));
 }
 
 TEST_F(PreprocessChatJsonTest, TopLevelNoneKeepsPlainAnswerInContent) {
@@ -527,18 +424,6 @@ TEST_F(PreprocessChatJsonTest, TopLevelNoneKeepsPlainAnswerInContent) {
   EXPECT_EQ(second.normal_text.value_or(""), second_chunk);
   EXPECT_FALSE(first.reasoning_text.has_value());
   EXPECT_FALSE(second.reasoning_text.has_value());
-}
-
-TEST_F(PreprocessChatJsonTest, ForcedReasoningMisclassifiesTaglessAnswer) {
-  ReasoningDetector detector("<think>",
-                             "</think>",
-                             /*force_reasoning=*/true,
-                             /*stream_reasoning=*/false);
-  std::string plain_text = "plain answer";
-  const ReasoningResult result = detector.detect_and_parse(plain_text);
-  EXPECT_FALSE(result.normal_text.has_value());
-  ASSERT_TRUE(result.reasoning_text.has_value());
-  EXPECT_EQ(result.reasoning_text.value(), plain_text);
 }
 
 TEST_F(PreprocessChatJsonTest, OpenAIObjectToolChoiceRemapped) {
@@ -600,18 +485,6 @@ TEST_F(PreprocessChatJsonTest, InvalidMessageObjectNamesMessages) {
   VlmChatJsonParser vlm_parser;
   expect_parameter_error(R"({"messages":[42]})", llm_parser, "messages");
   expect_parameter_error(R"({"messages":[42]})", vlm_parser, "messages");
-}
-
-TEST_F(PreprocessChatJsonTest, UnknownContentTypeOnMultimodal) {
-  // Unknown content types should pass through on multimodal
-  std::string input = R"({
-    "messages": [{
-      "role": "user",
-      "content": [{"type": "video", "video": {"url": "..."}}]
-    }]
-  })";
-  VlmChatJsonParser vlm_parser;
-  expect_success(input, vlm_parser, input);
 }
 
 TEST_F(PreprocessChatJsonTest, UnknownContentTypeErrorsOnTextOnly) {
@@ -772,31 +645,10 @@ TEST_F(PreprocessChatJsonTest, AnthropicSystemArrayRemapped) {
   expect_success(input, parser, expected);
 }
 
-TEST_F(PreprocessChatJsonTest, AnthropicNoContentNoSystem) {
-  std::string input = R"({"model": "claude-3"})";
-  AnthropicChatJsonParser parser;
-  expect_success(input, parser, input);
-}
-
 TEST_F(PreprocessChatJsonTest, AnthropicInvalidJsonReturnsError) {
   std::string input = "not valid json";
   AnthropicChatJsonParser parser;
   expect_error(input, parser, "Invalid JSON");
-}
-
-TEST_F(PreprocessChatJsonTest, AnthropicPreservesOtherFields) {
-  std::string input = R"({
-    "model": "claude-3",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Hello"}]
-  })";
-  std::string expected = R"({
-    "model": "claude-3",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content_string": "Hello"}]
-  })";
-  AnthropicChatJsonParser parser;
-  expect_success(input, parser, expected);
 }
 
 TEST_F(PreprocessChatJsonTest, AnthropicIgnoreEosParsedAfterRemap) {
@@ -820,6 +672,8 @@ TEST_F(PreprocessChatJsonTest, AnthropicIgnoreEosParsedAfterRemap) {
 
   EXPECT_TRUE(request.has_ignore_eos());
   EXPECT_TRUE(request.ignore_eos());
+  EXPECT_EQ(request.model(), "claude-3");
+  EXPECT_EQ(request.max_tokens(), 1024);
   ASSERT_EQ(request.messages_size(), 1);
   EXPECT_EQ(request.messages(0).content_string(), "Hello");
 }

@@ -37,6 +37,10 @@ namespace {
 class Qwen3_5FusedMoETest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     options_ = torch::TensorOptions()
                    .dtype(torch::kBFloat16)
                    .device(Platform::type_torch(), 0)
@@ -78,7 +82,11 @@ class Qwen3_5FusedMoETest : public ::testing::Test {
   StateDict create_gate_up_dict() {
     std::unordered_map<std::string, torch::Tensor> weights;
     weights["experts.gate_up_proj.qweight"] =
-        torch::ones({4, 8, 8}, options_.dtype(torch::kInt8));
+        torch::arange(256, options_.dtype(torch::kInt64))
+            .remainder(15)
+            .sub(7)
+            .reshape({4, 8, 8})
+            .to(torch::kInt8);
     weights["experts.gate_up_proj.per_channel_scale"] =
         torch::ones({4, 8}, options_.dtype(torch::kFloat32));
     weights["experts.gate_up_proj.smooth"] =
@@ -89,7 +97,11 @@ class Qwen3_5FusedMoETest : public ::testing::Test {
   StateDict create_down_dict() {
     std::unordered_map<std::string, torch::Tensor> weights;
     weights["experts.down_proj.qweight"] =
-        torch::ones({4, 8, 4}, options_.dtype(torch::kInt8));
+        torch::arange(128, options_.dtype(torch::kInt64))
+            .remainder(13)
+            .sub(6)
+            .reshape({4, 8, 4})
+            .to(torch::kInt8);
     weights["experts.down_proj.per_channel_scale"] =
         torch::ones({4, 8}, options_.dtype(torch::kFloat32));
     weights["experts.down_proj.smooth"] =
@@ -112,6 +124,12 @@ TEST_F(Qwen3_5FusedMoETest, LoadsFusedWeightsAcrossStateDicts) {
   moe->load_state_dict(down_dict);
 
   moe->verify_loaded_weights();
+  const auto parameters = moe->named_parameters();
+  EXPECT_TRUE(
+      torch::equal(parameters["w13"],
+                   gate_up_dict.get_tensor("experts.gate_up_proj.qweight")));
+  EXPECT_TRUE(torch::equal(parameters["w2"],
+                           down_dict.get_tensor("experts.down_proj.qweight")));
 }
 
 TEST_F(Qwen3_5FusedMoETest, RejectsPartialFusedWeightGroup) {

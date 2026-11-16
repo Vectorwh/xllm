@@ -109,8 +109,6 @@ class KVCacheStore final {
       Slice<BlockTransferInfo>& block_transfer_info);
 
  private:
-  friend class KVCacheStoreTestPeer;
-
   struct StoreEntry {
     uint32_t cache_handle = 0;
     std::string key_component;

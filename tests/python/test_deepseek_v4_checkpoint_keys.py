@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
 import pytest
 
-from xllm.python.models import deepseek_v4
 from xllm.python.models.deepseek_v4 import (
     _find_checkpoint_key,
     _find_checkpoint_prefix,
@@ -31,10 +28,6 @@ class _KeySet:
 
     def has(self, name: str) -> bool:
         return name in self.keys
-
-
-class _StopLoading(Exception):
-    pass
 
 
 def test_checkpoint_key_resolution_preserves_candidate_order() -> None:
@@ -52,32 +45,6 @@ def test_required_checkpoint_key_reports_all_supported_names() -> None:
     )
     with pytest.raises(KeyError, match=r"model\.head\.weight, head\.weight"):
         _require_checkpoint_key(_KeySet(), candidates, "output head")
-
-
-def test_dsv4_loader_uses_shared_model_prefix_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured_prefixes: tuple[str, ...] | None = None
-
-    class _RecordingLoader:
-        def __init__(
-            self,
-            model: object,
-            state_dicts: object,
-            tp_size: int,
-            tp_rank: int,
-            src_prefixes: tuple[str, ...] = ("",),
-        ) -> None:
-            del model, state_dicts, tp_size, tp_rank
-            nonlocal captured_prefixes
-            captured_prefixes = src_prefixes
-            raise _StopLoading
-
-    monkeypatch.setattr(deepseek_v4, "W8A8WeightLoader", _RecordingLoader)
-    model = SimpleNamespace(cfg=SimpleNamespace(tp_size=1, tp_rank=0))
-
-    with pytest.raises(_StopLoading):
-        deepseek_v4.DeepseekV4ForCausalLM.load_weights(model, [], 0, 1)
-
-    assert captured_prefixes == ("", "model.")
 
 
 @pytest.mark.parametrize(

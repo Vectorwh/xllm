@@ -184,11 +184,6 @@ class PagedAttentionGraphResources::Impl final {
     return resources;
   }
 
-  size_t stream_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return streams_.size();
-  }
-
  private:
   int64_t num_layers_;
   mutable std::mutex mutex_;
@@ -198,9 +193,6 @@ class PagedAttentionGraphResources::Impl final {
 PagedAttentionGraphResources::PagedAttentionGraphResources(int64_t num_layers)
     : impl_(std::make_unique<Impl>(num_layers)) {}
 PagedAttentionGraphResources::~PagedAttentionGraphResources() = default;
-size_t PagedAttentionGraphResources::stream_count() const {
-  return impl_->stream_count();
-}
 
 class PagedAttentionGraphOperation::Impl final {
  public:
@@ -294,8 +286,6 @@ class PagedAttentionGraphOperation::Impl final {
     at_npu::native::OpCommand::RunOpApiV2("PagedAttentionGraph", launch);
   }
 
-  uint64_t workspace_size() const { return workspace_size_; }
-
  private:
   std::shared_ptr<PaStreamResources> resources_;
   torch::Tensor query_source_;
@@ -342,9 +332,5 @@ void PagedAttentionGraphOperation::prepare(
 }
 
 void PagedAttentionGraphOperation::execute() { impl_->execute(); }
-
-uint64_t PagedAttentionGraphOperation::workspace_size() const {
-  return impl_->workspace_size();
-}
 
 }  // namespace xllm::kernel::npu

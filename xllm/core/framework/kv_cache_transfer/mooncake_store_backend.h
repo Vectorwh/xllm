@@ -57,17 +57,6 @@ class MooncakeStoreBackend final : public KVCacheStoreTransport {
       const std::vector<std::string>& keys) override;
 
  private:
-  friend class MooncakeStoreBackendTestPeer;
-
-  static std::optional<std::vector<StoreRegisteredRange>> unique_ranges(
-      const std::vector<StoreRegisteredRange>& ranges);
-  static std::optional<int32_t> get_bytes(const MultiBuffer& buffer);
-  static std::vector<uint8_t> get_statuses(
-      const std::vector<int32_t>& expected_bytes,
-      const std::vector<int>& results);
-  static bool put_succeeded(int result);
-  static MooncakeReplicaTier replica_tier(
-      const std::vector<mooncake::Replica::Descriptor>& replicas);
   void unregister_ranges();
 
  private:

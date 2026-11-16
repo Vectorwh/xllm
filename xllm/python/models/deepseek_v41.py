@@ -85,7 +85,6 @@ from xllm.python.layers.moe_parallel import ep_apply_local, ep_gather_tokens, ep
 from xllm.python.layers.sequence_parallel import sp_all_gather, sp_row_parallel_projection, sp_shard
 from xllm.python.layers.sequence_parallel_metadata import EpSpTokenLayout, SpMetadata, build_flashcomm1_layout
 from xllm.python.model_executor.forward_context import (
-    ForwardContext,
     capturing_acl_graph,
     get_execution_buffer,
     get_forward_context,

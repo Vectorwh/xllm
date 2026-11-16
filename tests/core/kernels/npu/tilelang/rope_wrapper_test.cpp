@@ -15,16 +15,13 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>
-#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/torch_npu.h>
 
-#include <functional>
-#include <iostream>
 #include <string>
 #include <vector>
 
 #include "acl/acl.h"
-#include "tilelang_ops_api.h"
+#include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 
 namespace xllm::kernel::npu::tilelang {
 namespace {
@@ -80,49 +77,6 @@ torch::Tensor torch_rope_ref(const torch::Tensor& x,
   return out.to(torch::kBFloat16);
 }
 
-double measure_npu_event_ms(const std::function<void()>& fn,
-                            int32_t device_id,
-                            int warmup_iters = 5,
-                            int measure_iters = 100) {
-  CHECK_GT(measure_iters, 0) << "measure_iters must be > 0";
-  CHECK_GE(warmup_iters, 0) << "warmup_iters must be >= 0";
-
-  const aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  for (int i = 0; i < warmup_iters; ++i) {
-    fn();
-  }
-  CHECK_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS)
-      << "warmup stream synchronize failed";
-
-  aclrtEvent start_event = nullptr;
-  aclrtEvent end_event = nullptr;
-  CHECK_EQ(aclrtCreateEvent(&start_event), ACL_SUCCESS)
-      << "aclrtCreateEvent(start) failed";
-  CHECK_EQ(aclrtCreateEvent(&end_event), ACL_SUCCESS)
-      << "aclrtCreateEvent(end) failed";
-
-  CHECK_EQ(aclrtRecordEvent(start_event, stream), ACL_SUCCESS)
-      << "aclrtRecordEvent(start) failed";
-  for (int i = 0; i < measure_iters; ++i) {
-    fn();
-  }
-  CHECK_EQ(aclrtRecordEvent(end_event, stream), ACL_SUCCESS)
-      << "aclrtRecordEvent(end) failed";
-  CHECK_EQ(aclrtSynchronizeEvent(end_event), ACL_SUCCESS)
-      << "aclrtSynchronizeEvent(end) failed";
-
-  float elapsed_ms = 0.0F;
-  CHECK_EQ(aclrtEventElapsedTime(&elapsed_ms, start_event, end_event),
-           ACL_SUCCESS)
-      << "aclrtEventElapsedTime failed";
-  CHECK_EQ(aclrtDestroyEvent(start_event), ACL_SUCCESS)
-      << "aclrtDestroyEvent(start) failed";
-  CHECK_EQ(aclrtDestroyEvent(end_event), ACL_SUCCESS)
-      << "aclrtDestroyEvent(end) failed";
-
-  return static_cast<double>(elapsed_ms) / static_cast<double>(measure_iters);
-}
-
 torch::Tensor maybe_narrow(const torch::Tensor& tensor,
                            int64_t start_dim,
                            int64_t rope_dim) {
@@ -133,96 +87,36 @@ torch::Tensor maybe_narrow(const torch::Tensor& tensor,
 }
 
 void run_apply_rotary_case(const RopeTestCase& test_case) {
-  ASSERT_GT(test_case.num_tokens, 0);
-  ASSERT_GT(test_case.num_heads, 0);
-  ASSERT_GT(test_case.full_head_dim, 0);
-  ASSERT_GT(test_case.rope_dim, 0);
-  ASSERT_GE(test_case.start_dim, 0);
-  ASSERT_LE(test_case.start_dim + test_case.rope_dim, test_case.full_head_dim);
-
-  const auto npu_device = torch::Device("npu:0");
-  const int32_t device_id = npu_device.index();
-  const auto bf16_opts =
-      torch::TensorOptions().dtype(torch::kBFloat16).device(npu_device);
-
+  const torch::Device device("npu:0");
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
   torch::manual_seed(test_case.seed);
-  auto q_full = torch::randn(
+  const torch::Tensor input = torch::randn(
       {test_case.num_tokens, test_case.num_heads, test_case.full_head_dim},
-      bf16_opts);
-  auto k_full = torch::randn(
-      {test_case.num_tokens, test_case.num_heads, test_case.full_head_dim},
-      bf16_opts);
-  auto sin_cache =
-      torch::randn({test_case.num_tokens, test_case.rope_dim}, bf16_opts);
-  auto cos_cache =
-      torch::randn({test_case.num_tokens, test_case.rope_dim}, bf16_opts);
+      options);
+  const torch::Tensor sin_cache =
+      torch::randn({test_case.num_tokens, test_case.rope_dim}, options);
+  const torch::Tensor cos_cache =
+      torch::randn({test_case.num_tokens, test_case.rope_dim}, options);
+  const torch::Tensor expected = torch_rope_ref(
+      maybe_narrow(input, test_case.start_dim, test_case.rope_dim),
+      sin_cache,
+      cos_cache);
 
-  auto q_input = maybe_narrow(q_full, test_case.start_dim, test_case.rope_dim);
-  auto k_input = maybe_narrow(k_full, test_case.start_dim, test_case.rope_dim);
-
+  torch::Tensor actual = input.clone();
+  torch::Tensor rotated =
+      maybe_narrow(actual, test_case.start_dim, test_case.rope_dim);
+  rope_in_place(rotated, sin_cache, cos_cache);
+  EXPECT_TRUE(torch::allclose(rotated, expected, /*rtol=*/1e-2, /*atol=*/1e-2))
+      << "max_diff="
+      << (rotated.to(torch::kFloat32) - expected.to(torch::kFloat32))
+             .abs()
+             .max()
+             .item<float>();
   if (test_case.start_dim > 0) {
-    EXPECT_EQ(q_input.storage_offset(), test_case.start_dim);
-    EXPECT_EQ(k_input.storage_offset(), test_case.start_dim);
-    if (test_case.num_tokens * test_case.num_heads > 1) {
-      EXPECT_FALSE(q_input.is_contiguous());
-      EXPECT_FALSE(k_input.is_contiguous());
-    }
+    EXPECT_TRUE(torch::equal(actual.narrow(2, 0, test_case.start_dim),
+                             input.narrow(2, 0, test_case.start_dim)));
   }
-
-  auto q_ref = torch_rope_ref(q_input, sin_cache, cos_cache);
-  auto k_ref = torch_rope_ref(k_input, sin_cache, cos_cache);
-  auto q_runtime_full = q_full.clone();
-  auto k_runtime_full = k_full.clone();
-  auto q =
-      maybe_narrow(q_runtime_full, test_case.start_dim, test_case.rope_dim);
-  auto k =
-      maybe_narrow(k_runtime_full, test_case.start_dim, test_case.rope_dim);
-  rope_in_place(q, sin_cache, cos_cache);
-  rope_in_place(k, sin_cache, cos_cache);
-
-  auto q_bench_full = q_full.clone();
-  auto k_bench_full = k_full.clone();
-  auto q_bench =
-      maybe_narrow(q_bench_full, test_case.start_dim, test_case.rope_dim);
-  auto k_bench =
-      maybe_narrow(k_bench_full, test_case.start_dim, test_case.rope_dim);
-  const double ref_elapsed_ms = measure_npu_event_ms(
-      [&]() {
-        [[maybe_unused]] auto q_ref_bench =
-            torch_rope_ref(q_input, sin_cache, cos_cache);
-        [[maybe_unused]] auto k_ref_bench =
-            torch_rope_ref(k_input, sin_cache, cos_cache);
-      },
-      device_id);
-  const double tl_elapsed_ms = measure_npu_event_ms(
-      [&]() {
-        rope_in_place(q_bench, sin_cache, cos_cache);
-        rope_in_place(k_bench, sin_cache, cos_cache);
-      },
-      device_id);
-
-  const double speedup =
-      tl_elapsed_ms > 0.0 ? ref_elapsed_ms / tl_elapsed_ms : 0.0;
-  std::cout << "[rope_wrapper_test] case=" << test_case.name
-            << ", ref_ms=" << ref_elapsed_ms
-            << ", tilelang_ms=" << tl_elapsed_ms << ", speedup=" << speedup
-            << "x" << std::endl;
-
-  auto q_max_diff = (q.to(torch::kFloat32) - q_ref.to(torch::kFloat32))
-                        .abs()
-                        .max()
-                        .item<float>();
-  auto k_max_diff = (k.to(torch::kFloat32) - k_ref.to(torch::kFloat32))
-                        .abs()
-                        .max()
-                        .item<float>();
-
-  EXPECT_TRUE(torch::allclose(q, q_ref, /*rtol=*/1e-2, /*atol=*/1e-2))
-      << "q mismatch: tilelang output differs from interleaved rope reference"
-      << ", max_diff=" << q_max_diff;
-  EXPECT_TRUE(torch::allclose(k, k_ref, /*rtol=*/1e-2, /*atol=*/1e-2))
-      << "k mismatch: tilelang output differs from interleaved rope reference"
-      << ", max_diff=" << k_max_diff;
 }
 
 TEST_F(TileLangRopeWrapperTest, ApplyRotaryMatchesNpuReferenceVariant128x128) {
@@ -321,13 +215,6 @@ TEST_F(TileLangRopeWrapperTest, ApplyRotaryMatchesNpuReferenceVariant576x64) {
        .rope_dim = kRopeDim,
        .start_dim = kStartDim,
        .seed = 20260226},
-      {.name = "8x576_start512_rope64",
-       .num_tokens = 8,
-       .num_heads = kNumHeads,
-       .full_head_dim = kFullHeadDim,
-       .rope_dim = kRopeDim,
-       .start_dim = kStartDim,
-       .seed = 20260227},
       {.name = "47x576_start512_rope64",
        .num_tokens = 47,
        .num_heads = kNumHeads,
@@ -370,27 +257,6 @@ TEST_F(TileLangRopeWrapperTest, ApplyRotaryMatchesNpuReferenceVariant576x64) {
        .rope_dim = kRopeDim,
        .start_dim = kStartDim,
        .seed = 20260306},
-      {.name = "128x576_start512_rope64",
-       .num_tokens = 128,
-       .num_heads = kNumHeads,
-       .full_head_dim = kFullHeadDim,
-       .rope_dim = kRopeDim,
-       .start_dim = kStartDim,
-       .seed = 20260228},
-      {.name = "512x576_start512_rope64",
-       .num_tokens = 512,
-       .num_heads = kNumHeads,
-       .full_head_dim = kFullHeadDim,
-       .rope_dim = kRopeDim,
-       .start_dim = kStartDim,
-       .seed = 20260307},
-      {.name = "1024x576_start512_rope64",
-       .num_tokens = 1024,
-       .num_heads = kNumHeads,
-       .full_head_dim = kFullHeadDim,
-       .rope_dim = kRopeDim,
-       .start_dim = kStartDim,
-       .seed = 20260308},
       {.name = "2048x576_start512_rope64",
        .num_tokens = 2048,
        .num_heads = kNumHeads,

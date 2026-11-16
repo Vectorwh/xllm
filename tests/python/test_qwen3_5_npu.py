@@ -511,7 +511,7 @@ def test_npu_gdn_packs_rank_local_projection_weights() -> None:
     assert b_weight.untyped_storage().data_ptr() == a_weight.untyped_storage().data_ptr()
 
 
-def test_npu_gdn_prefill_uses_packed_weight_views(monkeypatch) -> None:
+def test_npu_gdn_prefill_uses_packed_weight_views() -> None:
     layer = NpuQwen3_5GatedDeltaNet(
         _gdn_config(),
         0,
@@ -527,20 +527,16 @@ def test_npu_gdn_prefill_uses_packed_weight_views(monkeypatch) -> None:
         layer.in_proj_ba.weight.copy_(
             (torch.arange(layer.in_proj_ba.weight.numel(), dtype=torch.float32) / 1024).view_as(layer.in_proj_ba.weight)
         )
-    qkvz_forward = MagicMock(wraps=layer.in_proj_qkvz.forward)
-    ba_forward = MagicMock(wraps=layer.in_proj_ba.forward)
-    monkeypatch.setattr(layer.in_proj_qkvz, "forward", qkvz_forward)
-    monkeypatch.setattr(layer.in_proj_ba, "forward", ba_forward)
+    hidden = torch.arange(16, dtype=torch.float32).view(2, 8).to(torch.bfloat16) / 8
 
-    prefill_outputs = layer._project_prefill_inputs(torch.ones(2, 8, dtype=torch.bfloat16))
-    qkvz_forward.assert_not_called()
-    ba_forward.assert_not_called()
-    assert [tuple(output.shape) for output in prefill_outputs] == [
-        (2, 768),
-        (2, 2),
-        (2, 2),
-        (2, 2, 128),
-    ]
+    mixed_qkv, a, b, z = layer._project_prefill_inputs(hidden)
+
+    qkvz = torch.nn.functional.linear(hidden, layer.in_proj_qkvz.weight)
+    ba = torch.nn.functional.linear(hidden, layer.in_proj_ba.weight)
+    torch.testing.assert_close(mixed_qkv, qkvz[:, : layer.conv_dim])
+    torch.testing.assert_close(z, qkvz[:, layer.conv_dim :].view(2, layer.num_v_heads, layer.value_head_dim))
+    torch.testing.assert_close(a, ba[:, layer.num_v_heads :])
+    torch.testing.assert_close(b, ba[:, : layer.num_v_heads])
 
 
 def test_npu_decode_uses_mega_fusion_boundary(monkeypatch) -> None:
@@ -1075,17 +1071,10 @@ def test_npu_moe_uses_both_collectives_for_partial_ep(
     distributed.moe_ep_all_reduce.assert_called_once_with(grouped_output)
 
 
-def test_npu_moe_requires_resolved_sequence_parallel_state() -> None:
-    cfg = _config()
-    del cfg.sequence_parallel_enabled
-    with pytest.raises(AttributeError, match="sequence_parallel_enabled"):
-        NpuQwen3_5SparseMoEBlock(cfg, torch.bfloat16, torch.device("cpu"))
-
-
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"moe_tp_size": 2, "ep_size": 2}, "requires direct EP topology"),
+        ({"moe_tp_size": 2, "ep_size": 4}, "requires direct EP topology"),
         ({"ep_size": 2}, "requires direct EP topology"),
         ({"ep_rank": 1}, "EP rank mapping"),
         ({"dp_rank": 1, "ep_rank": 1}, "EP rank mapping"),

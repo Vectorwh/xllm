@@ -70,17 +70,22 @@ TEST(XGrammarConstraintTest, JsonSchemaConstrainsAnObject) {
 }
 
 TEST(XGrammarConstraintTest, FingerprintUsesContentHashNotObjectAddress) {
-  // G9: grammar_id_ is a hash of the serialized grammar, so two states built
-  // from the same grammar agree, states from different grammars disagree, and
-  // a freed-and-recompiled grammar keeps its fingerprint (no address reuse).
+  // Independent compilations of the same content must share an identity;
+  // comparing two states of one compiled object would also pass an address
+  // hash.
   auto compiler = make_compiler();
   std::string error;
   auto grammar = compiler->compile_regex("[A-Z]{2}-[0-9]{4}", error);
   ASSERT_NE(grammar, nullptr) << error;
   auto other = compiler->compile_regex("[a-z]{3}", error);
   ASSERT_NE(other, nullptr) << error;
+  auto equivalent_compiler = make_compiler();
+  auto equivalent =
+      equivalent_compiler->compile_regex("[A-Z]{2}-[0-9]{4}", error);
+  ASSERT_NE(equivalent, nullptr) << error;
+  ASSERT_NE(equivalent.get(), grammar.get());
   XGrammarState first(*grammar);
-  XGrammarState second(*grammar);
+  XGrammarState second(*equivalent);
   XGrammarState different(*other);
   EXPECT_EQ(first.fingerprint(), second.fingerprint());
   EXPECT_NE(first.fingerprint(), different.fingerprint());

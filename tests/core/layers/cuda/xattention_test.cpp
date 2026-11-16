@@ -52,6 +52,8 @@ class XAttentionDecodeCompareTest : public ::testing::Test {
   static constexpr int32_t kCurrentStep = 1;
 
   void SetUp() override {
+    saved_one_stage_ = RecConfig::get_instance().enable_xattention_one_stage();
+    saved_max_tokens_ = SchedulerConfig::get_instance().max_tokens_per_batch();
     if (!torch::cuda::is_available()) {
       GTEST_SKIP() << "CUDA is not available.";
     }
@@ -59,6 +61,11 @@ class XAttentionDecodeCompareTest : public ::testing::Test {
     device_ = torch::Device(torch::kCUDA, 0);
     flashinfer::FlashinferWorkspace::get_instance().initialize(device_);
     xattention::XAttentionWorkspace::get_instance().initialize(device_);
+  }
+
+  void TearDown() override {
+    RecConfig::get_instance().enable_xattention_one_stage(saved_one_stage_);
+    SchedulerConfig::get_instance().max_tokens_per_batch(saved_max_tokens_);
   }
 
   DecodeTestInput create_decode_test_input(torch::ScalarType dtype) {
@@ -97,11 +104,11 @@ class XAttentionDecodeCompareTest : public ::testing::Test {
     meta.full_k_cache.slice(0, 0, kSharedSeqLen)
         .copy_(
             torch::randn({kSharedSeqLen, kNumKvHeads, kHeadDim}, float_opts) *
-            0.001);
+            0.5);
     meta.full_v_cache.slice(0, 0, kSharedSeqLen)
         .copy_(
             torch::randn({kSharedSeqLen, kNumKvHeads, kHeadDim}, float_opts) *
-            0.001);
+            0.5);
 
     meta.unshared_k_cache =
         meta.full_k_cache.slice(0, unshared_offset, full_kv_len)
@@ -121,11 +128,11 @@ class XAttentionDecodeCompareTest : public ::testing::Test {
     meta.unshared_k_cache.slice(2, 0, 1).copy_(
         torch::randn({kBatchSize, kBeamWidth, 1, kNumKvHeads, kHeadDim},
                      float_opts) *
-        0.001);
+        0.5);
     meta.unshared_v_cache.slice(2, 0, 1).copy_(
         torch::randn({kBatchSize, kBeamWidth, 1, kNumKvHeads, kHeadDim},
                      float_opts) *
-        0.001);
+        0.5);
 
     meta.block_table =
         torch::arange(total_beam, int_opts).view({total_beam, 1});
@@ -190,11 +197,11 @@ class XAttentionDecodeCompareTest : public ::testing::Test {
     meta.xattention_two_stage_decode_cache = std::move(two_stage_cache);
 
     input.query =
-        torch::randn({total_beam, kNumHeads * kHeadDim}, float_opts) * 0.001;
+        torch::randn({total_beam, kNumHeads * kHeadDim}, float_opts) * 0.5;
     input.key =
-        torch::randn({total_beam, kNumKvHeads * kHeadDim}, float_opts) * 0.001;
+        torch::randn({total_beam, kNumKvHeads * kHeadDim}, float_opts) * 0.5;
     input.value =
-        torch::randn({total_beam, kNumKvHeads * kHeadDim}, float_opts) * 0.001;
+        torch::randn({total_beam, kNumKvHeads * kHeadDim}, float_opts) * 0.5;
 
     return input;
   }
@@ -255,11 +262,18 @@ class XAttentionDecodeCompareTest : public ::testing::Test {
         << ", mean_abs_diff=" << mean_abs_diff << ", atol=" << atol
         << ", rtol=" << rtol;
 
-    EXPECT_LT(max_abs_diff, atol)
-        << "max_abs_diff exceeds threshold: "
-        << "max_abs_diff=" << max_abs_diff << ", threshold=" << atol;
+    const double reference_norm =
+        torch::norm(single_output, 2.0, torch::kFloat32).item<double>();
+    ASSERT_GT(reference_norm, 0.0);
+    EXPECT_LE(
+        torch::norm(single_output - two_stage_output, 2.0, torch::kFloat32)
+                .item<double>() /
+            reference_norm,
+        rtol);
   }
 
+  bool saved_one_stage_ = false;
+  int32_t saved_max_tokens_ = 0;
   torch::Device device_{torch::kCPU};
 };
 

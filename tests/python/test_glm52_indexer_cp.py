@@ -24,10 +24,8 @@ kernels. S0 contract #6 -- row-internal top-k order varies with batch
 composition -- means the equality assertions compare each row's sorted
 index SET, never a bit-level tensor.
 
-Every test pins the gate explicitly (patching the module-private
-``glm5_2._INDEXER_CP_QUERY_PARTITION`` seam), so the file is independent of
-the ambient environment; the shipped build has the partition always on and
-exposes no environment override.
+Full-stream reference runs use the supported non-CP path and are
+sharded by this test harness for comparison with each CP rank.
 """
 
 from __future__ import annotations
@@ -277,6 +275,10 @@ def _run_select_qli(
     (duck-typed stand-ins) while this harness keeps sharding with the real
     one, and ``has_kv_shard`` marks a shard-aware index cache.
     """
+    if not partition and not non_cp:
+        output, kernel_calls, _ = _run_select_qli(scenario, rank, True, non_cp=True)
+        return cp_utils.cp_shard_rows(output, scenario.contexts[rank]), kernel_calls, [output]
+
     context = scenario.contexts[rank]
     indexer = _make_indexer()
     if non_cp:
@@ -325,7 +327,6 @@ def _run_select_qli(
     )
 
     with (
-        patch.object(glm5_2, "_INDEXER_CP_QUERY_PARTITION", partition),
         patch.object(glm5_2, "_apply_half_rope", side_effect=lambda _cache, value, _positions: value),
         patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
         patch.object(glm5_2, "cp_shard_rows", side_effect=shard_rows),
@@ -347,6 +348,7 @@ def _run_select_qli(
         ([13], 2, 6),
         ([7], 4, 3),
         ([9, 6], 2, 4),
+        ([1], 2, 5),
     ],
 )
 def test_partition_matches_full_stream_for_owned_rows(q_lens: list[int], cp_size: int, prefix: int) -> None:
@@ -359,14 +361,33 @@ def test_partition_matches_full_stream_for_owned_rows(q_lens: list[int], cp_size
     scenario = _Scenario(q_lens, prefix, cp_size)
     for rank in range(cp_size):
         context = scenario.contexts[rank]
-        partitioned, partition_calls, _shard_inputs = _run_select_qli(scenario, rank, partition=True)
+        partitioned, partition_calls, shard_inputs = _run_select_qli(scenario, rank, partition=True)
         full, full_calls, _ = _run_select_qli(scenario, rank, partition=False)
+        full_layout = shard_inputs[0]
+        rows = cp_utils.cp_real_query_rows(context)
+        outside = torch.ones(scenario.total, dtype=torch.bool)
+        outside[rows] = False
+        assert bool((full_layout[outside] == -1).all())
         if context.query_index.numel() == 0:
-            # An empty rank owns no real row: the partition skips the
-            # scoring call while the full stream still runs it.
+            # An empty rank owns no real row: no row reaches scoring, all
+            # scatter slots stay invalid and CP padding restores zeros.
             assert not partition_calls and full_calls
+            assert bool((full_layout == -1).all())
             assert torch.equal(partitioned, full)
+            assert torch.equal(partitioned, torch.zeros_like(partitioned))
             continue
+        assert not bool((full_layout[rows] == -1).all(dim=-1).any())
+        if q_lens == [9, 6] and cp_size == 2 and rank == 1:
+            # This multi-sequence case also pins the per-segment metadata
+            # contract so output equivalence cannot mask wrong segment order.
+            assert context.q_cu_seqlens == [3, 6, 8, 10]
+            assert context.segment_kv_seq_lens == [10, 13, 8, 10]
+            assert context.segment_seq_indices.tolist() == [0, 0, 1, 1]
+            args = partition_calls[0]
+            assert args[3] is context.q_cu_seqlens_tensor
+            assert args[4] is context.segment_kv_seq_lens_tensor
+            assert args[5].shape[0] == len(context.q_cu_seqlens)
+            assert torch.equal(args[5], scenario.block_table.index_select(0, context.segment_seq_indices))
         assert len(partition_calls) == 1 and len(full_calls) == 1
         # Only this rank's real rows are scored, packed per segment.
         assert partition_calls[0][0].shape[0] == context.query_index.numel()
@@ -379,109 +400,6 @@ def test_partition_matches_full_stream_for_owned_rows(q_lens: list[int], cp_size
         padding = ~context.shard_valid_mask
         assert torch.equal(partitioned[padding], full[padding])
         assert torch.equal(partitioned[padding], torch.zeros_like(partitioned[padding]))
-
-
-def test_gate_off_runs_the_byte_identical_full_stream_path() -> None:
-    """The seam off must reproduce the legacy (full-stream) output."""
-    scenario = _Scenario([13], 6, 2)
-    rank = 1
-    context = scenario.contexts[rank]
-    output, calls, _ = _run_select_qli(scenario, rank, partition=False)
-    # The kernel saw the full-stream arguments verbatim: the complete
-    # merged stream and the backend's per-sequence seq tensors and table.
-    args = calls[0]
-    assert args[0].shape[0] == scenario.total
-    assert args[3] is scenario.actual_seq_q
-    assert args[4] is scenario.actual_seq_kv
-    assert args[5] is scenario.block_table
-    # Byte-identical reconstruction of the pre-partition path: one
-    # full-stream kernel call followed by the cp_shard_rows exit.
-    legacy = cp_utils.cp_shard_rows(
-        _reference_lightning_indexer(
-            scenario.global_q,
-            scenario.index_cache,
-            scenario.global_weights,
-            scenario.actual_seq_q,
-            scenario.actual_seq_kv,
-            scenario.block_table,
-            "TND",
-            "PA_BSND",
-            TOPK,
-            3,
-            INT64_MAX,
-            INT64_MAX,
-            False,
-        ),
-        context,
-    )
-    assert torch.equal(output, legacy)
-
-
-def test_partition_scatters_minus_one_outside_owned_rows() -> None:
-    """Non-owned rows stay -1 in the scattered full-layout topk."""
-    scenario = _Scenario([13], 6, 2)
-    rank = 1
-    context = scenario.contexts[rank]
-    _output, _calls, shard_inputs = _run_select_qli(scenario, rank, partition=True)
-    full_layout = shard_inputs[0]
-    assert full_layout.shape[0] == scenario.total
-    rows = cp_utils.cp_real_query_rows(context)
-    outside = torch.ones(scenario.total, dtype=torch.bool)
-    outside[rows] = False
-    assert bool(outside.any())
-    assert bool((full_layout[outside] == -1).all()), "rows outside query_rows must stay -1 in the full-layout topk"
-    # Every owned row still carries a real selection (no all -1 row).
-    assert not bool((full_layout[rows] == -1).all(dim=-1).any())
-
-
-def test_partition_builds_per_segment_metadata_across_sequences() -> None:
-    """design.md open question 2: segments = 2 per sequence.
-
-    A multi-sequence batch packs two (sequence, half) segments per
-    sequence; the seq tensors and the block table must be built per segment
-    across the whole batch, and the partition must still match the full
-    stream.
-    """
-    scenario = _Scenario([9, 6], 4, 2)
-    rank = 1
-    context = scenario.contexts[rank]
-    # Rank 1 owns seq 0's chunks 1 and 2 (rows 3-5 and 6-8, chunk_len 3) plus
-    # seq 1's chunks 1 and 2 (rows 2-3 and 4-5, chunk_len 2): four segments,
-    # two per sequence, packed in (sequence, half) order.
-    assert context.q_cu_seqlens == [3, 6, 8, 10]
-    assert context.segment_kv_seq_lens == [10, 13, 8, 10]
-    assert context.segment_seq_indices.tolist() == [0, 0, 1, 1]
-    partitioned, calls, _ = _run_select_qli(scenario, rank, partition=True)
-    full, _, _ = _run_select_qli(scenario, rank, partition=False)
-    args = calls[0]
-    assert args[3] is context.q_cu_seqlens_tensor
-    assert args[4] is context.segment_kv_seq_lens_tensor
-    assert args[5].shape[0] == len(context.q_cu_seqlens)
-    assert torch.equal(args[5], scenario.block_table.index_select(0, context.segment_seq_indices))
-    assert torch.equal(
-        partitioned[context.query_index].sort(dim=-1).values,
-        full[context.query_index].sort(dim=-1).values,
-    )
-
-
-def test_partition_empty_rank_skips_scoring_and_matches_full_stream() -> None:
-    """A rank can own zero real rows (q_len=1 under cp_size=2: both of rank
-    1's chunks sit past the single real token).
-
-    The partition then skips the scoring call and hands cp_shard_rows the
-    -1-filled full layout; every local row is padding and gets zeroed, so
-    the output matches the full-stream path byte for byte.
-    """
-    scenario = _Scenario([1], 5, 2)
-    context = scenario.contexts[1]
-    assert context.query_index.numel() == 0
-    partitioned, calls, shard_inputs = _run_select_qli(scenario, 1, partition=True)
-    assert not calls
-    assert bool((shard_inputs[0] == -1).all())
-    full, full_calls, _ = _run_select_qli(scenario, 1, partition=False)
-    assert full_calls
-    assert torch.equal(partitioned, full)
-    assert torch.equal(partitioned, torch.zeros_like(partitioned))
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +555,13 @@ def _run_quant_select_qli(
     gate-case meaning as there (``non_cp`` / ``cp_context_override`` /
     ``has_kv_shard``).
     """
+    if not partition and not non_cp:
+        result = _run_quant_select_qli(scenario, rank, True, non_cp=True)
+        return result._replace(
+            output=cp_utils.cp_shard_rows(result.output, scenario.contexts[rank]),
+            shard_inputs=[result.output],
+        )
+
     context = scenario.contexts[rank]
     indexer = _make_indexer()
     if non_cp:
@@ -695,7 +620,6 @@ def _run_quant_select_qli(
     )
 
     with (
-        patch.object(glm5_2, "_INDEXER_CP_QUERY_PARTITION", partition),
         patch.object(glm5_2, "_apply_half_rope", side_effect=lambda _cache, value, _positions: value),
         patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
         patch.object(glm5_2, "cp_shard_rows", side_effect=shard_rows),
@@ -726,6 +650,7 @@ def _run_quant_select_qli(
         ([13], 2, 6),
         ([7], 4, 3),
         ([9, 6], 2, 4),
+        ([1], 2, 5),
     ],
 )
 def test_quant_partition_matches_full_stream_for_owned_rows(
@@ -745,13 +670,21 @@ def test_quant_partition_matches_full_stream_for_owned_rows(
         context = scenario.contexts[rank]
         partitioned = _run_quant_select_qli(scenario, rank, partition=True)
         full = _run_quant_select_qli(scenario, rank, partition=False)
+        full_layout = partitioned.shard_inputs[0]
+        rows = cp_utils.cp_real_query_rows(context)
+        outside = torch.ones(scenario.total, dtype=torch.bool)
+        outside[rows] = False
+        assert bool((full_layout[outside] == -1).all())
         if context.query_index.numel() == 0:
-            # An empty rank owns no real row: the partition skips the
-            # metadata and scoring calls while the full stream runs both.
+            # Empty ranks skip both tiling and scoring; scatter restores zeros.
             assert not partitioned.kernel_calls and not partitioned.metadata_calls
+            assert partitioned.ctx_metadata.call_count == 0
             assert full.kernel_calls
+            assert bool((full_layout == -1).all())
             assert torch.equal(partitioned.output, full.output)
+            assert torch.equal(partitioned.output, torch.zeros_like(partitioned.output))
             continue
+        assert not bool((full_layout[rows] == -1).all(dim=-1).any())
         assert len(partitioned.kernel_calls) == 1 and len(full.kernel_calls) == 1
         rows = cp_utils.cp_real_query_rows(context)
         partition_args = partitioned.kernel_calls[0]
@@ -828,10 +761,11 @@ def test_quant_partition_routes_metadata_through_the_cp_getter() -> None:
     rank = 1
     context = scenario.contexts[rank]
     seen: list[tuple] = []
+    metadata = torch.empty(0)
 
     def cp_getter(*args: object) -> torch.Tensor:
         seen.append(args)
-        return torch.empty(0)
+        return metadata
 
     result = _run_quant_select_qli(scenario, rank, partition=True, cp_metadata_getter=cp_getter)
     # The direct kernel tiling build is skipped entirely on this route.
@@ -849,7 +783,7 @@ def test_quant_partition_routes_metadata_through_the_cp_getter() -> None:
     assert args[5] == TOPK
     assert args[6] == 1  # cmp_ratio
     # The getter's tensor is what reaches the scoring kernel.
-    assert result.kernel_calls[0][5] is not None
+    assert result.kernel_calls[0][5] is metadata
 
 
 def test_quant_partition_shares_one_cp_metadata_build_across_layers() -> None:
@@ -880,89 +814,16 @@ def test_quant_partition_shares_one_cp_metadata_build_across_layers() -> None:
     assert len(builds) == 1, f"expected one tiling build per step, got {len(builds)}"
     assert first.metadata_calls == [] and second.metadata_calls == []
     # Both layers' scoring kernels consume the same cached metadata tensor.
+    assert first.kernel_calls[0][5] is second.kernel_calls[0][5]
+    assert first.kernel_calls[0][5] is cache[builds[0]]
     assert torch.equal(first.output, second.output)
-
-
-def test_quant_partition_empty_rank_skips_scoring_and_matches_full_stream() -> None:
-    """A rank owning zero real rows skips the quant metadata and kernel.
-
-    The partition hands cp_shard_rows the -1-filled full layout; every
-    local row is padding and gets zeroed, so the output matches the
-    full-stream path byte for byte.
-    """
-    scenario = _QuantScenario([1], 5, 2)
-    context = scenario.contexts[1]
-    assert context.query_index.numel() == 0
-    partitioned = _run_quant_select_qli(scenario, 1, partition=True)
-    assert not partitioned.kernel_calls
-    assert not partitioned.metadata_calls
-    assert partitioned.ctx_metadata.call_count == 0
-    assert bool((partitioned.shard_inputs[0] == -1).all())
-    full = _run_quant_select_qli(scenario, 1, partition=False)
-    assert full.kernel_calls
-    assert torch.equal(partitioned.output, full.output)
-    assert torch.equal(partitioned.output, torch.zeros_like(partitioned.output))
-
-
-def test_quant_gate_off_runs_the_byte_identical_full_stream_path() -> None:
-    """The seam off must reproduce the legacy (full-stream) quant output."""
-    scenario = _QuantScenario([13], 6, 2)
-    rank = 1
-    context = scenario.contexts[rank]
-    result = _run_quant_select_qli(scenario, rank, partition=False)
-    # The kernel saw the full-stream arguments verbatim: the complete
-    # merged stream (padded to 64 heads), the ctx helper's metadata and
-    # the backend's per-sequence seq tensors and table.
-    args = result.kernel_calls[0]
-    assert args[0].shape[0] == scenario.total
-    assert args[3].shape[0] == scenario.total
-    assert args[5] is result.ctx_metadata.return_value
-    assert args[6] is scenario.actual_seq_q
-    assert args[7] is scenario.actual_seq_kv
-    assert args[8] is scenario.block_table
-    result.ctx_metadata.assert_called_once_with(glm5_2._QLI_KERNEL_GSIZE, HEAD_DIM, TOPK, 1)
-    assert not result.metadata_calls
-    # Byte-identical reconstruction of the pre-partition path from the
-    # scenario data: quantize the rotated global stream, pad to 64 heads,
-    # score everything, then shard.
-    q_rotated = torch.matmul(scenario.global_q, torch.eye(HEAD_DIM)) * (HEAD_DIM**-0.5)
-    q_quantized, q_scales = _cpu_dynamic_quant(q_rotated)
-    pad_heads = glm5_2._QLI_KERNEL_GSIZE - N_HEAD
-    q_full = torch.cat(
-        [q_quantized, torch.zeros(scenario.total, pad_heads, HEAD_DIM, dtype=torch.int8)],
-        dim=1,
-    )
-    q_scale_full = torch.cat(
-        [q_scales.to(torch.float16), torch.ones(scenario.total, pad_heads, dtype=torch.float16)],
-        dim=1,
-    )
-    weight_scale = HEAD_DIM**-0.5 * N_HEAD**-0.5
-    weights_full = torch.cat([scenario.global_weights, torch.zeros(scenario.total, pad_heads)], dim=1)
-    legacy = cp_utils.cp_shard_rows(
-        _reference_quant_lightning_indexer(
-            q_full,
-            scenario.quant_index_cache,
-            (weights_full * weight_scale).to(torch.float16),
-            q_scale_full,
-            scenario.quant_index_cache_scale,
-            result.ctx_metadata.return_value,
-            scenario.actual_seq_q,
-            scenario.actual_seq_kv,
-            scenario.block_table,
-            TOPK,
-            1,
-        ),
-        context,
-    )
-    assert torch.equal(result.output, legacy)
 
 
 # ---------------------------------------------------------------------------
 # S4 batch: gate completeness. Every fallback branch of alpha_active must
 # run the status-quo full-stream path byte-identically, plus the kv_split
-# replicated positive case (the S3-carried item). Each fallback case pins
-# _INDEXER_CP_QUERY_PARTITION on, so the term under test is the only one
-# that can fail, captures the scoring kernel's call to prove it saw the
+# replicated positive case (the S3-carried item). Each case captures
+# the scoring kernel's call to prove it saw the
 # full-stream arguments, and compares the output with the pre-partition
 # reference; the positive case proves the partitioned call stays active.
 # ---------------------------------------------------------------------------
@@ -974,12 +835,13 @@ class _GateCaseResult(NamedTuple):
     output: torch.Tensor
     kernel_calls: list[tuple]
     shard_inputs: list[torch.Tensor]
+    ctx_metadata: MagicMock | None = None
+    metadata_calls: list[tuple] | None = None
 
 
 def _run_gate_case(
     scenario: _Scenario,
     rank: int,
-    partition: bool,
     *,
     quant: bool,
     has_kv_shard: bool = False,
@@ -991,16 +853,22 @@ def _run_gate_case(
         result = _run_quant_select_qli(
             scenario,
             rank,
-            partition,
+            True,
             has_kv_shard=has_kv_shard,
             non_cp=non_cp,
             cp_context_override=cp_context_override,
         )
-        return _GateCaseResult(result.output, result.kernel_calls, result.shard_inputs)
+        return _GateCaseResult(
+            result.output,
+            result.kernel_calls,
+            result.shard_inputs,
+            result.ctx_metadata,
+            result.metadata_calls,
+        )
     output, kernel_calls, shard_inputs = _run_select_qli(
         scenario,
         rank,
-        partition,
+        True,
         has_kv_shard=has_kv_shard,
         non_cp=non_cp,
         cp_context_override=cp_context_override,
@@ -1020,6 +888,10 @@ def _assert_full_stream_kernel_call(scenario: _Scenario, result: _GateCaseResult
     assert args[0].shape[0] == scenario.total
     if quant:
         assert args[3].shape[0] == scenario.total
+        assert result.ctx_metadata is not None
+        assert args[5] is result.ctx_metadata.return_value
+        result.ctx_metadata.assert_called_once_with(glm5_2._QLI_KERNEL_GSIZE, HEAD_DIM, TOPK, 1)
+        assert result.metadata_calls == []
         assert args[6] is scenario.actual_seq_q
         assert args[7] is scenario.actual_seq_kv
         assert args[8] is scenario.block_table
@@ -1107,7 +979,7 @@ def test_gate_fallback_without_cp_context_runs_full_stream(quant: bool) -> None:
     the global-stream data here; its per-rank contexts are unused.
     """
     scenario = _QuantScenario([13], 6, 2) if quant else _Scenario([13], 6, 2)
-    result = _run_gate_case(scenario, 0, partition=True, quant=quant, non_cp=True)
+    result = _run_gate_case(scenario, 0, quant=quant, non_cp=True)
     _assert_gate_fallback_full_stream(scenario, None, result, quant=quant)
 
 
@@ -1121,7 +993,7 @@ def test_gate_fallback_cp_size_one_runs_full_stream(quant: bool) -> None:
     """
     scenario = _QuantScenario([13], 6, 1) if quant else _Scenario([13], 6, 1)
     context = scenario.contexts[0]
-    result = _run_gate_case(scenario, 0, partition=True, quant=quant)
+    result = _run_gate_case(scenario, 0, quant=quant)
     _assert_gate_fallback_full_stream(scenario, context, result, quant=quant)
 
 
@@ -1148,7 +1020,7 @@ def test_gate_fallback_duck_typed_cp_context_runs_full_stream(quant: bool) -> No
         query_index=context.query_index,
         has_prefix=context.has_prefix,
     )
-    result = _run_gate_case(scenario, rank, partition=True, quant=quant, cp_context_override=stand_in)
+    result = _run_gate_case(scenario, rank, quant=quant, cp_context_override=stand_in)
     _assert_gate_fallback_full_stream(scenario, context, result, quant=quant)
 
 
@@ -1165,7 +1037,7 @@ def test_gate_fallback_acl_graph_capture_runs_full_stream(quant: bool) -> None:
     rank = 1
     context = scenario.contexts[rank]
     with patch.object(glm5_2, "in_acl_graph", return_value=True):
-        result = _run_gate_case(scenario, rank, partition=True, quant=quant)
+        result = _run_gate_case(scenario, rank, quant=quant)
     _assert_gate_fallback_full_stream(scenario, context, result, quant=quant)
 
 
@@ -1184,7 +1056,7 @@ def test_gate_fallback_kv_split_sharded_runs_full_stream(quant: bool) -> None:
     rank = 1
     context = scenario.contexts[rank]
     with patch.object(glm5_2, "cp_index_write_replicated", return_value=False):
-        result = _run_gate_case(scenario, rank, partition=True, quant=quant, has_kv_shard=True)
+        result = _run_gate_case(scenario, rank, quant=quant, has_kv_shard=True)
     _assert_gate_fallback_full_stream(scenario, context, result, quant=quant)
 
 
@@ -1206,7 +1078,7 @@ def test_gate_stays_active_under_kv_split_replicated(quant: bool) -> None:
     context = scenario.contexts[rank]
     assert context.query_index.numel() > 0
     with patch.object(glm5_2, "cp_index_write_replicated", return_value=True):
-        result = _run_gate_case(scenario, rank, partition=True, quant=quant, has_kv_shard=True)
+        result = _run_gate_case(scenario, rank, quant=quant, has_kv_shard=True)
     assert len(result.kernel_calls) == 1
     args = result.kernel_calls[0]
     assert args[0].shape[0] == context.query_index.numel()
@@ -1229,24 +1101,3 @@ def test_gate_stays_active_under_kv_split_replicated(quant: bool) -> None:
     padding = ~context.shard_valid_mask
     assert bool(padding.any())
     assert torch.equal(result.output[padding], legacy[padding])
-
-
-@pytest.mark.parametrize("quant", [False, True], ids=["non-quant", "quant"])
-def test_gate_seam_off_runs_byte_identical_full_stream(quant: bool) -> None:
-    """Gate term ``_INDEXER_CP_QUERY_PARTITION`` (the test-only seam).
-
-    With every other gate term eligible -- CP active with cp_size > 1, a
-    real CpContext, eager execution and a full-replica index cache
-    (has_kv_shard False) -- turning the seam off must reproduce the
-    status-quo path byte for byte. The shipped build pins the seam True and
-    exposes no environment override; this case is the A/B control that keeps
-    the full-stream path covered.
-    """
-    scenario = _QuantScenario([13], 6, 2) if quant else _Scenario([13], 6, 2)
-    rank = 1
-    context = scenario.contexts[rank]
-    assert context.cp_size > 1
-    assert isinstance(context, CpContext)
-    assert not glm5_2.in_acl_graph()
-    result = _run_gate_case(scenario, rank, partition=False, quant=quant)
-    _assert_gate_fallback_full_stream(scenario, context, result, quant=quant)

@@ -16,6 +16,7 @@ limitations under the License.
 #include "core/util/verbose_trace_logger.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
@@ -27,7 +28,7 @@ namespace {
 TEST(VerboseTraceLoggerTest, FlushesQueuedEntryOnShutdown) {
   const std::filesystem::path log_path =
       std::filesystem::temp_directory_path() /
-      "xllm_verbose_trace_logger_test.log";
+      ("xllm_verbose_trace_logger_test_" + std::to_string(getpid()) + ".log");
   std::error_code ec;
   std::filesystem::remove(log_path, ec);
 

@@ -102,11 +102,6 @@ class MooncakeTransferEngineCore {
   proto::MooncakeTransferEngineService_Stub* get_or_create_stub(
       uint64_t cluster_id);
 
-  bool is_initialized() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return initialized_;
-  }
-
  private:
   proto::MooncakeTransferEngineService_Stub* get_or_create_stub_locked(
       uint64_t cluster_id);

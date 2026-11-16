@@ -172,19 +172,6 @@ TEST(AttentionMetadataBuilderTest, GraphCapacityPreservesBatchHistory) {
   }
 }
 
-TEST(AttentionMetadataBuilderTest, MaterializesCanonicalInitialStateMask) {
-  ModelInputParams params = make_params();
-
-  AttentionMetadata metadata =
-      AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
-
-  ASSERT_TRUE(metadata.has_initial_states.defined());
-  EXPECT_EQ(metadata.has_initial_states.scalar_type(), torch::kBool);
-  EXPECT_EQ(metadata.has_initial_states.device(), torch::Device(torch::kCPU));
-  EXPECT_TRUE(torch::equal(metadata.has_initial_states,
-                           torch::tensor({false, true, false}, torch::kBool)));
-}
-
 TEST(AttentionMetadataBuilderTest, LeavesSourceStatePolicyToModel) {
   ModelInputParams params = make_params();
   params.embedding.linear_state_read_ids = {1, 1, 9};
@@ -207,6 +194,9 @@ TEST(AttentionMetadataBuilderTest, DoesNotDeriveValidityFromContextOrSlot) {
   AttentionMetadata metadata =
       AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
 
+  ASSERT_TRUE(metadata.has_initial_states.defined());
+  EXPECT_EQ(metadata.has_initial_states.scalar_type(), torch::kBool);
+  EXPECT_EQ(metadata.has_initial_states.device(), torch::Device(torch::kCPU));
   EXPECT_TRUE(torch::equal(metadata.has_initial_states,
                            torch::tensor({false, true, false}, torch::kBool)));
 }

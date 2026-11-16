@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <c10/core/DeviceGuard.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
@@ -134,53 +135,6 @@ std::vector<int64_t> make_compressed_positions(
   return positions;
 }
 
-torch::Tensor gather_paged_state(const torch::Tensor& paged_state,
-                                 const torch::Tensor& block_table,
-                                 int64_t batch_size,
-                                 int64_t state_len) {
-  torch::Tensor dense = torch::empty(
-      {batch_size, state_len, paged_state.size(2)}, paged_state.options());
-  torch::Tensor block_table_cpu =
-      block_table.to(torch::kCPU).to(torch::kInt64).contiguous();
-  const int64_t block_size = paged_state.size(1);
-  for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-    for (int64_t row_idx = 0; row_idx < state_len; ++row_idx) {
-      const int64_t block_col = row_idx / block_size;
-      const int64_t block_offset = row_idx % block_size;
-      const int64_t block_id =
-          block_table_cpu[seq_idx][block_col].item<int64_t>();
-      dense[seq_idx]
-          .slice(/*dim=*/0, /*start=*/row_idx, /*end=*/row_idx + 1)
-          .copy_(paged_state[block_id].slice(/*dim=*/0,
-                                             /*start=*/block_offset,
-                                             /*end=*/block_offset + 1));
-    }
-  }
-  return dense;
-}
-
-void scatter_paged_state(const torch::Tensor& dense,
-                         const torch::Tensor& paged_state,
-                         const torch::Tensor& block_table,
-                         int64_t state_len) {
-  torch::Tensor block_table_cpu =
-      block_table.to(torch::kCPU).to(torch::kInt64).contiguous();
-  const int64_t batch_size = dense.size(0);
-  const int64_t block_size = paged_state.size(1);
-  for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-    for (int64_t row_idx = 0; row_idx < state_len; ++row_idx) {
-      const int64_t block_col = row_idx / block_size;
-      const int64_t block_offset = row_idx % block_size;
-      const int64_t block_id =
-          block_table_cpu[seq_idx][block_col].item<int64_t>();
-      paged_state[block_id]
-          .slice(/*dim=*/0, /*start=*/block_offset, /*end=*/block_offset + 1)
-          .copy_(dense[seq_idx].slice(
-              /*dim=*/0, /*start=*/row_idx, /*end=*/row_idx + 1));
-    }
-  }
-}
-
 torch::Tensor gather_cache_rows(const torch::Tensor& paged_cache,
                                 const torch::Tensor& slot_mapping,
                                 int64_t head_dim) {
@@ -191,52 +145,16 @@ torch::Tensor gather_cache_rows(const torch::Tensor& paged_cache,
   return dense.index_select(/*dim=*/0, slot_mapping.to(torch::kLong));
 }
 
-void verify_state_rows(const torch::Tensor& actual,
-                       const torch::Tensor& expected,
-                       int64_t seq_idx,
-                       int64_t begin,
-                       int64_t end) {
-  if (begin == end) {
-    return;
-  }
-  test::verify_tensor_close(actual[seq_idx]
-                                .slice(/*dim=*/0, /*start=*/begin, /*end=*/end)
-                                .to(torch::kFloat32),
-                            expected[seq_idx]
-                                .slice(/*dim=*/0, /*start=*/begin, /*end=*/end)
-                                .to(torch::kFloat32),
-                            /*rtol=*/7e-2,
-                            /*atol=*/7e-2);
-}
-
-void verify_live_state(const torch::Tensor& actual,
-                       const torch::Tensor& expected,
-                       const std::vector<int64_t>& start_pos,
-                       int64_t q_len,
-                       int64_t compress_ratio) {
-  for (int64_t seq_idx = 0; seq_idx < static_cast<int64_t>(start_pos.size());
-       ++seq_idx) {
-    const int64_t ctx_len = start_pos[seq_idx] + q_len;
-    const int64_t remainder = ctx_len % compress_ratio;
-    if (compress_ratio == 4 && ctx_len >= compress_ratio) {
-      verify_state_rows(actual, expected, seq_idx, 0, compress_ratio);
-      verify_state_rows(actual,
-                        expected,
-                        seq_idx,
-                        compress_ratio,
-                        compress_ratio + remainder);
-      continue;
-    }
-    verify_state_rows(actual, expected, seq_idx, 0, remainder);
-  }
-}
-
 }  // namespace
 
 class DeepseekV4CompressorTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
     torch::Device torch_device(Platform::type_torch(), 0);
+    device_guard_ = std::make_unique<c10::DeviceGuard>(torch_device);
     Device device(torch_device);
     device.set_seed();
     options_ = torch::TensorOptions()
@@ -346,11 +264,6 @@ class DeepseekV4CompressorTest : public ::testing::Test {
         input_positions.emplace_back(
             static_cast<int32_t>(start_pos[seq_idx] + token_idx));
       }
-    }
-    int64_t output_rows = 0;
-    for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-      output_rows += (start_pos[seq_idx] + q_len) / compress_ratio -
-                     start_pos[seq_idx] / compress_ratio;
     }
     std::vector<int64_t> compressed_pos =
         make_compressed_positions(start_pos, q_len, compress_ratio);
@@ -496,6 +409,14 @@ class DeepseekV4CompressorTest : public ::testing::Test {
                                 expected.output.to(torch::kFloat32),
                                 /*rtol=*/2e-2,
                                 /*atol=*/2e-2);
+      const auto a = actual_result.output.to(torch::kFloat32);
+      const auto e = expected.output.to(torch::kFloat32);
+      const double scale = torch::norm(e).item<double>();
+      if (scale == 0.0) {
+        EXPECT_TRUE(torch::equal(a, e));
+      } else {
+        EXPECT_LE(torch::norm(a - e).item<double>() / scale, 0.02);
+      }
     }
     actual_result.kv_state = expected.kv_state;
     actual_result.score_state = expected.score_state;
@@ -504,6 +425,7 @@ class DeepseekV4CompressorTest : public ::testing::Test {
   }
 
   CompressorConfig config_;
+  std::unique_ptr<c10::DeviceGuard> device_guard_;
   torch::TensorOptions options_;
   torch::TensorOptions int_options_;
 };
@@ -671,6 +593,7 @@ TEST_F(DeepseekV4CompressorTest, Ratio4ChunkedPrefillRotatesOverlap) {
 }
 
 TEST_F(DeepseekV4CompressorTest, Ratio4ChunkedPrefillRotatesIndexerShape) {
+  config_.head_dim = 128;
   test::Dsv4CompressorRefResult state = run_case(/*compress_ratio=*/4,
                                                  /*batch_size=*/1,
                                                  /*q_len=*/5,

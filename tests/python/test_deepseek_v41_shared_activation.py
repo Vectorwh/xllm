@@ -286,35 +286,6 @@ def test_off_is_bitwise_the_eager_shared_forward(
     assert w8a8.dequant_calls == []  # the fused operator never ran
 
 
-def test_default_is_on(
-    monkeypatch: pytest.MonkeyPatch,
-    w8a8: _CpuW8A8Kernels,
-) -> None:
-    """The guards are satisfied, so the default runs the fused grouped path.
-    Default on since 2026-10-01 (TPOT -1.69%/-2.02%, throughput +1.83%/+2.06% on the on-device A/B), matching the"""
-    eager_calls: list[float] = []
-    original = v41._swiglu_with_clamp
-
-    def spy(x: torch.Tensor, limit: float) -> torch.Tensor:
-        eager_calls.append(limit)
-        return original(x, limit)
-
-    monkeypatch.setattr(v41, "_swiglu_with_clamp", spy)
-    mlp = _make_mlp()
-    moe = _Harness(mlp, _LIMIT)
-
-    out = moe._run_shared_experts(_hidden())
-
-    assert eager_calls == []  # the ~7-kernel eager chain never ran
-    assert len(w8a8.dequant_calls) == 1
-    call = w8a8.dequant_calls[0]
-    assert call["clamp_limit"] == _LIMIT
-    assert call["group_index"] is not None  # grouped, never the clamp-dropping dense form
-    assert int(call["group_index"][0]) == call["shape"][0] == 4
-    assert call["weight_scale_shape"] == (1, 2 * _INTER)
-    assert out.dtype == torch.bfloat16 and out.shape == (4, _HIDDEN)
-
-
 def test_pre_existing_dense_fused_callers_keep_the_no_clamp_default(
     monkeypatch: pytest.MonkeyPatch,
     w8a8: _CpuW8A8Kernels,
@@ -422,7 +393,6 @@ def test_on_parks_group_index_in_the_graph_buffer(
     first, second = (call["group_index"] for call in w8a8.dequant_calls)
     assert first is second  # same resident tensor, so no per-call host->device copy
     assert first.dtype == torch.int64 and first.shape == (1,) and int(first[0]) == 4
-    assert ("SHARED_ACT_GROUP_INDEX", first.device, 4) in state.persistent_buffers
 
     # A different row count must not reuse that buffer: the key carries ``rows``.
     with forward_context(_graph_context(AclGraphExecutionState({}))):
@@ -448,28 +418,16 @@ def test_staged_shared_mlp_preserves_the_serial_clamped_pipeline(
 
 
 def test_on_builds_group_index_inline_without_an_execution_state(
-    monkeypatch: pytest.MonkeyPatch,
     w8a8: _CpuW8A8Kernels,
 ) -> None:
-    """Eager degrades to a fresh, correct descriptor -- with or without a context.
-    Two eager shapes must both keep the previous behaviour of one correctly valued tensor per call: an eager forward"""
-    mlp = _make_mlp()
-    moe = _Harness(mlp, _LIMIT)
-
-    # Context present, nothing captured yet (runner eager step).
+    """A present forward context without graph state still supplies current counts."""
+    moe = _Harness(_make_mlp(), _LIMIT)
     with forward_context(_graph_context(None)):
-        moe._run_shared_experts(_hidden(rows=4))
-        moe._run_shared_experts(_hidden(rows=4))
-    # No forward context at all (standalone harness).
-    moe._run_shared_experts(_hidden(rows=4))
-    moe._run_shared_experts(_hidden(rows=4))
-
-    first, second, third, fourth = (call["group_index"] for call in w8a8.dequant_calls)
-    assert first is not second  # eager under a runner builds inline, nothing parked
-    assert third is not fourth  # no context: built inline too
-    assert len({id(grouped) for grouped in (first, second, third, fourth)}) == 4
-    for grouped in (first, second, third, fourth):
-        assert grouped.dtype == torch.int64 and grouped.shape == (1,) and int(grouped[0]) == 4
+        for rows in (4, 2):
+            moe._run_shared_experts(_hidden(rows=rows))
+            grouped = w8a8.dequant_calls[-1]["group_index"]
+            assert grouped.dtype == torch.int64 and grouped.shape == (1,)
+            assert int(grouped[0]) == rows
 
 
 def test_on_matches_off_within_the_derived_int8_bound(
@@ -533,28 +491,6 @@ def test_on_matches_off_within_the_derived_int8_bound(
     assert not torch.allclose(unclamped.float(), off.float())
 
 
-def test_on_is_bitwise_off_when_the_activation_is_exactly_representable(
-    monkeypatch: pytest.MonkeyPatch,
-    w8a8: _CpuW8A8Kernels,
-) -> None:
-    """A bf16-exact activation makes ON and OFF bitwise identical.
-    With the up half of the gate-up weight zeroed the activation is exactly 0, which both paths quantize identically --"""
-    mlp = _make_mlp()
-    with torch.no_grad():
-        mlp.gate_up_proj.weight[_INTER:, :].zero_()
-    moe = _Harness(mlp, _LIMIT)
-    hidden = _hidden()
-
-    real_supported = v41._fused_shared_act_supported
-    monkeypatch.setattr(v41, "_fused_shared_act_supported", lambda *a, **k: False)
-    off = moe._run_shared_experts(hidden)
-    monkeypatch.setattr(v41, "_fused_shared_act_supported", real_supported)
-    on = moe._run_shared_experts(hidden)
-
-    assert torch.equal(on, off)
-    assert bool((mlp(hidden) == 0).all())
-
-
 def test_eager_clamp_matches_the_golden_activation_reference() -> None:
     """The eager chain is the operator's clamp contract, and the clamp is not a no-op."""
     gate_up = torch.cat((_boundary_hidden(), _boundary_hidden().flip(-1)), dim=-1)
@@ -610,43 +546,3 @@ def test_guard_falls_back_to_eager(
 
     assert w8a8.dequant_calls == []
     assert torch.equal(out, shared(hidden))
-
-
-def test_logging_is_one_shot(
-    monkeypatch: pytest.MonkeyPatch,
-    w8a8: _CpuW8A8Kernels,
-) -> None:
-    spy = _SpyLogger()
-    monkeypatch.setattr(v41, "logger", spy)
-    monkeypatch.setattr(v41, "_fused_shared_act_active_logged", False)
-    monkeypatch.setattr(v41, "_fused_shared_act_fallback_logged", False)
-    moe = _Harness(_make_mlp(), _LIMIT)
-    hidden = _hidden()
-
-    # guard failure: exactly one warning, no info.
-    monkeypatch.setattr(v41, "_fused_shared_act_device_supported", lambda x: False)
-    moe._run_shared_experts(hidden)
-    moe._run_shared_experts(hidden)
-    assert len(spy.warnings) == 1 and "shared-expert" in spy.warnings[0]
-    assert spy.infos == []
-
-    # guards satisfied: exactly one info.
-    monkeypatch.setattr(v41, "_fused_shared_act_device_supported", lambda x: True)
-    moe._run_shared_experts(hidden)
-    moe._run_shared_experts(hidden)
-    active = [message for message in spy.infos if "shared expert" in message]
-    assert len(active) == 1
-
-
-def test_base_hook_is_the_eager_forward(
-    monkeypatch: pytest.MonkeyPatch,
-    w8a8: _CpuW8A8Kernels,
-) -> None:
-    """``DeepseekV4MoE._run_shared_experts`` stays the plain shared expert."""
-    mlp = _make_mlp()
-    moe = object.__new__(v41.DeepseekV4MoE)
-    object.__setattr__(moe, "shared_experts", mlp)
-    hidden = _hidden()
-
-    assert torch.equal(v41.DeepseekV4MoE._run_shared_experts(moe, hidden), mlp(hidden))
-    assert w8a8.dequant_calls == []

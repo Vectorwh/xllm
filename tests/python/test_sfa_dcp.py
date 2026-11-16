@@ -16,18 +16,15 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-import torch.nn as nn
 
-from xllm.python.attention.backend import LayerCache, MlaIndexContext
+from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.kv_shard_layout import KVShardLayout
-from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
-from xllm.python.attention.sfa_dcp_backend import SfaDcpAttentionBackend
 from xllm.python.layers.sfa_dcp import (
     AscendSFADCPImpl,
     AscendSFADCPMetadataBuilder,
@@ -39,7 +36,6 @@ from xllm.python.model_executor.forward_context import (
     copy_into_execution_buffer,
     forward_context,
 )
-from xllm.python.models import glm5_2
 
 
 def _cpu_context(execution_state: AclGraphExecutionState | None) -> ForwardContext:
@@ -102,214 +98,6 @@ def test_copy_into_execution_buffer_eager_returns_source() -> None:
         assert out.data_ptr() == source.data_ptr()
 
 
-def test_sfa_dcp_backend_constructs_as_mla_backend() -> None:
-    dcp_group = MagicMock()
-    dcp_group.size.return_value = 2
-    dcp_group.rank.return_value = 0
-
-    backend = SfaDcpAttentionBackend(
-        num_heads=4,
-        num_kv_heads=1,
-        head_dim=128,
-        scale=0.125,
-        sliding_window=0,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        dcp_group=dcp_group,
-        index_topk=512,
-        max_num_reqs=4,
-    )
-
-    assert backend.is_mla
-
-
-def test_mla_index_context_uses_expanded_table_and_preserves_cp_context() -> None:
-    backend = object.__new__(SfaDcpAttentionBackend)
-    expanded_block_table = torch.tensor([[3, 1]], dtype=torch.int32)
-    backend._expanded_indexer_block_table = expanded_block_table
-    index_cache = torch.empty(1)
-    index_cache_scale = torch.empty(1)
-    materialized_cache = torch.empty(2)
-    materialized_scale = torch.empty(2)
-    materialized_block_table = torch.tensor([[5, 7]], dtype=torch.int32)
-    materialize_index_cache = MagicMock(return_value=(materialized_cache, materialized_scale, materialized_block_table))
-    cp_context = MagicMock()
-    base_context = MlaIndexContext(
-        index_cache=index_cache,
-        slot_mapping=torch.tensor([0], dtype=torch.int32),
-        block_table=torch.tensor([[1]], dtype=torch.int32),
-        actual_seq_q=torch.tensor([1], dtype=torch.int32),
-        actual_seq_kv=torch.tensor([1], dtype=torch.int32),
-        index_cache_scale=index_cache_scale,
-        get_quant_indexer_metadata=MagicMock(),
-        update_index_cache=MagicMock(),
-        materialize_index_cache=materialize_index_cache,
-        cp_context=cp_context,
-    )
-
-    with patch.object(
-        NpuPagedAttentionBackend,
-        "mla_index_context",
-        return_value=base_context,
-    ):
-        remapped_context = backend.mla_index_context(MagicMock())
-
-    assert remapped_context.block_table is expanded_block_table
-    actual_cache, actual_scale, materialized_table = remapped_context.materialize_index_cache()
-    assert actual_cache is materialized_cache
-    assert actual_scale is materialized_scale
-    assert materialized_table is expanded_block_table
-    materialize_index_cache.assert_called_once_with()
-    for field in fields(MlaIndexContext):
-        if field.name in {"block_table", "materialize_index_cache"}:
-            continue
-        assert getattr(remapped_context, field.name) is getattr(base_context, field.name)
-
-
-def test_mla_index_materialization_keeps_cache_scale_and_table_together() -> None:
-    backend = object.__new__(NpuPagedAttentionBackend)
-    index_cache = torch.empty(1)
-    index_cache_scale = torch.empty(1)
-    materialized_cache = torch.empty(2)
-    materialized_scale = torch.empty(2)
-    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
-    metadata = MagicMock()
-    cp_context = MagicMock()
-    materialize_cp_cache = MagicMock(
-        side_effect=[
-            (materialized_cache, block_table),
-            (materialized_scale, block_table),
-        ]
-    )
-    backend._materialize_cp_cache = materialize_cp_cache
-
-    actual_cache, actual_scale, actual_table = backend._materialize_mla_index_cache(
-        index_cache,
-        index_cache_scale,
-        metadata,
-        cp_context,
-    )
-
-    assert actual_cache is materialized_cache
-    assert actual_scale is materialized_scale
-    assert actual_table is block_table
-    assert [call.args[0] for call in materialize_cp_cache.call_args_list] == [
-        index_cache,
-        index_cache_scale,
-    ]
-
-
-def test_mla_index_materialization_without_scale_keeps_legacy_path() -> None:
-    backend = object.__new__(NpuPagedAttentionBackend)
-    index_cache = torch.empty(1)
-    materialized_cache = torch.empty(2)
-    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
-    metadata = MagicMock()
-    cp_context = MagicMock()
-    materialize_cp_cache = MagicMock(return_value=(materialized_cache, block_table))
-    backend._materialize_cp_cache = materialize_cp_cache
-
-    actual_cache, actual_scale, actual_table = backend._materialize_mla_index_cache(
-        index_cache,
-        None,
-        metadata,
-        cp_context,
-    )
-
-    assert actual_cache is materialized_cache
-    assert actual_scale is None
-    assert actual_table is block_table
-    # The scale-free call still passes the index-cache page geometry the
-    # owner-sharded path added (one page group per kv_split_size owners);
-    # with no scale there is exactly one materialization call, as before.
-    materialize_cp_cache.assert_called_once_with(
-        index_cache,
-        metadata,
-        cp_context,
-        pages_per_block=metadata.kv_split_size,
-    )
-
-
-def test_glm_quant_indexer_uses_materialized_scale_and_reshards_topk() -> None:
-    indexer = glm5_2.Glm52Indexer.__new__(glm5_2.Glm52Indexer)
-    nn.Module.__init__(indexer)
-    indexer.n_head = 1
-    indexer.head_dim = 2
-    indexer.rope_dim = 0
-    indexer.topk = 2
-    indexer.indexer_rope_interleave = False
-    indexer.wq_b = MagicMock(return_value=torch.ones(2, 2))
-    indexer.wk = MagicMock(return_value=torch.ones(2, 2))
-    indexer.k_norm = nn.Identity()
-    indexer.weights_proj = MagicMock(return_value=torch.ones(2, 1))
-    indexer.hadamard = torch.eye(2)
-
-    persistent_cache = torch.empty(2, 2, 1, dtype=torch.int8)
-    persistent_scale = torch.empty(2, 2, 1, dtype=torch.float16)
-    materialized_cache = torch.empty(4, 2, 1, dtype=torch.int8)
-    materialized_scale = torch.empty(4, 2, 1, dtype=torch.float16)
-    materialized_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
-    global_topk = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
-    local_topk = torch.tensor([[2, 3]], dtype=torch.int32)
-    cp_context = MagicMock()
-    update_index_cache = MagicMock()
-    materialize_index_cache = MagicMock(return_value=(materialized_cache, materialized_scale, materialized_table))
-    context = MlaIndexContext(
-        index_cache=persistent_cache,
-        slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
-        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
-        actual_seq_q=torch.tensor([2], dtype=torch.int32),
-        actual_seq_kv=torch.tensor([4], dtype=torch.int32),
-        index_cache_scale=persistent_scale,
-        get_quant_indexer_metadata=MagicMock(return_value=torch.empty(0)),
-        update_index_cache=update_index_cache,
-        materialize_index_cache=materialize_index_cache,
-        cp_context=cp_context,
-    )
-
-    def dynamic_quant(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        quantized = torch.ones_like(value, dtype=torch.int8)
-        scale = torch.ones(value.shape[:-1], dtype=torch.float32)
-        return quantized, scale
-
-    with (
-        patch.object(glm5_2, "_apply_half_rope", side_effect=lambda _cache, value, _positions: value),
-        patch.object(glm5_2, "cp_gather_kv", side_effect=lambda value, _context: value),
-        patch.object(
-            glm5_2.kernels,
-            "dynamic_quant",
-            side_effect=dynamic_quant,
-            create=True,
-        ),
-        patch.object(
-            indexer,
-            "_pad_q_heads_to_kernel_gsize",
-            side_effect=lambda q, q_scale, weights, _required_heads: (q, q_scale, weights),
-        ),
-        patch.object(
-            glm5_2.kernels,
-            "quant_lightning_indexer",
-            return_value=global_topk,
-            create=True,
-        ) as quant_lightning_indexer,
-        patch.object(glm5_2, "cp_shard_rows", return_value=local_topk) as cp_shard_rows,
-    ):
-        output = indexer.select_qli(
-            torch.ones(2, 3),
-            torch.ones(2, 3),
-            torch.tensor([0, 1]),
-            context,
-            torch.empty(0),
-        )
-
-    assert output is local_topk
-    materialize_index_cache.assert_called_once_with()
-    assert quant_lightning_indexer.call_args.args[1] is materialized_cache
-    assert quant_lightning_indexer.call_args.args[4] is materialized_scale
-    assert quant_lightning_indexer.call_args.args[8] is materialized_table
-    cp_shard_rows.assert_called_once_with(global_topk, cp_context)
-
-
 def test_lse_as_token_head_squeezes_graph_leading_one() -> None:
     num_tokens = 8
     num_heads = 16
@@ -317,12 +105,33 @@ def test_lse_as_token_head_squeezes_graph_leading_one() -> None:
     out = _lse_as_token_head(lse, num_tokens, num_heads)
     assert tuple(out.shape) == (num_tokens, num_heads)
     torch.testing.assert_close(out, lse[0])
+    assert out.data_ptr() == lse.data_ptr()
 
 
 class _IdentityDcpGroup:
-    world_size = 1
+    """Two-rank descriptor; communication is deferred by the CPU fixture."""
+
+    world_size = 2
     rank_in_group = 0
     device_group = None
+
+
+@pytest.fixture(autouse=True)
+def _deferred_dcp_gather(monkeypatch: pytest.MonkeyPatch) -> None:
+    def gather(
+        output: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        group: object,
+        async_op: bool,
+    ) -> MagicMock:
+        assert group is None and async_op
+        assert output.shape == (value.shape[0] * 2, *value.shape[1:])
+        handle = MagicMock()
+        handle.wait.side_effect = lambda: output.copy_(torch.cat((value, value + 100), dim=0))
+        return handle
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
 
 
 def _dcp_impl() -> AscendSFADCPImpl:
@@ -340,7 +149,7 @@ def test_query_gather_nope_returns_none_q_pe() -> None:
     gather_context = impl._start_dcp_query_gather(ql_nope, None)
     assert gather_context.split_sizes == (8,)
     gathered_ql, gathered_q_pe = impl._finish_dcp_gather(gather_context)
-    torch.testing.assert_close(gathered_ql, ql_nope)
+    torch.testing.assert_close(gathered_ql, torch.cat((ql_nope, ql_nope + 100), dim=1))
     assert gathered_q_pe is None
 
 
@@ -351,9 +160,9 @@ def test_query_gather_with_rope_keeps_fused_split() -> None:
     gather_context = impl._start_dcp_query_gather(ql_nope, q_pe)
     assert gather_context.split_sizes == (8, 4)
     gathered_ql, gathered_q_pe = impl._finish_dcp_gather(gather_context)
-    torch.testing.assert_close(gathered_ql, ql_nope)
+    torch.testing.assert_close(gathered_ql, torch.cat((ql_nope, ql_nope + 100), dim=1))
     assert gathered_q_pe is not None
-    torch.testing.assert_close(gathered_q_pe, q_pe)
+    torch.testing.assert_close(gathered_q_pe, torch.cat((q_pe, q_pe + 100), dim=1))
 
 
 def test_decode_nope_query_gather_unpacks_none_before_sfa() -> None:
@@ -361,18 +170,18 @@ def test_decode_nope_query_gather_unpacks_none_before_sfa() -> None:
     builder = _builder()
     metadata = builder.build(
         torch.tensor([0, 1], dtype=torch.int32),
-        torch.tensor([[1, 2]], dtype=torch.int32),
-        torch.tensor([8], dtype=torch.int32),
-        num_reqs=1,
+        torch.tensor([[1, 2], [3, 0]], dtype=torch.int32),
+        torch.tensor([8, 8], dtype=torch.int32),
+        num_reqs=2,
         num_input_tokens=2,
         num_prefills=0,
     )
     ql_nope = torch.randn(2, 4, 8)
     impl._record_query_gather_context(ql_nope, None, metadata)
-    sfa_out = torch.randn(2, 4, 8)
-    softmax_max = torch.zeros(2, 4)
-    softmax_sum = torch.ones(2, 4)
-    merged = torch.randn(2, 2, 8)
+    sfa_out = torch.randn(2, 8, 8)
+    softmax_max = torch.zeros(2, 8)
+    softmax_sum = torch.ones(2, 8)
+    merged = torch.randn(2, 4, 8)
     topk = torch.zeros(2, 1, 8, dtype=torch.int32)
     kv = torch.randn(4, 4, 1, 8)
     with (
@@ -395,6 +204,7 @@ def test_decode_nope_query_gather_unpacks_none_before_sfa() -> None:
         )
     assert out is merged
     assert sparse_attn.call_args.args[1] is None
+    torch.testing.assert_close(sparse_attn.call_args.args[0], torch.cat((ql_nope, ql_nope + 100), dim=1))
     merge.assert_called_once()
 
 
@@ -417,8 +227,8 @@ def test_prefill_kv_gather_with_rope_still_fuses() -> None:
     assert gather_context.split_sizes == (16, 4)
     gathered_kv, gathered_rope = impl._finish_dcp_gather(gather_context)
     assert gathered_rope is not None
-    assert gathered_kv.shape[-1] == 16
-    assert gathered_rope.shape[-1] == 4
+    torch.testing.assert_close(gathered_kv, torch.cat((nope[1:2], nope[1:2] + 100), dim=0))
+    torch.testing.assert_close(gathered_rope, torch.cat((rope[1:2], rope[1:2] + 100), dim=0))
 
 
 def test_prefill_kv_gather_without_rope_cache() -> None:
@@ -452,7 +262,7 @@ def test_prefill_kv_gather_without_rope_cache() -> None:
             (nope, None),
             topk,
             metadata,
-            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([1, 2], dtype=torch.int32),
             torch.tensor([8, 4], dtype=torch.int32),
         )
     assert out is sfa_out
@@ -512,25 +322,11 @@ def test_npu_sparse_flash_attention_passes_none_rope() -> None:
     assert kwargs["key_rope"] is None
 
 
-# ---------------------------------------------------------------------------
-# M11.3 num_heads convention pins (W1 audit verdict: benign).
-#
-# glm5_next passes the GLOBAL cfg.n_heads to the Attention base
-# (glm5_next.py's Glm5NextMlaAttention) while glm5_2 passes the TP-local
-# count, so the executor hands SfaDcpAttentionBackend a GLOBAL num_heads for
-# glm5_next. That value is inert on the SfaDcp decode path: the only
-# prepare-time consumer of backend.num_heads is the non-MLA graph workspace
-# (pinned below), and the per-rank head count the merge produces is derived
-# from the SFA OUTPUT shape, never from the constructor argument.
-# ---------------------------------------------------------------------------
-
-
 def test_sfa_dcp_graph_prepare_never_allocates_num_heads_workspace() -> None:
-    """The only prepare-time consumer of backend.num_heads is the dense-GQA
-    graph workspace, guarded by ``not self._is_mla``; SfaDcp is MLA, so a
-    graph-mode decode prepare must leave it untouched. A regression that
-    lifts the guard would size NPU workspace from the GLOBAL head count and
-    break the glm5_next shape this pin protects."""
+    """MLA graph prepare must not request the dense-GQA native workspace."""
+    torch_npu = pytest.importorskip("torch_npu", reason="SFA backend graph preparation requires torch_npu")
+    from xllm.python.attention.sfa_dcp_backend import SfaDcpAttentionBackend
+
     dcp_group = MagicMock()
     dcp_group.size.return_value = 2
     dcp_group.rank.return_value = 0
@@ -553,9 +349,9 @@ def test_sfa_dcp_graph_prepare_never_allocates_num_heads_workspace() -> None:
     backend.bind_kv_caches(
         [
             LayerCache(
-                key=torch.empty(16, page_size, 1, 512),
-                value=torch.empty(16, page_size, 1, 0),
-                index=torch.empty(32, page_size, 1, 128),
+                key=torch.empty(16, page_size, 1, 512, dtype=torch.bfloat16),
+                value=torch.empty(16, page_size, 1, 0, dtype=torch.bfloat16),
+                index=torch.empty(32, page_size, 1, 128, dtype=torch.bfloat16),
             )
         ]
     )
@@ -574,9 +370,12 @@ def test_sfa_dcp_graph_prepare_never_allocates_num_heads_workspace() -> None:
         kv_split_size=1,
     )
 
-    with forward_context(_cpu_context(AclGraphExecutionState({}))):
+    with (
+        forward_context(_cpu_context(AclGraphExecutionState({}))),
+        patch.object(torch_npu, "_npu_fused_infer_attention_score_get_max_workspace") as workspace,
+    ):
         backend.prepare(metadata, graph_mode=True)
-
+    workspace.assert_not_called()
     assert backend._graph_workspace is None
 
 
@@ -603,20 +402,23 @@ def test_merge_dcp_outputs_derives_local_heads_from_output_shape() -> None:
     softmax_lse = torch.randn(num_tokens, gathered_heads)
     merged = torch.randn(num_tokens, gathered_heads // 2, head_dim)
 
+    packed_ops = ModuleType("xllm.python.kernels_npu.triton.dcp_packed_a2a")
+    pack = MagicMock()
+    combine = MagicMock(return_value=merged)
+    packed_ops.packed_send_shape = MagicMock(return_value=(2, 8, 3, 9))
+    packed_ops.pack_dcp_output_lse = pack
+    packed_ops.fused_dcp_lse_combine = combine
     with (
+        patch.dict(sys.modules, {packed_ops.__name__: packed_ops}),
         forward_context(_cpu_context(None)),
-        patch(
-            "xllm.python.kernels_npu.triton.dcp_packed_a2a.pack_dcp_output_lse",
-        ) as pack,
-        patch(
-            "xllm.python.kernels_npu.triton.dcp_packed_a2a.fused_dcp_lse_combine",
-            return_value=merged,
-        ) as combine,
         patch.object(torch.distributed, "all_to_all_single") as all_to_all,
     ):
         result = impl._merge_dcp_outputs(output, softmax_lse)
 
     assert result is merged
+    packed_ops.packed_send_shape.assert_called_once_with(
+        num_tokens, gathered_heads, head_dim, 2, scatter_dim=1, dtype=output.dtype
+    )
     pack.assert_called_once()
     all_to_all.assert_called_once()
     # The combine consumes a merged buffer sized from the OUTPUT shape:

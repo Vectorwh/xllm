@@ -16,15 +16,23 @@ from __future__ import annotations
 
 import sys
 import types
+from importlib.util import find_spec
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
-sys.modules.setdefault("torch_npu", types.ModuleType("torch_npu"))
-
-from xllm.python.attention import npu_paged_attention as npu_paged_attention_module  # noqa: E402
+# CPU metadata/ownership tests only. Restore the optional import placeholder
+# immediately, so later real-device suites cannot mistake it for torch_npu.
+if "torch_npu" not in sys.modules and find_spec("torch_npu") is None:
+    sys.modules["torch_npu"] = types.ModuleType("torch_npu")
+    try:
+        from xllm.python.attention import npu_paged_attention as npu_paged_attention_module
+    finally:
+        del sys.modules["torch_npu"]
+else:
+    from xllm.python.attention import npu_paged_attention as npu_paged_attention_module
 from xllm.python.attention.backend import resolve_linear_state_io_indices  # noqa: E402
 from xllm.python.attention.kv_shard_layout import (  # noqa: E402
     KVShardLayout,

@@ -18,10 +18,27 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace xllm {
 namespace {
+
+std::shared_ptr<DiTRequest> make_dit_request(
+    const std::string& request_id,
+    DiTRequestKind kind,
+    DiTGenerationParams generation_params) {
+  DiTInputParams inputs;
+  inputs.prompt = request_id;
+  DiTRequestState state(std::move(inputs),
+                        std::move(generation_params),
+                        DiTOutputFunc{},
+                        DiTOutputsFunc{},
+                        kind);
+  return std::make_shared<DiTRequest>(
+      request_id, "rid", "rtime", std::move(state));
+}
 
 TEST(DiTBatchTest, SingleRequestSourcesUseBatchViews) {
   DiTInputParams input_params;
@@ -60,6 +77,40 @@ TEST(DiTBatchTest, SingleRequestSourcesUseBatchViews) {
   EXPECT_EQ(batched_image.data_ptr(), image.data_ptr());
   EXPECT_EQ(batched_embed.data_ptr(), prompt_embed.data_ptr());
   EXPECT_EQ(batched_audio.data_ptr(), prompt_audio.data_ptr());
+}
+
+TEST(DiTBatchTest, ImageBatchChecksWorkerParametersNotResponseEncoding) {
+  DiTGenerationParams first;
+  first.num_inference_steps = 20;
+  DiTGenerationParams second = first;
+  second.output_type = "binary";
+  DiTBatch compatible;
+  compatible.add(make_dit_request("first", DiTRequestKind::kImage, first));
+  compatible.add(make_dit_request("second", DiTRequestKind::kImage, second));
+  const DiTForwardInput input = compatible.prepare_forward_input();
+  EXPECT_EQ(input.batch_size, 2);
+  EXPECT_EQ(input.prompts, (std::vector<std::string>{"first", "second"}));
+  EXPECT_EQ(input.generation_params.num_inference_steps, 20);
+
+  second.num_inference_steps = 21;
+  DiTBatch incompatible;
+  incompatible.add(make_dit_request("first", DiTRequestKind::kImage, first));
+  incompatible.add(make_dit_request("second", DiTRequestKind::kImage, second));
+  EXPECT_DEATH(incompatible.prepare_forward_input(),
+               "DiT generation params must be equal");
+}
+
+TEST(DiTBatchTest, RejectsMultipleTextRequests) {
+  DiTGenerationParams params;
+  DiTBatch single;
+  single.add(make_dit_request("text", DiTRequestKind::kText, params));
+  const DiTForwardInput input = single.prepare_forward_input();
+  EXPECT_EQ(input.batch_size, 1);
+  EXPECT_EQ(input.prompts, (std::vector<std::string>{"text"}));
+
+  single.add(make_dit_request("other", DiTRequestKind::kText, params));
+  EXPECT_DEATH(single.prepare_forward_input(),
+               "text generation supports batch_size=1 only");
 }
 
 }  // namespace

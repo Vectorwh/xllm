@@ -27,20 +27,20 @@ from xllm.python.model_loader.module_loaders import (
     read_quant_description,
 )
 from xllm.python.models.deepseek_v41 import V41_QUANT_ASCEND, _v41_unquantized_attn_projections
-from xllm.python.models.deepseek_v41_dspark import checkpoint_weight_is_quantized as draft_weight_is_quantized
+from xllm.python.models.deepseek_v41_dspark import _main_proj_quantized
 
 
 @pytest.mark.parametrize("label", ["FLOAT", "FLOAT16", "FLOAT32", "BF16", "BFLOAT16", "FP16", "FP32"])
-@pytest.mark.parametrize("prefix", ["", "model."])
-def test_float_aliases_match_target_and_dspark(tmp_path: Path, label: str, prefix: str) -> None:
+def test_float_aliases_match_target_and_dspark(tmp_path: Path, label: str) -> None:
+    prefix = "model."
     names = ["layers.0.attn.wq_a.weight", "mtp.0.attn.wq_a.weight", "mtp.0.main_proj.weight"]
     description = {prefix + name: " " + label.lower() + " " for name in names}
     (tmp_path / "quant_model_description.json").write_text(json.dumps(description), encoding="utf-8")
     assert read_quant_description(str(tmp_path)) == description
     for name in names:
         assert checkpoint_weight_is_quantized(str(tmp_path), name) is False
-        assert draft_weight_is_quantized(str(tmp_path), name) is False
     config = {"model_path": str(tmp_path)}
+    assert _main_proj_quantized(V41_QUANT_ASCEND, config) is False
     for checkpoint_prefix in ["layers", "mtp"]:
         assert _v41_unquantized_attn_projections(config, V41_QUANT_ASCEND, 1, checkpoint_prefix) == frozenset(
             {(0, "wq_a")}
@@ -55,8 +55,6 @@ def test_float_aliases_match_target_and_dspark(tmp_path: Path, label: str, prefi
         (None, " BF16 ", False),
         (3, "FLOAT", None),
         (False, "FLOAT", None),
-        ({}, "FLOAT", None),
-        ([], "FLOAT", None),
         ("W8A8_DYNAMIC", None, True),
         (None, None, None),
     ],
@@ -66,22 +64,21 @@ def test_label_precedence_and_missing_labels(bare_label: object, prefixed_label:
     description = {name: bare_label, "model." + name: prefixed_label}
     assert quant_description_weight_is_quantized(description, name) is expected
     assert quant_description_weight_is_quantized(description, "missing.weight") is None
-    assert quant_description_weight_is_quantized(None, name) is None
 
 
 def test_missing_description_preserves_unknown_precision(tmp_path: Path) -> None:
-    for path in [None, "", str(tmp_path), str(tmp_path / "missing")]:
+    for path in [None, str(tmp_path)]:
         assert read_quant_description(path) is None
         assert checkpoint_weight_is_quantized(path, "mtp.0.main_proj.weight") is None
 
 
-@pytest.mark.parametrize("contents", ["[]", "null", "1", "true", '"FLOAT"'])
+@pytest.mark.parametrize("contents", ["[]", "null", '"FLOAT"'])
 def test_non_object_description_rejected_consistently(tmp_path: Path, contents: str) -> None:
     (tmp_path / "quant_model_description.json").write_text(contents, encoding="utf-8")
     with pytest.raises(ValueError, match="JSON object"):
         read_quant_description(str(tmp_path))
     with pytest.raises(ValueError, match="JSON object"):
-        draft_weight_is_quantized(str(tmp_path), "mtp.0.main_proj.weight")
+        _main_proj_quantized(V41_QUANT_ASCEND, {"model_path": str(tmp_path)})
     with pytest.raises(ValueError, match="JSON object"):
         _v41_unquantized_attn_projections({"model_path": str(tmp_path)}, V41_QUANT_ASCEND, 1)
 

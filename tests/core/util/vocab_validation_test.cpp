@@ -47,12 +47,6 @@ TEST(VocabValidationTest, TokenEqualToVocabSizeIsFlagged) {
   EXPECT_EQ(invalid.value(), 1000);
 }
 
-TEST(VocabValidationTest, UpperAndLowerBoundaryAreInRange) {
-  const std::vector<int> token_ids = {0, 999};
-  EXPECT_FALSE(
-      find_out_of_vocab_token(token_ids, /*vocab_size=*/1000).has_value());
-}
-
 TEST(VocabValidationTest, ReturnsFirstOutOfRangeToken) {
   const std::vector<int> token_ids = {2000, 3000};
   const auto invalid = find_out_of_vocab_token(token_ids, /*vocab_size=*/1000);

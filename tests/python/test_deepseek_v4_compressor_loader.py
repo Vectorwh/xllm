@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 from xllm.python.models import deepseek_v4
-from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
+from xllm.python.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
 
 
 def test_compressor_loader_accepts_split_native_projection_aliases() -> None:
@@ -124,7 +123,7 @@ def test_load_weights_routes_compressor_aliases_through_loader(
     layer.mlp = torch.nn.Module()
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     torch.nn.Module.__init__(model)
-    model.cfg = SimpleNamespace(tp_size=1, tp_rank=0, n_layers=1, n_heads=1)
+    model.cfg = DeepseekV4Config(tp_size=1, tp_rank=0, n_layers=1, n_heads=1)
     model.model = torch.nn.Module()
     model.model.layers = torch.nn.ModuleList([layer])
 

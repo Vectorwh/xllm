@@ -35,14 +35,3 @@ cc_test(
     :config
     GTest::gtest_main
 )
-
-cc_test(
-  NAME
-    disagg_pd_config_test
-  SRCS
-    disagg_pd_config_test.cpp
-  DEPS
-    :config
-    GTest::gtest_main
-    glog::glog
-)

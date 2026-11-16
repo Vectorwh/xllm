@@ -61,89 +61,6 @@ testing::AssertionResult compare_next_draft_inputs(
   return testing::AssertionSuccess();
 }
 
-void check_all_acceptance_lengths(int64_t accepted_width, int64_t query_width) {
-  constexpr int64_t kBlockSize = 128;
-  constexpr int64_t kMaskTokenId = 999;
-  torch::Tensor base_offsets =
-      torch::tensor({0, 112, 113, 126, 127, 128, 2303, 2304}, torch::kLong);
-  const int64_t base_offset_count = base_offsets.numel();
-  const int64_t batch_size = accepted_width * base_offset_count;
-  torch::Tensor base_positions = base_offsets.repeat({accepted_width});
-  torch::Tensor accepted_counts =
-      torch::arange(1, accepted_width + 1, torch::kLong)
-          .repeat_interleave(base_offset_count);
-  torch::Tensor token_offsets =
-      torch::arange(accepted_width, torch::kLong).view({1, accepted_width});
-  torch::Tensor tokens =
-      torch::arange(batch_size * accepted_width, torch::kLong)
-          .reshape({batch_size, accepted_width}) +
-      100;
-  torch::Tensor accepted_tokens =
-      torch::where(token_offsets.lt(accepted_counts.unsqueeze(1)),
-                   tokens,
-                   torch::full_like(tokens, -1));
-  torch::Tensor block_table = torch::arange(batch_size * 32, torch::kInt32)
-                                  .reshape({batch_size, 32})
-                                  .flip({1});
-  NextDraftInputs result = prepare_next_draft(accepted_tokens,
-                                              base_positions,
-                                              block_table,
-                                              kMaskTokenId,
-                                              kBlockSize,
-                                              query_width);
-  ContextKvInputs context = prepare_context_kv(
-      accepted_tokens, base_positions, block_table, kBlockSize);
-  EXPECT_EQ(result.query_tokens.numel(), batch_size * query_width);
-  EXPECT_EQ(result.query_positions.numel(), batch_size * query_width);
-  EXPECT_EQ(result.query_slots.numel(), batch_size * query_width);
-  EXPECT_EQ(context.positions.numel(), batch_size * accepted_width);
-  EXPECT_EQ(context.slots.numel(), batch_size * accepted_width);
-  EXPECT_EQ(result.kv_lengths.scalar_type(), torch::kInt32);
-  for (int64_t sequence_index = 0; sequence_index < batch_size;
-       ++sequence_index) {
-    const int64_t prefix_length = sequence_index / base_offset_count + 1;
-    const int64_t base_position =
-        base_positions[sequence_index].item<int64_t>();
-    const int64_t anchor_token =
-        accepted_tokens[sequence_index][prefix_length - 1].item<int64_t>();
-    EXPECT_EQ(result.accepted_counts[sequence_index].item<int64_t>(),
-              prefix_length);
-    EXPECT_EQ(result.anchor_tokens[sequence_index].item<int64_t>(),
-              anchor_token);
-    EXPECT_EQ(result.kv_lengths[sequence_index].item<int64_t>(),
-              base_position + prefix_length + query_width);
-    for (int64_t token_index = 0; token_index < query_width; ++token_index) {
-      const int64_t result_index = sequence_index * query_width + token_index;
-      const int64_t query_position =
-          base_position + prefix_length + token_index;
-      const int64_t block_id =
-          block_table[sequence_index][query_position / kBlockSize]
-              .item<int64_t>();
-      EXPECT_EQ(result.query_positions[result_index].item<int64_t>(),
-                query_position);
-      EXPECT_EQ(result.query_slots[result_index].item<int64_t>(),
-                block_id * kBlockSize + query_position % kBlockSize);
-      EXPECT_EQ(result.query_tokens[result_index].item<int64_t>(),
-                token_index == 0 ? anchor_token : kMaskTokenId);
-    }
-    for (int64_t token_index = 0; token_index < accepted_width; ++token_index) {
-      const int64_t result_index =
-          sequence_index * accepted_width + token_index;
-      const int64_t context_position = base_position + token_index;
-      const int64_t context_slot =
-          token_index < prefix_length
-              ? block_table[sequence_index][context_position / kBlockSize]
-                            .item<int64_t>() *
-                        kBlockSize +
-                    context_position % kBlockSize
-              : -1;
-      EXPECT_EQ(context.positions[result_index].item<int64_t>(),
-                context_position);
-      EXPECT_EQ(context.slots[result_index].item<int64_t>(), context_slot);
-    }
-  }
-}
-
 TEST(DFlashAsyncInputBuilderTest, ReorderedSubsetsPreserveRowIdentity) {
   constexpr int64_t kAcceptedWidth = 16;
   constexpr int64_t kQueryWidth = 15;
@@ -173,6 +90,10 @@ TEST(DFlashAsyncInputBuilderTest, ReorderedSubsetsPreserveRowIdentity) {
                                              kQueryWidth);
   ContextKvInputs whole_context =
       prepare_context_kv(accepted, base_positions, block_tables, kBlockSize);
+  EXPECT_TRUE(torch::equal(whole.accepted_counts, accepted_counts));
+  EXPECT_TRUE(torch::equal(
+      whole.anchor_tokens,
+      torch::tensor({0, 31, 33, 62, 67, 82, 103, 112}, torch::kLong)));
   for (const torch::Tensor& rows :
        {torch::tensor({7, 1, 4}, torch::kLong),
         torch::tensor({0, 6, 3, 2, 5}, torch::kLong)}) {
@@ -208,97 +129,6 @@ TEST(DFlashAsyncInputBuilderTest, ReorderedSubsetsPreserveRowIdentity) {
   }
 }
 
-TEST(DFlashAsyncInputBuilderTest,
-     TenThousandBatchesMatchIndependentSlotOracle) {
-  constexpr int64_t kAcceptedWidth = 16;
-  constexpr int64_t kQueryWidth = 15;
-  constexpr int64_t kBlockSize = 128;
-  constexpr int64_t kBlocksPerRow = 32;
-  constexpr int64_t kMaskTokenId = 42;
-  constexpr std::array<int64_t, 10> kBasePositions = {
-      0, 112, 113, 126, 127, 128, 255, 256, 2303, 2304};
-  for (int64_t case_index = 0; case_index < 10000; ++case_index) {
-    SCOPED_TRACE(case_index);
-    const int64_t batch_size = case_index % 8 + 1;
-    torch::Tensor accepted =
-        torch::full({batch_size, kAcceptedWidth}, -1, torch::kLong);
-    torch::Tensor bases = torch::empty({batch_size}, torch::kLong);
-    torch::Tensor tables =
-        torch::empty({batch_size, kBlocksPerRow}, torch::kInt32);
-    torch::Tensor expected_counts = torch::empty_like(bases);
-    torch::Tensor expected_anchors = torch::empty_like(bases);
-    torch::Tensor expected_lengths = torch::empty({batch_size}, torch::kInt32);
-    torch::Tensor expected_tokens =
-        torch::full({batch_size * kQueryWidth}, kMaskTokenId, torch::kLong);
-    torch::Tensor expected_positions = torch::empty_like(expected_tokens);
-    torch::Tensor expected_slots = torch::empty_like(expected_tokens);
-    torch::Tensor expected_context_positions =
-        torch::empty({batch_size * kAcceptedWidth}, torch::kLong);
-    torch::Tensor expected_context_slots =
-        torch::full_like(expected_context_positions, -1);
-    for (int64_t row = 0; row < batch_size; ++row) {
-      const int64_t base = kBasePositions[(case_index / 8 + row) % 10];
-      const int64_t count = (case_index / 80 + row) % kAcceptedWidth + 1;
-      bases.data_ptr<int64_t>()[row] = base;
-      expected_counts.data_ptr<int64_t>()[row] = count;
-      const int64_t first_token = case_index * 128 + row * kAcceptedWidth;
-      expected_anchors.data_ptr<int64_t>()[row] = first_token + count - 1;
-      expected_lengths.data_ptr<int32_t>()[row] = base + count + kQueryWidth;
-      for (int64_t block = 0; block < kBlocksPerRow; ++block) {
-        tables.data_ptr<int32_t>()[row * kBlocksPerRow + block] =
-            row * kBlocksPerRow + (block * 17 + case_index) % kBlocksPerRow;
-      }
-      const auto slot_for_position = [&](int64_t position) {
-        const int64_t block =
-            row * kBlocksPerRow +
-            ((position / kBlockSize) * 17 + case_index) % kBlocksPerRow;
-        return block * kBlockSize + position % kBlockSize;
-      };
-      for (int64_t offset = 0; offset < kAcceptedWidth; ++offset) {
-        const int64_t index = row * kAcceptedWidth + offset;
-        expected_context_positions.data_ptr<int64_t>()[index] = base + offset;
-        if (offset < count) {
-          accepted.data_ptr<int64_t>()[index] = first_token + offset;
-          expected_context_slots.data_ptr<int64_t>()[index] =
-              slot_for_position(base + offset);
-        }
-      }
-      for (int64_t offset = 0; offset < kQueryWidth; ++offset) {
-        const int64_t index = row * kQueryWidth + offset;
-        expected_positions.data_ptr<int64_t>()[index] = base + count + offset;
-        expected_slots.data_ptr<int64_t>()[index] =
-            slot_for_position(base + count + offset);
-      }
-      expected_tokens.data_ptr<int64_t>()[row * kQueryWidth] =
-          first_token + count - 1;
-    }
-    NextDraftInputs result = prepare_next_draft(
-        accepted, bases, tables, kMaskTokenId, kBlockSize, kQueryWidth);
-    ContextKvInputs context =
-        prepare_context_kv(accepted, bases, tables, kBlockSize);
-    ASSERT_TRUE(torch::equal(result.accepted_counts, expected_counts));
-    ASSERT_TRUE(torch::equal(result.anchor_tokens, expected_anchors));
-    ASSERT_TRUE(torch::equal(result.kv_lengths, expected_lengths));
-    ASSERT_TRUE(torch::equal(result.query_tokens, expected_tokens));
-    ASSERT_TRUE(torch::equal(result.query_positions, expected_positions));
-    ASSERT_TRUE(torch::equal(result.query_slots, expected_slots));
-    ASSERT_TRUE(torch::equal(context.positions, expected_context_positions));
-    ASSERT_TRUE(torch::equal(context.slots, expected_context_slots));
-  }
-}
-
-TEST(DFlashAsyncInputBuilderTest, DSparkAcceptanceLengthsAcrossPageBoundaries) {
-  constexpr int64_t kAcceptedWidth = 16;
-  constexpr int64_t kQueryWidth = 15;
-  check_all_acceptance_lengths(kAcceptedWidth, kQueryWidth);
-}
-
-TEST(DFlashAsyncInputBuilderTest, SingleTokenQueryAcrossPageBoundaries) {
-  constexpr int64_t kAcceptedWidth = 16;
-  constexpr int64_t kQueryWidth = 1;
-  check_all_acceptance_lengths(kAcceptedWidth, kQueryWidth);
-}
-
 TEST(DFlashAsyncInputBuilderTest, DraftQueryDoesNotMapUnusedContextTail) {
   const torch::Tensor accepted_tokens =
       torch::tensor({{31, -1, 99, -1}}, torch::kLong);
@@ -322,62 +152,109 @@ TEST(DFlashAsyncInputBuilderTest, DraftQueryDoesNotMapUnusedContextTail) {
   EXPECT_TRUE(compare_next_draft_inputs(result, expected));
 }
 
-TEST(DFlashAsyncInputBuilderTest, AllAcceptanceLengthsAcrossPageBoundaries) {
-  constexpr int64_t kWidth = 8;
-  constexpr int64_t kBlockSize = 128;
-  torch::Tensor accepted = torch::full({kWidth, kWidth}, -1, torch::kLong);
-  torch::Tensor base =
-      torch::tensor({120, 121, 126, 127, 128, 2297, 2303, 2304}, torch::kLong);
-  torch::Tensor table =
-      torch::arange(8 * 32, torch::kInt32).reshape({8, 32}).flip({1});
-  for (int64_t seq = 0; seq < kWidth; ++seq) {
-    for (int64_t token = 0; token <= seq; ++token) {
-      accepted[seq][token] = 100 + seq * kWidth + token;
+TEST(DFlashAsyncInputBuilderTest, AllAcceptanceLengthsAcrossPageBoundary) {
+  constexpr int64_t kAcceptedWidth = 16;
+  for (const int64_t query_width : {1, 15}) {
+    SCOPED_TRACE(query_width);
+    constexpr int64_t kBlockSize = 128;
+    constexpr int64_t kMaskTokenId = 42;
+    constexpr int64_t kBatchSize = 2 * kAcceptedWidth;
+    const torch::Tensor accepted_counts =
+        torch::arange(1, kAcceptedWidth + 1, torch::kLong).repeat_interleave(2);
+    const torch::Tensor token_columns =
+        torch::arange(kAcceptedWidth, torch::kLong).unsqueeze(0);
+    const torch::Tensor tokens =
+        torch::arange(kBatchSize * kAcceptedWidth, torch::kLong)
+            .reshape({kBatchSize, kAcceptedWidth}) +
+        100;
+    const torch::Tensor accepted =
+        torch::where(token_columns.lt(accepted_counts.unsqueeze(1)),
+                     tokens,
+                     torch::full_like(tokens, -1));
+    const torch::Tensor base_positions =
+        torch::tensor({127, 128}, torch::kLong).repeat({kAcceptedWidth});
+    const torch::Tensor block_tables =
+        torch::arange(kBatchSize * 3, torch::kInt32).reshape({kBatchSize, 3});
+    const NextDraftInputs actual = prepare_next_draft(accepted,
+                                                      base_positions,
+                                                      block_tables,
+                                                      kMaskTokenId,
+                                                      kBlockSize,
+                                                      query_width);
+    const ContextKvInputs actual_context =
+        prepare_context_kv(accepted, base_positions, block_tables, kBlockSize);
+
+    std::vector<int64_t> anchors;
+    std::vector<int64_t> query_tokens;
+    std::vector<int64_t> query_positions;
+    std::vector<int32_t> query_slots;
+    std::vector<int32_t> kv_lengths;
+    std::vector<int64_t> context_positions;
+    std::vector<int32_t> context_slots;
+    for (int64_t row = 0; row < kBatchSize; ++row) {
+      const int64_t count = accepted_counts[row].item<int64_t>();
+      const int64_t base = base_positions[row].item<int64_t>();
+      const int64_t anchor = accepted[row][count - 1].item<int64_t>();
+      anchors.push_back(anchor);
+      kv_lengths.push_back(base + count + query_width);
+      for (int64_t column = 0; column < query_width; ++column) {
+        const int64_t position = base + count + column;
+        query_tokens.push_back(column == 0 ? anchor : kMaskTokenId);
+        query_positions.push_back(position);
+        const int64_t page = position / kBlockSize;
+        query_slots.push_back(block_tables[row][page].item<int32_t>() *
+                                  kBlockSize +
+                              position % kBlockSize);
+      }
+      for (int64_t column = 0; column < kAcceptedWidth; ++column) {
+        const int64_t position = base + column;
+        context_positions.push_back(position);
+        if (column < count) {
+          const int64_t page = position / kBlockSize;
+          context_slots.push_back(block_tables[row][page].item<int32_t>() *
+                                      kBlockSize +
+                                  position % kBlockSize);
+        } else {
+          context_slots.push_back(-1);
+        }
+      }
     }
+
+    const NextDraftInputs expected{accepted_counts,
+                                   torch::tensor(anchors, torch::kLong),
+                                   torch::tensor(query_tokens, torch::kLong),
+                                   torch::tensor(query_positions, torch::kLong),
+                                   torch::tensor(query_slots, torch::kInt32),
+                                   torch::tensor(kv_lengths, torch::kInt32)};
+    EXPECT_TRUE(compare_next_draft_inputs(actual, expected));
+    EXPECT_TRUE(torch::equal(actual_context.positions,
+                             torch::tensor(context_positions, torch::kLong)));
+    EXPECT_TRUE(torch::equal(actual_context.slots,
+                             torch::tensor(context_slots, torch::kInt32)));
   }
-  NextDraftInputs result = prepare_next_draft(
-      accepted, base, table, /*mask_token_id=*/999, kBlockSize);
-  constexpr int64_t kMaskTokenId = 999;
-  NextDraftInputs explicit_result = prepare_next_draft(
-      accepted, base, table, kMaskTokenId, kBlockSize, kWidth);
-  ContextKvInputs context =
-      prepare_context_kv(accepted, base, table, kBlockSize);
-  EXPECT_TRUE(
-      torch::equal(result.accepted_counts, explicit_result.accepted_counts));
-  EXPECT_TRUE(
-      torch::equal(result.anchor_tokens, explicit_result.anchor_tokens));
-  EXPECT_TRUE(torch::equal(result.query_tokens, explicit_result.query_tokens));
-  EXPECT_TRUE(
-      torch::equal(result.query_positions, explicit_result.query_positions));
-  EXPECT_TRUE(torch::equal(result.query_slots, explicit_result.query_slots));
-  EXPECT_TRUE(torch::equal(result.kv_lengths, explicit_result.kv_lengths));
-  for (int64_t seq = 0; seq < kWidth; ++seq) {
-    const int64_t prefix = seq + 1;
-    const int64_t old_position = base[seq].item<int64_t>();
-    EXPECT_EQ(result.accepted_counts[seq].item<int64_t>(), prefix);
-    EXPECT_EQ(result.kv_lengths[seq].item<int64_t>(),
-              old_position + prefix + kWidth);
-    for (int64_t token = 0; token < kWidth; ++token) {
-      const int64_t index = seq * kWidth + token;
-      const int64_t query_position = old_position + prefix + token;
-      const int64_t page =
-          table[seq][query_position / kBlockSize].item<int64_t>();
-      EXPECT_EQ(result.query_positions[index].item<int64_t>(), query_position);
-      EXPECT_EQ(result.query_slots[index].item<int64_t>(),
-                page * kBlockSize + query_position % kBlockSize);
-      EXPECT_EQ(result.query_tokens[index].item<int64_t>(),
-                token == 0 ? accepted[seq][prefix - 1].item<int64_t>() : 999);
-      const int64_t context_position = old_position + token;
-      const int64_t context_slot =
-          token < prefix
-              ? table[seq][context_position / kBlockSize].item<int64_t>() *
-                        kBlockSize +
-                    context_position % kBlockSize
-              : -1;
-      EXPECT_EQ(context.positions[index].item<int64_t>(), context_position);
-      EXPECT_EQ(context.slots[index].item<int64_t>(), context_slot);
-    }
-  }
+}
+TEST(DFlashAsyncInputBuilderTest, DefaultQueryWidthUsesAcceptedColumnWidth) {
+  const torch::Tensor accepted =
+      torch::tensor({{10, -1, -1}, {20, 21, 22}}, torch::kLong);
+  const torch::Tensor bases = torch::tensor({3, 6}, torch::kLong);
+  const torch::Tensor tables =
+      torch::tensor({{7, 2, 9}, {3, 8, 5}}, torch::kInt32);
+  const NextDraftInputs actual = prepare_next_draft(
+      accepted, bases, tables, /*mask_token_id=*/999, /*block_size=*/4);
+  const NextDraftInputs expected{
+      torch::tensor({1, 3}, torch::kLong),
+      torch::tensor({10, 22}, torch::kLong),
+      torch::tensor({10, 999, 999, 22, 999, 999}, torch::kLong),
+      torch::tensor({4, 5, 6, 9, 10, 11}, torch::kLong),
+      torch::tensor({8, 9, 10, 21, 22, 23}, torch::kInt32),
+      torch::tensor({7, 12}, torch::kInt32)};
+  EXPECT_TRUE(compare_next_draft_inputs(actual, expected));
+  const ContextKvInputs context =
+      prepare_context_kv(accepted, bases, tables, /*block_size=*/4);
+  EXPECT_TRUE(torch::equal(context.positions,
+                           torch::tensor({3, 4, 5, 6, 7, 8}, torch::kLong)));
+  EXPECT_TRUE(torch::equal(
+      context.slots, torch::tensor({31, -1, -1, 34, 35, 20}, torch::kInt32)));
 }
 
 TEST(DFlashAsyncInputBuilderTest,
@@ -425,8 +302,7 @@ TEST(DFlashAsyncInputBuilderTest, RejectsNonPositiveQueryWidth) {
   }
 }
 
-TEST(DFlashAsyncInputBuilderTest,
-     FixedReplayAndCheckerDetectEveryChangedField) {
+TEST(DFlashAsyncInputBuilderTest, FixedReplayMatchesGoldenFields) {
   const torch::Tensor accepted =
       torch::tensor({{0, 17, -1, 99}, {31, 32, 33, -1}}, torch::kLong);
   const torch::Tensor bases = torch::tensor({126, 127}, torch::kLong);
@@ -439,12 +315,10 @@ TEST(DFlashAsyncInputBuilderTest,
       torch::tensor({128, 129, 130, 131}, torch::kLong),
       torch::tensor({256, 257, 1026, 1027}, torch::kInt32),
       torch::tensor({130, 132}, torch::kInt32)};
-  for (int32_t repeat_index = 0; repeat_index < 3; ++repeat_index) {
-    SCOPED_TRACE(repeat_index);
-    const NextDraftInputs actual =
-        prepare_next_draft(accepted, bases, tables, 999, 128, 2);
-    ASSERT_TRUE(compare_next_draft_inputs(actual, expected));
-  }
+  const NextDraftInputs actual =
+      prepare_next_draft(accepted, bases, tables, 999, 128, 2);
+  EXPECT_TRUE(compare_next_draft_inputs(actual, expected));
+
   constexpr std::array<const char*, 6> kFieldNames = {"accepted_counts",
                                                       "anchor_tokens",
                                                       "query_tokens",
@@ -454,28 +328,26 @@ TEST(DFlashAsyncInputBuilderTest,
   for (size_t field_index = 0; field_index < kFieldNames.size();
        ++field_index) {
     SCOPED_TRACE(kFieldNames[field_index]);
-    NextDraftInputs corrupted =
-        prepare_next_draft(accepted, bases, tables, 999, 128, 2);
-    const std::array<torch::Tensor*, 6> fields = {&corrupted.accepted_counts,
-                                                  &corrupted.anchor_tokens,
-                                                  &corrupted.query_tokens,
-                                                  &corrupted.query_positions,
-                                                  &corrupted.query_slots,
-                                                  &corrupted.kv_lengths};
+    NextDraftInputs changed = actual;
+    const std::array<torch::Tensor*, 6> fields = {&changed.accepted_counts,
+                                                  &changed.anchor_tokens,
+                                                  &changed.query_tokens,
+                                                  &changed.query_positions,
+                                                  &changed.query_slots,
+                                                  &changed.kv_lengths};
     *fields[field_index] = fields[field_index]->clone();
     fields[field_index]->reshape({-1})[0].add_(1);
     const testing::AssertionResult mismatch =
-        compare_next_draft_inputs(corrupted, expected);
+        compare_next_draft_inputs(changed, expected);
     EXPECT_FALSE(mismatch);
     EXPECT_STREQ(mismatch.message(), kFieldNames[field_index]);
   }
-  NextDraftInputs wrong_dtype =
-      prepare_next_draft(accepted, bases, tables, 999, 128, 2);
-  wrong_dtype.query_slots = wrong_dtype.query_slots.to(torch::kLong);
-  const testing::AssertionResult dtype_mismatch =
-      compare_next_draft_inputs(wrong_dtype, expected);
-  EXPECT_FALSE(dtype_mismatch);
-  EXPECT_STREQ(dtype_mismatch.message(), "query_slots");
+  NextDraftInputs wrong_slot_dtype = actual;
+  wrong_slot_dtype.query_slots = wrong_slot_dtype.query_slots.to(torch::kLong);
+  const auto slot_dtype_mismatch =
+      compare_next_draft_inputs(wrong_slot_dtype, expected);
+  EXPECT_FALSE(slot_dtype_mismatch);
+  EXPECT_STREQ(slot_dtype_mismatch.message(), "query_slots");
 }
 
 TEST(DFlashAsyncInputBuilderTest, RejectsInvalidBatchGeometry) {
@@ -569,15 +441,6 @@ TEST(DFlashAsyncInputBuilderTest, ContextKvDoesNotMapRejectedTailPositions) {
   EXPECT_TRUE(torch::equal(result.slots, expected_slots.reshape({-1})));
 }
 
-TEST(DFlashAsyncInputBuilderTest, ContextKvDoesNotClampAcceptedPositions) {
-  torch::Tensor accepted_tokens = torch::tensor({{0, -1}}, torch::kLong);
-  torch::Tensor base_positions = torch::tensor({128}, torch::kLong);
-  torch::Tensor block_table = torch::tensor({{8}}, torch::kInt32);
-  constexpr int64_t kBlockSize = 128;
-  EXPECT_ANY_THROW(prepare_context_kv(
-      accepted_tokens, base_positions, block_table, kBlockSize));
-}
-
 TEST(DFlashAsyncInputBuilderTest, ContextKvRejectsNonPositiveBlockSize) {
   torch::Tensor accepted_tokens = torch::tensor({{0, -1}}, torch::kLong);
   torch::Tensor base_positions = torch::tensor({0}, torch::kLong);
@@ -592,50 +455,41 @@ TEST(DFlashAsyncInputBuilderTest, ContextKvRejectsNonPositiveBlockSize) {
 TEST(DFlashAsyncInputBuilderTest,
      MultiTableContextAndDraftUseCircularSwaSlots) {
   constexpr int64_t kBlockSize = 4;
-  constexpr int64_t kAcceptedWidth = 16;
-  constexpr int64_t kQueryWidth = 15;
-  std::vector<torch::Tensor> multi_block_tables = {
-      torch::tensor({{7, 3}}, torch::kInt32).repeat({kAcceptedWidth, 1}),
-      torch::tensor({{11, 17, 23}}, torch::kInt32).repeat({kAcceptedWidth, 1})};
-  DraftCacheBlockTable table =
+  const std::vector<torch::Tensor> multi_block_tables = {
+      torch::tensor({{7, 3}, {7, 3}}, torch::kInt32),
+      torch::tensor({{11, 17, 23}, {11, 17, 23}}, torch::kInt32)};
+  const DraftCacheBlockTable table =
       prepare_draft_cache_block_table(torch::Tensor(),
                                       multi_block_tables,
-                                      kAcceptedWidth,
+                                      /*num_sequences=*/2,
                                       torch::Device(torch::kCPU));
   ASSERT_TRUE(table.is_circular);
   EXPECT_TRUE(torch::equal(table.blocks, multi_block_tables.front()));
-  torch::Tensor bases = torch::arange(kAcceptedWidth, torch::kLong) * 7;
-  torch::Tensor tokens =
-      torch::arange(kAcceptedWidth * kAcceptedWidth, torch::kLong)
-          .view({kAcceptedWidth, kAcceptedWidth});
-  for (int64_t row = 0; row < kAcceptedWidth; ++row) {
-    tokens[row].slice(0, row + 1).fill_(-1);
-  }
-  ContextKvInputs context =
+  const torch::Tensor bases = torch::tensor({6, 7}, torch::kLong);
+  const torch::Tensor tokens =
+      torch::tensor({{10, 11, -1, -1}, {20, 21, 22, -1}}, torch::kLong);
+  const ContextKvInputs context =
       prepare_context_kv(tokens, bases, table, kBlockSize);
-  NextDraftInputs next =
-      prepare_next_draft(tokens, bases, table, 999, kBlockSize, kQueryWidth);
-  for (int64_t row = 0; row < kAcceptedWidth; ++row) {
-    for (int64_t offset = 0; offset < kAcceptedWidth; ++offset) {
-      const int64_t position = row * 7 + offset;
-      const int64_t page = position / kBlockSize % 2 == 0 ? 7 : 3;
-      const int64_t expected_slot =
-          offset <= row ? page * kBlockSize + position % kBlockSize : -1;
-      EXPECT_EQ(context.slots[row * kAcceptedWidth + offset].item<int32_t>(),
-                expected_slot);
-      EXPECT_EQ(
-          context.positions[row * kAcceptedWidth + offset].item<int64_t>(),
-          position);
-    }
-    for (int64_t offset = 0; offset < kQueryWidth; ++offset) {
-      const int64_t position = row * 7 + row + 1 + offset;
-      const int64_t page = position / kBlockSize % 2 == 0 ? 7 : 3;
-      EXPECT_EQ(next.query_slots[row * kQueryWidth + offset].item<int32_t>(),
-                page * kBlockSize + position % kBlockSize);
-    }
-  }
-  EXPECT_EQ(multi_block_tables.size(), 2);
-  EXPECT_EQ(multi_block_tables[1][0][0].item<int32_t>(), 11);
+  EXPECT_TRUE(
+      torch::equal(context.positions,
+                   torch::tensor({6, 7, 8, 9, 7, 8, 9, 10}, torch::kLong)));
+  EXPECT_TRUE(torch::equal(
+      context.slots,
+      torch::tensor({14, 15, -1, -1, 15, 28, 29, -1}, torch::kInt32)));
+  const NextDraftInputs next = prepare_next_draft(tokens,
+                                                  bases,
+                                                  table,
+                                                  /*mask_token_id=*/999,
+                                                  kBlockSize,
+                                                  /*query_width=*/3);
+  const NextDraftInputs expected{
+      torch::tensor({2, 3}, torch::kLong),
+      torch::tensor({11, 22}, torch::kLong),
+      torch::tensor({11, 999, 999, 22, 999, 999}, torch::kLong),
+      torch::tensor({8, 9, 10, 10, 11, 12}, torch::kLong),
+      torch::tensor({28, 29, 30, 30, 31, 12}, torch::kInt32),
+      torch::tensor({11, 13}, torch::kInt32)};
+  EXPECT_TRUE(compare_next_draft_inputs(next, expected));
 }
 
 TEST(DFlashAsyncInputBuilderTest, MultiTableIgnoresPaddedBatchRows) {

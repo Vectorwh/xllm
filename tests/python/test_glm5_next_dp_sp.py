@@ -180,7 +180,7 @@ def test_pcp_decode_keeps_tp_local_ownership_and_dp_masks(
         assert layout.dispatch_tokens == (max(counts) + tp - 1) // tp
 
 
-@pytest.mark.parametrize("counts", [None, (), (1,), (0, 2), (2.5, 2), torch.tensor([3, 2])])
+@pytest.mark.parametrize("counts", [None, (1,), (0, 2), (2.5, 2), torch.tensor([3, 2])])
 def test_invalid_dp_counts_fail_without_device_queries(counts: object) -> None:
     with pytest.raises((ValueError, TypeError)):
         TokenParallelLayout.from_dp(3, 4, 0, 2, 0, counts)

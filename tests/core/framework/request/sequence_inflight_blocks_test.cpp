@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/speculative_config.h"
@@ -152,20 +153,19 @@ TEST_F(SequenceInflightBlocksTest, PrefillRetainsTailFromCachedTokens) {
     Sequence sequence = make_sequence(6 * block_size);
     sequence.kv_state().add_blocks(cache.type, manager.allocate(5));
     const Slice<Block> blocks = sequence.kv_state().blocks(cache.type);
-    for (const size_t cached_tokens : {size_t{0},
-                                       size_t{1},
-                                       size_t{2},
-                                       cache.ratio - 1,
-                                       block_size - 1,
-                                       block_size,
-                                       5 * block_size}) {
+    const std::vector<std::pair<size_t, size_t>> boundary_cases = {
+        {0, 0},
+        {block_size + 1, 0},
+        {block_size + 2, 1},
+        {5 * block_size, 4},
+    };
+    for (const auto& [cached_tokens, first_expected_block] : boundary_cases) {
       sequence.kv_state().set_kv_cache_tokens_num(cached_tokens);
       SCOPED_TRACE(static_cast<int32_t>(cache.type));
       SCOPED_TRACE(cached_tokens);
       std::vector<int32_t> expected;
-      expected.reserve(blocks.size());
-      const size_t token_begin = cached_tokens > 2 ? cached_tokens - 2 : 0;
-      for (size_t block_index = token_begin / block_size;
+      expected.reserve(blocks.size() - first_expected_block);
+      for (size_t block_index = first_expected_block;
            block_index < blocks.size();
            ++block_index) {
         expected.emplace_back(blocks[block_index].id());

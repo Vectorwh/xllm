@@ -107,6 +107,7 @@ def test_interleaved_rope_fused_inverse_matches_eager(monkeypatch: pytest.Monkey
     cache = _build_cache(256, 64, device)
     cases = [
         (8, 4, 512),  # 3D q-like attn_out, partial [448:512)
+        (8, 1, 512),  # single-head q-like attn_out, partial [448:512)
         (5, 128),  # 2D latent-like, partial [64:128)
     ]
     for shape in cases:
@@ -132,16 +133,22 @@ def test_interleaved_rope_fused_inverse_matches_eager(monkeypatch: pytest.Monkey
 
 
 def test_interleaved_rope_falls_back_without_op(monkeypatch: pytest.MonkeyPatch) -> None:
-    device = "npu" if _npu_ready() else "cpu"
-    dtype = torch.bfloat16 if device == "npu" else torch.float32
-    cache = _build_cache(64, 16, device)
-    x = torch.randn(6, 2, 32, dtype=dtype, device=device)
-    positions = torch.arange(6, dtype=torch.int32, device=device)
-
-    monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: None)  # probe miss: stay eager
-    eager = csa2.apply_interleaved_rope(x.clone(), positions, cache)
-    fallback = csa2.apply_interleaved_rope(x.clone(), positions, cache)
-    assert torch.equal(fallback, eager)
+    cache = _build_cache(64, 16, "cpu")
+    generator = torch.Generator().manual_seed(42)
+    x = torch.randn(6, 2, 32, generator=generator)
+    positions = torch.tensor([5, 1, 4, 2, 0, 3], dtype=torch.int32)
+    monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: None)
+    actual = csa2.apply_interleaved_rope(x.clone(), positions, cache)
+    rows = cache[positions.long()]
+    cosine, sine = rows[:, None, :8], rows[:, None, 8:]
+    pairs = x[..., 16:].reshape(6, 2, 8, 2)
+    real, imag = pairs[..., 0], pairs[..., 1]
+    expected = torch.stack(
+        (real * cosine - imag * sine, real * sine + imag * cosine),
+        dim=-1,
+    ).reshape(6, 2, 16)
+    torch.testing.assert_close(actual[..., 16:], expected, rtol=1e-6, atol=1e-6)
+    assert torch.equal(actual[..., :16], x[..., :16])
 
 
 # ---------------------------------------------------------------------------

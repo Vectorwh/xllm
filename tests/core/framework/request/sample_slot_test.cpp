@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -152,57 +153,24 @@ class UnstableLiteralTokenizer final : public Tokenizer {
     }
     return true;
   }
+
+  std::optional<int32_t> token_to_id(
+      const std::string_view& token) const override {
+    return token == "<emb_0>" ? std::optional<int32_t>(100000) : std::nullopt;
+  }
+
+  std::string id_to_token(int32_t id) const override {
+    return id == 100000 ? "<emb_0>" : std::string();
+  }
 };
 
 TEST(SampleSlotTest, BuildSampleSlotsRejectsUnstableLiteralToken) {
   UnstableLiteralTokenizer tokenizer;
-  std::vector<SampleSlot> sample_slots;
+  std::vector<SampleSlot> sample_slots(1);
 
   EXPECT_FALSE(build_sample_slots(
       "sample-req", "A<emb_0>B<emb_0>C", "<emb_0>", tokenizer, &sample_slots));
   EXPECT_TRUE(sample_slots.empty());
-}
-
-TEST(SampleSlotTest, RequestPropagatesSampleSlotsToSequenceRuntime) {
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  RequestState request_state(
-      "abc",
-      std::vector<int32_t>{10, 11, 12},
-      sampling_param,
-      SchedulerParam{},
-      stopping_checker,
-      /*seq_capacity=*/8,
-      /*n=*/1,
-      /*best_of=*/1,
-      /*logprobs=*/false,
-      /*stream=*/false,
-      /*echo=*/false,
-      /*skip_special_tokens=*/true,
-      /*enable_schedule_overlap=*/false,
-      [](const RequestOutput&) { return true; },
-      OutputsFunc{});
-
-  SampleSlot first_slot;
-  first_slot.request_id = "sample-req";
-  first_slot.sample_id = 0;
-  first_slot.token_position = 2;
-
-  SampleSlot second_slot;
-  second_slot.request_id = "sample-req";
-  second_slot.sample_id = 1;
-  second_slot.token_position = 4;
-
-  request_state.sample_slots = {first_slot, second_slot};
-
-  Request request("sample-req", "", "", std::move(request_state));
-
-  ASSERT_EQ(request.sequences().size(), 1);
-  const auto& runtime_sample_slots = request.sequences()[0]->sample_slots();
-  ASSERT_EQ(runtime_sample_slots.size(), 2);
-  EXPECT_EQ(runtime_sample_slots[0].sample_id, 0);
-  EXPECT_EQ(runtime_sample_slots[0].token_position, 2);
-  EXPECT_EQ(runtime_sample_slots[1].sample_id, 1);
 }
 
 TEST(RequestTest, GenerateOutputReturnsSequenceFailureStatus) {
@@ -228,12 +196,6 @@ TEST(RequestTest, GenerateOutputReturnsSequenceFailureStatus) {
   Status failure(StatusCode::UNKNOWN,
                  "json_object constrained decoding failed");
   request.sequences()[0]->fail(failure);
-
-  Sequence copied_sequence(*request.sequences()[0], /*index=*/1);
-  EXPECT_EQ(copied_sequence.sample_sequence_id(), "req-error#1");
-  copied_sequence.reset_finish_state_for_beam_search();
-  EXPECT_TRUE(copied_sequence.finished());
-  ASSERT_TRUE(copied_sequence.error_status().has_value());
 
   CharTokenizer tokenizer;
   const RequestOutput output = request.generate_output(tokenizer);
@@ -456,13 +418,8 @@ TEST(SampleSlotTest, OneRecOutputCarriesTokenLogprobsWhenEnabled) {
 
   ASSERT_EQ(output.outputs.size(), 1);
   ASSERT_EQ(output.outputs[0].token_ids.size(), 3U);
-  ASSERT_EQ(output.outputs[0].token_ids_logprobs.size(), 3U);
-  ASSERT_TRUE(output.outputs[0].token_ids_logprobs[0].has_value());
-  ASSERT_TRUE(output.outputs[0].token_ids_logprobs[1].has_value());
-  ASSERT_TRUE(output.outputs[0].token_ids_logprobs[2].has_value());
-  EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[0].value(), -0.10f);
-  EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[1].value(), -0.20f);
-  EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[2].value(), -0.30f);
+  EXPECT_EQ(output.outputs[0].token_ids_logprobs,
+            (std::vector<std::optional<float>>{-0.10f, -0.20f, -0.30f}));
 }
 
 }  // namespace

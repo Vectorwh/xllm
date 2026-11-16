@@ -161,13 +161,6 @@ except ImportError:  # pragma: no cover - stub-loader path
 # and on the fixed fused kernel (eager CP prefill, single-sequence, kv_split
 # replicated).
 #
-# ALWAYS ON in a shipped build, and deliberately NOT an environment variable: a
-# process-wide knob that silently changes numerics is a footgun (it would also
-# let one rank of a CP group differ from its peers). The remaining terms of the
-# gate are correctness conditions, not toggles. This constant exists only as a
-# test seam so the CPU suite can exercise the byte-identical full-stream path --
-# nothing outside tests may assign it.
-_INDEXER_CP_QUERY_PARTITION = True
 
 
 class Glm5NextRMSNorm(nn.Module):
@@ -1514,8 +1507,7 @@ class Glm5NextIndexer(nn.Module):
         pool scores are independent of every other row -- and scatters the
         selected rows back into the full-layout tensor, so every downstream
         consumer (backend row select, ``cp_shard_rows``, the shared-layer
-        merge) keeps the exact legacy contract. On by default
-        (a test-only seam can turn it off for the full-stream comparison). Active under
+        merge) keeps the exact legacy contract. Active under
         ``kv_split_size > 1`` as long as the index write mode is the default
         replicated one (full per-rank index replica, per-sequence
         page-expanded read tables); the non-default sharded mode, acl_graph
@@ -1774,7 +1766,6 @@ class Glm5NextIndexer(nn.Module):
             kv_seq_lens = None
         alpha_active = (
             query_rows is not None
-            and _INDEXER_CP_QUERY_PARTITION
             and not in_acl_graph()
             and (not ctx.has_kv_shard or cp_index_write_replicated())
             and num_seqs == 1
@@ -2083,9 +2074,7 @@ class Glm5NextMlaAttention(Attention):
         topk = None
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
-            query_rows = (
-                cp_real_query_rows(cp_context) if _INDEXER_CP_QUERY_PARTITION and cp_context is not None else None
-            )
+            query_rows = cp_real_query_rows(cp_context) if cp_context is not None else None
             topk = self.indexer.select_qli(
                 hidden_states, q_c, position_ids, attention_mask, ctx, self, backend, query_rows=query_rows
             )

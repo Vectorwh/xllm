@@ -170,8 +170,11 @@ def test_mtp_constructor_defers_shared_target_modules() -> None:
 
     target_lm_head = nn.Linear(4, 16, bias=False)
     target_embedding = nn.Embedding(16, 4)
-    draft.lm_head = target_lm_head
-    draft.model.embed_tokens = target_embedding
+    source = SimpleNamespace(
+        get_lm_head=lambda: target_lm_head,
+        get_token_embedding=lambda: target_embedding,
+    )
+    draft.share_weights_from(source)
 
     assert draft.lm_head is target_lm_head
     assert draft.model.embed_tokens is target_embedding
@@ -207,5 +210,5 @@ def test_mtp_load_rejects_missing_required_weights() -> None:
         patch.object(deepseek_v32_mtp.DeepseekV3ForCausalLM, "load_weights"),
     ):
         draft = deepseek_v32_mtp.DeepseekV32MtpForCausalLM(config)
-        with pytest.raises(KeyError, match="missing required MTP weight"):
+        with pytest.raises(KeyError, match=r"missing required MTP weight: eh_proj\.weight"):
             draft.load_weights([], tp_rank=0, tp_size=1)

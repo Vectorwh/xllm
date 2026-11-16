@@ -16,34 +16,24 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/kv_cache/kv_cache_shape.h"
 #include "core/framework/parallel_state/collective_communicator.h"
 #include "core/framework/parallel_state/parallel_state.h"
 #include "core/layers/mlu/deepseek_v32/multi_device_test_utils.h"
 #include "core/layers/mlu/dflash2_decoder_layer.h"
 #include "core/platform/device.h"
-#include "core/runtime/dflash/dflash_worker_impl.h"
-#include "core/runtime/llm_worker_impl.h"
+#include "core/runtime/dflash/dflash2_worker_impl.h"
+#include "models/model_registry.h"
 
 namespace xllm {
-
-class DFlashWorkerImplTestPeer final {
- public:
-  static void set_draft(DFlashWorkerImpl& worker,
-                        const ParallelArgs& draft,
-                        const torch::Device& device,
-                        const runtime::Options& options) {
-    worker.draft_impl_ =
-        std::make_unique<LLMWorkerImpl>(draft, device, options);
-  }
-
-  static void synchronize(DFlashWorkerImpl& worker, torch::Tensor& tokens) {
-    worker.maybe_broadcast_spec_tokens(tokens);
-  }
-};
 
 namespace {
 
@@ -248,45 +238,176 @@ TEST(DFlash2MluParallelTest, CpDpDraftTpGroupKeepsDpBatchesIsolated) {
   });
 }
 
+// Full worker integration requires real, compatible GLM5-Next and DFlash2
+// checkpoints. No worker state, model registration or private method is
+// patched.
 TEST(DFlash2MluParallelTest, ValidationTokensAgreeAcrossFormerCpRanks) {
-  test::run_multi_device(/*ranks=*/8, [](int32_t rank, int32_t port) {
+  const char* target_path = std::getenv("XLLM_DFLASH2_CP_TARGET_MODEL");
+  const char* draft_path = std::getenv("XLLM_DFLASH2_CP_DRAFT_MODEL");
+  if (target_path == nullptr || draft_path == nullptr) {
+    GTEST_SKIP() << "Set XLLM_DFLASH2_CP_TARGET_MODEL and "
+                    "XLLM_DFLASH2_CP_DRAFT_MODEL to compatible checkpoints";
+  }
+  test::run_multi_device(/*ranks=*/8, [=](int32_t rank, int32_t port) {
     Device device(rank);
     device.set_device();
+    device.init_device_context();
+    torch::InferenceMode inference;
     CollectiveCommunicator communicator(rank,
                                         /*world_size=*/8,
                                         /*dp_size=*/1,
-                                        /*ep_size=*/1,
+                                        /*ep_size=*/8,
                                         /*cp_size=*/4,
                                         /*buffer_offset=*/0,
                                         /*needs_tp_cp_group=*/true);
     communicator.create_process_groups("127.0.0.1:" + std::to_string(port),
                                        device.unwrap());
-    const ParallelArgs target = *communicator.parallel_args();
-    const ParallelArgs draft =
-        parallel_state::get_cp_independent_tp_parallel_args(target);
-    // Construction requires no checkpoint for CP1; inject the resolved draft
-    // worker to exercise the production validation broadcast independently of
-    // model loading. Keep the target's two-rank group to detect the regression.
-    ParallelArgs construction = target;
-    construction.cp_size(1);
+    const ParallelArgs& target = *communicator.parallel_args();
+    SchedulerConfig::get_instance().enable_chunked_prefill(true);
+    KVCacheConfig::get_instance().block_size(16);
     runtime::Options options;
-    options.speculative_algorithm("DFlash2").num_speculative_tokens(3);
-    DFlashWorkerImpl worker(
-        construction, device.unwrap(), options, WorkerType::LLM);
-    worker.context_ = ModelContext(
-        target,
-        make_args(),
-        QuantArgs(),
-        torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap()));
-    DFlashWorkerImplTestPeer::set_draft(
-        worker, draft, device.unwrap(), options);
-    // Different rejection decisions encode both accepted length and bonus ID.
-    torch::Tensor tokens =
-        torch::tensor({rank, rank % 2 == 0 ? -1 : rank + 10}, torch::kInt32)
-            .to(device.unwrap());
-    DFlashWorkerImplTestPeer::synchronize(worker, tokens);
-    EXPECT_TRUE(torch::equal(tokens.to(torch::kCPU),
-                             torch::tensor({0, -1}, torch::kInt32)));
+    options.model_path(target_path)
+        .draft_model_path(std::string(draft_path))
+        .backend("llm")
+        .tp_size(2)
+        .cp_size(4)
+        .dp_size(1)
+        .ep_size(8)
+        .speculative_algorithm("DFlash2")
+        .num_speculative_tokens(3)
+        .num_decoding_tokens(4)
+        .enable_speculative_decode(true)
+        .block_size(16)
+        .max_seqs_per_batch(2)
+        .max_tokens_per_batch(1024)
+        .enable_graph(false)
+        .enable_schedule_overlap(true);
+    DFlash2WorkerImpl worker(target, device.unwrap(), options, WorkerType::LLM);
+    ASSERT_TRUE(worker.init_model(
+        target_path, /*random_seed=*/21, MasterStatus::WAKEUP));
+    ASSERT_TRUE(worker.init_model(
+        draft_path, /*random_seed=*/21, MasterStatus::WAKEUP));
+    const ModelArgs& args = worker.context_.get_model_args();
+    ASSERT_EQ(args.model_type(), "glm5_next");
+    ASSERT_GT(args.n_layers(), 0);
+    ASSERT_GT(args.vocab_size(), 4);
+    ASSERT_TRUE(worker.get_optimization_config().enable_spec_token_broadcast);
+    KVCacheCapacity capacity;
+    capacity.n_blocks(160)
+        .block_size(16)
+        .num_linear_state_blocks(3)
+        .linear_conv_state_len(args.linear_conv_kernel_dim() - 1 + 3)
+        .linear_ssm_checkpoint_stride(4)
+        .kpool_tail_len(args.index_kpool() + 8);
+    const LinearAttentionPolicy policy =
+        ModelRegistry::get_linear_attention_policy(args.model_type());
+    const KVCacheShape shape(
+        capacity,
+        args,
+        /*world_size=*/2,
+        linear_head_tp_size(policy, /*attention_tp_size=*/2, /*cp_size=*/4));
+    ASSERT_TRUE(worker.allocate_kv_cache(shape));
+    const auto make_input = [&](bool prefill) {
+      constexpr int32_t kPrefix = 512;
+      const int32_t width = prefill ? kPrefix : 1;
+      const int32_t begin = prefill ? 0 : kPrefix;
+      ForwardInput input;
+      input.token_ids_host =
+          torch::arange(2 * width, torch::kInt32).remainder(4).add(1);
+      input.positions_host =
+          torch::arange(begin, begin + width, torch::kInt32).repeat({2});
+      input.token_ids = input.token_ids_host;
+      input.positions = input.positions_host;
+      auto& params = input.input_params;
+      params.meta.batch_forward_type =
+          prefill ? BatchForwardType::PREFILL : BatchForwardType::DECODE;
+      params.meta.num_sequences = 2;
+      params.meta.actual_num_sequences = 2;
+      params.meta.q_max_seq_len = width;
+      params.meta.kv_max_seq_len = begin + width;
+      params.parallel.dp_global_token_nums = {2 * width};
+      params.parallel.dp_is_decode = {prefill ? 0 : 1};
+      params.attention.host.q_seq_lens = {0, width, 2 * width};
+      params.attention.host.q_cu_seq_lens = params.attention.host.q_seq_lens;
+      params.attention.host.kv_seq_lens = {
+          0, begin + width, 2 * (begin + width)};
+      params.attention.host.kv_cache_tokens_nums = {begin, begin};
+      params.attention.host.block_tables =
+          torch::arange(1, 129, torch::kInt32).view({2, 64});
+      params.attention.host.positions = input.positions_host;
+      params.attention.device.q_seq_lens =
+          torch::tensor(params.attention.host.q_seq_lens, torch::kInt32);
+      params.attention.device.q_cu_seq_lens =
+          params.attention.device.q_seq_lens;
+      params.attention.device.kv_seq_lens =
+          torch::tensor(params.attention.host.kv_seq_lens, torch::kInt32);
+      params.attention.device.kv_cache_tokens_nums =
+          torch::tensor({begin, begin}, torch::kInt32);
+      params.attention.device.block_tables = params.attention.host.block_tables;
+      params.attention.device.new_cache_slots = torch::cat(
+          {torch::arange(16 + begin, 16 + begin + width, torch::kInt32),
+           torch::arange(
+               65 * 16 + begin, 65 * 16 + begin + width, torch::kInt32)});
+      params.embedding.linear_state_ids = {1, 2};
+      params.embedding.embedding_ids = {1, 65};
+      params.embedding.request_ids = {"cp-request-0", "cp-request-1"};
+      params.linear_state_validity_mask = {prefill ? 0 : 1, prefill ? 0 : 1};
+      params.execution_batch.num_reqs = 2;
+      params.execution_batch.num_tokens = 2 * width;
+      params.execution_batch.num_scheduled_tokens = {width, width};
+      params.execution_batch.num_computed_tokens = {begin, begin};
+      params.execution_batch.is_prefilling = {prefill ? 1 : 0, prefill ? 1 : 0};
+      params.execution_batch.query_start_loc = params.attention.host.q_seq_lens;
+      RequestSamplingParam sampling;
+      sampling.do_sample = !prefill;
+      sampling.temperature = prefill ? 0.0f : 0.8f;
+      input.sampling_params.init({&sampling, &sampling},
+                                 {width - 1, 2 * width - 1},
+                                 {0, 1},
+                                 {{}, {}},
+                                 {{}, {}},
+                                 {0, 0});
+      input.decoder_sampling_params = input.sampling_params;
+      input.sample_sequence_ids = params.embedding.request_ids;
+      return input;
+    };
+    // Use the production upload/prepare path and public step dispatch. Overlap
+    // mode retains accepted output on non-driver ranks, without changing flags
+    // or injecting workers after construction.
+    WorkerImpl& public_worker = worker;
+    ASSERT_TRUE(public_worker.step_async(make_input(/*prefill=*/true))
+                    .get()
+                    .has_value());
+    if (public_worker.is_driver()) {
+      public_worker.get_last_step_result();
+    }
+    for (int32_t round = 0; round < 3; ++round) {
+      torch::manual_seed(1234 + 31 * rank + round);
+      auto output =
+          public_worker.step_async(make_input(/*prefill=*/false)).get();
+      ASSERT_TRUE(output.has_value());
+      ASSERT_TRUE(output->failed_request_ids.empty());
+      if (output->ready_event != nullptr) {
+        ASSERT_TRUE(output->ready_event->synchronize());
+      }
+      if (public_worker.is_driver()) {
+        public_worker.get_last_step_result();
+      }
+      const torch::Tensor accepted =
+          output->sample_output.next_tokens.to(device.unwrap(), torch::kInt64);
+      ASSERT_EQ(accepted.sizes(), torch::IntArrayRef({2, 4}));
+      std::vector<torch::Tensor> all_ranks;
+      all_ranks.reserve(8);
+      for (int32_t peer = 0; peer < 8; ++peer) {
+        all_ranks.emplace_back(torch::empty_like(accepted));
+      }
+      target.tp_cp_group_->allgather(accepted, all_ranks);
+      for (const auto& tokens : all_ranks) {
+        EXPECT_TRUE(torch::equal(tokens, all_ranks.front()))
+            << "accepted length or bonus differs across former CP ranks";
+      }
+      EXPECT_TRUE(accepted.select(1, 0).ge(0).all().item<bool>());
+    }
   });
 }
 

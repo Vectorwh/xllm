@@ -55,29 +55,7 @@ def _export_path() -> Path:
     return artifact
 
 
-def test_import_into_running_python_does_not_abort(tmp_path: Path) -> None:
-    artifact = _export_path()
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import importlib.util, sys; import torch; "
-            "spec = importlib.util.spec_from_file_location('xllm_export', sys.argv[1]); "
-            "module = importlib.util.module_from_spec(spec); "
-            "sys.modules['xllm_export'] = module; "
-            "spec.loader.exec_module(module)",
-            str(artifact),
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_import_registers_xllm_runtime(tmp_path: Path) -> None:
+def test_import_does_not_abort_and_registers_xllm_runtime(tmp_path: Path) -> None:
     artifact = _export_path()
     symbols = ", ".join(repr(name) for name in _RUNTIME_SYMBOLS)
     script = f"""

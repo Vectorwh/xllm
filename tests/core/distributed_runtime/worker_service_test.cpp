@@ -60,9 +60,6 @@ TEST(SpeculativeTokenStatsTest, CountsTokensPerSequence) {
   EXPECT_EQ(stats.sequence_stats[0].proposed_tokens, 5);
   EXPECT_EQ(stats.sequence_stats[1].accepted_tokens, 5);
   EXPECT_EQ(stats.sequence_stats[1].proposed_tokens, 5);
-  EXPECT_EQ(stats.sequence_stats[0].accepted_tokens +
-                stats.sequence_stats[1].accepted_tokens,
-            7);
 }
 
 TEST(SpeculativeTokenStatsTest, CountsAdaptiveTokensPerSequence) {

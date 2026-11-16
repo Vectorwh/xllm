@@ -21,14 +21,16 @@ limitations under the License.
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "core/common/global_flags.h"
-#include "core/framework/batch/batch_input_builder.h"
+#include "core/framework/batch/batch.h"
 #include "core/framework/block/block_manager_impl.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/model/model_args.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/json_object_grammar.h"
@@ -114,13 +116,68 @@ TEST(BatchPackedInputTest, MaterializationPinsPageablePackedPayload) {
 }
 #endif
 
-TEST(BatchPackedInputTest, ModelInputConversionPreservesValidityMask) {
-  ModelInputParams input_params;
-  input_params.linear_state_validity_mask = {0, 1, 1, 0};
-  ModelInputParams converted = input_params.to(torch::Device(torch::kCPU));
-  EXPECT_EQ(converted.linear_state_validity_mask,
-            std::vector<int64_t>({0, 1, 1, 0}));
-}
+namespace {
+
+class ScopedDeathTestConfiguration final {
+ public:
+  ScopedDeathTestConfiguration()
+      : death_test_style_(::testing::FLAGS_gtest_death_test_style),
+        log_to_stderr_(FLAGS_logtostderr) {}
+
+  ~ScopedDeathTestConfiguration() {
+    ::testing::FLAGS_gtest_death_test_style = std::move(death_test_style_);
+    FLAGS_logtostderr = log_to_stderr_;
+  }
+
+ private:
+  std::string death_test_style_;
+  bool log_to_stderr_;
+};
+
+class PackedDecodeInput final {
+ public:
+  PackedDecodeInput() : manager_(make_options()) {
+    sampling_param_.logprobs = true;
+    stopping_checker_.set_max_generated_tokens(4);
+  }
+
+  ForwardInput make_decode_input(int32_t num_sequences = 1) {
+    SequenceParams params;
+    params.seq_capacity = 32;
+    params.sampling_param = &sampling_param_;
+    params.stopping_checker = &stopping_checker_;
+    params.enable_schedule_overlap = true;
+    Batch batch;
+    for (int32_t row = 0; row < num_sequences; ++row) {
+      const int32_t first_token = row * 4 + 1;
+      sequences_.emplace_back(std::make_unique<Sequence>(
+          row,
+          std::vector<int32_t>{first_token, first_token + 1, first_token + 2},
+          torch::Tensor(),
+          MMData(),
+          IncrementalDecoder("", 3, false, false),
+          params));
+      Sequence* sequence = sequences_.back().get();
+      sequence->kv_state().add_blocks(BlockType::KV, manager_.allocate(1));
+      sequence->kv_state().set_kv_cache_tokens_num(3);
+      sequence->append_token(first_token + 3);
+      batch.add(sequence, 1);
+    }
+    return batch.prepare_forward_input(1, 0, ModelArgs());
+  }
+
+ private:
+  static BlockManager::Options make_options() {
+    BlockManager::Options options;
+    options.num_blocks(8).block_size(4);
+    return options;
+  }
+
+  RequestSamplingParam sampling_param_;
+  StoppingChecker stopping_checker_;
+  BlockManagerImpl manager_;
+  std::vector<std::unique_ptr<Sequence>> sequences_;
+};
 
 template <typename T>
 bool tensor_equals_vector(const torch::Tensor& tensor,
@@ -136,6 +193,8 @@ bool tensor_equals_vector(const torch::Tensor& tensor,
   }
   return true;
 }
+
+}  // namespace
 
 TEST(BatchPackedInputTest, ModelInputConversionExpandsMixedAdapterIds) {
   ModelInputParams input_params;
@@ -153,59 +212,8 @@ TEST(BatchPackedInputTest, ModelInputConversionExpandsMixedAdapterIds) {
 }
 
 TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
-  RequestSamplingParam sampling_param;
-  sampling_param.logprobs = true;
-
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(4);
-
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 32;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-  seq_params.skip_special_tokens = true;
-  seq_params.echo = false;
-  seq_params.logprobs = true;
-  seq_params.enable_schedule_overlap = true;
-
-  torch::Tensor input_embedding;
-  MMData mm_data;
-  BlockManager::Options options;
-  options.num_blocks(3).block_size(4);
-  BlockManagerImpl manager(options);
-
-  IncrementalDecoder decoder("", 1, false, false);
-  Sequence seq(/*index=*/0,
-               /*token_ids=*/{1, 2, 3, 4},
-               input_embedding,
-               mm_data,
-               std::move(decoder),
-               seq_params);
-
-  seq.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-
-  Sequence second_sequence(1,
-                           {5, 6, 7, 8},
-                           input_embedding,
-                           mm_data,
-                           IncrementalDecoder("", 1, false, false),
-                           seq_params);
-  second_sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-
-  std::vector<Sequence*> sequences = {&seq, &second_sequence};
-  std::vector<uint32_t> budgets = {4, 4};
-  BatchInputBuilder builder(sequences,
-                            budgets,
-                            {},
-                            {},
-                            nullptr,
-                            /*batch_id=*/1,
-                            nullptr,
-                            BatchForwardType::DECODE);
-
-  ForwardInput input =
-      builder.build_forward_input(/*num_decoding_tokens=*/1,
-                                  /*min_decoding_batch_size=*/0);
+  PackedDecodeInput fixture;
+  ForwardInput input = fixture.make_decode_input(2);
   ASSERT_EQ(input.input_params.meta.num_sequences, 2);
   input.input_params.embedding.engram_lookback_token_ids = {24, 23, 34, 33};
   input.input_params.embedding.linear_state_ids = {7, 8};
@@ -251,6 +259,10 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
 TEST(BatchPackedInputTest,
      LinearReadIndicesPreserveHostIdsAndClearWithTargetState) {
   ModelInputParams params;
+  params.meta.num_sequences = 2;
+  params.linear_state_validity_mask = {0, 1};
+  params.linear_state_validity_mask_tensor =
+      torch::tensor({0, 1}, torch::kInt32);
   params.embedding.linear_state_ids = {7, 8};
   params.embedding.linear_state_read_ids = {3, 4};
   ModelInputParams device_params = params.to(torch::Device(torch::kCPU));
@@ -258,7 +270,13 @@ TEST(BatchPackedInputTest,
             std::vector<int32_t>({3, 4}));
   EXPECT_TRUE(torch::equal(device_params.embedding.linear_state_read_indices,
                            torch::tensor({3, 4}, torch::kInt32)));
+  EXPECT_EQ(device_params.linear_state_validity_mask,
+            (std::vector<int64_t>{0, 1}));
+  EXPECT_TRUE(torch::equal(device_params.linear_state_validity_mask_tensor,
+                           torch::tensor({0, 1}, torch::kInt32)));
   device_params.clear_linear_attention_state();
+  EXPECT_TRUE(device_params.linear_state_validity_mask.empty());
+  EXPECT_FALSE(device_params.linear_state_validity_mask_tensor.defined());
   EXPECT_TRUE(device_params.embedding.linear_state_ids.empty());
   EXPECT_TRUE(device_params.embedding.linear_state_read_ids.empty());
   EXPECT_FALSE(device_params.embedding.linear_state_indices.defined());
@@ -266,51 +284,8 @@ TEST(BatchPackedInputTest,
 }
 
 TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresSampleIdxes) {
-  RequestSamplingParam sampling_param;
-  sampling_param.logprobs = true;
-
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(4);
-
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 32;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-  seq_params.skip_special_tokens = true;
-  seq_params.echo = false;
-  seq_params.logprobs = true;
-  seq_params.enable_schedule_overlap = true;
-
-  torch::Tensor input_embedding;
-  MMData mm_data;
-  BlockManager::Options options;
-  options.num_blocks(2).block_size(4);
-  BlockManagerImpl manager(options);
-
-  IncrementalDecoder decoder("", 1, false, false);
-  Sequence seq(/*index=*/0,
-               /*token_ids=*/{1, 2, 3, 4},
-               input_embedding,
-               mm_data,
-               std::move(decoder),
-               seq_params);
-
-  seq.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-
-  std::vector<Sequence*> sequences = {&seq};
-  std::vector<uint32_t> budgets = {4};
-  BatchInputBuilder builder(sequences,
-                            budgets,
-                            {},
-                            {},
-                            nullptr,
-                            /*batch_id=*/1,
-                            nullptr,
-                            BatchForwardType::DECODE);
-
-  ForwardInput input =
-      builder.build_forward_input(/*num_decoding_tokens=*/1,
-                                  /*min_decoding_batch_size=*/0);
+  PackedDecodeInput fixture;
+  ForwardInput input = fixture.make_decode_input(1);
   ASSERT_TRUE(input.sampling_params.sample_idxes.defined());
   input.sampling_params.filter_bitmask =
       torch::tensor({{static_cast<int32_t>(0x5)}},
@@ -406,6 +381,20 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
   ASSERT_TRUE(unpacked_input.input_params.dit_forward_input.has_value());
   const DiTForwardInput& unpacked_dit_input =
       *unpacked_input.input_params.dit_forward_input;
+  // Direct fields are the wire oracle: using only
+  // DiTGenerationParams::operator== could conceal a transport omission if that
+  // operator also missed the field.
+  const auto expect_text_params = [](const DiTGenerationParams& restored) {
+    EXPECT_EQ(restored.max_new_tokens, 96);
+    EXPECT_EQ(restored.diffusion_steps, 12);
+    EXPECT_FLOAT_EQ(restored.temperature, 0.6F);
+    EXPECT_EQ(restored.top_k, 32);
+    EXPECT_FLOAT_EQ(restored.top_p, 0.85F);
+    EXPECT_FLOAT_EQ(restored.repetition_penalty, 1.2F);
+    EXPECT_TRUE(restored.seed_is_set);
+    EXPECT_EQ(restored.seed, 1234567);
+  };
+  expect_text_params(unpacked_dit_input.generation_params);
   EXPECT_EQ(unpacked_dit_input.generation_params, params);
   ASSERT_EQ(unpacked_dit_input.media_sources.size(), 3u);
   EXPECT_EQ(unpacked_dit_input.media_sources.at(0).name, "prompt_video");
@@ -453,51 +442,12 @@ TEST(BatchPackedInputTest, PackedProtoPreservesDiTGenerationParams) {
   EXPECT_TRUE(torch::equal(*proto_input_round_trip.tensor_sources.get("latent"),
                            *dit_input.tensor_sources.get("latent")));
 
-  proto::DiTGenerationParams proto_params;
-  ASSERT_TRUE(generation_params_to_proto(params, &proto_params));
-  DiTGenerationParams proto_round_trip;
-  ASSERT_TRUE(proto_to_generation_params(proto_params, proto_round_trip));
-  EXPECT_EQ(proto_round_trip, params);
+  expect_text_params(proto_input_round_trip.generation_params);
 }
 
 TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(4);
-
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 32;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-  seq_params.enable_schedule_overlap = true;
-
-  MMData mm_data;
-  BlockManager::Options options;
-  options.num_blocks(2).block_size(4);
-  BlockManagerImpl manager(options);
-
-  IncrementalDecoder decoder("", 1, false, false);
-  Sequence sequence(/*index=*/0,
-                    /*token_ids=*/{1, 2, 3, 4},
-                    torch::Tensor(),
-                    mm_data,
-                    std::move(decoder),
-                    seq_params);
-  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-
-  std::vector<Sequence*> sequences = {&sequence};
-  std::vector<uint32_t> allowed_max_tokens = {4};
-  BatchInputBuilder builder(sequences,
-                            allowed_max_tokens,
-                            {},
-                            {},
-                            nullptr,
-                            /*batch_id=*/2,
-                            nullptr,
-                            BatchForwardType::DECODE);
-  ForwardInput input = builder.build_forward_input(
-      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
-
+  PackedDecodeInput fixture;
+  ForwardInput input = fixture.make_decode_input(1);
   JsonObjectGrammar grammar({"{", "}", "stop"}, /*stop_token_ids=*/{2});
   JsonObjectGrammarState state = grammar.initial_state();
   ASSERT_TRUE(state.accept_token(/*open_object=*/0));
@@ -528,55 +478,12 @@ TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
 }
 
 TEST(BatchPackedInputTest, PackedProtoRejectsIncompatibleLayoutHeader) {
-  // The assertions below inspect the CHECK message. Under the default fast
-  // style gtest forks this already multi-threaded test process, and the child
-  // can die before glog flushes, leaving no message to match. The threadsafe
-  // style re-executes the binary in a clean child instead.
+  ScopedDeathTestConfiguration death_test_configuration;
   ::testing::FLAGS_gtest_death_test_style = "threadsafe";
   FLAGS_logtostderr = true;
-
-  // The payload header is consumed as [format_tag][descriptor_bytes]
-  // [tensor_arena_offset][tensor_arena_bytes] with no length self-description,
-  // so a foreign or corrupted header must be rejected before any field is
-  // parsed instead of shifting every later field.
   constexpr size_t kRawLayoutHeaderBytes = 4 * sizeof(uint64_t);
-
-  RequestSamplingParam sampling_param;
-  StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(4);
-
-  SequenceParams seq_params;
-  seq_params.seq_capacity = 32;
-  seq_params.stopping_checker = &stopping_checker;
-  seq_params.sampling_param = &sampling_param;
-  seq_params.enable_schedule_overlap = true;
-
-  MMData mm_data;
-  BlockManager::Options options;
-  options.num_blocks(2).block_size(4);
-  BlockManagerImpl manager(options);
-
-  IncrementalDecoder decoder("", 1, false, false);
-  Sequence sequence(/*index=*/0,
-                    /*token_ids=*/{1, 2, 3, 4},
-                    torch::Tensor(),
-                    mm_data,
-                    std::move(decoder),
-                    seq_params);
-  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-
-  std::vector<Sequence*> sequences = {&sequence};
-  std::vector<uint32_t> allowed_max_tokens = {4};
-  BatchInputBuilder builder(sequences,
-                            allowed_max_tokens,
-                            {},
-                            {},
-                            nullptr,
-                            /*batch_id=*/2,
-                            nullptr,
-                            BatchForwardType::DECODE);
-  ForwardInput input = builder.build_forward_input(
-      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0);
+  PackedDecodeInput fixture;
+  ForwardInput input = fixture.make_decode_input();
 
   proto::PackedForwardInput packed_input;
   ASSERT_TRUE(forward_input_to_packed_proto(input, &packed_input));

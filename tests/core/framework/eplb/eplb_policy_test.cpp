@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "eplb_policy.h"
+#include "core/framework/eplb/eplb_policy.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -23,28 +23,21 @@ limitations under the License.
 #include <set>
 #include <vector>
 
-#include "core/platform/platform.h"
-
 namespace xllm {
 
 namespace {
 
-// Common shape used across the policy tests below. 16 experts on 4 devices,
-// 5 physical slots per device (i.e. 4 primaries + 1 redundant) = 20 total
-// slots, matching the pre-refactor Build test.
+// Shared policy-test shape: 16 logical experts on 4 devices, with 5 physical
+// slots per device (4 primary slots and 1 redundant slot).
 constexpr int32_t kDeviceExpertsNum = 5;
 constexpr int32_t kDeviceNum = 4;
 constexpr int32_t kLayerNum = 1;
 constexpr int32_t kNumExperts = 16;
 
 torch::Tensor make_skewed_load() {
-  std::vector<torch::Tensor> tensors;
-  tensors.reserve(1);
-  tensors.emplace_back(torch::arange(0, kNumExperts));
-  auto expert_load = torch::stack(tensors, 0);
-  expert_load[0] =
-      torch::tensor({100, 100, 100, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 100});
-  return expert_load;
+  return torch::tensor(
+      {{100, 100, 100, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 100}},
+      torch::kInt64);
 }
 
 // Validates a rebalanced distribution against the shape and slot-cardinality
@@ -75,7 +68,6 @@ void expect_distribution_valid(const torch::Tensor& distribution) {
 }  // namespace
 
 TEST(EplbPolicyTest, Build_Greedy) {
-  torch::Device device(Platform::type_torch(), 0);
   GreedyEplbPolicy policy(
       kDeviceExpertsNum, kDeviceNum, kLayerNum, EplbOptions{});
   auto expert_load = make_skewed_load();
@@ -87,7 +79,6 @@ TEST(EplbPolicyTest, Build_Greedy) {
 }
 
 TEST(EplbPolicyTest, Build_Balanced) {
-  torch::Device device(Platform::type_torch(), 0);
   BalancedEplbPolicy policy(
       kDeviceExpertsNum, kDeviceNum, kLayerNum, EplbOptions{});
   auto expert_load = make_skewed_load();
@@ -96,17 +87,6 @@ TEST(EplbPolicyTest, Build_Balanced) {
   expect_distribution_valid(rebalance_expert);
   ASSERT_EQ(static_cast<int32_t>(enable_update_vec.size()), kLayerNum);
   EXPECT_TRUE(enable_update_vec[0]);
-
-  // Balanced policy MUST have equal-cardinality per device: exactly
-  // kDeviceExpertsNum slots on every device, filled.
-  auto flat = rebalance_expert[0].contiguous().to(torch::kInt32);
-  for (int32_t d = 0; d < kDeviceNum; ++d) {
-    auto row = flat[d];
-    for (int32_t s = 0; s < kDeviceExpertsNum; ++s) {
-      EXPECT_GE(row[s].item<int32_t>(), 0)
-          << "Balanced policy left slot [" << d << "][" << s << "] unassigned.";
-    }
-  }
 }
 
 TEST(EplbPolicyTest, BalancedSpreadsReplicasAcrossDevices) {

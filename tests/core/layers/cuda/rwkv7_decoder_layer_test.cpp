@@ -178,7 +178,7 @@ class RWKV7DecoderLayerTest : public ::testing::Test {
     }
     device_ = torch::Device(torch::kCUDA, 0);
     options_ = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
-    parallel_args_ = ParallelArgs(1, 1, nullptr);
+    parallel_args_ = ParallelArgs(0, 1, nullptr);
     context_ =
         ModelContext(parallel_args_, make_model_args(), QuantArgs(), options_);
     layer_ = RWKV7DecoderLayer(context_, /*layer_id=*/0);
@@ -188,7 +188,7 @@ class RWKV7DecoderLayerTest : public ::testing::Test {
 
   torch::Device device_{torch::kCPU};
   torch::TensorOptions options_;
-  ParallelArgs parallel_args_{1, 1, nullptr};
+  ParallelArgs parallel_args_{0, 1, nullptr};
   ModelContext context_{parallel_args_,
                         make_model_args(),
                         QuantArgs(),
@@ -196,21 +196,6 @@ class RWKV7DecoderLayerTest : public ::testing::Test {
   RWKV7DecoderLayer layer_{nullptr};
   KVCache kv_cache_;
 };
-
-TEST_F(RWKV7DecoderLayerTest, ForwardProducesFiniteOutput) {
-  const int32_t seq_len = 4;
-  auto input = seeded_tensor("input", {seq_len, kHiddenSize}, options_);
-  auto params = make_input_params(/*num_sequences=*/1, {seq_len}, device_);
-
-  torch::Tensor v_first;
-  auto output =
-      layer_->forward(input, kv_cache_, params, /*layer_id=*/0, v_first);
-
-  EXPECT_EQ(output.sizes(), torch::IntArrayRef({seq_len, kHiddenSize}));
-  EXPECT_TRUE(torch::isfinite(output).all().item<bool>());
-  EXPECT_TRUE(v_first.defined());
-  EXPECT_EQ(v_first.sizes(), torch::IntArrayRef({seq_len, kHiddenSize}));
-}
 
 TEST_F(RWKV7DecoderLayerTest, ForwardUpdatesLinearAttentionState) {
   const int32_t seq_len = 2;
@@ -229,6 +214,8 @@ TEST_F(RWKV7DecoderLayerTest, ForwardUpdatesLinearAttentionState) {
   auto ssm_after = kv_cache_.get_ssm_cache();
   EXPECT_FALSE(torch::allclose(conv_before, conv_after));
   EXPECT_FALSE(torch::allclose(ssm_before, ssm_after));
+  EXPECT_EQ(conv_after.slice(0, 1).count_nonzero().item<int64_t>(), 0);
+  EXPECT_EQ(ssm_after.slice(0, 1).count_nonzero().item<int64_t>(), 0);
 }
 
 TEST_F(RWKV7DecoderLayerTest, ForwardSupportsMultipleSequences) {
@@ -244,6 +231,25 @@ TEST_F(RWKV7DecoderLayerTest, ForwardSupportsMultipleSequences) {
 
   EXPECT_EQ(output.sizes(), torch::IntArrayRef({total_tokens, kHiddenSize}));
   EXPECT_TRUE(torch::isfinite(output).all().item<bool>());
+  ASSERT_TRUE(v_first.defined());
+  EXPECT_EQ(v_first.sizes(), torch::IntArrayRef({total_tokens, kHiddenSize}));
+  std::vector<torch::Tensor> independent_outputs;
+  independent_outputs.reserve(q_lens.size());
+  int64_t begin = 0;
+  for (int32_t length : q_lens) {
+    KVCache independent_cache = make_kv_cache(device_);
+    auto independent_params = make_input_params(1, {length}, device_);
+    torch::Tensor independent_v_first;
+    independent_outputs.emplace_back(
+        layer_->forward(input.narrow(0, begin, length),
+                        independent_cache,
+                        independent_params,
+                        0,
+                        independent_v_first));
+    begin += length;
+  }
+  EXPECT_TRUE(
+      torch::allclose(output, torch::cat(independent_outputs), 1e-3, 1e-3));
 }
 
 }  // namespace layer

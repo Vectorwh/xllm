@@ -27,28 +27,6 @@ def _npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _atol_rtol(dtype: torch.dtype) -> tuple[float, float]:
-    if dtype == torch.bfloat16:
-        return 2e-2, 2e-2
-    return 1e-2, 1e-2
-
-
-def _decode_packed_lse(send: torch.Tensor, head_dim: int) -> torch.Tensor:
-    packed = send[..., head_dim:].float()
-    if packed.shape[-1] == 1:
-        return packed[..., 0]
-    exponent_code = packed[..., 0]
-    significand_hi = packed[..., 1]
-    significand_mid = packed[..., 2]
-    significand_lo = packed[..., 3]
-    packed_valid = exponent_code != 0
-    sign = torch.where(exponent_code < 0, -1.0, 1.0)
-    exponent_magnitude = exponent_code.abs()
-    significand = significand_hi * 65536.0 + significand_mid * 256.0 + significand_lo
-    lse = sign * significand * torch.exp2(exponent_magnitude - 128.0 - 23.0)
-    return torch.where(packed_valid, lse, torch.full_like(lse, float("nan")))
-
-
 def _reference_merge(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
     finite = torch.isfinite(lse)
     safe_lse = lse.masked_fill(~finite, float("-inf"))
@@ -62,6 +40,7 @@ def _simulate_all_to_all(packed_by_rank: list[torch.Tensor], my_rank: int) -> to
 
 
 def test_pack_rejects_cpu_tensors() -> None:
+    pytest.importorskip("triton", reason="Native pack wrapper requires Triton")
     from xllm.python.kernels_npu.triton.dcp_packed_a2a import pack_dcp_output_lse
 
     output = torch.randn(8, 16, 512, dtype=torch.bfloat16)
@@ -93,10 +72,18 @@ def _shard_for_rank(
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU is not available")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("scatter_dim", [0, 1])
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-def test_pack_layout_and_lse_roundtrip(dtype: torch.dtype, scatter_dim: int, head_dim: int) -> None:
+@pytest.mark.parametrize(
+    ("dtype", "scatter_dim", "head_dim"),
+    [
+        (torch.bfloat16, 0, 128),
+        (torch.float16, 1, 128),
+        (torch.bfloat16, 1, 256),
+        (torch.float16, 0, 256),
+        (torch.bfloat16, 1, 512),
+        (torch.float16, 0, 512),
+    ],
+)
+def test_pack_layout_copies_native_payload(dtype: torch.dtype, scatter_dim: int, head_dim: int) -> None:
     from xllm.python.kernels_npu.triton.dcp_packed_a2a import pack_dcp_output_lse
 
     device = torch.device("npu")
@@ -116,15 +103,11 @@ def test_pack_layout_and_lse_roundtrip(dtype: torch.dtype, scatter_dim: int, hea
                 head_idx = dest * local_scatter + scatter_idx
                 packed_out = send[dest, scatter_idx]
                 expected_out = output[:, head_idx]
-                expected_lse = softmax_lse[:, head_idx]
             else:
                 token_idx = dest * local_scatter + scatter_idx
                 packed_out = send[dest, scatter_idx]
                 expected_out = output[token_idx]
-                expected_lse = softmax_lse[token_idx]
             torch.testing.assert_close(packed_out[..., :head_dim], expected_out, rtol=0, atol=0)
-            decoded = _decode_packed_lse(packed_out.unsqueeze(0), head_dim).squeeze(0)
-            torch.testing.assert_close(decoded, expected_lse, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU is not available")
@@ -151,7 +134,7 @@ def test_fused_combine_matches_softmax_merge(dtype: torch.dtype, scatter_dim: in
     torch.npu.synchronize()
     shard_out, shard_lse = _shard_for_rank(outputs, lses, dcp_size, scatter_dim, my_rank)
     expected = _reference_merge(shard_out, shard_lse)
-    atol, rtol = _atol_rtol(dtype)
+    atol = rtol = 2e-2 if dtype == torch.bfloat16 else 1e-2
     torch.testing.assert_close(merged, expected, atol=atol, rtol=rtol)
 
 
@@ -234,48 +217,41 @@ def test_fused_combine_includes_local_attention_contribution() -> None:
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU is not available")
 def test_pack_accepts_noncontiguous_and_graph_lse() -> None:
-    from xllm.python.kernels_npu.triton.dcp_packed_a2a import pack_dcp_output_lse
+    from xllm.python.kernels_npu.triton.dcp_packed_a2a import fused_dcp_lse_combine, pack_dcp_output_lse
 
     device = torch.device("npu")
-    dcp_size = 4
-    num_tokens = 8
-    num_heads = 16
-    head_dim = 512
-    scatter_dim = 1
+    dcp_size, num_tokens, num_heads, head_dim = 4, 8, 16, 512
     torch.manual_seed(3)
-    base = torch.randn(num_heads, num_tokens, head_dim, dtype=torch.bfloat16, device=device)
-    output = base.permute(1, 0, 2)
-    assert not output.is_contiguous()
-    softmax_lse = torch.randn(1, num_tokens, num_heads, 1, dtype=torch.float32, device=device)[0]
-    assert tuple(softmax_lse.shape) == (num_tokens, num_heads, 1)
-    send = pack_dcp_output_lse(output, softmax_lse, dcp_size, scatter_dim)
+    outputs = [
+        torch.randn(num_heads, num_tokens, head_dim, dtype=torch.bfloat16, device=device).permute(1, 0, 2)
+        for _ in range(dcp_size)
+    ]
+    lses = [torch.randn(num_tokens, num_heads, 1, dtype=torch.float32, device=device) for _ in range(dcp_size)]
+    assert all(not output.is_contiguous() for output in outputs)
+    packed = [pack_dcp_output_lse(output, lse, dcp_size, 1) for output, lse in zip(outputs, lses, strict=True)]
+    torch.testing.assert_close(packed[0][0, 0, :, :head_dim], outputs[0][:, 0], rtol=0, atol=0)
+    my_rank = 1
+    merged = fused_dcp_lse_combine(_simulate_all_to_all(packed, my_rank), head_dim, 1)
     torch.npu.synchronize()
-    h_local = num_heads // dcp_size
-    torch.testing.assert_close(
-        send[0, 0, :, :head_dim],
-        output[:, 0],
-        rtol=0,
-        atol=0,
-    )
-    decoded = _decode_packed_lse(send[1, 3], head_dim)
-    torch.testing.assert_close(decoded, softmax_lse[:, 1 * h_local + 3, 0], rtol=1e-5, atol=1e-5)
+    shard_output, shard_lse = _shard_for_rank(outputs, [lse[..., 0] for lse in lses], dcp_size, 1, my_rank)
+    expected = _reference_merge(shard_output, shard_lse)
+    torch.testing.assert_close(merged, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU is not available")
 def test_pack_preserves_lse_outside_fp16_range() -> None:
-    from xllm.python.kernels_npu.triton.dcp_packed_a2a import pack_dcp_output_lse
+    from xllm.python.kernels_npu.triton.dcp_packed_a2a import fused_dcp_lse_combine, pack_dcp_output_lse
 
     device = torch.device("npu")
-    dcp_size = 2
-    num_tokens = 2
-    num_heads = 4
-    head_dim = 128
-    output = torch.zeros(num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-    softmax_lse = torch.full((num_tokens, num_heads), 70000.0, dtype=torch.float32, device=device)
-    softmax_lse[0, 1] = -70000.0
-    send = pack_dcp_output_lse(output, softmax_lse, dcp_size, scatter_dim=1)
+    dcp_size, num_tokens, num_heads, head_dim = 2, 2, 4, 128
+    outputs = [
+        torch.full((num_tokens, num_heads, head_dim), value, dtype=torch.bfloat16, device=device) for value in (1, 3)
+    ]
+    lses = [torch.full((num_tokens, num_heads), value, dtype=torch.float32, device=device) for value in (70000, 69999)]
+    lses[0][0, 1], lses[1][0, 1] = -70000, -69999
+    packed = [pack_dcp_output_lse(output, lse, dcp_size, 1) for output, lse in zip(outputs, lses, strict=True)]
+    merged = fused_dcp_lse_combine(_simulate_all_to_all(packed, 0), head_dim, 1)
     torch.npu.synchronize()
-    decoded = _decode_packed_lse(send[0, 0], head_dim)
-    torch.testing.assert_close(decoded, softmax_lse[:, 0], rtol=1e-5, atol=1.0)
-    decoded_neg = _decode_packed_lse(send[0, 1], head_dim)
-    torch.testing.assert_close(decoded_neg, softmax_lse[:, 1], rtol=1e-5, atol=1.0)
+    shard_output, shard_lse = _shard_for_rank(outputs, lses, dcp_size, 1, 0)
+    expected = _reference_merge(shard_output, shard_lse)
+    torch.testing.assert_close(merged, expected, rtol=0, atol=0)

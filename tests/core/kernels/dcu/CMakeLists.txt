@@ -37,7 +37,7 @@ cc_test(
     glog::glog
 )
 option(XLLM_ENABLE_DCU_BLOCK_COPY_TEST
-       "Build and register the expensive DCU block_copy_test"
+       "Build and register the optional DCU block_copy correctness test"
        OFF
 )
 
@@ -52,7 +52,6 @@ if(XLLM_ENABLE_DCU_BLOCK_COPY_TEST)
       hip::host
       torch
       GTest::gtest_main
-      glog::glog
   )
 endif()
 

@@ -427,6 +427,17 @@ TEST(MtpAsyncInputBuilderTest, PybindViewOwnsGlobalDpKvMaxSequenceLengths) {
     register_attention_metadata_views(main_module);
   }
 
+  auto empty_metadata = std::make_shared<layer::AttentionMetadata>();
+  py::object empty_view = py::cast(PyAttentionMetadataView(empty_metadata));
+  EXPECT_TRUE(empty_view.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>()
+                  .empty());
+  ModelInputParams empty_params;
+  py::object empty_params_view = py::cast(
+      PyAttentionMetadataView(std::move(empty_metadata), empty_params));
+  EXPECT_TRUE(empty_params_view.attr("dp_global_kv_max_seq_lens")
+                  .cast<std::vector<int32_t>>()
+                  .empty());
   const std::vector<std::vector<int32_t>> histories = {{32769, 0}, {0, 32769}};
   for (const std::vector<int32_t>& expected : histories) {
     py::object py_metadata;
@@ -463,31 +474,6 @@ TEST(MtpAsyncInputBuilderTest, PybindViewOwnsGlobalDpKvMaxSequenceLengths) {
         py::setattr(py_metadata, "dp_global_kv_max_seq_lens", py::none()),
         py::error_already_set);
   }
-}
-
-TEST(MtpAsyncInputBuilderTest, PybindViewDefaultsGlobalDpKvMaxSequenceLengths) {
-  if (!Py_IsInitialized()) {
-    setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", /*overwrite=*/1);
-    Py_InitializeEx(/*initsigs=*/0);
-  }
-  py::gil_scoped_acquire gil;
-  py::module_ main_module = py::module_::import("__main__");
-  if (!py::hasattr(main_module, "AttentionMetadataView")) {
-    register_attention_metadata_views(main_module);
-  }
-
-  auto metadata = std::make_shared<layer::AttentionMetadata>();
-  py::object py_metadata = py::cast(PyAttentionMetadataView(metadata));
-  EXPECT_TRUE(py_metadata.attr("dp_global_kv_max_seq_lens")
-                  .cast<std::vector<int32_t>>()
-                  .empty());
-
-  ModelInputParams params;
-  py::object py_params_metadata =
-      py::cast(PyAttentionMetadataView(std::move(metadata), params));
-  EXPECT_TRUE(py_params_metadata.attr("dp_global_kv_max_seq_lens")
-                  .cast<std::vector<int32_t>>()
-                  .empty());
 }
 
 TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
@@ -674,6 +660,18 @@ TEST(MtpAsyncInputBuilderTest, SharedModulesPointToTargetModel) {
   py::object draft_embedding = draft_model.attr("model").attr("embed_tokens");
   EXPECT_TRUE(draft_lm_head.is(target_lm_head));
   EXPECT_TRUE(draft_embedding.is(target_embedding));
+  py::object owned_lm_head = nn.attr("Linear")(py::arg("in_features") = 2,
+                                               py::arg("out_features") = 2);
+  py::object owned_embedding = nn.attr("Embedding")(
+      py::arg("num_embeddings") = 4, py::arg("embedding_dim") = 2);
+  draft_model.attr("lm_head") = owned_lm_head;
+  draft_model.attr("model").attr("embed_tokens") = owned_embedding;
+  ::xllm::detail::share_python_model_weights(draft_model, target_model);
+  py::object retained_lm_head = draft_model.attr("lm_head");
+  py::object retained_embedding =
+      draft_model.attr("model").attr("embed_tokens");
+  EXPECT_TRUE(retained_lm_head.is(owned_lm_head));
+  EXPECT_TRUE(retained_embedding.is(owned_embedding));
 }
 
 }  // namespace

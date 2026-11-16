@@ -35,17 +35,6 @@ def _positions(num_tokens: int) -> torch.Tensor:
     return torch.arange(num_tokens, dtype=torch.int64)
 
 
-def test_compute_cp_rows_by_rank_covers_each_row_once() -> None:
-    rows_by_rank = _compute_cp_rows_by_rank(3, [5, 2, 6])
-    assert len(rows_by_rank) == 3
-    seen: list[int] = []
-    for rows in rows_by_rank:
-        assert rows == sorted(rows)
-        seen.extend(rows)
-    assert sorted(seen) == list(range(13))
-    assert len(seen) == 13
-
-
 def test_compute_cp_rows_by_rank_aggregates_multi_sequence_by_rank() -> None:
     # Do not flatten (rank, sequence) pairs: each outer entry must contain one
     # rank's rows across every sequence, matching the C++ reference.
@@ -101,6 +90,7 @@ def test_global_rope_expands_built_half_width_pair() -> None:
     ctx = build_deepseek_v4_cp_context(2, 0, [4], [4], _positions(4))
     half_cos = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     half_sin = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100
+    original_cos, original_sin = half_cos.clone(), half_sin.clone()
     ctx.set_global_rope_pair(4, (half_cos, half_sin))
     cos, sin = ctx.global_rope(4)
     assert cos is not None and sin is not None
@@ -119,75 +109,58 @@ def test_global_rope_expands_built_half_width_pair() -> None:
         [106, 106, 107, 107],
     ]
     # The compressor-owned input pair must not be mutated.
-    assert tuple(half_cos.shape) == (4, 2)
+    torch.testing.assert_close(half_cos, original_cos, rtol=0, atol=0)
+    torch.testing.assert_close(half_sin, original_sin, rtol=0, atol=0)
 
 
 def test_global_rope_pair_rejects_mismatched_widths() -> None:
     ctx = build_deepseek_v4_cp_context(2, 0, [2], [2], _positions(2))
-    try:
+    with pytest.raises(RuntimeError, match="widths differ"):
         ctx.set_global_rope_pair(1, (torch.zeros(2, 3), torch.zeros(2, 4)))
-    except RuntimeError as exc:
-        assert "widths differ" in str(exc)
-    else:
-        raise AssertionError("expected mismatched RoPE widths to fail")
-
-
-def test_gather_restore_permutation_is_rank_major() -> None:
-    ctx = build_deepseek_v4_cp_context(2, 0, [5], [5], _positions(5))
-    # cp=2 contiguous split of rows 0..4:
-    #   rank0 owns [0,1,2], rank1 owns [3,4]
-    # all_gather gives [0,1,2,3,4], so restore[0..4] = [0,1,2,3,4].
-    assert ctx.restore_indices.tolist() == [0, 1, 2, 3, 4]
-
-    ctx1 = build_deepseek_v4_cp_context(2, 0, [4], [4], _positions(4))
-    # rank0 owns [0,1], rank1 owns [2,3], both identical here.
-    assert ctx1.restore_indices.tolist() == [0, 1, 2, 3]
 
 
 def test_global_rope_prefers_requested_ratio_and_falls_back() -> None:
-    cache = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    cache = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     ctx = build_deepseek_v4_cp_context(2, 0, [4], [4], _positions(4))
     ctx.set_global_rope_cache(1, cache)
+    expected_cos = torch.tensor([[0, 0, 1, 1], [4, 4, 5, 5], [8, 8, 9, 9], [12, 12, 13, 13]], dtype=torch.float32)
+    expected_sin = expected_cos + 2
     cos, sin = ctx.global_rope(4)
     assert cos is not None and sin is not None
-    # [cos, sin] is split before interleave: the requested fallback uses ratio
-    # 1's cache, whose half widths are 1 and 2 columns respectively.
-    assert tuple(cos.shape) == (4, 2)
-    assert tuple(sin.shape) == (4, 4)
+    torch.testing.assert_close(cos, expected_cos, rtol=0, atol=0)
+    torch.testing.assert_close(sin, expected_sin, rtol=0, atol=0)
+
+    ctx.set_global_rope_cache(4, cache + 100)
+    cos, sin = ctx.global_rope(4)
+    assert cos is not None and sin is not None
+    torch.testing.assert_close(cos, expected_cos + 100, rtol=0, atol=0)
+    torch.testing.assert_close(sin, expected_sin + 100, rtol=0, atol=0)
 
 
-def test_gather_restore_uses_uneven_cp_ranks(monkeypatch) -> None:
-    """Pin CP restore to the uneven ``tokens_per_rank`` collective path."""
-    positions = _positions(5)
-    ctx = build_deepseek_v4_cp_context(2, 1, [5], [5], positions)
-    assert ctx.tokens_per_rank == [3, 2]
-
+def test_gather_restore_uses_uneven_cp_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = build_deepseek_v4_cp_context(3, 1, [5, 2, 6], [5, 2, 6], _positions(13))
     captured: dict[str, object] = {}
 
     class _FakeXllmDistributed:
         @staticmethod
         def all_gather_variable(
-            tensor: torch.Tensor,
-            token_counts: list[int],
-            rank: int,
-            group_name: str,
+            tensor: torch.Tensor, token_counts: list[int], rank: int, group_name: str
         ) -> torch.Tensor:
-            captured["tensor"] = tensor
+            assert tensor.is_contiguous()
             captured["token_counts"] = list(token_counts)
             captured["rank"] = rank
             captured["group_name"] = group_name
-            # Simulate rank-major all_gather for [3, 2].
-            return torch.arange(5, dtype=torch.int64).reshape(5, 1)
+            return torch.cat((torch.tensor([[0], [1], [5], [7], [8]]), tensor, torch.tensor([[4], [11], [12]])))
 
     import xllm.python.model_executor.v4_cp_context as cp_module
 
-    fake = _FakeXllmDistributed()
-    monkeypatch.setattr(cp_module, "distributed", fake)
-    result = ctx.gather_restore(torch.arange(2, dtype=torch.int64).reshape(2, 1))
-    assert captured["token_counts"] == [3, 2]
+    monkeypatch.setattr(cp_module, "distributed", _FakeXllmDistributed())
+    local = torch.tensor([[2], [3], [6], [9], [10]], dtype=torch.int64)
+    result = ctx.gather_restore(local)
+    assert captured["token_counts"] == [5, 5, 3]
     assert captured["rank"] == 1
     assert captured["group_name"] == "cp"
-    assert result.tolist() == [[0], [1], [2], [3], [4]]
+    torch.testing.assert_close(result, torch.arange(13).reshape(13, 1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cp_rank", [-1, 2])

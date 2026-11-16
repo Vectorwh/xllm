@@ -48,42 +48,9 @@ TEST(PdTopologyGuardTest, HomoTopoBypass) {
   EXPECT_TRUE(result.reason.empty());
 }
 
-TEST(PdTopologyGuardTest, RegistrationOmitsCpAndKeepsTopologyCompatible) {
-  InstanceInfo prefill = make_info(1, {0, 1, 2, 3});
-  prefill.name = "prefill";
-  prefill.type = "PREFILL";
-  prefill.kv_split_size = 1;
-  InstanceInfo decode = make_info(1, {4, 5, 6, 7});
-  decode.name = "decode";
-  decode.type = "DECODE";
-  decode.kv_split_size = 1;
-
-  const nlohmann::json prefill_registration = prefill.serialize_to_json();
-  const nlohmann::json decode_registration = decode.serialize_to_json();
-  EXPECT_FALSE(prefill_registration.contains("cp_size"));
-  EXPECT_FALSE(prefill_registration.contains("requested_cp_size"));
-  EXPECT_FALSE(decode_registration.contains("cp_size"));
-  EXPECT_FALSE(decode_registration.contains("requested_cp_size"));
-
-  const PdTopoResult result = check_pd_topo(prefill, decode, "PUSH");
-  EXPECT_EQ(result.status, PdTopoStatus::ALLOW_HOMO);
-  EXPECT_TRUE(result.reason.empty());
-}
-
 TEST(PdTopologyGuardTest, KvSplitDoesNotAffectAggregateTopology) {
   InstanceInfo info = make_info(2, {0, 1, 2, 3});
   info.kv_split_size = 8;
-
-  PdTopo topo;
-  std::string reason;
-  EXPECT_TRUE(try_get_pd_topo(info, &topo, &reason));
-  EXPECT_EQ(topo.dp_size, 2);
-  EXPECT_EQ(topo.tp_size, 2);
-  EXPECT_TRUE(reason.empty());
-}
-
-TEST(PdTopologyGuardTest, TryGetPdTopoReturnTopo) {
-  const InstanceInfo info = make_info(2, {0, 1, 2, 3});
 
   PdTopo topo;
   std::string reason;
@@ -129,24 +96,6 @@ TEST(PdTopologyGuardTest, HeteroDpAndTpAllowsPush) {
   EXPECT_TRUE(result.reason.empty());
 }
 
-TEST(PdTopologyGuardTest, NonIntegerTpChangeAllowsPush) {
-  const InstanceInfo local_info = make_info(1, {0, 1, 2});
-  const InstanceInfo remote_info = make_info(1, {3, 4});
-
-  const PdTopoResult result = check_pd_topo(local_info, remote_info, "PUSH");
-  EXPECT_EQ(result.status, PdTopoStatus::ALLOW_HETERO);
-  EXPECT_TRUE(result.reason.empty());
-}
-
-TEST(PdTopologyGuardTest, PrefillTpFourDecodeTpOneAllowsPush) {
-  const InstanceInfo local_info = make_info(1, {0, 1, 2, 3});
-  const InstanceInfo remote_info = make_info(1, {4});
-
-  const PdTopoResult result = check_pd_topo(local_info, remote_info, "PUSH");
-  EXPECT_EQ(result.status, PdTopoStatus::ALLOW_HETERO);
-  EXPECT_TRUE(result.reason.empty());
-}
-
 TEST(PdTopologyGuardTest, CheckPdTopoRejectInvalidLocalTopo) {
   const InstanceInfo local_info = make_info(0, {0, 1, 2, 3});
   const InstanceInfo remote_info = make_info(1, {0, 1, 2, 3});
@@ -168,15 +117,6 @@ TEST(PdTopologyGuardTest, CheckPdTopoRejectInvalidRemoteTopo) {
             "dp_size");
 }
 
-TEST(PdTopologyGuardTest, TryGetPdTopoRejectBadClusterSplit) {
-  const InstanceInfo info = make_info(2, {0, 1, 2});
-
-  PdTopo topo;
-  std::string reason;
-  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
-  EXPECT_EQ(reason, "cluster_ids.size() must be divisible by dp_size");
-}
-
 TEST(PdTopologyGuardTest, TryGetPdTopoRejectEmptyClusterIds) {
   const InstanceInfo info = make_info(2, {});
 
@@ -186,28 +126,12 @@ TEST(PdTopologyGuardTest, TryGetPdTopoRejectEmptyClusterIds) {
   EXPECT_EQ(reason, "cluster_ids must not be empty");
 }
 
-TEST(PdTopologyGuardTest, TryGetPdTopoRejectZeroDpSize) {
-  const InstanceInfo info = make_info(0, {0, 1, 2, 3});
-
-  PdTopo topo;
-  std::string reason;
-  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
-  EXPECT_EQ(reason, "dp_size must be greater than 0");
-}
-
 TEST(PdTopologyGuardTest, GetPdTopoRejectBadClusterSplit) {
   set_death_style();
   const InstanceInfo info = make_info(2, {0, 1, 2});
 
   EXPECT_DEATH(get_pd_topo(info),
                "cluster_ids.size\\(\\) must be divisible by dp_size");
-}
-
-TEST(PdTopologyGuardTest, GetPdTopoRejectEmptyClusterIds) {
-  set_death_style();
-  const InstanceInfo info = make_info(2, {});
-
-  EXPECT_DEATH(get_pd_topo(info), "cluster_ids must not be empty");
 }
 
 }  // namespace

@@ -50,10 +50,7 @@ _HC_PRE_MODES = (_MODE_EAGER,)
 # Utilities
 # ---------------------------------------------------------------------------
 def _npu_ready() -> bool:
-    try:
-        return torch.npu.is_available()
-    except Exception:  # noqa: BLE001
-        return False
+    return hasattr(torch, "npu") and torch.npu.is_available()
 
 
 def _load_fused_ops_lib() -> bool:

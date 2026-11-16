@@ -233,21 +233,9 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
                                       const Stream& signal_stream) override;
 
-  [[nodiscard]] int32_t graph_slot_count_for_test() const {
-    return graph_slot_count_;
-  }
-  [[nodiscard]] bool graph_slot_prepared_for_test(int32_t slot_idx) const {
-    return graph_slots_.at(static_cast<size_t>(slot_idx)).is_prepared;
-  }
   size_t get_graph_count() const;
   size_t get_graph_memory_pool_count();
   size_t get_graph_capture_stream_count() const;
-
-  [[nodiscard]] uint64_t graph_key_for_test(
-      uint32_t bucket_num_tokens,
-      const ModelInputParams& params) const {
-    return get_graph_key(bucket_num_tokens, params);
-  }
 
  private:
   // not own

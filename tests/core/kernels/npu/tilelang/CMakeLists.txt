@@ -117,3 +117,16 @@ cc_test(
     glog::glog
     unified_dlog
 )
+
+cc_test(
+  NAME
+    chunk_gated_delta_rule_fwd_h_wrapper_test
+  SRCS
+    chunk_gated_delta_rule_fwd_h_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)

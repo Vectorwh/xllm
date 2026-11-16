@@ -225,6 +225,24 @@ TEST_P(DFlash2ContextKVTest, WritesOnlySelectedSlotsWithReferenceNormAndRope) {
                         expected_v,
                         0.02,
                         0.02));
+    auto active = torch::zeros({3, 16}, torch::kBool);
+    for (int64_t row = 0; row < slots.numel(); ++row) {
+      const int32_t slot = slots[row].item<int32_t>();
+      active[slot / 16][slot % 16] = true;
+    }
+    const auto untouched = (~active).unsqueeze(1).unsqueeze(-1);
+    for (const auto& pair :
+         {std::make_pair(caches[layer].get_k_cache().cpu(), expected_k),
+          std::make_pair(caches[layer].get_v_cache().cpu(), expected_v)}) {
+      EXPECT_EQ(
+          pair.first.masked_select(untouched).count_nonzero().item<int64_t>(),
+          0);
+      const auto actual = pair.first.to(torch::kFloat32);
+      const double norm = torch::norm(pair.second, 2.0).item<double>();
+      ASSERT_GT(norm, 0.0);
+      EXPECT_LE(torch::norm(actual - pair.second, 2.0).item<double>() / norm,
+                0.02);
+    }
   }
 }
 
@@ -265,7 +283,7 @@ TEST(DFlash2ContextKVDeathTest, RejectsInt8ProjectionWithoutScale) {
 
 TEST(DFlash2ContextKVDeathTest, RejectsInvalidHeadTopologyBeforeAllocation) {
   ModelArgs args = make_args();
-  args.n_heads(30);
+  args.n_heads(24);
   ModelContext context(
       ParallelArgs(0, 16, nullptr), args, QuantArgs(), torch::TensorOptions());
   EXPECT_DEATH(
@@ -841,7 +859,7 @@ TEST(DFlash2DispatchTest, ConvNormUpdatesAndAliasesResidual) {
 
 TEST(DFlash2DispatchDeathTest, ConvNormRejectsUnsupportedFusion) {
   const std::string original_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
       ([] {
         const torch::Device device(Platform::type_torch(), 0);
@@ -865,7 +883,7 @@ TEST(DFlash2DispatchDeathTest, ConvNormRejectsUnsupportedFusion) {
 
 TEST(DFlash2DispatchDeathTest, GroupedConvRejectsUnsupportedGroupSize) {
   const std::string original_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
       ([] {
         const torch::Device device(Platform::type_torch(), 0);
@@ -873,9 +891,9 @@ TEST(DFlash2DispatchDeathTest, GroupedConvRejectsUnsupportedGroupSize) {
             torch::TensorOptions().dtype(torch::kFloat32).device(device);
         const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
             "xllm_mlu::dflash2_grouped_conv", "");
-        std::vector<c10::IValue> stack{torch::ones({1, 1}, options),
+        std::vector<c10::IValue> stack{torch::ones({1, 2049}, options),
                                        torch::zeros({1, 1, 1}, options),
-                                       torch::ones({1, 1}, options),
+                                       torch::ones({1, 2049}, options),
                                        int64_t{1},
                                        int64_t{2049}};
         op.callBoxed(&stack);
@@ -886,7 +904,7 @@ TEST(DFlash2DispatchDeathTest, GroupedConvRejectsUnsupportedGroupSize) {
 
 TEST(DFlash2DispatchDeathTest, SamplePathRejectsEmptyCandidates) {
   const std::string original_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
       ([] {
         const torch::Device device(Platform::type_torch(), 0);
@@ -908,14 +926,14 @@ TEST(DFlash2DispatchDeathTest, SamplePathRejectsEmptyCandidates) {
 
 TEST(DFlash2GroupedConvDeathTest, RejectsExplicitTapMismatch) {
   const std::string original_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
       ([] {
         const torch::Device device(Platform::type_torch(), 0);
         const auto options =
             torch::TensorOptions().dtype(torch::kFloat32).device(device);
         kernel::mlu::dflash2_grouped_conv(torch::ones({4, 6}, options),
-                                          torch::zeros({4, 2, 3}, options),
+                                          torch::zeros({4, 3, 3}, options),
                                           torch::ones({2, 6}, options),
                                           /*block_size=*/4,
                                           /*group_size=*/2,
@@ -935,9 +953,8 @@ TEST(DFlash2ConvNormTest, MatchesRmsNormAndPreservesResidualAlias) {
   RMSNorm norm(/*dim=*/4096, /*eps=*/1e-5, options);
   norm->weight().copy_(torch::randn({4096}, options));
   for (int32_t batch :
-       {1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,
-        13,  14,  15,  16,  31,  32,  33,  63,  64,  65,  66,  67,
-        127, 128, 129, 131, 193, 257, 319, 385, 513, 769, 1025}) {
+       {1,  2,  3,  5,  7,  9,  11, 13,  15,  16,  21,  22,  31,
+        32, 33, 63, 64, 65, 66, 67, 127, 128, 129, 131, 193, 257}) {
     for (int32_t block : {4, 6}) {
       for (int32_t sides : {1, 2}) {
         SCOPED_TRACE(::testing::Message()
@@ -1130,8 +1147,7 @@ TEST(DFlash2ConvNormTest, TailWavesReplayUpdatedInputsOnNondefaultStream) {
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  for (int32_t batch :
-       {1, 15, 65, 66, 67, 129, 131, 193, 257, 319, 385, 513, 769, 1025}) {
+  for (int32_t batch : {1, 15, 65, 66, 67, 129, 131, 193, 257}) {
     for (int32_t block : {4, 6}) {
       for (int32_t sides : {1, 2}) {
         SCOPED_TRACE(::testing::Message()

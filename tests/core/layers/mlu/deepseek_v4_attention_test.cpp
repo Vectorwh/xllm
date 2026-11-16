@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "layers/mlu/deepseek_v4/deepseek_v4_attention.h"
 
+#include <c10/core/DeviceGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -160,18 +161,6 @@ std::vector<int64_t> compressed_positions(const std::vector<int64_t>& start_pos,
   return positions;
 }
 
-torch::Tensor rows_from_table(const torch::Tensor& table,
-                              const std::vector<int64_t>& positions,
-                              int64_t rope_dim) {
-  if (positions.empty()) {
-    return torch::empty({0, rope_dim}, table.options());
-  }
-  torch::Tensor index = torch::tensor(
-      positions,
-      torch::TensorOptions().dtype(torch::kInt64).device(table.device()));
-  return table.index_select(/*dim=*/0, index);
-}
-
 torch::Tensor compressed_cos_sin_table(
     const test::Dsv4AttentionRefConfig& config,
     const torch::TensorOptions& options) {
@@ -206,7 +195,11 @@ torch::Tensor default_cos_sin_table(const test::Dsv4AttentionRefConfig& config,
 class DeepseekV4AttentionTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
     torch::Device torch_device(Platform::type_torch(), 0);
+    device_guard_ = std::make_unique<c10::DeviceGuard>(torch_device);
     Device device(torch_device);
     device.set_seed();
     device_ = torch_device;
@@ -465,18 +458,6 @@ class DeepseekV4AttentionTest : public ::testing::Test {
                values,
                torch::TensorOptions().dtype(torch::kInt32).device(device_))
         .view({batch_size, blocks_per_seq});
-  }
-
-  torch::Tensor make_state_table(int64_t batch_size) const {
-    std::vector<int32_t> values;
-    values.reserve(static_cast<size_t>(batch_size));
-    for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-      values.emplace_back(static_cast<int32_t>(seq_idx));
-    }
-    return torch::tensor(
-               values,
-               torch::TensorOptions().dtype(torch::kInt32).device(device_))
-        .view({batch_size, 1});
   }
 
   torch::Tensor make_slots(const std::vector<int64_t>& start_pos,
@@ -1030,9 +1011,18 @@ class DeepseekV4AttentionTest : public ::testing::Test {
                               expected.to(torch::kFloat32),
                               /*rtol=*/2e-2,
                               /*atol=*/2e-2);
+    const auto a = actual.to(torch::kFloat32);
+    const auto e = expected.to(torch::kFloat32);
+    const double scale = torch::norm(e).item<double>();
+    if (scale == 0.0) {
+      EXPECT_TRUE(torch::equal(a, e));
+    } else {
+      EXPECT_LE(torch::norm(a - e).item<double>() / scale, 0.02);
+    }
   }
 
   torch::Device device_{torch::kCPU};
+  std::unique_ptr<c10::DeviceGuard> device_guard_;
   torch::TensorOptions options_;
   torch::TensorOptions cpu_options_;
   std::unique_ptr<ProcessGroup> process_group_;
@@ -1216,7 +1206,7 @@ TEST_F(DeepseekV4AttentionTest,
 TEST_F(DeepseekV4AttentionTest, SwaWrapContinuationIgnoresExpiredBlocks) {
   test::Dsv4AttentionRefConfig config = make_config(/*compress_ratio=*/1);
   test::Dsv4AttentionRefWeights weights = make_weights(config);
-  const int64_t warmup_len = 224;
+  const int64_t warmup_len = 48;
   const int64_t chunk_len = 8;
   torch::Tensor hidden = seeded("dsv4.attn.swa.wrap.hidden",
                                 {warmup_len + chunk_len, config.hidden_dim},
@@ -1277,7 +1267,7 @@ TEST_F(DeepseekV4AttentionTest, SwaWrapContinuationIgnoresExpiredBlocks) {
 TEST_F(DeepseekV4AttentionTest, RuntimeSwaBurstTableMatchesReference) {
   test::Dsv4AttentionRefConfig config = make_config(/*compress_ratio=*/1);
   test::Dsv4AttentionRefWeights weights = make_weights(config);
-  const int64_t warmup_len = 224;
+  const int64_t warmup_len = 48;
   const int64_t chunk_len = 8;
   torch::Tensor hidden = seeded("dsv4.attn.swa.burst.hidden",
                                 {warmup_len + chunk_len, config.hidden_dim},

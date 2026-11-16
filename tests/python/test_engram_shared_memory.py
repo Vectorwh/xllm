@@ -25,6 +25,7 @@ close paths -- everything except the cross-process attach.
 from __future__ import annotations
 
 import multiprocessing.resource_tracker
+import struct
 
 import pytest
 import torch
@@ -120,7 +121,9 @@ def test_verify_segment_token_reads_back_the_written_token(monkeypatch: pytest.M
 
     storage._verify_segment_token(storage._codes_handle, storage.token)  # matches
     with pytest.raises(RuntimeError, match="token mismatch"):
-        storage._verify_segment_token(storage._codes_handle, "0" * shm._TOKEN_BYTES)
+        storage._verify_segment_token(
+            storage._codes_handle, ("0" if storage.token[0] != "0" else "1") + storage.token[1:]
+        )
 
     # The token lives past the table view, so the codes geometry is unchanged.
     assert storage.codes is not None and storage.codes.shape == (8, 32)
@@ -157,35 +160,40 @@ def test_shared_host_engram_storage_single_process_lifecycle(monkeypatch: pytest
     )
     assert storage.state == shm.STATE_INIT
 
-    storage.create_or_attach()
-    assert storage.state == shm.STATE_ATTACHED
-    assert storage.is_loaded is False
+    try:
+        storage.create_or_attach()
+        assert storage.state == shm.STATE_ATTACHED
+        assert storage.is_loaded is False
 
-    # frombuffer views: CPU, contiguous, exact geometry.
-    assert storage.codes is not None and storage.codes.shape == (8, 32)
-    assert storage.scales is not None and storage.scales.shape == (8, 1)
-    assert storage.codes.dtype == torch.int8 and storage.scales.dtype == torch.float32
-    assert storage.codes.device.type == "cpu" and storage.scales.device.type == "cpu"
-    assert storage.codes.is_contiguous() and storage.scales.is_contiguous()
+        # frombuffer views: CPU, contiguous, exact geometry.
+        assert storage.codes is not None and storage.codes.shape == (8, 32)
+        assert storage.scales is not None and storage.scales.shape == (8, 1)
+        assert storage.codes.dtype == torch.int8 and storage.scales.dtype == torch.float32
+        assert storage.codes.device.type == "cpu" and storage.scales.device.type == "cpu"
+        assert storage.codes.is_contiguous() and storage.scales.is_contiguous()
 
-    # The views alias the shared mapping: a write reads back through the view.
-    storage.codes[0, :] = torch.arange(32, dtype=torch.int8)
-    storage.scales[0, 0] = 0.375
-    assert torch.equal(storage.codes[0], torch.arange(32, dtype=torch.int8))
-    assert float(storage.scales[0, 0]) == 0.375
+        # Reads from the OS mapping prove the tensors alias shared memory.
+        storage.codes[0, :] = torch.arange(32, dtype=torch.int8)
+        storage.scales[0, 0] = 0.375
+        assert storage._codes_handle is not None and storage._scales_handle is not None
+        codes_bytes = bytes(storage._codes_handle.buf[:32])
+        assert codes_bytes == bytes(range(32))
+        assert struct.unpack_from("f", storage._scales_handle.buf)[0] == 0.375
 
-    storage.mark_loaded()
-    assert storage.is_loaded is True
-    assert storage.state == shm.STATE_LOADED
+        storage.mark_loaded()
+        assert storage.is_loaded is True
+        assert storage.state == shm.STATE_LOADED
 
-    storage.close()
-    assert storage.state == shm.STATE_CLOSED
-    assert storage.codes is None and storage.scales is None
+        storage.close()
+        assert storage.state == shm.STATE_CLOSED
+        assert storage.codes is None and storage.scales is None
 
-    # close is idempotent and collective-free.
-    storage.close()
-    assert storage.state == shm.STATE_CLOSED
-    assert calls == {"broadcast": 1, "gather": 1, "barrier": 1}
+        # close is idempotent and collective-free.
+        storage.close()
+        assert storage.state == shm.STATE_CLOSED
+        assert calls == {"broadcast": 1, "gather": 1, "barrier": 1}
+    finally:
+        storage.close()
 
 
 def test_shared_host_engram_storage_creation_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:

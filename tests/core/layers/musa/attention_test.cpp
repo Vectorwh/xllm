@@ -27,6 +27,8 @@ namespace xllm::layer {
 namespace {
 
 TEST(MusaAttentionTest, DispatchHonorsCompiledContractAndOverrides) {
+  // Exec, not fork: a previous prefill test may have initialized cached flags.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
   struct Settings {
     const char* attention;
     const char* decode;

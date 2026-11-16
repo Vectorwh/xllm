@@ -214,9 +214,6 @@ class PrefixCache {
   std::unordered_set<int32_t> blocks_by_id_;
 
   std::atomic<uint64_t> total_blocks_{0}, matched_blocks_{0};
-
-  // Tests probe a resident by hash. Production match/insert do not.
-  friend class BlockManagerPoolTestPeer;
 };
 
 }  // namespace xllm

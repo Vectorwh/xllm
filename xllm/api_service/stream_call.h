@@ -262,9 +262,7 @@ class StreamCall : public Call {
   Response& response() { return *response_; }
   ::google::protobuf::Closure* done() { return done_; }
 
- protected:
-  // Serializes one SSE frame into io_buf_ without publishing it. Production
-  // code goes through write(); tests use this to exercise the exact bytes.
+ private:
   bool serialize_stream_response(const google::protobuf::Message& message,
                                  std::string_view empty_array_field = {}) {
     io_buf_.clear();
@@ -317,6 +315,7 @@ class StreamCall : public Call {
     return true;
   }
 
+ protected:
   bool stream_connected() const {
     return connection_status_.load(std::memory_order_relaxed) == 0 &&
            (!stream_ || !stream_stopped_->load(std::memory_order_acquire));

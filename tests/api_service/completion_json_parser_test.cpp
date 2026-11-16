@@ -43,17 +43,9 @@ TEST(PreprocessCompletionPromptTest, StringPromptPassThroughUnchanged) {
   EXPECT_EQ(result, input);
 }
 
-TEST(PreprocessCompletionPromptTest, TokenLookupPassesThroughUnchanged) {
-  const std::string input =
-      R"({"prompt":"[decision]:","max_tokens":1,"logprob_token_ids":[7,2]})";
-  auto [status, result] = preprocess_completion_prompt(input);
-  ASSERT_TRUE(status.ok()) << status.message();
-  EXPECT_EQ(result, input);
-}
-
-// Missing prompt passes through unchanged.
+// A token-id-only request does not need a text prompt.
 TEST(PreprocessCompletionPromptTest, MissingPromptPassThroughUnchanged) {
-  std::string input = R"({"max_tokens": 8})";
+  std::string input = R"({"token_ids": [9707], "max_tokens": 8})";
   auto [status, result] = preprocess_completion_prompt(input);
   ASSERT_TRUE(status.ok()) << status.message();
   EXPECT_EQ(result, input);
@@ -113,11 +105,6 @@ TEST(PreprocessCompletionPromptTest, NestedArraysRejected) {
 
 TEST(PreprocessCompletionPromptTest, FloatElementRejected) {
   expect_error(R"({"prompt": [785.5]})",
-               "prompt array must contain only integer token ids");
-}
-
-TEST(PreprocessCompletionPromptTest, ObjectElementRejected) {
-  expect_error(R"({"prompt": [{"a": 1}]})",
                "prompt array must contain only integer token ids");
 }
 

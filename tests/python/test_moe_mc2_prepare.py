@@ -14,6 +14,13 @@
 
 """Check MC2 preparation with the framework's typed execution context."""
 
+import importlib.util
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
 import pytest
 import torch
 
@@ -24,10 +31,28 @@ from xllm.python.model_executor.forward_context import (
     forward_context,
 )
 from xllm.python.model_executor.runners.decode_acl_graph import _StaticAttentionMetadata
-from xllm.python.models.kimi_k3_moe import MC2ExecutionContext, MC2PrepareAndFinalize, MoEParallelConfig
 
 
-def _context(counts: tuple[int, ...], phase: str, mc2: MC2ExecutionContext | None) -> ForwardContext:
+@pytest.fixture(name="mc2_module")
+def _mc2_module() -> Iterator[ModuleType]:
+    # Pure CPU partition/mask tests: no NPU operator or graph is simulated.
+    # Use a separate source-module namespace so this bootstrap cannot cache a
+    # native-runtime substitute in the canonical model module for other suites.
+    name = "mc2_prepare_cpu_source"
+    source = Path(__file__).parents[2] / "xllm/python/models/kimi_k3_moe.py"
+    spec = importlib.util.spec_from_file_location(name, source)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with pytest.MonkeyPatch.context() as modules:
+        modules.setitem(sys.modules, name, module)
+        with pytest.MonkeyPatch.context() as imports:
+            if "torch_npu" not in sys.modules and importlib.util.find_spec("torch_npu") is None:
+                imports.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+            spec.loader.exec_module(module)
+        yield module
+
+
+def _context(counts: tuple[int, ...], phase: str, mc2: Any | None) -> ForwardContext:
     metadata = _StaticAttentionMetadata(
         slot_mapping=torch.empty(0, dtype=torch.int32),
         paged_kv_indptr=torch.empty(0, dtype=torch.int32),
@@ -42,27 +67,37 @@ def _context(counts: tuple[int, ...], phase: str, mc2: MC2ExecutionContext | Non
         layer_caches=[],
         acl_graph=AclGraphCaptureContext(stream=object(), tasks=[]) if phase == "capture" else None,
         execution_state=AclGraphExecutionState(persistent_buffers={}) if phase != "eager" else None,
-        execution_contexts={MC2ExecutionContext: mc2} if mc2 is not None else {},
+        execution_contexts={type(mc2): mc2} if mc2 is not None else {},
     )
 
 
-@pytest.mark.parametrize("counts", [(1, 0, 0, 0), (1, 0, 3, 2), (17, 1, 0, 2)])
-@pytest.mark.parametrize("phase", ["eager", "warmup", "capture"])
-def test_mc2_partition_and_mask(monkeypatch: pytest.MonkeyPatch, counts: tuple[int, ...], phase: str) -> None:
-    def unexpected_gather(self: MC2PrepareAndFinalize, value: torch.Tensor) -> torch.Tensor:
+@pytest.mark.parametrize(
+    "counts,phase,padded",
+    [
+        ((1, 0, 3, 2), "eager", 16),
+        ((17, 1, 0, 2), "eager", 32),
+        ((1, 0, 0, 0), "capture", 16),
+        ((17, 1, 0, 2), "warmup", 32),
+    ],
+)
+def test_mc2_partition_and_mask(
+    monkeypatch: pytest.MonkeyPatch, mc2_module: ModuleType, counts: tuple[int, ...], phase: str, padded: int
+) -> None:
+    MC2ExecutionContext = mc2_module.MC2ExecutionContext
+    MC2PrepareAndFinalize = mc2_module.MC2PrepareAndFinalize
+    MoEParallelConfig = mc2_module.MoEParallelConfig
+
+    def unexpected_gather(self: Any, value: torch.Tensor) -> torch.Tensor:
         pytest.fail("published scheduler counts or a static bucket must not require token-count all-gather")
 
     monkeypatch.setattr(MC2PrepareAndFinalize, "_gather_token_counts", unexpected_gather)
     graph = phase != "eager"
-    padded = (max(counts) + 15) // 16 * 16
     masks = []
     for dp_rank, count in enumerate(counts):
-        hidden = torch.arange(max(count, 1) * 4).reshape(-1, 4).float()
-        logits = torch.arange(max(count, 1) * 7).reshape(-1, 7).float()
+        hidden = torch.arange(count * 4).reshape(-1, 4).float() if count else torch.zeros(1, 4)
+        logits = torch.arange(count * 7).reshape(-1, 7).float() if count else torch.zeros(1, 7)
         mc2 = MC2ExecutionContext(padded, torch.arange(padded) < count) if graph else None
         context = _context(counts, phase, mc2)
-        assert not hasattr(context, "padded_num_tokens")
-        assert not hasattr(context, "mc2_mask")
         parts = []
         for tp_rank in range(16):
             config = MoEParallelConfig(
@@ -87,7 +122,9 @@ def test_mc2_partition_and_mask(monkeypatch: pytest.MonkeyPatch, counts: tuple[i
         restored_mask = torch.cat([part.active_mask for part in parts])
         torch.testing.assert_close(restored_hidden[:count], hidden[:count])
         torch.testing.assert_close(restored_logits[:count], logits[:count])
-        assert restored_mask.tolist() == (torch.arange(padded) < count).tolist()
+        assert restored_mask.tolist() == [True] * count + [False] * (padded - count)
+        assert not restored_hidden[count:].any()
+        assert not restored_logits[count:].any()
         if mc2 is not None:
             mc2.active_mask.zero_()
             assert all(not part.active_mask.any() for part in parts)
@@ -96,7 +133,10 @@ def test_mc2_partition_and_mask(monkeypatch: pytest.MonkeyPatch, counts: tuple[i
 
 
 @pytest.mark.parametrize("padded,mask_size", [(1, 1), (16, 1), (16, 32)])
-def test_mc2_rejects_invalid_static_mask(padded: int, mask_size: int) -> None:
+def test_mc2_rejects_invalid_static_mask(padded: int, mask_size: int, mc2_module: ModuleType) -> None:
+    MC2ExecutionContext = mc2_module.MC2ExecutionContext
+    MC2PrepareAndFinalize = mc2_module.MC2PrepareAndFinalize
+    MoEParallelConfig = mc2_module.MoEParallelConfig
     context = _context((1, 0, 0, 0), "capture", MC2ExecutionContext(padded, torch.ones(mask_size, dtype=torch.bool)))
     config = MoEParallelConfig(
         tp_size=1, tp_rank=0, ep_size=64, ep_rank=15, dp_size=4, dp_rank=0, input_tp_size=16, input_tp_rank=15
@@ -105,9 +145,13 @@ def test_mc2_rejects_invalid_static_mask(padded: int, mask_size: int) -> None:
         MC2PrepareAndFinalize(config).prepare(torch.ones(1, 4), torch.ones(1, 7))
 
 
-@pytest.mark.parametrize("phase", ["warmup", "capture"])
-@pytest.mark.parametrize("tokens", [0, 1, 3])
-def test_mc2_nonreplicated_graph_uses_static_context(monkeypatch: pytest.MonkeyPatch, phase: str, tokens: int) -> None:
+@pytest.mark.parametrize("phase,tokens", [("warmup", 0), ("capture", 1), ("warmup", 3), ("capture", 0)])
+def test_mc2_nonreplicated_graph_uses_static_context(
+    monkeypatch: pytest.MonkeyPatch, phase: str, tokens: int, mc2_module: ModuleType
+) -> None:
+    MC2ExecutionContext = mc2_module.MC2ExecutionContext
+    MC2PrepareAndFinalize = mc2_module.MC2PrepareAndFinalize
+    MoEParallelConfig = mc2_module.MoEParallelConfig
     monkeypatch.setattr(
         MC2PrepareAndFinalize, "_gather_token_counts", lambda *args: pytest.fail("graph must not gather device counts")
     )
@@ -125,7 +169,9 @@ def test_mc2_nonreplicated_graph_uses_static_context(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.parametrize("phase", ["warmup", "capture"])
-def test_mc2_nonreplicated_graph_rejects_missing_context(phase: str) -> None:
+def test_mc2_nonreplicated_graph_rejects_missing_context(phase: str, mc2_module: ModuleType) -> None:
+    MC2PrepareAndFinalize = mc2_module.MC2PrepareAndFinalize
+    MoEParallelConfig = mc2_module.MoEParallelConfig
     config = MoEParallelConfig(tp_size=1, tp_rank=0, ep_size=2, ep_rank=0)
     with forward_context(_context((), phase, None)), pytest.raises(ValueError, match="static token bucket"):
         MC2PrepareAndFinalize(config).prepare(torch.ones(1, 2), torch.ones(1, 4))

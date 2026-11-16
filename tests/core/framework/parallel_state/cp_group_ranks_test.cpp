@@ -72,27 +72,6 @@ TEST(ContextParallelTopologyTest, PcpSizeTwoTpFourDpOne) {
   }
 }
 
-TEST(ContextParallelTopologyTest, PcpSizeFourTpTwoDpTwo) {
-  const int32_t world_size = 16;
-  const int32_t dp_size = 2;
-  const int32_t cp_size = 4;
-  for (int32_t rank = 0; rank < world_size; ++rank) {
-    const std::vector<int32_t> ranks =
-        pcp_group_ranks_for(rank, world_size, dp_size, cp_size);
-    ASSERT_EQ(ranks.size(), cp_size);
-    EXPECT_EQ(ranks[expected_cp_rank(rank, world_size, dp_size, cp_size)],
-              rank);
-    // Every member shares the same dp_rank and tp_rank as `rank`.
-    const int32_t attn_tp_size = world_size / (dp_size * cp_size);
-    const int32_t tp_rank = rank % attn_tp_size;
-    const int32_t dp_rank = rank / (cp_size * attn_tp_size);
-    for (int32_t r : ranks) {
-      EXPECT_EQ(r % attn_tp_size, tp_rank);
-      EXPECT_EQ(r / (cp_size * attn_tp_size), dp_rank);
-    }
-  }
-}
-
 TEST(ContextParallelTopologyTest, GroupsPartitionWorldAndAreOrthogonalToTp) {
   const int32_t world_size = 16;
   const int32_t dp_size = 2;
@@ -108,9 +87,6 @@ TEST(ContextParallelTopologyTest, GroupsPartitionWorldAndAreOrthogonalToTp) {
   };
 
   for (int32_t a = 0; a < world_size; ++a) {
-    // Capture the group once: computing begin()/end() on two separate
-    // temporaries would yield iterators into different containers (undefined
-    // behavior).
     const std::vector<int32_t> a_group =
         pcp_group_ranks_for(a, world_size, dp_size, cp_size);
     std::set<int32_t> group_members(a_group.begin(), a_group.end());

@@ -959,6 +959,7 @@ int32_t run_remote_decoder(int32_t rank, int32_t port) {
 
 TEST(DsaDeepEpDecoderTest, RemoteExpertsMatchUnshardedDecode) {
   const int32_t port = net::get_local_free_port();
+  ASSERT_GT(port, 0);
 
   const int32_t child_count = 2;
   const int32_t initial_parts = ::testing::UnitTest::GetInstance()
@@ -1001,6 +1002,9 @@ TEST(DsaDeepEpDecoderTest, RemoteExpertsMatchUnshardedDecode) {
                              children_skipped);
   }
 
+  if (children_ok && children_skipped) {
+    GTEST_SKIP() << "Requires two visible MLU devices";
+  }
   ASSERT_EQ(children_ok, true)
       << "forked ranks failed, timed out, or require more physical MLU cards";
 }

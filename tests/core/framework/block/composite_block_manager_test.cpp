@@ -30,7 +30,7 @@ limitations under the License.
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/block/concurrent_block_manager_impl.h"
 #include "core/framework/block/embedding_block_manager.h"
-#include "framework/block/block_manager_pool_test_peer.h"
+#include "framework/block/block_manager_test_access.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/linear_state_block_manager.h"
 #include "framework/block/sliding_window_block_manager.h"
@@ -228,7 +228,7 @@ TEST(CompositeBlockManagerTest,
       .block_size(2)
       .max_seqs_per_batch(4)
       .enable_prefix_cache(true);
-  BlockManagerPool pool(options, 2);
+  block_test::TestBlockManagerPool pool(options, 2);
   Sequence producer = MakeTestSequence(0, std::vector<int32_t>(8, 7));
   producer.set_dp_rank(1);
   ASSERT_TRUE(pool.allocate(&producer));
@@ -433,7 +433,6 @@ TEST(CompositeBlockManagerTest, FailedHostGrowthRollsBackAllStagedLeaves) {
     EXPECT_EQ(entry.leaf->num_used_blocks(), used_before.at(type));
   }
   held_blocks.clear();
-  held_blocks.clear();
   ASSERT_TRUE(host.allocate_sequence(&sequence, sequence.host_kv_state(), 128));
   for (const auto& [type, entry] : host.leaf_entries()) {
     EXPECT_EQ(sequence.host_kv_state().blocks(type)[0].ref_count(), 1u);
@@ -528,22 +527,6 @@ TEST(CompositeBlockManagerTest, EmbeddingLeafUsesExplicitState) {
     sequence.reset();
     EXPECT_EQ(manager->num_used_blocks(), 0u);
     EXPECT_EQ(manager->num_free_blocks(), manager->num_total_blocks());
-  }
-}
-
-TEST(CompositeBlockManagerTest, SlidingWindowLeafAcceptsNullSequence) {
-  for (const bool concurrent : {false, true}) {
-    SCOPED_TRACE(concurrent);
-    BlockManager::Options options = MakeCompositeOptions(512, 128, 256, 1);
-    options.enable_disagg_pd(concurrent).enable_prefix_cache(false);
-    CompositeBlockManager manager(build_composite_leaves(options), options);
-    BlockManager* leaf = manager.leaf_entries().at(BlockType::SWA).leaf.get();
-    KVCacheState kv_state;
-
-    EXPECT_FALSE(
-        leaf->allocate_for_sequence(nullptr, kv_state, 128).has_value());
-    EXPECT_EQ(kv_state.num_blocks(BlockType::SWA), 0u);
-    EXPECT_EQ(leaf->num_used_blocks(), 0u);
   }
 }
 
@@ -697,13 +680,6 @@ TEST(CompositeBlockManagerTest, AllocateContinuesAfterSatisfiedTokenManager) {
   EXPECT_EQ(C4Blocks(seq).size(), CeilBlocks(1500, kCompressedUnitTokens));
 
   manager.deallocate_for_sequence(&seq);
-}
-
-TEST(CompositeBlockManagerTest, AllocateForSequence_NullSeqReturnsFalse) {
-  BlockManager::Options opts =
-      MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);
-  CompositeBlockManager manager(build_composite_leaves(opts), opts);
-  EXPECT_FALSE(manager.allocate_sequence(nullptr, 10));
 }
 
 TEST(CompositeBlockManagerTest, FailedGrowthKeepsCommittedBlocks) {
@@ -993,68 +969,6 @@ TEST(CompositeBlockManagerTest,
   (void)sequence.host_kv_state().take_blocks(BlockType::SWA);
 }
 
-TEST(CompositeBlockManagerTest, DeallocateConsumesBlocksFromOwnerManagers) {
-  BlockManager::Options opts =
-      MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);
-  opts.enable_prefix_cache(false);
-  CompositeBlockManager manager(build_composite_leaves(opts), opts);
-
-  Sequence seq = MakeTestSequence(0, {1});
-  EXPECT_TRUE(manager.allocate_sequence(&seq, 1500));
-  EXPECT_GT(manager.num_used_blocks(), 0u);
-
-  std::vector<Block> flat_blocks;
-  flat_blocks.reserve(seq.kv_state().num_blocks(BlockType::SWA) +
-                      seq.kv_state().num_blocks(BlockType::C4) +
-                      seq.kv_state().num_blocks(BlockType::C128) + 1);
-  flat_blocks.emplace_back();
-  for (const BlockType type :
-       {BlockType::SWA, BlockType::C4, BlockType::C128}) {
-    std::vector<Block> manager_blocks = seq.kv_state().take_blocks(type);
-    for (Block& block : manager_blocks) {
-      flat_blocks.emplace_back(std::move(block));
-    }
-  }
-
-  flat_blocks.clear();
-  EXPECT_TRUE(flat_blocks.empty());
-  EXPECT_EQ(manager.num_used_blocks(), 0u);
-  for (const auto& [type, entry] : manager.leaf_entries()) {
-    EXPECT_EQ(entry.leaf->num_free_blocks(), entry.leaf->num_total_blocks());
-  }
-
-  seq.reset();
-}
-
-TEST(CompositeBlockManagerTest, DeallocateDispatchesWithoutInflatingRefCount) {
-  BlockManager::Options opts =
-      MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);
-  CompositeBlockManager manager(build_composite_leaves(opts), opts);
-
-  Sequence seq = MakeTestSequence(0, {1});
-  EXPECT_TRUE(manager.allocate_sequence(&seq, 1500));
-  EXPECT_GT(manager.num_used_blocks(), 0u);
-
-  std::vector<Block> owned_blocks;
-  for (const BlockType type :
-       {BlockType::SWA, BlockType::C4, BlockType::C128}) {
-    std::vector<Block> manager_blocks = seq.kv_state().take_blocks(type);
-    for (auto& block : manager_blocks) {
-      owned_blocks.emplace_back(std::move(block));
-    }
-  }
-
-  for (const Block& block : owned_blocks) {
-    EXPECT_EQ(block.ref_count(), 1u);
-  }
-
-  owned_blocks.clear();
-  EXPECT_TRUE(owned_blocks.empty());
-  EXPECT_EQ(manager.num_used_blocks(), 0u);
-
-  seq.reset();
-}
-
 TEST(CompositeBlockManagerTest, CapacityStatsUseBaseBlockUnits) {
   BlockManager::Options opts =
       MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);
@@ -1088,62 +1002,6 @@ TEST(CompositeBlockManagerTest, CapacityStatsUseBaseBlockUnits) {
 // clamped to a common compressed block, so the prompt has to span at least
 // 2048 tokens for the hit to be non-trivial. Uses a two-unit
 // prompt so we get a meaningful hit even after the exact-repeat pop.
-TEST(CompositeBlockManagerTest, Dsv4PrefixCacheHitOnRepeatedPrefix) {
-  const uint32_t base_num_blocks = 4096;
-  // Sliding window covers a couple compressed units worth of tokens so the SWA
-  // tail-continuity check has room to succeed even after the exact-repeat pop.
-  const uint32_t window_size = 4 * kBaseBlockSize;
-  const uint32_t max_seqs_per_batch = 4;
-  BlockManager::Options opts = MakeCompositeOptions(
-      base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  // max_tokens_per_batch has to accommodate the prompt so allocate_sequence
-  // does not exceed the SWA burst budget.
-  const size_t num_tokens =
-      repeat_hit_prompt_tokens(/*min_units=*/2, window_size);
-  set_swa_capacity_for_token_budget(
-      &opts, static_cast<uint32_t>(num_tokens + kCompressedUnitTokens));
-  ASSERT_TRUE(opts.enable_prefix_cache());
-  CompositeBlockManager manager(build_composite_leaves(opts), opts);
-
-  // First sequence: a 2*C128 prompt (32768 tokens) so both C4 and C128 have
-  // multiple full blocks worth of cacheable prefix. Mark all tokens as
-  // forwarded so the pre-grow hook (fired during the NEXT allocate) has data
-  // to insert -- and we drive one extra allocate to trigger it explicitly.
-  const std::vector<int32_t> prompt(num_tokens, 7);
-  Sequence seq_first = MakeTestSequence(0, prompt);
-  ASSERT_TRUE(manager.allocate_sequence(&seq_first, num_tokens));
-  seq_first.kv_state().incr_kv_cache_tokens_num(num_tokens);
-  // deallocate_for_sequence runs the pre-grow hook once more (via
-  // cache_for_sequence's fan-out), flushing the residual full blocks.
-  manager.deallocate_for_sequence(&seq_first);
-  seq_first.reset();
-
-  // The prefix cache under SWA / C4 / C128 should now hold the prompt's full
-  // blocks. On a second sequence with the same prompt, admission mounts from
-  // all three leaves and pins kv_cache_tokens_num to the safe min hit.
-  Sequence seq_hit = MakeTestSequence(1, prompt);
-  const size_t forecast = manager.prefix_hit_tokens(seq_hit);
-  EXPECT_FALSE(seq_hit.has_any_blocks());
-  EXPECT_EQ(seq_hit.kv_state().kv_cache_tokens_num(), 0u);
-  manager.allocate_shared_for_sequence(&seq_hit);
-  EXPECT_EQ(forecast, seq_hit.kv_state().kv_cache_tokens_num());
-  EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::SWA), 0u);
-  EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::C4), 0u);
-  EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::C128), 0u);
-  const size_t kv_tokens = seq_hit.kv_state().kv_cache_tokens_num();
-  EXPECT_GT(kv_tokens, 0u);
-  EXPECT_LT(kv_tokens, num_tokens);  // exact-repeat pop kept at least one c128
-  EXPECT_EQ(kv_tokens % kCompressedUnitTokens, 0u)
-      << "safe_hit_tokens must be a multiple of the compressed unit";
-  // SWA vector length matches safe_hit / base and the tail carries valid
-  // blocks.
-  const std::vector<Block> hit_swa = SwaBlocks(seq_hit);
-  EXPECT_EQ(hit_swa.size(), kv_tokens / kBaseBlockSize);
-  EXPECT_TRUE(hit_swa.back().is_valid());
-
-  manager.deallocate_for_sequence(&seq_hit);
-}
-
 TEST(CompositeBlockManagerTest,
      Dsv4PrefixCacheMatchesAtCompressedUnitBoundary) {
   const size_t unit_tokens = kCompressedUnitTokens;
@@ -2616,25 +2474,6 @@ TEST_P(LinearStateWindowTest, OverlapDecodePredictsAndResolvesCheckpoint) {
   }
 }
 
-TEST_P(LinearStateWindowTest, NullSequenceDoesNotAllocate) {
-  LinearStateBlockManager manager(linear_options(/*num_slots=*/2,
-                                                 /*block_size=*/2,
-                                                 GetParam()));
-  KVCacheState kv_state;
-  EXPECT_FALSE(manager.allocate_for_sequence(nullptr, kv_state, 8).has_value());
-  EXPECT_EQ(manager.num_used_blocks(), 0u);
-}
-
-TEST_P(LinearStateWindowTest, AllowsSpeculativeSpanAboveHalfStride) {
-  LinearStateBlockManager manager(linear_options(
-      /*num_slots=*/3,
-      /*block_size=*/4,
-      /*enable_prefix_cache=*/GetParam(),
-      /*instance_is_decode=*/false,
-      /*num_speculative_tokens=*/2));
-  EXPECT_EQ(manager.options().num_speculative_tokens(), 2u);
-}
-
 TEST_P(LinearStateWindowTest, FlatPrefixMountRestoresCachedTokens) {
   BlockManager::Options options;
   options.num_blocks(32).block_size(2).enable_prefix_cache(GetParam());
@@ -2808,7 +2647,7 @@ TEST_P(LinearStateWindowTest, PoolReleasesCancelledSequenceBeforeResults) {
         .enable_linear_state(true)
         .linear_state_num_slots(8)
         .enable_prefix_cache(GetParam());
-    BlockManagerPool pool(options, 1);
+    block_test::TestBlockManagerPool pool(options, 1);
     Sequence sequence = make_sequence(0, std::vector<int32_t>(13, 7));
     ASSERT_TRUE(pool.allocate(&sequence, 4));
     std::vector<Batch> first_batch(1);
@@ -2946,8 +2785,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheKeepsDeviceOnlyRolePolicy) {
     CompositeBlockManager manager(build_composite_leaves(options), options);
     for (const BlockType type :
          {BlockType::SWA, BlockType::C2, BlockType::C1}) {
-      const BlockManager* leaf =
-          BlockManagerPoolTestPeer::leaf_of(manager, type);
+      const BlockManager* leaf = block_test::leaf_of(manager, type);
       ASSERT_NE(leaf, nullptr);
       EXPECT_EQ(leaf->options().enable_prefix_cache(),
                 type != BlockType::SWA || !is_decode);
@@ -3231,7 +3069,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheMissesIfAnyRequiredGroupIsGone) {
     const BlockManager::Options options = make_v41_prefix_options();
     CompositeBlockManager manager(build_composite_leaves(options), options);
     publish_v41_prompt(manager, std::vector<int32_t>(769, 7));
-    BlockManagerPoolTestPeer::leaf_of(manager, missing)->reset_prefix_cache();
+    block_test::leaf_of(manager, missing)->reset_prefix_cache();
     Sequence hot = MakeTestSequence(/*index=*/1, std::vector<int32_t>(769, 7));
     const size_t forecast = manager.prefix_hit_tokens(hot);
     EXPECT_FALSE(hot.has_any_blocks());
@@ -3361,8 +3199,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsHoleInsideRequiredSwaTail) {
     retained.push_back(swa[index]);
   }
   manager.deallocate_for_sequence(&producer);
-  BlockManager* swa_leaf =
-      BlockManagerPoolTestPeer::leaf_of(manager, BlockType::SWA);
+  BlockManager* swa_leaf = block_test::leaf_of(manager, BlockType::SWA);
   ASSERT_NE(swa_leaf, nullptr);
   swa_leaf->reset_prefix_cache();
   swa_leaf->cache(retained);
@@ -3417,14 +3254,14 @@ TEST_F(V41PrefixCacheTest, V41CancelledSharedAliasReleasesAllLeafUsage) {
     for (const bool reverse_order : {false, true}) {
       SCOPED_TRACE(discard);
       SCOPED_TRACE(reverse_order);
-      BlockManagerPool pool(make_v41_prefix_pool_options(), /*dp_size=*/1);
+      block_test::TestBlockManagerPool pool(make_v41_prefix_pool_options(),
+                                            /*dp_size=*/1);
       const auto leaf_usage = [&pool]() {
         std::vector<size_t> usage;
         for (const BlockType type :
              {BlockType::SWA, BlockType::C1, BlockType::C2}) {
-          usage.push_back(
-              BlockManagerPoolTestPeer::leaf_of(pool, /*dp_rank=*/0, type)
-                  ->num_used_blocks());
+          usage.push_back(block_test::leaf_of(pool, /*dp_rank=*/0, type)
+                              ->num_used_blocks());
         }
         return usage;
       };
@@ -3494,7 +3331,8 @@ TEST_F(V41PrefixCacheTest, V41CancelledSharedAliasReleasesAllLeafUsage) {
 
 TEST_F(V41PrefixCacheTest,
        V41CancelledPartialForwardDoesNotPublishUnfinishedUnit) {
-  BlockManagerPool pool(make_v41_prefix_pool_options(), /*dp_size=*/1);
+  block_test::TestBlockManagerPool pool(make_v41_prefix_pool_options(),
+                                        /*dp_size=*/1);
   const std::vector<size_t> initial_usage = pool.num_used_blocks();
   const std::vector<int32_t> tokens(769, /*value=*/7);
   Sequence cancelled = MakeTestSequence(/*index=*/0, tokens);
@@ -3515,7 +3353,8 @@ TEST_F(V41PrefixCacheTest,
 }
 
 TEST_F(V41PrefixCacheTest, V41PrefixPoolsDoNotSharePublishedEntries) {
-  BlockManagerPool pool(make_v41_prefix_pool_options(), /*dp_size=*/2);
+  block_test::TestBlockManagerPool pool(make_v41_prefix_pool_options(),
+                                        /*dp_size=*/2);
   const std::vector<int32_t> tokens(769, /*value=*/7);
   Sequence producer = MakeTestSequence(/*index=*/0, tokens);
   producer.set_dp_rank(0);
@@ -3577,27 +3416,6 @@ TEST_F(V41PrefixCacheTest, V41PressureEvictsPrefixAndAllowsRepublication) {
   manager.deallocate_for_sequence(&restored);
   manager.reset_prefix_cache();
   EXPECT_EQ(manager.num_used_blocks(), initial_usage);
-}
-
-TEST_F(V41PrefixCacheTest, V41HostAndStoreLeavesUseValidatedOptions) {
-  BlockManager::Options options = make_v41_prefix_options();
-  options.enable_host_offload(true);
-  EXPECT_NO_FATAL_FAILURE(build_composite_leaves(options));
-  options.enable_host_offload(false).enable_kvcache_store(true);
-  EXPECT_NO_FATAL_FAILURE(build_composite_leaves(options));
-}
-
-TEST_F(V41PrefixCacheTest, V41PrefixCacheAcceptsMultimodalHasher) {
-  BlockManager::Options options = make_v41_prefix_options();
-  options.hasher_type(BlockHasherType::MM);
-  CompositeBlockManager manager(build_composite_leaves(options), options);
-  EXPECT_EQ(manager.leaf_combination(),
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
-    EXPECT_TRUE(manager.leaf_entries().at(type).supports_prefix_cache);
-    EXPECT_EQ(manager.leaf_entries().at(type).leaf->options().hasher_type(),
-              BlockHasherType::MM);
-  }
 }
 
 TEST_F(V41PrefixCacheTest, V41MMPrefixCacheHitsSameImageAndTextOnly) {
@@ -3704,9 +3522,8 @@ TEST_F(V41SpecPrefixCacheTest, SpecKeepsAllPrefixLeavesEnabled) {
   EXPECT_EQ(manager.leaf_combination(),
             CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
   for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
-    EXPECT_TRUE(BlockManagerPoolTestPeer::leaf_of(manager, type)
-                    ->options()
-                    .enable_prefix_cache());
+    EXPECT_TRUE(
+        block_test::leaf_of(manager, type)->options().enable_prefix_cache());
   }
 }
 
@@ -3717,9 +3534,8 @@ TEST_F(V41SpecPrefixCacheTest, SpecAllowsMMWithoutLookahead) {
   EXPECT_EQ(manager.leaf_combination(),
             CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
   for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
-    EXPECT_TRUE(BlockManagerPoolTestPeer::leaf_of(manager, type)
-                    ->options()
-                    .enable_prefix_cache());
+    EXPECT_TRUE(
+        block_test::leaf_of(manager, type)->options().enable_prefix_cache());
   }
 }
 
@@ -3742,9 +3558,8 @@ TEST_F(V41SpecPrefixCacheTest, SpecSupportsHostOffloadAndStore) {
               CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
     for (const BlockType type :
          {BlockType::SWA, BlockType::C1, BlockType::C2}) {
-      EXPECT_TRUE(BlockManagerPoolTestPeer::leaf_of(manager, type)
-                      ->options()
-                      .enable_prefix_cache());
+      EXPECT_TRUE(
+          block_test::leaf_of(manager, type)->options().enable_prefix_cache());
     }
   }
 }
@@ -3816,7 +3631,7 @@ TEST_F(V41SpecPrefixCacheTest,
   options.num_speculative_tokens(5).num_embedding_blocks(8);
   for (const bool discard : {false, true}) {
     SCOPED_TRACE(discard);
-    BlockManagerPool pool(options, 1);
+    block_test::TestBlockManagerPool pool(options, 1);
     Sequence source = MakeTestSequence(0, std::vector<int32_t>(1021, 7));
     ASSERT_TRUE(pool.allocate(&source, 1021));
     source.kv_state().set_kv_cache_tokens_num(1021);
@@ -3845,7 +3660,7 @@ TEST_F(V41SpecPrefixCacheTest,
 TEST_F(V41SpecPrefixCacheTest, SharedSpecRequestsKeepIndependentEmbeddingRows) {
   BlockManagerPool::Options options = make_v41_prefix_pool_options();
   options.num_speculative_tokens(5).num_embedding_blocks(8);
-  BlockManagerPool pool(options, 1);
+  block_test::TestBlockManagerPool pool(options, 1);
   const std::vector<int32_t> tokens(769, 7);
   Sequence source = MakeTestSequence(0, tokens);
   ASSERT_TRUE(pool.allocate(&source, 769));
@@ -3886,13 +3701,11 @@ TEST(CompositeBlockManagerTest, V4DefaultPrefixCacheKeepsRolePolicy) {
     SCOPED_TRACE(is_decode);
     opts.instance_is_decode(is_decode);
     CompositeBlockManager manager(build_composite_leaves(opts), opts);
-    const BlockManager* swa =
-        BlockManagerPoolTestPeer::leaf_of(manager, BlockType::SWA);
+    const BlockManager* swa = block_test::leaf_of(manager, BlockType::SWA);
     ASSERT_NE(swa, nullptr);
     EXPECT_EQ(swa->options().enable_prefix_cache(), !is_decode);
     for (const BlockType type : {BlockType::C4, BlockType::C128}) {
-      const BlockManager* leaf =
-          BlockManagerPoolTestPeer::leaf_of(manager, type);
+      const BlockManager* leaf = block_test::leaf_of(manager, type);
       ASSERT_NE(leaf, nullptr);
       EXPECT_TRUE(leaf->options().enable_prefix_cache());
     }

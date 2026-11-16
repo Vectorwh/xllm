@@ -620,27 +620,6 @@ TEST(GraphWarmupTest, DecodeRoleUsesDecodeOnlyPlan) {
             GraphWarmupPlan::DECODE_ONLY);
 }
 
-TEST(GraphWarmupTest, FormatsWarmupProgress) {
-  const std::string progress = graph_warmup_progress(
-      /*completed=*/3, /*total=*/8, /*token_bucket=*/8, /*latency_ms=*/12.5);
-
-  EXPECT_EQ(progress,
-            "Graph warmup progress: [########------------] 3/8 37.5%, "
-            "token_bucket=8, latency=12.50 ms");
-}
-
-TEST(GraphWarmupTest, FormatsCompletedWarmupProgress) {
-  const std::string progress = graph_warmup_progress(
-      /*completed=*/8,
-      /*total=*/8,
-      /*token_bucket=*/64,
-      /*latency_ms=*/100.0);
-
-  EXPECT_EQ(progress,
-            "Graph warmup progress: [####################] 8/8 100.0%, "
-            "token_bucket=64, latency=100.00 ms");
-}
-
 TEST(GraphWarmupTest, InjectsBootstrapEmbeddingWhenSpeculativeEnabled) {
   Sequence sequence = make_sequence(/*index=*/0, /*tokens=*/{1, 2, 3});
 

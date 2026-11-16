@@ -267,7 +267,11 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
     metadata.block_table = torch::tensor({{0}, {1}}, int_options);
     metadata.slot_mapping = torch::tensor({3, 4, 69, 70, 71}, int_options);
     FlashInferAttentionImpl attention(heads, 256, 0.0625f, 2, -1);
+    const auto initial_key = k_cache.clone();
+    const auto initial_value = v_cache.clone();
     for (const bool chunked : {false, true}) {
+      cache =
+          KVCache(KVCacheTensors{initial_key.clone(), initial_value.clone()});
       SCOPED_TRACE(chunked);
       metadata.is_prefill = !chunked;
       metadata.is_chunked_prefill = chunked;
@@ -303,9 +307,24 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
             expected,
             /*rtol=*/0.015,
             /*atol=*/0.015));
+        const auto observed =
+            actual.narrow(0, query_offset, q_len).to(torch::kFloat32);
+        const double reference_norm = torch::norm(expected, 2.0).item<double>();
+        ASSERT_GT(reference_norm, 0.0);
+        EXPECT_LE(torch::norm(observed - expected, 2.0).item<double>() /
+                      reference_norm,
+                  0.015);
         query_offset += q_len;
         kv_offset += kv_len;
       }
+      EXPECT_TRUE(torch::equal(cache.get_k_cache()[0].narrow(0, 0, 5).cpu(),
+                               full_key.narrow(0, 0, 5)));
+      EXPECT_TRUE(torch::equal(cache.get_k_cache()[1].narrow(0, 0, 8).cpu(),
+                               full_key.narrow(0, 5, 8)));
+      EXPECT_TRUE(torch::equal(cache.get_v_cache()[0].narrow(0, 0, 5).cpu(),
+                               full_value.narrow(0, 0, 5)));
+      EXPECT_TRUE(torch::equal(cache.get_v_cache()[1].narrow(0, 0, 8).cpu(),
+                               full_value.narrow(0, 5, 8)));
     }
     // Reuse the checked two-sequence result for decode warp boundaries and
     // paged prefill beyond the 32-warp single-CTA capacity.

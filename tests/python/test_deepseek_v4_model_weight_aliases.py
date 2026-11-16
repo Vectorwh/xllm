@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 
 import torch
 
-from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
+from xllm.python.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
 
 
 def test_model_loader_accepts_native_endpoint_aliases() -> None:
@@ -28,7 +27,6 @@ def test_model_loader_accepts_native_endpoint_aliases() -> None:
             "model.hc_head_base": torch.full((2,), 2.0),
             "model.hc_head_scale": torch.full((2,), 3.0),
             "model.head.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
-            "head.weight": torch.full((4, 2), -1.0),
         }
 
         def has(self, name: str) -> bool:
@@ -38,7 +36,7 @@ def test_model_loader_accepts_native_endpoint_aliases() -> None:
             return self.tensors[name]
 
     owner = torch.nn.Module()
-    owner.cfg = SimpleNamespace(tp_size=2, tp_rank=1, n_layers=0)
+    owner.cfg = DeepseekV4Config(tp_size=2, tp_rank=1, n_layers=0)
     owner.model = torch.nn.Module()
     owner.model.embed_tokens = torch.nn.Embedding(4, 2)
     owner.model.norm = torch.nn.LayerNorm(2, elementwise_affine=True, bias=False)

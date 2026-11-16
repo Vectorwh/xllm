@@ -51,21 +51,6 @@ torch::Tensor ref_gated_act(const torch::Tensor& input,
   return {};
 }
 
-// Reference non-gated activation: output = act(input)
-torch::Tensor ref_act(const torch::Tensor& input, const std::string& act_mode) {
-  if (act_mode == "silu") {
-    return input * torch::sigmoid(input);
-  }
-  if (act_mode == "gelu") {
-    return torch::gelu(input, "none");
-  }
-  if (act_mode == "gelu_tanh") {
-    return torch::gelu(input, "tanh");
-  }
-  LOG(FATAL) << "Unsupported act_mode in test: " << act_mode;
-  return {};
-}
-
 std::string to_string(torch::ScalarType dtype) {
   switch (dtype) {
     case torch::kFloat32:
@@ -81,7 +66,12 @@ std::string to_string(torch::ScalarType dtype) {
 
 class ActivationImplTest : public ::testing::Test {
  protected:
-  void SetUp() override { device_ = torch::Device(Platform::type_torch(), 0); }
+  void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "DCU device is required";
+    }
+    device_ = torch::Device(Platform::type_torch(), 0);
+  }
 
   void test_gated(torch::ScalarType dtype,
                   const std::string& act_mode,
@@ -100,28 +90,13 @@ class ActivationImplTest : public ::testing::Test {
     double rtol = (dtype == torch::kFloat32)    ? 1e-5
                   : (dtype == torch::kBFloat16) ? 1e-2
                                                 : 5e-3;
-    EXPECT_TRUE(torch::allclose(output, expected, rtol, atol))
-        << "Mismatch: act_mode=" << act_mode << ", dtype=" << to_string(dtype)
-        << ", hidden_dim=" << hidden_dim;
-  }
-
-  void test_non_gated(torch::ScalarType dtype,
-                      const std::string& act_mode,
-                      int64_t hidden_dim) const {
-    const auto opts = torch::TensorOptions().device(device_).dtype(dtype);
-    auto input = torch::randn({4, hidden_dim}, opts) * 0.5;
-    auto output = torch::empty_like(input);
-
-    ActivationImpl act(act_mode, /*is_gated=*/false);
-    act.forward(input, output);
-
-    auto expected = ref_act(input, act_mode);
-    double atol = (dtype == torch::kFloat32)    ? 1e-6
-                  : (dtype == torch::kBFloat16) ? 1e-2
-                                                : 5e-3;
-    double rtol = (dtype == torch::kFloat32)    ? 1e-5
-                  : (dtype == torch::kBFloat16) ? 1e-2
-                                                : 5e-3;
+    const double reference_norm =
+        torch::norm(expected, 2.0, torch::kFloat32).item<double>();
+    ASSERT_GT(reference_norm, 0.0);
+    EXPECT_LE(
+        torch::norm(output - expected, 2.0, torch::kFloat32).item<double>() /
+            reference_norm,
+        rtol);
     EXPECT_TRUE(torch::allclose(output, expected, rtol, atol))
         << "Mismatch: act_mode=" << act_mode << ", dtype=" << to_string(dtype)
         << ", hidden_dim=" << hidden_dim;
@@ -129,8 +104,6 @@ class ActivationImplTest : public ::testing::Test {
 
   torch::Device device_ = torch::Device(torch::kCPU);
 };
-
-// ---- Gated activation tests ----
 
 TEST_F(ActivationImplTest, GatedSiluBfloat16) {
   test_gated(torch::kBFloat16, "silu", 128);
@@ -156,9 +129,6 @@ TEST_F(ActivationImplTest, GatedGeluTanhBfloat16) {
   test_gated(torch::kBFloat16, "gelu_tanh", 128);
 }
 
-// ---- Gated with various hidden dims (cover vectorized / scalar / tail paths)
-// ----
-
 TEST_F(ActivationImplTest, GatedSiluSmallDim) {
   test_gated(torch::kBFloat16, "silu", 3);
 }
@@ -171,22 +141,6 @@ TEST_F(ActivationImplTest, GatedSiluLargeDim) {
   test_gated(torch::kBFloat16, "silu", 4096);
 }
 
-// ---- Non-gated activation tests ----
-
-TEST_F(ActivationImplTest, NonGatedSiluBfloat16) {
-  GTEST_SKIP() << "DCU ActivationImpl currently dispatches to gated "
-                  "act_and_mul, so non-gated activation is not supported.";
-  test_non_gated(torch::kBFloat16, "silu", 128);
-}
-
-TEST_F(ActivationImplTest, NonGatedGeluBfloat16) {
-  GTEST_SKIP() << "DCU ActivationImpl currently dispatches to gated "
-                  "act_and_mul, so non-gated activation is not supported.";
-  test_non_gated(torch::kBFloat16, "gelu", 128);
-}
-
-// ---- Edge cases ----
-
 TEST_F(ActivationImplTest, GatedZerosInput) {
   auto opts = torch::TensorOptions().device(device_).dtype(torch::kBFloat16);
   auto input = torch::zeros({2, 256}, opts);
@@ -196,7 +150,7 @@ TEST_F(ActivationImplTest, GatedZerosInput) {
   act.forward(input, output);
 
   // silu(0)*0 = 0
-  EXPECT_TRUE(torch::allclose(output, torch::zeros_like(output)));
+  EXPECT_TRUE(torch::equal(output, torch::zeros_like(output)));
 }
 
 TEST_F(ActivationImplTest, GatedLargeBatch) {
@@ -209,6 +163,13 @@ TEST_F(ActivationImplTest, GatedLargeBatch) {
 
   auto expected = ref_gated_act(input, "silu");
   EXPECT_TRUE(torch::allclose(output, expected, 1e-2, 2e-2));
+  const double reference_norm =
+      torch::norm(expected, 2.0, torch::kFloat32).item<double>();
+  ASSERT_GT(reference_norm, 0.0);
+  EXPECT_LE(
+      torch::norm(output - expected, 2.0, torch::kFloat32).item<double>() /
+          reference_norm,
+      1e-2);
 }
 
 }  // namespace

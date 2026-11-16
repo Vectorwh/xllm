@@ -300,20 +300,11 @@ CpTpTestGroups create_cp_tp_groups(int32_t rank,
   return groups;
 }
 
-struct Glm5DcpConfig {
-  ModelArgs args;
-  QuantArgs quant;
-};
-
-enum class DsaModelVariant { V32, GLM5, GLM52_SHARE, GLM5_MTP };
-
-enum class DsaWeightFormat { BF16, SMOOTHQUANT, COMPRESSED_TENSORS };
+enum class DsaWeightFormat { BF16 };
 
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
 ModelArgs create_decoder_model_args();
-ModelArgs create_production_mla_args(
-    const std::string& rope_type = "deepseek_yarn");
 Weights create_moe_bf16_weights(const ModelArgs& model_args,
                                 const torch::TensorOptions& options,
                                 int64_t n_shared_experts);
@@ -321,8 +312,7 @@ KVCache create_mla_cache(const ModelArgs& model_args,
                          const torch::TensorOptions& options,
                          int64_t block_num,
                          int64_t block_size);
-ModelArgs create_dsa_model_args(DsaModelVariant variant,
-                                bool production = false);
+ModelArgs create_dsa_model_args();
 Weights create_seeded_linear_weights(int64_t out,
                                      int64_t in,
                                      DsaWeightFormat format,
@@ -352,7 +342,6 @@ KVCache create_indexed_kv_cache(torch::Tensor key_cache,
                                 torch::Tensor index_cache);
 ModelArgs create_attention_model_args(int64_t q_lora_rank = 0,
                                       bool enable_indexer = false);
-Glm5DcpConfig create_glm5_dcp_config();
 
 ModelArgs create_decoder_model_args() {
   ModelArgs args = ::xllm::layer::test::create_default_model_args();
@@ -423,39 +412,6 @@ ModelArgs create_decoder_model_args() {
   args.enable_mla() = true;
 
   return args;
-}
-
-ModelArgs create_production_mla_args(const std::string& rope_type) {
-  ModelArgs model_args;
-  model_args.q_lora_rank() = 1536;
-  model_args.kv_lora_rank() = 512;
-  model_args.qk_nope_head_dim() = 128;
-  model_args.qk_rope_head_dim() = 64;
-  model_args.v_head_dim() = 128;
-  model_args.hidden_size() = 7168;
-  model_args.n_heads() = 128;
-  model_args.max_position_embeddings() = 163840;
-  model_args.rope_theta() = 10000;
-  model_args.rms_norm_eps() = 1e-06;
-
-  // rope_scaling config
-  model_args.rope_scaling_original_max_position_embeddings() = 4096;
-  model_args.rope_scaling_factor() = 40;
-  model_args.rope_extrapolation_factor() = 1.;
-  model_args.rope_scaling_attn_factor() = 1.;
-  model_args.rope_scaling_beta_fast() = 32;
-  model_args.rope_scaling_beta_slow() = 1;
-  model_args.rope_scaling_mscale() = 1.;
-  model_args.rope_scaling_mscale_all_dim() = 1.;
-  model_args.rope_scaling_rope_type() = rope_type;
-
-  // indexer
-  model_args.index_head_dim() = 128;
-  model_args.index_n_heads() = 64;
-  model_args.index_topk() = 2048;
-  model_args.enable_mla() = true;
-
-  return model_args;
 }
 
 Weights create_moe_bf16_weights(const ModelArgs& model_args,
@@ -534,92 +490,52 @@ KVCache create_mla_cache(const ModelArgs& model_args,
   return create_indexed_kv_cache(k_cache, index_cache);
 }
 
-ModelArgs create_dsa_model_args(DsaModelVariant variant, bool production) {
-  ModelArgs args = production
-                       ? create_production_mla_args()
-                       : create_attention_model_args(/*q_lora_rank=*/64,
-                                                     /*enable_indexer=*/true);
-  if (!production) {
-    const ModelArgs decoder = create_decoder_model_args();
-    args.n_layers() = decoder.n_layers();
-    args.vocab_size() = decoder.vocab_size();
-    args.intermediate_size() = decoder.intermediate_size();
-    args.moe_intermediate_size() = decoder.moe_intermediate_size();
-    args.first_k_dense_replace() = decoder.first_k_dense_replace();
-    args.moe_layer_freq() = decoder.moe_layer_freq();
-    args.n_routed_experts() = decoder.n_routed_experts();
-    args.n_shared_experts() = decoder.n_shared_experts();
-    args.num_experts_per_tok() = decoder.num_experts_per_tok();
-    args.routed_scaling_factor() = decoder.routed_scaling_factor();
-    args.norm_topk_prob() = decoder.norm_topk_prob();
-    args.scoring_func() = decoder.scoring_func();
-    args.topk_method() = decoder.topk_method();
-    args.n_group() = decoder.n_group();
-    args.topk_group() = decoder.topk_group();
-    args.hidden_act() = decoder.hidden_act();
-  }
-  args.model_type() = "deepseek_v32";
-  args.index_n_heads() = production ? 64 : 32;
-  args.index_topk() = production ? 2048 : 16;
-  if (variant == DsaModelVariant::V32) {
-    return args;
-  }
-  if (production) {
-    args = create_glm5_dcp_config().args;
-    args.n_layers() = 8;
-  }
+ModelArgs create_dsa_model_args() {
+  ModelArgs args = create_attention_model_args(/*q_lora_rank=*/64,
+                                               /*enable_indexer=*/true);
+
+  const ModelArgs decoder = create_decoder_model_args();
+  args.n_layers() = decoder.n_layers();
+  args.vocab_size() = decoder.vocab_size();
+  args.intermediate_size() = decoder.intermediate_size();
+  args.moe_intermediate_size() = decoder.moe_intermediate_size();
+  args.first_k_dense_replace() = decoder.first_k_dense_replace();
+  args.moe_layer_freq() = decoder.moe_layer_freq();
+  args.n_routed_experts() = decoder.n_routed_experts();
+  args.n_shared_experts() = decoder.n_shared_experts();
+  args.num_experts_per_tok() = decoder.num_experts_per_tok();
+  args.routed_scaling_factor() = decoder.routed_scaling_factor();
+  args.norm_topk_prob() = decoder.norm_topk_prob();
+  args.scoring_func() = decoder.scoring_func();
+  args.topk_method() = decoder.topk_method();
+  args.n_group() = decoder.n_group();
+  args.topk_group() = decoder.topk_group();
+  args.hidden_act() = decoder.hidden_act();
+
   args.model_type() = "glm_moe_dsa";
+  args.index_n_heads() = 32;
+  args.index_topk() = 16;
   args.qk_nope_head_dim() = 192;
   args.v_head_dim() = 256;
-  args.index_n_heads() = 32;
-  args.rope_theta() = production ? 8000000.0f : 1000000.0f;
+  args.rope_theta() = 1000000.0f;
   args.rope_scaling_rope_type() = "default";
   args.indexer_rope_interleave() = true;
   args.head_dim() = args.qk_nope_head_dim() + args.qk_rope_head_dim();
-  if (variant == DsaModelVariant::GLM52_SHARE) {
-    args.index_topk_pattern() = "FSFSFSFS";
-  }
-  if (variant == DsaModelVariant::GLM5_MTP) {
-    args.model_type() = "glm_moe_dsa_mtp";
-    args.index_share_for_mtp_iteration() = true;
-    args.mtp_start_layer_idx() = args.n_layers();
-  }
+  args.index_topk_pattern() = "FSFSFSFS";
   return args;
 }
 
 Weights create_seeded_linear_weights(int64_t out,
                                      int64_t in,
-                                     DsaWeightFormat format,
+                                     DsaWeightFormat /*format*/,
                                      const torch::TensorOptions& options,
                                      const std::string& seed,
                                      const std::string& prefix) {
-  Weights weights;
-  if (format == DsaWeightFormat::BF16) {
-    weights[prefix + "weight"] =
-        ::xllm::layer::test::seeded_tensor(
-            seed + ".weight", {out, in}, torch::kBFloat16, options.device()) *
-        0.01f;
-    return weights;
-  }
-  const bool compressed = format == DsaWeightFormat::COMPRESSED_TENSORS;
-  weights[prefix + (compressed ? "weight" : "qweight")] =
-      ::xllm::layer::test::seeded_tensor(
-          seed + ".qweight", {out, in}, torch::kInt8, options.device());
-  torch::Tensor scale =
-      ::xllm::layer::test::seeded_tensor(
-          seed + ".scale", {out}, torch::kFloat32, options.device())
-              .abs() *
-          0.01f +
-      0.03f;
-  weights[prefix + (compressed ? "weight_scale" : "per_channel_scale")] =
-      compressed ? scale.reshape({out, 1}) : scale;
-  weights[prefix + "smooth"] =
-      ::xllm::layer::test::seeded_tensor(
-          seed + ".smooth", {in}, torch::kFloat32, options.device())
-              .abs() *
-          0.01f +
-      0.03f;
-  return weights;
+  return {
+      {prefix + "weight",
+       ::xllm::layer::test::seeded_tensor(
+           seed + ".weight", {out, in}, torch::kBFloat16, options.device()) *
+           0.01f}};
 }
 
 Weights create_seeded_indexer_weights(const ModelArgs& args,
@@ -710,37 +626,10 @@ Weights create_seeded_mla_weights(const ModelArgs& args,
 }
 
 Weights create_seeded_moe_weights(const ModelArgs& args,
-                                  DsaWeightFormat format,
+                                  DsaWeightFormat /*format*/,
                                   const torch::TensorOptions& options) {
-  if (format == DsaWeightFormat::BF16) {
-    Weights weights =
-        create_moe_bf16_weights(args, options, args.n_shared_experts());
-    weights["gate.e_score_correction_bias"] =
-        torch::zeros({args.n_routed_experts()}, options.dtype(torch::kFloat32));
-    return weights;
-  }
-  Weights weights;
-  for (int32_t expert = 0; expert < args.n_routed_experts(); ++expert) {
-    ModelArgs dense_args = args;
-    dense_args.intermediate_size() = args.moe_intermediate_size();
-    weights.merge(
-        create_seeded_dense_weights(dense_args,
-                                    format,
-                                    options,
-                                    "experts." + std::to_string(expert) + "."));
-  }
-  if (args.n_shared_experts() > 0) {
-    ModelArgs dense_args = args;
-    dense_args.intermediate_size() =
-        args.moe_intermediate_size() * args.n_shared_experts();
-    weights.merge(create_seeded_dense_weights(
-        dense_args, format, options, "shared_experts."));
-  }
-  weights["gate.weight"] = ::xllm::layer::test::seeded_tensor(
-      "deepseek_v2_sparse_moe_block.gate",
-      {args.n_routed_experts(), args.hidden_size()},
-      torch::kBFloat16,
-      options.device());
+  Weights weights =
+      create_moe_bf16_weights(args, options, args.n_shared_experts());
   weights["gate.e_score_correction_bias"] =
       torch::zeros({args.n_routed_experts()}, options.dtype(torch::kFloat32));
   return weights;
@@ -797,33 +686,6 @@ ModelArgs create_attention_model_args(int64_t q_lora_rank,
   return args;
 }
 
-Glm5DcpConfig create_glm5_dcp_config() {
-  Glm5DcpConfig result;
-  ModelArgs& args = result.args;
-  args.model_type() = "glm_moe_dsa";
-  args.hidden_size() = 6144;
-  args.n_heads() = 64;
-  args.q_lora_rank() = 2048;
-  args.kv_lora_rank() = 512;
-  args.qk_nope_head_dim() = 192;
-  args.qk_rope_head_dim() = 64;
-  args.v_head_dim() = 256;
-  args.index_n_heads() = 32;
-  args.index_head_dim() = 128;
-  args.index_topk() = 2048;
-  args.max_position_embeddings() = 1048576;
-  args.rms_norm_eps() = 1e-5f;
-  args.rope_theta() = 8000000.0f;
-  args.rope_scaling_rope_type() = "default";
-  args.indexer_rope_interleave() = true;
-  args.enable_mla() = true;
-  result.quant.quant_method() = "smoothquant";
-  result.quant.bits() = 8;
-  result.quant.only_expert_per_group() = true;
-  result.quant.activation_dynamic() = true;
-  return result;
-}
-
 namespace fixture = layer::test;
 constexpr int32_t kLayers = 4;
 constexpr int32_t kPrefill = 12;
@@ -848,7 +710,7 @@ class MemoryModelLoader final : public ModelLoader {
 };
 
 ModelArgs model_args() {
-  ModelArgs args = create_dsa_model_args(DsaModelVariant::GLM52_SHARE);
+  ModelArgs args = create_dsa_model_args();
   args.n_layers() = kLayers;
   args.index_topk_pattern() = "FSFS";
   args.index_topk() = 4;
@@ -1227,305 +1089,88 @@ void run_parallel(int32_t rank, int32_t port, bool dcp) {
   }
 }
 
+void run_model_ranks(int32_t ranks,
+                     int32_t cp_size,
+                     const std::function<void(int32_t, int32_t)>& fn) {
+  const int32_t port = parallel_base_port(ranks, cp_size);
+
+  const int32_t child_count = ranks;
+  const int32_t initial_parts = ::testing::UnitTest::GetInstance()
+                                    ->current_test_info()
+                                    ->result()
+                                    ->total_part_count();
+  std::vector<pid_t> child_pids;
+  child_pids.reserve(child_count);
+  bool children_ok = true;
+  bool children_skipped = false;
+  for (int32_t child_rank = 0; child_rank < child_count; ++child_rank) {
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+      try {
+        if (Platform::device_count() < child_count) {
+          ::_exit(77);
+        }
+        const auto rank_body = [&](int32_t rank) {
+          fn(rank, port);
+          return 0;
+        };
+        const int32_t code = rank_body(child_rank);
+        std::fflush(nullptr);
+        ::_exit(child_failed(initial_parts) ? 1 : code);
+      } catch (const std::exception& error) {
+        LOG(ERROR) << "Rank " << child_rank << ": " << error.what();
+        ::_exit(1);
+      }
+    }
+    if (pid < 0) {
+      LOG(ERROR) << "fork failed: " << std::strerror(errno);
+      children_ok = false;
+      break;
+    }
+    child_pids.emplace_back(pid);
+  }
+  if (!children_ok) {
+    stop_ranks(child_pids, std::vector<bool>(child_pids.size(), false));
+  } else {
+    children_ok = wait_ranks(
+        child_pids, std::chrono::minutes(/*count=*/3), children_skipped);
+  }
+
+  if (children_ok && children_skipped) {
+    GTEST_SKIP() << "forked ranks failed, timed out, or require more "
+                    "physical MLU cards";
+  }
+  ASSERT_EQ(children_ok, true)
+      << "forked ranks failed, timed out, or require more physical MLU cards";
+}
+
 TEST(Glm52MluForwardTest, PrefillAndDecodeExposeFullAndSharedCacheWrites) {
-  {
-    const auto ranks = /*ranks=*/1;
-    const auto cp_size = /*cp_size=*/1;
-    const auto fn = [](int32_t /*rank*/, int32_t /*port*/) {
-      run_single(/*mutate_shared=*/false, /*mutate_full=*/false);
-    };
-
-    const int32_t port = parallel_base_port(ranks, cp_size);
-
-    const int32_t child_count = ranks;
-    const int32_t initial_parts = ::testing::UnitTest::GetInstance()
-                                      ->current_test_info()
-                                      ->result()
-                                      ->total_part_count();
-    std::vector<pid_t> child_pids;
-    child_pids.reserve(child_count);
-    bool children_ok = true;
-    bool children_skipped = false;
-    for (int32_t child_rank = 0; child_rank < child_count; ++child_rank) {
-      const pid_t pid = ::fork();
-      if (pid == 0) {
-        try {
-          if (Platform::device_count() < child_count) {
-            ::_exit(77);
-          }
-          const auto rank_body = [&](int32_t rank) {
-            fn(rank, port);
-            return 0;
-          };
-          const int32_t code = rank_body(child_rank);
-          std::fflush(nullptr);
-          ::_exit(child_failed(initial_parts) ? 1 : code);
-        } catch (const std::exception& error) {
-          LOG(ERROR) << "Rank " << child_rank << ": " << error.what();
-          ::_exit(1);
-        }
-      }
-      if (pid < 0) {
-        LOG(ERROR) << "fork failed: " << std::strerror(errno);
-        children_ok = false;
-        break;
-      }
-      child_pids.emplace_back(pid);
-    }
-    if (!children_ok) {
-      stop_ranks(child_pids, std::vector<bool>(child_pids.size(), false));
-    } else {
-      children_ok = wait_ranks(
-          child_pids, std::chrono::minutes(/*count=*/3), children_skipped);
-    }
-
-    if (children_ok && children_skipped) {
-      GTEST_SKIP() << "forked ranks failed, timed out, or require more "
-                      "physical MLU cards";
-    }
-    ASSERT_EQ(children_ok, true)
-        << "forked ranks failed, timed out, or require more physical MLU cards";
-  };
+  run_model_ranks(1, 1, [](int32_t /*rank*/, int32_t /*port*/) {
+    run_single(false, false);
+  });
 }
+
 TEST(Glm52MluForwardTest, SharedIndexerCheckpointDoesNotAffectStack) {
-  {
-    const auto ranks = /*ranks=*/1;
-    const auto cp_size = /*cp_size=*/1;
-    const auto fn = [](int32_t /*rank*/, int32_t /*port*/) {
-      run_single(/*mutate_shared=*/true, /*mutate_full=*/false);
-    };
-
-    const int32_t port = parallel_base_port(ranks, cp_size);
-
-    const int32_t child_count = ranks;
-    const int32_t initial_parts = ::testing::UnitTest::GetInstance()
-                                      ->current_test_info()
-                                      ->result()
-                                      ->total_part_count();
-    std::vector<pid_t> child_pids;
-    child_pids.reserve(child_count);
-    bool children_ok = true;
-    bool children_skipped = false;
-    for (int32_t child_rank = 0; child_rank < child_count; ++child_rank) {
-      const pid_t pid = ::fork();
-      if (pid == 0) {
-        try {
-          if (Platform::device_count() < child_count) {
-            ::_exit(77);
-          }
-          const auto rank_body = [&](int32_t rank) {
-            fn(rank, port);
-            return 0;
-          };
-          const int32_t code = rank_body(child_rank);
-          std::fflush(nullptr);
-          ::_exit(child_failed(initial_parts) ? 1 : code);
-        } catch (const std::exception& error) {
-          LOG(ERROR) << "Rank " << child_rank << ": " << error.what();
-          ::_exit(1);
-        }
-      }
-      if (pid < 0) {
-        LOG(ERROR) << "fork failed: " << std::strerror(errno);
-        children_ok = false;
-        break;
-      }
-      child_pids.emplace_back(pid);
-    }
-    if (!children_ok) {
-      stop_ranks(child_pids, std::vector<bool>(child_pids.size(), false));
-    } else {
-      children_ok = wait_ranks(
-          child_pids, std::chrono::minutes(/*count=*/3), children_skipped);
-    }
-
-    if (children_ok && children_skipped) {
-      GTEST_SKIP() << "forked ranks failed, timed out, or require more "
-                      "physical MLU cards";
-    }
-    ASSERT_EQ(children_ok, true)
-        << "forked ranks failed, timed out, or require more physical MLU cards";
-  };
+  run_model_ranks(1, 1, [](int32_t /*rank*/, int32_t /*port*/) {
+    run_single(true, false);
+  });
 }
+
 TEST(Glm52MluForwardTest, LaterFullIndexerChangesSparseDecodeOutput) {
-  {
-    const auto ranks = /*ranks=*/1;
-    const auto cp_size = /*cp_size=*/1;
-    const auto fn = [](int32_t /*rank*/, int32_t /*port*/) {
-      run_single(/*mutate_shared=*/false, /*mutate_full=*/true);
-    };
-
-    const int32_t port = parallel_base_port(ranks, cp_size);
-
-    const int32_t child_count = ranks;
-    const int32_t initial_parts = ::testing::UnitTest::GetInstance()
-                                      ->current_test_info()
-                                      ->result()
-                                      ->total_part_count();
-    std::vector<pid_t> child_pids;
-    child_pids.reserve(child_count);
-    bool children_ok = true;
-    bool children_skipped = false;
-    for (int32_t child_rank = 0; child_rank < child_count; ++child_rank) {
-      const pid_t pid = ::fork();
-      if (pid == 0) {
-        try {
-          if (Platform::device_count() < child_count) {
-            ::_exit(77);
-          }
-          const auto rank_body = [&](int32_t rank) {
-            fn(rank, port);
-            return 0;
-          };
-          const int32_t code = rank_body(child_rank);
-          std::fflush(nullptr);
-          ::_exit(child_failed(initial_parts) ? 1 : code);
-        } catch (const std::exception& error) {
-          LOG(ERROR) << "Rank " << child_rank << ": " << error.what();
-          ::_exit(1);
-        }
-      }
-      if (pid < 0) {
-        LOG(ERROR) << "fork failed: " << std::strerror(errno);
-        children_ok = false;
-        break;
-      }
-      child_pids.emplace_back(pid);
-    }
-    if (!children_ok) {
-      stop_ranks(child_pids, std::vector<bool>(child_pids.size(), false));
-    } else {
-      children_ok = wait_ranks(
-          child_pids, std::chrono::minutes(/*count=*/3), children_skipped);
-    }
-
-    if (children_ok && children_skipped) {
-      GTEST_SKIP() << "forked ranks failed, timed out, or require more "
-                      "physical MLU cards";
-    }
-    ASSERT_EQ(children_ok, true)
-        << "forked ranks failed, timed out, or require more physical MLU cards";
-  };
+  run_model_ranks(1, 1, [](int32_t /*rank*/, int32_t /*port*/) {
+    run_single(false, true);
+  });
 }
+
 TEST(Glm52MluForwardTest, CpStackMatchesUnshardedModel) {
-  {
-    const auto ranks = /*ranks=*/2;
-    const auto cp_size = /*cp_size=*/2;
-    const auto fn = [](int32_t rank, int32_t port) {
-      run_parallel(rank, port, /*dcp=*/false);
-    };
-
-    const int32_t port = parallel_base_port(ranks, cp_size);
-
-    const int32_t child_count = ranks;
-    const int32_t initial_parts = ::testing::UnitTest::GetInstance()
-                                      ->current_test_info()
-                                      ->result()
-                                      ->total_part_count();
-    std::vector<pid_t> child_pids;
-    child_pids.reserve(child_count);
-    bool children_ok = true;
-    bool children_skipped = false;
-    for (int32_t child_rank = 0; child_rank < child_count; ++child_rank) {
-      const pid_t pid = ::fork();
-      if (pid == 0) {
-        try {
-          if (Platform::device_count() < child_count) {
-            ::_exit(77);
-          }
-          const auto rank_body = [&](int32_t rank) {
-            fn(rank, port);
-            return 0;
-          };
-          const int32_t code = rank_body(child_rank);
-          std::fflush(nullptr);
-          ::_exit(child_failed(initial_parts) ? 1 : code);
-        } catch (const std::exception& error) {
-          LOG(ERROR) << "Rank " << child_rank << ": " << error.what();
-          ::_exit(1);
-        }
-      }
-      if (pid < 0) {
-        LOG(ERROR) << "fork failed: " << std::strerror(errno);
-        children_ok = false;
-        break;
-      }
-      child_pids.emplace_back(pid);
-    }
-    if (!children_ok) {
-      stop_ranks(child_pids, std::vector<bool>(child_pids.size(), false));
-    } else {
-      children_ok = wait_ranks(
-          child_pids, std::chrono::minutes(/*count=*/3), children_skipped);
-    }
-
-    if (children_ok && children_skipped) {
-      GTEST_SKIP() << "forked ranks failed, timed out, or require more "
-                      "physical MLU cards";
-    }
-    ASSERT_EQ(children_ok, true)
-        << "forked ranks failed, timed out, or require more physical MLU cards";
-  };
+  run_model_ranks(2, 2, [](int32_t rank, int32_t port) {
+    run_parallel(rank, port, false);
+  });
 }
+
 TEST(Glm52MluForwardTest, KvSplitStackMatchesUnsplitModel) {
-  {
-    const auto ranks = /*ranks=*/2;
-    const auto cp_size = /*cp_size=*/1;
-    const auto fn = [](int32_t rank, int32_t port) {
-      run_parallel(rank, port, /*dcp=*/true);
-    };
-
-    const int32_t port = parallel_base_port(ranks, cp_size);
-
-    const int32_t child_count = ranks;
-    const int32_t initial_parts = ::testing::UnitTest::GetInstance()
-                                      ->current_test_info()
-                                      ->result()
-                                      ->total_part_count();
-    std::vector<pid_t> child_pids;
-    child_pids.reserve(child_count);
-    bool children_ok = true;
-    bool children_skipped = false;
-    for (int32_t child_rank = 0; child_rank < child_count; ++child_rank) {
-      const pid_t pid = ::fork();
-      if (pid == 0) {
-        try {
-          if (Platform::device_count() < child_count) {
-            ::_exit(77);
-          }
-          const auto rank_body = [&](int32_t rank) {
-            fn(rank, port);
-            return 0;
-          };
-          const int32_t code = rank_body(child_rank);
-          std::fflush(nullptr);
-          ::_exit(child_failed(initial_parts) ? 1 : code);
-        } catch (const std::exception& error) {
-          LOG(ERROR) << "Rank " << child_rank << ": " << error.what();
-          ::_exit(1);
-        }
-      }
-      if (pid < 0) {
-        LOG(ERROR) << "fork failed: " << std::strerror(errno);
-        children_ok = false;
-        break;
-      }
-      child_pids.emplace_back(pid);
-    }
-    if (!children_ok) {
-      stop_ranks(child_pids, std::vector<bool>(child_pids.size(), false));
-    } else {
-      children_ok = wait_ranks(
-          child_pids, std::chrono::minutes(/*count=*/3), children_skipped);
-    }
-
-    if (children_ok && children_skipped) {
-      GTEST_SKIP() << "forked ranks failed, timed out, or require more "
-                      "physical MLU cards";
-    }
-    ASSERT_EQ(children_ok, true)
-        << "forked ranks failed, timed out, or require more physical MLU cards";
-  };
+  run_model_ranks(
+      2, 1, [](int32_t rank, int32_t port) { run_parallel(rank, port, true); });
 }
 
 }  // namespace

@@ -91,8 +91,6 @@ bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
                                  const runtime::Options& options);
 
 class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
-  friend class DFlashWorkerImplTestPeer;
-
  public:
   // VLM deployments must pass their real worker type so the target builds
   // the multimodal pipeline; see the constructor definition for the silent
@@ -223,6 +221,8 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   std::vector<torch::Tensor> consumed_context_tensors_;
 
  private:
+  friend class DFlashWorkerImplTestAccess;
+
   DraftBlock execute_greedy_draft_query(ForwardInput query, bool prepared);
   bool draft_use_block_parallel_rows() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;

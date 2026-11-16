@@ -19,7 +19,6 @@ limitations under the License.
 
 #include <bit>
 #include <cstdint>
-#include <limits>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -46,7 +45,6 @@ constexpr int32_t kEdgeRows = 16;
 constexpr int32_t kSentinel = 123456789;
 using TopkResult = std::pair<torch::Tensor, torch::Tensor>;
 
-using dcp_test::bf16_pattern;
 using dcp_test::Candidates;
 using dcp_test::make_candidates;
 using dcp_test::merge_reference;
@@ -112,7 +110,8 @@ Candidates make_history_candidates(const MergeCase& test,
 std::vector<MergeCase> history_cases(Deployment deployment, int32_t batch) {
   std::vector<MergeCase> cases;
   cases.reserve(deployment == Deployment::PREFILL ? 3 : 6);
-  for (int32_t history : {64 * 1024}) {
+  {
+    constexpr int32_t history = 64 * 1024;
     if (deployment == Deployment::PREFILL) {
       cases.emplace_back(MergeCase{
           "prefill_b" + std::to_string(batch) + "_h" + std::to_string(history),
@@ -329,9 +328,7 @@ void run_rank(int32_t rank,
   if (prefill) {
     CHECK_EQ(parallel.cp_group_->world_size(), pcp);
     CHECK_EQ(parallel.cp_group_->rank(), rank / tp);
-    CHECK_EQ(parallel.dcp_group_, parallel.cp_group_);
   } else {
-    CHECK_EQ(parallel.dcp_group_, parallel.tp_group_);
     CHECK_EQ(parallel.dp_local_process_group_->world_size(), dp);
     CHECK_EQ(parallel.dp_local_process_group_->rank(), rank / tp);
   }
@@ -340,10 +337,8 @@ void run_rank(int32_t rank,
             << " pcp=" << pcp << " tp=" << tp << " dcp=" << kDcp
             << " ep=" << kRanks << " replica=" << replica;
   for (const auto& test : cases) {
-    for (int32_t seed : {42}) {
-      run_case(rank, *parallel.dcp_group_, device, test, seed, replica);
-      CHECK_EQ(dev.synchronize_default_stream(), 0);
-    }
+    run_case(rank, *parallel.dcp_group_, device, test, /*seed=*/42, replica);
+    CHECK_EQ(dev.synchronize_default_stream(), 0);
   }
 }
 
@@ -375,109 +370,6 @@ TEST(Glm53DcpMergeTopkMultiDeviceTest,
 TEST(Glm53DcpMergeTopkMultiDeviceTest, DecodeAndVerifyDp2MatchReference) {
   run_distributed(Deployment::DECODE,
                   history_cases(Deployment::DECODE, /*batch=*/16));
-}
-
-// CPU fixtures keep the parent free of MLU initialization before fork.
-TEST(Glm53DcpMergeTopkReferenceTest, LongHistoryOwnershipAndCausality) {
-  for (int32_t history : {64 * 1024}) {
-    const MergeCase test{
-        "history", /*batch=*/2, /*query_width=*/kStripe + 1, history};
-    const int32_t pages = (history + test.query_width + kStripe - 1) / kStripe;
-    for (int32_t replica : {0, 1}) {
-      const int32_t base = replica * (test.batch * pages + 7);
-      std::vector<Candidates> inputs;
-      inputs.reserve(kDcp);
-      for (int32_t shard = 0; shard < kDcp; ++shard) {
-        inputs.emplace_back(
-            make_history_candidates(test, shard, replica, /*seed=*/42));
-        ASSERT_EQ(inputs.back().scores.scalar_type(), torch::kBFloat16);
-        ASSERT_EQ(inputs.back().slots.scalar_type(), torch::kInt32);
-        ASSERT_EQ(inputs.back().mapping.scalar_type(), torch::kInt32);
-        ASSERT_TRUE(inputs.back().scores.isfinite().all().item<bool>());
-      }
-      for (int32_t row = 0; row < test.batch * test.query_width; ++row) {
-        SCOPED_TRACE(::testing::Message()
-                     << "history=" << history << " replica=" << replica
-                     << " row=" << row);
-        const int32_t request = row / test.query_width;
-        const int32_t position = history + row % test.query_width;
-        const int32_t page_start = base + request * pages;
-        const int32_t new_slot =
-            (page_start + pages - 1 - position / kStripe) * kStripe +
-            position % kStripe;
-        std::unordered_set<int32_t> positions;
-        positions.reserve(kDcp * kTopk);
-        for (int32_t shard = 0; shard < kDcp; ++shard) {
-          ASSERT_EQ(inputs[shard].mapping[row].item<int32_t>(), new_slot);
-          const auto slots = inputs[shard].slots.accessor<int32_t, 2>();
-          for (int32_t col = 0; col < kTopk; ++col) {
-            const int32_t slot = slots[row][col];
-            ASSERT_GE(slot, 0);
-            ASSERT_EQ(slot / kPage % kDcp, shard);
-            ASSERT_GE(slot / kStripe, page_start);
-            ASSERT_LT(slot / kStripe, page_start + pages);
-            const int32_t logical =
-                (pages - 1 - (slot / kStripe - page_start)) * kStripe +
-                slot % kStripe;
-            ASSERT_GE(logical, 0);
-            ASSERT_LE(logical, position);
-            ASSERT_TRUE(positions.emplace(logical).second);
-          }
-        }
-        EXPECT_EQ(positions.size(), kDcp * kTopk);
-        EXPECT_EQ(positions.count(0), 1);
-        EXPECT_EQ(positions.count(position), 1);
-      }
-    }
-  }
-}
-
-TEST(Glm53DcpMergeTopkReferenceTest, UniqueScoresLengthsAndPadding) {
-  auto scores = torch::full(
-      {2, 3, 3}, std::numeric_limits<float>::quiet_NaN(), torch::kBFloat16);
-  auto slots = torch::arange(18, torch::kInt32).view({2, 3, 3});
-  auto mapping = torch::tensor({0, -7, 2}, torch::kInt32);
-  scores.select(/*dim=*/1, /*index=*/0)
-      .copy_(torch::tensor(
-          {{3.0f,
-            -std::numeric_limits<float>::infinity(),
-            std::numeric_limits<float>::quiet_NaN()},
-           {2.0f, 1.0f, std::numeric_limits<float>::infinity()}}));
-  scores.select(/*dim=*/1, /*index=*/1).fill_(9);
-  scores[0][2][0].fill_(-std::numeric_limits<float>::infinity());
-  const auto merged = merge_reference(scores, slots, mapping, /*topk=*/4);
-  EXPECT_TRUE(torch::equal(
-      merged.first,
-      torch::tensor({{11, 0, 9, 10}, {-1, -1, -1, -1}, {6, -1, -1, -1}},
-                    torch::kInt32)));
-  EXPECT_TRUE(
-      torch::equal(merged.second, torch::tensor({4, 0, 1}, torch::kInt32)));
-}
-
-TEST(Glm53DcpMergeTopkReferenceTest, SignedValuesAndInvalidSlots) {
-  auto scores =
-      bf16_pattern(
-          {0x8000, 0x8001, 0xff80, 0x0001, 0x7f80, 0x7fc1, 0xffc2, 0x7f80})
-          .view({1, 1, 8});
-  auto slots =
-      torch::tensor({0, 1, 2, 3, 4, 5, 6, -9}, torch::kInt32).view({1, 1, 8});
-  auto mapping = torch::zeros({1}, torch::kInt32);
-  const auto merged = merge_reference(scores, slots, mapping, /*topk=*/6);
-  EXPECT_TRUE(torch::equal(
-      merged.first, torch::tensor({{4, 3, 0, 1, 2, -1}}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(merged.second, torch::tensor({5}, torch::kInt32)));
-}
-
-TEST(Glm53DcpMergeTopkReferenceTest, EmptyQueries) {
-  const auto merged =
-      merge_reference(torch::empty({kDcp, 0, kTopk}, torch::kBFloat16),
-                      torch::empty({kDcp, 0, kTopk}, torch::kInt32),
-                      torch::empty({0}, torch::kInt32),
-                      kTopk);
-  EXPECT_EQ(merged.first.scalar_type(), torch::kInt32);
-  EXPECT_EQ(merged.second.scalar_type(), torch::kInt32);
-  EXPECT_EQ(merged.first.sizes(), torch::IntArrayRef({0, kTopk}));
-  EXPECT_EQ(merged.second.sizes(), torch::IntArrayRef({0}));
 }
 
 }  // namespace

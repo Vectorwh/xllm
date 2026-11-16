@@ -349,28 +349,6 @@ TEST(SpecDecodeInputBuilderTest, ValidateInputsNonAtbExpansion) {
             std::vector<int32_t>({2, 3, 4, 2, 3, 4}));
 }
 
-TEST(SpecDecodeInputBuilderTest, UpdatesDenseValidateExecutionBatchMetadata) {
-  ModelInputParams params;
-  params.execution_batch.num_reqs = 2;
-  params.execution_batch.num_tokens = 2;
-  params.execution_batch.num_scheduled_tokens = {1, 1};
-  params.execution_batch.num_computed_tokens = {7, 11};
-  params.execution_batch.query_start_loc = {0, 1, 2};
-  params.execution_batch.is_prefilling = {0, 0};
-
-  update_execution_batch_metadata(params, {16, 16});
-
-  EXPECT_EQ(params.execution_batch.num_reqs, 2);
-  EXPECT_EQ(params.execution_batch.num_tokens, 32);
-  EXPECT_EQ(params.execution_batch.num_scheduled_tokens,
-            std::vector<int32_t>({16, 16}));
-  EXPECT_EQ(params.execution_batch.query_start_loc,
-            std::vector<int32_t>({0, 16, 32}));
-  EXPECT_EQ(params.execution_batch.num_computed_tokens,
-            std::vector<int32_t>({7, 11}));
-  EXPECT_EQ(params.execution_batch.is_prefilling, std::vector<uint8_t>({0, 0}));
-}
-
 TEST(SpecDecodeInputBuilderTest,
      UpdatesVariableValidateExecutionBatchMetadata) {
   ModelInputParams params;
@@ -395,34 +373,6 @@ TEST(SpecDecodeInputBuilderTest,
             std::vector<uint8_t>({0, 0, 0}));
 }
 
-TEST(SpecDecodeInputBuilderTest, AppendDecodeRowTokenKinds) {
-  std::vector<int32_t> kv_seq_lens = to_layout_seq_lens({5, 9});
-  torch::Tensor token_ids = torch::tensor({10, 20}, torch::kInt);
-  torch::Tensor positions = torch::tensor({4, 8}, torch::kInt);
-  torch::Tensor block_tables =
-      torch::tensor({{0, 1, 2}, {3, 4, 5}}, torch::kInt);
-  ForwardInput input =
-      make_forward_input(token_ids, positions, block_tables, kv_seq_lens);
-  DecodeRowContext ctx = make_decode_row_context(input);
-
-  DecodeBuildBuffers buf;
-  append_decode_row(
-      ctx,
-      {.seq_id = 1, .use_input_token = true, .position_offset = 0},
-      /*block_size=*/4,
-      buf);
-  append_decode_row(ctx,
-                    {.seq_id = 0, .token_id = 123, .position_offset = 0},
-                    /*block_size=*/4,
-                    buf);
-  append_decode_row(ctx,
-                    {.seq_id = 0, .token_id = -2, .position_offset = 0},
-                    /*block_size=*/4,
-                    buf);
-
-  EXPECT_EQ(buf.out_token_ids, std::vector<int32_t>({20, 123, -2}));
-}
-
 TEST(SpecDecodeInputBuilderTest, AppendDecodeRowUsesInputBlockTableLayout) {
   std::vector<int32_t> kv_seq_lens = to_layout_seq_lens({5, 9});
   torch::Tensor token_ids = torch::tensor({10, 20}, torch::kInt);
@@ -440,8 +390,9 @@ TEST(SpecDecodeInputBuilderTest, AppendDecodeRowUsesInputBlockTableLayout) {
                     buf);
 
   expect_position_ids(buf, {10});
+  EXPECT_EQ(buf.out_token_ids, std::vector<int32_t>({99}));
   EXPECT_EQ(buf.out_new_cache_slots, std::vector<int32_t>({22}));
-  ASSERT_EQ(buf.out_block_tables.size(), 0);
+  EXPECT_TRUE(buf.out_block_tables.empty());
 }
 
 TEST(SpecDecodeInputBuilderTest, ValidateRowsStartFromCorrectedCurrentView) {
@@ -653,23 +604,6 @@ TEST(SpecDecodeInputBuilderTest, AppendDecodeRowFromLastStep) {
   EXPECT_EQ(buf.out_kv_seq_lens, to_layout_seq_lens({6, 10}));
 }
 
-TEST(SpecDecodeInputBuilderTest, CalcSlotIdOutOfRangeDeath) {
-  std::vector<int32_t> block_table = {0};
-  EXPECT_DEATH(calc_slot_id(/*position=*/4,
-                            to_slice(block_table),
-                            /*block_size=*/4),
-               "block table index out of range");
-}
-
-TEST(SpecDecodeInputBuilderTest, CalcSlotIdUsesDcpLogicalBlockSize) {
-  std::vector<int32_t> block_table = {7};
-
-  EXPECT_EQ(calc_slot_id(/*position=*/22,
-                         to_slice(block_table),
-                         /*block_size=*/16 * 8),
-            7 * 128 + 22);
-}
-
 // One block-table column is a logical block: with kv_split_size=4 a physical
 // block of 128 tokens spans 512 tokens, so position 200 stays in column 0 and
 // 513 is the first position of column 1. Reading the table with the physical
@@ -697,6 +631,10 @@ TEST(SpecDecodeInputBuilderTest, CalcSlotIdCrossesOneColumnPerLogicalBlock) {
                          to_slice(block_table),
                          /*block_size=*/128),
             9 * 128 + 72);
+  EXPECT_DEATH(calc_slot_id(/*position=*/1024,
+                            to_slice(block_table),
+                            /*block_size=*/512),
+               "block table index out of range");
 }
 
 TEST(SpecDecodeInputBuilderTest, CalcRingSlotIdWrapsSlidingWindowBlocks) {

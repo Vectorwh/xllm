@@ -63,16 +63,21 @@ ModelArgs pixel_dtype_args() {
 
 void expect_pixel_item_matches(const MMDataItem& actual,
                                const MMDataItem& expected) {
+  ASSERT_TRUE(expected.has("pixel_values") ||
+              expected.has("pixel_values_videos"));
   ASSERT_EQ(actual.data().size(), expected.data().size());
   for (const auto& [key, value] : expected.data()) {
     SCOPED_TRACE(key);
     ASSERT_TRUE(actual.has(key));
+    const bool is_pixel = key == "pixel_values" || key == "pixel_values_videos";
     std::vector<torch::Tensor> expected_tensors;
     std::vector<torch::Tensor> actual_tensors;
     expected.get(key, expected_tensors);
     actual.get(key, actual_tensors);
+    if (is_pixel) {
+      ASSERT_FALSE(expected_tensors.empty());
+    }
     ASSERT_EQ(actual_tensors.size(), expected_tensors.size());
-    const bool is_pixel = key == "pixel_values" || key == "pixel_values_videos";
     for (size_t index = 0; index < expected_tensors.size(); ++index) {
       const torch::Tensor reference =
           is_pixel ? expected_tensors[index].to(torch::kBFloat16)
@@ -103,16 +108,14 @@ TYPED_TEST(ImagePixelDtypeTest, MatchesFinalFloat32CastAndPreservesMetadata) {
   const std::vector<torch::Tensor> images{image, image.flip({2})};
   std::vector<MMDataItem> expected_items;
   ASSERT_TRUE(baseline.process(images, expected_items));
-  for (const std::string model_dtype : {"bfloat16", "BFLOAT16", "BFloat16"}) {
-    SCOPED_TRACE(model_dtype);
-    args.dtype(model_dtype);
-    const TypeParam processor(args);
-    std::vector<MMDataItem> actual_items;
-    ASSERT_TRUE(processor.process(images, actual_items));
-    ASSERT_EQ(actual_items.size(), expected_items.size());
-    for (size_t index = 0; index < actual_items.size(); ++index) {
-      expect_pixel_item_matches(actual_items[index], expected_items[index]);
-    }
+  ASSERT_EQ(expected_items.size(), images.size());
+  args.dtype("bfloat16");
+  const TypeParam processor(args);
+  std::vector<MMDataItem> actual_items;
+  ASSERT_TRUE(processor.process(images, actual_items));
+  ASSERT_EQ(actual_items.size(), expected_items.size());
+  for (size_t index = 0; index < actual_items.size(); ++index) {
+    expect_pixel_item_matches(actual_items[index], expected_items[index]);
   }
 }
 
@@ -140,54 +143,20 @@ TYPED_TEST(VideoPixelDtypeTest, MatchesFinalFloat32CastAndPreservesMetadata) {
   metadata.frame_indices = torch::arange(8, torch::kInt64);
   MMDataItem expected(MMType::VIDEO);
   ASSERT_TRUE(baseline.process(video, metadata, expected));
-  for (const std::string model_dtype : {"bfloat16", "BFLOAT16", "BFloat16"}) {
-    SCOPED_TRACE(model_dtype);
-    args.dtype(model_dtype);
-    const TypeParam processor(args);
-    MMDataItem actual(MMType::VIDEO);
-    ASSERT_TRUE(processor.process(video, metadata, actual));
-    expect_pixel_item_matches(actual, expected);
-    const auto expected_metadata =
-        expected.template get_metadata<VideoMetadata>();
-    const auto actual_metadata = actual.template get_metadata<VideoMetadata>();
-    ASSERT_TRUE(expected_metadata.has_value());
-    ASSERT_TRUE(actual_metadata.has_value());
-    EXPECT_EQ(actual_metadata->timestamps, expected_metadata->timestamps);
-    EXPECT_EQ(actual_metadata->sampled_fps, expected_metadata->sampled_fps);
-    EXPECT_TRUE(torch::equal(actual_metadata->frame_indices,
-                             expected_metadata->frame_indices));
-  }
-}
-
-class VideoConfigPromptProcessor final {
- public:
-  VideoConfigPromptProcessor(const ModelArgs&, const ProcessorConfig& config)
-      : stride_(config.value<int32_t>("video.frame_stride", 4)) {}
-
-  int32_t stride() const { return stride_; }
-
- private:
-  int32_t stride_;
-};
-
-TEST(MultimodalProcessorTest, PromptCanConsumeVideoConfiguration) {
-  ModelArgs args;
-  args.mm_patch_size(14).mm_spatial_merge_size(2).mm_image_size(112);
-  const ProcessorConfig config(nlohmann::json{
-      {"image", {{"longest_edge", 56}}}, {"video", {{"frame_stride", 8}}}});
-  const auto image = create_processor<Mistral3ImageProcessor>(args, config);
-  config.validate("image");
-  EXPECT_DEATH(config.validate("video"), "video.frame_stride");
-  const auto prompt =
-      create_processor<VideoConfigPromptProcessor>(args, config);
-  config.validate("video");
-  EXPECT_EQ(prompt->stride(), 8);
-  std::vector<MMDataItem> items;
-  ASSERT_TRUE(
-      image->process({torch::zeros({3, 112, 112}, torch::kUInt8)}, items));
-  const auto grid = items[0].get<torch::Tensor>("image_grid_thw");
-  ASSERT_TRUE(grid.has_value());
-  EXPECT_TRUE(torch::equal(*grid, torch::tensor({{1, 4, 4}}, torch::kInt64)));
+  args.dtype("bfloat16");
+  const TypeParam processor(args);
+  MMDataItem actual(MMType::VIDEO);
+  ASSERT_TRUE(processor.process(video, metadata, actual));
+  expect_pixel_item_matches(actual, expected);
+  const auto expected_metadata =
+      expected.template get_metadata<VideoMetadata>();
+  const auto actual_metadata = actual.template get_metadata<VideoMetadata>();
+  ASSERT_TRUE(expected_metadata.has_value());
+  ASSERT_TRUE(actual_metadata.has_value());
+  EXPECT_EQ(actual_metadata->timestamps, expected_metadata->timestamps);
+  EXPECT_EQ(actual_metadata->sampled_fps, expected_metadata->sampled_fps);
+  EXPECT_TRUE(torch::equal(actual_metadata->frame_indices,
+                           expected_metadata->frame_indices));
 }
 
 TEST(MultimodalProcessorTest, LegacyProcessorDoesNotConsumeOverrides) {

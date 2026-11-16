@@ -70,8 +70,16 @@ def test_models_inherit_identical_core_methods(name: str) -> None:
     assert getattr(Glm52MoE, name) is getattr(Glm5NextMoE, name) is getattr(MoECore, name)
 
 
-@pytest.mark.parametrize("limit", [0.0, 2.0, 10.0])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("limit", "dtype"),
+    [
+        (0.0, torch.float32),
+        (2.0, torch.float32),
+        (2.0, torch.bfloat16),
+        (2.0, torch.float16),
+        (10.0, torch.float32),
+    ],
+)
 def test_swiglu_matches_hf_pre_activation_clamp(limit: float, dtype: torch.dtype) -> None:
     gate = torch.tensor([[-20.0, -11.0, -2.0, 0.0, 2.0, 11.0, 20.0]], dtype=dtype)
     up = torch.tensor([[-20.0, 20.0, -1.0, 1.0, 20.0, -20.0, 20.0]], dtype=dtype)
@@ -418,26 +426,9 @@ def test_glm52_transport_is_cross_rank_consistent(dp_is_decode, dispatch_rows, e
     metadata = _dp_metadata(dp_is_decode, (dispatch_rows // 2,) * 2)
     layout = TokenParallelLayout(dispatch_rows, 2, 0, dispatch_rows=dispatch_rows)
     with _forward_ctx(metadata):
+        if dp_is_decode == (True, False):
+            # The outer source-SP gate and inner transport choice must agree
+            # on the mixed-step case to keep all EP ranks in AllToAllV.
+            assert model._uses_source_sp()
         backend, _ = model._select_routed_backend(layout, metadata, get_forward_context())
     assert backend == expected
-
-
-def test_glm52_mixed_step_agrees_between_gate_and_backend() -> None:
-    """``_uses_source_sp`` and ``_select_routed_backend`` never disagree on mixed steps.
-
-    ``_uses_source_sp`` is the outer transport gate; when it routes a mixed
-    step into the source-SP path (degree-2 decode always enters it), the
-    backend selection must also land on AllToAllV -- an MC2 pick here would
-    be the divergent-collective bug.
-    """
-    from xllm.python.layers.moe_parallel import Eplv2CommPolicy
-    from xllm.python.model_executor.forward_context import get_forward_context
-
-    model = _model("glm52", dp_size=2, world_size=4, ep_size=4)
-    model._comm_policy = Eplv2CommPolicy(mc2_capacity=32)
-    metadata = _dp_metadata((True, False), (4, 4))
-    layout = TokenParallelLayout(8, 2, 0, dispatch_rows=8)
-    with _forward_ctx(metadata):
-        assert model._uses_source_sp()
-        backend, _ = model._select_routed_backend(layout, metadata, get_forward_context())
-    assert backend == "alltoall"

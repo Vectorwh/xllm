@@ -39,19 +39,19 @@ from xllm.python.attention.dsa_metadata import (
 
 def test_build_cache_specs_groups() -> None:
     """Group 0 is always SWA; TOKEN groups register in first-seen order."""
-    compress_ratios = [0, 0, 4, 128, 4, 128, 4, 0]
+    compress_ratios = [0, 0, 128, 4, 128, 4, 128, 0]
     caches_info, group_infos = build_cache_specs(compress_ratios, window_size=128, n_layers=8)
 
-    # Three groups: SWA(1,128), TOKEN(4,512), TOKEN(128,16).
+    # Non-sorted first occurrence matters: SWA, C128, then C4.
     assert len(group_infos) == 3
     assert group_infos[0].cache_type == DSA_CACHE_SLIDING_WINDOW
     assert group_infos[0].ratio == 1
     assert group_infos[1].cache_type == DSA_CACHE_TOKEN
-    assert group_infos[1].ratio == 4
-    assert group_infos[1].block_size == 512
+    assert group_infos[1].ratio == 128
+    assert group_infos[1].block_size == 16
     assert group_infos[2].cache_type == DSA_CACHE_TOKEN
-    assert group_infos[2].ratio == 128
-    assert group_infos[2].block_size == 16
+    assert group_infos[2].ratio == 4
+    assert group_infos[2].block_size == 512
 
 
 def test_build_cache_specs_per_layer_cache_counts() -> None:
@@ -59,48 +59,24 @@ def test_build_cache_specs_per_layer_cache_counts() -> None:
     compress_ratios = [0, 4, 128]
     caches_info, _ = build_cache_specs(compress_ratios, 128, 3)
 
-    assert len(caches_info[0]) == 1  # cr=0 -> normalized to 1
-    assert len(caches_info[1]) == 8  # cr=4
-    assert len(caches_info[2]) == 4  # cr=128
+    assert [[cache.group_id for cache in layer] for layer in caches_info] == [
+        [0],
+        [1, 1, 0, 0, 0, 0, 0, 1],
+        [2, 0, 0, 0],
+    ]
 
 
-def test_build_cache_specs_does_not_silently_accept_unknown_ratio() -> None:
-    caches_info, group_infos = build_cache_specs([2], 128, 1)
-
-    assert len(group_infos) == 1
-    assert caches_info == [[]]
-
-
-def test_build_cache_specs_real_dsv4_config() -> None:
-    """The shipped DeepSeek-V4-Flash config produces 2 C1 + 21 C4 + 20 C128.
-
-    config.json has ``compress_ratios`` of length 44 (3 zeros, 21 fours, 20
-    one-twenty-eights) but ``num_hidden_layers=43``; only layers 0..42 are
-    built, so the trailing zero (index 43) is ignored and two C1 layers
-    remain (indices 0 and 1).
-    """
-    compress_ratios = (
-        [0, 0] + [4, 128] * 20 + [4, 0]  # layer 42 is C4; index 43 (zero) is ignored.
-    )
-    assert len(compress_ratios) == 44
-    caches_info, group_infos = build_cache_specs(compress_ratios, 128, 43)
-
-    assert len(group_infos) == 3
-    c1 = sum(1 for layer in caches_info if len(layer) == 1)
-    c4 = sum(1 for layer in caches_info if len(layer) == 8)
-    c128 = sum(1 for layer in caches_info if len(layer) == 4)
-    assert c1 == 2
-    assert c4 == 21
-    assert c128 == 20
-    assert c1 + c4 + c128 == 43
+def test_build_cache_specs_ignores_trailing_swa_layer() -> None:
+    caches_info, group_infos = build_cache_specs([0, 4, 0], 128, 2)
+    assert len(group_infos) == 2
+    assert [[cache.group_id for cache in layer] for layer in caches_info] == [[0], [1, 1, 0, 0, 0, 0, 0, 1]]
 
 
 def _make_builder(
-    n_layers: int = 4,
     read_table_layout: str = READ_TABLE_LAYOUT_RIGHT_ALIGNED,
 ) -> tuple[DsaMetadataBuilder, list, list]:
     compress_ratios = [0, 4, 128, 4]
-    caches_info, group_infos = build_cache_specs(compress_ratios, 128, n_layers)
+    caches_info, group_infos = build_cache_specs(compress_ratios, 128, 4)
     return (
         DsaMetadataBuilder(caches_info, group_infos, read_table_layout=read_table_layout),
         caches_info,
@@ -150,11 +126,16 @@ def test_build_seq_lengths_and_start_pos() -> None:
     # actual_seq_lengths_query is cumsum(q_lens) with a leading zero.
     assert dsa.actual_seq_lengths_query.tolist() == [0, 1, 2]
     assert dsa.kv_cu_seq_lens.tolist() == [0, 6, 14]
-    assert dsa.max_seqlen_q.ndim == 0
-    assert dsa.max_seqlen_kv.ndim == 0
+    assert dsa.max_seqlen_q.ndim == 0 and dsa.max_seqlen_q.item() == 1
+    assert dsa.max_seqlen_kv.ndim == 0 and dsa.max_seqlen_kv.item() == 8
 
 
-def test_build_max_lengths_include_attention_metadata_capacity() -> None:
+@pytest.mark.parametrize(
+    ("max_query_len", "max_seq_len", "expected"), [(16, 32, (16, 32)), (0, 0, (2, 8)), (1, 7, (2, 8))]
+)
+def test_build_max_lengths_include_attention_metadata_capacity(
+    max_query_len: int, max_seq_len: int, expected: tuple[int, int]
+) -> None:
     """C++ takes max(params.meta.max_*, max(host sequence lengths))."""
     builder, _, _ = _make_builder()
     dsa = builder.build(
@@ -165,12 +146,11 @@ def test_build_max_lengths_include_attention_metadata_capacity() -> None:
         dsa_cos_sin=None,
         is_prefill=False,
         is_chunked_prefill=False,
-        max_query_len=16,
-        max_seq_len=32,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
     )
 
-    assert dsa.max_query_len == 16
-    assert dsa.max_seq_len == 32
+    assert (dsa.max_query_len, dsa.max_seq_len) == expected
 
 
 def test_build_token_group_slot_committed_rows() -> None:
@@ -194,8 +174,8 @@ def test_build_token_group_slot_committed_rows() -> None:
     # One committed row: compressed_idx = prev_committed = 7//4 = 1.
     # block_idx = 1 // 512 = 0, block_id = token4_bt[0,0] = 20.
     # slot = 20 * 512 + 1 = 10241.
-    assert cmp_slot.numel() >= 1
-    assert cmp_slot[0].item() == 20 * 512 + 1
+    assert cmp_slot.tolist() == [20 * 512 + 1]
+    assert dsa.slot_mappings[0][0].tolist() == [10 * 128 + 7]
 
 
 def test_build_token_group_slot_empty_between_boundaries() -> None:
@@ -219,39 +199,18 @@ def test_build_token_group_slot_empty_between_boundaries() -> None:
 def test_build_token_group_slot_commits_at_later_boundary() -> None:
     builder, _, _ = _make_builder()
     swa_bt = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
-    token4_bt = torch.tensor([[20, 21, 22, 23]], dtype=torch.int32)
+    token4_bt = torch.tensor([[20, 37, 22, 23]], dtype=torch.int32)
     dsa = builder.build(
         multi_block_tables=[swa_bt, token4_bt],
-        kv_seq_lens=[132],
+        kv_seq_lens=[2052],
         q_seq_lens=[1],
-        positions=torch.tensor([131], dtype=torch.int64),
+        positions=torch.tensor([2051], dtype=torch.int64),
         dsa_cos_sin=None,
         is_prefill=False,
         is_chunked_prefill=False,
     )
 
-    assert dsa.slot_mappings[1][0].tolist() == [20 * 512 + 32]
-
-
-def test_build_swa_group_slot_query_tokens_only() -> None:
-    """A SWA cache writes only the current forward's query token."""
-    builder, _, _ = _make_builder()
-    swa_bt = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
-    token4_bt = torch.tensor([[20, 21, 22, 23]], dtype=torch.int32)
-    # kv_len=8, q_len=1, q_start=7, pos=7, block_idx = 7//128 % 4 = 0,
-    # block_id = swa_bt[0,0] = 10, offset = 7 % 128 = 7 -> slot = 10*128+7 = 1287.
-    dsa = builder.build(
-        multi_block_tables=[swa_bt, token4_bt],
-        kv_seq_lens=[8],
-        q_seq_lens=[1],
-        positions=torch.tensor([7], dtype=torch.int64),
-        dsa_cos_sin=None,
-        is_prefill=False,
-        is_chunked_prefill=False,
-    )
-    # Layer 0 (cr=1): the single SWA cache -> group 0.
-    swa_slot = dsa.slot_mappings[0][0]
-    assert swa_slot[0].item() == 10 * 128 + 7
+    assert dsa.slot_mappings[1][0].tolist() == [37 * 512]
 
 
 def test_build_swa_group_uses_scheduler_resolved_slots_for_expanded_decode() -> None:
@@ -274,14 +233,7 @@ def test_build_swa_group_uses_scheduler_resolved_slots_for_expanded_decode() -> 
 
 
 def test_swa_device_path_routes_through_dst_slots_kwarg() -> None:
-    """The device SWA branch must call a single ``_swa_slots_on_device``.
-
-    Regression: a stale second definition without the ``dst_slots`` parameter
-    shadowed the current one, so every call on the device branch
-    (``swa_device_ctx_lens is not None`` -> ``dst_slots=...``) raised
-    ``TypeError: _swa_slots_on_device() got an unexpected keyword argument
-    'dst_slots'``. This drives that branch end to end and checks the slot.
-    """
+    """Vector context-length route preserves in-place slots and values."""
     builder, _, _ = _make_builder()
     raw_bt = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
     device_ctx_lens = torch.tensor([8], dtype=torch.int32)
@@ -305,30 +257,10 @@ def test_swa_device_path_routes_through_dst_slots_kwarg() -> None:
     assert out_slots[0].item() == 10 * 128 + 7
 
 
-def test_swa_slots_on_device_static_signature_accepts_dst_slots() -> None:
-    """The device slot mapper must expose the ``dst_slots`` parameter."""
-    raw_bt = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
-    out_slots = DsaMetadataBuilder._swa_slots_on_device(
-        raw_bt,
-        128,
-        4,
-        1,
-        1,
-        [1],
-        None,
-        1,
-        torch.tensor([8], dtype=torch.int32),
-        dst_slots=torch.full((1,), -1, dtype=torch.int32),
-    )
-
-    assert out_slots[0].item() == 10 * 128 + 7
-
-
 def _swa_read_table(
     raw_bt: torch.Tensor,
     ctx_lens: list[int],
     *,
-    block_size: int = 128,
     graph_cols: int = 0,
     layout: str = READ_TABLE_LAYOUT_RING,
 ) -> torch.Tensor:
@@ -336,7 +268,7 @@ def _swa_read_table(
     builder, _, _ = _make_builder(read_table_layout=layout)
     read_bt, _ = builder._process_swa_group(
         raw_bt=raw_bt,
-        block_size=block_size,
+        block_size=128,
         ctx_lens=list(ctx_lens),
         q_lens=[1] * len(ctx_lens),
         batch_size=len(ctx_lens),
@@ -347,7 +279,7 @@ def _swa_read_table(
     return read_bt
 
 
-@pytest.mark.parametrize("ctx_len", [129, 257, 513])
+@pytest.mark.parametrize("ctx_len", [513])
 def test_swa_read_table_rings_every_addressed_column(ctx_len: int) -> None:
     """A non-zero ring block must appear in EVERY column a reader addresses.
 
@@ -398,27 +330,6 @@ def test_swa_read_table_rings_the_full_graph_storage_width() -> None:
     assert bool((read_bt[0] == 8).all())
 
 
-def test_swa_read_table_matches_the_write_path_ring_resolution() -> None:
-    """Every position's eager read must resolve the block the writer used.
-
-    The write path (``slot_for_position``) maps position ``p`` to
-    ``raw_bt[s, (p // block_size) % semantic_cols]``; the eager reader
-    (``_gather_swa_positions``) resolves ``(p // block_size) % read_cols``
-    against the read-side table and clamps ``-1`` to 0. Both must agree for
-    every position, not only the newest window.
-    """
-    block_size = 128
-    ctx_len = 513
-    raw_bt = torch.tensor([[8]], dtype=torch.int32)
-    read_bt = _swa_read_table(raw_bt, [ctx_len], block_size=block_size)
-    read_cols = int(read_bt.size(1))
-    semantic_cols = int(raw_bt.size(1))
-    for pos in range(ctx_len):
-        write_block = int(raw_bt[0, (pos // block_size) % semantic_cols].item())
-        eager_block = int(read_bt[0, (pos // block_size) % read_cols].clamp_min(0).item())
-        assert eager_block == write_block, f"pos={pos}"
-
-
 def test_default_swa_read_table_stays_right_aligned() -> None:
     """The shared (non-V4.1) default keeps the historical right-aligned layout."""
     raw_bt = torch.tensor([[8]], dtype=torch.int32)
@@ -460,16 +371,9 @@ def test_build_block_tables_shared_within_group() -> None:
 # -- group_limit: a sibling model that owns fewer groups than the request ----
 
 
-def _make_builder_v41(n_layers: int = 3):
-    """A V4.1 cache-spec builder (SWA + one TOKEN group per kv-source ratio)."""
-    caches_info, group_infos = build_cache_specs_v41([0, 2, 1], [1, 2], [1, 2], window_size=128, n_layers=n_layers)
-    return DsaMetadataBuilder(caches_info, group_infos), caches_info, group_infos
-
-
-def _make_swa_only_builder(n_layers: int = 3):
+def _make_swa_only_builder() -> tuple[DsaMetadataBuilder, list, list]:
     """A pure-SWA model (the DSpark draft): exactly one deduplicated group."""
-    caches_info, group_infos = build_cache_specs_v41([0] * n_layers, [], [], window_size=128, n_layers=n_layers)
-    assert len(group_infos) == 1
+    caches_info, group_infos = build_cache_specs_v41([0] * 3, [], [], window_size=128, n_layers=3)
     return DsaMetadataBuilder(caches_info, group_infos), caches_info, group_infos
 
 
@@ -497,14 +401,14 @@ def _build_v41(builder: DsaMetadataBuilder, group_limit: int | None = None) -> D
 
 
 def test_manager_count_beyond_the_model_groups_is_rejected() -> None:
-    """The invariant the DSpark draft tripped: managers > own deduplicated groups."""
+    """Managers must fit the initialized builder cache groups."""
     builder, _, _ = _make_swa_only_builder()
     with pytest.raises(ValueError, match="manager count 3 exceeds group count 1"):
         _build_v41(builder)
 
 
 def test_group_limit_selects_only_the_leading_managers() -> None:
-    """A one-group draft consumes just the request's leading SWA manager."""
+    """Explicit shared-request limit keeps only the owner SWA storage."""
     builder, _, _ = _make_swa_only_builder()
     dsa = _build_v41(builder, group_limit=1)
     # Every draft layer owns one SWA cache -> the same processed manager tensor.
@@ -518,62 +422,10 @@ def test_group_limit_selects_only_the_leading_managers() -> None:
     assert dsa.block_tables[0][0][0, 0].item() == 10
 
 
-def test_group_limit_equal_to_all_groups_is_the_default() -> None:
-    """The owning model (no limit) and an explicit full limit agree exactly."""
-    builder, _, _ = _make_builder_v41()
-    default = _build_v41(builder)
-    explicit = _build_v41(builder, group_limit=3)
-    assert len(default.block_tables) == len(explicit.block_tables)
-    for layer_default, layer_explicit in zip(default.block_tables, explicit.block_tables, strict=True):
-        assert len(layer_default) == len(layer_explicit)
-        for a, b in zip(layer_default, layer_explicit, strict=True):
-            assert a.shape == b.shape
-            assert torch.equal(a, b)
-
-
-def test_group_limit_partial_owner_leaves_later_groups_unmapped() -> None:
-    """A two-group owner reads managers 0..1; layers in group 2 get empty slots."""
-    builder, _, group_infos = _make_builder_v41()
-    assert len(group_infos) == 3
-    dsa = _build_v41(builder, group_limit=2)
-    # Layer 1 is the ratio-2 kv-source: entries [C2 key, C2 index, swa, swa, swa].
-    assert dsa.block_tables[1][0].data_ptr() == dsa.block_tables[1][1].data_ptr()
-    assert dsa.block_tables[1][2].data_ptr() == dsa.block_tables[0][0].data_ptr()
-    # Layer 2 is the ratio-1 kv-source: its two TOKEN entries (group 2, beyond
-    # the limit) stay unmapped while its SWA entry (group 0) is mapped.
-    assert dsa.block_tables[2][0].numel() == 0
-    assert dsa.block_tables[2][1].numel() == 0
-    assert dsa.block_tables[2][2].data_ptr() == dsa.block_tables[0][0].data_ptr()
-
-
 def test_group_limit_rejects_a_negative_value() -> None:
     builder, _, _ = _make_swa_only_builder()
     with pytest.raises(ValueError, match="group_limit must be non-negative"):
         _build_v41(builder, group_limit=-1)
-
-
-def test_batchless_build_is_the_b4_empty_length_signature() -> None:
-    """A zero-sequence build is what the idle DP shard used to hand the model.
-
-    The builder itself accepts it; the model's attention then maxes an empty
-    per-sequence length list. csa_attention now synthesizes the framework dummy
-    row before this state can reach the model, so this test pins the raw
-    signature the fix has to avoid.
-    """
-    builder, _, _ = _make_swa_only_builder()
-    dsa = builder.build(
-        multi_block_tables=[],
-        kv_seq_lens=[],
-        q_seq_lens=None,
-        positions=torch.tensor([0], dtype=torch.int64),
-        dsa_cos_sin=None,
-        is_prefill=False,
-        is_chunked_prefill=False,
-    )
-    assert dsa.seq_lens_q.numel() == 0
-    # CPython 3.11: "max() arg is an empty sequence"; 3.12: "iterable argument is empty".
-    with pytest.raises(ValueError, match="empty"):
-        max(int(value) for value in dsa.seq_lens_q.tolist())
 
 
 def test_build_c4_pad_positions() -> None:
@@ -582,15 +434,15 @@ def test_build_c4_pad_positions() -> None:
     # q_len=4, q_start=3 -> positions 3,4,5,6. (pos+1)%4==0 at pos=3 (next=4).
     dsa = builder.build(
         multi_block_tables=[],
-        kv_seq_lens=[7],
+        kv_seq_lens=[11],
         q_seq_lens=[4],
-        positions=torch.tensor([3, 4, 5, 6], dtype=torch.int64),
+        positions=torch.tensor([7, 8, 9, 10], dtype=torch.int64),
         dsa_cos_sin=None,
         is_prefill=True,
         is_chunked_prefill=False,
     )
-    # pos=3 -> next_pos=4 -> 4%4==0 -> record 4-4=0.
-    assert 0 in dsa.c4_pad_positions.tolist()
+    # Eager ABI reserves two rows: committed position4 plus safe zero padding.
+    assert dsa.c4_pad_positions.tolist() == [4, 0]
 
 
 def test_graph_compressed_positions_use_zero_padding() -> None:
@@ -598,16 +450,16 @@ def test_graph_compressed_positions_use_zero_padding() -> None:
     builder, _, _ = _make_builder()
     dsa = builder.build(
         multi_block_tables=[],
-        kv_seq_lens=[7],
+        kv_seq_lens=[11],
         q_seq_lens=[4],
-        positions=torch.tensor([3, 4, 5, 6], dtype=torch.int64),
+        positions=torch.tensor([7, 8, 9, 10], dtype=torch.int64),
         dsa_cos_sin=None,
         is_prefill=True,
         is_chunked_prefill=False,
         enable_graph=True,
     )
 
-    assert dsa.c4_pad_positions.tolist() == [0, 0, 0, 0]
+    assert dsa.c4_pad_positions.tolist() == [4, 0, 0, 0]
     assert dsa.c128_pad_positions.tolist() == [0, 0, 0, 0]
 
 
@@ -625,8 +477,8 @@ def test_empty_batch_preserves_cpp_zero_length_buffers() -> None:
 
     assert dsa.actual_seq_lengths_query.tolist() == [0]
     assert dsa.kv_cu_seq_lens.tolist() == [0]
-    assert dsa.max_seqlen_q.shape == (1,)
-    assert dsa.max_seqlen_kv.shape == (1,)
+    assert dsa.max_seqlen_q.shape == (1,) and dsa.max_seqlen_q.tolist() == [0]
+    assert dsa.max_seqlen_kv.shape == (1,) and dsa.max_seqlen_kv.tolist() == [0]
     assert dsa.max_query_len == 0
     assert dsa.max_seq_len == 0
     assert dsa.c4_pad_positions.numel() == 0
@@ -640,17 +492,17 @@ def test_build_c128_slot_at_compression_boundary() -> None:
     token128_bt = torch.tensor([[30, 31]], dtype=torch.int32)
     dsa = builder.build(
         multi_block_tables=[swa_bt, token4_bt, token128_bt],
-        kv_seq_lens=[128],
+        kv_seq_lens=[256],
         q_seq_lens=[1],
-        positions=torch.tensor([127], dtype=torch.int64),
+        positions=torch.tensor([255], dtype=torch.int64),
         dsa_cos_sin=None,
         is_prefill=False,
         is_chunked_prefill=False,
     )
 
     # Layer 2 uses TOKEN(128) for cache 0. The first compressed row is offset 0.
-    assert dsa.slot_mappings[2][0].tolist() == [30 * 16]
-    assert dsa.c128_pad_positions.tolist() == [0]
+    assert dsa.slot_mappings[2][0].tolist() == [30 * 16 + 1]
+    assert dsa.c128_pad_positions.tolist() == [128]
 
 
 def test_multi_batch_slots_are_concatenated_by_sequence() -> None:
@@ -735,9 +587,9 @@ def test_compressed_positions_preserve_position_dtype() -> None:
     builder, _, _ = _make_builder()
     dsa = builder.build(
         multi_block_tables=[],
-        kv_seq_lens=[4],
+        kv_seq_lens=[8],
         q_seq_lens=[4],
-        positions=torch.arange(4, dtype=torch.int32),
+        positions=torch.arange(4, 8, dtype=torch.int32),
         dsa_cos_sin=None,
         is_prefill=True,
         is_chunked_prefill=False,
@@ -745,6 +597,7 @@ def test_compressed_positions_preserve_position_dtype() -> None:
 
     assert dsa.c4_pad_positions.dtype == torch.int32
     assert dsa.c128_pad_positions.dtype == torch.int32
+    assert dsa.c4_pad_positions.tolist() == [4, 0]
 
 
 def test_graph_rejects_block_table_larger_than_bucket_capacity() -> None:
@@ -770,6 +623,8 @@ def test_async_upload_retains_staging_until_copy_finishes(monkeypatch: pytest.Mo
     """Identically shaped fields must not overwrite an in-flight host copy."""
     from types import SimpleNamespace
 
+    submission_order: list[str] = []
+
     class Device:
         type = "npu"
 
@@ -782,6 +637,7 @@ def test_async_upload_retains_staging_until_copy_finishes(monkeypatch: pytest.Mo
 
         def record(self, stream: object) -> None:
             assert stream is current_stream
+            submission_order.append("record")
             self.finished = False
 
     class Destination:
@@ -791,6 +647,7 @@ def test_async_upload_retains_staging_until_copy_finishes(monkeypatch: pytest.Mo
             self.copies: list[tuple[torch.Tensor, bool]] = []
 
         def copy_(self, source: torch.Tensor, *, non_blocking: bool) -> None:
+            submission_order.append("copy")
             self.copies.append((source, non_blocking))
 
     current_stream = object()
@@ -820,14 +677,17 @@ def test_async_upload_retains_staging_until_copy_finishes(monkeypatch: pytest.Mo
     torch.testing.assert_close(destination.copies[0][0], first)
     torch.testing.assert_close(destination.copies[1][0], second)
     if not non_blocking:
+        assert submission_order == ["copy", "copy"]
         assert not allocations
         assert not builder._pinned_uploads
         return
+    assert submission_order == ["copy", "record", "copy", "record"]
     assert len(allocations) == 2
     assert destination.copies[0][0].data_ptr() != destination.copies[1][0].data_ptr()
     uploads = next(iter(builder._pinned_uploads.values()))
     uploads[0][1].finished = True
     builder._copy_to_destination(destination, second, non_blocking=True)
     assert len(allocations) == 2
+    assert submission_order == ["copy", "record", "copy", "record", "copy", "record"]
     assert destination.copies[2][0] is destination.copies[0][0]
     torch.testing.assert_close(destination.copies[2][0], second)

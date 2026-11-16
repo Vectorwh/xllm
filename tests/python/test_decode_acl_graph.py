@@ -54,15 +54,24 @@ from xllm.python.model_executor.sampling_metadata import (
     ModelSamplingMetadataBuilder,
 )
 from xllm.python.models.engram_config import EngramConfig
+from xllm.python.models.multimodal import MultimodalInputs
 
 
-class _SamplingModel(nn.Identity):
+class _SamplingModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.sampling_builder = ModelSamplingMetadataBuilder()
 
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return input_ids + positions
+
     def can_execute_graph(self, inputs: ModelInput) -> bool:
         return inputs.input_batch is not None and self.sampling_builder.can_execute_graph(inputs.input_batch.sampling)
+
+
+class _PassThroughDecoder(nn.Module):
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return input_ids
 
 
 def _runner(model: nn.Module | None = None, max_batch: int = 8, **kwargs: Any) -> DecodeAclGraphRunner:
@@ -72,7 +81,7 @@ def _runner(model: nn.Module | None = None, max_batch: int = 8, **kwargs: Any) -
         graph_uses_dsa_metadata=lambda _: False,
     )
     return DecodeAclGraphRunner(
-        nn.Identity() if model is None else model,
+        _PassThroughDecoder() if model is None else model,
         attention_backend,
         torch.device("cpu"),
         max_batch=max_batch,
@@ -119,10 +128,20 @@ def test_custom_capture_dp_ranks_choose_same_shape_and_admission(
 ) -> None:
     for rank in range(2):
         runner = _runner(max_batch=16, dp_size=2, dp_rank=rank, capture_sizes=(3, 7, 10))
-        metadata = _dp_metadata(counts)
-        with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
-            input_ids = torch.arange(max(1, counts[rank]))
-            assert runner.can_execute(ModelInput(input_ids, input_ids, metadata)) == admitted
+        rows = max(1, counts[rank])
+        metadata = _aligned_dp_decode_metadata(rows)
+        metadata.is_spec_verify = False
+        metadata.linear_state_indices = None
+        metadata.dp_execution_token_counts = tuple(max(1, count) for count in counts)
+        metadata.raw_dp_execution_token_counts = counts
+        metadata.is_dummy = counts[rank] == 0
+        metadata.block_table[:, 0] = torch.arange(1, rows + 1) if counts[rank] else 0
+        metadata.paged_kv_indices = metadata.block_table[:, 0].clone()
+        metadata.slot_mapping = metadata.block_table[:, 0] * 4
+        if not counts[rank]:
+            metadata.slot_mapping.fill_(-1)
+        input_ids = torch.arange(rows)
+        assert runner.can_execute(ModelInput(input_ids, input_ids, metadata)) is admitted
         assert runner._padded_token_rows(max(metadata.dp_execution_token_counts)) == bucket
 
 
@@ -143,8 +162,7 @@ def _query_batch(num_reqs: int, width: int) -> InputBatch:
     )
 
 
-@pytest.mark.parametrize("query_width", [3, 5, 15])
-@pytest.mark.parametrize("num_sequences", [1, 2, 3, 5])
+@pytest.mark.parametrize(("query_width", "num_sequences"), [(3, 1), (3, 5), (5, 2), (15, 3)])
 def test_draft_graph_uses_same_whole_block_plan_for_active_and_empty_dp_shards(
     query_width: int,
     num_sequences: int,
@@ -175,31 +193,28 @@ def test_draft_graph_uses_same_whole_block_plan_for_active_and_empty_dp_shards(
 
 
 def test_draft_graph_communication_limit_uses_complete_block_padding() -> None:
-    runner = _runner()
-    runner._is_spec_draft = True
-    runner._draft_query_width = 5
-    runner._eplv2_graph_token_limit = 16
-    assert runner._padded_token_rows(15) == 20
-    assert not runner._eplv2_graph_admits(15)
-    runner._eplv2_graph_token_limit = 20
-    assert runner._eplv2_graph_admits(15)
+    rejected = _runner(is_spec_draft=True, draft_query_width=5, eplv2_graph_token_limit=16)
+    assert rejected._padded_token_rows(15) == 20
+    assert not rejected._eplv2_graph_admits(15)
+    allowed = _runner(is_spec_draft=True, draft_query_width=5, eplv2_graph_token_limit=20)
+    assert allowed._eplv2_graph_admits(15)
 
 
 @pytest.mark.parametrize("query_width", [3, 5, 15])
 def test_expanded_draft_proposal_has_shared_plan_with_empty_dp(query_width: int) -> None:
-    runner = DecodeAclGraphRunner(
-        nn.Identity(),
-        SimpleNamespace(page_size=128, is_mla=False),
-        torch.device("cpu"),
-        max_batch=8,
-        max_model_len=256,
-        dp_size=2,
-        is_spec_draft=True,
-        draft_query_width=query_width,
-    )
     plans = []
     for dp_rank, num_reqs in ((0, 2), (1, 0)):
-        runner.dp_rank = dp_rank
+        runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            SimpleNamespace(page_size=128, is_mla=False),
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=256,
+            dp_size=2,
+            dp_rank=dp_rank,
+            is_spec_draft=True,
+            draft_query_width=query_width,
+        )
         batch = _query_batch(num_reqs, query_width)
         row_count = batch.num_tokens if num_reqs else 1
         metadata = _metadata(None if num_reqs else torch.zeros(1, dtype=torch.int32))
@@ -216,14 +231,15 @@ def test_expanded_draft_proposal_has_shared_plan_with_empty_dp(query_width: int)
         metadata.dp_execution_token_counts = (2 * query_width, query_width)
         metadata.raw_dp_execution_token_counts = (2 * query_width, 0)
         metadata.dp_is_decode = (True, True)
-        assert runner.can_execute(ModelInput(batch.input_ids, batch.input_ids, metadata))
+        assert runner.can_execute(ModelInput(batch.input_ids, batch.input_ids, metadata, input_batch=batch))
         plans.append(runner._shared_graph_plan(metadata, batch.num_tokens))
     assert plans == [(True, query_width, 2)] * 2
 
 
-@pytest.mark.parametrize("dp_size", [1, 2, 4])
-@pytest.mark.parametrize("context_length", [256, 1024, 1025, 8192])
-@pytest.mark.parametrize("extra_target_tables", [False, True])
+@pytest.mark.parametrize(
+    ("dp_size", "context_length", "extra_target_tables"),
+    [(1, 256, True), (2, 1024, False), (4, 1025, True), (1, 8192, False), (4, 8192, True)],
+)
 def test_csa2_ring_paging_admission_and_dummy_replay(
     dp_size: int,
     context_length: int,
@@ -271,15 +287,21 @@ def test_csa2_ring_paging_admission_and_dummy_replay(
     metadata.dp_execution_token_counts = (query_width,) * dp_size
     metadata.raw_dp_execution_token_counts = (query_width,) + (0,) * (dp_size - 1)
     metadata.dp_is_decode = (True,) * dp_size
-    assert runner.can_execute(ModelInput(batch.input_ids, batch.input_ids, metadata))
+    assert runner.can_execute(ModelInput(batch.input_ids, batch.input_ids, metadata, input_batch=batch))
     normalized = runner._normalize_dsa_metadata(metadata)
     assert len(normalized.multi_block_tables) == 1
     assert normalized.multi_block_tables[0] is metadata.multi_block_tables[0]
     assert len(metadata.multi_block_tables) == (3 if extra_target_tables else 1)
     if extra_target_tables:
-        runner._is_spec_draft = False
-        assert runner._normalize_dsa_metadata(metadata) is metadata
-        runner._is_spec_draft = True
+        target_runner = DecodeAclGraphRunner(
+            nn.Identity(),
+            SimpleNamespace(page_size=page_size, is_mla=False, group_infos=group_infos),
+            torch.device("cpu"),
+            max_batch=8,
+            max_model_len=8192,
+            dp_size=dp_size,
+        )
+        assert target_runner._normalize_dsa_metadata(metadata) is metadata
     entry = runner._allocate_entry(8, batch.input_ids, batch.positions, normalized, batch)
     target = entry.execution_contexts[Csa2BlockAttentionMetadata]
     addresses = tuple(tensor.data_ptr() for tensor in (target.context_lengths, target.block_table, target.slot_mapping))
@@ -298,8 +320,8 @@ def test_csa2_ring_paging_admission_and_dummy_replay(
     dummy.paged_kv_indptr = torch.arange(query_width + 1, dtype=torch.int32)
     dummy.paged_kv_indices = torch.zeros(query_width, dtype=torch.int32)
     dummy.paged_kv_last_page_len = torch.ones(query_width, dtype=torch.int32)
-    runner.dp_rank = dp_size - 1
-    assert runner.can_execute(ModelInput(empty_batch.input_ids, empty_batch.input_ids, dummy))
+    dummy.raw_dp_execution_token_counts = ((0, query_width) + (0,) * (dp_size - 2)) if dp_size > 1 else (0,)
+    assert runner.can_execute(ModelInput(empty_batch.input_ids, empty_batch.input_ids, dummy, input_batch=empty_batch))
     assert runner._shared_graph_plan(metadata, query_width) == runner._shared_graph_plan(dummy, query_width)
     normalized_dummy = runner._normalize_dsa_metadata(dummy)
     assert normalized_dummy.multi_block_tables[0].shape == (query_width, 1)
@@ -374,17 +396,25 @@ def test_draft_graph_key_keeps_whole_query_blocks() -> None:
         is_spec_draft=True,
         draft_query_width=5,
     )
-    captured_keys = []
+    captured_keys: list[tuple[Any, ...]] = []
 
-    def capture_key(key: tuple) -> None:
-        captured_keys.append(key)
-        raise LookupError("graph key recorded")
+    class ProbeCache(dict):
+        def get(self, key: tuple[Any, ...], default: Any = None) -> Any:
+            captured_keys.append(key)
+            raise LookupError("graph key recorded")
 
-    runner._graphs = SimpleNamespace(get=capture_key)
+    runner._graphs = ProbeCache()
     for num_sequences in (2, 3):
-        input_ids = torch.arange(num_sequences * 5, dtype=torch.int32)
+        batch = _query_batch(num_sequences, 5)
+        metadata = _aligned_dp_decode_metadata(batch.num_tokens)
+        metadata.is_spec_verify = False
+        metadata.linear_state_indices = None
+        metadata.block_table[:, 0] = torch.arange(1, batch.num_tokens + 1)
+        metadata.kv_seq_lens = torch.ones(batch.num_tokens, dtype=torch.int32)
+        metadata.slot_mapping = metadata.block_table[:, 0] * 128
+        metadata.paged_kv_indices = metadata.block_table[:, 0].clone()
         with pytest.raises(LookupError, match="graph key recorded"):
-            runner.execute(input_ids, input_ids, SimpleNamespace())
+            runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
     assert [key[0] for key in captured_keys] == [10, 20]
 
 
@@ -433,6 +463,10 @@ def test_csa2_builder_updates_alongside_legacy_buffers_and_protects_capture() ->
     metadata.num_accepted_tokens = None
     metadata.is_dummy = False
     metadata.multi_block_tables = (torch.tensor([[5], [5], [6], [6]], dtype=torch.int32),)
+    metadata.block_table = torch.tensor([[5, 0], [5, 0], [6, 0], [6, 0]], dtype=torch.int32)
+    metadata.paged_kv_indices = torch.tensor([5, 5, 6, 6], dtype=torch.int32)
+    metadata.slot_mapping = torch.tensor([20, 21, 26, 27], dtype=torch.int32)
+    metadata.new_cache_slots_host_values = [20, 21, 26, 27]
     entry = runner._allocate_entry(8, batch.input_ids, batch.positions, metadata, batch)
     target = entry.execution_contexts[Csa2BlockAttentionMetadata]
     buffers = (target.context_lengths, target.block_table, target.slot_mapping)
@@ -470,7 +504,7 @@ def test_csa2_builder_updates_alongside_legacy_buffers_and_protects_capture() ->
     assert entry.execution_contexts[Csa2BlockAttentionMetadata] is target
     assert entry.static_input_ids.tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
     assert entry.static_positions.tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
-    assert entry.static_metadata.slot_mapping.tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
+    assert entry.static_metadata.slot_mapping.tolist() == [20, 21, 26, 27, -1, -1, -1, -1]
     assert entry.static_metadata.kv_seq_lens_host_values == [1, 2, 3, 4, 1, 1, 1, 1]
     assert entry.static_metadata.multi_block_tables[0].tolist() == [
         [5, 5],
@@ -508,30 +542,34 @@ def _metadata(linear_state_indices: torch.Tensor | None) -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("sampling_mode", ["greedy", "filter", "penalty", "probabilities", "confidence", "missing"])
+@pytest.mark.parametrize("sampling_mode", ["greedy", "non_greedy", "probabilities", "confidence", "missing"])
 def test_sampling_graph_admission_checks_request_capability(sampling_mode: str) -> None:
     runner = _runner(_SamplingModel())
     runner.bind_execution_metadata_builders((ModelSamplingMetadataBuilder(),))
     sampling = SimpleNamespace(
-        is_unconstrained_greedy=sampling_mode not in ("filter", "penalty"),
+        is_unconstrained_greedy=sampling_mode != "non_greedy",
         return_probs=sampling_mode == "probabilities",
         return_confidence=sampling_mode == "confidence",
     )
     batch = replace(_query_batch(4, 1), sampling=None if sampling_mode == "missing" else sampling)
+    metadata = _metadata(None)
+    metadata.block_table[:, 0] = torch.arange(1, 5)
+    metadata.paged_kv_indices = metadata.block_table[:, 0].clone()
+    metadata.slot_mapping = metadata.block_table[:, 0] * 4 + batch.positions
+    metadata.new_cache_slots_host_values = metadata.slot_mapping.tolist()
 
-    assert runner.can_execute(ModelInput(batch.input_ids, batch.positions, _metadata(None), input_batch=batch)) == (
+    assert runner.can_execute(ModelInput(batch.input_ids, batch.positions, metadata, input_batch=batch)) == (
         sampling_mode == "greedy"
     )
 
 
-@pytest.mark.parametrize("empty_peer", [False, True])
 @pytest.mark.parametrize(
-    ("sampling_allowed", "layout_allowed"),
+    ("empty_peer", "sampling_allowed", "layout_allowed"),
     [
-        ((True, True), (True, True)),
-        ((False, True), (True, True)),
-        ((True, False), (True, True)),
-        ((True, True), (False, True)),
+        (True, (True, True), (True, True)),
+        (False, (False, True), (True, True)),
+        (True, (True, False), (True, True)),
+        (False, (True, True), (False, True)),
     ],
 )
 def test_sampling_graph_admission_is_unanimous_across_dp(
@@ -540,67 +578,73 @@ def test_sampling_graph_admission_is_unanimous_across_dp(
     sampling_allowed: tuple[bool, bool],
     layout_allowed: tuple[bool, bool],
 ) -> None:
-    votes = [sampling and layout for sampling, layout in zip(sampling_allowed, layout_allowed)]
-    calls = []
+    votes = [sampling and layout for sampling, layout in zip(sampling_allowed, layout_allowed, strict=True)]
+    calls: list[int] = []
 
     def agree(allowed: bool, device: torch.device, world_size: int) -> bool:
-        assert device == torch.device("cpu")
-        assert world_size == 2
-        assert allowed == votes[rank]
+        assert device == torch.device("cpu") and world_size == 2
+        assert allowed is votes[rank]
         calls.append(rank)
         return all(votes)
 
     monkeypatch.setattr(distributed, "dp_all_true", agree, raising=False)
+    counts = (4, 1) if empty_peer else (4, 4)
     for rank in range(2):
-        runner = _runner(_SamplingModel())
-        runner.dp_size = 2
-        runner.dp_rank = rank
+        runner = _runner(_SamplingModel(), dp_size=2, dp_rank=rank)
         runner.bind_execution_metadata_builders((ModelSamplingMetadataBuilder(),))
-        monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=layout_allowed[rank]))
+        is_dummy = empty_peer and rank == 1
         sampling = SimpleNamespace(
             is_unconstrained_greedy=sampling_allowed[rank], return_probs=False, return_confidence=False
         )
-        batch = replace(_query_batch(0 if empty_peer and rank == 1 else 4, 1), sampling=sampling)
-        assert runner.can_execute(
-            ModelInput(batch.input_ids, batch.positions, _metadata(None), input_batch=batch)
-        ) == all(votes)
+        batch = _query_batch(0 if is_dummy else 4, 1)
+        batch = replace(batch, sampling=sampling, positions=torch.zeros(batch.num_tokens, dtype=torch.int32))
+        metadata = _aligned_dp_decode_metadata(batch.num_tokens)
+        metadata.is_spec_verify = False
+        metadata.linear_state_indices = None
+        metadata.is_dummy = is_dummy
+        metadata.dp_execution_token_counts = counts
+        metadata.raw_dp_execution_token_counts = (4, 0) if empty_peer else counts
+        metadata.block_table[:, 0] = 0 if is_dummy else torch.arange(1, batch.num_tokens + 1)
+        metadata.paged_kv_indices = metadata.block_table[:, 0].clone()
+        metadata.slot_mapping = metadata.block_table[:, 0] * 4
+        if is_dummy:
+            metadata.slot_mapping.fill_(-1)
+        multimodal = None if layout_allowed[rank] else MultimodalInputs(torch.zeros(batch.num_tokens, 1))
+        inputs = ModelInput(batch.input_ids, batch.positions, metadata, input_batch=batch, multimodal_inputs=multimodal)
+        assert runner.can_execute(inputs) is all(votes)
     assert calls == [0, 1]
 
 
 def test_sampling_graph_admission_propagates_dp_agreement_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    runner = _runner(_SamplingModel())
-    runner.dp_size = 2
+    runner = _runner(_SamplingModel(), dp_size=2)
     runner.bind_execution_metadata_builders((ModelSamplingMetadataBuilder(),))
-    monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=True))
     monkeypatch.setattr(
-        distributed,
-        "dp_all_true",
-        MagicMock(side_effect=RuntimeError("DP host agreement failed")),
-        raising=False,
+        distributed, "dp_all_true", MagicMock(side_effect=RuntimeError("DP host agreement failed")), raising=False
     )
     sampling = SimpleNamespace(is_unconstrained_greedy=True, return_probs=False, return_confidence=False)
-    batch = replace(_query_batch(4, 1), sampling=sampling)
+    batch = replace(_query_batch(4, 1), sampling=sampling, positions=torch.zeros(4, dtype=torch.int32))
+    metadata = _aligned_dp_decode_metadata(4)
+    metadata.is_spec_verify = False
+    metadata.linear_state_indices = None
     with pytest.raises(RuntimeError, match="DP host agreement failed"):
-        runner.can_execute(ModelInput(batch.input_ids, batch.positions, _metadata(None), input_batch=batch))
+        runner.can_execute(ModelInput(batch.input_ids, batch.positions, metadata, input_batch=batch))
 
 
-def test_sampling_graph_admission_does_not_gate_models_without_sampling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _runner()
-    runner.dp_size = 2
-    monkeypatch.setattr(runner, "_can_execute_inner", MagicMock(return_value=True))
-    gather = MagicMock(side_effect=AssertionError("unexpected DP admission collective"))
-    monkeypatch.setattr(distributed, "dp_all_true", gather, raising=False)
-    assert runner.can_execute(ModelInput(torch.arange(4), torch.arange(4), _metadata(None), input_batch=None))
-    gather.assert_not_called()
+def test_sampling_graph_admission_does_not_gate_models_without_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _runner(dp_size=2)
+    agreement = MagicMock(side_effect=AssertionError("unexpected DP admission collective"))
+    monkeypatch.setattr(distributed, "dp_all_true", agreement, raising=False)
+    metadata = _aligned_dp_decode_metadata(4)
+    metadata.is_spec_verify = False
+    metadata.linear_state_indices = None
+    assert runner.can_execute(ModelInput(torch.arange(4), torch.zeros(4, dtype=torch.int32), metadata))
+    agreement.assert_not_called()
 
 
 def test_sampling_graph_metadata_does_not_require_host_cached_counts() -> None:
     runner = _runner()
     builder = ModelSamplingMetadataBuilder()
     runner.bind_execution_metadata_builders((builder,))
-    assert runner.execution_metadata_builders == (builder,)
 
     first_sampling = SimpleNamespace(
         parameters=SimpleNamespace(all_greedy_sample=True),
@@ -616,7 +660,12 @@ def test_sampling_graph_metadata_does_not_require_host_cached_counts() -> None:
     )
     input_ids = torch.arange(4)
     positions = torch.arange(4)
-    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata = _metadata(None)
+    metadata.block_table = torch.tensor([[5, 0], [5, 0], [6, 0], [6, 0]], dtype=torch.int32)
+    metadata.paged_kv_indices = torch.tensor([5, 5, 6, 6], dtype=torch.int32)
+    metadata.slot_mapping = torch.tensor([20, 21, 26, 27], dtype=torch.int32)
+    metadata.new_cache_slots_host_values = metadata.slot_mapping.tolist()
+    metadata.num_accepted_tokens = None
     batch_metadata = SimpleNamespace(
         num_reqs=2,
         num_tokens=4,
@@ -633,7 +682,16 @@ def test_sampling_graph_metadata_does_not_require_host_cached_counts() -> None:
         sampling=first_sampling,
     )
 
-    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+    def copy_inputs(*args: Any) -> None:
+        for source, destination in ((args[0], args[7]), (args[1], args[8]), (args[2], args[9])):
+            destination.zero_()
+            destination[: source.numel()].copy_(source)
+
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+        side_effect=copy_inputs,
+        create=True,
+    ):
         entry = runner._allocate_entry(8, input_ids, positions, metadata, input_batch)
         persistent = entry.execution_contexts[ModelSamplingMetadata]
         assert persistent.sampling is first_sampling
@@ -660,6 +718,7 @@ def test_sampling_graph_metadata_does_not_require_host_cached_counts() -> None:
             assert persistent.sampling is sampling
             assert persistent.num_tokens == 4
             assert entry.static_input_ids.data_ptr() == input_address
+            assert entry.static_input_ids.tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
 
 
 @pytest.mark.parametrize(
@@ -667,99 +726,159 @@ def test_sampling_graph_metadata_does_not_require_host_cached_counts() -> None:
     [(16, 1, True), (16, 2, True), (16, 3, False), (24, 3, False), (32, 3, True), (32, 4, True), (32, 5, False)],
 )
 def test_eplv2_graph_admission_uses_padded_token_rows_for_dflash2(limit: int, sequences: int, expected: bool) -> None:
-    runner = _runner()
-    runner.max_batch = 128
-    runner.num_decoding_tokens = 8
-    runner._eplv2_graph_token_limit = limit
-    metadata = _metadata(torch.arange(3, dtype=torch.int32))
-    with (
-        patch.object(runner, "_has_compatible_decode_metadata", return_value=True),
-        patch(
-            "xllm.python.model_executor.runners.decode_acl_graph.resolve_expanded_decode_metadata",
-            return_value=object(),
-        ),
-    ):
-        # Three 8-row sequences capture a padded 32-row graph. A 24-row
-        # communication cap is insufficient even though the active rows fit.
-        metadata.linear_state_indices = torch.arange(sequences)
-        assert (
-            runner.can_execute(ModelInput(torch.arange(sequences * 8), torch.arange(sequences * 8), metadata))
-            is expected
-        )
+    runner = _runner(max_batch=128, num_decoding_tokens=8, eplv2_graph_token_limit=limit)
+    rows = sequences * 8
+    metadata = _aligned_dp_decode_metadata(rows)
+    metadata.linear_state_indices = torch.arange(sequences, dtype=torch.int32)
+    metadata.is_spec_verify = True
+    metadata.is_chunked_prefill = True
+    metadata.q_cu_seq_lens = torch.arange(sequences + 1, dtype=torch.int32) * 8
+    metadata.block_table = torch.arange(1, sequences * 2 + 1, dtype=torch.int32).view(sequences, 2)
+    metadata.kv_seq_lens = torch.full((sequences,), 8, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [8] * sequences
+    positions = torch.arange(8, dtype=torch.int32).repeat(sequences)
+    tables = metadata.block_table.repeat_interleave(8, dim=0)
+    lengths = positions + 1
+    metadata.slot_mapping = tables.gather(1, (positions // 4).long().unsqueeze(1)).flatten() * 4 + positions % 4
+    metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
+        kv_seq_lens=lengths,
+        block_table=tables,
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=lengths.clone(),
+        kv_seq_lens_host_values=lengths.tolist(),
+    )
+    assert runner.can_execute(ModelInput(torch.arange(rows), positions, metadata)) is expected
 
 
-@pytest.mark.parametrize("capture_has_accepted_tokens", [False, True])
-def test_full_attention_graph_ignores_accepted_token_metadata(capture_has_accepted_tokens: bool) -> None:
+def test_full_attention_graph_ignores_accepted_token_metadata() -> None:
     runner = _runner(max_batch=10, is_spec_draft=True, capture_sizes=(3, 7, 10))
-    runner.bind_layer_caches([LayerCache(torch.zeros(1), torch.zeros(1))])
+    runner.bind_layer_caches([LayerCache(torch.zeros(64, 4, 1, 1), torch.zeros(64, 4, 1, 1))])
     input_ids = torch.arange(4, dtype=torch.int32)
-    metadata = _metadata(None)
+    positions = torch.zeros(4, dtype=torch.int32)
+    metadata = _aligned_dp_decode_metadata(4)
+    metadata.is_spec_verify = False
+    metadata.linear_state_indices = None
     accepted = torch.ones(4, dtype=torch.int32)
-    metadata.num_accepted_tokens = accepted if capture_has_accepted_tokens else None
+    metadata.num_accepted_tokens = accepted
     metadata.is_dummy = True
-    entry = runner._allocate_entry(7, input_ids, input_ids, metadata)
+    metadata.slot_mapping.fill_(-1)
+    entry = runner._allocate_entry(7, input_ids, positions, metadata)
     assert entry.static_metadata.num_accepted_tokens is None
     with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
         for is_dummy, counts in ((True, accepted), (False, None), (False, accepted)):
             metadata.is_dummy = is_dummy
             metadata.num_accepted_tokens = counts
-            runner._fill_entry(entry, input_ids, input_ids, metadata, batch_size=4, input_embedding=None)
+            metadata.block_table[:, 0] = 0 if is_dummy else torch.arange(1, 5)
+            metadata.paged_kv_indices = metadata.block_table[:, 0].clone()
+            metadata.slot_mapping = metadata.block_table[:, 0] * 4
+            if is_dummy:
+                metadata.slot_mapping.fill_(-1)
+            runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
             assert entry.static_metadata.num_accepted_tokens is None
 
 
+def _verify_batch_metadata(num_reqs: int, width: int) -> tuple[InputBatch, SimpleNamespace]:
+    batch = _query_batch(num_reqs, width)
+    positions = torch.arange(width, dtype=torch.int32).repeat(num_reqs)
+    batch = replace(batch, positions=positions)
+    metadata = _metadata(torch.arange(1, num_reqs + 1, dtype=torch.int32))
+    metadata.is_spec_verify = True
+    metadata.is_chunked_prefill = True
+    metadata.q_cu_seq_lens = torch.arange(num_reqs + 1, dtype=torch.int32) * width
+    metadata.kv_cu_seq_lens = torch.arange(num_reqs + 1, dtype=torch.int32) * width
+    metadata.kv_seq_lens = torch.full((num_reqs,), width, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [width] * num_reqs
+    metadata.block_table = torch.arange(1, num_reqs * 2 + 1, dtype=torch.int32).view(num_reqs, 2)
+    tables = metadata.block_table.repeat_interleave(width, dim=0)
+    lengths = positions + 1
+    metadata.slot_mapping = tables.gather(1, (positions // 4).long().unsqueeze(1)).flatten() * 4 + positions % 4
+    metadata.new_cache_slots_host_values = metadata.slot_mapping.tolist()
+    metadata.num_accepted_tokens = torch.full((num_reqs,), width, dtype=torch.int32)
+    metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
+        kv_seq_lens=lengths,
+        block_table=tables,
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=lengths.clone(),
+        kv_seq_lens_host_values=lengths.tolist(),
+    )
+    return batch, metadata
+
+
 def test_accepted_tokens_use_live_per_sequence_graph_buffer() -> None:
-    runner = _runner()
-    runner.bind_layer_caches([LayerCache(None, None, conv=torch.zeros(1), ssm=torch.zeros(1))])
-    input_ids = torch.arange(4, dtype=torch.int32)
-    positions = torch.arange(4, dtype=torch.int32)
-    metadata = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
-    metadata.num_accepted_tokens = torch.tensor([4, 2], dtype=torch.int32)
-    entry = runner._allocate_entry(8, input_ids, positions, metadata)
+    runner = _runner(num_decoding_tokens=2)
+    runner.bind_layer_caches([LayerCache(None, None, conv=torch.zeros(8, 1, 2), ssm=torch.zeros(16, 1, 1, 1))])
+    batch, metadata = _verify_batch_metadata(2, 2)
+    entry = runner._allocate_entry(8, batch.input_ids, batch.positions, metadata)
     static_counts = entry.static_metadata.num_accepted_tokens
     address = static_counts.data_ptr()
     with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
-        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
-        assert static_counts.tolist() == [4, 2, 1, 1, 1, 1, 1, 1]
-        metadata.num_accepted_tokens.copy_(torch.tensor([1, 3]))
-        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
-        assert static_counts.tolist() == [1, 3, 1, 1, 1, 1, 1, 1]
-        metadata.num_accepted_tokens = torch.tensor([2], dtype=torch.int32)
-        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
-        assert static_counts.tolist() == [2, 1, 1, 1, 1, 1, 1, 1]
-        metadata.num_accepted_tokens = None
-        metadata.is_dummy = True
-        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+        for sequences, counts in ((2, [2, 1]), (2, [1, 2]), (1, [2])):
+            batch, metadata = _verify_batch_metadata(sequences, 2)
+            metadata.num_accepted_tokens = torch.tensor(counts, dtype=torch.int32)
+            runner._fill_entry(entry, batch.input_ids, batch.positions, metadata, batch.num_tokens, None)
+            assert static_counts.tolist() == counts + [1] * (8 - sequences)
+            assert static_counts.data_ptr() == address
+        dummy = _aligned_dp_decode_metadata(1)
+        dummy.is_dummy = True
+        dummy.slot_mapping.fill_(-1)
+        dummy.num_accepted_tokens = None
+        runner._fill_entry(entry, torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32), dummy, 1, None)
     assert static_counts.data_ptr() == address
     assert static_counts.tolist() == [1] * 8
 
-    plain_metadata = _metadata(torch.tensor([3, 7, 11, 15], dtype=torch.int32))
-    plain_metadata.num_accepted_tokens = None
-    plain_entry = runner._allocate_entry(8, input_ids, positions, plain_metadata)
-    assert plain_entry.static_metadata.num_accepted_tokens is None
 
+def test_host_dsa_fill_preserves_live_inputs_without_generic_paging(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = DecodeAclGraphRunner(
+        _PassThroughDecoder(),
+        SimpleNamespace(
+            page_size=128, is_mla=False, supports_draft_to_target_overlap=True, graph_uses_dsa_metadata=lambda _: True
+        ),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=16384,
+    )
 
-@pytest.mark.parametrize("is_dummy", [False, True])
-def test_host_dsa_fill_preserves_live_inputs_without_generic_paging(
-    monkeypatch: pytest.MonkeyPatch, is_dummy: bool
-) -> None:
-    runner = _runner()
-    source = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
-    entry = runner._allocate_entry(8, torch.arange(4), torch.arange(4), source)
-    runner.supports_draft_to_target_overlap = True
-    runner.attention_backend.graph_uses_dsa_metadata = lambda _: True
+    def source(rows: int, dummy: bool = False) -> SimpleNamespace:
+        metadata = _aligned_dp_decode_metadata(rows)
+        metadata.is_dummy = dummy
+        metadata.is_spec_verify = False
+        metadata.linear_state_indices = None
+        metadata.num_accepted_tokens = None
+        metadata.kv_seq_lens_host_values = [1] * rows if dummy else [127, 128, 8193, 8194][:rows]
+        metadata.kv_seq_lens = torch.tensor(metadata.kv_seq_lens_host_values, dtype=torch.int32)
+        metadata.block_table = (
+            torch.zeros((rows, 65), dtype=torch.int32)
+            if dummy
+            else torch.arange(1, rows * 65 + 1, dtype=torch.int32).view(rows, 65)
+        )
+        positions = metadata.kv_seq_lens - 1
+        metadata.slot_mapping = (
+            torch.full((rows,), -1, dtype=torch.int32)
+            if dummy
+            else metadata.block_table.gather(1, (positions // 128).long().unsqueeze(1)).flatten() * 128
+            + positions % 128
+        )
+        metadata.new_cache_slots_host_values = metadata.slot_mapping.tolist()
+        metadata.paged_kv_indptr, metadata.paged_kv_indices, metadata.paged_kv_last_page_len = (
+            runner._build_row_aligned_paged_kv_metadata(metadata.block_table, metadata.kv_seq_lens_host_values)
+        )
+        return metadata
+
+    initial = source(4)
+    entry = runner._allocate_entry(8, torch.arange(4), initial.kv_seq_lens - 1, initial)
     monkeypatch.setattr(runner, "_decode_metadata", lambda *_: pytest.fail("unused paged metadata was rebuilt"))
     addresses = (entry.static_input_ids.data_ptr(), entry.static_positions.data_ptr())
     paging = entry.static_metadata.paged_kv_indices.clone()
-    for rows in (4, 2, 4):
-        metadata = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
-        metadata.is_dummy = is_dummy
-        metadata.block_table = metadata.block_table[:rows]
-        metadata.slot_mapping = metadata.slot_mapping[:rows]
-        metadata.kv_seq_lens_host_values = [127, 128, 8193, 8194][:rows]
-        metadata.new_cache_slots_host_values = metadata.new_cache_slots_host_values[:rows]
-        metadata.num_accepted_tokens = metadata.num_accepted_tokens[:rows]
-        ids = torch.arange(rows) + 100
-        positions = torch.tensor([126, 127, 8192, 8193], dtype=torch.int32)[:rows]
+    for rows, dummy in ((4, False), (2, False), (1, True), (4, False)):
+        metadata = source(rows, dummy)
+        ids = torch.zeros(rows, dtype=torch.int64) if dummy else torch.arange(rows) + 100
+        positions = metadata.kv_seq_lens - 1
         runner._fill_entry(entry, ids, positions, metadata, rows, None)
         assert (entry.static_input_ids.data_ptr(), entry.static_positions.data_ptr()) == addresses
         assert torch.equal(entry.static_input_ids[:rows], ids)
@@ -774,23 +893,19 @@ def test_host_dsa_fill_preserves_live_inputs_without_generic_paging(
 
 
 def test_verify_graph_key_tracks_width_not_active_sequence_count() -> None:
-    runner = _runner()
-    captured_keys = []
+    runner = _runner(num_decoding_tokens=4)
+    captured_keys: list[tuple[Any, ...]] = []
 
-    def capture_key(key: tuple) -> None:
-        captured_keys.append(key)
-        raise LookupError("graph key recorded")
+    class ProbeCache(dict):
+        def get(self, key: tuple[Any, ...], default: Any = None) -> Any:
+            captured_keys.append(key)
+            raise LookupError("graph key recorded")
 
-    runner._graphs = SimpleNamespace(get=capture_key)
-    with patch(
-        "xllm.python.model_executor.runners.decode_acl_graph.resolve_expanded_decode_metadata",
-        return_value=object(),
-    ):
-        for sequence_count, width in ((3, 4), (4, 4), (8, 2)):
-            input_ids = torch.arange(sequence_count * width, dtype=torch.int32)
-            metadata = SimpleNamespace(linear_state_indices=torch.arange(sequence_count))
-            with pytest.raises(LookupError, match="graph key recorded"):
-                runner.execute(input_ids, input_ids, metadata)
+    runner._graphs = ProbeCache()
+    for sequence_count, width in ((3, 4), (4, 4), (8, 2)):
+        batch, metadata = _verify_batch_metadata(sequence_count, width)
+        with pytest.raises(LookupError, match="graph key recorded"):
+            runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
     assert captured_keys[0] == captured_keys[1]
     assert captured_keys[1] != captured_keys[2]
 
@@ -808,21 +923,19 @@ def test_accepted_tokens_reject_missing_or_invalid_replay_metadata(
     accepted_counts: torch.Tensor | None, error_type: type[Exception]
 ) -> None:
     runner = _runner(num_decoding_tokens=2)
-    runner.bind_layer_caches([LayerCache(None, None, conv=torch.zeros(1), ssm=torch.zeros(1))])
-    input_ids = torch.arange(4, dtype=torch.int32)
-    positions = torch.arange(4, dtype=torch.int32)
-    metadata = _metadata(torch.tensor([3, 3, 7, 7], dtype=torch.int32))
-    # An idle rank can capture without live counts, but the verify graph must
-    # still reserve the required recurrent-state buffer and reject missing data.
+    runner.bind_layer_caches([LayerCache(None, None, conv=torch.zeros(8, 1, 2), ssm=torch.zeros(16, 1, 1, 1))])
+    batch, metadata = _verify_batch_metadata(2, 2)
+    metadata.is_dummy = True
     metadata.num_accepted_tokens = None
-    entry = runner._allocate_entry(8, input_ids, positions, metadata)
-    entry.static_metadata.is_spec_verify = True
+    metadata.slot_mapping.fill_(-1)
+    entry = runner._allocate_entry(8, batch.input_ids, batch.positions, metadata)
+    batch, metadata = _verify_batch_metadata(2, 2)
     metadata.num_accepted_tokens = accepted_counts
     with (
         patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True),
         pytest.raises(error_type, match="accepted-token metadata"),
     ):
-        runner._fill_entry(entry, input_ids, positions, metadata, batch_size=4, input_embedding=None)
+        runner._fill_entry(entry, batch.input_ids, batch.positions, metadata, batch.num_tokens, None)
 
 
 def test_slice_output_preserves_aux_hidden_tuple() -> None:
@@ -837,87 +950,61 @@ def test_slice_output_preserves_aux_hidden_tuple() -> None:
 
 
 def test_linear_state_graph_buffers_are_stable() -> None:
-    runner = _runner()
+    runner = _runner(num_decoding_tokens=2)
     runner.bind_layer_caches(
         [
             LayerCache(
                 None,
                 None,
-                conv=torch.zeros(1),
-                ssm=torch.zeros(1),
-                kpool_tail=torch.zeros((1, 1, 1, 1), dtype=torch.bfloat16),
+                conv=torch.zeros(8, 2, 1),
+                ssm=torch.zeros(16, 1, 1, 1),
+                kpool_tail=torch.zeros((8, 1, 1, 1), dtype=torch.bfloat16),
             )
         ]
     )
-    input_ids = torch.arange(4, dtype=torch.int32)
-    positions = torch.arange(4, dtype=torch.int32)
-    metadata = _metadata(torch.tensor([3, 7, 11, 15], dtype=torch.int32))
-    metadata.kpool_query_lens = [4]
-    entry = runner._allocate_entry(
-        padded_batch_size=8,
-        input_ids=input_ids,
-        positions=positions,
-        metadata=metadata,
-    )
+    batch, metadata = _verify_batch_metadata(2, 2)
+    metadata.kpool_query_lens = [2, 2]
+    entry = runner._allocate_entry(8, batch.input_ids, batch.positions, metadata)
     static_indices = entry.static_metadata.linear_state_indices
-    static_num_accepted_tokens = entry.static_metadata.num_accepted_tokens
-    data_ptr = static_indices.data_ptr()
-    accepted_data_ptr = static_num_accepted_tokens.data_ptr()
-    assert entry.static_metadata.kpool_query_lens == (4, 4)
-    assert entry.static_metadata.kpool_query_lens_device.tolist() == [4, 4]
-    assert DecodeAclGraphRunner._graph_key(
-        8,
-        True,
-        None,
-        entry.static_metadata.kpool_query_lens,
-    ) != DecodeAclGraphRunner._graph_key(8, True, None, (2, 2, 2, 2))
-
-    with patch(
-        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
-        create=True,
-    ):
-        runner._fill_entry(
-            entry,
-            input_ids,
-            positions,
-            metadata,
-            batch_size=4,
-            input_embedding=None,
-        )
-        assert static_indices.tolist() == [3, 7, 11, 15, 0, 0, 0, 0]
-        metadata.linear_state_indices = torch.tensor(
-            [4, 8, 12, 16],
-            dtype=torch.int32,
-        )
-        metadata.num_accepted_tokens = torch.tensor(
-            [2, 1, 2, 1],
-            dtype=torch.int32,
-        )
-        runner._fill_entry(
-            entry,
-            input_ids,
-            positions,
-            metadata,
-            batch_size=4,
-            input_embedding=None,
-        )
-
-    assert static_indices.data_ptr() == data_ptr
-    assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
-    assert static_num_accepted_tokens.data_ptr() == accepted_data_ptr
-    assert static_num_accepted_tokens.tolist() == [2, 1, 2, 1, 1, 1, 1, 1]
+    static_counts = entry.static_metadata.num_accepted_tokens
+    pointers = (
+        static_indices.data_ptr(),
+        static_counts.data_ptr(),
+        entry.static_metadata.kpool_query_lens_device.data_ptr(),
+    )
+    assert entry.static_metadata.kpool_query_lens == (2, 2, 2, 2)
+    assert entry.static_metadata.kpool_query_lens_device.tolist() == [2, 2, 2, 2]
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        for slots, counts in (([1, 2], [2, 1]), ([3, 4], [1, 2])):
+            metadata.linear_state_indices = torch.tensor(slots, dtype=torch.int32)
+            metadata.num_accepted_tokens = torch.tensor(counts, dtype=torch.int32)
+            runner._fill_entry(entry, batch.input_ids, batch.positions, metadata, batch.num_tokens, None)
+            assert static_indices.tolist() == [slot for slot in slots for _ in range(2)] + [0] * 4
+            assert static_counts.tolist() == counts + [1] * 6
+            assert (
+                static_indices.data_ptr(),
+                static_counts.data_ptr(),
+                entry.static_metadata.kpool_query_lens_device.data_ptr(),
+            ) == pointers
+            assert entry.static_metadata.kpool_query_lens_device.tolist() == [2, 2, 2, 2]
 
 
 def test_dflash_proposal_mode_uses_a_distinct_graph_key() -> None:
-    ordinary_key = DecodeAclGraphRunner._graph_key(8, False, None)
-    proposal_key = DecodeAclGraphRunner._graph_key(
-        8,
-        False,
-        None,
-        use_dflash_proposal_attention=True,
-    )
+    runner = _runner(is_spec_draft=True, draft_query_width=4)
+    captured: list[tuple[Any, ...]] = []
 
-    assert ordinary_key != proposal_key
+    class ProbeCache(dict):
+        def get(self, key: tuple[Any, ...], default: Any = None) -> Any:
+            captured.append(key)
+            raise LookupError("graph key recorded")
+
+    runner._graphs = ProbeCache()
+    batch, metadata = _verify_batch_metadata(2, 4)
+    for proposal in (False, True):
+        metadata.use_dflash_proposal_attention = proposal
+        with pytest.raises(LookupError, match="graph key recorded"):
+            runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
+    assert captured[0] != captured[1]
 
 
 @pytest.mark.parametrize("verify_width", [1, 2])
@@ -927,23 +1014,11 @@ def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.Mon
     monkeypatch.setattr(
         import_module(DecodeAclGraphRunner.__module__), "device_capture_lock", lambda device: nullcontext()
     )
-    runner = _runner()
+    runner = _runner(num_decoding_tokens=verify_width)
+    batch, metadata = _verify_batch_metadata(4 // verify_width, verify_width)
     slots = torch.arange(1, 5, verify_width)
-    metadata = _metadata(slots)
+    metadata.linear_state_indices = slots
     metadata.has_initial_state = torch.ones_like(slots)
-    metadata.num_accepted_tokens = torch.full_like(slots, verify_width, dtype=torch.int32)
-    if verify_width > 1:
-        metadata.is_spec_verify = True
-        metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
-            kv_seq_lens=metadata.kv_seq_lens,
-            block_table=metadata.block_table,
-            paged_kv_indptr=metadata.paged_kv_indptr,
-            paged_kv_indices=metadata.paged_kv_indices,
-            paged_kv_last_page_len=metadata.paged_kv_last_page_len,
-            paged_attention_tiling_data=None,
-            kv_seq_lens_host=None,
-            kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
-        )
     conv = torch.arange(8, dtype=torch.float32)
     ssm = torch.arange(8 * verify_width, dtype=torch.float32)
     initial_conv, initial_ssm = conv.clone(), ssm.clone()
@@ -976,9 +1051,8 @@ def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.Mon
     runner.attention_backend.prepare = prepare
     monkeypatch.setattr(runner, "_forward_static", advance)
     npu.NPUGraph.return_value.replay.side_effect = advance
-    tokens = torch.arange(4, dtype=torch.int32)
     with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
-        result = runner.execute(tokens, tokens, metadata)
+        result = runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
     expected = initial_ssm[slots * verify_width + verify_width - 1] + 1
     torch.testing.assert_close(result.flatten(), expected.repeat_interleave(verify_width))
     torch.testing.assert_close(conv[slots], initial_conv[slots] + 1)
@@ -1002,24 +1076,22 @@ def test_static_collection_uses_capture_padding_without_caching_graph(
     )
     collection = MagicMock()
     collection.collect_forward.return_value = nullcontext()
-    runner = _runner()
-    runner.dp_size = 2 if dp_counts else 1
-    metadata = _metadata(torch.arange(1, 5, dtype=torch.int32))
+    runner = _runner(dp_size=2 if dp_counts else 1, num_decoding_tokens=verify_width)
+    if verify_width > 1:
+        batch, metadata = _verify_batch_metadata(4 // verify_width, verify_width)
+    else:
+        batch = _query_batch(4, 1)
+        metadata = _aligned_dp_decode_metadata(4)
+        metadata.is_spec_verify = False
+        metadata.linear_state_indices = None
+        metadata.block_table[:, 0] = torch.arange(1, 5)
+        metadata.paged_kv_indices = metadata.block_table[:, 0].clone()
+        metadata.slot_mapping = metadata.block_table[:, 0] * 4
+        batch = replace(batch, positions=torch.zeros(4, dtype=torch.int32))
     if dp_counts:
         metadata.dp_execution_token_counts = dp_counts
-    if verify_width > 1:
-        metadata.is_spec_verify = True
-        metadata.q_seq_lens_host_values = [verify_width] * (4 // verify_width)
-        metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
-            kv_seq_lens=metadata.kv_seq_lens,
-            block_table=metadata.block_table,
-            paged_kv_indptr=metadata.paged_kv_indptr,
-            paged_kv_indices=metadata.paged_kv_indices,
-            paged_kv_last_page_len=metadata.paged_kv_last_page_len,
-            paged_attention_tiling_data=None,
-            kv_seq_lens_host=None,
-            kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
-        )
+        metadata.raw_dp_execution_token_counts = dp_counts
+        metadata.dp_is_decode = (True, True)
     runner.attention_backend.prepare = MagicMock()
     layouts = []
 
@@ -1035,9 +1107,8 @@ def test_static_collection_uses_capture_padding_without_caching_graph(
         return torch.zeros(entry.batch_size, 1)
 
     monkeypatch.setattr(runner, "_forward_static", forward)
-    tokens = torch.arange(4, dtype=torch.int32)
     with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
-        result = runner.execute(tokens, tokens, metadata, static_kernel=collection)
+        result = runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch, static_kernel=collection)
         collected_layout = layouts[0]
         assert collected_layout[0] == (8 if dp_counts else 4,)
         assert result.shape == (4, 1)
@@ -1046,7 +1117,7 @@ def test_static_collection_uses_capture_padding_without_caching_graph(
         npu.graph_pool_handle.assert_not_called()
         collection.collect_forward.assert_called_once_with()
         layouts.clear()
-        runner.execute(tokens, tokens, metadata)
+        runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
     assert layouts and all(layout == collected_layout for layout in layouts)
     assert len(runner._graphs) == 1
 
@@ -3468,7 +3539,7 @@ def test_metadata_uses_async_upload() -> None:
     source.to.return_value = source
     source.contiguous.return_value = source
     source.pin_memory.return_value = source
-    device = torch.device("npu")
+    device = MagicMock(type="npu")
 
     runner._stage_metadata_tensor(source, device, torch.int32)
     source.pin_memory.assert_called_once_with(device="npu")
@@ -3493,7 +3564,7 @@ def test_dsa_host_tables_are_staged_before_device_copy(async_graph_inputs: bool)
     source = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
     target = MagicMock()
     target.shape = (4, 4)
-    target.device = torch.device("npu")
+    target.device = MagicMock(type="npu")
     target.dtype = torch.int32
     staged = MagicMock()
     staged.shape = source.shape

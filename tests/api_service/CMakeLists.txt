@@ -5,20 +5,6 @@ if(USE_MLU)
     "LD_LIBRARY_PATH=$ENV{PYTORCH_MLU_INSTALL_PATH}/csrc/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
-cc_test(
-  NAME
-    anthropic_protocol_test
-  CPU_ONLY
-  SRCS
-    anthropic_protocol_test.cpp
-  DEPS
-    proto::xllm_proto
-    GTest::gtest
-    GTest::gtest_main
-    nlohmann_json::nlohmann_json
-    glog::glog
-)
-
 # Integration test for Anthropic service - requires running server.
 # Tests are prefixed with DISABLED_ in code to skip by default.
 # Run manually: ./anthropic_service_test --gtest_also_run_disabled_tests

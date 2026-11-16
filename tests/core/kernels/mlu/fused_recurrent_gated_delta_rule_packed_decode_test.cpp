@@ -14,11 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include <framework/core/device.h>
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -59,76 +57,34 @@ class FusedRecurrentGdrPackedDecodeJitTest : public ::testing::Test {
   torch::Device device() { return torch::Device(torch::kPrivateUse1, 0); }
 };
 
-TEST_F(FusedRecurrentGdrPackedDecodeJitTest, SecondCallHitsCache) {
-  torch::DeviceGuard guard(device());
-  int32_t H = 8;
-  int32_t HV = 8;
-  int32_t K = 128;
-  int32_t V = 128;
-  int32_t batch = 4;
-  int32_t qkv_dim = 2 * H * K + HV * V;
-  double scale = 1.0 / std::sqrt(static_cast<double>(K));
-
-  torch::Tensor mixed_qkv = bf16_randn({batch, qkv_dim}, device());
-  torch::Tensor a = bf16_randn({batch, HV}, device());
-  torch::Tensor b = bf16_randn({batch, HV}, device());
-  torch::Tensor a_log = bf16_randn({HV}, device());
-  torch::Tensor dt_bias = torch::ones(
-      {HV}, torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
-  torch::Tensor ssm_orig = fp32_randn({batch, HV, V, K}, device());
-  torch::Tensor ssm_state_indices = torch::arange(
-      0, batch, torch::TensorOptions().dtype(torch::kInt32).device(device()));
-
-  torch::Tensor sc1 = ssm_orig.clone();
-  torch::Tensor sc2 = ssm_orig.clone();
-
-  auto t0 = std::chrono::steady_clock::now();
-  auto [out1, state1] =
-      fused_recurrent_gated_delta_rule_packed_decode(mixed_qkv,
-                                                     a,
-                                                     b,
-                                                     a_log,
-                                                     dt_bias,
-                                                     scale,
-                                                     sc1,
-                                                     ssm_state_indices,
-                                                     /*l2norm=*/true);
-  torch_mlu::synchronize();
-  auto t1 = std::chrono::steady_clock::now();
-  auto [out2, state2] = fused_recurrent_gated_delta_rule_packed_decode(
-      mixed_qkv, a, b, a_log, dt_bias, scale, sc2, ssm_state_indices, true);
-  torch_mlu::synchronize();
-  auto t2 = std::chrono::steady_clock::now();
-
-  int64_t first_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-  int64_t second_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-  LOG(INFO) << "first call (compile+launch): " << first_ms
-            << "ms; second call (cached): " << second_ms << "ms";
-  EXPECT_TRUE(tensors_allclose(out1, out2, /*rtol=*/1e-3, /*atol=*/1e-3))
-      << "output mismatch";
-  EXPECT_TRUE(tensors_allclose(state1, state2, /*rtol=*/1e-3, /*atol=*/1e-3))
-      << "ssm_cache mismatch";
-}
-
 TEST_F(FusedRecurrentGdrPackedDecodeJitTest, SupportsNoL2Norm) {
   torch::DeviceGuard guard(device());
-  int32_t H = 8;
-  int32_t HV = 8;
-  int32_t K = 128;
-  int32_t V = 128;
+  int32_t key_heads = 8;
+  int32_t value_heads = 8;
+  int32_t key_dim = 128;
+  int32_t value_dim = 128;
   int32_t batch = 2;
-  int32_t qkv_dim = 2 * H * K + HV * V;
-  double scale = 1.0 / std::sqrt(static_cast<double>(K));
+  int32_t qkv_dim = 2 * key_heads * key_dim + value_heads * value_dim;
+  double scale = 1.0 / std::sqrt(static_cast<double>(key_dim));
 
-  torch::Tensor mixed_qkv = bf16_randn({batch, qkv_dim}, device());
-  torch::Tensor a = bf16_randn({batch, HV}, device());
-  torch::Tensor b = bf16_randn({batch, HV}, device());
-  torch::Tensor a_log = bf16_randn({HV}, device());
-  torch::Tensor dt_bias = torch::ones(
-      {HV}, torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
-  torch::Tensor ssm_cache = fp32_randn({batch, HV, V, K}, device());
+  torch::Tensor mixed_qkv = torch::ones(
+      {batch, qkv_dim},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
+  torch::Tensor a = torch::zeros(
+      {batch, value_heads},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
+  torch::Tensor b = torch::zeros(
+      {batch, value_heads},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
+  torch::Tensor a_log = torch::zeros(
+      {value_heads},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
+  torch::Tensor dt_bias = torch::zeros(
+      {value_heads},
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
+  torch::Tensor ssm_cache = torch::zeros(
+      {batch, value_heads, value_dim, key_dim},
+      torch::TensorOptions().dtype(torch::kFloat32).device(device()));
   torch::Tensor ssm_state_indices = torch::arange(
       0, batch, torch::TensorOptions().dtype(torch::kInt32).device(device()));
 
@@ -143,8 +99,15 @@ TEST_F(FusedRecurrentGdrPackedDecodeJitTest, SupportsNoL2Norm) {
                                                      ssm_state_indices,
                                                      /*l2norm=*/false);
   torch_mlu::synchronize();
-  EXPECT_TRUE(torch::isfinite(out.to(torch::kFloat32)).all().item<bool>());
-  EXPECT_TRUE(torch::isfinite(state.to(torch::kFloat32)).all().item<bool>());
+  // With unnormalized q=k=v=1 and beta=0.5, each selected state is0.5
+  // and output is0.5*head_k_dim*scale. Accidental L2 normalization fails.
+  EXPECT_TRUE(torch::allclose(out,
+                              torch::full_like(out, 64.0 * scale),
+                              /*rtol=*/1e-3,
+                              /*atol=*/1e-3));
+  torch::Tensor expected_state = torch::zeros_like(state);
+  expected_state.index_fill_(0, ssm_state_indices.to(torch::kInt64), 0.5);
+  EXPECT_TRUE(torch::equal(state, expected_state));
 }
 
 TEST_F(FusedRecurrentGdrPackedDecodeJitTest,

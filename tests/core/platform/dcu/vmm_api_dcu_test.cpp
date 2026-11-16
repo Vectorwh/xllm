@@ -45,9 +45,12 @@ void PrepareDcuDeviceOrSkip() {
 }
 
 // get_recommended_granularity()
-TEST(VmmApiDcuTest, RecommendedGranularityMatchesHipRuntime) {
-  PrepareDcuDeviceOrSkip();
+class VmmApiDcuTest : public ::testing::Test {
+ protected:
+  void SetUp() override { PrepareDcuDeviceOrSkip(); }
+};
 
+TEST_F(VmmApiDcuTest, RecommendedGranularityMatchesHipRuntime) {
   hipMemAllocationProp prop = {};
   prop.type = hipMemAllocationTypePinned;
   prop.location.type = hipMemLocationTypeDevice;
@@ -67,40 +70,11 @@ TEST(VmmApiDcuTest, RecommendedGranularityMatchesHipRuntime) {
 }
 
 // create_phy_mem_handle() release_phy_mem_handle()
-TEST(VmmApiDcuTest, CanCreateAndReleasePhysicalMemoryHandle) {
-  PrepareDcuDeviceOrSkip();
-
-  const std::size_t granularity =
-      xllm::vmm::get_recommended_granularity(kDeviceId);
-
-  xllm::PhyMemHandle handle{};
-  xllm::vmm::create_phy_mem_handle(handle, kDeviceId);
-
-  EXPECT_EQ(
-      static_cast<std::size_t>(
-          xllm::KVCacheConfig::get_instance().phy_page_granularity_size()),
-      granularity);
-
-  xllm::vmm::release_phy_mem_handle(handle);
-}
 
 // create_vir_ptr()
-TEST(VmmApiDcuTest, CanReserveAndReleaseVirtualAddressRange) {
-  PrepareDcuDeviceOrSkip();
-
-  const std::size_t granularity =
-      xllm::vmm::get_recommended_granularity(kDeviceId);
-
-  xllm::VirPtr vir_ptr = xllm::uintptr_to_vir_ptr(0);
-  xllm::vmm::create_vir_ptr(vir_ptr, granularity * 2);
-
-  EXPECT_FALSE(xllm::is_null_vir_ptr(vir_ptr));
-
-  xllm::vmm::release_vir_ptr(vir_ptr, granularity * 2);
-}
 
 // uintptr_to_vir_ptr() add_vir_ptr_offset() vir_ptr_to_void_ptr()
-TEST(VmmApiDcuTest, VirPtrHelpersWork) {
+TEST(VmmApiHostTest, VirPtrHelpersWork) {
   constexpr uintptr_t kBase = 0x100000;
   constexpr std::size_t kOffset = 0x234;
   constexpr std::size_t kOffset1 = 0x100;
@@ -132,9 +106,7 @@ TEST(VmmApiDcuTest, VirPtrHelpersWork) {
   EXPECT_TRUE(xllm::is_null_vir_ptr(xllm::add_vir_ptr_offset(null_ptr, 0)));
 }
 
-TEST(VmmApiDcuTest, CanMapAndAccessMemoryWithExplicitGranularityOverload) {
-  PrepareDcuDeviceOrSkip();
-
+TEST_F(VmmApiDcuTest, CanMapAndAccessMemoryWithExplicitGranularityOverload) {
   const std::size_t granularity =
       xllm::vmm::get_recommended_granularity(kDeviceId);
 
@@ -170,9 +142,7 @@ TEST(VmmApiDcuTest, CanMapAndAccessMemoryWithExplicitGranularityOverload) {
   }
 }
 
-TEST(VmmApiDcuTest, CanMapAndAccessMemoryWithDefaultGranularityOverload) {
-  PrepareDcuDeviceOrSkip();
-
+TEST_F(VmmApiDcuTest, CanMapAndAccessMemoryWithDefaultGranularityOverload) {
   const std::size_t granularity =
       xllm::vmm::get_recommended_granularity(kDeviceId);
 
@@ -210,9 +180,7 @@ TEST(VmmApiDcuTest, CanMapAndAccessMemoryWithDefaultGranularityOverload) {
   }
 }
 
-TEST(VmmApiDcuTest, CanMapTwoDifferentVirtualRangesIndependently) {
-  PrepareDcuDeviceOrSkip();
-
+TEST_F(VmmApiDcuTest, CanMapTwoDifferentVirtualRangesIndependently) {
   const std::size_t granularity =
       xllm::vmm::get_recommended_granularity(kDeviceId);
 
@@ -265,9 +233,7 @@ TEST(VmmApiDcuTest, CanMapTwoDifferentVirtualRangesIndependently) {
   }
 }
 
-TEST(VmmApiDcuTest, CanAliasTwoVirtualRangesToSamePhysicalHandle) {
-  PrepareDcuDeviceOrSkip();
-
+TEST_F(VmmApiDcuTest, CanAliasTwoVirtualRangesToSamePhysicalHandle) {
   const std::size_t granularity =
       xllm::vmm::get_recommended_granularity(kDeviceId);
 
@@ -309,13 +275,11 @@ TEST(VmmApiDcuTest, CanAliasTwoVirtualRangesToSamePhysicalHandle) {
 
   for (std::size_t i = 0; i < host1.size(); ++i) {
     EXPECT_EQ(host1[i], 0x3C) << "Mismatch in range 1 at byte " << i;
-    // EXPECT_EQ(host2[i], 0x3C) << "Mismatch in range 2 at byte " << i;
+    EXPECT_EQ(host2[i], 0x3C) << "Mismatch in range 2 at byte " << i;
   }
 }
 
-TEST(VmmApiDcuTest, CanRemapSameVirtualRangeToNewPhysicalHandleAfterUnmap) {
-  PrepareDcuDeviceOrSkip();
-
+TEST_F(VmmApiDcuTest, CanRemapSameVirtualRangeToNewPhysicalHandleAfterUnmap) {
   const std::size_t granularity =
       xllm::vmm::get_recommended_granularity(kDeviceId);
 

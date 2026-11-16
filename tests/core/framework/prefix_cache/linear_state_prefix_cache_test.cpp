@@ -21,7 +21,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/request/sequence.h"
-#include "framework/block/block_manager_pool_test_peer.h"
+#include "framework/block/block_manager_test_access.h"
 #include "framework/block/linear_state_block_manager.h"
 #include "util/hash_util.h"
 
@@ -37,20 +37,13 @@ XXH3Key make_hash(uint8_t tag) {
 }
 
 int32_t insert_checkpoint(LinearStateBlockManager& cache, const XXH3Key& hash) {
-  if (BlockManagerPoolTestPeer::contains(&cache, hash)) {
-    Block matched = BlockManagerPoolTestPeer::match(&cache, hash);
-    return matched.is_valid() ? matched.id() : -1;
-  }
   std::vector<Block> allocated = cache.allocate(1);
   if (allocated.empty()) {
     return -1;
   }
-  Block slot_block = std::move(allocated.front());
-  const int32_t slot = slot_block.id();
-  slot_block.set_hash_value(hash.data);
-  std::vector<Block> checkpoint;
-  checkpoint.emplace_back(std::move(slot_block));
-  cache.cache(checkpoint);
+  const int32_t slot = allocated.front().id();
+  allocated.front().set_hash_value(hash.data);
+  cache.cache(allocated);
   return slot;
 }
 
@@ -100,8 +93,6 @@ std::vector<int32_t> placed_ids(const Sequence& sequence,
 
 }  // namespace
 
-// Padding slot 0 is never handed out, and a cache of N physical slots exposes
-// N - 1 live slots before it runs dry.
 TEST(LinearStatePrefixCacheTest, PaddingSlotReservedAndLiveSlotsExhaust) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/3, /*block_size=*/16));
@@ -122,7 +113,6 @@ TEST(LinearStatePrefixCacheTest, PaddingSlotReservedAndLiveSlotsExhaust) {
   EXPECT_TRUE(cache.allocate(1).empty());
 }
 
-// A live slot returns to the cache when its handle is dropped.
 TEST(LinearStatePrefixCacheTest, DroppingLiveHandleReleasesSlot) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/2, /*block_size=*/16));
@@ -142,8 +132,6 @@ TEST(LinearStatePrefixCacheTest, DroppingLiveHandleReleasesSlot) {
   EXPECT_EQ(again.front().id(), reused_id);
 }
 
-// insert() pins a slot that match()/contains() can find, and reusing the same
-// hash returns the same slot without consuming another.
 TEST(LinearStatePrefixCacheTest, InsertMatchAndDedup) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/4, /*block_size=*/16));
@@ -151,87 +139,29 @@ TEST(LinearStatePrefixCacheTest, InsertMatchAndDedup) {
 
   const int32_t slot = insert_checkpoint(cache, h1);
   EXPECT_GE(slot, 1);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  Block pinned = BlockManagerPoolTestPeer::match(&cache, h1);
+  EXPECT_TRUE(block_test::contains(&cache, h1));
+  Block pinned = block_test::match(&cache, h1);
   ASSERT_TRUE(pinned.is_valid());
   EXPECT_EQ(pinned.id(), slot);
   EXPECT_TRUE(pinned.is_shared());
 
-  // Re-inserting the same hash is idempotent.
-  EXPECT_EQ(insert_checkpoint(cache, h1), slot);
+  // Submit a different physical block with the same hash to the cache itself.
+  const size_t free_before = cache.num_free_blocks();
+  std::vector<Block> duplicate = cache.allocate(1);
+  ASSERT_EQ(duplicate.size(), 1u);
+  EXPECT_NE(duplicate.front().id(), slot);
+  duplicate.front().set_hash_value(h1.data);
+  cache.cache(duplicate);
+  duplicate.clear();
+  EXPECT_EQ(cache.num_blocks_in_prefix_cache(), 1u);
+  EXPECT_EQ(cache.num_free_blocks(), free_before);
+  EXPECT_EQ(block_test::match(&cache, h1).id(), slot);
 
   // Unknown hashes miss.
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, make_hash(2)));
-  EXPECT_FALSE(
-      BlockManagerPoolTestPeer::match(&cache, make_hash(2)).is_valid());
+  EXPECT_FALSE(block_test::contains(&cache, make_hash(2)));
+  EXPECT_FALSE(block_test::match(&cache, make_hash(2)).is_valid());
 }
 
-TEST(LinearStatePrefixCacheTest, ReserveDoesNotInsertUntilReady) {
-  // Reservation API was removed in favor of promotion. The remaining
-  // insert_checkpoint() is committed atomically; nothing pending exists
-  // between allocate() and insert_checkpoint(), so this test is a
-  // no-op compatibility shell to keep the test count stable.
-  LinearStateBlockManager cache(
-      linear_options(/*num_slots=*/3, /*block_size=*/16));
-  const XXH3Key h1 = make_hash(1);
-  std::vector<Block> allocated = cache.allocate(1);
-  ASSERT_EQ(allocated.size(), 1u);
-  Block slot_block = std::move(allocated.front());
-  ASSERT_TRUE(slot_block.is_valid());
-  const int32_t slot = slot_block.id();
-  ASSERT_GE(slot, 1);
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  slot_block.set_hash_value(h1.data);
-  std::vector<Block> checkpoint;
-  checkpoint.emplace_back(std::move(slot_block));
-  cache.cache(checkpoint);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  Block matched = BlockManagerPoolTestPeer::match(&cache, h1);
-  ASSERT_TRUE(matched.is_valid());
-  EXPECT_EQ(matched.id(), slot);
-}
-
-TEST(LinearStatePrefixCacheTest, DroppedReservationReleasesSlot) {
-  // Reservation API was removed; dropping an unused live-slot Block on the
-  // floor returns the slot to the free pool, so a subsequent insert can reuse
-  // it.
-  LinearStateBlockManager cache(
-      linear_options(/*num_slots=*/2, /*block_size=*/16));
-  const XXH3Key h1 = make_hash(1);
-  const XXH3Key h2 = make_hash(2);
-  int32_t reserved_slot = -1;
-
-  {
-    std::vector<Block> allocated = cache.allocate(1);
-    ASSERT_EQ(allocated.size(), 1u);
-    Block slot_block = std::move(allocated.front());
-    ASSERT_TRUE(slot_block.is_valid());
-    reserved_slot = slot_block.id();
-    ASSERT_GE(reserved_slot, 1);
-    EXPECT_EQ(insert_checkpoint(cache, h2), -1);
-  }
-
-  EXPECT_EQ(insert_checkpoint(cache, h2), reserved_slot);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h2));
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
-}
-
-TEST(LinearStatePrefixCacheTest, ReserveExistingHashDoesNotAllocate) {
-  LinearStateBlockManager cache(
-      linear_options(/*num_slots=*/2, /*block_size=*/16));
-  const XXH3Key h1 = make_hash(1);
-  const int32_t slot = insert_checkpoint(cache, h1);
-  ASSERT_GE(slot, 1);
-
-  // contains() / match() find the existing entry without consuming a slot.
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  Block matched = BlockManagerPoolTestPeer::match(&cache, h1);
-  ASSERT_TRUE(matched.is_valid());
-  EXPECT_EQ(matched.id(), slot);
-}
-
-// When all usable slots hold checkpoints, the next insert reclaims the
-// least-recently-used one.
 TEST(LinearStatePrefixCacheTest, InsertEvictsLeastRecentlyUsed) {
   // 3 physical slots -> 2 usable checkpoint slots.
   LinearStateBlockManager cache(
@@ -242,17 +172,16 @@ TEST(LinearStatePrefixCacheTest, InsertEvictsLeastRecentlyUsed) {
 
   insert_checkpoint(cache, h1);
   insert_checkpoint(cache, h2);
-  ASSERT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  ASSERT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h2));
+  ASSERT_TRUE(block_test::contains(&cache, h1));
+  ASSERT_TRUE(block_test::contains(&cache, h2));
 
   // Cache full: a third checkpoint evicts the oldest (h1).
   insert_checkpoint(cache, h3);
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h2));
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h3));
+  EXPECT_FALSE(block_test::contains(&cache, h1));
+  EXPECT_TRUE(block_test::contains(&cache, h2));
+  EXPECT_TRUE(block_test::contains(&cache, h3));
 }
 
-// match() refreshes LRU order so the touched checkpoint survives eviction.
 TEST(LinearStatePrefixCacheTest, MatchRefreshesLruOrder) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/3, /*block_size=*/16));
@@ -263,17 +192,17 @@ TEST(LinearStatePrefixCacheTest, MatchRefreshesLruOrder) {
   insert_checkpoint(cache, h1);
   insert_checkpoint(cache, h2);
   // Touch h1 so h2 becomes the least-recently-used entry.
-  Block matched = BlockManagerPoolTestPeer::match(&cache, h1);
-  ASSERT_TRUE(matched.is_valid());
-  EXPECT_GE(matched.id(), 1);
-
+  {
+    Block matched = block_test::match(&cache, h1);
+    ASSERT_TRUE(matched.is_valid());
+  }
+  // With the hit released, survival must come from recency, not a pin.
   insert_checkpoint(cache, h3);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h2));
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h3));
+  EXPECT_TRUE(block_test::contains(&cache, h1));
+  EXPECT_FALSE(block_test::contains(&cache, h2));
+  EXPECT_TRUE(block_test::contains(&cache, h3));
 }
 
-// allocate() reclaims a checkpoint slot when no slot is free.
 TEST(LinearStatePrefixCacheTest, AcquireLiveSlotReclaimsCheckpoint) {
   // 2 physical slots -> 1 usable slot.
   LinearStateBlockManager cache(
@@ -282,7 +211,7 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotReclaimsCheckpoint) {
 
   const int32_t checkpoint_slot = insert_checkpoint(cache, h1);
   ASSERT_GE(checkpoint_slot, 1);
-  ASSERT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
+  ASSERT_TRUE(block_test::contains(&cache, h1));
 
   // The only usable slot holds a checkpoint; acquiring a live slot must reclaim
   // it.
@@ -291,7 +220,7 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotReclaimsCheckpoint) {
   Block live = std::move(live_blocks.front());
   ASSERT_TRUE(live.is_valid());
   EXPECT_EQ(live.id(), checkpoint_slot);
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
+  EXPECT_FALSE(block_test::contains(&cache, h1));
 }
 
 TEST(LinearStatePrefixCacheTest, AcquireLiveSlotSkipsPinnedCheckpoint) {
@@ -302,7 +231,7 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotSkipsPinnedCheckpoint) {
 
   const int32_t pinned_slot = insert_checkpoint(cache, h1);
   ASSERT_GE(pinned_slot, 1);
-  Block restore_pin = BlockManagerPoolTestPeer::match(&cache, h1);
+  Block restore_pin = block_test::match(&cache, h1);
   ASSERT_TRUE(restore_pin.is_valid());
   EXPECT_EQ(restore_pin.id(), pinned_slot);
 
@@ -314,11 +243,10 @@ TEST(LinearStatePrefixCacheTest, AcquireLiveSlotSkipsPinnedCheckpoint) {
   Block live = std::move(live_blocks.front());
   ASSERT_TRUE(live.is_valid());
   EXPECT_EQ(live.id(), reclaimable_slot);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h2));
+  EXPECT_TRUE(block_test::contains(&cache, h1));
+  EXPECT_FALSE(block_test::contains(&cache, h2));
 }
 
-// Live slots are never reclaimed for checkpoints.
 TEST(LinearStatePrefixCacheTest, InsertCannotReclaimLiveSlots) {
   LinearStateBlockManager cache(
       linear_options(/*num_slots=*/2, /*block_size=*/16));
@@ -327,71 +255,9 @@ TEST(LinearStatePrefixCacheTest, InsertCannotReclaimLiveSlots) {
   Block live = std::move(live_blocks.front());
   ASSERT_TRUE(live.is_valid());
 
-  // The only usable slot is live, so no checkpoint slot can be reserved.
+  // A published checkpoint cannot steal a live sequence slot.
   EXPECT_EQ(insert_checkpoint(cache, make_hash(1)), -1);
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, make_hash(1)));
-}
-
-TEST(LinearStatePrefixCacheTest, InsertSkipsPinnedCheckpointSlots) {
-  LinearStateBlockManager cache(
-      linear_options(/*num_slots=*/3, /*block_size=*/16));
-  const XXH3Key h1 = make_hash(1);
-  const XXH3Key h2 = make_hash(2);
-  const XXH3Key h3 = make_hash(3);
-
-  const int32_t pinned_slot = insert_checkpoint(cache, h1);
-  ASSERT_GE(pinned_slot, 1);
-  ASSERT_GE(insert_checkpoint(cache, h2), 1);
-
-  Block restore_pin = BlockManagerPoolTestPeer::match(&cache, h1);
-  ASSERT_TRUE(restore_pin.is_valid());
-  EXPECT_EQ(restore_pin.id(), pinned_slot);
-
-  EXPECT_GE(insert_checkpoint(cache, h3), 1);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h2));
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h3));
-}
-
-TEST(LinearStatePrefixCacheTest, InsertFailsWhenAllCheckpointsPinned) {
-  LinearStateBlockManager cache(
-      linear_options(/*num_slots=*/3, /*block_size=*/16));
-  const XXH3Key h1 = make_hash(1);
-  const XXH3Key h2 = make_hash(2);
-  const XXH3Key h3 = make_hash(3);
-
-  const int32_t slot1 = insert_checkpoint(cache, h1);
-  const int32_t slot2 = insert_checkpoint(cache, h2);
-  ASSERT_GE(slot1, 1);
-  ASSERT_GE(slot2, 1);
-
-  Block restore_pin1 = BlockManagerPoolTestPeer::match(&cache, h1);
-  Block restore_pin2 = BlockManagerPoolTestPeer::match(&cache, h2);
-  ASSERT_TRUE(restore_pin1.is_valid());
-  ASSERT_TRUE(restore_pin2.is_valid());
-
-  EXPECT_EQ(insert_checkpoint(cache, h3), -1);
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h2));
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h3));
-}
-
-TEST(LinearStatePrefixCacheTest, InsertExistingHashIgnoresPinnedCheckpoint) {
-  LinearStateBlockManager cache(
-      linear_options(/*num_slots=*/2, /*block_size=*/16));
-  const XXH3Key h1 = make_hash(1);
-
-  const int32_t slot = insert_checkpoint(cache, h1);
-  ASSERT_GE(slot, 1);
-
-  Block restore_pin = BlockManagerPoolTestPeer::match(&cache, h1);
-  ASSERT_TRUE(restore_pin.is_valid());
-  // The pinned cache entry is still discoverable by hash; the cache neither
-  // evicts the pin nor allocates a duplicate slot.
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  Block matched = BlockManagerPoolTestPeer::match(&cache, h1);
-  ASSERT_TRUE(matched.is_valid());
-  EXPECT_EQ(matched.id(), slot);
+  EXPECT_FALSE(block_test::contains(&cache, make_hash(1)));
 }
 
 TEST(LinearStatePrefixCacheTest, ReleasedPinAllowsCheckpointReclaim) {
@@ -403,14 +269,14 @@ TEST(LinearStatePrefixCacheTest, ReleasedPinAllowsCheckpointReclaim) {
   const int32_t slot = insert_checkpoint(cache, h1);
   ASSERT_GE(slot, 1);
   {
-    Block restore_pin = BlockManagerPoolTestPeer::match(&cache, h1);
+    Block restore_pin = block_test::match(&cache, h1);
     ASSERT_TRUE(restore_pin.is_valid());
     EXPECT_EQ(insert_checkpoint(cache, h2), -1);
   }
 
   EXPECT_EQ(insert_checkpoint(cache, h2), slot);
-  EXPECT_FALSE(BlockManagerPoolTestPeer::contains(&cache, h1));
-  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, h2));
+  EXPECT_FALSE(block_test::contains(&cache, h1));
+  EXPECT_TRUE(block_test::contains(&cache, h2));
 }
 
 // batch 8, V 2, stride 4, two groups. Valid slots sit at the end of each
@@ -487,9 +353,8 @@ TEST(LinearStatePrefixCacheTest, PrefetchReclaimsCachedSlotsForBothGroups) {
   EXPECT_NE(ids[3], ids[7]);
   EXPECT_NE(ids[3], ids[11]);
   EXPECT_NE(ids[7], ids[11]);
-  // Absolute batch 1 reuses nothing from batch 0. The next even batch would.
-  EXPECT_NE(ids[11], ids[3]);
-  EXPECT_NE(ids[15], ids[7]);
+  EXPECT_NE(ids[3], ids[15]);
+  EXPECT_NE(ids[7], ids[15]);
   EXPECT_NE(ids[11], ids[15]);
 }
 

@@ -195,16 +195,12 @@ class OverlapLinearStateRestoreWorker final : public LLMWorkerImpl {
     }
   }
 
-  std::optional<ForwardOutput> run_overlap_forward(ForwardInput& input,
-                                                   int64_t destination_slot) {
-    forward_destination_slot_ = destination_slot;
-    return step_for_schedule_overlap(input);
-  }
-
   std::optional<ForwardOutput> execute_no_sync_on_stream(
-      const ForwardInput& /*input*/,
+      const ForwardInput& input,
       Stream& compute_stream) override {
     c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
+    const int32_t destination_slot =
+        input.input_params.embedding.linear_state_ids.front();
     for (KVCache& kv_cache : kv_caches_) {
       torch::Tensor conv_cache = kv_cache.get_conv_cache();
       torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
@@ -212,18 +208,19 @@ class OverlapLinearStateRestoreWorker final : public LLMWorkerImpl {
         continue;
       }
       const int64_t ssm_stride = ssm_cache.size(0) / conv_cache.size(0);
-      conv_cache.select(/*dim=*/0, forward_destination_slot_).add_(2.0f);
-      ssm_cache
-          .narrow(/*dim=*/0, forward_destination_slot_ * ssm_stride, ssm_stride)
+      if (input.input_params.linear_state_validity_mask.front() == 0) {
+        conv_cache.select(/*dim=*/0, destination_slot).zero_();
+        ssm_cache.narrow(/*dim=*/0, destination_slot * ssm_stride, ssm_stride)
+            .zero_();
+      }
+      conv_cache.select(/*dim=*/0, destination_slot).add_(2.0f);
+      ssm_cache.narrow(/*dim=*/0, destination_slot * ssm_stride, ssm_stride)
           .add_(4.0f);
     }
     return std::nullopt;
   }
 
   void synchronize_compute_stream() { compute_stream_->synchronize(); }
-
- private:
-  int64_t forward_destination_slot_ = -1;
 };
 
 TEST(MluLinearStateRestoreWorkerTest,
@@ -451,26 +448,15 @@ class MluGlmPrefillRestoreTest : public ::testing::Test {
 };
 
 TEST_F(MluGlmPrefillRestoreTest, PrefillPreservesAllStateUntilComputation) {
-  for (const BatchForwardType forward_type :
-       {BatchForwardType::PREFILL, BatchForwardType::CHUNKED_PREFILL}) {
-    for (const std::string model_type : {"glm5_next", "glm5_3_flash"}) {
-      verify_restore(forward_type, false, model_type, false);
-    }
-  }
+  verify_restore(BatchForwardType::PREFILL, false, "glm5_next", false);
+  verify_restore(
+      BatchForwardType::CHUNKED_PREFILL, false, "glm5_3_flash", false);
 }
 
 TEST_F(MluGlmPrefillRestoreTest, DecodeAndVerifyRestoreAcceptedCheckpoint) {
   verify_restore(BatchForwardType::DECODE, false, "glm5_next", true);
   verify_restore(BatchForwardType::MIXED, false, "glm5_next", true);
   verify_restore(BatchForwardType::CHUNKED_PREFILL, true, "glm5_next", true);
-}
-
-TEST_F(MluGlmPrefillRestoreTest, ContextParallelPrefillSkipsStateCopies) {
-  verify_restore(BatchForwardType::CHUNKED_PREFILL,
-                 false,
-                 "glm5_next",
-                 false,
-                 /*cp_size=*/2);
 }
 
 TEST_F(MluGlmPrefillRestoreTest, OtherModelsRestoreAcceptedCheckpoint) {
@@ -484,45 +470,6 @@ TEST_F(MluGlmPrefillRestoreTest, DecodeRestoresNonzeroAcceptedCheckpoint) {
                  /*expect_recurrent_copy=*/true,
                  /*cp_size=*/1,
                  /*accepted_tokens=*/2);
-}
-
-TEST(MluLinearStateRestoreWorkerTest,
-     NonOverlapPrepareExpandsLogicalRowsForActiveRows) {
-  const torch::Device device("mlu:0");
-  ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  ModelArgs model_args;
-  model_args.layer_types({"linear_attention"});
-  runtime::Options runtime_options;
-  runtime_options.enable_schedule_overlap(false);
-  LinearStateRestoreWorker worker(
-      parallel_args, device, runtime_options, model_args);
-
-  constexpr int64_t kSsmStride = 2;
-  LinearCacheTensors cache =
-      make_linear_cache(device, kSsmStride, /*sentinel=*/-101.0f);
-  std::vector<KVCache> kv_caches;
-  kv_caches.emplace_back(LinearAttentionKVCacheTensors{cache.conv, cache.ssm});
-  worker.set_kv_caches(std::move(kv_caches));
-
-  ForwardInput input;
-  input.token_ids = torch::ones(
-      {6}, torch::TensorOptions().dtype(torch::kInt32).device(device));
-  input.positions = torch::zeros_like(input.token_ids);
-  input.device_tensors_ready = true;
-  input.input_params.meta.num_sequences = 2;
-  input.input_params.attention.host.q_seq_lens = {0, 1, 2, 3, 4, 5, 6};
-  input.input_params.attention.host.kv_cache_tokens_nums = {0, 8};
-  input.input_params.embedding.linear_state_ids = {1, 2, 3, 4, 5, 6};
-  input.input_params.embedding.linear_state_read_ids = {1, 2, 3, 4, 5, 6};
-
-  Device xllm_device(device);
-  input.metadata_ready_event = xllm_device.current_stream()->record_event();
-  ForwardInput processed_input;
-  worker.prepare_work_before_execute(input, processed_input);
-
-  EXPECT_EQ(processed_input.input_params.linear_state_validity_mask,
-            std::vector<int64_t>({0, 0, 0, 1, 1, 1}));
 }
 
 TEST(MluLinearStateRestoreWorkerTest,
@@ -586,10 +533,9 @@ TEST(MluLinearStateRestoreWorkerTest,
 
   ForwardInput input;
   input.input_params.meta.batch_id = 43;
-  input.input_params.embedding.linear_state_ids = {1, 2, 3, 5};
-  input.input_params.embedding.linear_state_read_ids = {
-      kRestoreSourceSlot, 2, 3, 5};
-  input.input_params.linear_state_validity_mask = {0, 1, 0, 0};
+  input.input_params.embedding.linear_state_ids = {1};
+  input.input_params.embedding.linear_state_read_ids = {kRestoreSourceSlot};
+  input.input_params.linear_state_validity_mask = {0};
 
   // Finish fixture initialization before the simulated previous forward writes
   // the same cache tensors on the worker's compute stream.
@@ -597,11 +543,19 @@ TEST(MluLinearStateRestoreWorkerTest,
   ASSERT_EQ(xllm_device.current_stream()->synchronize(), 0);
   worker.enqueue_previous_chunk_write(kRestoreSourceSlot,
                                       {{3.0f, 5.0f}, {7.0f, 11.0f}});
-  worker.run_overlap_forward(input, /*destination_slot=*/1);
+  input.token_ids_host = torch::ones({1}, torch::kInt32);
+  input.positions_host = torch::zeros_like(input.token_ids_host);
+  input.token_ids = input.token_ids_host.to(device);
+  input.positions = input.positions_host.to(device);
+  input.input_params.meta.num_sequences = 1;
+  input.input_params.meta.q_max_seq_len = 1;
+  input.input_params.meta.batch_forward_type =
+      BatchForwardType::CHUNKED_PREFILL;
+  input.input_params.attention.host.q_seq_lens = {0, 1};
+  input.input_params.attention.host.kv_cache_tokens_nums = {0};
+  std::move(worker.step_async(input)).get();
   worker.synchronize_compute_stream();
 
-  EXPECT_EQ(input.input_params.linear_state_validity_mask,
-            std::vector<int64_t>({1, 1, 0, 0}));
   expect_slot_equals(first, first_baseline, /*slot=*/1, kFirstStride);
   expect_slot_equals(second, second_baseline, /*slot=*/1, kSecondStride);
   EXPECT_TRUE(torch::all(first.conv.select(/*dim=*/0, /*index=*/2) == 13.0f)

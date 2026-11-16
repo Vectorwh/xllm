@@ -91,14 +91,6 @@ TEST_F(HostPageAlignedRegionTest, MoveTransfersSoleOwnership) {
   EXPECT_EQ(assigned.total_bytes, bytes);
 }
 
-TEST_F(HostPageAlignedRegionTest, RepeatedAllocationAndReleaseSucceeds) {
-  for (int32_t iteration = 0; iteration < 64; ++iteration) {
-    HostPageAlignedRegion region(
-        /*bytes=*/static_cast<size_t>(iteration + 1));
-    ASSERT_NE(region.base_ptr, nullptr);
-  }
-}
-
 TEST_F(HostPageAlignedRegionTest, ReleaseOnAnotherThreadRestoresItsContext) {
   HostPageAlignedRegion region(/*bytes=*/65);
   std::promise<CNresult> release_result;

@@ -150,12 +150,14 @@ def test_pipeline_uses_runtime_query_width(query_width: int) -> None:
 
     assert model.model._query_width == query_width
 
+
 def test_pipeline_requires_runtime_query_width() -> None:
     config = {**_DSPARK_CONFIG, "num_speculative_tokens": 16}
     del config["draft_query_width"]
 
     with pytest.raises(KeyError, match="draft_query_width"):
         DeepseekV4DSparkForCausalLM(config)
+
 
 def test_dspark_requires_draft_layers_and_markov_rank() -> None:
     with pytest.raises(ValueError, match="dspark_num_layers > 0"):

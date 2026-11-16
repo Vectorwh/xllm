@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from xllm.python.models import deepseek_v4 as deepseek_v4_module
-from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
+from xllm.python.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
 
 
 @pytest.mark.parametrize(
@@ -78,9 +78,9 @@ def test_moe_loader_uses_native_projection_names_and_local_expert_range() -> Non
         expert_prefix + "gate_proj.weight": torch.arange(12, dtype=torch.int8).reshape(4, 3),
         expert_prefix + "up_proj.weight": torch.arange(12, 24, dtype=torch.int8).reshape(4, 3),
         expert_prefix + "down_proj.weight": torch.arange(12, dtype=torch.int8).reshape(3, 4),
-        expert_prefix + "gate_proj.weight_scale": torch.ones(4, 1),
-        expert_prefix + "up_proj.weight_scale": torch.ones(4, 1),
-        expert_prefix + "down_proj.weight_scale": torch.ones(3, 1),
+        expert_prefix + "gate_proj.weight_scale": torch.arange(4, dtype=torch.float32).reshape(4, 1) + 1,
+        expert_prefix + "up_proj.weight_scale": torch.arange(4, dtype=torch.float32).reshape(4, 1) + 5,
+        expert_prefix + "down_proj.weight_scale": torch.arange(3, dtype=torch.float32).reshape(3, 1) + 9,
         shared_prefix + "gate_proj.weight": torch.arange(12, dtype=torch.int8).reshape(4, 3),
         shared_prefix + "up_proj.weight": torch.arange(12, 24, dtype=torch.int8).reshape(4, 3),
         shared_prefix + "down_proj.weight": torch.arange(12, dtype=torch.int8).reshape(3, 4),
@@ -144,6 +144,19 @@ def test_moe_loader_uses_native_projection_names_and_local_expert_range() -> Non
     torch.testing.assert_close(
         copied["model.layers.0.mlp.shared_experts.down_proj.weight"],
         tensors[shared_prefix + "down_proj.weight"][:, 2:],
+    )
+    torch.testing.assert_close(
+        buffers["model.layers.0.mlp.experts_w13_scale"][0],
+        torch.cat(
+            [
+                tensors[expert_prefix + "gate_proj.weight_scale"][2:],
+                tensors[expert_prefix + "up_proj.weight_scale"][2:],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        buffers["model.layers.0.mlp.experts_w2_scale"][0],
+        tensors[expert_prefix + "down_proj.weight_scale"],
     )
 
 
@@ -325,7 +338,7 @@ def test_moe_loader_validates_shared_mxfp8_shapes(
         get_buffer=lambda _name: torch.empty(0),
     )
 
-    with pytest.raises(ValueError, match="shared expert tensor"):
+    with pytest.raises(ValueError) as error:
         DeepseekV4ForCausalLM._load_deepseek_v4_moe_experts_mxfp4(
             owner,
             SimpleNamespace(
@@ -338,6 +351,10 @@ def test_moe_loader_validates_shared_mxfp8_shapes(
             0,
             prefix,
         )
+    error_text = str(error.value)
+    assert shared_prefix + checkpoint_name in error_text
+    assert f"shape {bad_shape}" in error_text
+    assert "expected" in error_text
 
 
 @pytest.mark.parametrize("module_name", ["ffn", "mlp"])
@@ -360,16 +377,20 @@ def test_load_weights_reaches_routed_expert_aliases(
     tensors = {
         "embed.weight": torch.zeros(1),
         "norm.weight": torch.zeros(1),
+        "hc_head_fn": torch.zeros(1),
+        "hc_head_base": torch.zeros(1),
+        "hc_head_scale": torch.zeros(1),
         "lm_head.weight": torch.zeros(1),
         prefix + "gate.weight": torch.arange(6).reshape(2, 3),
         prefix + "gate.tid2eid": torch.arange(2),
         expert_prefix + gate_name + ".weight": torch.arange(12, dtype=torch.int8).reshape(4, 3),
         expert_prefix + up_name + ".weight": torch.arange(12, 24, dtype=torch.int8).reshape(4, 3),
         expert_prefix + down_name + ".weight": torch.arange(12, dtype=torch.int8).reshape(3, 4),
-        expert_prefix + gate_name + ".weight_scale": torch.ones(4, 1),
-        expert_prefix + up_name + ".weight_scale": torch.ones(4, 1),
-        expert_prefix + down_name + ".weight_scale": torch.ones(3, 1),
+        expert_prefix + gate_name + ".weight_scale": torch.arange(4, dtype=torch.float32).reshape(4, 1) + 1,
+        expert_prefix + up_name + ".weight_scale": torch.arange(4, dtype=torch.float32).reshape(4, 1) + 5,
+        expert_prefix + down_name + ".weight_scale": torch.arange(3, dtype=torch.float32).reshape(3, 1) + 9,
     }
+    copied: dict[str, torch.Tensor] = {}
 
     class FakeWeightLoader:
         def __init__(self, *args, **kwargs) -> None:
@@ -379,7 +400,7 @@ def test_load_weights_reaches_routed_expert_aliases(
             return name in tensors
 
         def load_tensor(self, name: str) -> torch.Tensor:
-            return tensors.get(name, torch.zeros(1))
+            return tensors[name]
 
         def shard(
             self,
@@ -391,7 +412,7 @@ def test_load_weights_reaches_routed_expert_aliases(
             return tensor
 
         def copy_in(self, name: str, tensor: torch.Tensor) -> None:
-            pass
+            copied[name] = tensor.clone()
 
     monkeypatch.setattr(deepseek_v4_module, "W8A8WeightLoader", FakeWeightLoader)
     process_calls = 0
@@ -425,7 +446,7 @@ def test_load_weights_reaches_routed_expert_aliases(
     buffer_names += " experts_w13_offset experts_w2_offset experts_w13_scale_bias experts_w2_scale_bias"
     buffers = {"model.layers.0.mlp." + name: torch.empty(0) for name in buffer_names.split()}
     owner = SimpleNamespace(
-        cfg=SimpleNamespace(
+        cfg=DeepseekV4Config(
             tp_size=1,
             tp_rank=0,
             n_layers=1,
@@ -453,6 +474,25 @@ def test_load_weights_reaches_routed_expert_aliases(
             ]
         ),
     )
+    torch.testing.assert_close(
+        parameters["model.layers.0.mlp.experts_w2"][0],
+        tensors[expert_prefix + down_name + ".weight"],
+    )
+    torch.testing.assert_close(
+        buffers["model.layers.0.mlp.experts_w13_scale"][0],
+        torch.cat(
+            [
+                tensors[expert_prefix + gate_name + ".weight_scale"],
+                tensors[expert_prefix + up_name + ".weight_scale"],
+            ]
+        ),
+    )
+    torch.testing.assert_close(
+        buffers["model.layers.0.mlp.experts_w2_scale"][0],
+        tensors[expert_prefix + down_name + ".weight_scale"],
+    )
+    torch.testing.assert_close(copied["model.layers.0.mlp.gate.weight"], tensors[prefix + "gate.weight"])
+    torch.testing.assert_close(copied["model.layers.0.mlp.tid2eid"], tensors[prefix + "gate.tid2eid"])
     assert process_calls == 1
 
 

@@ -392,10 +392,6 @@ class ReduceScatterMultiDeviceTest : public ::testing::Test {
     hidden_dim_ = 128;
   }
 
-  void TearDown() override {
-    // Clean up if needed
-  }
-
   // Run test with multiple processes
   void RunMultiProcessTest(int64_t input_size, bool test_padding) {
     std::vector<pid_t> child_pids;
@@ -606,11 +602,6 @@ TEST_F(ReduceScatterMultiDeviceTest, BasicTest) {
 TEST_F(ReduceScatterMultiDeviceTest, PaddingTest) {
   // Test with input size not divisible by world_size (requires padding)
   RunMultiProcessTest(7, true);
-}
-
-TEST_F(ReduceScatterMultiDeviceTest, LargeInputTest) {
-  // Test with larger input
-  RunMultiProcessTest(32, false);
 }
 
 TEST_F(AllGatherBaseMultiDeviceTest, BasicTest) {

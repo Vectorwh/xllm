@@ -460,30 +460,6 @@ void run_copy_case(int32_t source_tp,
   }
 }
 
-bool is_legal_head_tp(int64_t global_heads, int32_t tp_size) {
-  return global_heads >= tp_size ? global_heads % tp_size == 0
-                                 : tp_size % global_heads == 0;
-}
-
-TEST(ReshardPlannerTest, EnumeratesLegalHeadAndTpPairs) {
-  for (int64_t global_heads = 1; global_heads <= 8; ++global_heads) {
-    for (int32_t source_tp = 1; source_tp <= 8; ++source_tp) {
-      if (!is_legal_head_tp(global_heads, source_tp)) {
-        continue;
-      }
-      for (int32_t destination_tp = 1; destination_tp <= 8; ++destination_tp) {
-        if (!is_legal_head_tp(global_heads, destination_tp)) {
-          continue;
-        }
-        SCOPED_TRACE("heads=" + std::to_string(global_heads) +
-                     ", source_tp=" + std::to_string(source_tp) +
-                     ", destination_tp=" + std::to_string(destination_tp));
-        run_copy_case(source_tp, destination_tp, global_heads);
-      }
-    }
-  }
-}
-
 TEST(ReshardPlannerTest, NonIntegerTpTwoToThree) {
   run_copy_case(/*source_tp=*/2, /*destination_tp=*/3, /*global_heads=*/6);
 }

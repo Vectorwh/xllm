@@ -29,7 +29,6 @@ class PagedAttentionGraphResources final {
  public:
   explicit PagedAttentionGraphResources(int64_t num_layers);
   ~PagedAttentionGraphResources();
-  size_t stream_count() const;
 
  private:
   friend class PagedAttentionGraphOperation;
@@ -53,7 +52,6 @@ class PagedAttentionGraphOperation final {
 
   void prepare(const std::vector<int32_t>& kv_seq_lens);
   void execute();
-  uint64_t workspace_size() const;
 
  private:
   class Impl;

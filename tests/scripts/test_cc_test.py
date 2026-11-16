@@ -366,7 +366,6 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/npu_layers.links" "${{links}}")
     def test_host_metadata_targets_preserve_device_test_bootstrap(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
         cpu_targets = (
-            "anthropic_protocol_test",
             "api_service_test",
             "completion_json_parser_test",
             "request_id_test",
@@ -511,6 +510,7 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/npu_layers.links" "${{links}}")
                 scheduler_source.parent.mkdir(parents=True, exist_ok=True)
                 scheduler_source.touch()
             for relative_source in (
+                "core/framework/kv_cache_transfer/kv_cache_store.cpp",
                 "models/dit/utils/lanczos_resample.cpp",
                 "core/layers/common/attention_mask.cpp",
             ):

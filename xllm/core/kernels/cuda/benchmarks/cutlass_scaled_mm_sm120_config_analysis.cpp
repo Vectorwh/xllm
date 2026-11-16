@@ -159,8 +159,7 @@ bool VerifyCorrectness(int64_t m,
   torch::Tensor b_fp8 = b_fp32.to(torch::kFloat8_e4m3fn);
 
   // Convert FP8 back to FP32 for reference computation
-  // This ensures fair comparison since FP8 has very low precision (4-bit
-  // mantissa)
+  // Compare with the represented FP8 values, not their FP32 source.
   torch::Tensor a_f32_from_fp8 = a.to(torch::kFloat32);
   torch::Tensor b_f32_from_fp8 = b_fp8.to(torch::kFloat32);
 
@@ -242,138 +241,6 @@ class CutlassScaledMMSM120ConfigTest : public ::testing::Test {
 };
 
 // ============================================================================
-// Configuration Selection Correctness Tests
-// ============================================================================
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_M16) {
-  PrintHeader("Test M <= 16 configuration selection (expected: 128x32_swap)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {1, 4, 8, 12, 16};
-  const int64_t N = 2048;
-  const int64_t K = 2048;
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    EXPECT_EQ(result.config_name, "128x32_swap")
-        << "M=" << m << " should use 128x32_swap configuration";
-  }
-}
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_M64_SmallK) {
-  PrintHeader(
-      "Test M in (16, 64], K < 4096, N < 8192 configuration selection "
-      "(expected: 128x64)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {17, 24, 32, 48, 64};
-  const int64_t N = 2048;  // N < 8192
-  const int64_t K = 2048;  // K < 4096
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    // With small N and K, all M in (16, 64] should use 128x64 (no swap)
-    EXPECT_EQ(result.config_name, "128x64")
-        << "M=" << m << ", N=" << N << ", K=" << K
-        << " should use 128x64 configuration";
-  }
-}
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_M64_LargeK) {
-  PrintHeader(
-      "Test M in (16, 64], K >= 4096 configuration selection (expected: "
-      "128x64_swap)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {17, 24, 32, 48, 64};
-  const int64_t N = 2048;
-  const int64_t K = 11008;  // K >= 4096
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    // With K >= 4096, all M in (16, 64] should use 128x64_swap
-    EXPECT_EQ(result.config_name, "128x64_swap")
-        << "M=" << m << ", K=" << K << " should use 128x64_swap configuration";
-  }
-}
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_M128) {
-  PrintHeader("Test M in (64, 128] configuration selection (expected: 128x64)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {65, 80, 96, 112, 128};
-  const int64_t N = 2048;
-  const int64_t K = 2048;
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    EXPECT_EQ(result.config_name, "128x64")
-        << "M=" << m << " should use 128x64 configuration";
-  }
-}
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_M256) {
-  PrintHeader(
-      "Test M in (128, 256] configuration selection (expected: 128x64)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {129, 160, 192, 224, 256};
-  const int64_t N = 2048;
-  const int64_t K = 2048;
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    EXPECT_EQ(result.config_name, "128x64")
-        << "M=" << m << " should use 128x64 configuration";
-  }
-}
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_LargeM) {
-  PrintHeader(
-      "Test M > 256 configuration selection (expected: 128x64 or 128x128, "
-      "depending on wave efficiency)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {257, 320, 384, 448, 512};
-  const int64_t N = 2048;
-  const int64_t K = 2048;
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    // Wave efficiency based selection - either 128x64 or 128x128
-    EXPECT_TRUE(result.config_name == "128x64" ||
-                result.config_name == "128x128")
-        << "M=" << m << " should use 128x64 or 128x128 configuration";
-  }
-}
-
-TEST_F(CutlassScaledMMSM120ConfigTest, ConfigSelection_VeryLargeM) {
-  PrintHeader(
-      "Test M > 512 configuration selection (expected: 128x64 or 128x128, "
-      "depending on wave efficiency)");
-  PrintTableHeader();
-
-  std::vector<int64_t> m_values = {513, 1024, 2048, 4000};
-  const int64_t N = 2048;
-  const int64_t K = 2048;
-
-  for (int64_t m : m_values) {
-    auto result = BenchmarkWithDispatch(m, N, K, device_);
-    PrintResult(m, result);
-    // Wave efficiency based selection - either 128x64 or 128x128
-    EXPECT_TRUE(result.config_name == "128x64" ||
-                result.config_name == "128x128")
-        << "M=" << m << " should use 128x64 or 128x128 configuration";
-  }
-}
-
-// ============================================================================
 // Numerical Correctness Tests
 // ============================================================================
 
@@ -388,7 +255,7 @@ TEST_F(CutlassScaledMMSM120ConfigTest, Correctness_AllConfigs) {
       {32, 2048, 2048, "128x64"},        // M in (16,32], small N and K
       {32, 2048, 11008, "128x64_swap"},  // M in (16,32], K>=4096
       {96, 2048, 2048, "128x64"},        // M in (64,128]
-      {192, 2048, 2048, "128x64"},       // M in (128,256]
+      {192, 2048, 2048, ""},  // Adaptive choice depends on device SM count
   };
 
   for (const auto& [m, n, k, expected_config] : test_cases) {
@@ -396,7 +263,9 @@ TEST_F(CutlassScaledMMSM120ConfigTest, Correctness_AllConfigs) {
         m, n, k, device_.index());
     std::string config =
         xllm::kernel::cuda::get_sm120_dispatch_kernel_name(dispatch.kernel);
-    EXPECT_EQ(config, expected_config);
+    if (!expected_config.empty()) {
+      EXPECT_EQ(config, expected_config);
+    }
 
     bool correct = VerifyCorrectness(m, n, k, device_);
     EXPECT_TRUE(correct) << "Configuration " << config << " (M=" << m

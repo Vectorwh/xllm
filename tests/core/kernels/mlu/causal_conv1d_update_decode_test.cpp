@@ -14,11 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include <framework/core/device.h>
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
-#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -92,52 +90,6 @@ TEST_F(CausalConv1dUpdateDecodeJitTest, PaddingSkipsStateWithoutApc) {
   }
 }
 
-TEST_F(CausalConv1dUpdateDecodeJitTest, SecondCallHitsCache) {
-  torch::DeviceGuard guard(device());
-  int32_t dim = 1024;
-  int32_t width = 4;
-  int32_t batch = 4;
-  torch::Tensor x = bf16_randn({batch, dim, 1}, device());
-  torch::Tensor conv_state_orig = bf16_randn({batch, dim, width - 1}, device());
-  torch::Tensor weight = bf16_randn({dim, width}, device());
-  torch::Tensor conv_state_indices = torch::arange(
-      0, batch, torch::TensorOptions().dtype(torch::kInt32).device(device()));
-
-  torch::Tensor cs1 = conv_state_orig.clone();
-  torch::Tensor cs2 = conv_state_orig.clone();
-
-  auto t0 = std::chrono::steady_clock::now();
-  torch::Tensor out1 = causal_conv1d_update_decode(x,
-                                                   cs1,
-                                                   weight,
-                                                   std::nullopt,
-                                                   conv_state_indices,
-                                                   /*activation=*/true,
-                                                   /*pad_slot_id=*/-1);
-  torch_mlu::synchronize();
-  auto t1 = std::chrono::steady_clock::now();
-  torch::Tensor out2 = causal_conv1d_update_decode(x,
-                                                   cs2,
-                                                   weight,
-                                                   std::nullopt,
-                                                   conv_state_indices,
-                                                   /*activation=*/true,
-                                                   /*pad_slot_id=*/-1);
-  torch_mlu::synchronize();
-  auto t2 = std::chrono::steady_clock::now();
-
-  int64_t first_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-  int64_t second_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-  LOG(INFO) << "first call (compile+launch): " << first_ms
-            << "ms; second call (cached): " << second_ms << "ms";
-  EXPECT_TRUE(tensors_allclose(out1, out2, /*rtol=*/1e-3, /*atol=*/1e-3))
-      << "output mismatch";
-  EXPECT_TRUE(tensors_allclose(cs1, cs2, /*rtol=*/1e-3, /*atol=*/1e-3))
-      << "conv_state mismatch";
-}
-
 TEST_F(CausalConv1dUpdateDecodeJitTest, AcceptsUncompiledDim) {
   torch::DeviceGuard guard(device());
   int32_t dim = 1000;
@@ -157,6 +109,7 @@ TEST_F(CausalConv1dUpdateDecodeJitTest, AcceptsUncompiledDim) {
                                                   /*activation=*/true,
                                                   /*pad_slot_id=*/-1);
   torch_mlu::synchronize();
+  EXPECT_EQ(out.sizes(), torch::IntArrayRef({batch, dim, 1}));
   EXPECT_TRUE(torch::isfinite(out.to(torch::kFloat32)).all().item<bool>());
 }
 

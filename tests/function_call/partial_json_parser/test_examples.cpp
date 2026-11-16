@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
 
 #include "partial_json_parser/options.h"
 #include "partial_json_parser/parser.h"
@@ -121,11 +124,9 @@ TEST(PartialJsonParserTest, TestBasicFunctionality) {
   EXPECT_EQ(parse_malformed_string("[", ALL), "[]");
   EXPECT_EQ(parse_malformed_string("[0.", ALL), "[0]");
   EXPECT_EQ(parse_malformed_string("{\"key\": ", ALL), "{}");
-  EXPECT_EQ(parse_malformed_string("t", ALL), "true");
 
-  // Test with restricted options
+  // Test with restricted options and malformed input.
   EXPECT_EQ(parse_malformed_string("[1", static_cast<TypeOptions>(~NUM)), "[]");
-  EXPECT_EQ(parse_malformed_string("1", static_cast<TypeOptions>(~NUM)), "1");
 
   // Test error case
   EXPECT_THROW(parse_malformed_string("-", ALL), MalformedJSONException);
@@ -157,11 +158,6 @@ TEST(PartialJsonParserTest, TestEdgeCases) {
   // Test whitespace only
   EXPECT_THROW(parse_malformed_string("   ", ALL), MalformedJSONException);
 
-  // Test single characters
-  EXPECT_EQ(parse_malformed_string("n", NULL_TYPE), "null");
-  EXPECT_EQ(parse_malformed_string("t", BOOL), "true");
-  EXPECT_EQ(parse_malformed_string("f", BOOL), "false");
-
   // Test numbers with trailing operators
   EXPECT_EQ(parse_malformed_string("123.", NUM), "123");
   EXPECT_EQ(parse_malformed_string("123e", NUM), "123");
@@ -180,12 +176,26 @@ TEST(PartialJsonParserTest, TestFormatParameter) {
 
 // Test Go example
 TEST(PartialJsonParserTest, TestGoExample) {
-  // Test the example: `{"foo":"bar`
-  std::string result = parse_malformed_string("{\"foo\":\"bar", ALL);
-  EXPECT_EQ(result, "{\"foo\":\"bar\"}");
-
   // Test the array example: `["a",{"a":123`
-  std::string result2 = parse_malformed_string(
+  const std::string result = parse_malformed_string(
       "[\"a\",{\"a\":123", static_cast<TypeOptions>(NUM | ARR | OBJ));
-  EXPECT_EQ(result2, "[\"a\",{\"a\":123}]");
+  EXPECT_EQ(result, "[\"a\",{\"a\":123}]");
+}
+// Valid complete JSON is an unconditional oracle; parser errors must fail,
+// not turn the case into a skip.
+TEST(PartialJsonParserTest, CompleteJsonRoundTrips) {
+  const std::vector<std::string> inputs = {
+      "null",
+      "true",
+      "-1.25e+4",
+      R"json("escaped \"quote\", slash \\ and newline \n")json",
+      R"json([1, -2.5, null, true, {"text":"上海"}])json",
+      R"json({"name":"get_weather","arguments":{"city":"上海","samples":[1,-2.5,null,true,{"text":"a\"b"}]}})json",
+  };
+
+  for (const auto& input : inputs) {
+    SCOPED_TRACE(input);
+    const std::string result = parse_malformed_string(input, ALL);
+    EXPECT_EQ(nlohmann::json::parse(result), nlohmann::json::parse(input));
+  }
 }

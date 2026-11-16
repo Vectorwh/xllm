@@ -65,23 +65,6 @@ class KimiK2DetectorTest : public ::testing::Test {
   std::vector<JsonTool> tools_;
 };
 
-// Test constructor and basic properties
-TEST_F(KimiK2DetectorTest, ConstructorInitializesCorrectly) {
-  EXPECT_NE(detector_, nullptr);
-
-  // Test basic token detection
-  std::string text_with_tool_call =
-      "Some text "
-      "<|tool_calls_section_begin|><|tool_call_begin|>functions.test:0 "
-      "<|tool_call_argument_begin|>{\"param\": "
-      "\"value\"}<|tool_call_end|><|tool_calls_section_end|>";
-  std::string text_without_tool_call =
-      "Just normal text without any tool calls";
-
-  EXPECT_TRUE(detector_->has_tool_call(text_with_tool_call));
-  EXPECT_FALSE(detector_->has_tool_call(text_without_tool_call));
-}
-
 // Test has_tool_call method
 TEST_F(KimiK2DetectorTest, HasToolCallDetection) {
   // Test text containing tool calls
@@ -412,35 +395,44 @@ TEST_F(KimiK2DetectorTest, MultipleSections) {
   EXPECT_EQ(result.calls[1].name.value(), "calculate");
 }
 
-// Performance test: many tool calls
-TEST_F(KimiK2DetectorTest, PerformanceWithManyToolCalls) {
-  std::string text = "Performance test <|tool_calls_section_begin|>";
+// Verify multi-digit response indices without a timing-free stress loop.
+TEST_F(KimiK2DetectorTest, ParsesMultiDigitResponseIndices) {
+  const std::string text =
+      "Multiple indices "
+      "<|tool_calls_section_begin|><|tool_call_begin|>functions.calculate:9 "
+      "<|tool_call_argument_begin|>{\"expression\": \"9 + 1\"}"
+      "<|tool_call_end|><|tool_call_begin|>functions.get_current_weather:10 "
+      "<|tool_call_argument_begin|>{\"location\": \"Tokyo\"}"
+      "<|tool_call_end|><|tool_call_begin|>functions.calculate:99 "
+      "<|tool_call_argument_begin|>{\"expression\": \"99 + 1\"}"
+      "<|tool_call_end|><|tool_call_begin|>functions.get_current_weather:100 "
+      "<|tool_call_argument_begin|>{\"location\": \"Oslo\"}"
+      "<|tool_call_end|><|tool_call_begin|>functions.calculate:9999 "
+      "<|tool_call_argument_begin|>{\"expression\": \"9999 + 1\"}"
+      "<|tool_call_end|><|tool_calls_section_end|>";
 
-  // Build text containing multiple tool calls
-  for (int i = 0; i < 10000; ++i) {
-    text += "<|tool_call_begin|>functions.calculate:" + std::to_string(i) +
-            " <|tool_call_argument_begin|>{\"expression\": \"" +
-            std::to_string(i) + " + " + std::to_string(i + 1) +
-            "\"}<|tool_call_end|>";
-  }
-  text += "<|tool_calls_section_end|>";
+  const auto result = detector_->detect_and_parse(text, tools_);
 
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "Performance test ");
-  EXPECT_EQ(result.calls.size(), 10000);
-
-  // Verify each tool call is correctly parsed
-  for (int i = 0; i < 10000; ++i) {
-    const auto& call = result.calls[i];
-    EXPECT_EQ(call.tool_index, i);
-    EXPECT_EQ(call.name.value(), "calculate");
-
-    nlohmann::json params = nlohmann::json::parse(call.parameters);
-    std::string expected_expr =
-        std::to_string(i) + " + " + std::to_string(i + 1);
-    EXPECT_EQ(params["expression"], expected_expr);
-  }
+  EXPECT_EQ(result.normal_text, "Multiple indices ");
+  ASSERT_EQ(result.calls.size(), 5);
+  EXPECT_EQ(result.calls[0].tool_index, 9);
+  EXPECT_EQ(result.calls[0].name, "calculate");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[0].parameters)["expression"],
+            "9 + 1");
+  EXPECT_EQ(result.calls[1].tool_index, 10);
+  EXPECT_EQ(result.calls[1].name, "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[1].parameters)["location"],
+            "Tokyo");
+  EXPECT_EQ(result.calls[2].tool_index, 99);
+  EXPECT_EQ(result.calls[2].name, "calculate");
+  EXPECT_EQ(result.calls[3].tool_index, 100);
+  EXPECT_EQ(result.calls[3].name, "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[3].parameters)["location"],
+            "Oslo");
+  EXPECT_EQ(result.calls[4].tool_index, 9999);
+  EXPECT_EQ(result.calls[4].name, "calculate");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[4].parameters)["expression"],
+            "9999 + 1");
 }
 
 // Test edge case: nested braces in JSON
@@ -609,32 +601,6 @@ TEST_F(KimiK2DetectorTest, StreamingParseIncrementalArguments) {
   EXPECT_EQ(result6.calls.size(), 1);
   EXPECT_FALSE(result6.calls[0].name.has_value());
   EXPECT_EQ(result6.calls[0].parameters, "}");
-}
-
-TEST_F(KimiK2DetectorTest, StreamingParseStateReset) {
-  // Test that streaming state is properly reset between different parsing
-  // sessions
-
-  // First complete tool call
-  std::string text1 =
-      "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_current_"
-      "weather:0 <|tool_call_argument_begin|>{\"location\": "
-      "\"Beijing\"}<|tool_call_end|>";
-  auto result1 = detector_->parse_streaming_increment(text1, tools_);
-
-  // Create a new detector to simulate fresh state
-  auto fresh_detector = std::make_unique<KimiK2Detector>();
-
-  // Second complete tool call with fresh detector
-  std::string text2 =
-      "<|tool_calls_section_begin|><|tool_call_begin|>functions.calculate:0 "
-      "<|tool_call_argument_begin|>{\"expression\": \"1+1\"}<|tool_call_end|>";
-  auto result2 = fresh_detector->parse_streaming_increment(text2, tools_);
-
-  EXPECT_EQ(result2.calls.size(), 1);
-  EXPECT_EQ(result2.calls[0].name.value(), "calculate");
-  EXPECT_EQ(result2.calls[0].tool_index,
-            0);  // Should start from 0 with fresh state
 }
 
 }  // namespace function_call

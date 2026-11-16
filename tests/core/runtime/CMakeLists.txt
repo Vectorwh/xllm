@@ -157,6 +157,8 @@ if(USE_NPU)
     SRCS dspark_decode_step_test.cpp
     DEPS :runtime :models :batch :block :platform GTest::gtest_main
   )
+  target_compile_definitions(dspark_decode_step_test PRIVATE
+    XLLM_RUNTIME_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(dspark_decode_step_test PRIVATE
     torch_npu torch_python Python::Python ascendcl hccl c_sec nnopbase)
   target_link_options(dspark_decode_step_test PRIVATE
@@ -303,10 +305,10 @@ if(USE_NPU)
     "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
     "-Wl,--no-whole-archive")
 
-  # This case captures and replays three ACL graphs on NPU 0. Running it
+  # This case captures and replays an ACL graph on NPU 0. Running it
   # alongside hundreds of torch_npu test processes can stall graph cleanup.
   set_tests_properties(
-    AclGraphTaskUpdateTest.StaticMtpPrepareReplaysFiaSpecVerifyWidths
+    AclGraphTaskUpdateTest.FiaSpecVerifyDeclinesStaticPrepareAndReplaysDynamically
     PROPERTIES RUN_SERIAL TRUE)
 endif()
 

@@ -13,20 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <cnrt.h>
 #include <framework/core/MLUStream.h>
 #include <framework/core/device.h>
 #include <framework/core/stream_guard.h>
 #include <framework/graphs/MLUGraph.h>
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -464,7 +460,10 @@ TEST(FusedIndexerKTest, ReplaysChangingLiveMetadataAndAccumulatesCache) {
     torch::Tensor expected =
         torch::full_like(data.cache.cpu(), kSentinel).view({-1, 128});
     data.cache.fill_(kSentinel);
-    for (int64_t step = 0; step < 1000; ++step) {
+    // Two rotations exercise every metadata state repeatedly without an
+    // otherwise identical 1000-replay device soak in the regular test suite.
+    for (int64_t step = 0; step < 2 * static_cast<int64_t>(states.size());
+         ++step) {
       const int64_t id = step % static_cast<int64_t>(states.size());
       const State& state = states[id];
       data.x.copy_(x + id / 32.0);
@@ -548,6 +547,7 @@ TEST(FusedIndexerKTest, RejectsInvalidTensorContracts) {
       "device");
 }
 
+// Opt-in: the cache and sparse RoPE stride exercise real multi-GiB offsets.
 TEST(FusedIndexerKTest, DISABLED_Uses64BitCacheAndRopeOffsets) {
   const torch::DeviceGuard guard(
       torch::Device(torch::kPrivateUse1, torch_mlu::current_device()));
@@ -601,150 +601,5 @@ TEST(FusedIndexerKTest, DISABLED_Uses64BitCacheAndRopeOffsets) {
   }
 }
 
-struct Timing {
-  double event_us;
-  double host_us;
-};
-
-Timing measure(const std::function<void()>& call) {
-  for (int32_t i = 0; i < 10; ++i) {
-    call();
-  }
-  torch_mlu::synchronize();
-  cnrtNotifier_t start, end;
-  CHECK_EQ(cnrtNotifierCreate(&start), cnrtSuccess);
-  CHECK_EQ(cnrtNotifierCreate(&end), cnrtSuccess);
-  Timing total{};
-  for (int32_t group = 0; group < 3; ++group) {
-    const auto begin = std::chrono::steady_clock::now();
-    CHECK_EQ(cnrtPlaceNotifier(start, torch_mlu::getCurMLUStream()),
-             cnrtSuccess);
-    for (int32_t i = 0; i < 100; ++i) {
-      call();
-    }
-    CHECK_EQ(cnrtPlaceNotifier(end, torch_mlu::getCurMLUStream()), cnrtSuccess);
-    torch_mlu::synchronize();
-    float elapsed_ms = 0;
-    CHECK_EQ(cnrtNotifierElapsedTime(start, end, &elapsed_ms), cnrtSuccess);
-    total.event_us += elapsed_ms * 1000.0 / 100.0;
-    total.host_us += std::chrono::duration<double, std::micro>(
-                         std::chrono::steady_clock::now() - begin)
-                         .count() /
-                     100.0;
-  }
-  CHECK_EQ(cnrtNotifierDestroy(start), cnrtSuccess);
-  CHECK_EQ(cnrtNotifierDestroy(end), cnrtSuccess);
-  return {total.event_us / 3, total.host_us / 3};
-}
-
-TEST(FusedIndexerKTest, DISABLED_ReportsPairedLatency) {
-  const torch::DeviceGuard guard(
-      torch::Device(torch::kPrivateUse1, torch_mlu::current_device()));
-  for (const auto& [mx, mk] :
-       std::vector<std::pair<int64_t, int64_t>>{{16, 16},
-                                                {96, 96},
-                                                {127, 127},
-                                                {128, 128},
-                                                {129, 129},
-                                                {255, 255},
-                                                {256, 256},
-                                                {257, 257},
-                                                {128, 129},
-                                                {129, 128},
-                                                {256, 129},
-                                                {129, 256},
-                                                {511, 0},
-                                                {512, 0},
-                                                {513, 0},
-                                                {0, 511},
-                                                {0, 512},
-                                                {0, 513},
-                                                {2048, 16384}}) {
-    Inputs data = make_inputs(mx, mk);
-    const int64_t requests = mx == 16 || mx == 96 ? 16 : 1;
-    const int64_t rows = mk / requests;
-    torch::Tensor base_head;
-    const auto baseline = [&]() {
-      base_head = torch::matmul(data.x, data.wp.t()).to(torch::kFloat32) / 64;
-      for (int64_t begin = 0; begin < mk; begin += rows) {
-        torch::Tensor key =
-            torch::matmul(data.latent.slice(0, begin, begin + rows),
-                          data.wk.t())
-                .to(torch::kFloat32);
-        key = (key * torch::rsqrt(key.square().mean(-1, true) + 1e-20) *
-               data.gamma.to(torch::kFloat32))
-                  .to(torch::kBFloat16);
-        const torch::Tensor table = data.rope.index_select(
-            0, data.positions.slice(0, begin, begin + rows).to(torch::kInt64));
-        const torch::Tensor tail = key.slice(1, 64).to(torch::kFloat32);
-        const torch::Tensor pairs = tail.reshape({rows, 32, 2});
-        const torch::Tensor swapped =
-            torch::stack({-pairs.select(2, 1), pairs.select(2, 0)}, -1)
-                .reshape({rows, 64});
-        key.slice(1, 64).copy_(
-            (tail * table.slice(1, 0, 64) + swapped * table.slice(1, 64))
-                .to(torch::kBFloat16));
-        data.cache.view({-1, 128}).index_copy_(
-            0, data.slots.slice(0, begin, begin + rows).to(torch::kInt64), key);
-      }
-    };
-    const Timing prepared = measure([&]() {
-      Inputs merged = data;
-      std::vector<torch::Tensor> latent, positions, slots;
-      latent.reserve(requests);
-      positions.reserve(requests);
-      slots.reserve(requests);
-      for (int64_t begin = 0; begin < mk; begin += rows) {
-        latent.emplace_back(data.latent.slice(0, begin, begin + rows));
-        positions.emplace_back(data.positions.slice(0, begin, begin + rows));
-        slots.emplace_back(data.slots.slice(0, begin, begin + rows));
-      }
-      if (requests > 1) {
-        merged.latent = torch::cat(latent, 0);
-        merged.positions = torch::cat(positions, 0);
-        merged.slots = torch::cat(slots, 0);
-      }
-      run(merged);
-    });
-    LOG(INFO) << "indexer_k x=" << mx << " k=" << mk << " requests=" << requests
-              << " prepared_fused_event_us=" << prepared.event_us
-              << " prepared_fused_host_us=" << prepared.host_us;
-    for (const bool capture : {false, true}) {
-      torch_mlu::MLUGraph base_graph, fused_graph;
-      if (capture) {
-        baseline();
-        run(data);
-        torch_mlu::synchronize();
-        torch_mlu::mlu::MLUStreamGuard stream(torch_mlu::getStreamFromPool(
-            /*isHighPriority=*/false, data.x.device().index()));
-        base_graph.capture_begin();
-        baseline();
-        base_graph.capture_end();
-        fused_graph.capture_begin();
-        run(data);
-        fused_graph.capture_end();
-      }
-      const Timing base = measure([&]() {
-        if (capture) {
-          base_graph.replay();
-        } else {
-          baseline();
-        }
-      });
-      const Timing fused = measure([&]() {
-        if (capture) {
-          fused_graph.replay();
-        } else {
-          run(data);
-        }
-      });
-      LOG(INFO) << "indexer_k x=" << mx << " k=" << mk << " graph=" << capture
-                << " baseline_event_us=" << base.event_us
-                << " fused_event_us=" << fused.event_us
-                << " baseline_host_us=" << base.host_us
-                << " fused_host_us=" << fused.host_us;
-    }
-  }
-}
 }  // namespace
 }  // namespace xllm::kernel::mlu::bangc

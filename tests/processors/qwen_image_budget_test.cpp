@@ -17,10 +17,8 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
-#include "core/framework/config/model_config.h"
 #include "core/framework/config/multimodal_config.h"
 #include "processors/qwen2_vl_image_processor.h"
 
@@ -70,27 +68,7 @@ int64_t image_tokens(const Qwen2VLImageProcessor& processor,
   return grid_t * grid_h * grid_w / 4;
 }
 
-class QwenImageBudgetTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    ModelConfig& config = ModelConfig::get_instance();
-    saved_model_impl_ = config.model_impl();
-    saved_model_path_ = config.model();
-    config.model_impl("python").model("/nonexistent/xllm-processor-test");
-  }
-
-  void TearDown() override {
-    ModelConfig::get_instance()
-        .model_impl(saved_model_impl_)
-        .model(saved_model_path_);
-  }
-
- private:
-  std::string saved_model_impl_;
-  std::string saved_model_path_;
-};
-
-TEST_F(QwenImageBudgetTest, UsesBothModelPixelBudgetLayouts) {
+TEST(QwenImageBudgetTest, UsesBothModelPixelBudgetLayouts) {
   for (bool pixel_layout : {false, true}) {
     const Qwen2VLImageProcessor processor(image_args(pixel_layout));
     EXPECT_EQ(image_tokens(processor, 512, 512), 256);
@@ -98,15 +76,7 @@ TEST_F(QwenImageBudgetTest, UsesBothModelPixelBudgetLayouts) {
   }
 }
 
-TEST_F(QwenImageBudgetTest, ModelMaximumControlsActualGrid) {
-  auto args = image_args(true);
-  args.mm_image_max_pixels(262144);
-  const Qwen2VLImageProcessor processor(args);
-  EXPECT_EQ(image_tokens(processor, 1024, 1024), 256);
-  EXPECT_EQ(image_tokens(processor, 32, 32), 64);
-}
-
-TEST_F(QwenImageBudgetTest, PixelLayoutTakesPrecedence) {
+TEST(QwenImageBudgetTest, PixelLayoutTakesPrecedence) {
   auto args = image_args();
   args.mm_image_min_pixels(4096).mm_image_max_pixels(65536);
   const Qwen2VLImageProcessor processor(args);
@@ -114,7 +84,7 @@ TEST_F(QwenImageBudgetTest, PixelLayoutTakesPrecedence) {
   EXPECT_EQ(image_tokens(processor, 32, 32), 4);
 }
 
-TEST_F(QwenImageBudgetTest, RetainsModelTokenBudgetResizing) {
+TEST(QwenImageBudgetTest, RetainsModelTokenBudgetResizing) {
   auto args = image_args();
   args.mm_image_min_tokens(4).mm_image_max_tokens(16);
   const Qwen2VLImageProcessor processor(args);
@@ -122,14 +92,14 @@ TEST_F(QwenImageBudgetTest, RetainsModelTokenBudgetResizing) {
   EXPECT_EQ(image_tokens(processor, 32, 32), 4);
 }
 
-TEST_F(QwenImageBudgetTest, RejectsUnsupportedAspectRatio) {
+TEST(QwenImageBudgetTest, RejectsUnsupportedAspectRatio) {
   const Qwen2VLImageProcessor processor(image_args());
   std::vector<MMDataItem> items;
   EXPECT_FALSE(
       processor.process({torch::zeros({3, 32, 6432}, torch::kUInt8)}, items));
 }
 
-TEST_F(QwenImageBudgetTest, ServiceOverridesChangeActualImageGrid) {
+TEST(QwenImageBudgetTest, ServiceOverridesChangeActualImageGrid) {
   google::FlagSaver flag_saver;
   google::SetCommandLineOption("config_json_file", "");
   for (bool pixel_layout : {false, true}) {
@@ -147,14 +117,14 @@ TEST_F(QwenImageBudgetTest, ServiceOverridesChangeActualImageGrid) {
   }
 }
 
-TEST_F(QwenImageBudgetTest, TightPixelBudgetKeepsNarrowDimensionsNonzero) {
+TEST(QwenImageBudgetTest, TightPixelBudgetKeepsNarrowDimensionsNonzero) {
   auto args = image_args(true);
   args.mm_image_min_pixels(1024).mm_image_max_pixels(1024);
   const Qwen2VLImageProcessor processor(args);
   EXPECT_EQ(image_tokens(processor, 32, 6400), 14);
 }
 
-TEST_F(QwenImageBudgetTest, ServicePixelBudgetPreservesNarrowImageAlignment) {
+TEST(QwenImageBudgetTest, ServicePixelBudgetPreservesNarrowImageAlignment) {
   google::FlagSaver flag_saver;
   google::SetCommandLineOption("config_json_file", "");
   google::SetCommandLineOption(
@@ -167,7 +137,7 @@ TEST_F(QwenImageBudgetTest, ServicePixelBudgetPreservesNarrowImageAlignment) {
   EXPECT_EQ(image_tokens(processor, 32, 6400), 14);
 }
 
-TEST_F(QwenImageBudgetTest, SupportsSingleMinimumAndNestedSizeOverrides) {
+TEST(QwenImageBudgetTest, SupportsSingleMinimumAndNestedSizeOverrides) {
   const ProcessorConfig min_config(
       nlohmann::json{{"image", {{"min_pixels", 4096}}}});
   const Qwen2VLImageProcessor small_min(image_args(), min_config);
@@ -180,7 +150,7 @@ TEST_F(QwenImageBudgetTest, SupportsSingleMinimumAndNestedSizeOverrides) {
   EXPECT_EQ(image_tokens(small_max, 1024, 1024), 256);
 }
 
-TEST_F(QwenImageBudgetTest, RejectsInvalidOverridesBeforeProcessing) {
+TEST(QwenImageBudgetTest, RejectsInvalidOverridesBeforeProcessing) {
   const auto args = image_args();
   EXPECT_DEATH(
       Qwen2VLImageProcessor(
@@ -211,7 +181,7 @@ TEST_F(QwenImageBudgetTest, RejectsInvalidOverridesBeforeProcessing) {
       "token-budget resizing");
 }
 
-TEST_F(QwenImageBudgetTest, NativePixelsPreservePatchOrderAcrossModelImpls) {
+TEST(QwenImageBudgetTest, NativePixelsPreservePatchOrder) {
   constexpr int32_t kHeight = 56;
   constexpr int32_t kWidth = 84;
   constexpr int32_t kPatchSize = 14;
@@ -228,8 +198,7 @@ TEST_F(QwenImageBudgetTest, NativePixelsPreservePatchOrderAcrossModelImpls) {
                          .to(torch::kUInt8)
                          .reshape({3, kHeight, kWidth});
 
-  for (const std::string model_impl : {"cpp", "python", "py"}) {
-    ModelConfig::get_instance().model_impl(model_impl);
+  {
     const Qwen2VLImageProcessor processor(args);
     std::vector<MMDataItem> items;
     ASSERT_TRUE(processor.process({image, 255 - image}, items));

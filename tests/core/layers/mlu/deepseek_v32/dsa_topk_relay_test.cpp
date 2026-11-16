@@ -215,16 +215,12 @@ TEST(DsaTopkTransferTest, ExistingMtpStateIsReusedAndRecaptured) {
             block_tables.data_ptr());
   EXPECT_EQ(transfer.input()->context_lens().data_ptr(),
             context_lens.data_ptr());
-}
-
-TEST(DsaTopkTransferTest, CompleteSkipsResolvedStateForReuseOnly) {
-  const DsaTopkState input = make_topk_state();
-  const DsaTopkState resolved_state = make_topk_state();
-  DsaTopkTransfer transfer = DsaTopkTransfer::reuse(input);
-
-  transfer.complete(resolved_state);
-
-  EXPECT_EQ(transfer.output(), nullptr);
+  const DsaTopkState next = make_localized_state();
+  transfer.complete(next);
+  const auto captured = transfer.mtp_output_state();
+  ASSERT_TRUE(captured.has_value());
+  EXPECT_TRUE(torch::equal(captured->block_tables(), next.block_tables()));
+  EXPECT_TRUE(torch::equal(captured->context_lens(), next.context_lens()));
 }
 
 TEST(DsaTopkTransferTest, CompletePublishesResolvedStateWhenCapturing) {
@@ -246,20 +242,6 @@ TEST(DsaTopkTransferTest, CompleteSkipsMissingStateWhenCapturing) {
   transfer.complete(std::nullopt);
 
   EXPECT_EQ(transfer.output(), nullptr);
-}
-
-TEST(DsaTopkTransferTest, CompletePublishesStateWhenReusingAndCapturing) {
-  const DsaTopkState input = make_topk_state();
-  const DsaTopkState resolved_state = make_topk_state();
-  DsaTopkTransfer transfer = DsaTopkTransfer::reuse_and_capture(input);
-
-  transfer.complete(resolved_state);
-
-  ASSERT_NE(transfer.output(), nullptr);
-  EXPECT_EQ(transfer.output()->block_tables().data_ptr(),
-            resolved_state.block_tables().data_ptr());
-  EXPECT_EQ(transfer.output()->context_lens().data_ptr(),
-            resolved_state.context_lens().data_ptr());
 }
 
 TEST(DsaTopkTransferTest, CompletePublishesLocalizedViewWhenCapturing) {

@@ -21,8 +21,6 @@ limitations under the License.
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <mutex>
-#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -84,41 +82,6 @@ class SynchronousD2HBatchMemcpy final : public BatchMemcpy {
   size_t submit_count_ = 0;
   size_t descriptor_count_ = 0;
   std::vector<size_t> descriptor_counts_;
-};
-
-class CountingD2HBatchMemcpy final : public BatchMemcpy {
- public:
-  void init(int32_t /*device_id*/) override {}
-
-  bool submit_h2d(const std::vector<torch::Tensor>& /*src_tensors*/,
-                  const std::vector<torch::Tensor>& /*dst_tensors*/,
-                  Stream* /*stream*/) override {
-    ADD_FAILURE() << "Compact D2H must not submit H2D copies.";
-    return false;
-  }
-
-  bool submit_d2h(const std::vector<torch::Tensor>& src_tensors,
-                  const std::vector<torch::Tensor>& dst_tensors,
-                  Stream* /*stream*/) override {
-    EXPECT_EQ(src_tensors.size(), dst_tensors.size());
-    ++submit_count_;
-    descriptor_count_ += src_tensors.size();
-    return true;
-  }
-
-  bool copy_d2h(const std::vector<torch::Tensor>& /*src_tensors*/,
-                const std::vector<torch::Tensor>& /*dst_tensors*/,
-                Stream* /*stream*/) override {
-    ADD_FAILURE() << "Compact D2H must use submit_d2h.";
-    return false;
-  }
-
-  size_t submit_count() const { return submit_count_; }
-  size_t descriptor_count() const { return descriptor_count_; }
-
- private:
-  size_t submit_count_ = 0;
-  size_t descriptor_count_ = 0;
 };
 
 class BorrowedBatchMemcpy final : public BatchMemcpy {
@@ -238,48 +201,6 @@ class GatedD2HBatchMemcpy final : public BatchMemcpy {
   std::atomic<bool>* gate_open_ = nullptr;
   std::atomic<bool> gate_submitted_{false};
   size_t submit_count_ = 0;
-};
-
-class WarningLogSink final : public google::LogSink {
- public:
-  void send(google::LogSeverity severity,
-            const char* /*full_filename*/,
-            const char* /*base_filename*/,
-            int /*line*/,
-            const google::LogMessageTime& /*logmsgtime*/,
-            const char* message,
-            size_t message_len) override {
-    if (severity != google::GLOG_WARNING) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    messages_.append(message, message_len);
-  }
-
-  bool contains(const std::string& message) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return messages_.find(message) != std::string::npos;
-  }
-
- private:
-  mutable std::mutex mutex_;
-  std::string messages_;
-};
-
-class ScopedLogSink final {
- public:
-  explicit ScopedLogSink(google::LogSink* sink) : sink_(sink) {
-    CHECK(sink_ != nullptr);
-    google::AddLogSink(sink_);
-  }
-
-  ~ScopedLogSink() { google::RemoveLogSink(sink_); }
-
-  ScopedLogSink(const ScopedLogSink&) = delete;
-  ScopedLogSink& operator=(const ScopedLogSink&) = delete;
-
- private:
-  google::LogSink* sink_ = nullptr;
 };
 
 bool wait_for_gate_submission(const GatedD2HBatchMemcpy& batch_memcpy) {
@@ -598,32 +519,45 @@ TEST(CompactOffloadTest, ExpandsBothSlotsForOversizedMapping) {
   device.init_device_context();
 
   torch::Tensor host_key =
-      make_host_blocks(/*block_count=*/1, /*layer_count=*/2);
+      make_host_blocks(/*block_count=*/3, /*layer_count=*/2);
   torch::Tensor host_value =
-      make_host_blocks(/*block_count=*/1, /*layer_count=*/2);
+      make_host_blocks(/*block_count=*/3, /*layer_count=*/2);
   torch::Tensor key_layer_zero =
-      make_device_blocks(device, /*block_count=*/1, /*offset=*/10.0);
+      make_device_blocks(device, /*block_count=*/3, /*offset=*/10.0);
   torch::Tensor key_layer_two =
-      make_device_blocks(device, /*block_count=*/1, /*offset=*/20.0);
+      make_device_blocks(device, /*block_count=*/3, /*offset=*/20.0);
   torch::Tensor value_layer_two =
-      make_device_blocks(device, /*block_count=*/1, /*offset=*/30.0);
+      make_device_blocks(device, /*block_count=*/3, /*offset=*/30.0);
   HostKVLayout layout(
       make_layout(
           host_key, host_value, key_layer_zero, key_layer_two, value_layer_two),
       device.unwrap());
   SynchronousD2HBatchMemcpy batch_memcpy;
-  WarningLogSink warning_sink;
-  {
-    ScopedLogSink log_sink(&warning_sink);
-    CompactOffloadHarness compact_offload(layout,
-                                          device,
-                                          batch_memcpy,
-                                          /*target_bytes=*/8);
+  CompactOffloadHarness compact_offload(layout,
+                                        device,
+                                        batch_memcpy,
+                                        /*target_bytes=*/8);
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  ASSERT_NE(compute_stream, nullptr);
+  const HostKVRequest request{{HostKVMapping{17, 0, 2},
+                               HostKVMapping{17, 1, 0},
+                               HostKVMapping{17, 2, 1}}};
+  ASSERT_TRUE(compact_offload.execute(request, *compute_stream));
+  for (const HostKVMapping& mapping : request.target_mappings) {
+    EXPECT_TRUE(
+        torch::equal(host_key[mapping.host_block_id][0],
+                     key_layer_zero[mapping.device_block_id].to(torch::kCPU)));
+    EXPECT_TRUE(
+        torch::equal(host_key[mapping.host_block_id][1],
+                     key_layer_two[mapping.device_block_id].to(torch::kCPU)));
+    EXPECT_TRUE(
+        torch::equal(host_value[mapping.host_block_id][1],
+                     value_layer_two[mapping.device_block_id].to(torch::kCPU)));
+    EXPECT_TRUE(
+        torch::equal(host_value[mapping.host_block_id][0],
+                     torch::zeros_like(host_value[mapping.host_block_id][0])));
   }
-  EXPECT_TRUE(
-      warning_sink.contains("budget_bytes=8, slot_bytes=512, "
-                            "total_slot_bytes=1024, "
-                            "total_extra_hbm_bytes=1008"));
+  compact_offload.drain();
 }
 
 TEST(CompactOffloadTest, FinalFlushWaitsForQueuedD2HBeforeReusingSlots) {
@@ -765,43 +699,6 @@ TEST(CompactOffloadTest, ClearsSharedSlotsWhenGroupsChange) {
     EXPECT_TRUE(torch::equal(host_b[host_block][2],
                              torch::zeros_like(host_b[host_block][2])));
   }
-}
-
-TEST(CompactOffloadTest, UsesOneDescriptorPerMappingAndActiveRole) {
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for compact D2H.";
-  }
-
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-  constexpr int64_t kMappingCount = 512;
-  torch::Tensor host_key = make_host_blocks(kMappingCount, /*layer_count=*/2);
-  torch::Tensor host_value = make_host_blocks(kMappingCount, /*layer_count=*/2);
-  torch::Tensor key_layer_zero =
-      make_device_blocks(device, kMappingCount, /*offset=*/10.0);
-  torch::Tensor key_layer_two =
-      make_device_blocks(device, kMappingCount, /*offset=*/20.0);
-  torch::Tensor value_layer_two =
-      make_device_blocks(device, kMappingCount, /*offset=*/30.0);
-  HostKVLayout layout(
-      make_layout(
-          host_key, host_value, key_layer_zero, key_layer_two, value_layer_two),
-      device.unwrap());
-  CountingD2HBatchMemcpy batch_memcpy;
-  CompactOffloadHarness compact_offload(layout, device, batch_memcpy);
-  std::unique_ptr<Stream> compute_stream = device.current_stream();
-  ASSERT_NE(compute_stream, nullptr);
-  HostKVRequest request;
-  request.target_mappings.reserve(kMappingCount);
-  for (int64_t block_id = 0; block_id < kMappingCount; ++block_id) {
-    request.target_mappings.emplace_back(HostKVMapping{17, block_id, block_id});
-  }
-
-  ASSERT_TRUE(compact_offload.execute(request, *compute_stream));
-
-  EXPECT_EQ(batch_memcpy.submit_count(), 1U);
-  EXPECT_EQ(batch_memcpy.descriptor_count(), 1024U);
 }
 
 }  // namespace

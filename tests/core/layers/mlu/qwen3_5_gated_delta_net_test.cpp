@@ -116,6 +116,10 @@ TEST(Qwen3_5GatedDeltaNetSplitTest, BuildRebasedSsmStateIndicesCreatesGroups) {
 class Qwen3_5GatedDeltaNetTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     torch::Device device(Platform::type_torch(), 0);
     Device xllm_device(device);
     xllm_device.set_seed(42);
@@ -401,6 +405,8 @@ TEST_F(Qwen3_5GatedDeltaNetTest, PrefillForward) {
   ModelInputParams input_params;
   input_params.embedding.linear_state_ids = {1};
 
+  KVCache sequential(LinearAttentionKVCacheTensors{
+      kv_cache_.get_conv_cache().clone(), kv_cache_.get_ssm_cache().clone()});
   auto output = layer->forward(hidden, metadata, kv_cache_, input_params);
   Device xllm_device(device_);
   xllm_device.synchronize_default_stream();
@@ -410,6 +416,22 @@ TEST_F(Qwen3_5GatedDeltaNetTest, PrefillForward) {
   auto out_cpu = output.flatten().to(torch::kFloat32).cpu();
   ASSERT_TRUE(torch::isfinite(out_cpu).all().item<bool>())
       << "Prefill output must be finite";
+  std::vector<torch::Tensor> rows;
+  rows.reserve(num_tokens);
+  for (int64_t row = 0; row < num_tokens; ++row) {
+    auto step = MakeDecodeMetadata(1);
+    rows.emplace_back(layer->forward(
+        hidden.narrow(0, row, 1), step, sequential, input_params));
+  }
+  const auto expected = torch::cat(rows).to(torch::kFloat32);
+  EXPECT_TRUE(
+      torch::allclose(output.to(torch::kFloat32), expected, 0.02, 0.002));
+  const double norm = torch::norm(expected, 2.0).item<double>();
+  ASSERT_GT(norm, 0.0);
+  EXPECT_LE(
+      torch::norm(output.to(torch::kFloat32) - expected, 2.0).item<double>() /
+          norm,
+      0.02);
 }
 
 TEST_F(Qwen3_5GatedDeltaNetTest, PrefillStoresSsmStateAtCheckpointGroupBase) {

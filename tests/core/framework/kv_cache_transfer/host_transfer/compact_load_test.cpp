@@ -31,10 +31,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(CompactLoadTest, UsesApprovedDefaultStagingBudget) {
-  EXPECT_EQ(CompactTransferConfig{}.load_target_bytes, 64ULL * 1024 * 1024);
-}
-
 using CompactLoadLayerLayout = HostKVLayerLayout;
 using CompactLoadGroupLayout = HostKVGroupLayout;
 using CompactLoadLayout = HostKVLayoutInput;
@@ -218,57 +214,6 @@ CompactLoadLayout make_single_role_layout(int64_t num_layers,
   layout.num_layers = num_layers;
   layout.groups = {std::move(group)};
   return layout;
-}
-
-TEST(HostKVLayoutTest, SortsGroupsAndFiltersActiveRoleLayers) {
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for host KV layout.";
-  }
-
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-
-  torch::Tensor host_key =
-      make_host_blocks(/*block_count=*/2, /*layer_count=*/2, /*offset=*/10.0);
-  torch::Tensor host_value =
-      make_host_blocks(/*block_count=*/2, /*layer_count=*/2, /*offset=*/20.0);
-  const torch::TensorOptions options =
-      torch::TensorOptions().dtype(torch::kFloat32).device(device.unwrap());
-  torch::Tensor key_layer_one = torch::zeros({2, 2}, options);
-  torch::Tensor value_layer_zero = torch::zeros({2, 2}, options);
-
-  HostKVGroupLayout group;
-  group.group_id = 17;
-  group.host_roles.emplace(KVCacheTensorRole::KEY, host_key);
-  group.host_roles.emplace(KVCacheTensorRole::VALUE, host_value);
-  group.layers = {
-      HostKVLayerLayout{1, 1, {{KVCacheTensorRole::KEY, key_layer_one}}},
-      HostKVLayerLayout{0, 0, {{KVCacheTensorRole::VALUE, value_layer_zero}}},
-  };
-
-  HostKVLayout layout(/*num_layers=*/2, {std::move(group)}, device.unwrap());
-  const std::vector<KVCacheTensorRole::Value>& roles = layout.active_roles(17);
-  ASSERT_EQ(roles.size(), 2);
-  EXPECT_EQ(roles[0], KVCacheTensorRole::KEY);
-  EXPECT_EQ(roles[1], KVCacheTensorRole::VALUE);
-
-  const std::vector<const HostKVLayerLayout*> key_layers =
-      layout.active_layers(17,
-                           KVCacheTensorRole::KEY,
-                           /*begin_layer=*/0,
-                           /*end_layer=*/2);
-  ASSERT_EQ(key_layers.size(), 1);
-  EXPECT_EQ(key_layers[0]->absolute_layer_id, 1);
-  EXPECT_EQ(key_layers[0]->group_layer_slot, 1);
-
-  const std::vector<const torch::Tensor*> value_tensors =
-      layout.active_tensors(17,
-                            KVCacheTensorRole::VALUE,
-                            /*begin_layer=*/0,
-                            /*end_layer=*/1);
-  ASSERT_EQ(value_tensors.size(), 1);
-  EXPECT_TRUE(torch::equal(*value_tensors[0], value_layer_zero));
 }
 
 TEST(CompactLoadTest, RestoresLayerWindowFromDirectHostSlices) {

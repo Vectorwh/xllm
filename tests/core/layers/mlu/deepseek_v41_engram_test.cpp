@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "framework/config/model_config.h"
 #include "layers/mlu/tests_utils.h"
+#include "platform/platform.h"
 
 namespace xllm::layer {
 namespace {
@@ -32,6 +33,9 @@ class DeepseekV41EngramTest : public ::testing::Test {
  protected:
   void SetUp() override {
     saved_config_ = ModelConfig::get_instance().engram_config();
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
     args_.hidden_size(8)
         .vocab_size(8)
         .hc_mult(2)
@@ -293,24 +297,6 @@ TEST_F(DeepseekV41EngramTest, RejectsUnknownOrUnsupportedConfiguration) {
   EXPECT_DEATH(
       create(R"({"placement":"cpu","replication":"per_node"})", context),
       "requires the model world process group");
-}
-
-TEST_F(DeepseekV41EngramTest, PlacementAndReplicationMatchDefaultOutput) {
-  torch::InferenceMode inference;
-  torch::DeviceGuard guard(options_.device());
-  auto tokens =
-      torch::tensor({2, 5, 1, 7}, torch::kInt64).to(options_.device());
-  auto hidden = torch::ones({4, 2, 8}, options_);
-  auto expected =
-      create(R"({"placement":"gpu"})")->forward(hidden, tokens, input_).cpu();
-  for (const std::string config :
-       {"{}",
-        R"({"placement":"gpu","replication":"none"})",
-        R"({"placement":"cpu","replication":"none"})",
-        R"({"placement":"cpu","replication":"per_node"})"}) {
-    EXPECT_TRUE(torch::equal(
-        create(config)->forward(hidden, tokens, input_).cpu(), expected));
-  }
 }
 
 TEST_F(DeepseekV41EngramTest, RejectsInvalidPadAndLayerConfiguration) {

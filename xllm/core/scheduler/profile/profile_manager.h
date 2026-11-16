@@ -108,8 +108,6 @@ class ProfileManager {
                      int32_t batch_size = 1,
                      int32_t extra_token_length = 0,
                      bool is_graph_warmup = true);
-  double run_request(const std::vector<int32_t>& token_length_vec,
-                     const std::vector<int32_t>& prefix_length_vec);
 
   // Generate a batch of decode requests in DECODE stage and execute one decode
   // step, then return the step latency.
@@ -164,10 +162,6 @@ class ProfileManager {
                                         int32_t total_length);
 
   std::string generate_filename(const std::string& file_suffix);
-
-  void eval_sequence_latency_prediction();
-
-  void eval_batch_latency_prediction(const std::string mode);
 
   void profile_token_budget();
 

@@ -20,6 +20,7 @@ limitations under the License.
 #include <unistd.h>
 
 #include <cerrno>
+#include <csignal>
 #include <unordered_map>
 #include <vector>
 
@@ -370,7 +371,17 @@ void check_two_ranks(RankCheck check) {
   children.reserve(kWorldSize);
   for (int32_t rank = 0; rank < kWorldSize; ++rank) {
     const pid_t child = ::fork();
-    ASSERT_GE(child, 0);
+    if (child < 0) {
+      for (const pid_t started : children) {
+        ::kill(started, SIGKILL);
+      }
+      for (const pid_t started : children) {
+        int32_t status = 0;
+        while (::waitpid(started, &status, 0) < 0 && errno == EINTR) {
+        }
+      }
+      FAIL() << "fork failed: " << errno;
+    }
     if (child == 0) {
       ::_exit(run_rank(rank, port, check));
     }

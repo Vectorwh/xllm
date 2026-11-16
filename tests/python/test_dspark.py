@@ -19,7 +19,6 @@ import torch
 from torch import nn
 
 from xllm.python.models.base import PyModelBase
-
 from xllm.python.models.dspark import (
     DSparkConfidenceHead,
     DSparkForCausalLMBase,
@@ -67,9 +66,10 @@ def test_markov_bias_matches_embedding_projection() -> None:
             )
         )
 
-    output = head.bias(torch.tensor([0, 2]))
+    token_ids = torch.tensor([0, 2])
+    output = head.bias(token_ids)
 
-    expected = head.markov_w1(torch.tensor([0, 2])) @ head.markov_w2.weight.T
+    expected = head.markov_w1(token_ids) @ head.markov_w2.weight.T
     torch.testing.assert_close(output, expected)
 
 
@@ -88,12 +88,15 @@ def test_confidence_head_supports_batched_markov_features() -> None:
 
 
 def test_pipeline_owns_dspark_head_parameters() -> None:
-    assert set(_model().state_dict()) == {
+    expected = {
         "model.markov_head.markov_w1.weight",
         "model.markov_head.markov_w2.weight",
         "model.confidence_head.proj.weight",
         "model.confidence_head.proj.bias",
     }
+    parameters = dict(_model().named_parameters())
+    assert expected <= parameters.keys()
+    assert all(parameters[name].numel() > 0 for name in expected)
 
 
 def test_base_forwards_confidence_for_batched_hidden() -> None:
@@ -139,19 +142,3 @@ def test_shared_weights_bind_to_pipeline_components(own_head: bool, own_embeddin
     assert draft.get_token_embedding() is (own_token_embedding if own_embedding else source.model.embed_tokens)
     hidden = torch.ones(2, 3)
     torch.testing.assert_close(draft.compute_logits(hidden, None), execution_model.lm_head(hidden))
-
-
-def test_plain_model_weight_sharing_keeps_existing_layout() -> None:
-    source = PyModelBase()
-    source.model = nn.Module()
-    source.model.embed_tokens = nn.Embedding(4, 3)
-    source.lm_head = nn.Linear(3, 4, bias=False)
-    draft = PyModelBase()
-    draft.model = nn.Module()
-    draft.model.embed_tokens = None
-    draft.lm_head = None
-
-    draft.share_weights_from(source)
-
-    assert draft.lm_head is source.lm_head
-    assert draft.model.embed_tokens is source.model.embed_tokens

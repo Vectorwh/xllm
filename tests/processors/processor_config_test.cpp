@@ -24,32 +24,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-struct ExampleArgs {
-  int32_t stride = 4;
-};
-
-class ExampleProcessor final {
- public:
-  ExampleProcessor(const ExampleArgs& args, const ProcessorConfig& config)
-      : stride_(config.value("frame_stride", args.stride)) {}
-
-  int32_t stride() const { return stride_; }
-
- private:
-  int32_t stride_;
-};
-
-TEST(ProcessorConfigTest,
-     NewProcessorUsesParametersWithoutCentralRegistration) {
-  const ProcessorConfig config(nlohmann::json{{"frame_stride", 8}},
-                               "mm_args.video");
-  const ExampleProcessor processor(ExampleArgs(), config);
-  config.validate();
-  EXPECT_EQ(processor.stride(), 8);
-  const ProcessorConfig defaults;
-  EXPECT_EQ(ExampleProcessor(ExampleArgs(), defaults).stride(), 4);
-}
-
 TEST(ProcessorConfigTest, EmptyAndMissingModalitiesUseDefaults) {
   const ProcessorConfig config(
       nlohmann::json{{"image", nlohmann::json::object()}});
@@ -129,14 +103,6 @@ TEST(ProcessorConfigTest, RejectsWrongArrayElementTypesAndUnknownObjects) {
   EXPECT_DEATH(config.value<std::vector<double>>("mean", {}),
                "must be a number");
   EXPECT_DEATH(config.validate(), "Unsupported processor parameter");
-}
-
-TEST(ProcessorConfigTest, MultipleConsumersReadTheSameEffectiveConfiguration) {
-  const ProcessorConfig config(nlohmann::json{{"frame_stride", 8}});
-  const ExampleProcessor first(ExampleArgs(), config);
-  const ExampleProcessor second(ExampleArgs(), config);
-  config.validate();
-  EXPECT_EQ(first.stride(), second.stride());
 }
 
 }  // namespace

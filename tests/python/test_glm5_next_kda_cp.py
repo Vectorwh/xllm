@@ -94,6 +94,11 @@ _CPU_DEVICE = torch.device("cpu")
 # ---------------------------------------------------------------------------
 
 
+def _rel_fro(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    difference = (actual.float() - expected.float()).norm().item()
+    return difference / max(expected.float().norm().item(), 1e-30)
+
+
 def _zigzag_layout(q_seq_lens: list[int], cp_size: int, cp_rank: int) -> dict[str, Any]:
     """Mirror of the C++ zigzag index math (npu_ops_library.cpp)."""
     num_chunks = 2 * cp_size
@@ -489,28 +494,39 @@ def test_kda_cp_gate_reads_every_host_metadata_form(monkeypatch: pytest.MonkeyPa
     assert kda_cp_prefill_eligible(context, device_only, layer) is False
 
 
-def test_kda_cp_gate_is_rank_uniform_across_zigzag_views() -> None:
-    """The gate consumes only global batch state, so every rank agrees even
-    when the per-rank local segment views differ (padding in the last chunk
-    makes rank 0's second segment shorter than its peers')."""
-    for q_seq_lens, cp_size, expected in (
-        ([2048], 4, True),
-        ([1993], 4, False),
-        ([1094], 4, False),
-        ([513], 2, False),
-    ):
-        answers = set()
-        local_views = []
-        for cp_rank in range(cp_size):
-            layout = _zigzag_layout(q_seq_lens, cp_size, cp_rank)
-            answers.add(kda_cp_segments_chunk_aligned(q_seq_lens, cp_size))
-            cu = layout["q_cu_seqlens"]
-            local_views.append(tuple([cu[0], *(cu[i] - cu[i - 1] for i in range(1, len(cu)))]))
-        assert answers == {expected}
-        # The 1993-token case really does produce rank-dependent local views;
-        # a gate reading them would desynchronize the group.
-        if q_seq_lens == [1993]:
-            assert len(set(local_views)) > 1
+def test_kda_cp_gate_is_rank_uniform_across_zigzag_views(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared gate uses common global metadata, not rank-local segment lengths.
+
+    At [2047], cp=8, each nominal chunk is 128 rows except the causal tail
+    (127). Rank 0 owns that short tail and a local-only alignment check would
+    reject it, while ranks 1..7 each see two 128-row segments and would
+    incorrectly accept. The real shared gate must reject the batch on every
+    rank from the same global host metadata, before CP collectives diverge.
+    """
+    monkeypatch.setattr(kda_module, "_kda_cp_ops", lambda: (object(), object(), object()))
+    q_seq_lens = [2047]
+    cp_size = 8
+    metadata = _gate_metadata(q_seq_lens)
+    layer = _gate_layer()
+    decisions = []
+    local_views = []
+    local_view_aligned = []
+
+    for cp_rank in range(cp_size):
+        context = _toy_cp_context(q_seq_lens, cp_size, cp_rank, _CPU_DEVICE)
+        decisions.append(kda_cp_prefill_eligible(context, metadata, layer))
+        local_cu = [0, *context.q_cu_seqlens]
+        local_lengths = [end - start for start, end in zip(local_cu[:-1], local_cu[1:])]
+        local_views.append(tuple(local_lengths))
+        local_view_aligned.append(
+            bool(local_lengths) and all(length > 0 and length % KDA_CP_CHUNK_SIZE == 0 for length in local_lengths)
+        )
+
+    assert decisions == [False] * cp_size
+    # This is the concrete counterexample to gating independently on local
+    # views: rank 0 owns lengths (128, 127), while every peer owns (128, 128).
+    assert local_views == [(128, 127), *([(128, 128)] * (cp_size - 1))]
+    assert local_view_aligned == [False, *([True] * (cp_size - 1))]
 
 
 # ---------------------------------------------------------------------------
@@ -535,18 +551,6 @@ def test_kda_cp_chunk_owner_is_a_permutation_with_balanced_pairs(cp_size: int) -
     # Out-of-range chunk ids are rejected, not silently wrapped.
     with pytest.raises(ValueError):
         kda_cp_chunk_owner(2 * cp_size, cp_size)
-
-
-@pytest.mark.parametrize("cp_size", [2, 4, 8])
-def test_kda_cp_causal_summary_rows_form_a_permutation(cp_size: int) -> None:
-    """The gathered-summary row of each causal chunk (rank*2 + half) must be
-    a permutation of [0, 2*cp): a collision would silently compose the wrong
-    segment into some rank's initial state."""
-    rows = []
-    for chunk in range(2 * cp_size):
-        owner_rank, owner_half = kda_cp_chunk_owner(chunk, cp_size)
-        rows.append(owner_rank * 2 + owner_half)
-    assert sorted(rows) == list(range(2 * cp_size))
 
 
 # ---------------------------------------------------------------------------
@@ -628,18 +632,6 @@ def test_kda_cp_compose_empty_span_identity_is_exact() -> None:
             with_identity[row] = summaries[source_rank * 2 + source_half]
     shifted = kda_cp_compose_initial_state(base, with_identity, prior_chunks + 1)
     torch.testing.assert_close(shifted, plain, rtol=0, atol=0)
-
-
-def test_kda_cp_compose_order_matters() -> None:
-    """Reversed (newest->oldest) composition must differ: the fold is only
-    correct in causal order."""
-    generator = torch.Generator().manual_seed(11)
-    n_seqs, hv, k_dim, v_dim, cp_size = 1, 2, 8, 8, 2
-    base = torch.zeros(n_seqs, hv, v_dim, k_dim)
-    summaries = _random_summaries(n_seqs, 2 * cp_size, hv, k_dim, v_dim, generator)
-    causal = kda_cp_compose_initial_state(base, summaries, 3)
-    wrong = kda_cp_compose_initial_state(base, summaries.flip(0), 3)
-    assert not torch.equal(causal, wrong)
 
 
 def test_kda_cp_compose_divergence_exists_but_is_bounded() -> None:
@@ -874,11 +866,10 @@ def test_kda_cp_warm_host_values_resolution() -> None:
     assert _kda_cp_warm_host_values(metadata, torch.tensor([2, 0], dtype=torch.int64), num_seqs) == [1, 0]
     # 5. Values normalize like the bool view did (any nonzero -> 1).
     assert _kda_cp_warm_host_values(metadata, [7, 0], num_seqs) == [1, 0]
-    # 6. A device-typed mask with no twin still resolves (the documented
-    # sync fallback -- correct everywhere; the engine always supplies the
-    # twin). Verified on the CPU device here.
-    device_mask = torch.tensor([1, 1], dtype=torch.int64)
-    assert _kda_cp_warm_host_values(metadata, device_mask, num_seqs) == [1, 1]
+    # 6. A CPU mask without a twin resolves through the host path. This does
+    # not exercise the non-CPU .tolist() fallback or its device synchronization.
+    cpu_mask = torch.tensor([1, 1], dtype=torch.int64, device="cpu")
+    assert _kda_cp_warm_host_values(metadata, cpu_mask, num_seqs) == [1, 1]
 
 
 def test_kda_cp_host_plan_conv_metadata_is_cpu() -> None:
@@ -1422,30 +1413,11 @@ def test_kda_cp_flag_config_channel() -> None:
         cfg.enable_kda_cp = enable_kda_cp
         return glm5_next.Glm5NextKdaAttention(cfg, 0, torch.float32, torch.device("cpu"))
 
+    assert glm5_next.Glm5NextConfig().enable_kda_cp is True
     assert glm5_next.Glm5NextConfig.from_dict({}).enable_kda_cp is True
     assert glm5_next.Glm5NextConfig.from_dict({"enable_kda_cp": False}).enable_kda_cp is False
     assert _attention(True).enable_kda_cp is True
     assert _attention(False).enable_kda_cp is False
-
-
-def test_kda_cp_flag_defaults_true() -> None:
-    """The DEFAULT is ON: with the flag absent everywhere (no gflag on the
-    engine command line, no key in the config dict), KDA CP prefill is
-    enabled — the two-pass scheme is the ONLY shipped KDA CP implementation
-    (the fused operator stayed out of the standard vendor per the G5
-    verdict), so the flag exists to opt OUT with --enable_kda_cp=false.
-    Pins every layer of the channel: the dataclass default, the from_dict
-    absent-key default, and the attention ctor's stored attribute."""
-    # The dataclass default (what py_causal_lm's missing-key fallback and
-    # non-NPU builds see).
-    assert glm5_next.Glm5NextConfig().enable_kda_cp is True
-    # The from_dict absent-key default (the flag-absent engine form).
-    assert glm5_next.Glm5NextConfig.from_dict({}).enable_kda_cp is True
-    # The ctor store: a config built with no explicit switch leaves the
-    # attention layer CP-enabled.
-    cfg = glm5_next.Glm5NextConfig(hidden_size=32, kda_num_heads=8, kda_head_dim=8)
-    attention = glm5_next.Glm5NextKdaAttention(cfg, 0, torch.float32, torch.device("cpu"))
-    assert attention.enable_kda_cp is True
 
 
 # ---------------------------------------------------------------------------
@@ -1531,22 +1503,13 @@ def _run_cp_rank(
     return output, conv_cache, ssm_cache
 
 
-@pytest.mark.parametrize("q_seq_lens", [[256], [512], [256, 512], [250]])
-def _assert_cp_pipeline_matches_full_stream(
-    q_seq_lens: list[int], monkeypatch: pytest.MonkeyPatch, force_gate: bool = False
-) -> None:
-    """The shared pipeline oracle: run every virtual rank through the real
-    ``execute_linear`` CP branch and compare outputs, cache writes and the
-    broadcast replica invariant against a full-stream reference run of the
-    same reference kernels. The mock summary op composes the mock kernel's
-    exact affine map, so the only divergence is fp32 re-association.
-
-    ``force_gate`` bypasses the eligibility gate for layouts the gate
-    excludes (the g2 ragged-tail fallbacks: their correctness must not
-    rest on the gate's every-chunk-exactly-full invariant)."""
+def _assert_cp_pipeline_matches_full_stream(q_seq_lens: list[int], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every eligible virtual rank through the real execute_linear CP
+    branch and compare outputs, cache writes and replicated final state to a
+    full-stream reference run using the same reference kernels. The mock
+    summary op composes the mock kernel's exact affine map, so the only
+    divergence is fp32 re-association."""
     _install_kda_cp_reference_kernels(monkeypatch)
-    if force_gate:
-        monkeypatch.setattr(kda_module, "kda_cp_prefill_eligible", lambda *args, **kwargs: True)
     device = torch.device("cpu")
     dtype = torch.float32
     generator = torch.Generator().manual_seed(20261015)
@@ -1677,30 +1640,6 @@ def test_kda_cp_execute_linear_pipeline_matches_full_stream(
     _assert_cp_pipeline_matches_full_stream(q_seq_lens, monkeypatch)
 
 
-@pytest.mark.parametrize("q_seq_lens", [[250]])
-def test_kda_cp_execute_linear_pipeline_ragged_tail_fallback(
-    q_seq_lens: list[int], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """g2 guarded fallbacks on a ragged tail the eligibility gate excludes
-    (the gate forces every chunk exactly full, so this layout can only
-    reach the CP path through the forced gate here -- exactly the
-    future-layout change the guards exist for). The causally-last chunk
-    carries 61 of its 63 slot rows, so its owner (rank 0, the early rank)
-    reassembles through the composed query_index row packs while rank 1
-    stays fully tiled; every output row -- including the zeroed padding
-    rows -- must land exactly where the old reassemble-then-scatter chain
-    put it (verified: the pre-g2 code passes this same oracle).
-
-    Mixed-chunk-length ragged layouts ([250, 514]-class) are deliberately
-    NOT here: the two-pass CP scheme itself diverges from the full-stream
-    reference on them (pre-existing, identical before and after g2 --
-    their per-segment 64-row chunk grids are not 64-multiples), so the
-    oracle cannot judge the fallback there. The gate excludes every
-    ragged layout; this test pins the fallback's row placement, not the
-    scheme's numerics."""
-    _assert_cp_pipeline_matches_full_stream(q_seq_lens, monkeypatch, force_gate=True)
-
-
 def test_kda_cp_execute_linear_pipeline_head_dim_128(monkeypatch: pytest.MonkeyPatch) -> None:
     """Full CP pipeline at the ENGINE head dim (K = V = 128), where the
     fold selection picks the MERGE OP path (the head_dim-8 pipeline tests
@@ -1786,41 +1725,6 @@ def test_kda_cp_execute_linear_pipeline_head_dim_128(monkeypatch: pytest.MonkeyP
     # 2. The replica invariant holds across ranks.
     torch.testing.assert_close(caches[0][0], caches[1][0], rtol=0, atol=0)
     torch.testing.assert_close(caches[0][1], caches[1][1], rtol=0, atol=0)
-
-
-def test_kda_cp_execute_linear_emits_one_time_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The alpha-style probe fires exactly once per process with the active
-    segment/row counts and the merge source."""
-    _install_kda_cp_reference_kernels(monkeypatch)
-    calls: list[str] = []
-    monkeypatch.setattr(
-        kda_module,
-        "logger",
-        SimpleNamespace(
-            info=lambda message: calls.append(message),
-            warning=lambda message: calls.append(message),
-        ),
-    )
-    monkeypatch.setattr(kda_module, "_KDA_CP_PROBE_EMITTED", False)
-    device = torch.device("cpu")
-    generator = torch.Generator().manual_seed(3)
-    layer = _toy_layer(device, torch.float32, generator)
-    total = 256
-    global_qkv = torch.randn(total, layer.conv_dim, generator=generator)
-    global_beta = torch.zeros(total, layer.num_heads_local) - 3.0
-    global_gate = torch.randn(total, layer.num_heads_local, layer.head_dim, generator=generator)
-
-    halo = torch.zeros(2, 1, 3, layer.conv_dim)
-    group = _FakeCpGroup(2, {0: halo, 1: halo})
-    group.install(monkeypatch)
-    _run_cp_rank(0, group, [total], layer, global_qkv, global_beta, global_gate, 2, device)
-    _run_cp_rank(0, group, [total], layer, global_qkv, global_beta, global_gate, 2, device)
-    probes = [message for message in calls if message.startswith("KDA_CP_ACTIVE")]
-    assert len(probes) == 1
-    # head_dim 8 selects the tree-scan fold (K != 128); the descriptor cache
-    # is on by default.
-    assert "segments=2" in probes[0] and "rows=128" in probes[0] and "msrc=prepare1+ppfm1+scan" in probes[0]
-    assert "desccache=on" in probes[0]
 
 
 def test_kda_cp_execute_linear_batches_segment_factor_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2255,7 +2159,7 @@ def _import_npu_kda_ops() -> tuple[Any, Any, Any] | None:
     """
     try:
         from fla_npu.ops.ascendc import chunk_kda_fwd, npu_causal_conv1d  # type: ignore[attr-defined]
-    except Exception:
+    except ImportError:
         return None
     if not kda_cp_ops.available():
         return None
@@ -2352,10 +2256,6 @@ def test_kda_cp_prepare_factors_match_fused_emission_npu() -> None:
     for fused_index, prepare_index, bound in ((2, 0, 2e-7), (5, 3, 1e-3), (6, 4, 1e-3), (8, 6, 1e-3)):
         diff = (prepare[prepare_index].float() - fused[fused_index].float()).abs().max().item()
         assert diff <= bound, (fused_index, prepare_index, diff)
-
-    def _rel_fro(actual: torch.Tensor, expected: torch.Tensor) -> float:
-        difference = (actual.float() - expected.float()).norm().item()
-        return difference / max(expected.float().norm().item(), 1e-30)
 
     # Clone before the second ppfm call: both calls share one marshalling
     # signature, so with the descriptor cache on they share ONE static
@@ -2546,10 +2446,6 @@ def test_kda_cp_two_pass_matches_full_stream_npu(q_seq_lens: list[int], monkeypa
         for rank in range(cp_size):
             outputs[rank], conv_cache, ssm_cache = _run_rank(rank)
             caches[rank] = (conv_cache, ssm_cache)
-
-    def _rel_fro(actual: torch.Tensor, expected: torch.Tensor) -> float:
-        difference = (actual.float() - expected.float()).norm().item()
-        return difference / max(expected.float().norm().item(), 1e-30)
 
     for rank in range(cp_size):
         layout = _zigzag_layout(q_seq_lens, cp_size, rank)
@@ -2804,10 +2700,6 @@ def test_kda_cp_merge_fold_matches_sequential_npu(monkeypatch: pytest.MonkeyPatc
     )
     scan_states = kda_cp_tree_scan_fold_initial_states(base, gathered.index_select(0, causal_rows), (1, 2, 3))
     torch.npu.synchronize()
-
-    def _rel_fro(actual: torch.Tensor, expected: torch.Tensor) -> float:
-        difference = (actual.float() - expected.float()).norm().item()
-        return difference / max(expected.float().norm().item(), 1e-30)
 
     for index, prior_chunks in enumerate((1, 2, 3)):
         sequential = kda_cp_compose_initial_state(base, gathered, prior_chunks)

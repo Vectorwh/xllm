@@ -55,8 +55,6 @@ class NpuProfiler final {
   bool is_running() const;
 
  private:
-  friend class NpuProfilerLifecycleTest;
-
   NpuProfiler();
   ~NpuProfiler();
   NpuProfiler(const NpuProfiler&) = delete;

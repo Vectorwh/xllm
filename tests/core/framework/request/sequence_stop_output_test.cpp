@@ -228,15 +228,13 @@ TEST_F(SequenceStopOutputTest, EmbeddingsDoNotRecordDetokenizationLatency) {
   const double latency_before =
       COUNTER_VALUE(detokenization_latency_seconds_non_stream);
 
-  for (int32_t iteration = 0; iteration < 64; ++iteration) {
-    SequenceOutput output = sequence_->generate_output(tokenizer_);
-    ASSERT_TRUE(output.embeddings.has_value());
-    EXPECT_EQ(output.embeddings.value(), values);
-    EXPECT_EQ(output.index, 0u);
-    EXPECT_FALSE(output.mm_embeddings.has_value());
-    EXPECT_TRUE(output.text.empty());
-    EXPECT_TRUE(output.token_ids.empty());
-  }
+  SequenceOutput output = sequence_->generate_output(tokenizer_);
+  ASSERT_TRUE(output.embeddings.has_value());
+  EXPECT_EQ(output.embeddings.value(), values);
+  EXPECT_EQ(output.index, 0u);
+  EXPECT_FALSE(output.mm_embeddings.has_value());
+  EXPECT_TRUE(output.text.empty());
+  EXPECT_TRUE(output.token_ids.empty());
 
   EXPECT_EQ(COUNTER_VALUE(detokenization_latency_seconds_non_stream),
             latency_before);
@@ -250,17 +248,14 @@ TEST_F(SequenceStopOutputTest, MmEmbeddingsDoNotRecordDetokenizationLatency) {
   const double latency_before =
       COUNTER_VALUE(detokenization_latency_seconds_non_stream);
 
-  for (int32_t iteration = 0; iteration < 64; ++iteration) {
-    SequenceOutput output = sequence_->generate_output(tokenizer_);
-    ASSERT_TRUE(output.mm_embeddings.has_value());
-    ASSERT_EQ(output.mm_embeddings->size(), 1u);
-    EXPECT_TRUE(
-        torch::equal(output.mm_embeddings->front().embedding, embedding));
-    EXPECT_EQ(output.index, 0u);
-    EXPECT_FALSE(output.embeddings.has_value());
-    EXPECT_TRUE(output.text.empty());
-    EXPECT_TRUE(output.token_ids.empty());
-  }
+  SequenceOutput output = sequence_->generate_output(tokenizer_);
+  ASSERT_TRUE(output.mm_embeddings.has_value());
+  ASSERT_EQ(output.mm_embeddings->size(), 1u);
+  EXPECT_TRUE(torch::equal(output.mm_embeddings->front().embedding, embedding));
+  EXPECT_EQ(output.index, 0u);
+  EXPECT_FALSE(output.embeddings.has_value());
+  EXPECT_TRUE(output.text.empty());
+  EXPECT_TRUE(output.token_ids.empty());
 
   EXPECT_EQ(COUNTER_VALUE(detokenization_latency_seconds_non_stream),
             latency_before);

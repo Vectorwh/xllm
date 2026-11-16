@@ -140,7 +140,7 @@ Glm5DcpConfig create_glm5_dcp_config() {
   args.index_n_heads() = 32;
   args.index_head_dim() = 128;
   args.index_topk() = 2048;
-  args.max_position_embeddings() = 1048576;
+  args.max_position_embeddings() = 8192;
   args.rms_norm_eps() = 1e-5f;
   args.rope_theta() = 8000000.0f;
   args.rope_scaling_rope_type() = "default";
@@ -240,6 +240,9 @@ void check_close(const torch::Tensor& actual,
   CHECK(torch::isfinite(a).all().item<bool>()) << label;
   CHECK(torch::isfinite(b).all().item<bool>()) << label;
   const torch::Tensor error = (a - b).abs();
+  const double scale = torch::norm(b).item<double>();
+  CHECK_GT(scale, 0.0);
+  CHECK_LE(torch::norm(a - b).item<double>() / scale, 0.01) << label;
   // A zero-output implementation must fail the same elementwise contract.
   CHECK(!torch::allclose(torch::zeros_like(b), b, /*rtol=*/1e-2, /*atol=*/1e-2))
       << label << " reference is too small for a meaningful absolute tolerance";
@@ -522,7 +525,7 @@ void run_attention(int32_t rank,
   base.kv_split_size() = 1;
   ParallelArgs sharded(rank, kRanks, &group);
   sharded.tp_group_ = &group;
-  sharded.cp_group_ = &group;
+  sharded.cp_group_ = &self;
   sharded.single_rank_group_ = &self;
   sharded.cp_size() = 1;
   sharded.dp_size() = 1;

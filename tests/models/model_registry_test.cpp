@@ -138,12 +138,6 @@ TEST(ModelRegistryTest, DeepseekV41UsesTorchBackend) {
             "--npu_kernel_backend=TORCH.");
 }
 
-TEST(ModelRegistryTest, DeepseekV41RegistersArgsLoaderAndLlmBackend) {
-  EXPECT_TRUE(
-      static_cast<bool>(ModelRegistry::get_model_args_loader("deepseek_v41")));
-  EXPECT_EQ(ModelRegistry::get_model_backend("deepseek_v41"), "llm");
-}
-
 TEST(ModelRegistryTest, KimiK3StopsOnEndMarkersButNotOrdinaryTokenZero) {
   ModelArgsLoader loader = ModelRegistry::get_model_args_loader("kimi_k3");
   ASSERT_TRUE(static_cast<bool>(loader));

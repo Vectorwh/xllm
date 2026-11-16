@@ -22,8 +22,6 @@ from typing import Any
 import pytest
 import torch
 
-pytest.importorskip("torch_npu")
-
 from xllm.python.models import glm5_next_mtp
 
 

@@ -148,9 +148,6 @@ class LoRAMetrics {
   // the wait threshold is hit.
   void inc_affinity_deferred(const char* reason);
 
-  // For test / debug: how many adapters are currently tracked.
-  size_t adapter_count() const;
-
  private:
   LoRAMetrics();
   ~LoRAMetrics();

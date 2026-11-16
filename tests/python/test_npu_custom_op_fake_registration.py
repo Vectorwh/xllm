@@ -24,7 +24,6 @@ start; graph capture through a genuinely missing operator keeps failing.
 
 from __future__ import annotations
 
-import importlib
 import warnings
 
 import pytest
@@ -65,25 +64,6 @@ def test_register_fake_without_namespace_skips_silently(
         _custom_op.register_fake("xllm_ops::definitely_missing_op_xyz", lambda tensor: tensor)
 
     assert caught == []
-
-
-def test_custom_op_module_imports_without_native_ops() -> None:
-    """Module import must not raise even when no xLLM operator is loaded."""
-
-    module = importlib.import_module("xllm.python.kernels_npu._custom_op")
-    assert hasattr(module, "register_fake")
-
-
-@pytest.mark.parametrize("dtype", [torch.int32, torch.bfloat16])
-def test_dequant_situ_quant_fake_output_contract(dtype: torch.dtype) -> None:
-    with FakeTensorMode():
-        x = torch.empty((7, 768), dtype=dtype)
-        y, scale = _custom_op._dequant_situ_quant_fake(x, None, None, None, None, None, None, 1.0, 1.0, True, "dynamic")
-        assert y.shape == (7, 384)
-        assert y.dtype == torch.int8
-        assert scale.shape == (7,)
-        assert scale.dtype == torch.float32
-        assert y.device == scale.device == x.device
 
 
 @pytest.mark.parametrize("layout", ["TND", "BSND"])

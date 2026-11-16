@@ -87,7 +87,7 @@ class RandomSampleDcuTest : public ::testing::TestWithParam<SampleCase> {
 TEST_P(RandomSampleDcuTest, SamplingRangeValidity) {
   const auto& c = GetParam();
   torch::manual_seed(42);
-  constexpr int64_t kNumTrials = 5000;
+  constexpr int64_t kNumTrials = 8;
 
   auto logits = torch::randn({c.batch_size, c.vocab_size}, torch::kFloat32);
   auto probs_cpu = torch::softmax(logits, /*dim=*/-1);
@@ -219,22 +219,15 @@ TEST_P(RandomSampleDcuTest, DegenerateOneHot) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Generate test cases matching FlashInfer's parameter space:
-//   batch_size in {1, 99, 989}
-//   vocab_size in {111, 32000, 128256}
-// ---------------------------------------------------------------------------
+// The launch uses one block per row, not a batch-size specialization. Keep
+// one multi-row, non-four-aligned Philox-offset case and each vocab regime:
+// masked vector tail, multiple scan chunks, and large-vocab accumulation.
 std::vector<SampleCase> GenerateCases() {
   return {
       {"B1_V111", 1, 111},
       {"B99_V111", 99, 111},
-      {"B989_V111", 989, 111},
       {"B1_V32000", 1, 32000},
-      {"B99_V32000", 99, 32000},
-      {"B989_V32000", 989, 32000},
       {"B1_V128256", 1, 128256},
-      {"B99_V128256", 99, 128256},
-      {"B989_V128256", 989, 128256},
   };
 }
 

@@ -35,7 +35,9 @@ namespace {
 
 ForwardInput make_media_transport_input() {
   ForwardInput input;
-  input.token_ids = torch::tensor({1, 2, 3, 4}, torch::kInt32);
+  input.token_ids = torch::arange(18, torch::kInt32);
+  input.positions = torch::arange(9, torch::kInt32).repeat({2});
+  input.input_params.meta.num_sequences = 2;
   std::vector<MMData> requests;
   requests.reserve(2);
   for (int32_t request = 0; request < 2; ++request) {
@@ -49,7 +51,7 @@ ForwardInput make_media_transport_input() {
           std::vector<torch::Tensor>{torch::tensor({1, 2, 3}, torch::kInt64),
                                      torch::tensor({4}, torch::kInt32)};
       auto& state = item.mutable_state();
-      state.mutable_seq_index() = 13 + request * 16;
+      state.mutable_seq_index() = request;
       state.mutable_token_pos() = {occurrence * 3, 3};
       state.mutable_mm_token_num() = 2;
       state.mutable_mm_token_mask() =
@@ -78,7 +80,7 @@ void expect_media_transport(const ForwardInput& restored) {
       const auto& item = items[occurrence];
       const auto& state = item.state();
       EXPECT_EQ(item.type(), MMType::IMAGE);
-      EXPECT_EQ(state.seq_index(), 13 + request * 16);
+      EXPECT_EQ(state.seq_index(), request);
       EXPECT_EQ(state.token_pos().offset, occurrence * 3);
       EXPECT_EQ(state.token_pos().length, 3);
       EXPECT_EQ(state.mm_token_num(), 2);
@@ -366,7 +368,26 @@ TEST(BatchTransportTest, PreviewAndSplitPreserveUnexecutedSequenceState) {
 }
 
 TEST(BatchTransportTest, HostRestoreBatchRemainsAtomicAfterPreview) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(4);
+  BlockManagerImpl manager(options);
+  RequestSamplingParam sampling;
+  StoppingChecker stopping;
+  SequenceParams params;
+  params.seq_capacity = 8;
+  params.sampling_param = &sampling;
+  params.stopping_checker = &stopping;
+  params.request_id = "restore-first";
+  Sequence first(
+      0, {1, 2}, {}, {}, IncrementalDecoder("", 2, false, false), params);
+  params.request_id = "restore-second";
+  Sequence second(
+      0, {3, 4}, {}, {}, IncrementalDecoder("", 2, false, false), params);
+  first.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
+  second.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
   Batch batch;
+  batch.add(&first, 2);
+  batch.add(&second, 2);
   batch.require_host_restore();
   ModelArgs args;
   Batch preview_batch = batch;
@@ -375,6 +396,9 @@ TEST(BatchTransportTest, HostRestoreBatchRemainsAtomicAfterPreview) {
   EXPECT_TRUE(preview.input_params.meta.requires_host_restore);
   auto parts = batch.split_by_request();
   ASSERT_EQ(parts.size(), 1);
+  ASSERT_EQ(parts.front().size(), 2u);
+  EXPECT_EQ(parts.front().get_sequences(),
+            (std::vector<Sequence*>{&first, &second}));
   const auto input = parts[0].prepare_forward_input(args, nullptr);
   EXPECT_TRUE(input.input_params.meta.requires_host_restore);
 }
@@ -395,26 +419,35 @@ TEST(BatchTransportTest,
   MMDataItem item(MMType::IMAGE, MMDict{{"pixel_values", torch::ones({2, 3})}});
   item.mutable_state().mutable_token_pos().length = 4;
   item.mutable_state().mutable_seq_index() = 77;
-  item.mutable_state().mutable_schedule_data().start_pos = 91;
-  item.mutable_state().mutable_schedule_data().end_pos = 92;
-  MMData data(MMType::IMAGE, MMItemVec{item, item});
+  item.mutable_state().mutable_schedule_data().start_pos = 0;
+  item.mutable_state().mutable_schedule_data().end_pos = 4;
+  MMDataItem second_item = item;
+  second_item.mutable_state().mutable_token_pos().offset = 4;
+  MMData data(MMType::IMAGE, MMItemVec{item, second_item});
   Sequence sequence(0,
-                    {1, 2, 3, 4},
+                    {1, 2, 3, 4, 5, 6, 7, 8},
                     {},
                     data,
                     IncrementalDecoder("", 1, false, false),
                     params);
-  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
-  sequence.set_mrope_positions(torch::arange(4, torch::kInt32).expand({3, -1}));
+  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(2));
+  sequence.set_mrope_positions(torch::arange(8, torch::kInt32).expand({3, -1}));
   Batch batch;
-  batch.add(&sequence, 2);
+  batch.add(&sequence, 6);
   batch.require_host_restore();
   ModelArgs args;
   args.rope_scaling_rope_type("mrope");
   auto candidate = batch.prepare_forward_input_candidate(args, nullptr);
   const auto& before = sequence.mm_data().items<MMItemVec>().front().state();
   EXPECT_EQ(before.seq_index(), 77);
-  EXPECT_EQ(before.schedule_data().start_pos, 91);
+  EXPECT_EQ(before.schedule_data().start_pos, 0);
+  EXPECT_EQ(before.schedule_data().end_pos, 4);
+  const auto& second_before =
+      sequence.mm_data().items<MMItemVec>().back().state();
+  EXPECT_EQ(second_before.seq_index(), 77);
+  EXPECT_EQ(second_before.token_pos().offset, 4);
+  EXPECT_EQ(second_before.schedule_data().start_pos, 0);
+  EXPECT_EQ(second_before.schedule_data().end_pos, 4);
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0);
   const auto pixel_values =
       candidate.input().input_params.multimodal.mm_data.get<torch::Tensor>(
@@ -427,12 +460,18 @@ TEST(BatchTransportTest,
   const auto input = batch.commit_forward_input(std::move(candidate));
   EXPECT_EQ(input.token_ids.data_ptr(), token_storage);
   EXPECT_EQ(ForwardSharedMemoryManager::input_size(input), size);
-  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 2);
+  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 6);
   EXPECT_TRUE(input.input_params.meta.requires_host_restore);
   const auto& after = sequence.mm_data().items<MMItemVec>().front().state();
   EXPECT_EQ(after.seq_index(), 0);
   EXPECT_EQ(after.schedule_data().start_pos, 0);
-  EXPECT_EQ(after.schedule_data().end_pos, 2);
+  EXPECT_EQ(after.schedule_data().end_pos, 4);
+  const auto& second_after =
+      sequence.mm_data().items<MMItemVec>().back().state();
+  EXPECT_EQ(second_after.seq_index(), 0);
+  EXPECT_EQ(second_after.token_pos().offset, 4);
+  EXPECT_EQ(second_after.schedule_data().start_pos, 0);
+  EXPECT_EQ(second_after.schedule_data().end_pos, 2);
   EXPECT_TRUE(torch::equal(
       *input.input_params.multimodal.mm_data.get<torch::Tensor>("pixel_values"),
       torch::ones({4, 3})));

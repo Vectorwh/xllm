@@ -77,11 +77,16 @@ def test_full_hc_pre_caches_rounded_nonpersistent_weight(full_hc_pre: list[tuple
     layer.process_weights_after_loading()
     _forward(layer)
     _forward(layer)
-    weight = full_hc_pre[-1][0]
-    assert weight is full_hc_pre[-2][0]
-    assert weight.data_ptr() != layer.fn.data_ptr()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        _forward(layer)
+    assert not {event.key for event in trace.key_averages()} & {"aten::to", "aten::_to_copy", "aten::copy_"}
+    calls = full_hc_pre[-3:]
+    for previous, current in zip(calls, calls[1:]):
+        for previous_parameter, current_parameter in zip(previous, current):
+            assert previous_parameter is current_parameter
     assert set(layer.state_dict()) == {"fn", "scale", "base"}
-    torch.testing.assert_close(weight, layer.fn.float(), rtol=0, atol=0)
+    for cached, name in zip(calls[-1], ("fn", "scale", "base")):
+        torch.testing.assert_close(cached, getattr(layer, name).float(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("assign", [False, True])
@@ -108,13 +113,3 @@ def test_full_hc_pre_dtype_move_refreshes_weight(full_hc_pre: list[tuple[torch.T
     layer.to(torch.bfloat16)
     _forward(layer)
     torch.testing.assert_close(full_hc_pre[-1][0], layer.fn.float(), rtol=0, atol=0)
-
-
-@torch.inference_mode()
-def test_full_hc_pre_forward_has_no_weight_cast(full_hc_pre: list[tuple[torch.Tensor, ...]]) -> None:
-    layer = _layer()
-    layer.process_weights_after_loading()
-    hidden = torch.zeros(1, 4, 4, 16, dtype=torch.bfloat16)
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
-        layer(hidden)
-    assert not {event.key for event in trace.key_averages()} & {"aten::to", "aten::_to_copy", "aten::copy_"}

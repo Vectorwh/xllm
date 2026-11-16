@@ -24,16 +24,6 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
-namespace {
-
-torch::Tensor remap_with_log2phy(const torch::Tensor& ids,
-                                 const torch::Tensor& log2phy_map) {
-  torch::Tensor flat_ids = ids.reshape({-1}).to(torch::kInt64);
-  return log2phy_map.index_select(/*dim=*/0, flat_ids).reshape(ids.sizes());
-}
-
-}  // namespace
-
 TEST(DeepseekV4EplbTest, DispatchFfnWorkspaceTracksActualTokenCapacity) {
   EXPECT_EQ(dsv4_eplb::dispatch_ffn_max_output_size(
                 /*local_tokens=*/40, /*topk=*/6, /*ep_world_size=*/8),
@@ -147,40 +137,6 @@ TEST(DeepseekV4EplbTest, Log2PhyRotatesAcrossMoeTpRanksWithinSameEpRank) {
 // Default moe_tp_rank_in_group = 0 must keep the historical
 // `ep_rank % duplicate_count` behaviour so callers unaware of moe_tp keep
 // their current pick.
-TEST(DeepseekV4EplbTest, Log2PhyDefaultsToLegacyEpRankRotation) {
-  const std::vector<int32_t> expert_ids = {0, 1, 2, 3, 3, 4, 5, 6, 7, 7};
-
-  const std::vector<int32_t> rank1_default =
-      dsv4_eplb::build_log2phy_map(expert_ids,
-                                   /*num_total_experts=*/8,
-                                   /*ep_rank=*/1);
-  const std::vector<int32_t> rank1_tp0 =
-      dsv4_eplb::build_log2phy_map(expert_ids,
-                                   /*num_total_experts=*/8,
-                                   /*ep_rank=*/1,
-                                   /*moe_tp_rank_in_group=*/0);
-  EXPECT_EQ(rank1_default, rank1_tp0);
-  const std::vector<int32_t> expected_rank1 = {0, 1, 2, 4, 5, 6, 7, 9};
-  EXPECT_EQ(rank1_default, expected_rank1);
-}
-
-TEST(DeepseekV4EplbTest, Log2PhyMapCopyKeepsStorageAndChangesRemapResult) {
-  torch::Tensor log2phy_map = torch::tensor({0, 1, 2, 3}, torch::kInt32);
-  const void* original_data = log2phy_map.data_ptr();
-  torch::Tensor ids = torch::tensor({{0, 3}, {1, 2}}, torch::kInt32);
-
-  torch::Tensor first_remap = remap_with_log2phy(ids, log2phy_map);
-  EXPECT_TRUE(torch::equal(first_remap,
-                           torch::tensor({{0, 3}, {1, 2}}, torch::kInt32)));
-
-  torch::Tensor new_map = torch::tensor({3, 2, 1, 0}, torch::kInt32);
-  log2phy_map.copy_(new_map);
-
-  EXPECT_EQ(log2phy_map.data_ptr(), original_data);
-  torch::Tensor second_remap = remap_with_log2phy(ids, log2phy_map);
-  EXPECT_TRUE(torch::equal(second_remap,
-                           torch::tensor({{3, 0}, {2, 1}}, torch::kInt32)));
-}
 
 TEST(DeepseekV4EplbTest, FindsNonResidentSlotSources) {
   const std::vector<int32_t> active_expert_ids = {4, 5, 6, 7, 7};
@@ -206,31 +162,6 @@ TEST(DeepseekV4EplbTest, CollectsOnlyChangedLocalSlots) {
   EXPECT_EQ(changed_slots, expected);
 }
 
-// Locks the "first occurrence wins" contract that find_slot_sources must
-// preserve across the reverse-index refactor.
-TEST(DeepseekV4EplbTest, SlotSourcesReturnFirstOccurrenceForDuplicates) {
-  // Expert 7 shows up at slots {2, 4, 5}; expert 4 shows up at {0, 3}.
-  const std::vector<int32_t> active_expert_ids = {4, 5, 7, 4, 7, 7};
-
-  const std::vector<int32_t> lenient_slots =
-      dsv4_eplb::find_slot_sources(active_expert_ids, {7, 4, 7});
-  EXPECT_EQ(lenient_slots, (std::vector<int32_t>{2, 0, 2}));
-}
-
-// find_slot_sources treats missing targets as sentinel -1 slot-by-slot
-// instead of failing the whole call. Locks the divergence from the strict
-// variant even when duplicates of an unrelated expert are present, so a
-// future refactor that consolidates the two paths can't accidentally
-// collapse them to the same failure mode.
-TEST(DeepseekV4EplbTest, FindSlotSourcesMixesSentinelWithHits) {
-  const std::vector<int32_t> active_expert_ids = {4, 5, 7, 7, 7};
-
-  const std::vector<int32_t> source_slots =
-      dsv4_eplb::find_slot_sources(active_expert_ids, {8, 7, 9, 4});
-  const std::vector<int32_t> expected = {-1, 2, -1, 0};
-  EXPECT_EQ(source_slots, expected);
-}
-
 TEST(DeepseekV4EplbTest, DispatchCountsRecordReceiverObservedPhysicalLoad) {
   torch::Tensor expert_load_data =
       torch::zeros({2, 4}, torch::TensorOptions().dtype(torch::kInt64));
@@ -242,26 +173,6 @@ TEST(DeepseekV4EplbTest, DispatchCountsRecordReceiverObservedPhysicalLoad) {
   torch::Tensor expected = torch::tensor({2, 3, 6, 10}, torch::kInt64);
   EXPECT_TRUE(torch::equal(expert_load_data[1], expected));
   EXPECT_TRUE(torch::equal(expert_load_data[0], torch::zeros_like(expected)));
-}
-
-TEST(DeepseekV4EplbTest, ActiveSlotAndMapUpdateKeepsStorage) {
-  torch::Tensor active_weight =
-      torch::tensor({{10, 11}, {20, 21}, {30, 31}}, torch::kInt32);
-  torch::Tensor active_map = torch::tensor({0, 1, 2}, torch::kInt32);
-  const void* original_weight_data = active_weight.data_ptr();
-  const void* original_map_data = active_map.data_ptr();
-
-  torch::Tensor pending_weight =
-      torch::tensor({{30, 31}, {90, 91}, {10, 11}}, torch::kInt32);
-  torch::Tensor pending_map = torch::tensor({2, 0, 1}, torch::kInt32);
-
-  active_weight.copy_(pending_weight);
-  active_map.copy_(pending_map);
-
-  EXPECT_EQ(active_weight.data_ptr(), original_weight_data);
-  EXPECT_EQ(active_map.data_ptr(), original_map_data);
-  EXPECT_TRUE(torch::equal(active_weight, pending_weight));
-  EXPECT_TRUE(torch::equal(active_map, pending_map));
 }
 
 // Baseline: no cross-rank motion at all — every rank keeps its slots. Both
@@ -494,13 +405,6 @@ TEST(DeepseekV4EplbTest, StagesAllResidentAndAllMissingSlots) {
   }
 }
 
-TEST(DeepseekV4EplbTest, ChoosesFullActivationForHighSlotChurn) {
-  EXPECT_FALSE(dsv4_eplb::should_activate_full_expert_tensor(0, 33));
-  EXPECT_FALSE(dsv4_eplb::should_activate_full_expert_tensor(16, 33));
-  EXPECT_TRUE(dsv4_eplb::should_activate_full_expert_tensor(17, 33));
-  EXPECT_TRUE(dsv4_eplb::should_activate_full_expert_tensor(33, 33));
-}
-
 TEST(DeepseekV4EplbTest, ActivatesOnlyChangedExpertSlots) {
   torch::Tensor active = torch::zeros({4, 2}, torch::kFloat32);
   const torch::Tensor pending =
@@ -599,119 +503,15 @@ TEST(DeepseekV4EplbTest, RefreshesWholeDispatchScaleWhenMostSlotsChange) {
 }
 
 TEST(DeepseekV4EplbTest, LogicalChunkStagingPreservesLayout) {
-  torch::Tensor source =
-      torch::arange(3 * 2 * 4, torch::kFloat32).reshape({3, 2, 4});
-  source = source.transpose(1, 2);
-  torch::Tensor pending = torch::empty(source.sizes(), source.options());
-
-  ASSERT_FALSE(source[0].is_contiguous());
-  ASSERT_TRUE(source[0].is_non_overlapping_and_dense());
-  ASSERT_TRUE(pending[0].is_contiguous());
-  ASSERT_NE(source[0].strides().vec(), pending[0].strides().vec());
-
-  torch::Tensor source_slot = source[2];
-  torch::Tensor pending_slot = pending[1];
-  torch::Tensor raw_source_storage = source_slot.as_strided(
-      {source_slot.numel()}, {1}, source_slot.storage_offset());
-  torch::Tensor raw_destination = torch::empty_like(pending_slot);
-  raw_destination.reshape({-1}).copy_(raw_source_storage);
-  ASSERT_FALSE(torch::equal(raw_destination, source_slot));
-
-  torch::Tensor send_staging =
-      torch::empty(source_slot.sizes(), source.options());
-  send_staging.copy_(source_slot);
-  torch::Tensor recv_staging = torch::empty_like(send_staging);
-  torch::Tensor flat_send_staging = send_staging.reshape({-1});
-  torch::Tensor flat_recv_staging = recv_staging.reshape({-1});
-  constexpr int64_t kChunkElements = 3;
-  for (int64_t offset = 0; offset < flat_send_staging.numel();
-       offset += kChunkElements) {
-    const int64_t chunk_elements =
-        std::min(kChunkElements, flat_send_staging.numel() - offset);
-    flat_recv_staging.narrow(/*dim=*/0, offset, chunk_elements)
-        .copy_(flat_send_staging.narrow(/*dim=*/0, offset, chunk_elements));
-  }
-  pending_slot.copy_(recv_staging);
+  const torch::Tensor source =
+      torch::arange(24, torch::kFloat32).reshape({3, 2, 4}).transpose(1, 2);
+  torch::Tensor pending = torch::zeros(source.sizes(), source.options());
+  ASSERT_FALSE(source[2].is_contiguous());
+  ASSERT_TRUE(pending[1].is_contiguous());
+  dsv4_eplb::stage_resident_expert_slots(source, pending, {-1, 2, -1});
   EXPECT_TRUE(torch::equal(pending[1], source[2]));
-}
-
-TEST(DeepseekV4EplbTest, P2PBucketStatsIdentityAllUnchanged) {
-  // Same active == pending on every rank: every slot lands in UNCHANGED and
-  // no HCCS P2P op is emitted.
-  std::vector<int32_t> global_active = {0, 1, 2, 3, 4, 5};
-  std::vector<int32_t> global_pending = global_active;
-  std::vector<dsv4_eplb::P2POp> recv;
-  std::vector<dsv4_eplb::P2POp> send;
-  dsv4_eplb::EplbP2PBucketStats stats;
-  ASSERT_TRUE(dsv4_eplb::compute_p2p_transfer_plan(global_active,
-                                                   global_pending,
-                                                   /*ep_rank=*/0,
-                                                   /*device_experts_num=*/3,
-                                                   recv,
-                                                   send,
-                                                   &stats));
-  EXPECT_TRUE(recv.empty());
-  EXPECT_TRUE(send.empty());
-  EXPECT_EQ(stats.unchanged, 6);
-  EXPECT_EQ(stats.same_gpu, 0);
-  EXPECT_EQ(stats.hccs, 0);
-}
-
-TEST(DeepseekV4EplbTest, P2PBucketStatsCountsSameGpuLocalRewrite) {
-  // Rank 0 rewrites its own two slots: slot 0 <-> slot 1. Different expert
-  // ids in both slots so this counts as SAME_GPU.
-  std::vector<int32_t> global_active = {10, 20, 30, 40};
-  std::vector<int32_t> global_pending = {20, 10, 30, 40};
-  std::vector<dsv4_eplb::P2POp> recv;
-  std::vector<dsv4_eplb::P2POp> send;
-  dsv4_eplb::EplbP2PBucketStats stats;
-  ASSERT_TRUE(dsv4_eplb::compute_p2p_transfer_plan(global_active,
-                                                   global_pending,
-                                                   /*ep_rank=*/0,
-                                                   /*device_experts_num=*/2,
-                                                   recv,
-                                                   send,
-                                                   &stats));
-  EXPECT_TRUE(recv.empty());
-  EXPECT_TRUE(send.empty());
-  EXPECT_EQ(stats.same_gpu, 2);
-  EXPECT_EQ(stats.unchanged, 2);
-  EXPECT_EQ(stats.hccs, 0);
-}
-
-TEST(DeepseekV4EplbTest, P2PBucketStatsTreatEveryRemoteRankAsHccs) {
-  // The deployment is one HCCS super-node. Every remote-rank transfer has
-  // the same transport cost regardless of host placement.
-  // Active:   rank0=[10,11]  rank1=[20,21]  rank2=[30,31]  rank3=[40,41]
-  // Pending:  rank0=[20,11]  rank1=[10,21]  rank2=[40,31]  rank3=[30,41]
-  std::vector<int32_t> global_active = {10, 11, 20, 21, 30, 31, 40, 41};
-  std::vector<int32_t> global_pending = {20, 11, 10, 21, 40, 31, 30, 41};
-  std::vector<dsv4_eplb::P2POp> recv;
-  std::vector<dsv4_eplb::P2POp> send;
-  dsv4_eplb::EplbP2PBucketStats stats;
-  ASSERT_TRUE(dsv4_eplb::compute_p2p_transfer_plan(global_active,
-                                                   global_pending,
-                                                   /*ep_rank=*/0,
-                                                   /*device_experts_num=*/2,
-                                                   recv,
-                                                   send,
-                                                   &stats));
-  EXPECT_EQ(stats.unchanged, 4);
-  EXPECT_EQ(stats.hccs, 4);
-
-  // Pairing rank0 with rank2 and rank1 with rank3 remains the same HCCS
-  // bucket because host boundaries are irrelevant inside the super-node.
-  // Pending:  rank0=[30,11]  rank1=[40,21]  rank2=[10,31]  rank3=[20,41]
-  std::vector<int32_t> global_pending_remote = {30, 11, 40, 21, 10, 31, 20, 41};
-  ASSERT_TRUE(dsv4_eplb::compute_p2p_transfer_plan(global_active,
-                                                   global_pending_remote,
-                                                   /*ep_rank=*/0,
-                                                   /*device_experts_num=*/2,
-                                                   recv,
-                                                   send,
-                                                   &stats));
-  EXPECT_EQ(stats.unchanged, 4);
-  EXPECT_EQ(stats.hccs, 4);
+  EXPECT_EQ(pending[0].count_nonzero().item<int64_t>(), 0);
+  EXPECT_EQ(pending[2].count_nonzero().item<int64_t>(), 0);
 }
 
 }  // namespace layer

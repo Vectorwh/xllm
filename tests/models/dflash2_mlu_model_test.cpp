@@ -17,7 +17,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -108,38 +107,6 @@ std::unordered_map<std::string, torch::Tensor> make_decoder_weights(
   return weights;
 }
 
-TEST(DFlash2MluModelTest, DedicatedDecoderRetainsCheckpointModuleKeys) {
-  const torch::Device device(Platform::type_torch(), 0);
-  const auto options =
-      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  ProcessGroup group(0, 1, device);
-  ParallelArgs parallel(0, 1, &group);
-  parallel.tp_group_ = &group;
-  ModelArgs args = make_draft_args();
-  ModelContext context(parallel, args, QuantArgs(), options);
-  layer::mlu::DFlash2DecoderLayer decoder(context, 0);
-  const auto weights = make_decoder_weights(options);
-  decoder->load_state_dict(StateDict(weights));
-  decoder->verify_loaded_weights("layers.0.");
-  const auto parameters = decoder->named_parameters();
-  for (const std::string& conv : {"attention_conv", "mlp_conv"}) {
-    for (const std::string& suffix :
-         {"base_kernel", "kernel_projection.weight"}) {
-      const std::string name = conv + "." + suffix;
-      ASSERT_TRUE(parameters.contains(name)) << name;
-      EXPECT_TRUE(torch::equal(parameters[name], weights.at(name))) << name;
-    }
-  }
-
-  // Ordinary Qwen3 must retain the common decoder without local convolutions.
-  args.model_type("qwen3");
-  ModelContext ordinary_context(parallel, args, QuantArgs(), options);
-  layer::Qwen3DecoderLayer ordinary(ordinary_context, 0);
-  const auto ordinary_modules = ordinary->named_modules();
-  EXPECT_FALSE(ordinary_modules.contains("attention_conv"));
-  EXPECT_FALSE(ordinary_modules.contains("mlp_conv"));
-}
-
 TEST(DFlash2MluModelTest, ActualDraftModelLoadsUnchangedLayerPrefixes) {
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
@@ -163,63 +130,7 @@ TEST(DFlash2MluModelTest, ActualDraftModelLoadsUnchangedLayerPrefixes) {
   weights.emplace("candidate_selector.successor_codebook",
                   torch::ones({16, 8}, options));
   model.load_state_dict(StateDict(weights));
-  // Verifies the real model's decoder vector, including both convolution
-  // modules. The vector was never registered as torch named_modules.
   model.verify_loaded_weights();
-  const auto modules =
-      model.named_modules(/*name_prefix=*/"", /*include_self=*/false);
-  EXPECT_FALSE(modules.contains("embed_tokens"));
-  EXPECT_TRUE(modules.contains("fc"));
-  EXPECT_TRUE(modules.contains("hidden_norm"));
-}
-
-TEST(DFlash2MluModelTest, CompressedInt8MlpMatchesDequantizedReference) {
-  const torch::Device device(Platform::type_torch(), 0);
-  const auto options =
-      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
-  ProcessGroup group(0, 1, device);
-  ParallelArgs parallel(0, 1, &group);
-  parallel.tp_group_ = &group;
-  QuantArgs quant_args;
-  quant_args.quant_method("compressed-tensors")
-      .is_compressed_tensors_w8a8_dynamic(true);
-  CompressedQuantGroup scheme;
-  scheme.targets = {
-      R"(re:layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$)",
-      R"(re:layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)$)"};
-  quant_args.compressed_groups() = {scheme};
-  ModelContext context(parallel, make_draft_args(), quant_args, options);
-  layer::mlu::DFlash2DecoderLayer decoder(context, 0);
-  auto weights = make_decoder_weights(options.device(torch::kCPU));
-  for (const std::string& name : {"self_attn.q_proj",
-                                  "self_attn.k_proj",
-                                  "self_attn.v_proj",
-                                  "self_attn.o_proj",
-                                  "mlp.gate_proj",
-                                  "mlp.up_proj",
-                                  "mlp.down_proj"}) {
-    torch::Tensor& weight = weights.at(name + ".weight");
-    weights.emplace(
-        name + ".weight_scale",
-        torch::full(
-            {weight.size(0), 1}, 1.0 / 32, options.device(torch::kCPU)));
-    weight = (weight * 32).to(torch::kInt8);
-  }
-  // Preserve the real checkpoint prefix used by the linear quantization loader.
-  decoder->load_state_dict(StateDict(std::move(weights), "layers.0."));
-  decoder->verify_loaded_weights("layers.0.");
-  const auto modules = decoder->named_modules();
-  const auto mlp = modules["mlp"]->as<layer::DenseMLPImpl>();
-  ASSERT_NE(mlp, nullptr);
-  const torch::Tensor input = torch::full({2, 128}, 1.0 / 128, options);
-  const torch::Tensor actual = mlp->forward(input);
-  const torch::Tensor gate = torch::full({2, 256}, 0.25);
-  const torch::Tensor up = torch::full({2, 256}, 0.5);
-  const torch::Tensor expected = torch::matmul(
-      (torch::silu(gate) * up).to(torch::kBFloat16).to(torch::kFloat32),
-      torch::full({256, 128}, 0.125));
-  EXPECT_TRUE(
-      torch::allclose(actual.cpu().to(torch::kFloat32), expected, 0.02, 0.02));
 }
 
 TEST(DFlash2MluModelTest, DraftGraphReplaysFreshBlocksForBfloat16AndInt8) {

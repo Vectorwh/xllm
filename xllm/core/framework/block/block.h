@@ -272,9 +272,4 @@ class Block final {
   uint8_t hash_value_[XXH3_128BITS_HASH_VALUE_LEN];
 };
 
-// equal operator, mainly used for testing
-inline constexpr bool operator==(const Block& lhs, const Block& rhs) {
-  return lhs.id() == rhs.id();
-}
-
 }  // namespace xllm

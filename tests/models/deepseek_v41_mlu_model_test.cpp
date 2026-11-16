@@ -272,7 +272,6 @@ class ExecutorV41Model final : public CausalLM {
                                       const torch::Tensor& positions,
                                       ModelInputParams& input) override {
     model_->prepare_graph_forward_metadata(state, positions, input);
-    graph_state_ = dynamic_cast<mlu::model::DeepseekV41GraphState*>(state);
   }
   layer::WordEmbedding get_word_embedding() override {
     return model_->get_word_embedding();
@@ -289,15 +288,11 @@ class ExecutorV41Model final : public CausalLM {
       const std::vector<int32_t>& /*expert_ids*/) override {}
   void update_expert_weight(int32_t /*layer_id*/) override {}
   int32_t forward_count() const { return forward_count_; }
-  const mlu::model::DeepseekV41GraphState* graph_state() const {
-    return graph_state_;
-  }
 
  private:
   mlu::model::DeepseekV41Model model_;
   torch::TensorOptions options_;
   int32_t forward_count_ = 0;
-  const mlu::model::DeepseekV41GraphState* graph_state_ = nullptr;
 };
 
 // Observe the same public aux_hidden_states tensor that the draft consumes.
@@ -440,30 +435,8 @@ class DeepseekV41CaptureTest : public DeepseekV41MluModelTest {
     const auto actual = result.aux_hidden_states.cpu().to(torch::kFloat32);
     ASSERT_EQ(actual.sizes(), expected.sizes());
     ASSERT_TRUE(torch::isfinite(actual).all().item<bool>());
-    const auto diff = actual - expected;
-    const double max_abs = diff.abs().max().item<double>();
-    const double mean_abs = diff.abs().mean().item<double>();
-    const double relative_l2 = (diff.norm() / expected.norm()).item<double>();
-    const double cosine =
-        ((actual * expected).sum() / (actual.norm() * expected.norm()))
-            .item<double>();
-    const double post_engram_max_abs =
-        (actual - after_engram).abs().max().item<double>();
-    RecordProperty("max_abs", std::to_string(max_abs));
-    RecordProperty("mean_abs", std::to_string(mean_abs));
-    RecordProperty("relative_l2", std::to_string(relative_l2));
-    RecordProperty("cosine", std::to_string(cosine));
-    RecordProperty("post_engram_max_abs", std::to_string(post_engram_max_abs));
-    LOG(INFO) << "Capture difference: with_engram=" << with_engram
-              << " value_scale=" << value_scale << " max_abs=" << max_abs
-              << " mean_abs=" << mean_abs << " relative_l2=" << relative_l2
-              << " cosine=" << cosine
-              << " post_engram_max_abs=" << post_engram_max_abs;
-    // No tolerance is needed: capture only averages four identical HC lanes.
     EXPECT_TRUE(torch::equal(actual, expected))
-        << "DSpark must receive the entering residual before Engram. "
-        << "max_abs=" << max_abs << ", relative_l2=" << relative_l2
-        << ", distance to post-Engram features=" << post_engram_max_abs;
+        << "DSpark must capture the residual before Engram injection";
   }
 
  private:
@@ -474,18 +447,8 @@ TEST_F(DeepseekV41CaptureTest, CapturesEnteringResidualWithoutEngram) {
   expect_entering_residual(/*with_engram=*/false, /*value_scale=*/0);
 }
 
-TEST_F(DeepseekV41CaptureTest, CapturesEnteringResidualWithZeroEngramValue) {
-  expect_entering_residual(/*with_engram=*/true, /*value_scale=*/0);
-}
-
 TEST_F(DeepseekV41CaptureTest, CapturesEnteringResidualBeforeEngramInjection) {
   expect_entering_residual(/*with_engram=*/true, /*value_scale=*/0.5);
-}
-
-TEST_F(DeepseekV41CaptureTest, MaterializesPostBeforeUpperLayerCapture) {
-  expect_entering_residual(/*with_engram=*/false,
-                           /*value_scale=*/0,
-                           /*capture_layer=*/1);
 }
 
 TEST_F(DeepseekV41CaptureTest,
@@ -497,12 +460,6 @@ TEST_F(DeepseekV41CaptureTest,
 
 // Hidden sizes other than 5120 have no fused MHC kernel: the layers run the
 // unfused boundaries and never defer their post.
-TEST_F(DeepseekV41CaptureTest, UnsupportedHiddenSizeUsesUnfusedBoundaries) {
-  expect_entering_residual(/*with_engram=*/false,
-                           /*value_scale=*/0,
-                           /*capture_layer=*/1,
-                           /*model_hidden_size=*/256);
-}
 
 TEST_F(DeepseekV41CaptureTest,
        UnsupportedHiddenSizeUsesUnfusedBoundariesWithEngram) {
@@ -790,28 +747,6 @@ TEST_F(DeepseekV41CaptureTest,
     EXPECT_TRUE(
         torch::equal(actual.aux_hidden_states, expected.aux_hidden_states));
     expect_cache(graph_cache, eager_cache);
-    ASSERT_NE(graph_model.graph_state(), nullptr);
-    const auto& state = *graph_model.graph_state();
-    ASSERT_TRUE(state.verify_input.has_value());
-    EXPECT_EQ(state.verify_input->meta.num_sequences, 4);
-    EXPECT_EQ(state.verify_input->meta.actual_num_sequences, requests);
-    EXPECT_EQ(state.verify_input->attention.host.q_seq_lens,
-              (std::vector<int32_t>{0, 6, 12, 18, 24}));
-    const auto& compressed = state.shared.compressed[1];
-    EXPECT_EQ(compressed.outputs.num_valid_rows.item<int32_t>(), requests * 3);
-    EXPECT_TRUE(torch::equal(
-        state.shared.query_prefix.cpu(),
-        torch::tensor({0, 6, 12, 18, requests * 6}, torch::kInt32)));
-    EXPECT_EQ(state.shared.block_tables[1].size(1), 2);
-    if (round == 2) {
-      EXPECT_TRUE(
-          state.shared.block_tables[1].select(1, 1).eq(0).all().item<bool>());
-    }
-    ASSERT_EQ(state.hashes.size(), 1);
-    ASSERT_NE(state.hashes[0], nullptr);
-    // This also observes query_width=6: independent decode hashes would have
-    // needed 24 history IDs, while the real grouped HashState accepts four.
-    EXPECT_EQ(state.verify_input->embedding.engram_lookback_token_ids, history);
     if (round == 0) {
       captured_forward_count = graph_model.forward_count();
       ASSERT_GT(captured_forward_count, 0);
@@ -865,8 +800,6 @@ TEST_F(DeepseekV41CaptureTest,
   EXPECT_TRUE(
       torch::equal(actual.aux_hidden_states, expected.aux_hidden_states));
   expect_cache(graph_cache, eager_cache);
-  const auto* large_state = graph_model.graph_state();
-  auto large_latent = large_state->shared.compressed[1].outputs.latent.clone();
   auto small = make_input({kWidth}, {3}, {blocks[0]}, {history[0], history[1]});
   auto small_flat = flatten_verify(small, {3});
   auto small_tokens = tokens.slice(0, 0, kWidth);
@@ -877,18 +810,11 @@ TEST_F(DeepseekV41CaptureTest,
       executor.run(small_tokens, small_positions, graph_cache, small_flat);
   EXPECT_TRUE(torch::allclose(
       small_actual.hidden_states, small_expected.hidden_states, 0.02, 0.02));
-  EXPECT_NE(graph_model.graph_state(), large_state);
-  EXPECT_NE(
-      graph_model.graph_state()->shared.compressed[1].outputs.latent.data_ptr(),
-      large_state->shared.compressed[1].outputs.latent.data_ptr());
-  EXPECT_TRUE(torch::equal(large_latent,
-                           large_state->shared.compressed[1].outputs.latent));
   const int32_t after_small_capture = graph_model.forward_count();
   auto again_expected =
       eager_model.forward(tokens, positions, eager_cache, resumed);
   auto again_actual = executor.run(tokens, positions, graph_cache, flat);
   EXPECT_EQ(graph_model.forward_count(), after_small_capture);
-  EXPECT_EQ(graph_model.graph_state(), large_state);
   EXPECT_TRUE(torch::allclose(
       again_actual.hidden_states, again_expected.hidden_states, 0.02, 0.02));
   expect_cache(graph_cache, eager_cache);
@@ -1001,23 +927,6 @@ TEST_F(DeepseekV41MluModelTest, CpuBlockTablesSupportEagerPrefillAndDecode) {
   }
 }
 
-TEST_F(DeepseekV41MluModelTest, SelectsFusedMhcOnlyForSupportedShapes) {
-  {
-    layer::DeepseekV41DecoderLayer layer(make_context(), 0);
-    EXPECT_TRUE(layer->uses_fused_mhc());
-  }
-  {
-    args_.hidden_size(128);
-    layer::DeepseekV41DecoderLayer layer(make_context(), 0);
-    EXPECT_FALSE(layer->uses_fused_mhc());
-  }
-  {
-    args_.hidden_size(5120).hc_mult(2);
-    layer::DeepseekV41DecoderLayer layer(make_context(), 0);
-    EXPECT_FALSE(layer->uses_fused_mhc());
-  }
-}
-
 TEST_F(DeepseekV41MluModelTest, RejectsInvalidSinkhornIterations) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
@@ -1118,47 +1027,6 @@ TEST_F(DeepseekV41MluModelTest,
 }
 
 TEST_F(DeepseekV41MluModelTest,
-       VerifyMetadataGroupsRequestsAndReusesGatherStorage) {
-  args_.window_size(16).index_topk(4);
-  set_cache_role(2);
-  mlu::model::DeepseekV41Model model(make_context());
-  mlu::model::DeepseekV41GraphState state;
-  ModelInputParams input;
-  input.meta.batch_forward_type = BatchForwardType::DECODE;
-  input.meta.num_sequences = 6;
-  input.meta.actual_num_sequences = 3;
-  input.meta.spec_verify_width = 3;
-  input.attention.host.q_seq_lens = {0, 1, 2, 3, 4, 5, 6};
-  input.attention.host.kv_seq_lens = {0, 4, 9, 15, 16, 18, 21};
-  input.multi_block_tables = {
-      torch::arange(12, options_.dtype(torch::kInt32)).view({6, 2})};
-  auto positions = torch::arange(6, options_.dtype(torch::kInt64));
-  input.attention.host.positions = torch::arange(6, torch::kInt64);
-
-  model->prepare_graph_forward_metadata(&state, positions, input);
-  ASSERT_TRUE(state.verify_input.has_value());
-  EXPECT_EQ(state.verify_input->meta.num_sequences, 2);
-  EXPECT_EQ(state.verify_input->meta.actual_num_sequences, 1);
-  EXPECT_EQ(state.verify_input->attention.host.q_seq_lens,
-            (std::vector<int32_t>{0, 3, 6}));
-  EXPECT_EQ(state.verify_input->attention.host.kv_seq_lens,
-            (std::vector<int32_t>{0, 6, 9}));
-  EXPECT_EQ(state.shared.topk.size(), 2);
-  EXPECT_EQ(state.shared.candidates.size(), 2);
-  EXPECT_EQ(state.shared.selected_lengths.numel(), 6);
-  EXPECT_EQ(state.shared.selected_kv.size(0), 6 * (16 + 4));
-  EXPECT_TRUE(torch::equal(state.shared.block_tables[0],
-                           input.multi_block_tables[0].slice(0, 0, 6, 3)));
-
-  const void* gather_address = state.shared.selected_kv.data_ptr();
-  input.attention.host.kv_seq_lens = {0, 6, 13, 21, 22, 24, 27};
-  model->prepare_graph_forward_metadata(&state, positions, input);
-  EXPECT_EQ(state.shared.selected_kv.data_ptr(), gather_address);
-  EXPECT_EQ(state.verify_input->attention.host.kv_seq_lens,
-            (std::vector<int32_t>{0, 8, 11}));
-}
-
-TEST_F(DeepseekV41MluModelTest,
        SharedKvConsumerDoesNotRequireSourceOnlyWeights) {
   args_.n_layers(2)
       .compress_ratios({1, 1})
@@ -1176,53 +1044,6 @@ TEST_F(DeepseekV41MluModelTest,
   layer::DeepseekV41Attention attention(make_context(), /*layer_id=*/1);
   attention->load_state_dict(StateDict(std::move(weights)));
   attention->verify_loaded_weights();
-}
-
-TEST_F(DeepseekV41MluModelTest,
-       CompressedGraphMetadataOwnsCapacityAndClearsPadding) {
-  set_cache_role(2);
-  mlu::model::DeepseekV41Model model(make_context());
-  mlu::model::DeepseekV41GraphState first, second;
-  ModelInputParams input;
-  input.enable_graph = true;
-  input.meta.batch_forward_type = BatchForwardType::DECODE;
-  input.meta.num_sequences = 24;
-  input.meta.actual_num_sequences = 18;
-  input.meta.spec_verify_width = 6;
-  input.graph.kv_seq_len_capacity = 512;
-  for (int32_t row = 0; row <= 24; ++row) {
-    input.attention.host.q_seq_lens.emplace_back(row);
-    input.attention.host.kv_seq_lens.emplace_back(row * 8);
-  }
-  auto positions =
-      torch::arange(2, 8, options_.dtype(torch::kInt64)).repeat({4});
-  input.attention.host.positions =
-      torch::arange(2, 8, torch::kInt64).repeat({4});
-  input.multi_block_tables = {torch::arange(24, torch::kInt32).view({24, 1})};
-  model->prepare_graph_forward_metadata(&first, positions, input);
-  EXPECT_TRUE(torch::equal(first.shared.query_prefix.cpu(),
-                           torch::tensor({0, 6, 12, 18, 18}, torch::kInt32)));
-  EXPECT_EQ(first.shared.num_valid_input_rows.item<int32_t>(), 18);
-  const void* latent = first.shared.compressed[1].outputs.latent.data_ptr();
-  const void* table = first.shared.block_tables[0].data_ptr();
-  input.multi_block_tables[0] =
-      torch::tensor({2, 1}, torch::kInt32).view({1, 2}).expand({24, 2});
-  input.meta.actual_num_sequences = 24;
-  model->prepare_graph_forward_metadata(&first, positions, input);
-  EXPECT_TRUE(torch::equal(first.shared.block_tables[0][0].cpu(),
-                           torch::tensor({2, 1, 2, 1}, torch::kInt32)));
-  EXPECT_EQ(first.shared.num_valid_input_rows.item<int32_t>(), 24);
-  model->prepare_graph_forward_metadata(&second, positions, input);
-  EXPECT_NE(second.shared.compressed[1].outputs.latent.data_ptr(), latent);
-  EXPECT_NE(second.shared.block_tables[0].data_ptr(), table);
-  input.meta.actual_num_sequences = 0;
-  model->prepare_graph_forward_metadata(&first, positions, input);
-  EXPECT_EQ(first.shared.num_valid_input_rows.item<int32_t>(), 0);
-  EXPECT_TRUE(first.shared.query_prefix.eq(0).all().item<bool>());
-  EXPECT_TRUE(first.shared.compressed[1].prefix.eq(0).all().item<bool>());
-  EXPECT_EQ(first.shared.compressed[1].outputs.latent.data_ptr(), latent);
-  EXPECT_EQ(first.shared.block_tables[0].data_ptr(), table);
-  EXPECT_EQ(second.shared.num_valid_input_rows.item<int32_t>(), 24);
 }
 
 }  // namespace

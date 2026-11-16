@@ -81,6 +81,22 @@ torch::Tensor seeded(const std::string& key,
   return (test::seeded_tensor(key, shape, dtype, device) - 0.5) * 0.05;
 }
 
+// The seeded residuals are small: an absolute BF16 tolerance alone can
+// accept a large coherent drift. Keep the elementwise guard for outliers and
+// also bound the aggregate relative error with FP32 norm accumulation.
+void verify_relative_tensor_close(const torch::Tensor& actual,
+                                  const torch::Tensor& expected,
+                                  double rtol,
+                                  double atol) {
+  test::verify_tensor_close(actual, expected, rtol, atol);
+  const double reference_norm =
+      torch::norm(expected, /*p=*/2.0, torch::kFloat32).item<double>();
+  ASSERT_GT(reference_norm, 0.0);
+  const double error_norm =
+      torch::norm(actual - expected, /*p=*/2.0, torch::kFloat32).item<double>();
+  EXPECT_LE(error_norm / reference_norm, rtol);
+}
+
 torch::Tensor linear_ref(const torch::Tensor& input,
                          const torch::Tensor& weight) {
   return torch::nn::functional::linear(
@@ -368,15 +384,15 @@ class HyperConnectionTest : public ::testing::Test {
     std::tie(actual_norm, actual_residual, actual_post, actual_comb) =
         hc_pre->fused_post_pre_norm(x, residual, post, comb, gamma);
 
-    test::verify_tensor_close(actual_norm.cpu(),
-                              expected_norm.to(torch::kBFloat16).cpu(),
-                              2e-2,
-                              2e-2);
-    test::verify_tensor_close(
+    verify_relative_tensor_close(actual_norm.cpu(),
+                                 expected_norm.to(torch::kBFloat16).cpu(),
+                                 2e-2,
+                                 2e-2);
+    verify_relative_tensor_close(
         actual_residual.cpu(), expected_residual.cpu(), 2e-2, 2e-2);
-    test::verify_tensor_close(
+    verify_relative_tensor_close(
         actual_post.cpu(), expected_pre.post.cpu(), 2e-3, 2e-3);
-    test::verify_tensor_close(
+    verify_relative_tensor_close(
         actual_comb.cpu(), expected_pre.comb.cpu(), 2e-3, 2e-3);
   }
 
@@ -410,11 +426,11 @@ TEST_F(HyperConnectionTest, StandalonePreNormMatchesUnfusedLoadedWeights) {
     const auto expected_norm = std::get<0>(norm->forward(expected.output));
     const auto [actual_norm, new_pre, post, comb] =
         pre->fused_pre_norm(residual, mix, gamma);
-    test::verify_tensor_close(
+    verify_relative_tensor_close(
         actual_norm.cpu(), expected_norm.cpu(), 2e-2, 2e-2);
-    test::verify_tensor_close(new_pre.cpu(), expected.pre.cpu(), 2e-3, 2e-3);
-    test::verify_tensor_close(post.cpu(), expected.post.cpu(), 2e-3, 2e-3);
-    test::verify_tensor_close(comb.cpu(), expected.comb.cpu(), 2e-3, 2e-3);
+    verify_relative_tensor_close(new_pre.cpu(), expected.pre.cpu(), 2e-3, 2e-3);
+    verify_relative_tensor_close(post.cpu(), expected.post.cpu(), 2e-3, 2e-3);
+    verify_relative_tensor_close(comb.cpu(), expected.comb.cpu(), 2e-3, 2e-3);
   }
 }
 
@@ -437,13 +453,13 @@ TEST_F(HyperConnectionTest, DelayedPreMixUsesPreviousSublayerCoefficients) {
       torch::zeros({3, config_.hc_mult}, options_.dtype(torch::kFloat32));
   pre.select(1, 0).fill_(1);
   const auto first = hc->forward(x, std::nullopt, pre);
-  test::verify_tensor_close(first.output.cpu(), x.select(1, 0).cpu(), 0, 0);
+  verify_relative_tensor_close(first.output.cpu(), x.select(1, 0).cpu(), 0, 0);
   torch::Tensor next = x * 0.75;
   const auto second = hc->forward(next, std::nullopt, first.pre);
   torch::Tensor expected = (next.to(torch::kFloat32) * first.pre.unsqueeze(-1))
                                .sum(1)
                                .to(torch::kBFloat16);
-  test::verify_tensor_close(second.output.cpu(), expected.cpu(), 1e-3, 1e-3);
+  verify_relative_tensor_close(second.output.cpu(), expected.cpu(), 1e-3, 1e-3);
   const auto ordinary = hc->forward(next);
   EXPECT_TRUE(torch::equal(second.pre, ordinary.pre));
   EXPECT_TRUE(torch::equal(second.post, ordinary.post));
@@ -605,10 +621,12 @@ TEST_F(HyperConnectionTest, HCPreMatchesOfficialReference) {
   EXPECT_EQ(actual.output.sizes(), expected.output.sizes());
   EXPECT_EQ(actual.post.sizes(), expected.post.sizes());
   EXPECT_EQ(actual.comb.sizes(), expected.comb.sizes());
-  test::verify_tensor_close(
+  verify_relative_tensor_close(
       actual.output.cpu(), expected.output.cpu(), 1e-2, 1e-2);
-  test::verify_tensor_close(actual.post.cpu(), expected.post.cpu(), 1e-3, 1e-3);
-  test::verify_tensor_close(actual.comb.cpu(), expected.comb.cpu(), 1e-3, 1e-3);
+  verify_relative_tensor_close(
+      actual.post.cpu(), expected.post.cpu(), 1e-3, 1e-3);
+  verify_relative_tensor_close(
+      actual.comb.cpu(), expected.comb.cpu(), 1e-3, 1e-3);
 }
 
 TEST_F(HyperConnectionTest, HCPostMatchesOfficialReference) {
@@ -649,8 +667,8 @@ TEST_F(HyperConnectionTest, HCPostMatchesOfficialReference) {
 
   EXPECT_EQ(actual.sizes(), expected.sizes());
   EXPECT_EQ(actual_rsqrt.sizes(), expected_rsqrt.sizes());
-  test::verify_tensor_close(actual.cpu(), expected.cpu(), 1e-2, 1e-2);
-  test::verify_tensor_close(
+  verify_relative_tensor_close(actual.cpu(), expected.cpu(), 1e-2, 1e-2);
+  verify_relative_tensor_close(
       actual_rsqrt.cpu(), expected_rsqrt.cpu(), 1e-4, 1e-4);
 }
 
@@ -681,7 +699,7 @@ TEST_F(HyperConnectionTest, HCHeadMatchesOfficialReference) {
                                        config_);
 
   EXPECT_EQ(actual.sizes(), expected.sizes());
-  test::verify_tensor_close(actual.cpu(), expected.cpu(), 1e-2, 1e-2);
+  verify_relative_tensor_close(actual.cpu(), expected.cpu(), 1e-2, 1e-2);
 }
 
 }  // namespace layer

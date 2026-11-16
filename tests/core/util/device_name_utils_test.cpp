@@ -83,16 +83,6 @@ TEST(DeviceNameUtilsTest, MapsAnyValidRankToOnlyVisibleDevice) {
             0);
 }
 
-TEST(DeviceNameUtilsTest, PreservesGlobalRankInput) {
-  int32_t node_rank = 8;
-
-  EXPECT_EQ(DeviceNameUtils::get_device_idx(node_rank,
-                                            /*nnodes=*/16,
-                                            /*visible_device_count=*/8),
-            0);
-  EXPECT_EQ(node_rank, 8);
-}
-
 TEST(DeviceNameUtilsTest, ParseGeneratedDeviceString) {
   const std::vector<torch::Device> devices =
       DeviceNameUtils::parse_devices(Platform::type_str() + ":2");

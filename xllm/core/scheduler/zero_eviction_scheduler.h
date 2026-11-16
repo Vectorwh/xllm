@@ -86,8 +86,6 @@ class BlockCapacityGuard {
 
   uint32_t num_release_block_for(Sequence* sequence);
 
-  std::vector<SequenceStatus> get_running_sequence_status();
-
  private:
   KVCacheManager* kv_cache_manager_;
 

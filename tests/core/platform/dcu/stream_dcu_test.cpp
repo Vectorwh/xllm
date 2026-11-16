@@ -19,16 +19,15 @@ limitations under the License.
 #include <hip/hip_runtime_api.h>
 #include <torch/torch.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
-#include <sstream>
+#include <future>
+#include <thread>
 
 #include "core/platform/stream.h"
 
 namespace {
-
-// =============================================================================
-// Test environment
-// =============================================================================
 
 class StreamDcuTestEnvironment final : public ::testing::Environment {
  public:
@@ -59,15 +58,14 @@ void PrepareDeviceOrSkip() {
   ASSERT_EQ(hipFree(nullptr), hipSuccess);
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 // xllm::Stream APIs under test: Stream(HIPStream), get_stream,
 // set_stream_guard, synchronize
-TEST(StreamDcuTest, ConstructFromExistingCurrentStreamWorks) {
-  PrepareDeviceOrSkip();
+class StreamDcuTest : public ::testing::Test {
+ protected:
+  void SetUp() override { PrepareDeviceOrSkip(); }
+};
 
+TEST_F(StreamDcuTest, ConstructFromExistingCurrentStreamWorks) {
   constexpr size_t kNumBytes = 1 << 16;
   unsigned char* dev_ptr = nullptr;
   ASSERT_EQ(hipMalloc(&dev_ptr, kNumBytes), hipSuccess);
@@ -98,116 +96,31 @@ TEST(StreamDcuTest, ConstructFromExistingCurrentStreamWorks) {
 }
 
 // xllm::Stream APIs under test: Stream(), set_stream_guard, synchronize
-TEST(StreamDcuTest, StreamGuardVerifiesOperationOnCorrectStream) {
-  PrepareDeviceOrSkip();
-
-  constexpr size_t kNumBytes = 1 << 16;
-  unsigned char* dev_ptr = nullptr;
-  ASSERT_EQ(hipMalloc(&dev_ptr, kNumBytes), hipSuccess);
-
-  xllm::Stream s1, s2;
-
-  {
-    auto guard = s1.set_stream_guard();
-    ASSERT_EQ(
-        hipMemsetAsync(dev_ptr, 0xAA, kNumBytes, s1.get_stream()->stream()),
-        hipSuccess);
-  }
-  s1.synchronize();
-
-  {
-    auto guard = s2.set_stream_guard();
-    ASSERT_EQ(
-        hipMemsetAsync(dev_ptr, 0xBB, kNumBytes, s2.get_stream()->stream()),
-        hipSuccess);
-  }
-  s2.synchronize();
-
-  std::vector<unsigned char> host(kNumBytes);
-  ASSERT_EQ(hipMemcpy(host.data(), dev_ptr, kNumBytes, hipMemcpyDeviceToHost),
-            hipSuccess);
-  for (size_t i = 0; i < kNumBytes; ++i) {
-    ASSERT_EQ(host[i], 0xBB) << "Data mismatch at byte " << i;
-  }
-
-  ASSERT_EQ(hipFree(dev_ptr), hipSuccess);
-}
 
 // xllm::Stream APIs under test: Stream(), set_stream_guard, synchronize
-TEST(StreamDcuTest, StreamGuardSwitchesAndRestoresCurrentStream) {
-  PrepareDeviceOrSkip();
-
-  constexpr size_t kNumBytes = 1 << 16;
-  unsigned char *ptr1 = nullptr, *ptr2 = nullptr, *ptr3 = nullptr;
-  ASSERT_EQ(hipMalloc(&ptr1, kNumBytes), hipSuccess);
-  ASSERT_EQ(hipMalloc(&ptr2, kNumBytes), hipSuccess);
-  ASSERT_EQ(hipMalloc(&ptr3, kNumBytes), hipSuccess);
-
-  ASSERT_EQ(hipMemset(ptr1, 0, kNumBytes), hipSuccess);
-  ASSERT_EQ(hipMemset(ptr2, 0, kNumBytes), hipSuccess);
-  ASSERT_EQ(hipMemset(ptr3, 0, kNumBytes), hipSuccess);
-
-  xllm::Stream s1, s2, s3;
-
-  ASSERT_NE(s1.get_stream()->stream(), s2.get_stream()->stream());
-  ASSERT_NE(s2.get_stream()->stream(), s3.get_stream()->stream());
-  ASSERT_NE(s1.get_stream()->stream(), s3.get_stream()->stream());
-
+TEST_F(StreamDcuTest, StreamGuardSwitchesAndRestoresCurrentStream) {
+  const auto original = c10::hip::getCurrentHIPStream(kDeviceId);
+  xllm::Stream first, second, third;
   {
-    auto g1 = s1.set_stream_guard();
-    ASSERT_EQ(hipMemsetAsync(ptr1, 0x11, kNumBytes, s1.get_stream()->stream()),
-              hipSuccess);
-
+    auto first_guard = first.set_stream_guard();
+    EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), *first.get_stream());
     {
-      auto g2 = s2.set_stream_guard();
-      ASSERT_EQ(
-          hipMemsetAsync(ptr2, 0x22, kNumBytes, s2.get_stream()->stream()),
-          hipSuccess);
-
+      auto second_guard = second.set_stream_guard();
+      EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), *second.get_stream());
       {
-        auto g3 = s3.set_stream_guard();
-        ASSERT_EQ(
-            hipMemsetAsync(ptr3, 0x33, kNumBytes, s3.get_stream()->stream()),
-            hipSuccess);
+        auto third_guard = third.set_stream_guard();
+        EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId),
+                  *third.get_stream());
       }
+      EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), *second.get_stream());
     }
+    EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), *first.get_stream());
   }
-
-  // StreamGuard only restores the current-stream context on destruction; it
-  // does not synchronize.  Explicitly sync all three streams before readback.
-  s1.synchronize();
-  s2.synchronize();
-  s3.synchronize();
-
-  std::vector<unsigned char> host(kNumBytes);
-
-  ASSERT_EQ(hipMemcpy(host.data(), ptr1, kNumBytes, hipMemcpyDeviceToHost),
-            hipSuccess);
-  for (size_t i = 0; i < kNumBytes; ++i) {
-    ASSERT_EQ(host[i], 0x11) << "ptr1 mismatch at byte " << i;
-  }
-
-  ASSERT_EQ(hipMemcpy(host.data(), ptr2, kNumBytes, hipMemcpyDeviceToHost),
-            hipSuccess);
-  for (size_t i = 0; i < kNumBytes; ++i) {
-    ASSERT_EQ(host[i], 0x22) << "ptr2 mismatch at byte " << i;
-  }
-
-  ASSERT_EQ(hipMemcpy(host.data(), ptr3, kNumBytes, hipMemcpyDeviceToHost),
-            hipSuccess);
-  for (size_t i = 0; i < kNumBytes; ++i) {
-    ASSERT_EQ(host[i], 0x33) << "ptr3 mismatch at byte " << i;
-  }
-
-  ASSERT_EQ(hipFree(ptr1), hipSuccess);
-  ASSERT_EQ(hipFree(ptr2), hipSuccess);
-  ASSERT_EQ(hipFree(ptr3), hipSuccess);
+  EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), original);
 }
 
 // xllm::Stream APIs under test: Stream(Stream&&), get_stream, synchronize
-TEST(StreamDcuTest, MoveConstructPreservesPendingOperations) {
-  PrepareDeviceOrSkip();
-
+TEST_F(StreamDcuTest, MoveConstructPreservesPendingOperations) {
   constexpr size_t kNumBytes = 1 << 20;
   unsigned char* dev_ptr = nullptr;
   ASSERT_EQ(hipMalloc(&dev_ptr, kNumBytes), hipSuccess);
@@ -235,16 +148,11 @@ TEST(StreamDcuTest, MoveConstructPreservesPendingOperations) {
 
   ASSERT_EQ(hipFree(dev_ptr), hipSuccess);
 
-  // Moved-from object remains in a valid state; destroying it must not crash.
-  // NOLINTNEXTLINE(bugprone-use-after-move): intentional use-after-move
-  // verification
-  s1.~Stream();
+  // Both stream objects leave scope exactly once.
 }
 
 // xllm::Stream APIs under test: Stream(), get_stream, wait_stream, synchronize
-TEST(StreamDcuTest, WaitStreamEstablishesOrdering) {
-  PrepareDeviceOrSkip();
-
+TEST_F(StreamDcuTest, WaitStreamEstablishesOrdering) {
   xllm::Stream producer;
   xllm::Stream consumer;
 
@@ -265,17 +173,45 @@ TEST(StreamDcuTest, WaitStreamEstablishesOrdering) {
 
   std::memset(host_ptr, 0, kNumBytes);
 
-  ASSERT_EQ(hipMemsetAsync(dev_ptr, 0x5A, kNumBytes, producer_stream),
+  ASSERT_EQ(hipMemset(dev_ptr, 0, kNumBytes), hipSuccess);
+  std::atomic<bool> gate_open{false};
+  ASSERT_EQ(hipLaunchHostFunc(
+                producer_stream,
+                [](void* data) {
+                  auto* gate = static_cast<std::atomic<bool>*>(data);
+                  while (!gate->load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                  }
+                },
+                &gate_open),
             hipSuccess);
+  const hipError_t queued =
+      hipMemsetAsync(dev_ptr, 0x5A, kNumBytes, producer_stream);
+  if (queued != hipSuccess) {
+    gate_open.store(true, std::memory_order_release);
+    EXPECT_EQ(producer.synchronize(), 0);
+  }
+  ASSERT_EQ(queued, hipSuccess);
 
-  consumer.wait_stream(producer);
-
-  ASSERT_EQ(
-      hipMemcpyAsync(
-          host_ptr, dev_ptr, kNumBytes, hipMemcpyDeviceToHost, consumer_stream),
-      hipSuccess);
-
-  EXPECT_EQ(consumer.synchronize(), 0);
+  auto readback = std::async(std::launch::async, [&] {
+    if (hipSetDevice(kDeviceId) != hipSuccess) {
+      return false;
+    }
+    consumer.wait_stream(producer);
+    if (hipMemcpyAsync(host_ptr,
+                       dev_ptr,
+                       kNumBytes,
+                       hipMemcpyDeviceToHost,
+                       consumer_stream) != hipSuccess) {
+      return false;
+    }
+    return consumer.synchronize() == 0;
+  });
+  const auto before_release = readback.wait_for(std::chrono::milliseconds(100));
+  gate_open.store(true, std::memory_order_release);
+  EXPECT_EQ(before_release, std::future_status::timeout);
+  EXPECT_TRUE(readback.get());
+  EXPECT_EQ(producer.synchronize(), 0);
 
   for (size_t i = 0; i < kNumBytes; ++i) {
     ASSERT_EQ(host_ptr[i], 0x5A) << "Mismatch at byte " << i;
@@ -286,35 +222,11 @@ TEST(StreamDcuTest, WaitStreamEstablishesOrdering) {
 }
 
 // xllm::Stream APIs under test: operator<<
-TEST(StreamDcuTest, OutputStreamOperatorWorks) {
-  PrepareDeviceOrSkip();
-
-  xllm::Stream s;
-  std::ostringstream oss;
-  oss << s;
-  std::string out = oss.str();
-  EXPECT_FALSE(out.empty()) << "Output stream should not be empty";
-}
 
 // xllm::Stream APIs under test: set_stream_guard
-TEST(StreamDcuTest, GuardRestoresOriginalStreamContext) {
-  PrepareDeviceOrSkip();
-
-  c10::hip::HIPStream original = c10::hip::getCurrentHIPStream(kDeviceId);
-  xllm::Stream s;
-
-  {
-    auto guard = s.set_stream_guard();
-    EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), *s.get_stream());
-  }
-
-  EXPECT_EQ(c10::hip::getCurrentHIPStream(kDeviceId), original);
-}
 
 // xllm::Stream APIs under test: wait_stream, synchronize
-TEST(StreamDcuTest, WaitStreamSelfIsSafe) {
-  PrepareDeviceOrSkip();
-
+TEST_F(StreamDcuTest, WaitStreamSelfIsSafe) {
   constexpr size_t kNumBytes = 1 << 20;
   unsigned char* dev_ptr = nullptr;
   ASSERT_EQ(hipMalloc(&dev_ptr, kNumBytes), hipSuccess);

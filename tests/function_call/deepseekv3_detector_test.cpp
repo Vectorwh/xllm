@@ -65,23 +65,6 @@ class DeepSeekV3DetectorTest : public ::testing::Test {
   std::vector<JsonTool> tools_;
 };
 
-// Test constructor and basic properties
-TEST_F(DeepSeekV3DetectorTest, ConstructorInitializesCorrectly) {
-  EXPECT_NE(detector_, nullptr);
-
-  // Test basic token detection
-  std::string text_with_tool_call =
-      "Some text "
-      "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>test\n`"
-      "``json\n{\"name\": "
-      "\"test\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
-  std::string text_without_tool_call =
-      "Just normal text without any tool calls";
-
-  EXPECT_TRUE(detector_->has_tool_call(text_with_tool_call));
-  EXPECT_FALSE(detector_->has_tool_call(text_without_tool_call));
-}
-
 // Test has_tool_call method
 TEST_F(DeepSeekV3DetectorTest, HasToolCallDetection) {
   // Test text containing tool calls
@@ -157,27 +140,6 @@ TEST_F(DeepSeekV3DetectorTest, MultipleToolCallsParsing) {
 
   nlohmann::json params2 = nlohmann::json::parse(call2.parameters);
   EXPECT_EQ(params2["expression"], "2 + 3 * 4");
-}
-
-// Test DeepSeekV3 specific format with exact tokens
-TEST_F(DeepSeekV3DetectorTest, DeepSeekV3SpecificFormat) {
-  std::string text =
-      "I need weather info "
-      "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_"
-      "current_weather\n```json\n{\"location\": "
-      "\"Tokyo\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "I need weather info");
-  EXPECT_EQ(result.calls.size(), 1);
-
-  const auto& call = result.calls[0];
-  EXPECT_TRUE(call.name.has_value());
-  EXPECT_EQ(call.name.value(), "get_current_weather");
-
-  nlohmann::json params = nlohmann::json::parse(call.parameters);
-  EXPECT_EQ(params["location"], "Tokyo");
 }
 
 // Test invalid JSON handling
@@ -374,35 +336,26 @@ TEST_F(DeepSeekV3DetectorTest, RegexPatternEdgeCases) {
             0);  // Should fail to match without ```json``` markers
 }
 
-// Performance test: multiple tool calls
-TEST_F(DeepSeekV3DetectorTest, PerformanceWithMultipleToolCalls) {
-  std::string text = "Performance test";
+TEST_F(DeepSeekV3DetectorTest, MultipleToolCallSections) {
+  const std::string text =
+      "Two sections "
+      "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+      "calculate\n```json\n{\"expression\": \"2 + 3\"}\n```"
+      "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+      "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+      "get_current_weather\n```json\n{\"location\": \"Tokyo\"}\n```"
+      "<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
 
-  // Build text containing multiple tool calls
-  for (int i = 0; i < 10000; ++i) {
-    text +=
-        " <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
-        "calculate\n```json\n{\"expression\": \"" +
-        std::to_string(i) + " + " + std::to_string(i + 1) +
-        "\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
-  }
+  const auto result = detector_->detect_and_parse(text, tools_);
 
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "Performance test");
-  EXPECT_EQ(result.calls.size(), 10000);
-
-  // Verify each tool call is correctly parsed
-  for (int i = 0; i < 10000; ++i) {
-    const auto& call = result.calls[i];
-    EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
-    EXPECT_EQ(call.name.value(), "calculate");
-
-    nlohmann::json params = nlohmann::json::parse(call.parameters);
-    std::string expected_expr =
-        std::to_string(i) + " + " + std::to_string(i + 1);
-    EXPECT_EQ(params["expression"], expected_expr);
-  }
+  EXPECT_EQ(result.normal_text, "Two sections");
+  ASSERT_EQ(result.calls.size(), 2);
+  EXPECT_EQ(result.calls[0].name, "calculate");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[0].parameters)["expression"],
+            "2 + 3");
+  EXPECT_EQ(result.calls[1].name, "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[1].parameters)["location"],
+            "Tokyo");
 }
 
 // Test error handling with malformed tokens
@@ -468,42 +421,6 @@ TEST_F(DeepSeekV3DetectorTest, BasicStreamingParsing) {
 
   EXPECT_TRUE(found_tool_name) << "Should find tool name in streaming results";
   EXPECT_TRUE(found_arguments) << "Should find arguments in streaming results";
-}
-
-// Test incremental argument streaming
-TEST_F(DeepSeekV3DetectorTest, IncrementalArgumentStreaming) {
-  std::vector<std::string> chunks = {
-      "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_"
-      "current_weather\n```json\n",
-      "{\"location\":",
-      " \"San Francisco\"",
-      ", \"unit\": \"celsius\"",
-      "}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"};
-
-  std::string accumulated_args;
-  bool tool_name_sent = false;
-
-  for (const auto& chunk : chunks) {
-    auto result = detector_->parse_streaming_increment(chunk, tools_);
-
-    for (const auto& call : result.calls) {
-      if (call.name.has_value()) {
-        tool_name_sent = true;
-        EXPECT_EQ(call.name.value(), "get_current_weather");
-      } else {
-        accumulated_args += call.parameters;
-      }
-    }
-  }
-
-  EXPECT_TRUE(tool_name_sent)
-      << "Tool name should be sent when tool call is complete";
-  if (!accumulated_args.empty()) {
-    EXPECT_TRUE(accumulated_args.find("San Francisco") != std::string::npos)
-        << "Should contain location argument";
-    EXPECT_TRUE(accumulated_args.find("celsius") != std::string::npos)
-        << "Should contain unit argument";
-  }
 }
 
 // Test streaming with multiple tool calls

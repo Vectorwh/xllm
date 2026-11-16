@@ -156,11 +156,6 @@ class Batch {
     return allowed_max_tokens_;
   }
 
-  std::unordered_map<uint32_t, uint32_t> cal_seq_exchange_index_test(
-      std::vector<uint32_t>& kv_cache_tokens_num) {
-    return cal_seq_exchange_index(kv_cache_tokens_num);
-  }
-
   // Get all sequences from either sequences_ or sequence_groups_
   // Used by RecEngine to access sequences for stopping checker evaluation
   std::vector<Sequence*> get_sequences();

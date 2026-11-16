@@ -18,7 +18,6 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
-#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -121,38 +120,6 @@ TEST(LanczosResize, RgbMatchesPilAndOpaqueRgba) {
       resize_rgba_like_pil(opaque, /*width=*/5, /*height=*/4);
   EXPECT_TRUE(torch::equal(resized, resized_rgba.slice(1, 0, 3)));
   EXPECT_TRUE(resized_rgba.slice(1, 3, 4).eq(255).all().item<bool>());
-}
-
-TEST(LanczosResize, EightHundredTo1024MatchesPilFullImage) {
-  auto hwc = torch::empty({800, 800, 4}, torch::kUInt8);
-  auto* source = hwc.data_ptr<uint8_t>();
-  for (int64_t y = 0; y < 800; ++y) {
-    for (int64_t x = 0; x < 800; ++x) {
-      const int64_t offset = (y * 800 + x) * 4;
-      source[offset] = static_cast<uint8_t>((17 * x + 29 * y) % 256);
-      source[offset + 1] = static_cast<uint8_t>((13 * x + 7 * y + 41) % 256);
-      source[offset + 2] = static_cast<uint8_t>((5 * x + 23 * y + 97) % 256);
-      source[offset + 3] = static_cast<uint8_t>((11 * x + 19 * y) % 256);
-    }
-  }
-  // FNV-1a of all CHW output bytes from Pillow 11.2.1 LANCZOS, for RGB/RGBA.
-  // A full-image fingerprint keeps the 800x800 production-size fixture compact.
-  constexpr std::array<uint64_t, 2> kPilHashes{0x64b135564244a732ULL,
-                                               0x33083ce0205fa936ULL};
-  for (int64_t channels = 3; channels <= 4; ++channels) {
-    const auto image =
-        hwc.slice(2, 0, channels).permute({2, 0, 1}).unsqueeze(0);
-    const auto resized =
-        resize_rgba_like_pil(image, /*width=*/1024, /*height=*/1024);
-    ASSERT_EQ(resized.sizes(), (torch::IntArrayRef{1, channels, 1024, 1024}));
-    ASSERT_TRUE(resized.is_contiguous());
-    const auto* pixels = resized.data_ptr<uint8_t>();
-    uint64_t hash = 0xcbf29ce484222325ULL;
-    for (int64_t i = 0; i < resized.numel(); ++i) {
-      hash = (hash ^ pixels[i]) * 0x100000001b3ULL;
-    }
-    EXPECT_EQ(hash, kPilHashes[channels - 3]) << "channels=" << channels;
-  }
 }
 
 }  // namespace

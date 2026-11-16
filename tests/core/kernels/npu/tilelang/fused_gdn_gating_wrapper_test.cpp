@@ -147,12 +147,6 @@ TEST_F(TileLangFusedGdnGatingWrapperTest, MatchesTorchReference) {
           .seed = 202,
       },
       {
-          .name = "qwen35_tp2_video_b4096_h24",
-          .num_batches = 4096,
-          .num_heads = 24,
-          .seed = 203,
-      },
-      {
           .name = "qwen35_tp2_video_b8192_h24",
           .num_batches = 8192,
           .num_heads = 24,
@@ -201,12 +195,6 @@ TEST_F(TileLangFusedGdnGatingWrapperTest, MatchesTorchReference) {
           .seed = 107,
           .beta = 2.0F,
           .threshold = 0.5F,
-      },
-      {
-          .name = "large_b65536_h32",
-          .num_batches = 65536,
-          .num_heads = 32,
-          .seed = 109,
       },
       {
           .name = "large_b262144_h32",

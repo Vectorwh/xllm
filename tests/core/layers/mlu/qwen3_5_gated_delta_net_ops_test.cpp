@@ -45,13 +45,23 @@ using xllm::kernel::mlu::fused_sigmoid_gating_delta_rule_update;
 // Shared fixture: initializes a single MLU device and exposes seeded tensor
 // helpers that match the conventions used by neighbouring MLU layer tests.
 // ---------------------------------------------------------------------------
+
 class Qwen3_5GatedDeltaNetOpsTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
+    if (Platform::device_count() == 0) {
+      return;
+    }
     torch::Device device(Platform::type_torch(), 0);
     Device xllm_device(device);
     xllm_device.set_seed(42);
     device_ = device;
+  }
+
+  void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
   }
 
   // Seeded noise in [-stddev, +stddev) on the MLU device, bf16 by default.
@@ -471,11 +481,11 @@ void Qwen3_5GatedDeltaNetOpsTest::
   EXPECT_EQ(g.scalar_type(), torch::kFloat32);
   EXPECT_EQ(beta.scalar_type(), torch::kFloat32);
 
-  EXPECT_TRUE(torch::allclose(q, q_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
-  EXPECT_TRUE(torch::allclose(k, k_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
-  EXPECT_TRUE(torch::allclose(v, v_ref, /*rtol=*/1e-3, /*atol=*/1e-3));
-  EXPECT_TRUE(torch::allclose(g, g_ref, /*rtol=*/1e-4, /*atol=*/1e-4));
-  EXPECT_TRUE(torch::allclose(beta, beta_ref, /*rtol=*/1e-4, /*atol=*/1e-4));
+  EXPECT_TRUE(test::scaled_close(q, q_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
+  EXPECT_TRUE(test::scaled_close(k, k_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
+  EXPECT_TRUE(test::scaled_close(v, v_ref, /*rtol=*/1e-3, /*atol=*/1e-3));
+  EXPECT_TRUE(test::scaled_close(g, g_ref, /*rtol=*/1e-4, /*atol=*/1e-4));
+  EXPECT_TRUE(test::scaled_close(beta, beta_ref, /*rtol=*/1e-4, /*atol=*/1e-4));
 }
 
 void Qwen3_5GatedDeltaNetOpsTest::
@@ -514,8 +524,8 @@ void Qwen3_5GatedDeltaNetOpsTest::
                                                  /*output_g_exp=*/false);
   Sync();
 
-  EXPECT_TRUE(torch::allclose(q, q_ref, /*rtol=*/1e-3, /*atol=*/1e-3));
-  EXPECT_TRUE(torch::allclose(k, k_ref, /*rtol=*/1e-3, /*atol=*/1e-3));
+  EXPECT_TRUE(test::scaled_close(q, q_ref, /*rtol=*/1e-3, /*atol=*/1e-3));
+  EXPECT_TRUE(test::scaled_close(k, k_ref, /*rtol=*/1e-3, /*atol=*/1e-3));
   EXPECT_TRUE(torch::isfinite(v.to(torch::kFloat32)).all().item<bool>());
   EXPECT_TRUE(torch::isfinite(g).all().item<bool>());
   EXPECT_TRUE(torch::isfinite(beta).all().item<bool>());
@@ -586,7 +596,7 @@ void Qwen3_5GatedDeltaNetOpsTest::check_causal_conv1d_fn_prefill() {
                                std::nullopt,
                                true);
   Sync();
-  EXPECT_TRUE(torch::allclose(out, out2, /*rtol=*/1e-3, /*atol=*/1e-4))
+  EXPECT_TRUE(test::scaled_close(out, out2, /*rtol=*/1e-3, /*atol=*/1e-4))
       << "conv1d_fn should be deterministic for fixed inputs";
 }
 
@@ -638,13 +648,13 @@ void Qwen3_5GatedDeltaNetOpsTest::check_causal_conv1d_update_decode() {
       (conv_state_run1.index({conv_state_indices}).to(torch::kFloat32) -
        conv_state_ref.to(torch::kFloat32))
           .abs();
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2))
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2))
       << "max out diff: " << out_abs_diff.max().item<float>()
       << ", mean out diff: " << out_abs_diff.mean().item<float>();
-  EXPECT_TRUE(torch::allclose(conv_state_run1.index({conv_state_indices}),
-                              conv_state_ref,
-                              /*rtol=*/1e-2,
-                              /*atol=*/5e-2))
+  EXPECT_TRUE(test::scaled_close(conv_state_run1.index({conv_state_indices}),
+                                 conv_state_ref,
+                                 /*rtol=*/1e-2,
+                                 /*atol=*/5e-2))
       << "max state diff: " << state_abs_diff.max().item<float>()
       << ", mean state diff: " << state_abs_diff.mean().item<float>();
 
@@ -658,7 +668,7 @@ void Qwen3_5GatedDeltaNetOpsTest::check_causal_conv1d_update_decode() {
                                           /*activation=*/true,
                                           /*pad_slot_id=*/-1);
   Sync();
-  EXPECT_TRUE(torch::allclose(out, out2, /*rtol=*/1e-3, /*atol=*/1e-4))
+  EXPECT_TRUE(test::scaled_close(out, out2, /*rtol=*/1e-3, /*atol=*/1e-4))
       << "conv1d_update_decode should be deterministic for fixed inputs";
 }
 
@@ -690,11 +700,11 @@ void Qwen3_5GatedDeltaNetOpsTest::
   Sync();
 
   EXPECT_EQ(out.sizes(), x.sizes());
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2));
-  EXPECT_TRUE(torch::allclose(conv_state,
-                              conv_state_ref,
-                              /*rtol=*/1e-2,
-                              /*atol=*/5e-2));
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2));
+  EXPECT_TRUE(test::scaled_close(conv_state,
+                                 conv_state_ref,
+                                 /*rtol=*/1e-2,
+                                 /*atol=*/5e-2));
 }
 
 void Qwen3_5GatedDeltaNetOpsTest::
@@ -734,11 +744,11 @@ void Qwen3_5GatedDeltaNetOpsTest::
   Sync();
 
   EXPECT_EQ(out.sizes(), x.sizes());
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2));
-  EXPECT_TRUE(torch::allclose(conv_state,
-                              conv_state_ref,
-                              /*rtol=*/1e-2,
-                              /*atol=*/5e-2));
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2));
+  EXPECT_TRUE(test::scaled_close(conv_state,
+                                 conv_state_ref,
+                                 /*rtol=*/1e-2,
+                                 /*atol=*/5e-2));
 }
 
 void run_causal_conv1d_update_spec_verify_test(
@@ -810,13 +820,13 @@ void run_causal_conv1d_update_spec_verify_test(
       (conv_state_run.index({conv_state_indices}).to(torch::kFloat32) -
        conv_state_ref.index({conv_state_indices}).to(torch::kFloat32))
           .abs();
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2))
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/5e-2))
       << "max out diff: " << out_abs_diff.max().item<float>()
       << ", mean out diff: " << out_abs_diff.mean().item<float>();
-  EXPECT_TRUE(torch::allclose(conv_state_run.index({conv_state_indices}),
-                              conv_state_ref.index({conv_state_indices}),
-                              /*rtol=*/1e-2,
-                              /*atol=*/5e-2))
+  EXPECT_TRUE(test::scaled_close(conv_state_run.index({conv_state_indices}),
+                                 conv_state_ref.index({conv_state_indices}),
+                                 /*rtol=*/1e-2,
+                                 /*atol=*/5e-2))
       << "max state diff: " << state_abs_diff.max().item<float>()
       << ", mean state diff: " << state_abs_diff.mean().item<float>();
 }
@@ -902,13 +912,13 @@ void Qwen3_5GatedDeltaNetOpsTest::
   auto state_abs_diff =
       (final_state.to(torch::kFloat32) - final_state_ref.to(torch::kFloat32))
           .abs();
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/2e-2))
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/2e-2))
       << "max out diff: " << out_abs_diff.max().item<float>()
       << ", mean out diff: " << out_abs_diff.mean().item<float>();
-  EXPECT_TRUE(torch::allclose(final_state,
-                              final_state_ref,
-                              /*rtol=*/1e-2,
-                              /*atol=*/2e-2))
+  EXPECT_TRUE(test::scaled_close(final_state,
+                                 final_state_ref,
+                                 /*rtol=*/1e-2,
+                                 /*atol=*/2e-2))
       << "max state diff: " << state_abs_diff.max().item<float>()
       << ", mean state diff: " << state_abs_diff.mean().item<float>();
 
@@ -925,7 +935,7 @@ void Qwen3_5GatedDeltaNetOpsTest::
                                                      ssm_state_indices,
                                                      true);
   Sync();
-  EXPECT_TRUE(torch::allclose(out, out2, /*rtol=*/1e-3, /*atol=*/1e-4))
+  EXPECT_TRUE(test::scaled_close(out, out2, /*rtol=*/1e-3, /*atol=*/1e-4))
       << "recurrent decode should be deterministic for fixed inputs";
 }
 
@@ -1033,13 +1043,13 @@ void Qwen3_5GatedDeltaNetOpsTest::
   auto state_abs_diff =
       (final_state.to(torch::kFloat32) - final_state_ref.to(torch::kFloat32))
           .abs();
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/1e-2))
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/1e-2))
       << "max out diff: " << out_abs_diff.max().item<float>()
       << ", mean out diff: " << out_abs_diff.mean().item<float>();
-  EXPECT_TRUE(torch::allclose(final_state,
-                              final_state_ref,
-                              /*rtol=*/1e-2,
-                              /*atol=*/1e-2))
+  EXPECT_TRUE(test::scaled_close(final_state,
+                                 final_state_ref,
+                                 /*rtol=*/1e-2,
+                                 /*atol=*/1e-2))
       << "max state diff: " << state_abs_diff.max().item<float>()
       << ", mean state diff: " << state_abs_diff.mean().item<float>();
 }
@@ -1166,8 +1176,8 @@ void Qwen3_5GatedDeltaNetOpsTest::
       final_state.sizes(),
       torch::IntArrayRef(
           {batch_size * num_tokens, num_v_heads, head_v_dim, head_k_dim}));
-  EXPECT_TRUE(torch::allclose(out, out_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
-  EXPECT_TRUE(torch::allclose(
+  EXPECT_TRUE(test::scaled_close(out, out_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
+  EXPECT_TRUE(test::scaled_close(
       final_state, final_state_ref, /*rtol=*/1e-2, /*atol=*/1e-2));
 }
 
@@ -1246,14 +1256,14 @@ void Qwen3_5GatedDeltaNetOpsTest::
   Sync();
 
   EXPECT_EQ(out.sizes(), expected_out.sizes());
-  EXPECT_TRUE(torch::allclose(out,
-                              expected_out,
-                              /*rtol=*/1e-3,
-                              /*atol=*/1e-4));
-  EXPECT_TRUE(torch::allclose(params.initial_state_source,
-                              expected_final_state,
-                              /*rtol=*/1e-3,
-                              /*atol=*/1e-4));
+  EXPECT_TRUE(test::scaled_close(out,
+                                 expected_out,
+                                 /*rtol=*/1e-3,
+                                 /*atol=*/1e-4));
+  EXPECT_TRUE(test::scaled_close(params.initial_state_source,
+                                 expected_final_state,
+                                 /*rtol=*/1e-3,
+                                 /*atol=*/1e-4));
 }
 
 void run_rebased_ssm_checkpoint_group_test(const torch::Device& device,
@@ -1343,20 +1353,20 @@ void run_rebased_ssm_checkpoint_group_test(const torch::Device& device,
   Device xllm_device(device);
   xllm_device.synchronize_default_stream();
 
-  EXPECT_TRUE(torch::allclose(out1, out_ref1, /*rtol=*/1e-2, /*atol=*/1e-2))
+  EXPECT_TRUE(test::scaled_close(out1, out_ref1, /*rtol=*/1e-2, /*atol=*/1e-2))
       << "Rebased Checkpoint Group first iteration output mismatch";
-  EXPECT_TRUE(torch::allclose(
+  EXPECT_TRUE(test::scaled_close(
       select_rebased_checkpoint_rows(final_state1, ssm_state_indices),
       select_rebased_checkpoint_rows(state_ref1, ssm_state_indices),
       /*rtol=*/1e-2,
       /*atol=*/1e-2))
       << "Rebased Checkpoint Group first iteration checkpoint mismatch";
-  EXPECT_FALSE(torch::allclose(final_state1.index({ssm_state_indices.select(
-                                   /*dim=*/1, /*index=*/0)}),
-                               initial_state.index({ssm_state_indices.select(
-                                   /*dim=*/1, /*index=*/0)}),
-                               /*rtol=*/1e-5,
-                               /*atol=*/1e-6))
+  EXPECT_FALSE(test::scaled_close(final_state1.index({ssm_state_indices.select(
+                                      /*dim=*/1, /*index=*/0)}),
+                                  initial_state.index({ssm_state_indices.select(
+                                      /*dim=*/1, /*index=*/0)}),
+                                  /*rtol=*/1e-5,
+                                  /*atol=*/1e-6))
       << "Rebased Checkpoint Group offset 0 must be rewritten";
 
   auto [out_ref2, state_ref2] = FusedSigmoidSpecVerifyRef(q2,
@@ -1390,10 +1400,10 @@ void run_rebased_ssm_checkpoint_group_test(const torch::Device& device,
                                              second_accepted);
   xllm_device.synchronize_default_stream();
 
-  EXPECT_TRUE(torch::allclose(out2, out_ref2, /*rtol=*/1e-2, /*atol=*/1e-2))
+  EXPECT_TRUE(test::scaled_close(out2, out_ref2, /*rtol=*/1e-2, /*atol=*/1e-2))
       << "Rebased Checkpoint Group accepted prefix 1 must resume from "
          "rewritten offset 0";
-  EXPECT_TRUE(torch::allclose(
+  EXPECT_TRUE(test::scaled_close(
       select_rebased_checkpoint_rows(final_state2, ssm_state_indices),
       select_rebased_checkpoint_rows(state_ref2, ssm_state_indices),
       /*rtol=*/1e-2,
@@ -1437,6 +1447,8 @@ void Qwen3_5GatedDeltaNetOpsTest::check_chunk_gated_delta_rule_forward() {
       "chunk.g", {batch_size, seq_len, num_v_heads}, 0.002f, torch::kFloat32);
   auto beta =
       MakeNoise("chunk.beta", {batch_size, seq_len, num_v_heads}, 0.02f);
+  g = -g.abs() - 0.1f;
+  beta = torch::sigmoid(beta.to(torch::kFloat32)).to(torch::kBFloat16);
   // initial_state: mirror the layer path -- ssm_cache [B, H, K, V] transposed
   // to [B, H, V, K], fp32.
   auto initial_state =
@@ -1476,26 +1488,29 @@ void Qwen3_5GatedDeltaNetOpsTest::check_chunk_gated_delta_rule_forward() {
                   .item<bool>())
       << "chunk GDN final state must be finite";
 
-  // Determinism: rebuild inputs with the same seeds for a second run.
-  auto q2 = MakeNoise(
-      "chunk.q", {batch_size, seq_len, num_k_heads, head_k_dim}, 0.01f);
-  auto k2 = MakeNoise(
-      "chunk.k", {batch_size, seq_len, num_k_heads, head_k_dim}, 0.01f);
-  auto v2 = MakeNoise(
-      "chunk.v", {batch_size, seq_len, num_v_heads, head_v_dim}, 0.01f);
-  auto g2 = MakeNoise(
-      "chunk.g", {batch_size, seq_len, num_v_heads}, 0.002f, torch::kFloat32);
-  auto beta2 =
-      MakeNoise("chunk.beta", {batch_size, seq_len, num_v_heads}, 0.02f);
-  auto init2 = MakeNoise("chunk.initial_state",
-                         {batch_size, num_v_heads, head_v_dim, head_k_dim},
-                         0.01f,
-                         torch::kFloat32);
-  auto [o2, _] = chunk_gdr->forward(
-      q2, k2, v2, g2, beta2, init2, cu_seqlens, chunk_indices, true, true);
-  Sync();
-  EXPECT_TRUE(torch::allclose(o, o2, /*rtol=*/1e-3, /*atol=*/1e-4))
-      << "chunk GDN should be deterministic for fixed inputs";
+  auto normalize = [](const torch::Tensor& x) {
+    const auto cpu = x.cpu();
+    return (cpu / cpu.norm(2.0, -1, true).clamp_min(1e-6)).to(torch::kFloat32);
+  };
+  const auto q_ref = normalize(q) / std::sqrt(static_cast<double>(head_k_dim));
+  const auto k_ref = normalize(k);
+  const auto v_ref = v.cpu().to(torch::kFloat32);
+  const auto gates = g.cpu();
+  const auto betas = beta.cpu().to(torch::kFloat32);
+  auto state = initial_state.cpu().clone().squeeze(0);
+  auto expected = torch::empty(o.sizes(), torch::kBFloat16);
+  for (int64_t token = 0; token < seq_len; ++token) {
+    const auto key = k_ref[0][token].repeat_interleave(2, 0);
+    const auto query = q_ref[0][token].repeat_interleave(2, 0);
+    state *= gates[0][token].exp().view({num_v_heads, 1, 1});
+    const auto delta = (v_ref[0][token] - (state * key.unsqueeze(1)).sum(-1)) *
+                       betas[0][token].unsqueeze(1);
+    state += delta.unsqueeze(2) * key.unsqueeze(1);
+    expected[0][token].copy_((state * query.unsqueeze(1)).sum(-1));
+  }
+  EXPECT_TRUE(test::scaled_close(o, expected, 0.02, 0.002));
+  EXPECT_TRUE(
+      test::scaled_close(final_state.cpu(), state.unsqueeze(0), 0.02, 0.002));
 }
 
 TEST_F(Qwen3_5GatedDeltaNetOpsTest, PostConvPrepMatchesProductionModes) {

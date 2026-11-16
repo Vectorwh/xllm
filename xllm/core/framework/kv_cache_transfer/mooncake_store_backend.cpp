@@ -13,14 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "framework/kv_cache_transfer/mooncake_store_backend.h"
-
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <exception>
 #include <limits>
 #include <utility>
+
+#include "framework/kv_cache_transfer/mooncake_store_backend_internal.h"
 
 namespace xllm {
 
@@ -30,7 +30,7 @@ bool MooncakeStoreBackend::init(
     const MooncakeStoreBackendConfig& config,
     const std::vector<StoreRegisteredRange>& ranges) {
   const std::optional<std::vector<StoreRegisteredRange>> unique =
-      unique_ranges(ranges);
+      internal::unique_ranges(ranges);
   if (!unique.has_value()) {
     LOG(ERROR) << "Invalid Mooncake Host tensor registration ranges.";
     return false;
@@ -111,7 +111,8 @@ std::vector<uint8_t> MooncakeStoreBackend::batch_put(
     }
     const size_t result_count = std::min(keys.size(), results.size());
     for (size_t result_index = 0; result_index < result_count; ++result_index) {
-      statuses[result_index] = put_succeeded(results[result_index]) ? 1 : 0;
+      statuses[result_index] =
+          internal::put_succeeded(results[result_index]) ? 1 : 0;
     }
   } catch (const std::exception& error) {
     LOG(ERROR) << "Mooncake Put failed: " << error.what();
@@ -151,7 +152,7 @@ std::vector<uint8_t> MooncakeStoreBackend::batch_get(
   request_indices.reserve(keys.size());
   for (size_t index = 0; index < buffers.size(); ++index) {
     const MultiBuffer& buffer = buffers[index];
-    const std::optional<int32_t> bytes = get_bytes(buffer);
+    const std::optional<int32_t> bytes = internal::get_bytes(buffer);
     if (!bytes.has_value()) {
       LOG(ERROR) << "Invalid Mooncake Get buffer: index=" << index
                  << " key=" << keys[index] << " batch_size=" << keys.size()
@@ -184,7 +185,7 @@ std::vector<uint8_t> MooncakeStoreBackend::batch_get(
                << " first_key=" << get_keys.front();
   }
   const std::vector<uint8_t> get_results =
-      get_statuses(expected_bytes, results);
+      internal::get_statuses(expected_bytes, results);
   for (size_t index = 0; index < request_indices.size(); ++index) {
     statuses[request_indices[index]] = get_results[index];
   }
@@ -204,7 +205,7 @@ std::vector<MooncakeReplicaTier> MooncakeStoreBackend::batch_query_tiers(
     const size_t result_count = std::min(keys.size(), results.size());
     for (size_t index = 0; index < result_count; ++index) {
       if (results[index].has_value()) {
-        tiers[index] = replica_tier(results[index].value().replicas);
+        tiers[index] = internal::replica_tier(results[index].value().replicas);
       }
     }
   } catch (const std::exception& error) {
@@ -215,7 +216,9 @@ std::vector<MooncakeReplicaTier> MooncakeStoreBackend::batch_query_tiers(
   return tiers;
 }
 
-MooncakeReplicaTier MooncakeStoreBackend::replica_tier(
+namespace internal {
+
+MooncakeReplicaTier replica_tier(
     const std::vector<mooncake::Replica::Descriptor>& replicas) {
   MooncakeReplicaTier tier = MooncakeReplicaTier::MISSING;
   for (const mooncake::Replica::Descriptor& replica : replicas) {
@@ -234,8 +237,7 @@ MooncakeReplicaTier MooncakeStoreBackend::replica_tier(
   return tier;
 }
 
-std::optional<std::vector<StoreRegisteredRange>>
-MooncakeStoreBackend::unique_ranges(
+std::optional<std::vector<StoreRegisteredRange>> unique_ranges(
     const std::vector<StoreRegisteredRange>& ranges) {
   std::vector<StoreRegisteredRange> unique;
   unique.reserve(ranges.size());
@@ -278,8 +280,7 @@ MooncakeStoreBackend::unique_ranges(
   return unique;
 }
 
-std::optional<int32_t> MooncakeStoreBackend::get_bytes(
-    const MultiBuffer& buffer) {
+std::optional<int32_t> get_bytes(const MultiBuffer& buffer) {
   if (buffer.addresses.size() != buffer.sizes.size()) {
     return std::nullopt;
   }
@@ -295,9 +296,8 @@ std::optional<int32_t> MooncakeStoreBackend::get_bytes(
   return static_cast<int32_t>(bytes);
 }
 
-std::vector<uint8_t> MooncakeStoreBackend::get_statuses(
-    const std::vector<int32_t>& expected_bytes,
-    const std::vector<int>& results) {
+std::vector<uint8_t> get_statuses(const std::vector<int32_t>& expected_bytes,
+                                  const std::vector<int>& results) {
   std::vector<uint8_t> statuses(expected_bytes.size(), /*value=*/0);
   const size_t result_count = std::min(expected_bytes.size(), results.size());
   for (size_t index = 0; index < result_count; ++index) {
@@ -307,10 +307,12 @@ std::vector<uint8_t> MooncakeStoreBackend::get_statuses(
   return statuses;
 }
 
-bool MooncakeStoreBackend::put_succeeded(int result) {
+bool put_succeeded(int result) {
   return result == 0 ||
          result == static_cast<int>(mooncake::ErrorCode::OBJECT_ALREADY_EXISTS);
 }
+
+}  // namespace internal
 
 void MooncakeStoreBackend::unregister_ranges() {
   if (client_ptr_ == nullptr) {

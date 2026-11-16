@@ -34,6 +34,38 @@ namespace xllm {
 namespace layer {
 namespace test {
 
+inline ::testing::AssertionResult scaled_close(const torch::Tensor& actual,
+                                               const torch::Tensor& expected,
+                                               double rtol = 1e-5,
+                                               double atol = 1e-8) {
+  if (actual.scalar_type() != expected.scalar_type()) {
+    return ::testing::AssertionFailure() << "Tensor dtype mismatch";
+  }
+  const auto actual_float = actual.cpu().to(torch::kFloat32);
+  const auto expected_float = expected.cpu().to(torch::kFloat32);
+  if (actual_float.sizes() != expected_float.sizes() ||
+      !torch::isfinite(actual_float).all().item<bool>() ||
+      !torch::isfinite(expected_float).all().item<bool>()) {
+    return ::testing::AssertionFailure() << "Invalid shape or nonfinite tensor";
+  }
+  if (!torch::allclose(actual_float, expected_float, rtol, atol)) {
+    return ::testing::AssertionFailure() << "Elementwise precision mismatch";
+  }
+  const double norm = torch::norm(expected_float, 2.0).item<double>();
+  if (norm == 0.0) {
+    return torch::equal(actual_float, expected_float)
+               ? ::testing::AssertionSuccess()
+               : ::testing::AssertionFailure()
+                     << "Nonzero output for zero reference";
+  }
+  const double relative =
+      torch::norm(actual_float - expected_float, 2.0).item<double>() / norm;
+  return relative <= rtol ? ::testing::AssertionSuccess()
+                          : ::testing::AssertionFailure()
+                                << "Relative L2 " << relative << " exceeds "
+                                << rtol;
+}
+
 class CompletedWork : public c10d::Work {
  public:
   CompletedWork() { finish(); }
@@ -43,11 +75,11 @@ inline c10::intrusive_ptr<c10d::Work> make_completed_work() {
   return c10::make_intrusive<CompletedWork>();
 }
 
-// Mock Backend for testing - minimal implementation for tp=1 tests
+// Backend stub returns completed work; it does not perform transport.
 class MockBackend : public c10d::Backend {
  public:
   MockBackend(int64_t rank, int64_t world_size)
-      : c10d::Backend(rank, world_size), rank_(rank), world_size_(world_size) {}
+      : c10d::Backend(rank, world_size) {}
 
   c10::intrusive_ptr<c10d::Work> allreduce(
       std::vector<torch::Tensor>& tensors,
@@ -130,17 +162,9 @@ class MockBackend : public c10d::Backend {
     return make_completed_work();
   }
 
-  int64_t getRank() const { return rank_; }
-
-  int64_t getSize() const { return world_size_; }
-
   void shutdown() override {
     // Mock implementation - do nothing
   }
-
- private:
-  int64_t rank_;
-  int64_t world_size_;
 };
 
 // Mock ProcessGroup for testing
@@ -150,7 +174,6 @@ class MockProcessGroup : public xllm::ProcessGroup {
                    int64_t rank = 0,
                    int64_t world_size = 1)
       : xllm::ProcessGroup(rank, world_size, device) {
-    // Initialize pg_ with a mock backend for testing
     pg_ = std::make_unique<MockBackend>(rank, world_size);
   }
 
@@ -244,22 +267,10 @@ void verify_precision(const torch::Tensor& actual_output,
                       double rtol = 1e-3,
                       double atol = 1e-4);
 
-// Expect tensor's min, max, sum (computed in fp32) to match expected values
-// within tolerance. Uses atol + rtol * |expected| for each of min, max, sum.
-void expect_tensor_stats(const torch::Tensor& t,
-                         double expected_min,
-                         double expected_max,
-                         double expected_sum,
-                         double rtol = 1e-2,
-                         double atol = 1e-5);
-
-// Helper function to create default model arguments for testing
 ModelArgs create_default_model_args();
 
-// Helper function to create default quantization arguments for testing
 QuantArgs create_default_quant_args();
 
-// Helper function to create default parallel arguments for testing
 ParallelArgs create_default_parallel_args(
     std::unique_ptr<xllm::ProcessGroup>& mock_process_group);
 

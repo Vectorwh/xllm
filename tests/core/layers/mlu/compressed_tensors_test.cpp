@@ -24,6 +24,7 @@ limitations under the License.
 #include "core/layers/common/linear.h"
 #include "core/layers/mlu/deepseek_v32/deepseek_v32_attention.h"
 #include "core/layers/mlu/fused_moe.h"
+#include "core/platform/platform.h"
 #include "layers/mlu/tests_utils.h"
 #include "tests/core/layers/mlu/glm5_next_kpool_test_utils.h"
 
@@ -123,8 +124,6 @@ torch::TensorOptions mlu_options() {
       .dtype(torch::kBFloat16);
 }
 
-using Weights = std::unordered_map<std::string, torch::Tensor>;
-
 Weights ct_weights(int64_t out, int64_t in, bool smooth) {
   return create_compressed_weights(out, in, smooth);
 }
@@ -144,6 +143,11 @@ torch::Tensor reference(const torch::Tensor& input, const Weights& weights) {
 }
 
 void expect_close(const torch::Tensor& actual, const torch::Tensor& expected) {
+  const auto values = actual.cpu().to(torch::kFloat32);
+  const double reference_norm = torch::norm(expected, 2.0).item<double>();
+  ASSERT_GT(reference_norm, 0.0);
+  EXPECT_LE(torch::norm(values - expected, 2.0).item<double>() / reference_norm,
+            0.02);
   EXPECT_TRUE(torch::allclose(actual.cpu().to(torch::kFloat32),
                               expected,
                               /*rtol=*/0.02,
@@ -192,7 +196,24 @@ Weights attention_weights(const ModelArgs& args, bool compressed) {
   return create_compressed_mla_weights(args, compressed);
 }
 
-TEST(CompressedTensorsMluTest, AttentionPreservesBothCheckpointFormats) {
+class CompressedTensorsDeviceTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    death_style_ = GTEST_FLAG_GET(death_test_style);
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+  }
+  void TearDown() override { GTEST_FLAG_SET(death_test_style, death_style_); }
+
+ private:
+  std::string death_style_;
+};
+using CompressedTensorsMluTest = CompressedTensorsDeviceTest;
+using CompressedTensorsMluDeathTest = CompressedTensorsDeviceTest;
+
+TEST_F(CompressedTensorsMluTest, AttentionPreservesBothCheckpointFormats) {
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
   ParallelArgs parallel(0, 1, &pg);
@@ -267,7 +288,7 @@ TEST(CompressedTensorsMluTest, AttentionPreservesBothCheckpointFormats) {
   }
 }
 
-TEST(CompressedTensorsMluTest, KpoolProjectionRemainsBfloat16) {
+TEST_F(CompressedTensorsMluTest, KpoolProjectionRemainsBfloat16) {
   const test::BlockSizeGuard block_size_guard(/*block_size=*/16);
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
@@ -301,7 +322,7 @@ TEST(CompressedTensorsMluTest, KpoolProjectionRemainsBfloat16) {
                              weight.to(torch::kFloat32).t()));
 }
 
-TEST(CompressedTensorsMluDeathTest, AttentionRejectsIncompleteCheckpoint) {
+TEST_F(CompressedTensorsMluDeathTest, AttentionRejectsIncompleteCheckpoint) {
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
   ParallelArgs parallel(0, 1, &pg);
@@ -327,7 +348,7 @@ TEST(CompressedTensorsMluDeathTest, AttentionRejectsIncompleteCheckpoint) {
   }
 }
 
-TEST(CompressedTensorsMluTest, LinearLoadsWeightAndScaleInEitherOrder) {
+TEST_F(CompressedTensorsMluTest, LinearLoadsWeightAndScaleInEitherOrder) {
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
   const auto weights = ct_weights(/*out=*/64, /*in=*/128, /*smooth=*/false);
@@ -354,7 +375,7 @@ TEST(CompressedTensorsMluTest, LinearLoadsWeightAndScaleInEitherOrder) {
   }
 }
 
-TEST(CompressedTensorsMluTest, LinearLoadsPreservedSmooth) {
+TEST_F(CompressedTensorsMluTest, LinearLoadsPreservedSmooth) {
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
   auto args = ct_args();
@@ -390,7 +411,7 @@ QuantArgs mixed_linear_args() {
   return args;
 }
 
-TEST(CompressedTensorsMluTest, FusedSmoothLoadsInEitherOrder) {
+TEST_F(CompressedTensorsMluTest, FusedSmoothLoadsInEitherOrder) {
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
   ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &pg);
@@ -443,7 +464,7 @@ TEST(CompressedTensorsMluTest, FusedSmoothLoadsInEitherOrder) {
   }
 }
 
-TEST(CompressedTensorsMluDeathTest, FusedSmoothRequiresEveryProjection) {
+TEST_F(CompressedTensorsMluDeathTest, FusedSmoothRequiresEveryProjection) {
   test::MockProcessGroup pg(mlu_options().device());
   ColumnParallelLinear linear(
       128, 128, false, false, mixed_linear_args(), &pg, mlu_options());
@@ -469,7 +490,7 @@ TEST(CompressedTensorsMluDeathTest, FusedSmoothRequiresEveryProjection) {
       "Smooth size mismatch");
 }
 
-TEST(CompressedTensorsMluDeathTest, ReplicatedPreservedSmoothIsRequired) {
+TEST_F(CompressedTensorsMluDeathTest, ReplicatedPreservedSmoothIsRequired) {
   ReplicatedLinear linear(128, 64, false, mixed_linear_args(), mlu_options());
   auto weights = ct_weights(/*out=*/64, /*in=*/128, /*smooth=*/true);
   const auto smooth = weights.at("smooth");
@@ -483,7 +504,7 @@ TEST(CompressedTensorsMluDeathTest, ReplicatedPreservedSmoothIsRequired) {
   expect_close(linear->forward(input), reference(input, weights));
 }
 
-TEST(CompressedTensorsMluDeathTest, LinearRejectsW4a8Target) {
+TEST_F(CompressedTensorsMluDeathTest, LinearRejectsW4a8Target) {
   auto args = mixed_linear_args();
   args.compressed_groups() = {CompressedQuantGroup{
       .targets = {"model.q_proj"}, .bits = 4, .group_size = 128}};
@@ -494,7 +515,7 @@ TEST(CompressedTensorsMluDeathTest, LinearRejectsW4a8Target) {
                "Linear only supports.*W8A8");
 }
 
-TEST(CompressedTensorsMluTest, ReplicatedRouterRemainsBfloat16) {
+TEST_F(CompressedTensorsMluTest, ReplicatedRouterRemainsBfloat16) {
   auto weights = torch::ones({4, 128}, torch::kBFloat16);
   ReplicatedLinear router(128, 4, false, ct_args(), mlu_options());
   router->load_state_dict(
@@ -504,7 +525,7 @@ TEST(CompressedTensorsMluTest, ReplicatedRouterRemainsBfloat16) {
                torch::full({2, 4}, 128.0));
 }
 
-TEST(CompressedTensorsMluTest, IgnoredRouterIgnoresSmoothInLaterShard) {
+TEST_F(CompressedTensorsMluTest, IgnoredRouterIgnoresSmoothInLaterShard) {
   ReplicatedLinear router(128, 4, /*bias=*/false, ct_args(), mlu_options());
   router->load_state_dict(
       StateDict({{"weight", torch::ones({4, 128}, torch::kBFloat16)}},
@@ -514,7 +535,7 @@ TEST(CompressedTensorsMluTest, IgnoredRouterIgnoresSmoothInLaterShard) {
   EXPECT_FALSE(router->named_parameters().contains("smooth"));
 }
 
-TEST(CompressedTensorsMluTest, RowShardsWeightWithoutSmooth) {
+TEST_F(CompressedTensorsMluTest, RowShardsWeightWithoutSmooth) {
   auto weights = ct_weights(/*out=*/64, /*in=*/128, /*smooth=*/false);
   torch::Tensor input =
       torch::linspace(-1, 1, 256).reshape({2, 128}).to(mlu_options());
@@ -530,7 +551,7 @@ TEST(CompressedTensorsMluTest, RowShardsWeightWithoutSmooth) {
   }
 }
 
-TEST(CompressedTensorsMluTest, RowShardsPreservedSmooth) {
+TEST_F(CompressedTensorsMluTest, RowShardsPreservedSmooth) {
   const auto weights = ct_weights(/*out=*/64, /*in=*/128, /*smooth=*/true);
   for (int64_t rank = 0; rank < 2; ++rank) {
     torch::DeviceGuard guard(mlu_options().device());
@@ -554,7 +575,7 @@ TEST(CompressedTensorsMluTest, RowShardsPreservedSmooth) {
   }
 }
 
-TEST(CompressedTensorsMluTest, QkvReplicatesKvHeadsAndFusesScales) {
+TEST_F(CompressedTensorsMluTest, QkvReplicatesKvHeadsAndFusesScales) {
   for (int64_t rank = 0; rank < 2; ++rank) {
     test::MockProcessGroup pg(mlu_options().device(), rank, 2);
     ParallelArgs parallel(rank, 2, &pg);
@@ -596,7 +617,7 @@ TEST(CompressedTensorsMluTest, QkvReplicatesKvHeadsAndFusesScales) {
   }
 }
 
-TEST(CompressedTensorsMluTest, LinearIgnoresSmoothAfterWeightsAreLoaded) {
+TEST_F(CompressedTensorsMluTest, LinearIgnoresSmoothAfterWeightsAreLoaded) {
   test::MockProcessGroup pg(mlu_options().device());
   const auto weights = ct_weights(/*out=*/64, /*in=*/128, /*smooth=*/false);
   const StateDict late_smooth({{"smooth", torch::ones({128})}});
@@ -642,7 +663,7 @@ TEST(CompressedTensorsMluTest, LinearIgnoresSmoothAfterWeightsAreLoaded) {
                reference(replicated_input, weights));
 }
 
-TEST(CompressedTensorsMluTest, FusedColumnIgnoresSmoothFromEitherProjection) {
+TEST_F(CompressedTensorsMluTest, FusedColumnIgnoresSmoothFromEitherProjection) {
   test::MockProcessGroup pg(mlu_options().device());
   ColumnParallelLinear linear(128,
                               128,
@@ -663,7 +684,7 @@ TEST(CompressedTensorsMluTest, FusedColumnIgnoresSmoothFromEitherProjection) {
   }
 }
 
-TEST(CompressedTensorsMluTest, QkvIgnoresSmoothFromEveryProjection) {
+TEST_F(CompressedTensorsMluTest, QkvIgnoresSmoothFromEveryProjection) {
   test::MockProcessGroup pg(
       mlu_options().device(), /*rank=*/0, /*world_size=*/2);
   ParallelArgs parallel(/*rank=*/0, /*world_size=*/2, &pg);
@@ -690,7 +711,7 @@ TEST(CompressedTensorsMluTest, QkvIgnoresSmoothFromEveryProjection) {
   }
 }
 
-TEST(CompressedTensorsMluTest, MoeIgnoresSmoothFromEveryProjection) {
+TEST_F(CompressedTensorsMluTest, MoeIgnoresSmoothFromEveryProjection) {
   std::unique_ptr<ProcessGroup> pg;
   const auto parallel = test::create_default_parallel_args(pg);
   const auto model = moe_model_args();
@@ -711,7 +732,7 @@ TEST(CompressedTensorsMluTest, MoeIgnoresSmoothFromEveryProjection) {
   }
 }
 
-TEST(CompressedTensorsMluTest, LegacyLinearUsesSharedW8a8Execution) {
+TEST_F(CompressedTensorsMluTest, LegacyLinearUsesSharedW8a8Execution) {
   torch::DeviceGuard guard(mlu_options().device());
   test::MockProcessGroup pg(mlu_options().device());
   auto weights = ct_weights(/*out=*/64, /*in=*/128, /*smooth=*/true);
@@ -752,7 +773,7 @@ TEST(CompressedTensorsMluTest, LegacyLinearUsesSharedW8a8Execution) {
   expect_close(row->forward(gated_input), reference(activated, weights) + bias);
 }
 
-TEST(CompressedTensorsMluTest, MoeWithoutSmoothMatchesLegacyWithUnitSmooth) {
+TEST_F(CompressedTensorsMluTest, MoeWithoutSmoothMatchesLegacyWithUnitSmooth) {
   std::unique_ptr<ProcessGroup> pg;
   auto parallel = test::create_default_parallel_args(pg);
   const auto model = moe_model_args();
@@ -832,7 +853,7 @@ Weights mixed_moe_weights() {
   return checkpoint;
 }
 
-TEST(CompressedTensorsMluTest, MixedMoeMatchesLegacyAndShardsTpWeights) {
+TEST_F(CompressedTensorsMluTest, MixedMoeMatchesLegacyAndShardsTpWeights) {
   const auto checkpoint = mixed_moe_weights();
   Weights legacy_weights;
   for (const auto& [name, tensor] : checkpoint) {
@@ -886,7 +907,7 @@ TEST(CompressedTensorsMluTest, MixedMoeMatchesLegacyAndShardsTpWeights) {
   }
 }
 
-TEST(CompressedTensorsMluTest, MixedPrecisionMoeLoadsInEitherShardOrder) {
+TEST_F(CompressedTensorsMluTest, MixedPrecisionMoeLoadsInEitherShardOrder) {
   std::unique_ptr<ProcessGroup> pg;
   const auto parallel = test::create_default_parallel_args(pg);
   ModelContext ctx(parallel, moe_model_args(), mixed_moe_args(), mlu_options());
@@ -925,7 +946,7 @@ TEST(CompressedTensorsMluTest, MixedPrecisionMoeLoadsInEitherShardOrder) {
   }
 }
 
-TEST(CompressedTensorsMluDeathTest, MixedPrecisionMoeValidatesLateSmooth) {
+TEST_F(CompressedTensorsMluDeathTest, MixedPrecisionMoeValidatesLateSmooth) {
   std::unique_ptr<ProcessGroup> pg;
   const auto parallel = test::create_default_parallel_args(pg);
   ModelContext ctx(parallel, moe_model_args(), mixed_moe_args(), mlu_options());
@@ -945,7 +966,7 @@ TEST(CompressedTensorsMluDeathTest, MixedPrecisionMoeValidatesLateSmooth) {
   moe->verify_loaded_weights();
 }
 
-TEST(CompressedTensorsMluDeathTest, FusedProjectionsRequireCompatibleSmooth) {
+TEST_F(CompressedTensorsMluDeathTest, FusedProjectionsRequireCompatibleSmooth) {
   test::MockProcessGroup pg(mlu_options().device());
   auto args = ct_args();
   args.compressed_groups() = {
@@ -959,7 +980,7 @@ TEST(CompressedTensorsMluDeathTest, FusedProjectionsRequireCompatibleSmooth) {
                "different preserve_smooth");
 }
 
-TEST(CompressedTensorsMluTest, MoeSmoothIsIndependentOfWeightBits) {
+TEST_F(CompressedTensorsMluTest, MoeSmoothIsIndependentOfWeightBits) {
   std::unique_ptr<ProcessGroup> pg;
   const auto parallel = test::create_default_parallel_args(pg);
   for (int64_t bits : {4, 8}) {
@@ -1028,7 +1049,7 @@ TEST(CompressedTensorsMluTest, MoeSmoothIsIndependentOfWeightBits) {
   }
 }
 
-TEST(CompressedTensorsMluTest, MoeResolvesEachLayerBeforeAllocation) {
+TEST_F(CompressedTensorsMluTest, MoeResolvesEachLayerBeforeAllocation) {
   std::unique_ptr<ProcessGroup> pg;
   const auto parallel = test::create_default_parallel_args(pg);
   auto args = ct_args();
@@ -1048,7 +1069,7 @@ TEST(CompressedTensorsMluTest, MoeResolvesEachLayerBeforeAllocation) {
   EXPECT_EQ(fp->named_parameters()["w13"].scalar_type(), torch::kBFloat16);
 }
 
-TEST(CompressedTensorsMluDeathTest, MoeRejectsIncompatibleExpertSchemes) {
+TEST_F(CompressedTensorsMluDeathTest, MoeRejectsIncompatibleExpertSchemes) {
   std::unique_ptr<ProcessGroup> pg;
   const auto parallel = test::create_default_parallel_args(pg);
   auto args = ct_args();

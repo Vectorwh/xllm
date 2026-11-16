@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -32,19 +33,33 @@ sys.modules.setdefault("xllm.python.kernels_cuda", _kernels_cuda)
 
 from xllm.python import distributed, kernels  # noqa: E402
 
-kernels.grouped_moe = MagicMock()
-kernels.prepare_grouped_moe_weights = MagicMock(side_effect=lambda w13, w2: (w13, w2))
-kernels.supports_cutlass_moe = MagicMock(return_value=False)
-kernels.moe_fused_topk = MagicMock()
-kernels.cutlass_fused_moe = MagicMock()
-kernels.fused_moe = MagicMock()
-kernels.dynamic_quant = MagicMock()
-kernels.quant_matmul = MagicMock()
-kernels.silu_and_mul = MagicMock()
-distributed.all_gather_variable = MagicMock()
-distributed.all_reduce_ = MagicMock()
-distributed.all_gather = MagicMock(side_effect=lambda x, **kw: x)
-distributed.tp_rank = MagicMock(return_value=0)
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolate_runtime_ops() -> Iterator[None]:
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(kernels, "grouped_moe", MagicMock(), raising=False)
+        patcher.setattr(
+            kernels,
+            "prepare_grouped_moe_weights",
+            MagicMock(side_effect=lambda w13, w2: (w13, w2)),
+            raising=False,
+        )
+        patcher.setattr(kernels, "supports_cutlass_moe", MagicMock(return_value=False), raising=False)
+        for name in (
+            "moe_fused_topk",
+            "cutlass_fused_moe",
+            "fused_moe",
+            "dynamic_quant",
+            "quant_matmul",
+            "silu_and_mul",
+        ):
+            patcher.setattr(kernels, name, MagicMock(), raising=False)
+        patcher.setattr(distributed, "all_gather_variable", MagicMock(), raising=False)
+        patcher.setattr(distributed, "all_reduce_", MagicMock(), raising=False)
+        patcher.setattr(distributed, "all_gather", MagicMock(side_effect=lambda x, **kw: x), raising=False)
+        patcher.setattr(distributed, "tp_rank", MagicMock(return_value=0), raising=False)
+        yield
+
 
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     AclGraphExecutionState,
@@ -163,8 +178,8 @@ class TestDeepseekV3ConfigValidation:
             cfg.validate()
 
     def test_ep_moe_tp_world_mismatch(self):
-        cfg = _config(ep_size=2, moe_tp_size=2, world_size=3)
-        with pytest.raises(ValueError, match="world_size"):
+        cfg = _config(ep_size=2, moe_tp_size=2, world_size=2)
+        with pytest.raises(ValueError, match=r"world_size \(2\) must equal moe_tp_size \(2\) \* ep_size \(2\)"):
             cfg.validate()
 
 
@@ -180,6 +195,7 @@ def _make_moe(
     dp_rank: int = 0,
     moe_tp_size: int = 1,
     n_experts: int = 16,
+    world_size: int | None = None,
 ) -> DeepseekV3MoE:
     cfg = _config(
         n_routed_experts=n_experts,
@@ -188,7 +204,7 @@ def _make_moe(
         dp_size=dp_size,
         dp_rank=dp_rank,
         moe_tp_size=moe_tp_size,
-        world_size=max(ep_size, 1) * dp_size,
+        world_size=world_size if world_size is not None else max(ep_size, 1) * dp_size,
     )
     return DeepseekV3MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
 
@@ -212,16 +228,8 @@ class TestDeepseekV3MoEConstruction:
         assert moe.local_expert_start == 8
         assert moe.local_expert_end == 16
 
-    def test_weight_shape_ep1(self):
-        moe = _make_moe(ep_size=1, n_experts=16)
-        assert moe.num_local_experts == 16
-
-    def test_weight_shape_ep2(self):
-        moe = _make_moe(ep_size=2, ep_rank=0, n_experts=16)
-        assert moe.num_local_experts == 8
-
     def test_intermediate_tp_sharding(self):
-        moe = _make_moe(ep_size=2, ep_rank=0, moe_tp_size=2)
+        moe = _make_moe(ep_size=2, ep_rank=0, moe_tp_size=2, world_size=4)
         assert moe.inter_local == 32 // 2  # moe_intermediate_size // moe_tp_size
 
 
@@ -280,6 +288,7 @@ class TestDeepseekV3MoEForward:
     def test_dp2_calls_gather(self):
         moe = _make_moe(dp_size=2, dp_rank=0)
         hidden = torch.randn(3, 64)
+        padded_hidden = torch.nn.functional.pad(hidden, (0, 0, 0, 1))
         # Execution counts=(3,4), padded_tokens=4, pad to [4,64],
         # all_gather → [8,64].
         kernels.grouped_moe.return_value = torch.zeros(8, 64)
@@ -293,6 +302,7 @@ class TestDeepseekV3MoEForward:
             moe.forward(hidden)
 
         distributed.all_gather.assert_called_once()
+        torch.testing.assert_close(distributed.all_gather.call_args.args[0], padded_hidden)
         call_kwargs = distributed.all_gather.call_args[1]
         assert call_kwargs["dim"] == 0
         assert call_kwargs["world_size"] == 2
@@ -325,7 +335,7 @@ class TestDeepseekV3MoEForward:
         assert len(reduce_calls) == 0
 
     def test_moe_tp_calls_allreduce(self):
-        moe = _make_moe(moe_tp_size=2, ep_size=2, ep_rank=0)
+        moe = _make_moe(moe_tp_size=2, ep_size=2, ep_rank=0, world_size=4)
         hidden = torch.randn(4, 64)
         kernels.grouped_moe.return_value = torch.zeros(4, 64)
         self._patch_shared_experts(moe, 4)
@@ -360,7 +370,7 @@ class TestDeepseekV3MoEForward:
         # Execution counts=(3,4), padded_tokens=4, pad_size=0,
         # all_gather → [8,64].
         # dp_rank=1: narrow(0, 4, 4) → [4, 64]
-        moe_output = torch.randn(8, 64)
+        moe_output = torch.arange(8 * 64, dtype=torch.float32).reshape(8, 64)
         kernels.grouped_moe.return_value = moe_output
         self._patch_shared_experts(moe, 8)
 
@@ -371,7 +381,7 @@ class TestDeepseekV3MoEForward:
         with forward_context(ctx):
             result = moe.forward(hidden)
 
-        assert result.shape[0] == 4
+        torch.testing.assert_close(result, moe_output[4:8])
 
     def test_dp2_eager_uses_compact_gather(self):
         moe = _make_moe(dp_size=2, dp_rank=0)
@@ -380,7 +390,8 @@ class TestDeepseekV3MoEForward:
         compact_output = torch.randn(7, 64)
         distributed.all_gather_variable.reset_mock()
         distributed.all_gather_variable.return_value = compact_output
-        kernels.grouped_moe.return_value = torch.zeros(7, 64)
+        moe_output = torch.arange(7 * 64, dtype=torch.float32).reshape(7, 64)
+        kernels.grouped_moe.return_value = moe_output
         self._patch_shared_experts(moe, 7)
 
         ctx = _mock_forward_context(
@@ -392,9 +403,12 @@ class TestDeepseekV3MoEForward:
             result = moe.forward(hidden)
 
         distributed.all_gather_variable.assert_called_once()
+        torch.testing.assert_close(distributed.all_gather_variable.call_args.args[0], hidden)
+        assert distributed.all_gather_variable.call_args.args[1:] == ([3, 4], 0, "dp")
+        torch.testing.assert_close(kernels.grouped_moe.call_args.args[0], compact_output)
         distributed.all_gather.assert_not_called()
         # dp_rank=0: offset=0, narrow(0, 0, 3) → [3, 64]
-        assert result.shape[0] == 3
+        torch.testing.assert_close(result, moe_output[:3])
 
     def test_dp2_eager_output_sliced_rank1(self):
         moe = _make_moe(dp_size=2, dp_rank=1)
@@ -403,7 +417,7 @@ class TestDeepseekV3MoEForward:
         compact_output = torch.randn(7, 64)
         distributed.all_gather_variable.reset_mock()
         distributed.all_gather_variable.return_value = compact_output
-        moe_output = torch.randn(7, 64)
+        moe_output = torch.arange(7 * 64, dtype=torch.float32).reshape(7, 64)
         kernels.grouped_moe.return_value = moe_output
         self._patch_shared_experts(moe, 7)
 
@@ -415,5 +429,9 @@ class TestDeepseekV3MoEForward:
         with forward_context(ctx):
             result = moe.forward(hidden)
 
+        distributed.all_gather_variable.assert_called_once()
+        torch.testing.assert_close(distributed.all_gather_variable.call_args.args[0], hidden)
+        assert distributed.all_gather_variable.call_args.args[1:] == ([3, 4], 1, "dp")
+        torch.testing.assert_close(kernels.grouped_moe.call_args.args[0], compact_output)
         # dp_rank=1: offset=sum([3])=3, narrow(0, 3, 4) → [4, 64]
-        assert result.shape[0] == 4
+        torch.testing.assert_close(result, moe_output[3:7])

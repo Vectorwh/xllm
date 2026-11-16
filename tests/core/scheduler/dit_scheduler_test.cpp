@@ -52,6 +52,10 @@ class TestDiTScheduler final : public DiTDynamicBatchScheduler {
   std::vector<DiTBatch> prepare() { return prepare_batch(); }
 
   void clear_running_requests() { running_requests_.clear(); }
+
+  const std::shared_ptr<DiTRequest>& selected_request() const {
+    return running_requests_.front();
+  }
 };
 
 std::shared_ptr<DiTRequest> make_request(const std::string& request_id,
@@ -103,8 +107,10 @@ TEST(DiTSchedulerTest, WaitingTracksQueuesSelectionCancellationAndDestruction) {
     EXPECT_EQ(GAUGE_VALUE(num_waiting_requests), 2);
     EXPECT_EQ(GAUGE_VALUE(num_running_requests), 1);
     scheduler.clear_running_requests();
-    scheduler.prepare();
-    ASSERT_EQ(scheduler.get_running_requests().front(), second);
+    auto batches = scheduler.prepare();
+    ASSERT_EQ(batches.size(), 1u);
+    ASSERT_EQ(batches.front().size(), 1u);
+    EXPECT_EQ(scheduler.selected_request(), second);
     EXPECT_DOUBLE_EQ(ingress->get_value(), 0.0);
     EXPECT_DOUBLE_EQ(deferred->get_value(), 1.0);
     third->set_cancel();

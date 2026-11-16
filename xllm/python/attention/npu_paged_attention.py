@@ -1099,11 +1099,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             cache_slots = metadata.local_slot_mapping if metadata.has_kv_shard else metadata.slot_mapping
             if cache_slots is None:
                 raise RuntimeError("CP prefill requires a global MLA slot mapping")
-            # kv_split_size > 1 with CP is refused at admission for every
-            # model that reaches this NoPE branch (master.cpp: "Python
-            # GLM-5 Next CP initially requires kv_split_size == 1") -- the
-            # startup validation is the single owner of that policy, so the
-            # backend keeps no second copy of the check.
             torch.ops.xllm_ops.reshape_paged_cache(
                 cache_slots,
                 k_latent_3d,
@@ -1330,11 +1325,6 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         ``cp_shard_rows`` can reslice it unchanged (padding and peer-owned rows
         stay zero).
 
-        The latent-cache write and its materialization stay on the legacy global
-        ``slot_mapping`` path and are done by the caller, exactly as in the
-        unpartitioned branch. ``kv_split_size > 1`` is rejected before the call:
-        only the identity materialization path is verified for GLM-5.3-Flash
-        (which forces ``kv_split_size == 1``).
         """
         # real_rows carries this rank's CP shard's global row indices: the CP
         # partition assigns each global row to exactly one rank and

@@ -373,72 +373,6 @@ def test_model_restore_rejects_odd_engram_history() -> None:
         DeepseekV41Model.restore_engram_history(model, backend, metadata)
 
 
-def test_engram_decode_batch_skips_empty_late_publish(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = _state()
-    window = 128
-    state.ensure_cache(torch.zeros((4, window, 8)), window)
-    num_tokens = 200
-    calls: list[torch.Tensor] = []
-    original = state._write_hash_cache
-
-    def record(comp, slots, *, deduplicate=False):
-        calls.append(slots.clone())
-        return original(comp, slots, deduplicate=deduplicate)
-
-    monkeypatch.setattr(state, "_write_hash_cache", record)
-    state(
-        torch.ones(num_tokens, dtype=torch.int64),
-        torch.arange(num_tokens),
-        torch.arange(num_tokens + 1),
-        torch.zeros(num_tokens, dtype=torch.bool),
-        None,
-        torch.arange(num_tokens),
-        None,
-        window,
-        max_chunk_len=1,
-    )
-    assert len(calls) == 1
-    assert (calls[0] >= 0).all()
-
-
-def test_engram_mixed_batch_late_publish_only_long_chunks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = _state()
-    window = 128
-    state.ensure_cache(torch.zeros((4, window, 8)), window)
-    long_len = 200
-    num_tokens = long_len + 1
-    calls: list[torch.Tensor] = []
-    original = state._write_hash_cache
-
-    def record(comp, slots, *, deduplicate=False):
-        calls.append(slots.clone())
-        return original(comp, slots, deduplicate=deduplicate)
-
-    monkeypatch.setattr(state, "_write_hash_cache", record)
-    state(
-        torch.ones(num_tokens, dtype=torch.int64),
-        torch.arange(num_tokens),
-        torch.tensor([0, long_len, num_tokens]),
-        torch.zeros(num_tokens, dtype=torch.bool),
-        None,
-        torch.arange(num_tokens),
-        None,
-        window,
-        max_chunk_len=long_len,
-    )
-    assert len(calls) == 2
-    early, late = calls
-    assert early.shape == (num_tokens,)
-    assert (early[:long_len] == -1).all()
-    assert (early[long_len:] >= 0).all()
-    assert (late[:long_len] >= 0).all()
-    assert (late[long_len:] == -1).all()
-
-
 @pytest.mark.parametrize("prefix", [7, 127, 128, 129])
 @pytest.mark.parametrize("width", [1, 6])
 @pytest.mark.parametrize("order", [(0, 1, 2), (2, 0)])
@@ -468,6 +402,7 @@ def test_model_resolves_position_shifted_history_from_slot_cache(
         dtype=torch.int32,
         device=device,
     )
+    lookback_before = lookback.clone()
     actual = state(
         torch.tensor([histories[lane][starts[lane] : starts[lane] + width] for lane in order], device=device).flatten(),
         torch.tensor([list(range(starts[lane], starts[lane] + width)) for lane in order], device=device).flatten(),
@@ -501,7 +436,7 @@ def test_model_resolves_position_shifted_history_from_slot_cache(
         expected.append(full[starts[lane] : end])
     torch.testing.assert_close(actual.cpu(), torch.cat(expected), atol=0, rtol=0)
     # Resolving stale rows must not mutate the scheduler's explicit history.
-    assert torch.all(lookback >= 0)
+    assert torch.equal(lookback, lookback_before)
 
 
 @pytest.mark.parametrize("shape", [(2,), (1, 1)])

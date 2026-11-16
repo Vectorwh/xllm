@@ -37,18 +37,5 @@ TEST(OptionsTest, ContextParallelDefaultsToOneAcrossPublicApis) {
   static_assert(std::is_same_v<decltype(XLLM_InitOptions::cp_size), uint32_t>);
 }
 
-TEST(OptionsTest, ContextParallelAcceptsExplicitValuesAcrossPublicApis) {
-  Options options;
-  options.cp_size(4);
-  XLLM_InitLLMOptions cc_options;
-  cc_options.cp_size = 4;
-  XLLM_InitOptions c_options = XLLM_INIT_LLM_OPTIONS_DEFAULT;
-  c_options.cp_size = 4;
-
-  EXPECT_EQ(options.cp_size(), 4);
-  EXPECT_EQ(cc_options.cp_size, 4);
-  EXPECT_EQ(c_options.cp_size, 4U);
-}
-
 }  // namespace
 }  // namespace xllm

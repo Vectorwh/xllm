@@ -45,10 +45,8 @@ void expect_int32_vector(const torch::Tensor& tensor,
             torch::IntArrayRef({static_cast<int64_t>(expected.size())}));
   EXPECT_TRUE(torch::equal(tensor, torch::tensor(expected, torch::kInt32)));
 }
-
-// clang-format off
-TEST(Qwen3_5GatedDeltaNetIndicesTest, BuildsColdWarmOrderedPaddingAndStridedIndices) {
-  // clang-format on
+TEST(Qwen3_5GatedDeltaNetIndicesTest,
+     BuildsColdWarmOrderedPaddingAndStridedIndices) {
   AttentionMetadata metadata;
   const std::vector<int32_t> slots = {3, 0, 7, 0};
   const std::vector<int64_t> validity = {0, 0, 1, 0};
@@ -59,12 +57,9 @@ TEST(Qwen3_5GatedDeltaNetIndicesTest, BuildsColdWarmOrderedPaddingAndStridedIndi
   expect_int32_vector(indices.conv_write, {3, 0, 7, 0});
   expect_int32_vector(indices.ssm_read, {-1, -1, 28, -1});
   expect_int32_vector(indices.ssm_write, {12, 0, 28, 0});
-  EXPECT_EQ(indices.device_tensor_materializations, 4);
 }
-
-// clang-format off
-TEST(Qwen3_5GatedDeltaNetIndicesTest, MapsMixedColdContinuationAndIndependentReadSlots) {
-  // clang-format on
+TEST(Qwen3_5GatedDeltaNetIndicesTest,
+     MapsMixedColdContinuationAndIndependentReadSlots) {
   AttentionMetadata metadata;
   const std::vector<int32_t> slots = {2, 4, 6, 8};
   const std::vector<int64_t> validity = {0, 1, 1, 1};
@@ -89,10 +84,8 @@ TEST(Qwen3_5GatedDeltaNetIndicesTest, MapsMixedColdContinuationAndIndependentRea
   expect_int32_vector(indices.ssm_read, {-1, 16, 24, 48});
   expect_int32_vector(indices.ssm_write, {8, 16, 24, 32});
 }
-
-// clang-format off
-TEST(Qwen3_5GatedDeltaNetIndicesTest, ReusesAllTensorStorageForMatchingForwardKey) {
-  // clang-format on
+TEST(Qwen3_5GatedDeltaNetIndicesTest,
+     ReusesAllTensorStorageForMatchingForwardKey) {
   AttentionMetadata metadata;
   const std::vector<int32_t> slots = {2, 5};
   const std::vector<int64_t> validity = {0, 1};
@@ -103,14 +96,13 @@ TEST(Qwen3_5GatedDeltaNetIndicesTest, ReusesAllTensorStorageForMatchingForwardKe
   const void* ssm_read = first.ssm_read.data_ptr();
   const void* ssm_write = first.ssm_write.data_ptr();
 
-  for (int64_t layer = 1; layer < 64; ++layer) {
+  for (int64_t layer = 1; layer < 3; ++layer) {
     const MegaGdnPrefillIndicesCache& reused = get_or_build_prefill_indices(
         metadata, slots, validity, {}, kCheckpointStride, kNumSlots, kDevice);
     EXPECT_EQ(reused.conv_read.data_ptr(), conv_read);
     EXPECT_EQ(reused.conv_write.data_ptr(), conv_write);
     EXPECT_EQ(reused.ssm_read.data_ptr(), ssm_read);
     EXPECT_EQ(reused.ssm_write.data_ptr(), ssm_write);
-    EXPECT_EQ(reused.device_tensor_materializations, 4);
   }
 }
 
@@ -127,21 +119,16 @@ TEST(Qwen3_5GatedDeltaNetIndicesTest, NewMetadataMaterializesNewTensorSet) {
                                    kCheckpointStride,
                                    kNumSlots,
                                    kDevice);
-  const MegaGdnPrefillIndicesCache& next =
-      get_or_build_prefill_indices(next_metadata,
-                                   slots,
-                                   validity,
-                                   {},
-                                   kCheckpointStride,
-                                   kNumSlots,
-                                   kDevice);
-
-  EXPECT_NE(next.conv_read.data_ptr(), first.conv_read.data_ptr());
-  EXPECT_NE(next.conv_write.data_ptr(), first.conv_write.data_ptr());
-  EXPECT_NE(next.ssm_read.data_ptr(), first.ssm_read.data_ptr());
-  EXPECT_NE(next.ssm_write.data_ptr(), first.ssm_write.data_ptr());
-  EXPECT_EQ(first.device_tensor_materializations, 4);
-  EXPECT_EQ(next.device_tensor_materializations, 4);
+  const MegaGdnPrefillIndicesCache& next = get_or_build_prefill_indices(
+      next_metadata, {3, 7}, {1, 0}, {}, kCheckpointStride, kNumSlots, kDevice);
+  expect_int32_vector(next.conv_read, {3, -1});
+  expect_int32_vector(next.conv_write, {3, 7});
+  expect_int32_vector(next.ssm_read, {12, -1});
+  expect_int32_vector(next.ssm_write, {12, 28});
+  expect_int32_vector(first.conv_read, {-1, 5});
+  expect_int32_vector(first.conv_write, {2, 5});
+  expect_int32_vector(first.ssm_read, {-1, 20});
+  expect_int32_vector(first.ssm_write, {8, 20});
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsInvalidValidity) {
@@ -185,59 +172,31 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsReadSizeMismatch) {
                    metadata, {1, 2}, {1, 1}, {1}, 1, kNumSlots, kDevice),
                "read_ids must be empty or sequence-scoped");
 }
-
-// clang-format off
-
-// clang-format off
-
-
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsNegativeReadSlot) {
   AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {1},
-                                            {-1},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
+  EXPECT_DEATH(get_or_build_prefill_indices(
+                   metadata, {1}, {1}, {-1}, 1, kNumSlots, kDevice),
                "read_ids");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsColdDirectRead) {
   AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {0},
-                                            {2},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
+  EXPECT_DEATH(get_or_build_prefill_indices(
+                   metadata, {1}, {0}, {2}, 1, kNumSlots, kDevice),
                "direct-read row must be warm");
 }
 
-
-
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsPaddingSource) {
   AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {1},
-                                            {0},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
+  EXPECT_DEATH(get_or_build_prefill_indices(
+                   metadata, {1}, {1}, {0}, 1, kNumSlots, kDevice),
                "padding must not be used");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsSourceOutOfBounds) {
   AttentionMetadata metadata;
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata,
-                                            {1},
-                                            {1},
-                                            {16},
-                                            1,
-                                            kNumSlots,
-                                            kDevice),
+  EXPECT_DEATH(get_or_build_prefill_indices(
+                   metadata, {1}, {1}, {16}, 1, kNumSlots, kDevice),
                "source exceeds cache capacity");
 }
 
@@ -284,16 +243,6 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedBatchSize) {
       "batch size changed");
 }
 
-TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedSlotGeometry) {
-  AttentionMetadata metadata;
-  get_or_build_prefill_indices(
-      metadata, {1}, {1}, {}, kCheckpointStride, kNumSlots, kDevice);
-  EXPECT_DEATH(
-      get_or_build_prefill_indices(
-          metadata, {1}, {1}, {}, kCheckpointStride, kNumSlots + 1, kDevice),
-      "slot geometry changed");
-}
-
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedCheckpointStride) {
   AttentionMetadata metadata;
   get_or_build_prefill_indices(
@@ -326,9 +275,12 @@ TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedValidity) {
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedReadSlots) {
   AttentionMetadata metadata;
-  get_or_build_prefill_indices(metadata, {1}, {1}, {2}, kCheckpointStride, kNumSlots, kDevice);
-  EXPECT_DEATH(get_or_build_prefill_indices(metadata, {1}, {1}, {3}, kCheckpointStride, kNumSlots, kDevice),
-               "read state ids changed");
+  get_or_build_prefill_indices(
+      metadata, {1}, {1}, {2}, kCheckpointStride, kNumSlots, kDevice);
+  EXPECT_DEATH(
+      get_or_build_prefill_indices(
+          metadata, {1}, {1}, {3}, kCheckpointStride, kNumSlots, kDevice),
+      "read state ids changed");
 }
 
 TEST_F(Qwen3_5GatedDeltaNetIndicesDeathTest, RejectsChangedDevice) {

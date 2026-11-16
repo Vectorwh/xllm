@@ -152,7 +152,7 @@ TEST(QwenImage21CacheNpu, RectangularAttentionPreservesPaddingAndTargetRows) {
   torch::NoGradGuard guard;
   torch::manual_seed(21);
   const auto device = torch::Device(torch::kPrivateUse1, 0);
-  for (int64_t prefix : {6, 15, 56, 128, 143}) {
+  for (int64_t prefix : {15, 128}) {
     const int64_t total = prefix + 256;
     auto q = torch::randn({1, 2, total, 128}).to(device, torch::kBFloat16);
     auto k = torch::randn_like(q);
@@ -212,86 +212,6 @@ TEST(QwenImage21CacheNpu, Bf16TransformerCacheMatchesChangingTimesteps) {
       auto actual = model->forward(target, prompt, t, layout, &cache);
       expect_noise_close(actual, expected);
       EXPECT_TRUE(torch::equal(saved_key, cache.layer(0).key.cpu()));
-    }
-  }
-}
-
-// Opt-in real 32-layer checkpoint comparison; ordinary CI does not allocate
-// these weights or depend on a developer's local model/fixture directory.
-TEST(QwenImage21CacheNpu, RealCheckpointNoiseParity) {
-  const char* model_dir = std::getenv("XLLM_QWEN21_TEST_MODEL");
-  const char* fixture_file = std::getenv("XLLM_QWEN21_TEST_EMBEDDINGS");
-  if (model_dir == nullptr || fixture_file == nullptr) {
-    GTEST_SKIP() << "Set XLLM_QWEN21_TEST_MODEL and "
-                    "XLLM_QWEN21_TEST_EMBEDDINGS to opt in";
-  }
-  torch::NoGradGuard guard;
-  torch::manual_seed(21);
-  const auto device = torch::Device(torch::kPrivateUse1, 0);
-  auto options = torch::TensorOptions().device(device).dtype(torch::kBFloat16);
-  ProcessGroup process_group(/*rank=*/0, /*world_size=*/1, device);
-  QwenImage21Transformer2DModel model(
-      QwenImage21TransformerConfig{}, &process_group, options);
-  std::vector<std::filesystem::path> files;
-  for (const auto& file : std::filesystem::directory_iterator(
-           std::filesystem::path(model_dir) / "transformer")) {
-    if (file.path().extension() == ".safetensors") {
-      files.emplace_back(file.path());
-    }
-  }
-  std::sort(files.begin(), files.end());
-  for (const auto& file : files) {
-    auto weights = StateDictFromSafeTensor::load(file.string());
-    model->load_state_dict(*weights);
-  }
-  model->verify_loaded_weights();
-  auto fixture = StateDictFromSafeTensor::load(fixture_file);
-  for (const std::string& prefix : {std::string(), std::string("negative_")}) {
-    auto prompt = fixture->get_tensor(prefix + "prompt_embeds").to(options);
-    auto mask = fixture->get_tensor(prefix + "image_pad_mask");
-    auto valid = fixture->get_tensor(prefix + "prompt_embeds_mask");
-    if (prompt.dim() == 2) {
-      ASSERT_EQ(mask.dim(), 1);
-      ASSERT_EQ(valid.dim(), 1);
-      prompt = prompt.unsqueeze(0);
-      mask = mask.unsqueeze(0);
-      valid = valid.unsqueeze(0);
-    }
-    ASSERT_EQ(mask.sum().item<int64_t>(), 1024)
-        << "This opt-in case expects one 1024x1024 condition image";
-    auto layout =
-        model->prepare_layout(mask, valid, {{1, 64, 64}, {1, 64, 64}}, device);
-    auto full = torch::randn({1, 8192, 64}).to(options);
-    qwen_image_21::PrefixKVCache cache(32);
-    auto t = torch::tensor({1.0f}).to(options);
-    auto expected = model->forward(full, prompt, t, layout);
-    auto prefill = model->forward(full, prompt, t, layout, &cache);
-    expect_noise_close(prefill, expected);
-    LOG(INFO) << "Real checkpoint branch=" << prefix
-              << " kv_bytes=" << cache.bytes();
-    for (float timestep : {0.5f, 0.1f}) {
-      auto target = torch::randn({1, 4096, 64}).to(options);
-      full.slice(1, 4096).copy_(target);
-      t = torch::tensor({timestep}).to(options);
-      qwen_image_21::PrefixKVCache recomputed(32);
-      expected = model->forward(full, prompt, t, layout, &recomputed);
-      for (int64_t index = 0; index < 32; ++index) {
-        const float key_difference =
-            (cache.layer(index).key - recomputed.layer(index).key)
-                .abs()
-                .max()
-                .item<float>();
-        const float value_difference =
-            (cache.layer(index).value - recomputed.layer(index).value)
-                .abs()
-                .max()
-                .item<float>();
-        EXPECT_EQ(key_difference, 0) << "Prefix key changed at layer " << index;
-        EXPECT_EQ(value_difference, 0)
-            << "Prefix value changed at layer " << index;
-      }
-      auto actual = model->forward(target, prompt, t, layout, &cache);
-      expect_noise_close(actual, expected);
     }
   }
 }

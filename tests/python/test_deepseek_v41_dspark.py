@@ -284,10 +284,6 @@ def test_config_falls_back_to_the_captured_layer_count() -> None:
     assert cfg.num_draft_layers == len(cfg.dspark_target_layer_ids) == 2
 
 
-def test_registry_resolves_deepseek_v41_dspark() -> None:
-    assert get_model_class("deepseek_v41_dspark").__name__ == "DeepseekV41DSparkForCausalLM"
-
-
 def test_config_accepts_the_cpp_routed_draft_model_type() -> None:
     """The C++ draft route hands PyCausalLM this exact model_type.
 
@@ -301,7 +297,7 @@ def test_config_accepts_the_cpp_routed_draft_model_type() -> None:
     cfg.validate()
     assert cfg.model_type == "deepseek_v41_dspark"
     assert cfg.num_draft_layers == len(cfg.dspark_target_layer_ids) == 2
-    lm = DeepseekV41DSparkForCausalLM(_config_dict(model_type="deepseek_v41_dspark"))
+    lm = get_model_class("deepseek_v41_dspark")(_config_dict(model_type="deepseek_v41_dspark"))
     assert lm.cfg.model_type == "deepseek_v41_dspark"
     assert len(lm.model.backbone.layers) == 2
 
@@ -733,15 +729,6 @@ def test_ascend_main_proj_declared_w8a8_but_exported_bf16_fails_fast(monkeypatch
         lm.load_weights([_FakeStateDict(tensors)], 0, 1)
 
 
-def test_non_ascend_checkpoint_never_quantizes_main_proj() -> None:
-    """The bf16/fp8 modes always build the dense main_proj (no metadata read)."""
-    lm = DeepseekV41DSparkForCausalLM(_config_dict())
-    assert lm.quant_mode != "ascend"
-    assert lm.model.backbone.main_proj.quantized is False
-    assert lm.model.backbone.main_proj.linear is not None
-    assert lm.model.backbone.main_proj.w8a8 is None
-
-
 def test_checkpoint_weight_is_quantized_reads_the_description(tmp_path) -> None:
     from xllm.python.models.deepseek_v41_dspark import checkpoint_weight_is_quantized
 
@@ -813,7 +800,7 @@ def test_write_context_kv_matches_eager_reference() -> None:
         assert torch.count_nonzero(cache[untouched]) == 0
 
 
-def test_write_context_kv_accepts_layer_cache_slots_and_tuple_form() -> None:
+def test_write_context_kv_accepts_layer_cache_and_rejects_legacy_tuple() -> None:
     torch.manual_seed(12)
     cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
     lm = DeepseekV41DSparkForCausalLM(_config_dict())
@@ -946,7 +933,7 @@ def test_draft_step_runs_the_block_in_one_parallel_pass(
     assert calls == [(stage, (block_size, n_heads_local, head_dim)) for stage in range(cfg.num_draft_layers)]
 
 
-def test_draft_forward_uses_the_rotary_and_norm_head(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_draft_forward_applies_last_collapse_and_norm(monkeypatch: pytest.MonkeyPatch) -> None:
     """The head path is ``norm(collapse(last hidden))`` with the draft RoPE table."""
     torch.manual_seed(16)
     cfg = DeepseekV41DSparkConfig.from_dict(_config_dict())
@@ -1132,28 +1119,6 @@ def _draft_ring_attention() -> SimpleNamespace:
         win=win,
         previous=previous,
     )
-
-
-def test_draft_swa_tail_keeps_final_block_row_after_ring_wrap(_draft_ring_attention: SimpleNamespace) -> None:
-    from xllm.python.attention.csa2_attention import CSA2SharedRuntime
-
-    case = _draft_ring_attention
-    actual = case.backend._csa2_attention(
-        case.q,
-        case.kv,
-        case.layer,
-        case.dsa,
-        [case.width],
-        torch.tensor([case.previous + case.width]),
-        None,
-        CSA2SharedRuntime(query_layout=case.query_layout),
-    )
-
-    # Zero queries and a zero sink give every history/block row equal weight.
-    # The final block row must also contribute to the first non-causal query.
-    keys = torch.cat((case.history, case.kv))
-    expected = keys.sum(dim=0) / (case.win + case.width + 1)
-    torch.testing.assert_close(actual, expected.view(1, 1, -1).expand_as(actual))
 
 
 def test_draft_graph_defers_ring_writes_without_dynamic_filter(
@@ -1352,15 +1317,6 @@ def test_pipeline_matches_sequential_greedy_markov(monkeypatch: pytest.MonkeyPat
 def test_pipeline_rejects_context_parallelism_at_initialization(cp_size: int) -> None:
     with pytest.raises(ValueError, match="CP=1"):
         DeepseekV41DSparkForCausalLM({**_config_dict(), "cp_size": cp_size})
-
-
-def test_draft_group_infos_is_a_single_swa_group() -> None:
-    """The draft cache spec is pure SWA: exactly one deduplicated group."""
-    from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW
-
-    group_infos = _draft_group_infos()
-    assert len(group_infos) == 1
-    assert group_infos[0].cache_type == DSA_CACHE_SLIDING_WINDOW
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])

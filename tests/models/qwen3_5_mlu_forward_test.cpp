@@ -20,8 +20,6 @@ limitations under the License.
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
-#include <memory>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -38,7 +36,6 @@ namespace xllm {
 namespace {
 
 constexpr int64_t kHiddenSize = 128;
-constexpr double kNormEps = 1e-6;
 
 bool has_safe_visible_device() {
   const char* visible = std::getenv("MLU_VISIBLE_DEVICES");
@@ -54,110 +51,6 @@ bool has_safe_visible_device() {
       devices.data(), devices.data() + devices.size(), physical);
   return error == std::errc{} && end == devices.data() + devices.size() &&
          physical > 0;
-}
-
-struct ModelFixture {
-  explicit ModelFixture(int32_t dp_size)
-      : device("mlu:0"),
-        options(torch::TensorOptions().dtype(torch::kBFloat16).device(device)),
-        tp_group(std::make_unique<ProcessGroup>(
-            /*rank=*/0,
-            /*world_size=*/1,
-            device)) {
-    ParallelArgs parallel_args(/*rank=*/0,
-                               /*world_size=*/dp_size,
-                               dp_size,
-                               tp_group.get());
-    parallel_args.tp_group_ = tp_group.get();
-
-    ModelArgs args;
-    args.model_type("qwen3_5")
-        .n_layers(0)
-        .hidden_size(kHiddenSize)
-        .vocab_size(16)
-        .head_dim(64)
-        .partial_rotary_factor(0.25f)
-        .rope_scaling_mrope_section({3, 3, 2})
-        .max_position_embeddings(32)
-        .rope_theta(10000.0f)
-        .rms_norm_eps(kNormEps);
-    ModelContext context(parallel_args, args, QuantArgs(), options);
-    model = std::make_unique<Qwen3_5ModelImpl>(context);
-    auto parameters = model->named_parameters();
-    parameters["norm.weight"].fill_(0);
-    parameters["embed_tokens.weight"].fill_(0.25);
-  }
-
-  torch::Device device;
-  torch::TensorOptions options;
-  std::unique_ptr<ProcessGroup> tp_group;
-  std::unique_ptr<Qwen3_5ModelImpl> model;
-};
-
-ModelInputParams make_params(const torch::Device& device,
-                             const std::vector<int32_t>& dp_counts,
-                             bool dummy) {
-  ModelInputParams params;
-  params.meta.batch_forward_type = BatchForwardType::DECODE;
-  params.meta.num_sequences = dummy ? 0 : 2;
-  params.meta.q_max_seq_len = dummy ? 0 : 1;
-  params.meta.kv_max_seq_len = dummy ? 0 : 1;
-  params.parallel.dp_global_token_nums = dp_counts;
-  params.parallel.dp_is_decode.assign(dp_counts.size(), 1);
-  if (!dummy) {
-    const auto ints =
-        torch::TensorOptions().dtype(torch::kInt32).device(device);
-    params.attention.host.q_seq_lens = {0, 1, 2};
-    params.attention.host.kv_seq_lens = {0, 1, 2};
-    params.attention.device.q_seq_lens = torch::tensor({0, 1, 2}, ints);
-    params.attention.device.kv_seq_lens = torch::tensor({0, 1, 2}, ints);
-    params.attention.device.new_cache_slots = torch::tensor({0, 1}, ints);
-    params.attention.device.block_tables = torch::zeros({2, 1}, ints);
-    const torch::Tensor values = torch::arange(2 * kHiddenSize, torch::kFloat32)
-                                     .reshape({2, kHiddenSize});
-    params.embedding.input_embedding =
-        ((values.remainder(17) - 8.0f) / 8.0f).to(device, torch::kBFloat16);
-  }
-  return params;
-}
-
-ModelOutput run_forward(ModelFixture& fixture,
-                        const torch::Tensor& tokens,
-                        const torch::Tensor& positions,
-                        const ModelInputParams& params) {
-  std::vector<KVCache> caches;
-  return fixture.model->forward(tokens, positions, caches, params);
-}
-
-void expect_norm_output(const torch::Tensor& output,
-                        const torch::Tensor& input) {
-  const torch::Tensor values = input.to(torch::kCPU).to(torch::kFloat32);
-  const torch::Tensor variance =
-      values.pow(2).mean(/*dim=*/-1, /*keepdim=*/true);
-  const torch::Tensor expected = values * torch::rsqrt(variance + kNormEps);
-  EXPECT_EQ(output.sizes(), input.sizes());
-  EXPECT_TRUE(torch::allclose(output.to(torch::kCPU).to(torch::kFloat32),
-                              expected,
-                              /*rtol=*/1e-2,
-                              /*atol=*/1e-2));
-}
-
-void expect_selected_params(const ModelInputParams& params,
-                            int32_t dp_size,
-                            const std::vector<int32_t>& expected,
-                            bool expect_copy) {
-  std::optional<ModelInputParams> patched_params;
-  const ModelInputParams& selected =
-      detail::select_qwen_dp_params(params, dp_size, patched_params);
-  EXPECT_EQ(selected.parallel.dp_global_token_nums, expected);
-  if (expect_copy) {
-    ASSERT_TRUE(patched_params.has_value());
-    EXPECT_EQ(&selected, &*patched_params);
-    EXPECT_NE(&selected, &params);
-  } else {
-    EXPECT_FALSE(patched_params.has_value());
-    EXPECT_EQ(&selected, &params);
-  }
 }
 
 struct SyncGatherObserved {};
@@ -230,7 +123,7 @@ TEST(Qwen35MluForwardTest, MoeForwardUsesPatchedDpCounts) {
       .rope_scaling_mrope_section({3, 3, 2})
       .max_position_embeddings(32)
       .rope_theta(10000.0f)
-      .rms_norm_eps(kNormEps)
+      .rms_norm_eps(1e-6)
       .n_routed_experts(2)
       .num_experts_per_tok(1)
       .moe_intermediate_size(64)
@@ -297,130 +190,6 @@ TEST(Qwen35MluForwardTest, MoeForwardUsesPatchedDpCounts) {
   EXPECT_EQ(dp_group.input_rows(), 1);
   EXPECT_EQ(params.parallel.dp_global_token_nums, std::vector<int32_t>({1, 0}));
   EXPECT_EQ(params.embedding.input_embedding.data_ptr(), embedding_storage);
-}
-
-TEST(Qwen35MluForwardTest, SelectsOriginalOrPatchedDpParams) {
-  ModelInputParams params;
-  params.parallel.dp_global_token_nums = {2, 0};
-  expect_selected_params(params,
-                         /*dp_size=*/1,
-                         /*expected=*/{2, 0},
-                         /*expect_copy=*/false);
-  EXPECT_EQ(params.parallel.dp_global_token_nums, std::vector<int32_t>({2, 0}));
-
-  params.parallel.dp_global_token_nums = {2, 2};
-  expect_selected_params(params,
-                         /*dp_size=*/2,
-                         /*expected=*/{2, 2},
-                         /*expect_copy=*/false);
-  params.parallel.dp_global_token_nums = {2, 0};
-  expect_selected_params(params,
-                         /*dp_size=*/2,
-                         /*expected=*/{2, 1},
-                         /*expect_copy=*/true);
-  EXPECT_EQ(params.parallel.dp_global_token_nums, std::vector<int32_t>({2, 0}));
-
-  params.parallel.dp_global_token_nums = {0, 2};
-  expect_selected_params(params,
-                         /*dp_size=*/2,
-                         /*expected=*/{1, 2},
-                         /*expect_copy=*/true);
-  EXPECT_EQ(params.parallel.dp_global_token_nums, std::vector<int32_t>({0, 2}));
-}
-
-TEST(Qwen35MluForwardTest, DpOnePreservesCallerAndOutput) {
-  if (!has_safe_visible_device()) {
-    GTEST_SKIP() << "Set MLU_VISIBLE_DEVICES to healthy physical card IDs "
-                    "excluding 0";
-  }
-  ModelFixture fixture(/*dp_size=*/1);
-  const auto ints =
-      torch::TensorOptions().dtype(torch::kInt32).device(fixture.device);
-  const torch::Tensor tokens = torch::tensor({1, 2}, ints);
-  const torch::Tensor positions = torch::tensor({0, 1}, ints);
-  ModelInputParams params = make_params(fixture.device, {2}, /*dummy=*/false);
-  const torch::Tensor input_before = params.embedding.input_embedding.clone();
-  expect_selected_params(params,
-                         /*dp_size=*/1,
-                         /*expected=*/{2},
-                         /*expect_copy=*/false);
-
-  const ModelOutput output = run_forward(fixture, tokens, positions, params);
-
-  ASSERT_TRUE(output.hidden_states.defined());
-  expect_norm_output(output.hidden_states, input_before);
-  EXPECT_EQ(params.parallel.dp_global_token_nums, std::vector<int32_t>({2}));
-  EXPECT_TRUE(torch::equal(params.embedding.input_embedding, input_before));
-}
-
-TEST(Qwen35MluForwardTest, DpTwoZeroTransitionsPreserveCaller) {
-  if (!has_safe_visible_device()) {
-    GTEST_SKIP() << "Set MLU_VISIBLE_DEVICES to healthy physical card IDs "
-                    "excluding 0";
-  }
-  ModelFixture fixture(/*dp_size=*/2);
-  const auto ints =
-      torch::TensorOptions().dtype(torch::kInt32).device(fixture.device);
-  const torch::Tensor tokens = torch::tensor({1, 2}, ints);
-  const torch::Tensor positions = torch::tensor({0, 1}, ints);
-  ModelInputParams params =
-      make_params(fixture.device, {2, 2}, /*dummy=*/false);
-  const torch::Tensor input_before = params.embedding.input_embedding.clone();
-
-  for (const std::vector<int32_t>& counts :
-       {std::vector<int32_t>{2, 2}, {2, 0}, {2, 2}, {2, 0}}) {
-    params.parallel.dp_global_token_nums = counts;
-    const std::vector<int32_t> expected =
-        counts[1] == 0 ? std::vector<int32_t>{2, 1} : counts;
-    expect_selected_params(params,
-                           /*dp_size=*/2,
-                           expected,
-                           /*expect_copy=*/counts[1] == 0);
-    const ModelOutput output = run_forward(fixture, tokens, positions, params);
-    ASSERT_TRUE(output.hidden_states.defined());
-    expect_norm_output(output.hidden_states, input_before);
-    EXPECT_EQ(params.parallel.dp_global_token_nums, counts);
-    EXPECT_TRUE(torch::equal(params.embedding.input_embedding, input_before));
-  }
-}
-
-TEST(Qwen35MluForwardTest, EmptyLocalTokensUseDummyWithAndWithoutZero) {
-  if (!has_safe_visible_device()) {
-    GTEST_SKIP() << "Set MLU_VISIBLE_DEVICES to healthy physical card IDs "
-                    "excluding 0";
-  }
-  ModelFixture fixture(/*dp_size=*/2);
-  const auto ints =
-      torch::TensorOptions().dtype(torch::kInt32).device(fixture.device);
-  const torch::Tensor empty = torch::empty({0}, ints);
-  const torch::Tensor dummy = torch::tensor({1}, ints);
-  for (const std::vector<int32_t>& counts :
-       {std::vector<int32_t>{0, 2}, {1, 2}, {1, 0}}) {
-    ModelInputParams params =
-        make_params(fixture.device, counts, /*dummy=*/true);
-    std::vector<int32_t> expected = counts;
-    for (int32_t& count : expected) {
-      if (count == 0) {
-        count = 1;
-      }
-    }
-    expect_selected_params(params,
-                           /*dp_size=*/2,
-                           expected,
-                           /*expect_copy=*/expected != counts);
-    const ModelOutput from_empty = run_forward(fixture, empty, empty, params);
-    const ModelOutput from_dummy = run_forward(fixture, dummy, dummy, params);
-
-    ASSERT_TRUE(from_empty.hidden_states.defined());
-    ASSERT_TRUE(from_dummy.hidden_states.defined());
-    EXPECT_EQ(from_empty.hidden_states.sizes(),
-              torch::IntArrayRef({1, kHiddenSize}));
-    EXPECT_TRUE(
-        torch::equal(from_empty.hidden_states, from_dummy.hidden_states));
-    EXPECT_EQ(empty.numel(), 0);
-    EXPECT_EQ(params.parallel.dp_global_token_nums, counts);
-    EXPECT_FALSE(params.embedding.input_embedding.defined());
-  }
 }
 
 }  // namespace

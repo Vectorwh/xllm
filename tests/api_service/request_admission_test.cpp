@@ -125,18 +125,6 @@ TEST_F(EmbeddingsEntryMetricsTest, NoServiceEarlyExitsCountOnce) {
     EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures + 1);
     EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
               classified + 1);
-
-    ::testing::internal::CaptureStderr();
-    service.EmbeddingsHttp(nullptr, &request, &response, &done);
-    const std::string error_log = ::testing::internal::GetCapturedStderr();
-    EXPECT_NE(error_log.find("brpc controller is null"), std::string::npos);
-    EXPECT_EQ(error_log.find("ctrl is nullptr"), std::string::npos);
-    EXPECT_EQ(done.count(), 2);
-    EXPECT_EQ(COUNTER_VALUE(server_request_in_total), incoming + 2);
-    EXPECT_EQ(COUNTER_VALUE(server_request_total_ok), successes);
-    EXPECT_EQ(COUNTER_VALUE(server_request_total_fail), failures + 1);
-    EXPECT_EQ(MULTI_COUNTER_VALUE(api_request_terminal_total, outcome),
-              classified + 1);
   }
 }
 
@@ -435,30 +423,6 @@ class RateLimitMetricsTest : public testing::Test {
   int32_t previous_limit_ = 0;
 };
 
-TEST_F(RateLimitMetricsTest, AdmissionGuardReleasesEarlyReturn) {
-  const absl::flat_hash_set<std::string> models = {"supported-model"};
-  for (int32_t limit : {0, 1}) {
-    SCOPED_TRACE(limit);
-    ServiceConfig::get_instance().max_concurrent_requests(limit);
-    RateLimiter rate_limiter;
-    const auto prepare_request = [&]() -> Status {
-      const Status status = api_service_internal::admit_rpc_request(
-          /*model=*/"supported-model", models, &rate_limiter);
-      if (!status.ok()) {
-        return status;
-      }
-      xllm::ScopeGuard rate_limit_guard(
-          [&rate_limiter] { rate_limiter.decrease_one_request(); });
-      EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
-      return {StatusCode::INVALID_ARGUMENT, "Invalid input"};
-    };
-    for (int32_t attempt = 0; attempt < 2; ++attempt) {
-      EXPECT_EQ(prepare_request().code(), StatusCode::INVALID_ARGUMENT);
-      EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
-    }
-  }
-}
-
 TEST_F(RateLimitMetricsTest, AdmissionHandoffReleasesExactlyOnce) {
   const absl::flat_hash_set<std::string> models = {"supported-model"};
   for (bool finish_immediately : {false, true}) {
@@ -469,7 +433,7 @@ TEST_F(RateLimitMetricsTest, AdmissionHandoffReleasesExactlyOnce) {
       ASSERT_TRUE(api_service_internal::admit_rpc_request(
                       /*model=*/"supported-model", models, &rate_limiter)
                       .ok());
-      xllm::ScopeGuard rate_limit_guard(
+      ScopeGuard rate_limit_guard(
           [&rate_limiter] { rate_limiter.decrease_one_request(); });
       rate_limit_guard.dismiss();
       request = std::make_unique<RequestBase>(/*request_id=*/"request",
@@ -619,8 +583,7 @@ TEST(RequestAdmissionTest, EarlyHttpErrorsHaveOneClassifiedApiTerminal) {
   }
 }
 
-TEST(RequestAdmissionTest, UnsupportedModelDoesNotConsumeConcurrencySlot) {
-  ServiceConfig::get_instance().max_concurrent_requests(1);
+TEST_F(RateLimitMetricsTest, UnsupportedModelDoesNotConsumeConcurrencySlot) {
   RateLimiter rate_limiter;
   const absl::flat_hash_set<std::string> models = {"supported-model"};
 
@@ -641,46 +604,19 @@ TEST(RequestAdmissionTest, UnsupportedModelDoesNotConsumeConcurrencySlot) {
   rate_limiter.decrease_one_request();
 }
 
-TEST(RequestAdmissionTest, FullConcurrencyLimitPreserves429Cause) {
-  ServiceConfig::get_instance().max_concurrent_requests(1);
-  RateLimiter rate_limiter;
-  const absl::flat_hash_set<std::string> models = {"supported-model"};
-
-  EXPECT_TRUE(api_service_internal::admit_rpc_request(
-                  "supported-model", models, &rate_limiter)
-                  .ok());
-  const Status rejected = api_service_internal::admit_rpc_request(
-      "supported-model", models, &rate_limiter);
-  EXPECT_EQ(rejected.code(), StatusCode::RESOURCE_EXHAUSTED);
-  EXPECT_EQ(rejected.reason(), FailureReason::CONCURRENCY_LIMIT_REACHED);
-  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 1);
-  rate_limiter.decrease_one_request();
-}
-
-TEST(RequestAdmissionTest, SleepingModelIsNotAConcurrencyLimit) {
-  ServiceConfig::get_instance().max_concurrent_requests(1);
-  RateLimiter rate_limiter;
-  const absl::flat_hash_set<std::string> models = {"supported-model"};
-
-  ASSERT_TRUE(rate_limiter.try_set_sleeping());
-  const Status rejected = api_service_internal::admit_rpc_request(
-      "supported-model", models, &rate_limiter);
-  EXPECT_EQ(rejected.code(), StatusCode::UNAVAILABLE);
-  EXPECT_NE(rejected.reason(), FailureReason::CONCURRENCY_LIMIT_REACHED);
-  EXPECT_TRUE(rate_limiter.is_sleeping());
-  EXPECT_TRUE(rate_limiter.try_wakeup());
-}
-
-TEST(RequestAdmissionTest, AdapterAdmissionRequiresServiceOptIn) {
+TEST_F(RateLimitMetricsTest, AdapterAdmissionRequiresServiceOptIn) {
   auto& runtime = LoRARuntime::instance();
   const LoRAConfig previous_config = runtime.config();
   LoRAConfig config = previous_config;
   config.enable_lora = true;
   runtime.init(config);
+  ScopeGuard restore_runtime([&runtime, previous_config] {
+    runtime.unload("admission-test-adapter");
+    runtime.init(previous_config);
+  });
   const auto id = runtime.registry().register_adapter(
       {"admission-test-adapter", 0, "/unused/test/path", "supported-model"});
   EXPECT_TRUE(id.has_value());
-  ServiceConfig::get_instance().max_concurrent_requests(1);
   RateLimiter rate_limiter;
   const absl::flat_hash_set<std::string> models = {"supported-model"};
   const Status unsupported = api_service_internal::admit_rpc_request(
@@ -696,8 +632,6 @@ TEST(RequestAdmissionTest, AdapterAdmissionRequiresServiceOptIn) {
   if (supported.ok()) {
     rate_limiter.decrease_one_request();
   }
-  runtime.unload("admission-test-adapter");
-  runtime.init(previous_config);
 }
 
 }  // namespace

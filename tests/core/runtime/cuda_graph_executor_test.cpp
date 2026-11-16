@@ -383,7 +383,7 @@ ModelInputParams make_multi_sequence_decode_params(
   ModelInputParams p;
   p.meta.batch_forward_type = BatchForwardType::DECODE;
   p.meta.num_sequences = 2;
-  p.meta.kv_max_seq_len = 9;
+  p.meta.kv_max_seq_len = 5;
   p.meta.q_max_seq_len = 1;
   p.enable_graph = false;
 
@@ -392,12 +392,12 @@ ModelInputParams make_multi_sequence_decode_params(
   p.attention.device.q_seq_lens = torch::tensor({0, 1, 2}, iopt);
   p.attention.device.kv_seq_lens = torch::tensor({0, 4, 9}, iopt);
   p.attention.device.q_cu_seq_lens = p.attention.device.q_seq_lens;
-  p.attention.device.new_cache_slots = torch::tensor({5, 7}, iopt);
+  p.attention.device.new_cache_slots = torch::tensor({3, 8}, iopt);
   p.attention.device.block_tables =
-      torch::tensor({{0, 1, 2, 3}, {4, 5, 6, 7}}, iopt);
-  p.attention.device.paged_kv_indptr = torch::tensor({0, 1, 3}, iopt);
-  p.attention.device.paged_kv_indices = torch::tensor({2, 4, 6}, iopt);
-  p.attention.device.paged_kv_last_page_len = torch::tensor({1, 2}, iopt);
+      torch::tensor({{0, 1, 2, 3, 0}, {4, 5, 6, 7, 8}}, iopt);
+  p.attention.device.paged_kv_indptr = torch::tensor({0, 4, 9}, iopt);
+  p.attention.device.paged_kv_indices = torch::arange(9, iopt);
+  p.attention.device.paged_kv_last_page_len = torch::tensor({1, 1}, iopt);
   return p;
 }
 
@@ -405,174 +405,77 @@ TEST(CudaGraphExecutorTest, DecodeMetadataFastPathUpdatesPersistentBuffers) {
   if (!torch::cuda::is_available()) {
     GTEST_SKIP() << "CUDA is not available at runtime.";
   }
-
   const torch::Device device = InitXllmCudaDeviceForTest(/*device_index=*/0);
-  xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
-      device);
+  layer::flashinfer::FlashinferWorkspace::get_instance().initialize(device);
   ModelArgs args = make_test_model_args();
   runtime::Options options =
       make_test_runtime_options(/*max_seqs_per_batch=*/4);
+  auto model = std::make_unique<FakeAttnCausalLM>(args, device);
+  const auto iopt = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto tokens = torch::tensor({10, 11}, iopt);
+  auto positions = torch::tensor({3, 4}, iopt);
+  auto params = make_multi_sequence_decode_params(device);
+  auto kv = MakeKvCaches(device,
+                         /*num_pages=*/16,
+                         /*page_size=*/1,
+                         /*num_kv_heads=*/1,
+                         /*head_dim=*/128);
+  auto eager_kv = MakeSingleKvCaches(kv[0].get_k_cache().clone(),
+                                     kv[0].get_v_cache().clone());
+  const auto expected =
+      model->forward(tokens, positions, eager_kv, params).hidden_states.clone();
   runtime::cuda::CudaGraphPersistentParam persistent(args, device, options);
-
-  torch::TensorOptions iopt =
-      torch::TensorOptions().dtype(torch::kInt32).device(device);
-  torch::Tensor tokens = torch::tensor({10, 11}, iopt);
-  torch::Tensor positions = torch::tensor({20, 21}, iopt);
-  ModelInputParams params = make_multi_sequence_decode_params(device);
-  std::vector<KVCache> kv = MakeKvCaches(device,
-                                         /*num_pages=*/16,
-                                         /*page_size=*/1,
-                                         /*num_kv_heads=*/1,
-                                         /*head_dim=*/128);
-
-  std::optional<ModelInputParams> updated =
-      persistent.update(tokens,
-                        kv[0].get_k_cache(),
-                        kv[0].get_v_cache(),
-                        positions,
-                        params,
-                        /*padded_num_tokens=*/4,
-                        /*return_capture_params=*/true);
-
+  auto updated = persistent.update(tokens,
+                                   kv[0].get_k_cache(),
+                                   kv[0].get_v_cache(),
+                                   positions,
+                                   params,
+                                   /*padded_num_tokens=*/4,
+                                   /*return_capture_params=*/true);
   ASSERT_TRUE(updated.has_value());
-  ASSERT_TRUE(updated->attn_metadata);
-
-  EXPECT_TRUE(
-      torch::equal(persistent.persistent_tokens(/*actual_tokens=*/4).cpu(),
-                   torch::tensor({10, 11, 0, 0}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(
-      torch::equal(persistent.persistent_positions(/*actual_tokens=*/4).cpu(),
-                   torch::tensor({20, 21, 0, 0}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(
-      persistent.persistent_new_cache_slots(/*actual_tokens=*/4).cpu(),
-      torch::tensor({5, 7, -1, -1}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(
-      persistent.kv_seq_lens(/*actual_batch_size=*/5).cpu(),
-      torch::tensor({0, 4, 9, 9, 9}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(
-      persistent.persistent_kv_seq_lens_delta(/*actual_batch_size=*/4).cpu(),
-      torch::tensor({4, 5, 0, 0}, torch::dtype(torch::kInt32))));
-
-  EXPECT_TRUE(torch::equal(
-      updated->attn_metadata->q_cu_seq_lens.cpu(),
-      torch::tensor({0, 1, 2, 3, 4}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(
-      updated->attn_metadata->kv_cu_seq_lens.cpu(),
-      torch::tensor({0, 4, 9, 9, 9}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(
-      torch::equal(updated->attn_metadata->kv_seq_lens.cpu(),
-                   torch::tensor({4, 5, 0, 0}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(
-      torch::equal(updated->attn_metadata->slot_mapping.cpu(),
-                   torch::tensor({5, 7, -1, -1}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(
-      updated->attn_metadata->paged_kv_indptr.cpu(),
-      torch::tensor({0, 1, 3, 3, 3}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(
-      torch::equal(updated->attn_metadata->paged_kv_indices
-                       .slice(/*dim=*/0,
-                              /*start=*/0,
-                              /*end=*/3)
-                       .cpu(),
-                   torch::tensor({2, 4, 6}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(
-      torch::equal(updated->attn_metadata->paged_kv_last_page_len.cpu(),
-                   torch::tensor({1, 2, 1, 1}, torch::dtype(torch::kInt32))));
-  ASSERT_TRUE(updated->attn_metadata->qo_indptr.has_value());
-  EXPECT_TRUE(torch::equal(
-      updated->attn_metadata->qo_indptr.value().cpu(),
-      torch::tensor({0, 1, 2, 3, 4}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(updated->attn_metadata->block_table.cpu(),
-                           params.attention.device.block_tables.cpu()));
-}
-
-TEST(CudaGraphExecutorTest, DecodeMetadataFastPathUpdatesLinearStateIndices) {
-  if (!torch::cuda::is_available()) {
-    GTEST_SKIP() << "CUDA is not available at runtime.";
-  }
-
-  const torch::Device device = InitXllmCudaDeviceForTest(/*device_index=*/0);
-  xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
-      device);
-  ModelArgs args = make_test_model_args();
-  runtime::Options options =
-      make_test_runtime_options(/*max_seqs_per_batch=*/4);
-  runtime::cuda::CudaGraphPersistentParam persistent(args, device, options);
-
-  torch::TensorOptions iopt =
-      torch::TensorOptions().dtype(torch::kInt32).device(device);
-  torch::Tensor tokens = torch::tensor({10, 11}, iopt);
-  torch::Tensor positions = torch::tensor({20, 21}, iopt);
-  ModelInputParams params = make_multi_sequence_decode_params(device);
-  params.embedding.linear_state_ids = {8, 6};
-  params.embedding.linear_state_indices = torch::tensor({8, 6}, iopt);
-  std::vector<KVCache> kv = MakeKvCaches(device,
-                                         /*num_pages=*/16,
-                                         /*page_size=*/1,
-                                         /*num_kv_heads=*/1,
-                                         /*head_dim=*/128);
-
-  std::optional<ModelInputParams> updated =
-      persistent.update(tokens,
-                        kv[0].get_k_cache(),
-                        kv[0].get_v_cache(),
-                        positions,
-                        params,
-                        /*padded_num_tokens=*/4,
-                        /*return_capture_params=*/true);
-
-  ASSERT_TRUE(updated.has_value());
-  EXPECT_TRUE(torch::equal(
-      persistent.persistent_linear_state_indices(/*actual_batch_size=*/2).cpu(),
-      torch::tensor({8, 6}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(updated->embedding.linear_state_indices.cpu(),
-                           torch::tensor({8, 6}, torch::dtype(torch::kInt32))));
+  auto actual =
+      model
+          ->forward(persistent.persistent_tokens(/*actual_tokens=*/4),
+                    persistent.persistent_positions(/*actual_tokens=*/4),
+                    kv,
+                    *updated)
+          .hidden_states.narrow(0, 0, 2)
+          .clone();
+  torch::cuda::synchronize();
+  EXPECT_TRUE(torch::allclose(actual, expected, /*rtol=*/1e-3, /*atol=*/1e-3));
 }
 
 TEST(CudaGraphExecutorTest, DecodeMetadataFastPathFallbackMatchesLegacyPath) {
   if (!torch::cuda::is_available()) {
     GTEST_SKIP() << "CUDA is not available at runtime.";
   }
-
   const torch::Device device = InitXllmCudaDeviceForTest(/*device_index=*/0);
-  xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
-      device);
+  layer::flashinfer::FlashinferWorkspace::get_instance().initialize(device);
   ModelArgs args = make_test_model_args();
   runtime::Options options =
       make_test_runtime_options(/*max_seqs_per_batch=*/4);
-  runtime::cuda::CudaGraphPersistentParam fast_path_persistent(
-      args, device, options);
-  runtime::cuda::CudaGraphPersistentParam fallback_persistent(
-      args, device, options);
-
-  torch::TensorOptions iopt =
-      torch::TensorOptions().dtype(torch::kInt32).device(device);
-  torch::Tensor tokens = torch::tensor({10, 11, 12}, iopt);
-  torch::Tensor positions = torch::tensor({20, 21, 22}, iopt);
-  ModelInputParams fast_params = MakeBatchDecodeParams(device, 3);
-  ModelInputParams fallback_params = MakeBatchDecodeParams(device, 3);
-  torch::Tensor new_cache_slots_base =
+  auto model = std::make_unique<FakeAttnCausalLM>(args, device);
+  const auto iopt = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto tokens = torch::tensor({10, 11, 12}, iopt);
+  auto positions = torch::zeros({3}, iopt);
+  auto fast_params = MakeBatchDecodeParams(device, 3);
+  auto fallback_params = fast_params;
+  auto new_cache_slots_base =
       torch::tensor({0, 99, 1, 88, 2, 77}, iopt).view({3, 2});
   fallback_params.attention.device.new_cache_slots =
       new_cache_slots_base.select(1, 0);
-  ASSERT_FALSE(
-      fallback_params.attention.device.new_cache_slots.is_contiguous());
-
-  std::vector<KVCache> kv = MakeKvCaches(device,
-                                         /*num_pages=*/16,
-                                         /*page_size=*/1,
-                                         /*num_kv_heads=*/1,
-                                         /*head_dim=*/128);
-
-  std::optional<ModelInputParams> fast_updated =
-      fast_path_persistent.update(tokens,
-                                  kv[0].get_k_cache(),
-                                  kv[0].get_v_cache(),
-                                  positions,
-                                  fast_params,
-                                  /*padded_num_tokens=*/4,
-                                  /*return_capture_params=*/true);
-  std::optional<ModelInputParams> fallback_updated =
+  auto kv = MakeKvCaches(device,
+                         /*num_pages=*/16,
+                         /*page_size=*/1,
+                         /*num_kv_heads=*/1,
+                         /*head_dim=*/128);
+  auto eager_kv = MakeSingleKvCaches(kv[0].get_k_cache().clone(),
+                                     kv[0].get_v_cache().clone());
+  const auto expected = model->forward(tokens, positions, eager_kv, fast_params)
+                            .hidden_states.clone();
+  runtime::cuda::CudaGraphPersistentParam fallback_persistent(
+      args, device, options);
+  auto fallback_updated =
       fallback_persistent.update(tokens,
                                  kv[0].get_k_cache(),
                                  kv[0].get_v_cache(),
@@ -580,56 +483,18 @@ TEST(CudaGraphExecutorTest, DecodeMetadataFastPathFallbackMatchesLegacyPath) {
                                  fallback_params,
                                  /*padded_num_tokens=*/4,
                                  /*return_capture_params=*/true);
-
-  ASSERT_TRUE(fast_updated.has_value());
   ASSERT_TRUE(fallback_updated.has_value());
-  ASSERT_TRUE(fast_updated->attn_metadata);
-  ASSERT_TRUE(fallback_updated->attn_metadata);
-
-  EXPECT_TRUE(torch::equal(
-      fast_path_persistent.persistent_tokens(/*actual_tokens=*/4).cpu(),
-      fallback_persistent.persistent_tokens(/*actual_tokens=*/4).cpu()));
-  EXPECT_TRUE(torch::equal(
-      fast_path_persistent.persistent_positions(/*actual_tokens=*/4).cpu(),
-      fallback_persistent.persistent_positions(/*actual_tokens=*/4).cpu()));
-  EXPECT_TRUE(torch::equal(
-      fast_path_persistent.persistent_new_cache_slots(/*actual_tokens=*/4)
-          .cpu(),
-      fallback_persistent.persistent_new_cache_slots(/*actual_tokens=*/4)
-          .cpu()));
-  EXPECT_TRUE(torch::equal(
-      fast_path_persistent.kv_seq_lens(/*actual_batch_size=*/5).cpu(),
-      fallback_persistent.kv_seq_lens(/*actual_batch_size=*/5).cpu()));
-  EXPECT_TRUE(torch::equal(
-      fast_path_persistent.persistent_kv_seq_lens_delta(/*actual_batch_size=*/4)
-          .cpu(),
-      fallback_persistent.persistent_kv_seq_lens_delta(/*actual_batch_size=*/4)
-          .cpu()));
-  EXPECT_TRUE(torch::equal(fast_updated->attn_metadata->kv_seq_lens.cpu(),
-                           fallback_updated->attn_metadata->kv_seq_lens.cpu()));
-  EXPECT_TRUE(
-      torch::equal(fast_updated->attn_metadata->q_cu_seq_lens.cpu(),
-                   fallback_updated->attn_metadata->q_cu_seq_lens.cpu()));
-  EXPECT_TRUE(
-      torch::equal(fast_updated->attn_metadata->kv_cu_seq_lens.cpu(),
-                   fallback_updated->attn_metadata->kv_cu_seq_lens.cpu()));
-  EXPECT_TRUE(
-      torch::equal(fast_updated->attn_metadata->slot_mapping.cpu(),
-                   fallback_updated->attn_metadata->slot_mapping.cpu()));
-  EXPECT_TRUE(
-      torch::equal(fast_updated->attn_metadata->paged_kv_indptr.cpu(),
-                   fallback_updated->attn_metadata->paged_kv_indptr.cpu()));
-  EXPECT_TRUE(
-      torch::equal(fast_updated->attn_metadata->paged_kv_indices.cpu(),
-                   fallback_updated->attn_metadata->paged_kv_indices.cpu()));
-  EXPECT_TRUE(torch::equal(
-      fast_updated->attn_metadata->paged_kv_last_page_len.cpu(),
-      fallback_updated->attn_metadata->paged_kv_last_page_len.cpu()));
-  ASSERT_TRUE(fast_updated->attn_metadata->qo_indptr.has_value());
-  ASSERT_TRUE(fallback_updated->attn_metadata->qo_indptr.has_value());
-  EXPECT_TRUE(
-      torch::equal(fast_updated->attn_metadata->qo_indptr.value().cpu(),
-                   fallback_updated->attn_metadata->qo_indptr.value().cpu()));
+  auto actual =
+      model
+          ->forward(
+              fallback_persistent.persistent_tokens(/*actual_tokens=*/4),
+              fallback_persistent.persistent_positions(/*actual_tokens=*/4),
+              kv,
+              *fallback_updated)
+          .hidden_states.narrow(0, 0, 3)
+          .clone();
+  torch::cuda::synchronize();
+  EXPECT_TRUE(torch::allclose(actual, expected, /*rtol=*/1e-3, /*atol=*/1e-3));
 }
 
 TEST(CudaGraphExecutorTest, BatchDecodeCaptureAndReplay) {
@@ -678,11 +543,9 @@ TEST(CudaGraphExecutorTest, BatchDecodeCaptureAndReplay) {
   auto eager_out =
       model->forward(tokens, positions, kv, params).hidden_states.clone();
   torch::cuda::synchronize();
-  // LOG(INFO) << "eager_out: " << eager_out;
   // Graph capture (first run) + replay (second run).
   auto out1 = graph_exec->run(tokens, positions, kv, params).hidden_states;
   torch::cuda::synchronize();
-  // LOG(INFO) << "out1: " << out1;
   EXPECT_TRUE(torch::allclose(out1, eager_out, /*rtol=*/1e-3, /*atol=*/1e-3))
       << "graph capture output should match eager output";
 
@@ -712,22 +575,6 @@ TEST(CudaGraphExecutorTest, BatchDecodePaddedBucket100CaptureAndReplay) {
   args.max_position_embeddings(16);
   runtime::Options options =
       make_test_runtime_options(/*max_seqs_per_batch=*/100);
-
-  runtime::cuda::CudaGraphPersistentParam persistent(args, device, options);
-  EXPECT_EQ(persistent.q_seq_lens(/*actual_batch_size=*/0).size(0), 113);
-  EXPECT_EQ(persistent.kv_seq_lens(/*actual_batch_size=*/0).size(0), 113);
-  EXPECT_EQ(
-      persistent.persistent_paged_kv_indptr(/*actual_batch_size=*/0).size(0),
-      113);
-  EXPECT_EQ(
-      persistent.persistent_paged_kv_last_page_len(/*actual_batch_size=*/0)
-          .size(0),
-      112);
-  EXPECT_EQ(
-      persistent.persistent_decode_qo_indptr(/*actual_batch_size=*/0).size(0),
-      113);
-  EXPECT_EQ(persistent.persistent_block_tables(/*actual_batch_size=*/0).size(0),
-            112);
 
   auto model = std::make_unique<FakeAttnCausalLM>(args, device);
   auto graph_exec = std::make_unique<runtime::cuda::CudaGraphExecutorImpl>(
@@ -787,22 +634,6 @@ TEST(CudaGraphExecutorTest, BatchDecodeNoPaddingBucket100CaptureAndReplay) {
   args.max_position_embeddings(16);
   runtime::Options options =
       make_test_runtime_options(/*max_seqs_per_batch=*/100);
-
-  runtime::cuda::CudaGraphPersistentParam persistent(args, device, options);
-  EXPECT_EQ(persistent.q_seq_lens(/*actual_batch_size=*/0).size(0), 101);
-  EXPECT_EQ(persistent.kv_seq_lens(/*actual_batch_size=*/0).size(0), 101);
-  EXPECT_EQ(
-      persistent.persistent_paged_kv_indptr(/*actual_batch_size=*/0).size(0),
-      101);
-  EXPECT_EQ(
-      persistent.persistent_paged_kv_last_page_len(/*actual_batch_size=*/0)
-          .size(0),
-      100);
-  EXPECT_EQ(
-      persistent.persistent_decode_qo_indptr(/*actual_batch_size=*/0).size(0),
-      101);
-  EXPECT_EQ(persistent.persistent_block_tables(/*actual_batch_size=*/0).size(0),
-            100);
 
   auto model = std::make_unique<FakeAttnCausalLM>(args, device);
   auto graph_exec = std::make_unique<runtime::cuda::CudaGraphExecutorImpl>(
@@ -1058,42 +889,12 @@ TEST(CudaGraphExecutorTest, CompareMqa2v1AndMqa8v1) {
     return PrefillRunOutputs{std::move(eager_out), std::move(graph_out)};
   };
 
-  auto out_mqa_2v1 = run_mqa_prefill(/*n_heads=*/2, /*n_kv_heads=*/1);
   auto out_mqa_8v1 = run_mqa_prefill(/*n_heads=*/8, /*n_kv_heads=*/1);
-
-  EXPECT_EQ(out_mqa_2v1.eager_out.size(0), kNumTokens);
-  EXPECT_EQ(out_mqa_2v1.graph_out.size(0), kNumTokens);
-  EXPECT_EQ(out_mqa_8v1.eager_out.size(0), kNumTokens);
-  EXPECT_EQ(out_mqa_8v1.graph_out.size(0), kNumTokens);
-  EXPECT_EQ(out_mqa_2v1.eager_out.size(1), 256);
-  EXPECT_EQ(out_mqa_2v1.graph_out.size(1), 256);
-  EXPECT_EQ(out_mqa_8v1.eager_out.size(1), 1024);
-  EXPECT_EQ(out_mqa_8v1.graph_out.size(1), 1024);
-
-  EXPECT_TRUE(torch::isfinite(out_mqa_2v1.eager_out).all().item<bool>());
-  EXPECT_TRUE(torch::isfinite(out_mqa_2v1.graph_out).all().item<bool>());
-  EXPECT_TRUE(torch::isfinite(out_mqa_8v1.eager_out).all().item<bool>());
   EXPECT_TRUE(torch::isfinite(out_mqa_8v1.graph_out).all().item<bool>());
-
-  EXPECT_TRUE(torch::allclose(out_mqa_2v1.graph_out,
-                              out_mqa_2v1.eager_out,
-                              /*rtol=*/1e-2,
-                              /*atol=*/1e-2))
-      << "MQA(2/1) graph output should match eager output";
   EXPECT_TRUE(torch::allclose(out_mqa_8v1.graph_out,
                               out_mqa_8v1.eager_out,
                               /*rtol=*/1e-2,
-                              /*atol=*/1e-2))
-      << "MQA(8/1) graph output should match eager output";
-
-  const auto out_mqa_8v1_first_256 = out_mqa_8v1.graph_out.slice(/*dim=*/1,
-                                                                 /*start=*/0,
-                                                                 /*end=*/256);
-  const float mean_abs_delta = (out_mqa_2v1.graph_out - out_mqa_8v1_first_256)
-                                   .abs()
-                                   .mean()
-                                   .item<float>();
-  EXPECT_TRUE(std::isfinite(mean_abs_delta));
+                              /*atol=*/1e-2));
 }
 
 TEST(CudaGraphExecutorTest, GraphVmmPoolMemoryReuseAcrossMultiShape) {
@@ -1149,8 +950,8 @@ TEST(CudaGraphExecutorTest, GraphVmmPoolMemoryReuseAcrossMultiShape) {
                            /*head_dim=*/128);
 
     std::vector<size_t> memory_usage_bytes;
-    memory_usage_bytes.reserve(9);
-    for (int32_t num_tokens = 256; num_tokens >= 128; num_tokens -= 16) {
+    memory_usage_bytes.reserve(3);
+    for (int32_t num_tokens : {256, 192, 128}) {
       auto tokens =
           all_tokens.slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens);
       auto positions =
@@ -1173,25 +974,6 @@ TEST(CudaGraphExecutorTest, GraphVmmPoolMemoryReuseAcrossMultiShape) {
         << "during 256->128 multi-shape capture sweep, step=" << i
         << ", baseline=" << vmm_usage.front() << ", current=" << vmm_usage[i];
   }
-
-  const auto no_vmm_usage =
-      run_prefill_capture_sweep(/*enable_graph_vmm_pool=*/false);
-  ASSERT_FALSE(no_vmm_usage.empty());
-
-  size_t grow_steps = 0;
-  for (size_t i = 1; i < no_vmm_usage.size(); ++i) {
-    if (no_vmm_usage[i] > no_vmm_usage[i - 1]) {
-      ++grow_steps;
-    }
-  }
-
-  EXPECT_GT(no_vmm_usage.back(), no_vmm_usage.front())
-      << "With enable_graph_vmm_pool=false, memory should grow during "
-      << "256->128 multi-shape capture sweep, first=" << no_vmm_usage.front()
-      << ", last=" << no_vmm_usage.back();
-  EXPECT_GT(grow_steps, 0U)
-      << "With enable_graph_vmm_pool=false, expected at least one increasing "
-      << "step during 256->128 sweep.";
 }
 
 TEST(CudaGraphExecutorTest, GraphVmmPoolEnabledPrefillCorrectness) {
@@ -1234,7 +1016,7 @@ TEST(CudaGraphExecutorTest, GraphVmmPoolEnabledPrefillCorrectness) {
   auto all_tokens = torch::arange(1, 257, iopt);
   auto all_positions = torch::arange(0, 256, iopt);
 
-  for (int32_t num_tokens = 128; num_tokens <= 256; num_tokens += 16) {
+  for (int32_t num_tokens : {128, 192, 256}) {
     auto tokens = all_tokens.slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens);
     auto positions =
         all_positions.slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens);

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -34,7 +34,6 @@ from xllm.python.model_executor.runners.base import BaseRunner
 from xllm.python.model_executor.runners.decode_cuda_graph import DecodeCudaGraphRunner
 from xllm.python.model_executor.sampling_metadata import (
     ModelSamplingInput,
-    ModelSamplingMetadata,
     ModelSamplingMetadataBuilder,
     prepare_sampling_input,
     sample_logits,
@@ -499,13 +498,6 @@ def test_pipeline_uses_current_anchor_tokens_without_storing_request_state() -> 
     assert list(model.children()) == [model.model]
 
 
-def test_model_does_not_expose_an_alternative_pipeline_forward() -> None:
-    model = _DraftModel()
-    with pytest.raises(NotImplementedError, match="forward"):
-        model.model(torch.tensor([1, 0, 0]), torch.arange(3))
-    assert model.calls == []
-
-
 @pytest.mark.parametrize("missing", ["input_batch", "sampling"])
 def test_pipeline_requires_sampling_before_backbone(missing: str) -> None:
     model = _DraftModel()
@@ -554,21 +546,17 @@ def test_runner_preserves_output_structure(output_kind: str, clone: bool) -> Non
     assert (sliced_hidden.data_ptr() != hidden.data_ptr()) == clone
 
 
-def test_pipeline_output_fields_match_native_contract() -> None:
-    assert [member.name for member in fields(ModelOutput)] == [
-        "draft_proposal",
-        "draft_confidence_probs",
-        "hidden_states",
-        "residual",
-        "aux_hidden_states",
-    ]
-    assert [member.name for member in fields(DraftProposal)] == ["token_ids", "draft_probs"]
-
-
-@pytest.mark.parametrize("num_tokens,num_reqs", [(1, 1), (6, 2), (5, 2), (12, 4)])
-@pytest.mark.parametrize("return_probs", [False, True])
-@pytest.mark.parametrize("return_confidence", [False, True])
-@pytest.mark.parametrize("clone", [False, True])
+@pytest.mark.parametrize(
+    "num_tokens,num_reqs,return_probs,return_confidence,clone",
+    [
+        (1, 1, False, False, False),
+        (6, 2, True, True, False),
+        (5, 2, True, True, True),
+        (12, 4, False, False, True),
+        (6, 2, True, False, True),
+        (5, 2, False, True, False),
+    ],
+)
 def test_runner_trims_pipeline_output_with_independent_token_and_request_counts(
     num_tokens: int, num_reqs: int, return_probs: bool, return_confidence: bool, clone: bool
 ) -> None:

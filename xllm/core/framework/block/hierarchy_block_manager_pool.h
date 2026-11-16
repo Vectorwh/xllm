@@ -86,7 +86,6 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   void reset_prefix_cache() override;
 
  private:
-  friend class HierarchyPoolTestPeer;
   void collect_load_block_transfer_infos(Sequence* sequence);
   void collect_offload_pairs(Sequence* sequence);
   bool should_probe_prefix_cache(Sequence* sequence) const;

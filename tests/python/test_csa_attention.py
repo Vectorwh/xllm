@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -33,14 +34,9 @@ from xllm.python.attention import csa_attention as csa_attention_module
 from xllm.python.attention import dsa_metadata as dsa_metadata_module
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import (
-    COMPRESSED_SPARSE_ATTENTION,
-    HEAVILY_COMPRESSED_ATTENTION,
-    SLIDING_ATTENTION,
     CsaAttentionBackend,
     DsaAttentionBackend,
-    _attention_type_for_compress_ratio,
     _build_dspark_swa_indices,
-    _CompressedAttentionCacheMapping,
     _deepseek_v4_ori_window_left,
     _get_layer_cache_tensor,
     _scatter_by_slot,
@@ -54,22 +50,30 @@ from xllm.python.model_executor.v4_cp_context import (
 )
 
 
-def _make_backend(device: torch.device | None = None) -> CsaAttentionBackend:
+def _make_backend(device: torch.device | None = None, *, index_topk: int = 512) -> CsaAttentionBackend:
     compress_ratios = [0, 4, 128]
-    caches_info, group_infos = build_cache_specs(compress_ratios, 128, 3)
     return CsaAttentionBackend(
         compress_ratios=compress_ratios,
         window_size=128,
         n_layers=3,
         num_heads=8,
         attn_head_dim=512,
-        index_topk=512,
+        index_topk=index_topk,
         index_n_heads=64,
         index_head_dim=128,
         rope_head_dim=64,
         device=device or torch.device("cpu"),
         dtype=torch.bfloat16,
     )
+
+
+def _bound_dummy_caches() -> list[LayerCache]:
+    swa = lambda: torch.zeros((2, 128, 1, 512), dtype=torch.bfloat16)
+    return [
+        LayerCache(key=None, value=None, swa=swa()),
+        LayerCache(key=torch.zeros((4, 512, 1, 512), dtype=torch.bfloat16), value=None, swa=swa()),
+        LayerCache(key=torch.zeros((1, 16, 1, 512), dtype=torch.bfloat16), value=None, swa=swa()),
+    ]
 
 
 def test_dspark_native_sas_window_matches_cpp_contract() -> None:
@@ -89,14 +93,15 @@ def test_dspark_native_swa_indices_are_shared_by_query_rows() -> None:
     )
 
     assert indices.shape == (3, 1, 128)
-    expected = torch.tensor([40, 41, 42, 43, 44, 45, -1], dtype=torch.int32)
+    expected = torch.full((128,), -1, dtype=torch.int32)
+    expected[:6] = torch.tensor([40, 41, 42, 43, 44, 45], dtype=torch.int32)
     for row in range(3):
-        torch.testing.assert_close(indices[row, 0, :7], expected)
+        torch.testing.assert_close(indices[row, 0], expected, rtol=0, atol=0)
 
 
 def test_dspark_native_swa_indices_wrap_ring_buffer() -> None:
     indices = _build_dspark_swa_indices(
-        torch.tensor([[20, 21]], dtype=torch.int32),
+        torch.tensor([[20, 37, 22]], dtype=torch.int32),
         torch.tensor([0, 1], dtype=torch.int32),
         torch.tensor([10], dtype=torch.int32),
         window_size=4,
@@ -105,8 +110,9 @@ def test_dspark_native_swa_indices_wrap_ring_buffer() -> None:
     )
 
     assert indices.shape == (1, 1, 128)
-    expected = torch.tensor([41, 42, 43, 40, 41], dtype=torch.int32)
-    torch.testing.assert_close(indices[0, 0, :5], expected)
+    expected = torch.full((128,), -1, dtype=torch.int32)
+    expected[:5] = torch.tensor([45, 40, 41, 74, 75], dtype=torch.int32)
+    torch.testing.assert_close(indices[0, 0], expected, rtol=0, atol=0)
 
 
 def test_dspark_native_swa_indices_map_expanded_metadata_ring() -> None:
@@ -146,74 +152,36 @@ def test_dspark_native_swa_indices_map_expanded_metadata_ring() -> None:
     assert compressed_metadata.block_tables[0][0].tolist() == [[-1, 21, 20]]
     backend._build_dspark_swa_metadata(compressed_metadata)
 
-    expected = torch.tensor([83, 84, 85, 86, 87, 80], dtype=torch.int32)
+    expected = torch.full((128,), -1, dtype=torch.int32)
+    expected[:6] = torch.tensor([83, 84, 85, 86, 87, 80], dtype=torch.int32)
     for row in range(2):
-        torch.testing.assert_close(compressed_metadata.explicit_swa_indices[row, 0, :6], expected)
-
-
-def test_compress_ratio_per_layer() -> None:
-    b = _make_backend()
-    assert b._layer_compress_ratio(0) == 1
-    assert b._layer_compress_ratio(1) == 4
-    assert b._layer_compress_ratio(2) == 128
+        torch.testing.assert_close(compressed_metadata.explicit_swa_indices[row, 0], expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
-    ("compress_ratio", "attention_type"),
-    [
-        (1, SLIDING_ATTENTION),
-        (4, COMPRESSED_SPARSE_ATTENTION),
-        (128, HEAVILY_COMPRESSED_ATTENTION),
-    ],
+    ("layer_id", "ratio", "expected"),
+    [(1, 4, (0, 1, 7, 2, 3, 4, 5, 6)), (2, 128, (0, -1, -1, 1, 2, 3, -1, -1)), (0, 1, (-1, -1, -1, 0, -1, -1, -1, -1))],
 )
-def test_official_attention_type_names(compress_ratio: int, attention_type: str) -> None:
-    assert _attention_type_for_compress_ratio(compress_ratio) == attention_type
-
-
-def test_unsupported_compression_ratio_has_clear_error() -> None:
-    with pytest.raises(ValueError, match="unsupported DeepSeek-V4 compression ratio"):
-        _attention_type_for_compress_ratio(8)
-
-
-def test_resolve_cache_mapping_csa() -> None:
-    """CSA layer: compressed/index caches plus sliding-window state caches."""
-    b = _make_backend()
-    m = b._resolve_cache_mapping(1, 4)
-    assert m.cmp_cache_idx == 0
-    assert m.index_cache_idx == 1
-    assert m.indexer_scale_cache_idx == 7
-    assert m.ori_cache_idx == 2
-    assert m.kv_state_cache_idx == 3
-    assert m.score_state_cache_idx == 4
-    assert m.index_kv_state_cache_idx == 5
-    assert m.index_score_state_cache_idx == 6
-
-
-def test_resolve_cache_mapping_hca() -> None:
-    """HCA layer: compressed cache and sliding-window state caches."""
-    b = _make_backend()
-    m = b._resolve_cache_mapping(2, 128)
-    assert m.cmp_cache_idx == 0
-    assert m.ori_cache_idx == 1
-    assert m.kv_state_cache_idx == 2
-    assert m.score_state_cache_idx == 3
-    assert m.index_cache_idx == -1  # HCA has no indexer
-    assert m.indexer_scale_cache_idx == -1
-
-
-def test_resolve_cache_mapping_sliding_attention() -> None:
-    """Sliding-attention layer: one SWA cache and no compressed cache."""
-    b = _make_backend()
-    m = b._resolve_cache_mapping(0, 1)
-    assert m.cmp_cache_idx == -1
-    assert m.ori_cache_idx == 0
-    assert m.index_cache_idx == -1
+def test_cache_mapping_respects_layer_slot_abi(layer_id: int, ratio: int, expected: tuple[int, ...]) -> None:
+    mapping = _make_backend()._resolve_cache_mapping(layer_id, ratio)
+    assert (
+        mapping.cmp_cache_idx,
+        mapping.index_cache_idx,
+        mapping.indexer_scale_cache_idx,
+        mapping.ori_cache_idx,
+        mapping.kv_state_cache_idx,
+        mapping.score_state_cache_idx,
+        mapping.index_kv_state_cache_idx,
+        mapping.index_score_state_cache_idx,
+    ) == expected
 
 
 def test_get_layer_cache_tensor_bounds() -> None:
     tensors = [[torch.empty(0)], [torch.zeros(2), torch.zeros(3)]]
-    assert _get_layer_cache_tensor(tensors, 0, 0).numel() == 0
-    assert _get_layer_cache_tensor(tensors, 1, 1).numel() == 3
+    assert _get_layer_cache_tensor(tensors, 0, 0) is tensors[0][0]
+    assert _get_layer_cache_tensor(tensors, 1, 1) is tensors[1][1]
+    assert _get_layer_cache_tensor(tensors, -1, 0) is None
+    assert _get_layer_cache_tensor(tensors, 1, -1) is None
     assert _get_layer_cache_tensor(tensors, 5, 0) is None  # bad layer
     assert _get_layer_cache_tensor(tensors, 1, 9) is None  # bad cache idx
 
@@ -224,10 +192,12 @@ def test_scatter_by_slot_writes_rows() -> None:
     slots = torch.tensor([0, -1, 2], dtype=torch.int32)
     value = torch.tensor([[1.0, 1.0, 1.0], [9.0, 9.0, 9.0], [2.0, 2.0, 2.0]])
     _scatter_by_slot(cache, slots, value)
-    assert torch.equal(cache[0], torch.tensor([1.0, 1.0, 1.0]))
-    assert torch.equal(cache[2], torch.tensor([2.0, 2.0, 2.0]))
-    # Row 1 untouched (slot -1 skipped); value row 1 dropped.
-    assert torch.equal(cache[1], torch.zeros(3))
+    torch.testing.assert_close(
+        cache,
+        torch.tensor([[1, 1, 1], [0, 0, 0], [2, 2, 2], [0, 0, 0]], dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_scatter_by_slot_ignores_all_padded_rows() -> None:
@@ -241,40 +211,8 @@ def test_scatter_by_slot_ignores_all_padded_rows() -> None:
     assert torch.equal(cache, original)
 
 
-def test_scatter_by_slot_npu_works_without_forward_context(monkeypatch: pytest.MonkeyPatch) -> None:
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    from xllm.python import kernels
-
-    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    monkeypatch.setattr(csa_attention_module, "get_forward_context_or_none", lambda: None)
-    monkeypatch.setattr(
-        kernels,
-        "scatter_nd_update",
-        lambda cache, indices, updates: calls.append((cache, indices, updates)),
-        raising=False,
-    )
-
-    with FakeTensorMode():
-        cache = torch.zeros(4, 3, dtype=torch.float32, device="npu")
-        slots = torch.tensor([0, -1, 2], dtype=torch.int32, device="npu")
-        values = torch.ones(3, 3, dtype=torch.float32, device="npu")
-        _scatter_by_slot(cache, slots, values)
-
-    assert len(calls) == 1
-    assert calls[0][1].shape == (3, 1)
-    assert calls[0][2].shape == (3, 3)
-
-
-def test_default_mapping_is_empty() -> None:
-    m = _CompressedAttentionCacheMapping()
-    assert m.cmp_cache_idx == -1
-    assert m.ori_cache_idx == -1
-
-
-def test_prepare_binds_compressed_metadata_to_current_forward(monkeypatch) -> None:
+def test_prepare_binds_compressed_metadata_to_current_forward(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda compressed_metadata: None)
     monkeypatch.setattr(
         backend,
         "_build_precomputed_metadata",
@@ -290,7 +228,7 @@ def test_prepare_binds_compressed_metadata_to_current_forward(monkeypatch) -> No
             is_prefill=is_prefill,
             is_chunked_prefill=False,
             dsa_metadata=None,
-            dsa_positions=None,
+            dsa_positions=torch.arange(kv_len - q_len, kv_len, dtype=torch.int64),
             dsa_cos_sin=None,
             dsa_c4_cos_sin=None,
             dsa_c128_cos_sin=None,
@@ -312,7 +250,7 @@ def test_prepare_binds_compressed_metadata_to_current_forward(monkeypatch) -> No
     assert prefill.dsa_metadata is prefill_compressed_metadata
 
 
-def test_prepare_clamps_target_block_tables_to_draft_groups(monkeypatch) -> None:
+def test_prepare_clamps_target_block_tables_to_draft_groups(monkeypatch: pytest.MonkeyPatch) -> None:
     """An MTP draft backend consumes only its registered SWA manager table."""
     backend = CsaAttentionBackend(
         compress_ratios=[1],
@@ -327,7 +265,6 @@ def test_prepare_clamps_target_block_tables_to_draft_groups(monkeypatch) -> None
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
     )
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
     metadata = SimpleNamespace(
         multi_block_tables=[
@@ -353,123 +290,58 @@ def test_prepare_clamps_target_block_tables_to_draft_groups(monkeypatch) -> None
     assert dsa.slot_mappings[0][0].tolist() == [1280]
 
 
-@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("compressed_unit_tokens", [128, 2048])
+@pytest.mark.parametrize(("index_topk", "c4_slot", "c128_slot"), [(512, 127, 3), (1024, 255, 7), (2048, 511, 15)])
 def test_empty_dp_metadata_uses_safe_lengths_and_cache_tables(
-    monkeypatch,
-    index_topk: int,
-    compressed_unit_tokens: int,
+    monkeypatch: pytest.MonkeyPatch, index_topk: int, c4_slot: int, c128_slot: int
 ) -> None:
-    monkeypatch.setattr(dsa_metadata_module, "DSV4_COMPRESSED_BLOCK_TOKEN_SIZE", compressed_unit_tokens)
-    backend = _make_backend()
-    backend.index_topk = index_topk
-    backend.bind_kv_caches(
-        [
-            LayerCache(key=None, value=None, swa=torch.empty((2, 128, 1, 1))),
-            LayerCache(
-                key=torch.empty((4, 128, 1, 1)),
-                value=None,
-                swa=torch.empty((2, 128, 1, 1)),
-            ),
-            LayerCache(
-                key=torch.empty((1, 128, 1, 1)),
-                value=None,
-                swa=torch.empty((2, 128, 1, 1)),
-            ),
-        ]
-    )
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    backend = _make_backend(index_topk=index_topk)
+    backend.bind_kv_caches(_bound_dummy_caches())
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
-    metadata = SimpleNamespace(
-        multi_block_tables=[],
+    metadata = _sequence_metadata(
         kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
         q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
         is_prefill=True,
-        is_chunked_prefill=False,
         is_dummy=True,
-        dsa_metadata=None,
-        dsa_positions=torch.tensor([0], dtype=torch.int64),
-        dsa_cos_sin=None,
-        dsa_c4_cos_sin=None,
-        dsa_c128_cos_sin=None,
-        dsa_graph_mode=False,
-        dsa_graph_block_table_cols=0,
     )
-
     dsa = backend._build_dsa_metadata_for_forward(metadata)
-
     assert dsa.seq_lens.tolist() == [index_topk]
     assert dsa.seq_lens_q.tolist() == [1]
-    assert dsa.max_seq_len == index_topk
-    assert dsa.max_query_len == 1
-    c4_group = backend.group_infos[backend.caches_info[1][0].group_id]
-    c4_tokens = index_topk // c4_group.ratio
-    expected_c4_columns = (c4_tokens + c4_group.block_size - 1) // c4_group.block_size
-    assert tuple(dsa.block_tables[1][0].shape) == (1, expected_c4_columns)
+    assert dsa.max_seq_len == index_topk and dsa.max_query_len == 1
+    assert dsa.block_tables[1][0].tolist() == [[0]]
     assert dsa.slot_mappings[0][0].tolist() == [127]
-    assert dsa.slot_mappings[1][0].tolist() == [(c4_tokens - 1) % c4_group.block_size]
-    c128_group = backend.group_infos[backend.caches_info[2][0].group_id]
-    assert dsa.slot_mappings[2][0].tolist() == [(index_topk // c128_group.ratio - 1) % c128_group.block_size]
+    assert dsa.slot_mappings[1][0].tolist() == [c4_slot]
+    assert dsa.slot_mappings[2][0].tolist() == [c128_slot]
 
 
-@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("compressed_unit_tokens", [128, 2048])
+@pytest.mark.parametrize(
+    ("index_topk", "graph_cols", "swa_column", "c4_slot", "c128_slot"),
+    [(512, 8, 3, 127, 3), (1024, 8, 7, 255, 7), (2048, 16, 15, 511, 15)],
+)
 def test_empty_dp_graph_metadata_preserves_bucket_rows(
-    monkeypatch, index_topk: int, compressed_unit_tokens: int
+    monkeypatch: pytest.MonkeyPatch, index_topk: int, graph_cols: int, swa_column: int, c4_slot: int, c128_slot: int
 ) -> None:
-    monkeypatch.setattr(dsa_metadata_module, "DSV4_COMPRESSED_BLOCK_TOKEN_SIZE", compressed_unit_tokens)
-    backend = _make_backend()
-    backend.index_topk = index_topk
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
+    backend = _make_backend(index_topk=index_topk)
+    backend.bind_kv_caches(_bound_dummy_caches())
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
-    graph_block_table_cols = max(8, index_topk // 128)
-    metadata = SimpleNamespace(
-        multi_block_tables=[
-            torch.full((4, graph_block_table_cols), -1, dtype=torch.int32),
-            torch.full((4, graph_block_table_cols), -1, dtype=torch.int32),
-            torch.full((4, graph_block_table_cols), -1, dtype=torch.int32),
-        ],
-        kv_seq_lens_host=None,
+    metadata = _sequence_metadata(
+        multi_block_tables=[torch.full((4, graph_cols), -1, dtype=torch.int32) for _ in range(3)],
         kv_seq_lens_host_values=[1, 0, 0, 0],
-        q_seq_lens_host=None,
         q_seq_lens=torch.ones(4, dtype=torch.int32),
-        is_prefill=False,
-        is_chunked_prefill=False,
         is_dummy=True,
-        dsa_metadata=None,
         dsa_positions=torch.zeros(4, dtype=torch.int64),
-        dsa_cos_sin=None,
-        dsa_c4_cos_sin=None,
-        dsa_c128_cos_sin=None,
         dsa_graph_mode=True,
-        dsa_graph_block_table_cols=graph_block_table_cols,
+        dsa_graph_block_table_cols=graph_cols,
     )
-    dummy_tables = backend._build_empty_dp_block_tables(
-        list(metadata.multi_block_tables),
-        4,
-        index_topk,
-        torch.device("cpu"),
-        graph_mode=True,
-        graph_block_table_capacity_cols=graph_block_table_cols,
-    )
-
     dsa = backend._build_dsa_metadata_for_forward(metadata)
-
-    assert tuple(dummy_tables[0].shape) == (4, 1)
     assert dsa.seq_lens.tolist() == [index_topk] * 4
-    assert dsa.seq_lens_q.tolist() == [1, 1, 1, 1]
-    assert tuple(dsa.block_tables[0][0].shape) == (4, graph_block_table_cols)
-    expected_swa_column = index_topk // 128 - 1
-    assert dsa.block_tables[0][0][:, expected_swa_column].tolist() == [0, 0, 0, 0]
-    assert tuple(dsa.block_tables[1][0].shape) == (4, graph_block_table_cols)
-    assert dsa.block_tables[1][0][:, 0].tolist() == [0, 0, 0, 0]
-    assert dsa.slot_mappings[0][0][:4].tolist() == [127, 127, 127, 127]
-    c4_group = backend.group_infos[backend.caches_info[1][0].group_id]
-    expected_c4_slot = (index_topk // c4_group.ratio - 1) % c4_group.block_size
-    assert dsa.slot_mappings[1][0][:4].tolist() == [expected_c4_slot] * 4
-    c128_group = backend.group_infos[backend.caches_info[2][0].group_id]
-    expected_c128_slot = (index_topk // c128_group.ratio - 1) % c128_group.block_size
-    assert dsa.slot_mappings[2][0][:4].tolist() == [expected_c128_slot] * 4
+    assert dsa.seq_lens_q.tolist() == [1] * 4
+    expected_swa = torch.full((4, graph_cols), -1, dtype=torch.int32)
+    expected_swa[:, swa_column] = 0
+    torch.testing.assert_close(dsa.block_tables[0][0], expected_swa, rtol=0, atol=0)
+    torch.testing.assert_close(dsa.block_tables[1][0], torch.zeros((4, graph_cols), dtype=torch.int32), rtol=0, atol=0)
+    assert dsa.slot_mappings[0][0].tolist() == [127] * 4
+    assert dsa.slot_mappings[1][0].tolist() == [c4_slot] * 4
+    assert dsa.slot_mappings[2][0].tolist() == [c128_slot] * 4
 
 
 def test_empty_dp_graph_rejects_insufficient_swa_capacity() -> None:
@@ -495,11 +367,11 @@ def test_prepare_clears_previous_forward_state() -> None:
         q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
         is_prefill=False,
         is_chunked_prefill=False,
-        dsa_metadata=object(),
-        dsa_positions=torch.ones(1),
-        dsa_cos_sin=torch.ones(1),
-        dsa_c4_cos_sin=torch.ones(1),
-        dsa_c128_cos_sin=torch.ones(1),
+        dsa_metadata=backend._builder.build([], [1], [1], torch.tensor([0], dtype=torch.int64), None, False, False),
+        dsa_positions=torch.tensor([0], dtype=torch.int64),
+        dsa_cos_sin=torch.ones(1, 128),
+        dsa_c4_cos_sin=torch.ones(1, 128),
+        dsa_c128_cos_sin=torch.ones(1, 128),
         dsa_graph_mode=True,
     )
     backend.attach_compressor(lambda *_args: None)
@@ -518,7 +390,7 @@ def test_prepare_clears_previous_forward_state() -> None:
 # -- sequence-length supply: expanded spec-verify + idle-shard dummy ---------
 
 
-def _sequence_metadata(**overrides) -> SimpleNamespace:
+def _sequence_metadata(**overrides: Any) -> SimpleNamespace:
     """The minimal metadata surface the DSA builder reads.
 
     The three DSA compression levels are named c1/c4/c128 by their ratio
@@ -547,33 +419,21 @@ def _sequence_metadata(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def _prepared_metadata(backend, metadata) -> None:
-    backend.prepare_dsa_metadata_for_forward(metadata)
-
-
 def test_idle_shard_without_host_lengths_keeps_one_dummy_sequence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An idle DP shard runs the forward with no sequences; stay at batch 1.
-
-    Without the fallback the DSA metadata degenerates to batch_size == 0 and the
-    model's attention does a bare ``max(q_lens)`` on an empty list
-    (csa2_attention.py), which is the B4 smoke signature.
-    """
+    """Legacy missing host lengths with physicalrow1 yields nonempty metadata."""
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
     metadata = _sequence_metadata()  # one fake query row, no sequence lengths
 
-    _prepared_metadata(backend, metadata)
+    backend.prepare_dsa_metadata_for_forward(metadata)
 
     dsa = metadata.dsa_metadata
     assert dsa.seq_lens_q.tolist() == [1]
     assert dsa.seq_lens.tolist() == [1]
-    assert dsa.seq_lens_q.numel() == 1
     assert dsa.block_tables == []
     # The literal B4 raise point: csa2_attention maxes the per-sequence q lens.
-    assert max(int(value) for value in dsa.seq_lens_q.tolist()) == 1
 
 
 def test_idle_shard_dummy_rows_follow_the_query_row_count(
@@ -581,14 +441,14 @@ def test_idle_shard_dummy_rows_follow_the_query_row_count(
 ) -> None:
     """The dummy sequence count stays aligned with the padded query rows."""
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
-    metadata = _sequence_metadata(dsa_positions=torch.tensor([0, 1, 2]))
+    metadata = _sequence_metadata(is_dummy=True, dsa_positions=torch.zeros(3, dtype=torch.int64))
 
-    _prepared_metadata(backend, metadata)
+    backend.prepare_dsa_metadata_for_forward(metadata)
 
-    assert metadata.dsa_metadata.seq_lens_q.tolist() == [1]
-    assert metadata.dsa_metadata.max_query_len >= 1
+    assert metadata.dsa_metadata.seq_lens_q.tolist() == [1, 1, 1]
+    assert metadata.dsa_metadata.max_query_len == 1
+    assert metadata.dsa_metadata.seq_lens.tolist() == [512, 512, 512]
 
 
 def test_expanded_spec_verify_lengths_supply_the_missing_host_view(
@@ -596,7 +456,6 @@ def test_expanded_spec_verify_lengths_supply_the_missing_host_view(
 ) -> None:
     """A packed verify batch keeps its lengths in the expanded view."""
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
     expanded = SimpleNamespace(
         enabled=True,
@@ -606,9 +465,11 @@ def test_expanded_spec_verify_lengths_supply_the_missing_host_view(
         q_seq_lens_host=None,
         q_seq_lens_host_values=None,
     )
-    metadata = _sequence_metadata(expanded_decode_metadata=expanded)
+    metadata = _sequence_metadata(
+        dsa_positions=torch.tensor([6, 8], dtype=torch.int64), expanded_decode_metadata=expanded
+    )
 
-    _prepared_metadata(backend, metadata)
+    backend.prepare_dsa_metadata_for_forward(metadata)
 
     dsa = metadata.dsa_metadata
     assert dsa.seq_lens.tolist() == [7, 9]
@@ -620,7 +481,6 @@ def test_real_host_lengths_are_never_replaced_by_the_fallbacks(
 ) -> None:
     """A normal batch keeps the C++ host view verbatim (no dummy, no expanded)."""
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
     expanded = SimpleNamespace(
         enabled=True,
@@ -634,9 +494,10 @@ def test_real_host_lengths_are_never_replaced_by_the_fallbacks(
         kv_seq_lens_host=torch.tensor([5, 6], dtype=torch.int32),
         q_seq_lens_host=torch.tensor([1, 1], dtype=torch.int32),
         expanded_decode_metadata=expanded,
+        dsa_positions=torch.tensor([4, 5], dtype=torch.int64),
     )
 
-    _prepared_metadata(backend, metadata)
+    backend.prepare_dsa_metadata_for_forward(metadata)
 
     assert metadata.dsa_metadata.seq_lens.tolist() == [5, 6]
     assert metadata.dsa_metadata.seq_lens_q.tolist() == [1, 1]
@@ -647,62 +508,26 @@ def test_empty_forward_without_positions_stays_empty(
 ) -> None:
     """No query rows at all -> no synthetic sequence (nothing to align to)."""
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
     metadata = _sequence_metadata(dsa_positions=torch.empty(0, dtype=torch.int64))
 
-    _prepared_metadata(backend, metadata)
-
-    assert metadata.dsa_metadata.seq_lens_q.numel() == 0
-
-
-def test_dsa_api_aliases_are_equivalent(monkeypatch) -> None:
-    backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
-    monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
-    metadata = SimpleNamespace(
-        multi_block_tables=[],
-        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        is_prefill=False,
-        is_chunked_prefill=False,
-        dsa_metadata=None,
-        dsa_positions=torch.tensor([0]),
-        dsa_cos_sin=None,
-        dsa_c4_cos_sin=None,
-        dsa_c128_cos_sin=None,
-        dsa_graph_mode=False,
-    )
     backend.prepare_dsa_metadata_for_forward(metadata)
-    canonical = metadata.dsa_metadata
-    metadata.dsa_metadata = None
-    backend.prepare_csa_metadata_for_forward(metadata)
-    aliased = metadata.dsa_metadata
-    # The alias must resolve to the canonical DSA build semantics, not
-    # merely produce a fresh object: field-by-field equality is the real
-    # contract of ``prepare_csa_metadata_for_forward`` (a pure delegation).
-    assert aliased is not canonical
-    assert aliased.seq_lens.tolist() == canonical.seq_lens.tolist() == [1]
-    assert aliased.seq_lens_q.tolist() == canonical.seq_lens_q.tolist() == [1]
+
+    assert metadata.dsa_metadata.seq_lens_q.tolist() == []
+    assert metadata.dsa_metadata.seq_lens.tolist() == []
+    assert metadata.dsa_metadata.actual_seq_lengths_query.tolist() == [0]
 
 
-def test_graph_mode_is_recorded_on_metadata() -> None:
-    backend = _make_backend()
-    metadata = SimpleNamespace()
-    backend.prepare(metadata, graph_mode=True)
-    assert metadata.dsa_graph_mode is True
-
-
-def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
+def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _make_backend()
     sparse_calls: list[dict] = []
     qli_calls: list[dict] = []
 
-    def fake_sparse_metadata(**kwargs):
+    def fake_sparse_metadata(**kwargs: Any) -> torch.Tensor:
         sparse_calls.append(kwargs)
         return torch.tensor([kwargs["cmp_ratio"]], dtype=torch.int32)
 
-    def fake_qli_metadata(**kwargs):
+    def fake_qli_metadata(**kwargs: Any) -> torch.Tensor:
         qli_calls.append(kwargs)
         return torch.tensor([4], dtype=torch.int32)
 
@@ -718,13 +543,8 @@ def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
         fake_qli_metadata,
         raising=False,
     )
-    compressed_metadata = SimpleNamespace(
-        actual_seq_lengths_query=torch.tensor([0, 1], dtype=torch.int32),
-        actual_seq_lengths_kv=torch.tensor([85], dtype=torch.int32),
-        seq_lens_q=torch.tensor([1], dtype=torch.int32),
-        seq_lens=torch.tensor([85], dtype=torch.int32),
-        max_query_len=1,
-        max_seq_len=85,
+    compressed_metadata = backend._builder.build(
+        [], [85], [1], torch.tensor([84], dtype=torch.int64), None, False, False
     )
     metadata = SimpleNamespace(
         max_query_len=1,
@@ -744,9 +564,14 @@ def test_decode_precomputed_metadata_matches_cpp_contract(monkeypatch) -> None:
     assert qli_calls[0]["actual_seq_lengths_key"].tolist() == [85]
     assert qli_calls[0]["head_dim"] == 128
     assert compressed_metadata.precomputed_metadata_inputs[0] is compressed_metadata.actual_seq_lengths_query
+    owned_storage = {tensor.untyped_storage().data_ptr() for tensor in compressed_metadata.precomputed_metadata_inputs}
+    for call in sparse_calls + qli_calls:
+        for value in call.values():
+            if isinstance(value, torch.Tensor) and value.numel():
+                assert value.untyped_storage().data_ptr() in owned_storage
 
 
-def test_dspark_native_decode_metadata_uses_expanded_window(monkeypatch) -> None:
+def test_dspark_native_decode_metadata_uses_expanded_window(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = CsaAttentionBackend(
         compress_ratios=[1],
         window_size=128,
@@ -776,14 +601,8 @@ def test_dspark_native_decode_metadata_uses_expanded_window(monkeypatch) -> None
         lambda **_kwargs: torch.tensor([4]),
         raising=False,
     )
-    compressed_metadata = SimpleNamespace(
-        actual_seq_lengths_query=torch.tensor([0, 5], dtype=torch.int32),
-        actual_seq_lengths_kv=torch.tensor([10], dtype=torch.int32),
-        seq_lens_q=torch.tensor([5], dtype=torch.int32),
-        seq_lens=torch.tensor([10], dtype=torch.int32),
-        block_tables=[[torch.tensor([[0]], dtype=torch.int32)]],
-        max_query_len=5,
-        max_seq_len=10,
+    compressed_metadata = backend._builder.build(
+        [torch.tensor([[1]], dtype=torch.int32)], [10], [5], torch.arange(5, 10, dtype=torch.int64), None, False, False
     )
     metadata = SimpleNamespace(
         is_prefill=False,
@@ -800,9 +619,13 @@ def test_dspark_native_decode_metadata_uses_expanded_window(monkeypatch) -> None
     assert all(call["ori_win_left"] == 132 for call in sparse_calls)
     assert compressed_metadata.sparse_metadata_ori_win_left == 132
     assert compressed_metadata.explicit_swa_indices.shape == (5, 1, 256)
+    expected = torch.full((256,), -1, dtype=torch.int32)
+    expected[:10] = torch.arange(128, 138, dtype=torch.int32)
+    for row in range(5):
+        torch.testing.assert_close(compressed_metadata.explicit_swa_indices[row, 0], expected, rtol=0, atol=0)
 
 
-def test_dspark_native_attention_uses_explicit_swa_indices(monkeypatch) -> None:
+def test_dspark_native_attention_uses_explicit_swa_indices(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = CsaAttentionBackend(
         compress_ratios=[1],
         window_size=4,
@@ -839,7 +662,7 @@ def test_dspark_native_attention_uses_explicit_swa_indices(monkeypatch) -> None:
     )
     calls: list[dict] = []
 
-    def fake_sparse_attn(**kwargs):
+    def fake_sparse_attn(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         calls.append(kwargs)
         return kwargs["q"].clone(), torch.empty(0)
 
@@ -855,12 +678,12 @@ def test_dspark_native_attention_uses_explicit_swa_indices(monkeypatch) -> None:
     assert calls[0]["ori_sparse_indices"].shape == (3, 1, 128)
     assert calls[0]["ori_win_left"] == 6
     assert calls[0]["cu_seqlens_ori_kv"] is None
+    torch.testing.assert_close(swa.view(12, 4)[3:6], kv.view(3, 4), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_dspark_native_mixed_ratio_decode_uses_expanded_window(
-    monkeypatch: pytest.MonkeyPatch,
-    compress_ratio: int,
+    monkeypatch: pytest.MonkeyPatch, compress_ratio: int
 ) -> None:
     backend = CsaAttentionBackend(
         compress_ratios=[compress_ratio],
@@ -877,42 +700,30 @@ def test_dspark_native_mixed_ratio_decode_uses_expanded_window(
         dspark_block_size=3,
         dspark_use_native_sas=True,
     )
-    backend.bind_kv_caches([LayerCache(key=None, value=None, swa=torch.zeros(1, 4, 1, 4))])
+    cmp_cache = torch.zeros((1, 512 if compress_ratio == 4 else 16, 1, 4))
+    backend.bind_kv_caches([LayerCache(key=cmp_cache, value=None, swa=torch.zeros(2, 4, 1, 4))])
+    metadata_tables = [torch.tensor([[0, 1]], dtype=torch.int32), torch.tensor([[0]], dtype=torch.int32)]
     compressed_metadata = backend._builder.build(
-        multi_block_tables=[torch.tensor([[0]], dtype=torch.int32) for _ in backend.group_infos],
-        kv_seq_lens=[1],
-        q_seq_lens=[1],
-        positions=torch.tensor([0], dtype=torch.int64),
-        dsa_cos_sin=None,
-        is_prefill=False,
-        is_chunked_prefill=False,
+        metadata_tables, [128], [3], torch.arange(125, 128, dtype=torch.int64), None, False, False
     )
-    compressed_metadata.cos_table = torch.empty(0)
-    compressed_metadata.sin_table = torch.empty(0)
-    compressed_metadata.c4_cos = torch.empty(0)
-    compressed_metadata.c128_cos = torch.empty(0)
+    backend.attach_compressor(lambda *_args: torch.full((1, 1, 4), 5.0))
+    backend.attach_indexer(
+        lambda *_args: torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2).expand(3, -1, -1).contiguous()
+    )
     metadata = SimpleNamespace(
         dsa_metadata=compressed_metadata,
         is_prefill=False,
         is_chunked_prefill=False,
-        max_query_len=1,
-        max_seq_len=1,
-        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
+        max_query_len=3,
+        max_seq_len=128,
+        q_seq_lens_host=torch.tensor([3], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([128], dtype=torch.int32),
     )
-    calls: list[dict] = []
+    calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
-        kernels,
-        "sparse_attn_sharedkv_metadata",
-        lambda **kwargs: torch.tensor([kwargs["cmp_ratio"]]),
-        raising=False,
+        kernels, "sparse_attn_sharedkv_metadata", lambda **kwargs: torch.tensor([kwargs["cmp_ratio"]]), raising=False
     )
-    monkeypatch.setattr(
-        kernels,
-        "quant_lightning_indexer_metadata",
-        lambda **_kwargs: torch.tensor([4]),
-        raising=False,
-    )
+    monkeypatch.setattr(kernels, "quant_lightning_indexer_metadata", lambda **_kwargs: torch.tensor([4]), raising=False)
     monkeypatch.setattr(
         csa_attention_module,
         "_sparse_attn_sharedkv",
@@ -920,24 +731,25 @@ def test_dspark_native_mixed_ratio_decode_uses_expanded_window(
     )
     backend._build_precomputed_metadata(compressed_metadata, metadata)
     backend._metadata = metadata
-
     backend.execute(
-        torch.zeros(1, 2, 4),
-        torch.zeros(1, 1, 4),
-        torch.zeros(1, 1, 4),
+        torch.zeros(3, 2, 4),
+        torch.ones(3, 1, 4),
+        torch.ones(3, 1, 4),
         SimpleNamespace(layer_id=0, attn_sink=None, attn_sink_loaded=False),
     )
-
+    assert len(calls) == 1
     assert compressed_metadata.sparse_metadata_ori_win_left == 6
     assert calls[0]["ori_win_left"] == 6
     assert calls[0]["ori_sparse_indices"] is None
+    row = 31 if compress_ratio == 4 else 0
+    torch.testing.assert_close(cmp_cache.view(-1, 4)[row], torch.full((4,), 5.0), rtol=0, atol=0)
 
 
-def test_csa_execute_requires_model_compressor(monkeypatch) -> None:
+def test_csa_execute_requires_model_compressor(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _make_backend()
     empty_cache = LayerCache(key=None, value=None)
-    cmp_cache = torch.zeros(2, 128, 1, 512)
-    swa_cache = torch.zeros(2, 128, 1, 512)
+    cmp_cache = torch.zeros(2, 512, 1, 512, dtype=torch.bfloat16)
+    swa_cache = torch.zeros(2, 128, 1, 512, dtype=torch.bfloat16)
     backend.bind_kv_caches(
         [
             empty_cache,
@@ -945,21 +757,14 @@ def test_csa_execute_requires_model_compressor(monkeypatch) -> None:
             empty_cache,
         ]
     )
-    block_tables = [[], [torch.tensor([[1]], dtype=torch.int32) for _ in range(8)], []]
-    slot_mappings = [[], [torch.tensor([128], dtype=torch.int32) for _ in range(8)], []]
-    compressed_metadata = SimpleNamespace(
-        block_tables=block_tables,
-        slot_mappings=slot_mappings,
-        actual_seq_lengths_query=torch.tensor([0, 1], dtype=torch.int32),
-        actual_seq_lengths_kv=torch.tensor([1], dtype=torch.int32),
-        input_positions=torch.tensor([0], dtype=torch.int64),
-        cos_table=torch.zeros(1, 64),
-        sin_table=torch.zeros(1, 64),
-        c4_cos=torch.zeros(1, 64),
-        c4_sin=torch.zeros(1, 64),
-        c128_cos=torch.zeros(1, 64),
-        c128_sin=torch.zeros(1, 64),
-        c4_metadata=torch.zeros(1, dtype=torch.int32),
+    compressed_metadata = backend._builder.build(
+        [torch.tensor([[1]], dtype=torch.int32) for _ in range(3)],
+        [1],
+        [1],
+        torch.tensor([0], dtype=torch.int64),
+        None,
+        False,
+        False,
     )
     backend._metadata = SimpleNamespace(
         dsa_metadata=compressed_metadata,
@@ -969,16 +774,15 @@ def test_csa_execute_requires_model_compressor(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="compressor is required"):
         backend.execute(
-            torch.zeros(1, 8, 512),
-            torch.zeros(1, 1, 512),
-            torch.zeros(1, 1, 512),
+            torch.zeros(1, 8, 512, dtype=torch.bfloat16),
+            torch.zeros(1, 1, 512, dtype=torch.bfloat16),
+            torch.zeros(1, 1, 512, dtype=torch.bfloat16),
             SimpleNamespace(layer_id=1, attn_sink=None),
         )
 
 
-def test_forward_rope_state_is_owned_by_each_metadata(monkeypatch) -> None:
+def test_forward_rope_state_is_owned_by_each_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda compressed_metadata: None)
     monkeypatch.setattr(
         backend,
         "_build_precomputed_metadata",
@@ -1001,7 +805,7 @@ def test_forward_rope_state_is_owned_by_each_metadata(monkeypatch) -> None:
             dsa_graph_mode=False,
         )
 
-    rope_cache = torch.arange(256 * 8, dtype=torch.float32).view(256, 8)
+    rope_cache = torch.arange(256 * 128, dtype=torch.float32).view(256, 128)
     prefill = make_metadata(84, 84)
     backend.prepare(prefill)
     backend.attach_rope_tables(
@@ -1027,9 +831,10 @@ def test_forward_rope_state_is_owned_by_each_metadata(monkeypatch) -> None:
     assert prefill.dsa_metadata.input_positions.numel() == 84
     assert decode.dsa_positions.numel() == 1
     assert prefill.dsa_positions.data_ptr() != decode.dsa_positions.data_ptr()
+    torch.testing.assert_close(prefill.dsa_metadata.input_rope_by_ratio[1][0], rope_cache[:84, :64], rtol=0, atol=0)
 
 
-def test_cp_localization_keeps_runtime_metadata_read_only(monkeypatch) -> None:
+def test_cp_localization_keeps_runtime_metadata_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _make_backend()
     dsa = backend._builder.build(
         multi_block_tables=[],
@@ -1045,6 +850,9 @@ def test_cp_localization_keeps_runtime_metadata_read_only(monkeypatch) -> None:
         def __init__(self) -> None:
             self.dsa_metadata = dsa
             self.dp_execution_token_counts = (4,)
+            self.dsa_cos_sin = torch.arange(4 * 128, dtype=torch.float32).view(4, 128)
+            self.dsa_c4_cos_sin = self.dsa_cos_sin
+            self.dsa_c128_cos_sin = self.dsa_cos_sin
 
         @property
         def q_seq_lens_host(self) -> torch.Tensor:
@@ -1072,15 +880,10 @@ def test_cp_localization_keeps_runtime_metadata_read_only(monkeypatch) -> None:
         max_query_len_override=None,
         max_seq_len_override=None,
     ) -> None:
-        del cu_seqlens_ori_kv_override
+        assert cu_seqlens_ori_kv_override.tolist() == [0, 2]
         captured["max_query_len"] = max_query_len_override
         captured["max_seq_len"] = max_seq_len_override
 
-    monkeypatch.setattr(
-        backend,
-        "_build_dsa_rope_metadata",
-        lambda *_args: {1: (torch.zeros(2, 1), torch.zeros(2, 1))},
-    )
     monkeypatch.setattr(backend, "_build_precomputed_metadata", capture_precomputed)
     metadata = _ReadOnlyMetadata()
     cp_context = build_deepseek_v4_cp_context(
@@ -1098,9 +901,10 @@ def test_cp_localization_keeps_runtime_metadata_read_only(monkeypatch) -> None:
     assert captured == {"max_query_len": 2, "max_seq_len": 2}
     assert metadata.q_seq_lens_host.tolist() == [4]
     assert metadata.kv_seq_lens_host.tolist() == [4]
+    torch.testing.assert_close(dsa.input_rope_by_ratio[1][0], metadata.dsa_cos_sin[:2, :64], rtol=0, atol=0)
 
 
-def test_cp_prefill_localization_clears_dspark_native_swa_indices(monkeypatch) -> None:
+def test_cp_prefill_localization_clears_dspark_native_swa_indices(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = CsaAttentionBackend(
         compress_ratios=[1],
         window_size=4,
@@ -1129,11 +933,6 @@ def test_cp_prefill_localization_clears_dspark_native_swa_indices(monkeypatch) -
     assert dsa.explicit_swa_indices.shape[0] == 4
 
     monkeypatch.setattr(
-        backend,
-        "_build_dsa_rope_metadata",
-        lambda *_args: {1: (torch.zeros(2, 1), torch.zeros(2, 1))},
-    )
-    monkeypatch.setattr(
         kernels,
         "sparse_attn_sharedkv_metadata",
         lambda **kwargs: torch.tensor([kwargs["cmp_ratio"]]),
@@ -1154,6 +953,9 @@ def test_cp_prefill_localization_clears_dspark_native_swa_indices(monkeypatch) -
         kv_seq_lens_host=torch.tensor([4], dtype=torch.int32),
         max_query_len=4,
         max_seq_len=4,
+        dsa_cos_sin=torch.arange(16, dtype=torch.float32).view(4, 4),
+        dsa_c4_cos_sin=torch.arange(16, dtype=torch.float32).view(4, 4),
+        dsa_c128_cos_sin=torch.arange(16, dtype=torch.float32).view(4, 4),
     )
     cp_context = build_deepseek_v4_cp_context(
         2,
@@ -1194,6 +996,7 @@ def test_graph_dsa_refresh_preserves_tensor_addresses() -> None:
     refreshed = make_metadata(7, 2)
     seq_lens_ptr = persistent.seq_lens.data_ptr()
     block_table_ptr = persistent.block_tables[0][0].data_ptr()
+    slot_ptr = persistent.slot_mappings[0][0].data_ptr()
     swa_indices_ptr = persistent.explicit_swa_indices.data_ptr()
     rope_ptr = persistent.input_rope_by_ratio[1][0].data_ptr()
 
@@ -1204,15 +1007,19 @@ def test_graph_dsa_refresh_preserves_tensor_addresses() -> None:
     assert persistent.block_tables[0][0].data_ptr() == block_table_ptr
     assert persistent.block_tables[0][0].tolist() == [[7, 7], [7, 7], [-1, -1], [-1, -1]]
     assert persistent.slot_mappings[0][0].tolist() == [7, 7, -1, -1]
+    assert persistent.slot_mappings[0][0].data_ptr() == slot_ptr
+    assert persistent.explicit_swa_indices.data_ptr() == swa_indices_ptr
+    expected_swa = torch.full((4, 1, 128), -1, dtype=torch.int32)
+    expected_swa[:2] = 7
+    torch.testing.assert_close(persistent.explicit_swa_indices, expected_swa, rtol=0, atol=0)
     assert persistent.input_rope_by_ratio[1][0].data_ptr() == rope_ptr
     assert persistent.input_rope_by_ratio[1][0].tolist() == [[7.0, 7.0], [7.0, 7.0]]
     assert persistent.max_query_len == 7
     assert persistent.max_seq_len == 7
 
 
-def test_graph_dsa_build_uses_stable_host_length_values(monkeypatch) -> None:
+def test_graph_dsa_build_uses_stable_host_length_values(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _make_backend()
-    monkeypatch.setattr(backend, "_move_metadata_to_device", lambda _metadata: None)
     monkeypatch.setattr(backend, "_build_precomputed_metadata", lambda *_args: None)
     metadata = SimpleNamespace(
         multi_block_tables=[],
@@ -1253,7 +1060,7 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
         dspark_block_size=5,
         dspark_use_native_sas=True,
     )
-    swa = torch.zeros(2, 128, 1, 512, dtype=torch.float32)
+    swa = torch.zeros(2, 128, 1, 512, dtype=torch.bfloat16)
     backend.bind_kv_caches([LayerCache(key=None, value=None, swa=swa)])
     block_table = torch.tensor([[1]], dtype=torch.int32)
     layer = SimpleNamespace(
@@ -1263,7 +1070,7 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     )
     calls: list[dict] = []
 
-    def fake_sparse_attn(**kwargs):
+    def fake_sparse_attn(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         calls.append(kwargs)
         return kwargs["q"].clone(), torch.empty(0)
 
@@ -1282,41 +1089,26 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     )
 
     def prepare_step(
-        kv_len: int,
-        q_len: int,
-        is_prefill: bool,
-        *,
-        is_chunked_prefill: bool = False,
-        is_dummy: bool = False,
-    ):
-        compressed_metadata = backend._builder.build(
+        kv_len: int, q_len: int, is_prefill: bool, *, is_chunked_prefill: bool = False, is_dummy: bool = False
+    ) -> Any:
+        metadata = _sequence_metadata(
             multi_block_tables=[block_table],
-            kv_seq_lens=[kv_len],
-            q_seq_lens=[q_len],
-            positions=torch.arange(kv_len - q_len, kv_len, dtype=torch.int64),
-            dsa_cos_sin=None,
-            is_prefill=is_prefill,
-            is_chunked_prefill=is_chunked_prefill,
-        )
-        metadata = SimpleNamespace(
-            dsa_metadata=compressed_metadata,
+            kv_seq_lens_host=torch.tensor([kv_len], dtype=torch.int32),
+            q_seq_lens_host=torch.tensor([q_len], dtype=torch.int32),
             is_prefill=is_prefill,
             is_chunked_prefill=is_chunked_prefill,
             is_dummy=is_dummy,
-            max_query_len=q_len,
-            max_seq_len=kv_len,
-            q_seq_lens_host=torch.tensor([q_len], dtype=torch.int32),
-            kv_seq_lens_host=torch.tensor([kv_len], dtype=torch.int32),
+            dsa_positions=torch.arange(kv_len - q_len, kv_len, dtype=torch.int64),
         )
-        backend._build_precomputed_metadata(compressed_metadata, metadata)
-        backend._metadata = metadata
-        return compressed_metadata
+        backend.prepare(metadata)
+        backend.prepare_dsa_metadata_for_forward(metadata)
+        return metadata.dsa_metadata
 
     prefill_metadata = prepare_step(kv_len=2, q_len=2, is_prefill=True)
     assert prefill_metadata.explicit_swa_indices is None
     assert prefill_metadata.sparse_metadata_ori_win_left == 127
-    prefill_kv = torch.arange(2 * 512, dtype=torch.float32).view(2, 1, 512)
-    backend.execute(torch.zeros(2, 8, 512), prefill_kv, prefill_kv, layer)
+    prefill_kv = torch.arange(2 * 512, dtype=torch.bfloat16).view(2, 1, 512)
+    backend.execute(torch.zeros(2, 8, 512, dtype=torch.bfloat16), prefill_kv, prefill_kv, layer)
     assert torch.equal(swa[1, :2], prefill_kv)
     assert calls[-1]["ori_sparse_indices"] is None
     assert calls[-1]["ori_win_left"] == 127
@@ -1324,8 +1116,8 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     decode_metadata = prepare_step(kv_len=3, q_len=1, is_prefill=False)
     assert decode_metadata.explicit_swa_indices is not None
     assert decode_metadata.sparse_metadata_ori_win_left == 132
-    decode_kv = torch.full((1, 1, 512), 7.0)
-    backend.execute(torch.zeros(1, 8, 512), decode_kv, decode_kv, layer)
+    decode_kv = torch.full((1, 1, 512), 7.0, dtype=torch.bfloat16)
+    backend.execute(torch.zeros(1, 8, 512, dtype=torch.bfloat16), decode_kv, decode_kv, layer)
     assert torch.equal(swa[1, 2], decode_kv[0])
     assert calls[-1]["cu_seqlens_ori_kv"] is None
     assert calls[-1]["ori_sparse_indices"] is not None
@@ -1335,7 +1127,7 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     dummy_metadata = prepare_step(kv_len=3, q_len=1, is_prefill=True, is_dummy=True)
     assert dummy_metadata.explicit_swa_indices is not None
     assert dummy_metadata.sparse_metadata_ori_win_left == 132
-    backend.execute(torch.zeros(1, 8, 512), decode_kv, decode_kv, layer)
+    backend.execute(torch.zeros(1, 8, 512, dtype=torch.bfloat16), decode_kv, decode_kv, layer)
     assert calls[-1]["cu_seqlens_ori_kv"] is None
     assert calls[-1]["ori_sparse_indices"] is not None
     assert calls[-1]["ori_win_left"] == 132
@@ -1349,14 +1141,14 @@ def test_prefill_and_dummy_decode_metadata_stay_in_sync_with_execute(
     )
     assert chunked_dummy_metadata.explicit_swa_indices is None
     assert chunked_dummy_metadata.sparse_metadata_ori_win_left == 127
-    backend.execute(torch.zeros(1, 8, 512), decode_kv, decode_kv, layer)
+    backend.execute(torch.zeros(1, 8, 512, dtype=torch.bfloat16), decode_kv, decode_kv, layer)
     assert calls[-1]["cu_seqlens_ori_kv"] is not None
     assert calls[-1]["ori_sparse_indices"] is None
     assert calls[-1]["ori_win_left"] == 127
 
     layer.attn_sink_loaded = True
     prepare_step(kv_len=3, q_len=1, is_prefill=False)
-    backend.execute(torch.zeros(1, 8, 512), decode_kv, decode_kv, layer)
+    backend.execute(torch.zeros(1, 8, 512, dtype=torch.bfloat16), decode_kv, decode_kv, layer)
     assert torch.equal(calls[-1]["sinks"], layer.attn_sink)
 
 
@@ -1496,37 +1288,6 @@ def _make_metadata(persistent_seed: int, refreshed_seed: int) -> tuple[SimpleNam
     return meta, refreshed
 
 
-def _legacy_copy_graph_dsa_metadata(persistent: SimpleNamespace, refreshed: SimpleNamespace) -> None:
-    """Pre-change behaviour: per-layer copy with no alias dedup."""
-
-    for field_name in _TENSOR_FIELDS:
-        CsaAttentionBackend._copy_graph_tensor(
-            getattr(persistent, field_name, None),
-            getattr(refreshed, field_name, None),
-            field_name,
-        )
-    CsaAttentionBackend._copy_graph_tensor(
-        persistent.explicit_swa_indices,
-        refreshed.explicit_swa_indices,
-        "explicit_swa_indices",
-        pad_value=-1,
-    )
-    for layer_id, (p_layer, r_layer) in enumerate(zip(persistent.block_tables, refreshed.block_tables)):
-        CsaAttentionBackend._copy_graph_tensor_list(p_layer, r_layer, f"block_tables[{layer_id}]", pad_value=-1)
-    for layer_id, (p_layer, r_layer) in enumerate(zip(persistent.slot_mappings, refreshed.slot_mappings)):
-        CsaAttentionBackend._copy_graph_tensor_list(p_layer, r_layer, f"slot_mappings[{layer_id}]", pad_value=-1)
-    for ratio, p_pair in persistent.input_rope_by_ratio.items():
-        r_pair = refreshed.input_rope_by_ratio[ratio]
-        CsaAttentionBackend._copy_graph_tensor(p_pair[0], r_pair[0], f"input_rope[{ratio}].cos")
-        CsaAttentionBackend._copy_graph_tensor(p_pair[1], r_pair[1], f"input_rope[{ratio}].sin")
-    persistent.max_query_len = refreshed.max_query_len
-    persistent.max_seq_len = refreshed.max_seq_len
-    persistent.sparse_metadata_ori_win_left = getattr(refreshed, "sparse_metadata_ori_win_left", -1)
-    persistent.is_acl_graph = refreshed.is_acl_graph
-    persistent.graph_token_capacity = int(getattr(refreshed, "graph_token_capacity", 0) or 0)
-    persistent.precomputed_metadata_inputs = refreshed.precomputed_metadata_inputs
-
-
 # --- [Candidate A] In-place refresh helpers ---------------------------------
 
 
@@ -1534,8 +1295,8 @@ def _legacy_copy_graph_dsa_metadata(persistent: SimpleNamespace, refreshed: Simp
 # ``_build_precomputed_metadata`` -- the AICPU metadata kernels are not
 # available on CPU; the base builder only consumes them later, so a no-op
 # keeps the field set under test intact.
-def _inplace_make_backend(device: torch.device | None = None) -> CsaAttentionBackend:
-    backend = _make_backend(device=device)
+def _inplace_make_backend() -> CsaAttentionBackend:
+    backend = _make_backend()
     backend._build_precomputed_metadata = lambda *args, **kwargs: None  # noqa: SLF001
     return backend
 
@@ -1563,7 +1324,9 @@ def _inplace_forward_metadata(
         kv_seq_lens_host=None,
         kv_seq_lens_host_values=list(kv_seq_lens),
         new_cache_slots_host_values=None,
-        dsa_positions=positions if positions is not None else torch.arange(batch, dtype=torch.int64) + seed,
+        dsa_positions=positions
+        if positions is not None
+        else torch.tensor([kv_len - 1 for kv_len in kv_seq_lens], dtype=torch.int64),
         q_seq_lens_host=None,
         q_seq_lens=None,
         dsa_cos_sin=None,
@@ -1587,9 +1350,9 @@ def _paired_metadata(seed: int) -> tuple[SimpleNamespace, SimpleNamespace]:
     and the replay observe the same object -- exactly the graph contract.
     """
     batch = 4
-    positions = torch.arange(batch, dtype=torch.int64)
+    positions = torch.tensor([2, 4, 6, 8], dtype=torch.int64)
     capture = _inplace_forward_metadata([3, 5, 7, 9], seed, positions=positions)
-    positions.copy_(torch.arange(batch, dtype=torch.int64) + (seed + 1))
+    positions.copy_(torch.tensor([3, 5, 7, 9], dtype=torch.int64))
     replay = _inplace_forward_metadata([4, 6, 8, 10], seed + 1, positions=positions)
     return capture, replay
 
@@ -1598,7 +1361,7 @@ def _tensor_signature(value: torch.Tensor) -> tuple[int, tuple[int, ...], torch.
     return (value.data_ptr(), tuple(value.shape), value.dtype)
 
 
-def _persistent_field_tensors(dsa) -> dict[str, torch.Tensor]:
+def _persistent_field_tensors(dsa: Any) -> dict[str, torch.Tensor]:
     tensors: dict[str, torch.Tensor] = {}
     for name in _INPLACE_FIELDS:
         tensors[name] = getattr(dsa, name)
@@ -1613,13 +1376,13 @@ def _persistent_field_tensors(dsa) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _run_copy(persistent, refreshed, inplace_fields=None) -> None:
+def _run_copy(persistent: Any, refreshed: Any, inplace_fields: frozenset[str] | None = None) -> None:
     CsaAttentionBackend._copy_graph_dsa_metadata(  # noqa: SLF001 - tested unit
         persistent, refreshed, inplace_fields=inplace_fields
     )
 
 
-def _assert_fields_equal(left, right) -> None:
+def _assert_fields_equal(left: Any, right: Any) -> None:
     # Scalar attributes.
     for name in ("max_query_len", "max_seq_len", "graph_token_capacity", "is_acl_graph"):
         assert getattr(left, name) == getattr(right, name), name
@@ -1634,8 +1397,8 @@ def _assert_fields_equal(left, right) -> None:
     # Per-layer manager tables (alias-aware, compare by storage contents).
     assert len(left.block_tables) == len(right.block_tables)
     seen: set[tuple[int, int]] = set()
-    for lid, (ll, rr) in enumerate(zip(left.block_tables, right.block_tables)):
-        for ci, (a, b) in enumerate(zip(ll, rr)):
+    for lid, (ll, rr) in enumerate(zip(left.block_tables, right.block_tables, strict=True)):
+        for ci, (a, b) in enumerate(zip(ll, rr, strict=True)):
             if a.numel() == 0 and b.numel() == 0:
                 continue
             key = (a.data_ptr(), b.data_ptr())
@@ -1644,8 +1407,8 @@ def _assert_fields_equal(left, right) -> None:
             seen.add(key)
             assert torch.equal(a, b), f"block_tables[{lid}][{ci}]"
     seen = set()
-    for lid, (ll, rr) in enumerate(zip(left.slot_mappings, right.slot_mappings)):
-        for ci, (a, b) in enumerate(zip(ll, rr)):
+    for lid, (ll, rr) in enumerate(zip(left.slot_mappings, right.slot_mappings, strict=True)):
+        for ci, (a, b) in enumerate(zip(ll, rr, strict=True)):
             if a.numel() == 0 and b.numel() == 0:
                 continue
             key = (a.data_ptr(), b.data_ptr())
@@ -1671,8 +1434,6 @@ def _run_swa(
     new_cache_slots: list[int],
     *,
     device_ctx_lens: torch.Tensor | None,
-    graph_slot_capacity: int | None = None,
-    graph_block_table_capacity_cols: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     builder = _builder()
     return builder._process_swa_group(  # noqa: SLF001 - exercise the unit directly
@@ -1681,10 +1442,8 @@ def _run_swa(
         ctx_lens,
         q_lens,
         batch_size=len(ctx_lens),
-        graph_slot_capacity=len(ctx_lens) if graph_slot_capacity is None else graph_slot_capacity,
-        graph_block_table_capacity_cols=(
-            int(raw_bt.size(1)) if graph_block_table_capacity_cols is None else graph_block_table_capacity_cols
-        ),
+        graph_slot_capacity=len(ctx_lens),
+        graph_block_table_capacity_cols=int(raw_bt.size(1)),
         new_cache_slots=new_cache_slots,
         swa_device_ctx_lens=device_ctx_lens,
     )
@@ -1693,62 +1452,77 @@ def _run_swa(
 # === [S4a] Alias dedup ===
 
 
-def test_alias_dedup_matches_legacy_bitwise_and_preserves_addresses() -> None:
-    p_new, r_new = _make_metadata(persistent_seed=1, refreshed_seed=7)
-    p_legacy, r_legacy = _make_metadata(persistent_seed=1, refreshed_seed=7)
-
-    addresses_before = [[tensor.data_ptr() for tensor in layer] for layer in p_new.block_tables]
-
-    CsaAttentionBackend._copy_graph_dsa_metadata(p_new, r_new)
-    _legacy_copy_graph_dsa_metadata(p_legacy, r_legacy)
-
-    # Addresses must be untouched: the dedup copies into the captured storage.
-    for layer_id, layer in enumerate(p_new.block_tables):
-        for cache_id, tensor in enumerate(layer):
-            assert tensor.data_ptr() == addresses_before[layer_id][cache_id]
-
-    # Aliasing preserved: same group across layers is still one storage.
-    for cache_id in range(_GROUPS):
-        ptr = p_new.block_tables[0][cache_id].data_ptr()
-        for layer_id in range(_N_LAYERS):
-            assert p_new.block_tables[layer_id][cache_id].data_ptr() == ptr
-
-    for field_name in _TENSOR_FIELDS + ("explicit_swa_indices",):
-        assert torch.equal(getattr(p_new, field_name), getattr(p_legacy, field_name)), field_name
-    for layer_id in range(_N_LAYERS):
-        for cache_id in range(_GROUPS):
-            assert torch.equal(p_new.block_tables[layer_id][cache_id], p_legacy.block_tables[layer_id][cache_id])
-            assert torch.equal(p_new.slot_mappings[layer_id][cache_id], p_legacy.slot_mappings[layer_id][cache_id])
-    for ratio in p_new.input_rope_by_ratio:
-        for index in (0, 1):
-            assert torch.equal(p_new.input_rope_by_ratio[ratio][index], p_legacy.input_rope_by_ratio[ratio][index])
-    assert p_new.max_query_len == p_legacy.max_query_len
-    assert p_new.max_seq_len == p_legacy.max_seq_len
-    assert p_new.graph_token_capacity == p_legacy.graph_token_capacity
-
-    # Spot-check the prefix-pad semantics survived dedup: rows past the
-    # refreshed prefix keep the -1 pad, the prefix carries refreshed values.
-    expected_block = torch.full((_PERSISTENT_ROWS, _COLS), 70, dtype=torch.int32)
-    expected_block[_REFRESHED_ROWS:] = -1
-    assert torch.equal(p_new.block_tables[0][0], expected_block)
-    expected_slots = torch.full((_PERSISTENT_ROWS,), 70, dtype=torch.int32)
-    expected_slots[_REFRESHED_ROWS:] = -1
-    assert torch.equal(p_new.slot_mappings[0][0], expected_slots)
-
-
-def test_alias_dedup_skips_only_duplicate_pairs(monkeypatch) -> None:
-    captured: dict[str, int] = {}
-    monkeypatch.setattr(
-        csa_attention_module,
-        "_log_dsa_alias_dedup_once",
-        lambda total, skipped: captured.update(total=total, skipped=skipped),
-    )
+def test_alias_dedup_preserves_values_and_owned_storage() -> None:
     persistent, refreshed = _make_metadata(persistent_seed=1, refreshed_seed=7)
+    fields_before = {name: getattr(persistent, name).data_ptr() for name in _TENSOR_FIELDS + ("explicit_swa_indices",)}
+    block_before = [[tensor.data_ptr() for tensor in layer] for layer in persistent.block_tables]
+    slot_before = [[tensor.data_ptr() for tensor in layer] for layer in persistent.slot_mappings]
+    rope_before = persistent.input_rope_by_ratio[1][0].data_ptr()
+    asynchronous_input = torch.tensor([11, 12], dtype=torch.int32)
+    input_storage = asynchronous_input.untyped_storage().data_ptr()
+    refreshed.precomputed_metadata_inputs = (asynchronous_input,)
     CsaAttentionBackend._copy_graph_dsa_metadata(persistent, refreshed)
+    for name in _TENSOR_FIELDS:
+        tensor = getattr(persistent, name)
+        assert tensor.data_ptr() == fields_before[name]
+        expected = torch.zeros_like(tensor)
+        expected[:_REFRESHED_ROWS] = 7
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+    expected_indices = torch.full((_PERSISTENT_ROWS, 1, 128), -1, dtype=torch.int32)
+    expected_indices[:_REFRESHED_ROWS] = 7
+    assert persistent.explicit_swa_indices.data_ptr() == fields_before["explicit_swa_indices"]
+    torch.testing.assert_close(persistent.explicit_swa_indices, expected_indices, rtol=0, atol=0)
+    for layer_id in range(_N_LAYERS):
+        for group in range(_GROUPS):
+            table = persistent.block_tables[layer_id][group]
+            slots = persistent.slot_mappings[layer_id][group]
+            assert table.data_ptr() == block_before[layer_id][group]
+            assert slots.data_ptr() == slot_before[layer_id][group]
+            assert table.data_ptr() == persistent.block_tables[0][group].data_ptr()
+            assert slots.data_ptr() == persistent.slot_mappings[0][group].data_ptr()
+            expected_table = torch.full_like(table, -1)
+            expected_table[:_REFRESHED_ROWS] = 70 + group
+            expected_slots = torch.full_like(slots, -1)
+            expected_slots[:_REFRESHED_ROWS] = 70 + group
+            torch.testing.assert_close(table, expected_table, rtol=0, atol=0)
+            torch.testing.assert_close(slots, expected_slots, rtol=0, atol=0)
+    for tensor in persistent.input_rope_by_ratio[1]:
+        expected = torch.zeros_like(tensor)
+        expected[:_REFRESHED_ROWS] = 7
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+    assert persistent.input_rope_by_ratio[1][0].data_ptr() == rope_before
+    assert persistent.max_query_len == persistent.max_seq_len == persistent.graph_token_capacity == 7
+    refreshed.precomputed_metadata_inputs = ()
+    del asynchronous_input
+    assert any(
+        tensor.untyped_storage().data_ptr() == input_storage for tensor in persistent.precomputed_metadata_inputs
+    )
+    torch.testing.assert_close(
+        persistent.precomputed_metadata_inputs[0], torch.tensor([11, 12], dtype=torch.int32), rtol=0, atol=0
+    )
 
-    total = _N_LAYERS * _GROUPS * 2  # block tables + slot mappings
-    unique_pairs = _GROUPS * 2  # one per (group, list)
-    assert captured == {"total": total, "skipped": total - unique_pairs}
+
+def test_alias_dedup_skips_only_duplicate_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    persistent, refreshed = _make_metadata(persistent_seed=1, refreshed_seed=7)
+    pairs = {
+        (a.data_ptr(), b.data_ptr()) for a, b in zip(persistent.block_tables[0], refreshed.block_tables[0], strict=True)
+    }
+    pairs |= {
+        (a.data_ptr(), b.data_ptr())
+        for a, b in zip(persistent.slot_mappings[0], refreshed.slot_mappings[0], strict=True)
+    }
+    observed: dict[tuple[int, int], int] = {}
+    real_copy = torch.Tensor.copy_
+
+    def count_copy(destination: torch.Tensor, source: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        pair = (destination.data_ptr(), source.data_ptr())
+        if pair in pairs:
+            observed[pair] = observed.get(pair, 0) + 1
+        return real_copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", count_copy)
+    CsaAttentionBackend._copy_graph_dsa_metadata(persistent, refreshed)
+    assert observed == {pair: 1 for pair in pairs}
 
 
 def test_alias_dedup_keeps_last_write_for_shared_target_distinct_sources() -> None:
@@ -1766,31 +1540,25 @@ def test_alias_dedup_keeps_last_write_for_shared_target_distinct_sources() -> No
     assert torch.equal(target, expected)
 
 
-def test_move_metadata_to_device_still_moves_cpu_fields(monkeypatch) -> None:
-    # A differing backend device must still trigger a real move for every
-    # tensor, so eager (CPU-pinned scheduler tables) keeps working.
+def test_move_metadata_to_device_still_moves_cpu_fields() -> None:
     backend = _make_backend(torch.device("meta"))
-    metadata = SimpleNamespace(
-        block_tables=[[torch.zeros((2, 2), dtype=torch.int32)]],
-        slot_mappings=[[torch.zeros((2,), dtype=torch.int32)]],
-        seq_lens=torch.zeros((2,), dtype=torch.int32),
-    )
-    original_to = torch.Tensor.to
-    calls: list[str] = []
-
-    def counting_to(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        calls.append(str(args[0]) if args else "")
-        return original_to(self, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    original = [
+        torch.zeros((2,), dtype=torch.int32),
+        torch.zeros((2, 2), dtype=torch.int32),
+        torch.zeros((2,), dtype=torch.int32),
+    ]
+    metadata = SimpleNamespace(seq_lens=original[0], block_tables=[[original[1]]], slot_mappings=[[original[2]]])
     backend._move_metadata_to_device(metadata)
-
-    # seq_lens + one block table + one slot mapping.
-    assert calls == ["meta", "meta", "meta"]
+    actual = [metadata.seq_lens, metadata.block_tables[0][0], metadata.slot_mappings[0][0]]
+    for source, target in zip(original, actual, strict=True):
+        assert source.device.type == "cpu"
+        assert target.device.type == "meta"
+        assert target.shape == source.shape and target.dtype == source.dtype
 
 
 def test_graph_metadata_h2d_staging_lives_until_event_completes(monkeypatch: pytest.MonkeyPatch) -> None:
-    backend = _make_backend(torch.device("npu:0"))
+    backend = _make_backend()
+    backend.device = Mock(type="npu", index=0)
     backend.supports_draft_to_target_overlap = True
     metadata = SimpleNamespace(
         is_acl_graph=True,
@@ -1871,8 +1639,9 @@ def test_graph_metadata_h2d_staging_lives_until_event_completes(monkeypatch: pyt
 
 
 def test_eager_metadata_move_keeps_synchronous_copy(monkeypatch: pytest.MonkeyPatch) -> None:
-    device = torch.device("npu:0")
-    backend = _make_backend(device)
+    device = Mock(type="npu", index=0)
+    backend = _make_backend()
+    backend.device = device
     backend.supports_draft_to_target_overlap = True
     metadata = SimpleNamespace(
         is_acl_graph=False,
@@ -1902,25 +1671,6 @@ def test_eager_metadata_move_keeps_synchronous_copy(monkeypatch: pytest.MonkeyPa
 
 
 # -- (a) off path equivalence ------------------------------------------------
-
-
-def test_off_path_matches_plain_build_and_copy() -> None:
-    backend = _inplace_make_backend()
-    capture_meta, replay_meta = _paired_metadata(seed=0)
-
-    persistent_ref = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
-    persistent_off = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
-
-    refreshed_ref = backend._build_dsa_metadata_for_forward(replay_meta)  # noqa: SLF001
-    refreshed_off = backend._build_dsa_metadata_for_forward(replay_meta)  # noqa: SLF001
-
-    _run_copy(persistent_ref, refreshed_ref)
-    _run_copy(persistent_off, refreshed_off)
-
-    _assert_fields_equal(persistent_ref, persistent_off)
-    # The off path never aliases: refreshed tensors are fresh storage.
-    assert refreshed_off.seq_lens is not persistent_off.seq_lens
-    assert refreshed_off.refresh_inplace_fields == frozenset()
 
 
 def test_graph_host_block_tables_match_device_build_without_device_reads() -> None:
@@ -1992,11 +1742,15 @@ def test_inplace_refresh_matches_capture_values_for_same_metadata() -> None:
 def test_query_descriptor_reuse_tracks_layout_changes(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _inplace_make_backend()
     backend._builder.async_graph_refresh = True
-    metadata = _inplace_forward_metadata([127, 128, 8193, 8194], seed=3)
+    metadata = _inplace_forward_metadata(
+        [127, 128, 2047, 2048], seed=3, positions=torch.tensor([126, 127, 2046, 2047, 0, 0, 0, 0], dtype=torch.int64)
+    )
+    metadata.dsa_graph_token_capacity = 8
     metadata.q_seq_lens_host_values = [1, 1, 1, 1]
     persistent = backend._build_dsa_metadata_for_forward(metadata)
     names = ("seq_lens_q", "actual_seq_lengths_query", "max_seqlen_q")
-    addresses = {getattr(persistent, name).data_ptr() for name in names}
+    by_name = {name: getattr(persistent, name).data_ptr() for name in names}
+    addresses = set(by_name.values())
     copies = []
     original = backend._builder._copy_to_destination
 
@@ -2009,12 +1763,25 @@ def test_query_descriptor_reuse_tracks_layout_changes(monkeypatch: pytest.Monkey
     for values, expected_copies in (([1, 1, 1, 1], 0), ([2, 1, 2, 1], 3), ([2, 1, 2, 1], 0), ([1, 1, 1, 1], 3)):
         copies.clear()
         metadata.q_seq_lens_host_values = values
+        positions = [
+            position
+            for kv_len, q_len in zip([127, 128, 2047, 2048], values, strict=True)
+            for position in range(kv_len - q_len, kv_len)
+        ]
+        metadata.dsa_positions.zero_()
+        metadata.dsa_positions[: len(positions)].copy_(torch.tensor(positions, dtype=torch.int64))
         backend._build_dsa_metadata_for_forward(metadata, inplace_target=persistent)
         expected = backend._build_dsa_metadata_for_forward(metadata)
         for name in names:
             assert torch.equal(getattr(persistent, name), getattr(expected, name)), name
         assert len(copies) == expected_copies
         assert persistent.query_lengths_host == tuple(values)
+        assert persistent.seq_lens_q.tolist() == values
+        assert persistent.actual_seq_lengths_query.tolist() == (
+            [0, 1, 2, 3, 4] if values == [1, 1, 1, 1] else [0, 2, 3, 5, 6]
+        )
+        assert persistent.max_seqlen_q.item() == max(values)
+        assert all(getattr(persistent, name).data_ptr() == by_name[name] for name in names)
 
 
 # -- (c) captured-address stability -----------------------------------------
@@ -2094,20 +1861,18 @@ def test_inplace_refresh_does_not_host_sync_or_move_fields(monkeypatch) -> None:
     assert set(alias_checks) == set(_INPLACE_FIELDS)
 
 
-def test_inplace_refresh_uses_no_device_d2h_in_device_slot_path() -> None:
+def test_inplace_refresh_uses_no_device_d2h_in_device_slot_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # The SWA device slot build, when handed a captured buffer, must not call
     # ``.tolist()`` (a D2H sync) and must write the target buffer in place.
     raw_bt = torch.tensor([[5], [7]], dtype=torch.int32)
     ctx = torch.tensor([3, 4], dtype=torch.int32)
     target = torch.full((4,), -1, dtype=torch.int32)
 
-    original_tolist = torch.Tensor.tolist
-
     def _forbidden_tolist(self):  # type: ignore[no-untyped-def]
         raise AssertionError("unexpected .tolist() in the device slot path")
 
-    torch.Tensor.tolist = _forbidden_tolist
-    try:
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "tolist", _forbidden_tolist)
         out = DsaMetadataBuilder._swa_slots_on_device(  # noqa: SLF001
             raw_bt,
             block_size=128,
@@ -2120,11 +1885,9 @@ def test_inplace_refresh_uses_no_device_d2h_in_device_slot_path() -> None:
             device_ctx_lens=ctx,
             dst_slots=target,
         )
-    finally:
-        torch.Tensor.tolist = original_tolist
 
     assert out is target
-    assert torch.equal(target[:2], torch.tensor([5 * 128 + 2, 7 * 128 + 3], dtype=torch.int32))
+    assert torch.equal(target, torch.tensor([5 * 128 + 2, 7 * 128 + 3, -1, -1], dtype=torch.int32))
 
 
 # -- (e) ownership conflicts -------------------------------------------------
@@ -2148,6 +1911,7 @@ def test_reset_forward_does_not_touch_captured_tensors() -> None:
 
 
 def test_shared_metadata_draft_group_limit_is_eager_and_isolated() -> None:
+    """Explicit shared-request slicing leaves independent captured storage untouched."""
     # The DSpark draft shares the request's multi_block_tables but owns one SWA
     # group and is always eager (no graph target): its build must never write
     # into the target's captured persistent metadata.
@@ -2170,6 +1934,7 @@ def test_inplace_falls_back_when_shapes_do_not_match() -> None:
     capture_meta, _ = _paired_metadata(seed=0)
     persistent = backend._build_dsa_metadata_for_forward(capture_meta)  # noqa: SLF001
     before = _tensor_signature(persistent.seq_lens)
+    original_values = persistent.seq_lens.clone()
 
     # A different batch size cannot alias the captured buffer; the builder must
     # allocate fresh and let the copy path handle it, leaving the address alone.
@@ -2180,6 +1945,7 @@ def test_inplace_falls_back_when_shapes_do_not_match() -> None:
     assert refreshed.seq_lens is not persistent.seq_lens
     assert "seq_lens" not in refreshed.refresh_inplace_fields
     assert _tensor_signature(persistent.seq_lens) == before
+    torch.testing.assert_close(persistent.seq_lens, original_values, rtol=0, atol=0)
 
 
 # -- (f) capture-time gating -------------------------------------------------
@@ -2270,20 +2036,6 @@ def test_swa_device_slots_bit_identical_to_host_path() -> None:
         assert torch.equal(off_slots, on_slots), (raw_bt.tolist(), ctx_lens)
 
 
-def test_swa_device_slots_expected_values() -> None:
-    raw_bt = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
-    _bt, slots = _run_swa(
-        raw_bt,
-        4,
-        [5, 9],
-        [1, 1],
-        [],
-        device_ctx_lens=torch.tensor([5, 9], dtype=torch.int32),
-    )
-    # seq0: pos 4 -> block 1 col 1, offset 0 -> 4; seq1: pos 8 -> block 2 col 0 -> 8.
-    assert torch.equal(slots, torch.tensor([4, 8], dtype=torch.int32))
-
-
 def test_swa_device_refresh_writes_into_captured_storage_in_place() -> None:
     persistent_bt = torch.full((2, 3), -7, dtype=torch.int32)
     persistent_slots = torch.full((2,), -7, dtype=torch.int32)
@@ -2306,16 +2058,11 @@ def test_swa_device_refresh_writes_into_captured_storage_in_place() -> None:
     assert persistent_slots.data_ptr() == slots_ptr
     assert torch.equal(persistent_bt, on_bt)
     assert torch.equal(persistent_slots, on_slots)
+    torch.testing.assert_close(persistent_bt, torch.tensor([[0, 1, -1], [-1, 3, 2]], dtype=torch.int32), rtol=0, atol=0)
+    torch.testing.assert_close(persistent_slots, torch.tensor([4, 8], dtype=torch.int32), rtol=0, atol=0)
 
 
-# ---- rope inverse fusion ----
-# R2: fused inverse interleaved RoPE on the V4.1 output de-rotation; a CPU
-# stand-in exercises the dispatch wiring and the |x|<=8 tolerance boundary
-# (scale-8/16). The fused path engages whenever the op is registered and the
-# structural guards pass.
-
-# bf16 acceptance tolerance (matches the repo's fused-op suite).
-_TOL = 2**-6
+# Native rotary dispatch and independent eager fallback contract.
 
 
 def _build_cache(max_pos: int, rotary_dim: int) -> torch.Tensor:
@@ -2326,14 +2073,7 @@ def _build_cache(max_pos: int, rotary_dim: int) -> torch.Tensor:
 
 
 def _stub_partial_rotary() -> Any:
-    """CPU stand-in for ``npu_inplace_partial_rotary_mul``'s contract.
-
-    Mirrors the wrapper: 3D ``[M, H, head_dim]`` input rotated in place over
-    the trailing ``rope_head_dim`` slice with the per-element duplicated
-    interleave cos/sin; ``inverse`` conjugates the rotation by negating sin.
-    Records ``(inverse, shape, start, head)`` per call so tests can assert the
-    dispatcher reached it (and with which sign).
-    """
+    """Native-call recorder; it deliberately computes no fake rotary result."""
     calls: list[tuple[bool, tuple[int, ...], int, int]] = []
 
     def op(
@@ -2344,90 +2084,31 @@ def _stub_partial_rotary() -> Any:
         rope_head_dim: int,
         inverse: bool = False,
     ) -> None:
-        calls.append((bool(inverse), tuple(x.shape), int(rope_start_dim), int(rope_head_dim)))
-        start = int(rope_start_dim)
-        end = start + int(rope_head_dim)
-        signed_sin = -sin if inverse else sin
-        rope = x[..., start:end]
-        even = rope[..., 0::2].float()
-        odd = rope[..., 1::2].float()
-        cos_pair = cos[..., 0::2].float().unsqueeze(1)
-        sin_pair = signed_sin[..., 0::2].float().unsqueeze(1)
-        rotated = torch.stack(
-            (even * cos_pair - odd * sin_pair, even * sin_pair + odd * cos_pair),
-            dim=-1,
-        ).flatten(-2)
-        x[..., start:end] = rotated.to(x.dtype)
+        assert cos.dtype == sin.dtype == x.dtype
+        calls.append((inverse, tuple(x.shape), rope_start_dim, rope_head_dim))
 
     op.calls = calls  # type: ignore[attr-defined]
     return op
 
 
-def _install_fused_stub(monkeypatch: Any) -> Any:
+@pytest.mark.parametrize(
+    ("shape", "inverse"),
+    [((8, 4, 512), True), ((8, 1, 512), True), ((5, 128), True), ((6, 3, 256), False)],
+)
+def test_fused_rotary_dispatch_preserves_inplace_inputs(
+    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, ...], inverse: bool
+) -> None:
     op = _stub_partial_rotary()
     monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: op)
-    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: True)
-    monkeypatch.setattr(csa2, "_log_fused_rope_inverse_active", lambda: None)
-    return op
-
-
-def _eager_reference(
-    monkeypatch: Any,
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cache: torch.Tensor,
-    inverse: bool,
-) -> torch.Tensor:
-    """Force the eager path (device guard off) on an identical input."""
-    original = csa2._rope_fused_device_supported
-    csa2._rope_fused_device_supported = lambda x: False
-    try:
-        return csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=inverse)
-    finally:
-        csa2._rope_fused_device_supported = original
-
-
-def test_fused_inverse_matches_eager(monkeypatch: Any) -> None:
-    op = _install_fused_stub(monkeypatch)
-
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda _x: True)
     cache = _build_cache(256, 64)
-    cases = [
-        (8, 4, 512),  # 3D q-like, partial [448:512)
-        (8, 1, 512),  # 3D single-head
-        (5, 128),  # 2D latent-like, partial [64:128)
-    ]
-    for shape in cases:
-        torch.manual_seed(sum(shape) + 11)
-        x = (torch.randn(*shape) * 0.9).to(torch.bfloat16)
-        positions = torch.randint(0, 200, (shape[0],), dtype=torch.int32)
-
-        fused = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
-        eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
-
-        assert op.calls[-1][0] is True, "the dispatcher must forward inverse=True"
-        assert fused.shape == eager.shape
-        diff = (fused.float() - eager.float()).abs()
-        budget = _TOL + _TOL * eager.float().abs()
-        assert (diff <= budget).all(), f"shape={shape} max_abs={diff.max().item():.3e}"
-        # The un-rotated prefix must survive the in-place kernel untouched.
-        rope_width = cache.size(-1)
-        if shape[-1] > rope_width:
-            assert torch.equal(fused[..., : shape[-1] - rope_width], eager[..., : shape[-1] - rope_width])
-
-
-def test_fused_forward_unchanged_by_r2(monkeypatch: Any) -> None:
-    op = _install_fused_stub(monkeypatch)
-
-    cache = _build_cache(128, 64)
-    torch.manual_seed(5)
-    x = (torch.randn(6, 3, 256) * 0.9).to(torch.bfloat16)
-    positions = torch.arange(6, dtype=torch.int32)
-
-    fused = csa2.apply_interleaved_rope(x.clone(), positions, cache)
-    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=False)
-    assert op.calls[-1][0] is False
-    diff = (fused.float() - eager.float()).abs()
-    assert (diff <= _TOL + _TOL * eager.float().abs()).all()
+    x = torch.zeros(shape, dtype=torch.bfloat16)
+    positions = torch.arange(shape[0], dtype=torch.int32)
+    output = csa2.apply_interleaved_rope(x, positions, cache, inverse=inverse)
+    native_shape = shape if len(shape) == 3 else (shape[0], 1, shape[1])
+    assert op.calls == [(inverse, native_shape, shape[-1] - 64, 64)]
+    assert output.shape == shape
+    assert output.data_ptr() == x.data_ptr()
 
 
 def test_inverse_guard_matrix(monkeypatch: Any) -> None:
@@ -2445,8 +2126,11 @@ def test_inverse_guard_matrix(monkeypatch: Any) -> None:
     assert csa2._rope_fused_supported(x.to(torch.float16), positions, cache, True) is False
     assert csa2._rope_fused_supported(x, positions, _build_cache(64, 16), True) is False
     assert csa2._rope_fused_supported(x, positions, cache.to(torch.bfloat16), True) is False
-    assert csa2._rope_fused_supported(x.transpose(0, 1), positions, cache, True) is False
-    assert csa2._rope_fused_supported(torch.zeros(4, 2, 256, 1, dtype=torch.bfloat16), positions, cache, True) is False
+    assert (
+        csa2._rope_fused_supported(torch.zeros(4, 2, 512, dtype=torch.bfloat16)[..., ::2], positions, cache, True)
+        is False
+    )
+    assert csa2._rope_fused_supported(torch.zeros(4, 2, 1, 256, dtype=torch.bfloat16), positions, cache, True) is False
     # P2-a: an ODD table width (65 // 2 == 32, so the old 2*half == 64 passed).
     odd_cache = torch.randn(64, 65)
     assert csa2._rope_fused_supported(x, positions, odd_cache, True) is False
@@ -2455,18 +2139,16 @@ def test_inverse_guard_matrix(monkeypatch: Any) -> None:
     assert csa2._rope_fused_supported(x, positions, cache, True) is False
 
 
-def test_inverse_falls_back_when_op_missing(monkeypatch: Any) -> None:
-    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda x: True)
+def test_inverse_falls_back_when_op_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(csa2, "_rope_fused_device_supported", lambda _x: True)
     monkeypatch.setattr(csa2, "_get_partial_rotary_op", lambda: None)
-    monkeypatch.setattr(csa2, "_log_fused_rope_fallback", lambda *a, **k: None)
-
-    cache = _build_cache(64, 64)
-    x = (torch.randn(4, 2, 256) * 0.9).to(torch.bfloat16)
-    positions = torch.arange(4, dtype=torch.int32)
-
-    fallback = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
-    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
-    assert torch.equal(fallback, eager)
+    cache = torch.cat((torch.zeros(64, 32), torch.ones(64, 32)), dim=-1)
+    x = torch.full((2, 1, 128), 9, dtype=torch.bfloat16)
+    x[..., 64:] = torch.tensor([1, 2] * 32, dtype=torch.bfloat16)
+    fallback = csa2.apply_interleaved_rope(x, torch.tensor([0, 1], dtype=torch.int32), cache, inverse=True)
+    expected = torch.full_like(x, 9)
+    expected[..., 64:] = torch.tensor([2, -1] * 32, dtype=torch.bfloat16)
+    torch.testing.assert_close(fallback, expected, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -2476,59 +2158,6 @@ def test_inverse_falls_back_when_op_missing(monkeypatch: Any) -> None:
 # Deterministic hash-like pattern (no RNG) so the scale boundary is stable
 # across torch builds; found by the rev-3 stress sweep (scale=8 -> ratio ~0.82,
 # scale=16 -> ~1.39).
-_AMP_HASH = (7.31, 78.233, 9876.54321)
-_AMP_SHAPE = (8, 4, 512)
-
-
-def _amplitude_input(scale: float) -> torch.Tensor:
-    n = 1
-    for dim in _AMP_SHAPE:
-        n *= dim
-    idx = torch.arange(n, dtype=torch.float32)
-    a, b, c = _AMP_HASH
-    h = torch.sin(idx * a + b) * c
-    h = (h - torch.floor(h)) * 2.0 - 1.0
-    return (h.reshape(_AMP_SHAPE) * scale).to(torch.bfloat16)
-
-
-def _amplitude_positions() -> torch.Tensor:
-    return (torch.arange(_AMP_SHAPE[0], dtype=torch.int32) * 7) % 200
-
-
-def _inverse_tolerance_ratio(monkeypatch: Any, scale: float) -> float:
-    """Worst ``diff / (2**-6 + 2**-6 * |eager|)`` over the amplitude case.
-
-    Reusable on-device check: the real run should sample ``attn_out`` absmax
-    once at the inverse call; if it is materially above ~8, this ratio-based
-    re-evaluation (swap the stub for the real op) decides the bound.
-    """
-    cache = _build_cache(256, 64)
-    x = _amplitude_input(scale)
-    positions = _amplitude_positions()
-    fused = csa2.apply_interleaved_rope(x.clone(), positions, cache, inverse=True)
-    eager = _eager_reference(monkeypatch, x, positions, cache, inverse=True)
-    diff = (fused.float() - eager.float()).abs()
-    bound = _TOL + _TOL * eager.float().abs()
-    return (diff / bound).max().item()
-
-
-def test_inverse_tolerance_holds_at_scale8(monkeypatch: Any) -> None:
-    _install_fused_stub(monkeypatch)
-    ratio = _inverse_tolerance_ratio(monkeypatch, 8.0)
-    assert ratio <= 1.0, f"scale=8 ratio={ratio:.3f} (mixed tolerance must hold)"
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="P1-b: near-cancellation + scale=16 exceeds the mixed tolerance; "
-    "re-evaluate the bound against the real attn_out amplitude domain; "
-    "strict=True pins this boundary: if upstream precision improves past the "
-    "bound this test turns XPASS and goes red",
-)
-def test_inverse_tolerance_breaks_at_scale16(monkeypatch: Any) -> None:
-    _install_fused_stub(monkeypatch)
-    ratio = _inverse_tolerance_ratio(monkeypatch, 16.0)
-    assert ratio <= 1.0, f"scale=16 ratio={ratio:.3f} (expected to break the bound)"
 
 
 @pytest.mark.parametrize("async_graph_inputs", [False, True])

@@ -146,10 +146,9 @@ def _wired_select_qli_inputs() -> tuple[
 
 
 @torch.inference_mode()
-def test_select_qli_query_rows_partition_matches_full_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_select_qli_query_rows_partition_matches_full_stream() -> None:
     torch.manual_seed(42)
     indexer, hidden, qr, positions, mask, ctx, backend = _wired_select_qli_inputs()
-    monkeypatch.setattr(glm5_next, "_INDEXER_CP_QUERY_PARTITION", True)
 
     def _select_qli(query_rows: torch.Tensor | None) -> torch.Tensor:
         return indexer.select_qli(hidden, qr, positions, mask, ctx, None, backend, query_rows=query_rows)
@@ -164,10 +163,9 @@ def test_select_qli_query_rows_partition_matches_full_stream(monkeypatch: pytest
 
 
 @torch.inference_mode()
-def test_select_qli_query_rows_empty_fills_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_select_qli_query_rows_empty_fills_invalid() -> None:
     torch.manual_seed(42)
     indexer, hidden, qr, positions, mask, ctx, backend = _wired_select_qli_inputs()
-    monkeypatch.setattr(glm5_next, "_INDEXER_CP_QUERY_PARTITION", True)
 
     topk_indices = indexer.select_qli(
         hidden,
@@ -193,7 +191,6 @@ def test_select_qli_query_rows_active_under_kv_split_replicated(monkeypatch: pyt
     torch.manual_seed(42)
     indexer, hidden, qr, positions, mask, ctx, backend = _wired_select_qli_inputs()
     ctx.has_kv_shard = True
-    monkeypatch.setattr(glm5_next, "_INDEXER_CP_QUERY_PARTITION", True)
     rows = torch.arange(128, 384)
 
     def _select_qli(query_rows: torch.Tensor | None) -> torch.Tensor:

@@ -40,7 +40,6 @@ class RecordingPolicy final : public IEplbPolicy {
   std::pair<torch::Tensor, std::vector<bool>> rebalance_experts(
       torch::Tensor expert_load,
       torch::Tensor physical_expert_load = torch::Tensor()) override {
-    (void)physical_expert_load;
     std::lock_guard<std::mutex> lock(mutex_);
     recorded_loads_.push_back(expert_load.clone());
     recorded_physical_loads_.push_back(physical_expert_load.clone());

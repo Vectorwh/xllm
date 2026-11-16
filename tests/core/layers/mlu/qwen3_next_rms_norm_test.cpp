@@ -26,6 +26,9 @@ namespace layer {
 namespace {
 
 TEST(Qwen3NextRMSNormMluTest, FusesResidualAndReturnsUpdatedState) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
   constexpr int64_t kHiddenSize = 128;
   constexpr double kEps = 1e-6;
   torch::Device device(Platform::type_torch(), 0);
@@ -54,7 +57,8 @@ TEST(Qwen3NextRMSNormMluTest, FusesResidualAndReturnsUpdatedState) {
   Device(device).synchronize_default_stream();
 
   ASSERT_TRUE(residual_out.has_value());
-  torch::Tensor quantized_input = input.to(torch::kCPU).to(torch::kFloat);
+  torch::Tensor quantized_input =
+      input_cpu.to(torch::kBFloat16).to(torch::kFloat);
   torch::Tensor quantized_residual =
       residual_cpu.to(torch::kBFloat16).to(torch::kFloat);
   torch::Tensor expected_residual = quantized_input + quantized_residual;
@@ -73,6 +77,12 @@ TEST(Qwen3NextRMSNormMluTest, FusesResidualAndReturnsUpdatedState) {
                               expected_residual,
                               /*rtol=*/1e-2,
                               /*atol=*/1e-2));
+  const double reference_norm =
+      torch::norm(expected_output, 2.0).item<double>();
+  ASSERT_GT(reference_norm, 0.0);
+  EXPECT_LE(torch::norm(actual_output - expected_output, 2.0).item<double>() /
+                reference_norm,
+            1e-2);
   EXPECT_TRUE(torch::allclose(actual_output,
                               expected_output,
                               /*rtol=*/1e-2,

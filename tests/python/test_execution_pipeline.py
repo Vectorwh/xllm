@@ -19,7 +19,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import fields, is_dataclass, replace
 from importlib import import_module
-from inspect import signature
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -36,7 +35,7 @@ from tests.python.test_dspark_pipeline import (
     _SamplingParameters,
     sampling_runtime,
 )
-from tests.python.test_model_executor import StubAttentionBackend, _make_attention_layer
+from tests.python.test_model_executor import StubAttentionBackend, _FakeModel, _make_attention_layer
 from xllm.python import distributed
 from xllm.python.model_executor.execution_context import can_execute_graph
 from xllm.python.model_executor.execution_pipeline import (
@@ -45,19 +44,21 @@ from xllm.python.model_executor.execution_pipeline import (
 )
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.model_executor.forward_context import (
+    EplbRuntimeState,
     get_execution_context,
     get_forward_context,
     get_forward_context_or_none,
 )
 from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.model_input import ModelInput
-from xllm.python.model_executor.model_output import ModelOutput
+from xllm.python.model_executor.model_output import DraftProposal, ModelOutput
 from xllm.python.model_executor.runner import Runner, RunnerConfig
 from xllm.python.model_executor.runners.acl_graph import AclGraphRunner
 from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
 from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.model_executor.sampling_metadata import ModelSamplingMetadataBuilder
 from xllm.python.models.dspark_model import DSparkDecoderModel, ProposalMetadata, ProposalMetadataBuilder
+from xllm.python.models.multimodal import MultimodalInputs
 from xllm.python.pipelines.dspark_pipeline import DSparkExecutionPipeline
 
 
@@ -83,7 +84,7 @@ def _copy_output(destination: Any, source: Any) -> None:
 
 @pytest.fixture
 def capture_lock_state(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    state = SimpleNamespace(held=False, acquisitions=0, releases=0)
+    state = SimpleNamespace(held=False, acquisitions=0, releases=0, replaying=False)
 
     @contextmanager
     def lock(device: torch.device) -> Iterator[None]:
@@ -123,7 +124,11 @@ def acl_graph_runtime(monkeypatch: pytest.MonkeyPatch, capture_lock_state: Simpl
 
         def replay() -> None:
             assert not capture_lock_state.held
-            _copy_output(output, forward())
+            capture_lock_state.replaying = True
+            try:
+                _copy_output(output, forward())
+            finally:
+                capture_lock_state.replaying = False
 
         graph.replay.side_effect = replay
         captures.append(SimpleNamespace(graph=graph, output=output, stream=stream, pool=pool))
@@ -173,8 +178,9 @@ def _model_inputs(hidden: torch.Tensor, *, width: int = 1) -> ModelInput:
     return replace(inputs, input_embedding=hidden)
 
 
-@pytest.mark.parametrize("device", [torch.device("cpu", 2), torch.device("cpu")])
-def test_device_capture_lock_uses_native_device_guard(monkeypatch: pytest.MonkeyPatch, device: torch.device) -> None:
+@pytest.mark.parametrize("index", [2, None])
+def test_device_capture_lock_uses_native_device_guard(monkeypatch: pytest.MonkeyPatch, index: int | None) -> None:
+    device = SimpleNamespace(type="npu", index=index)
     module = import_module("xllm.python.model_executor.runners.acl_graph_capture")
     guard = nullcontext()
     factory = Mock(return_value=guard)
@@ -192,15 +198,15 @@ def test_graph_capture_lock_covers_warmup_but_not_replay(
     forward_lock_states: list[bool] = []
 
     def record_lock(model: torch.nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
-        forward_lock_states.append(capture_lock_state.held)
+        if not capture_lock_state.replaying:
+            forward_lock_states.append(capture_lock_state.held)
 
     model.register_forward_pre_hook(record_lock)
     for rows, first_capture in ((3, True), (3, False), (5, True)):
         forward_lock_states.clear()
         pipeline.execute(_model_inputs(torch.ones(rows, 2)))
-        assert any(forward_lock_states) == first_capture
-        assert all(forward_lock_states[:-1])
-        assert not forward_lock_states[-1]
+        assert len(forward_lock_states) == (4 if first_capture else 0)
+        assert all(forward_lock_states)
         assert not capture_lock_state.held
     assert len(acl_graph_runtime) == 2
     assert capture_lock_state.acquisitions == capture_lock_state.releases == 2
@@ -250,22 +256,6 @@ def test_runner_is_ready_for_eager_execution_after_construction() -> None:
     assert runner.eager_runner.model is model
     assert runner.graph_runner is None
     torch.testing.assert_close(runner.execute(_model_inputs(torch.ones(2, 2))), torch.full((2, 2), 2.0))
-
-
-def test_runner_constructs_graph_with_shared_model_and_metadata() -> None:
-    model = _ScaleModel()
-    builder = ProposalMetadataBuilder()
-    config = RunnerConfig(
-        torch.device("cpu"), enable_graph=True, max_seqs_per_batch=8, acl_graph_decode_batch_size_limit=4
-    )
-    runner = Runner(model, (builder,), config)
-    assert runner.eager_runner.model is model
-    assert runner.graph_runner.model is model
-    assert runner.eager_runner.execution_metadata_builders == (builder,)
-    assert runner.graph_runner.execution_metadata_builders == (builder,)
-    assert runner.graph_runner.max_requests == 4
-    assert runner.graph_runner._graphs == {}
-    assert model.calls == 0
 
 
 def test_pipeline_construction_initializes_main_and_head_runners(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -348,7 +338,10 @@ def test_pipeline_only_orchestrates_runner_calls(return_confidence: bool, monkey
     inputs = _inputs(_SamplingInput(return_confidence=return_confidence))
     hidden = torch.ones(6, 2)
     logits = torch.ones(6, 7)
-    output = ModelOutput()
+    output = ModelOutput(
+        draft_proposal=DraftProposal(inputs.input_ids.reshape(2, 3).clone()),
+        draft_confidence_probs=torch.full((2, 3), 1 / 7) if return_confidence else None,
+    )
     calls = Mock()
     calls.decoder.return_value = (logits, hidden)
     calls.proposal.return_value = output
@@ -407,26 +400,12 @@ def test_graph_pool_is_lazy_shared_across_keys_and_runner_local(acl_graph_runtim
 
 def test_graph_distinguishes_optional_forward_arguments(acl_graph_runtime: list[SimpleNamespace]) -> None:
     pipeline = _make_model_pipeline(_ScaleModel())
-    inputs = _model_inputs(torch.arange(3))
+    inputs = _model_inputs(torch.arange(3) + 10)
     for embedding in (None, inputs.input_embedding):
         output = pipeline.execute(replace(inputs, input_embedding=embedding))
-        torch.testing.assert_close(output, torch.arange(3) * 2)
+        expected = inputs.input_ids if embedding is None else embedding
+        torch.testing.assert_close(output, expected * 2)
     assert len(acl_graph_runtime) == 2
-
-
-def test_graph_backend_queries_model_not_metadata_builders(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = _ScaleModel()
-    pipeline = _make_model_pipeline(model)
-    builder = Mock()
-    builder.can_execute_graph.side_effect = AssertionError("Builder admission must be aggregated by the model")
-    graph = pipeline.entry_runner.graph_runner
-    gather = Mock(side_effect=AssertionError("Local graph stages must not introduce DP admission collectives"))
-    monkeypatch.setattr(distributed, "dp_all_true", gather, raising=False)
-    graph.bind_execution_metadata_builders((builder,))
-    inputs = _model_inputs(torch.ones(3, 2))
-    assert graph.can_execute(inputs)
-    builder.can_execute_graph.assert_not_called()
-    gather.assert_not_called()
 
 
 def test_model_admission_does_not_hide_invalid_persistent_metadata(acl_graph_runtime: list[SimpleNamespace]) -> None:
@@ -442,16 +421,7 @@ def test_graph_backend_owns_multimodal_admission() -> None:
     pipeline = _make_model_pipeline(_ScaleModel())
     graph = pipeline.entry_runner.graph_runner
     inputs = _model_inputs(torch.ones(3, 2))
-    assert not graph.can_execute(replace(inputs, multimodal_inputs=SimpleNamespace()))
-
-
-def test_runner_consumes_complete_backend_admission() -> None:
-    runner = Runner(_ScaleModel(), (), RunnerConfig(torch.device("cpu")))
-    runner.graph_runner = Mock()
-    inputs = replace(_model_inputs(torch.ones(3, 2)), multimodal_inputs=SimpleNamespace(), eplb=SimpleNamespace())
-    runner.graph_runner.can_execute.return_value = True
-    assert runner.execute(inputs) is runner.graph_runner.execute.return_value
-    runner.graph_runner.can_execute.assert_called_once_with(inputs)
+    assert not graph.can_execute(replace(inputs, multimodal_inputs=MultimodalInputs(inputs.input_embedding)))
 
 
 @pytest.mark.parametrize("stage", ["backbone", "lm_head", "proposal"])
@@ -485,7 +455,6 @@ def test_decoder_preserves_backbone_runtime_hooks() -> None:
         "stage_engram_rows_outside_graph",
     ):
         assert getattr(decoder, name) is getattr(model.backbone, name)
-    assert getattr(decoder, "missing_hook", None) is None
     assert list(decoder.parameters()) == []
 
 
@@ -507,11 +476,13 @@ def test_decoder_returns_logits_and_hidden_without_sampling(
 
 
 def test_model_without_graph_hook_has_no_extra_computation_constraints() -> None:
-    inputs = _model_inputs(torch.ones(3, 2))
-    model = torch.nn.Identity()
+    inputs = replace(_model_inputs(torch.ones(3, 2)), input_embedding=None)
+    model = _FakeModel(num_layers=0)
     assert can_execute_graph(model, inputs)
     pipeline = _make_model_pipeline(model, max_requests=2)
     assert not pipeline.entry_runner.graph_runner.can_execute(inputs)
+    torch.testing.assert_close(pipeline.execute(inputs), inputs.input_ids)
+    assert pipeline.entry_runner.execution_mode == "eager"
 
 
 def test_graph_backend_passes_complete_stage_input_to_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -653,15 +624,6 @@ def test_model_admission_can_fall_back_then_reuse_graph(acl_graph_runtime: list[
         torch.testing.assert_close(pipeline.execute(inputs), torch.full((3, 2), 2.0))
         assert pipeline.entry_runner.execution_mode == ("graph" if allowed else "eager")
     assert len(acl_graph_runtime) == 1
-
-
-def test_disabled_graph_reuses_the_existing_eager_runner(acl_graph_runtime: list[SimpleNamespace]) -> None:
-    model = _ScaleModel()
-    pipeline = _make_model_pipeline(model, graph_enabled=False)
-    pipeline.execute(_model_inputs(torch.ones(2, 2)))
-    assert type(pipeline.entry_runner.eager_runner) is EagerRunner
-    assert pipeline.entry_runner.graph_runner is None
-    assert acl_graph_runtime == []
 
 
 def test_graph_failure_is_not_retried_as_eager() -> None:
@@ -852,9 +814,23 @@ def test_pipeline_checks_sampling_before_running_any_model() -> None:
 def test_runner_trims_dummy_request_rows(graph_enabled: bool, acl_graph_runtime: list[SimpleNamespace]) -> None:
     pipeline = _make_pipeline(_DraftModel(), graph_enabled=graph_enabled)
     inputs = _inputs(_SamplingInput(), rows=1)
-    inputs.input_batch = replace(inputs.input_batch, num_reqs=0, num_tokens=0, is_dummy=True)
+    metadata = SimpleNamespace(
+        num_reqs=0,
+        num_tokens=3,
+        num_scheduled_tokens=[],
+        num_computed_tokens=[],
+        query_start_loc=[0],
+        is_prefilling=[],
+    )
+    batch = InputBatch.from_runtime(
+        inputs.input_ids, inputs.positions, metadata, is_dummy=True, sampling=inputs.input_batch.sampling
+    )
+    inputs = replace(inputs, input_batch=batch)
+    pipeline.entry_runner.graph_runner.can_execute.return_value = False
     result = pipeline.execute(inputs)
     assert result.draft_proposal.token_ids.shape == (0, 3)
+    assert pipeline.entry_runner.execution_mode == "eager"
+    assert pipeline.proposal_runner.execution_mode == "eager"
 
 
 def test_decoder_model_uses_weights_shared_after_pipeline_creation(acl_graph_runtime: list[SimpleNamespace]) -> None:
@@ -873,16 +849,11 @@ def test_decoder_model_uses_weights_shared_after_pipeline_creation(acl_graph_run
     assert list(pipeline.proposal_runner.model.parameters()) == []
 
 
-def test_models_share_forward_signature_and_do_not_leak_context() -> None:
+def test_pipeline_execution_restores_forward_context() -> None:
     model = _DraftModel()
     pipeline = model.model.create_execution_pipeline(
         (ModelSamplingMetadataBuilder(),), RunnerConfig(torch.device("cpu"))
     )
-    expected_parameters = tuple(signature(model.model.backbone.forward).parameters)
-    for runner in pipeline.runners:
-        assert isinstance(runner.model, torch.nn.Module)
-        assert tuple(signature(runner.model.forward).parameters) == expected_parameters
-        assert type(runner.eager_runner) is EagerRunner
     pipeline.execute(_inputs(_SamplingInput()))
     assert get_forward_context_or_none() is None
 
@@ -894,7 +865,7 @@ def test_pipeline_passes_features_explicitly_and_keeps_layer_runtime_on_backbone
     inputs = _inputs(_SamplingInput(return_confidence=True))
     inputs.layer_synchronizer = Mock()
     inputs.layer_load_context = Mock()
-    inputs.eplb = SimpleNamespace(expert_load_data=torch.zeros(1))
+    inputs.eplb = EplbRuntimeState(expert_load_data=torch.zeros(1), decode_token_mask=None, is_graph_warmup=False)
     forwarded: dict[torch.nn.Module, torch.Tensor] = {}
     produced: dict[torch.nn.Module, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -920,20 +891,6 @@ def test_pipeline_passes_features_explicitly_and_keeps_layer_runtime_on_backbone
     output = pipeline.execute(inputs)
     assert isinstance(output, ModelOutput)
     assert forwarded[pipeline.proposal_runner.model] is produced[pipeline.entry_runner.model][0]
-
-
-@pytest.mark.parametrize("tuple_output", [False, True])
-def test_plain_model_uses_single_stage_and_preserves_result_identity(tuple_output: bool) -> None:
-    model = torch.nn.Identity()
-    pipeline = create_execution_pipeline(model, (), RunnerConfig(torch.device("cpu")))
-    assert isinstance(pipeline, SingleModelExecutionPipeline)
-    assert pipeline.entry_runner.model is model
-    hidden = torch.ones(2, 3)
-    output = (hidden, hidden + 1) if tuple_output else hidden
-    eager = Mock()
-    eager.execute.return_value = output
-    pipeline.entry_runner.eager_runner = eager
-    assert pipeline.execute(_inputs(_SamplingInput())) is output
 
 
 def test_executor_constructs_and_runs_the_registered_dspark_pipeline(

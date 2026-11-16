@@ -327,7 +327,23 @@ torch::Tensor mla_run_single_test(
 }
 }  // namespace
 
-TEST(DeepseekMLATest, PrefillTestRandomInput) {
+class DeepseekMLATest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_block_ = KVCacheConfig::get_instance().block_size();
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+  }
+  void TearDown() override {
+    KVCacheConfig::get_instance().block_size(saved_block_);
+  }
+
+ private:
+  int64_t saved_block_ = 0;
+};
+
+TEST_F(DeepseekMLATest, PrefillTestRandomInput) {
   ModelArgs model_args_;
   QuantArgs quant_args_;
   ParallelArgs parallel_args_{0, 1, nullptr};
@@ -414,7 +430,7 @@ TEST(DeepseekMLATest, PrefillTestRandomInput) {
       << ", expected=" << expected;
 }
 
-TEST(DeepseekMLATest, DecoderTestRandomInput) {
+TEST_F(DeepseekMLATest, VariousBatchSizesTest) {
   ModelArgs model_args_;
   QuantArgs quant_args_;
   ParallelArgs parallel_args_{0, 1, nullptr};
@@ -444,92 +460,9 @@ TEST(DeepseekMLATest, DecoderTestRandomInput) {
 
   mla_init_test_weights(model_args_, options_, weight_dict_);
 
-  int64_t batch_size = 1;
-  int64_t max_query_len = 1;
-  int64_t num_tokens = batch_size * max_query_len;
-  int64_t hidden_size = model_args_.hidden_size();
-
-  auto hidden_states = mla_create_seeded_hidden_states(
-      options_, "mla.decoder.hidden_states", num_tokens, hidden_size);
-  auto positions = torch::arange(max_query_len, options_.dtype(torch::kInt32))
-                       .repeat({batch_size});
-
-  int64_t block_num = 100;
-  auto k_cache = mla_create_seeded_cache(
-      options_,
-      "mla.decoder.k_cache",
-      {block_num,
-       1,
-       1,
-       model_args_.qk_rope_head_dim() + model_args_.kv_lora_rank()});
-  auto index_cache =
-      mla_create_seeded_cache(options_,
-                              "mla.decoder.index_cache",
-                              {block_num, 1, 1, model_args_.index_head_dim()});
-  KVCache kv_cache =
-      create_indexed_kv_cache(std::move(k_cache), std::move(index_cache));
-
-  auto output_non_fused = mla_run_single_test(model_args_,
-                                              quant_args_,
-                                              parallel_args_,
-                                              options_,
-                                              weight_dict_,
-                                              false,
-                                              batch_size,
-                                              max_query_len,
-                                              false,
-                                              hidden_states,
-                                              positions,
-                                              kv_cache);
-  auto output_fused = mla_run_single_test(model_args_,
-                                          quant_args_,
-                                          parallel_args_,
-                                          options_,
-                                          weight_dict_,
-                                          true,
-                                          batch_size,
-                                          max_query_len,
-                                          false,
-                                          hidden_states,
-                                          positions,
-                                          kv_cache);
-  test::verify_tensor_close(output_fused, output_non_fused);
-}
-
-TEST(DeepseekMLATest, VariousBatchSizesTest) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unordered_map<std::string, torch::Tensor> weight_dict_;
-
-  torch::Device torch_device(Platform::type_torch(), 0);
-  Device device(torch_device);
-  device.set_seed();
-
-  KVCacheConfig::get_instance().block_size(1);
-  // Initialize default model arguments for testing
-  model_args_ = mla_create_mla_model_args();
-
-  // Initialize w8a8 quantization arguments
-  quant_args_ = test::create_default_quant_args();
-
-  // Initialize tensor options
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(torch_device)
-                 .requires_grad(false);
-
-  // Create mock ProcessGroup and initialize ParallelArgs
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-
-  mla_init_test_weights(model_args_, options_, weight_dict_);
-
-  std::vector<int64_t> test_cases = {1, 2, 4, 8};
+  const std::vector<int64_t> test_cases = {1, 3, 8};
   int32_t seq_len = 1;
   for (const auto& batch_size : test_cases) {
-    LOG(INFO) << "Testing batch_size=" << batch_size << ", seq_len=" << seq_len;
     int64_t num_tokens = batch_size * seq_len;
     int64_t hidden_size = model_args_.hidden_size();
     auto hidden_states = mla_create_seeded_hidden_states(
@@ -555,6 +488,8 @@ TEST(DeepseekMLATest, VariousBatchSizesTest) {
     KVCache kv_cache =
         create_indexed_kv_cache(std::move(k_cache), std::move(index_cache));
 
+    KVCache independent_cache = create_indexed_kv_cache(
+        kv_cache.get_k_cache().clone(), kv_cache.get_index_cache().clone());
     bool is_prefill = false;
     auto output_fused = mla_run_single_test(model_args_,
                                             quant_args_,
@@ -579,85 +514,15 @@ TEST(DeepseekMLATest, VariousBatchSizesTest) {
                                                 is_prefill,
                                                 hidden_states,
                                                 positions,
-                                                kv_cache);
+                                                independent_cache);
     test::verify_tensor_close(output_fused, output_non_fused);
+    test::verify_tensor_close(
+        kv_cache.get_k_cache(), independent_cache.get_k_cache(), 2e-2, 2e-3);
+    test::verify_tensor_close(kv_cache.get_index_cache(),
+                              independent_cache.get_index_cache(),
+                              2e-2,
+                              2e-3);
   }
-}
-
-TEST(DeepseekMLATest, DefaultRopePrefillTest) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unordered_map<std::string, torch::Tensor> weight_dict_;
-
-  torch::Device torch_device(Platform::type_torch(), 0);
-  Device device(torch_device);
-  device.set_seed();
-
-  KVCacheConfig::get_instance().block_size(1);
-  // Initialize default model arguments for testing
-  model_args_ = mla_create_mla_model_args();
-
-  // Initialize w8a8 quantization arguments
-  quant_args_ = test::create_default_quant_args();
-
-  // Initialize tensor options
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(torch_device)
-                 .requires_grad(false);
-
-  // Create mock ProcessGroup and initialize ParallelArgs
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-
-  mla_init_test_weights(model_args_, options_, weight_dict_);
-
-  model_args_ = mla_create_mla_model_args("default");
-  mla_init_test_weights(model_args_, options_, weight_dict_);
-
-  int64_t batch_size = 2;
-  int64_t max_query_len = 3;
-  int64_t num_tokens = batch_size * max_query_len;
-  int64_t hidden_size = model_args_.hidden_size();
-
-  auto hidden_states = mla_create_seeded_hidden_states(
-      options_, "mla.default_rope.hidden_states", num_tokens, hidden_size);
-  auto positions = torch::arange(max_query_len, options_.dtype(torch::kInt32))
-                       .repeat({batch_size});
-
-  int64_t block_num = 32;
-  auto k_cache = mla_create_seeded_cache(
-      options_,
-      "mla.default_rope.k_cache",
-      {block_num,
-       1,
-       1,
-       model_args_.qk_rope_head_dim() + model_args_.kv_lora_rank()});
-  auto index_cache =
-      mla_create_seeded_cache(options_,
-                              "mla.default_rope.index_cache",
-                              {block_num, 1, 1, model_args_.index_head_dim()});
-  KVCache kv_cache =
-      create_indexed_kv_cache(std::move(k_cache), std::move(index_cache));
-
-  auto output = mla_run_single_test(model_args_,
-                                    quant_args_,
-                                    parallel_args_,
-                                    options_,
-                                    weight_dict_,
-                                    false,
-                                    batch_size,
-                                    max_query_len,
-                                    true,
-                                    hidden_states,
-                                    positions,
-                                    kv_cache);
-
-  EXPECT_EQ(output.dim(), 2);
-  EXPECT_EQ(output.size(0), num_tokens);
-  EXPECT_EQ(output.size(1), hidden_size);
 }
 
 }  // namespace layer

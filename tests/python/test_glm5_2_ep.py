@@ -191,8 +191,7 @@ def test_cp1_degree2_mega_pure_decode_preserves_base_and_graph(
     alltoall.assert_not_called()
 
 
-@pytest.mark.parametrize("chunked", (False, True))
-@pytest.mark.parametrize("dp_size", (1, 2))
+@pytest.mark.parametrize("chunked,dp_size", ((False, 1), (True, 1), (False, 2)))
 def test_cp1_degree2_mega_prefill_always_selects_alltoall(
     chunked: bool, dp_size: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -249,11 +248,9 @@ def test_eplv2_rejects_incompatible_modes(field: str) -> None:
         cfg.validate()
 
 
-@pytest.mark.parametrize("degree", (0, 1))
-def test_legacy_ep_degrees_reject_eplb_with_their_own_message(degree: int) -> None:
-    """Degree 0/1 configure plain EP, so the EPLB rejection must name their
-    legacy grouped path instead of the degree-2 AllToAllV transport."""
-    cfg = _config(degree=degree, enable_eplb=True)
+def test_legacy_ep_degrees_reject_eplb_with_their_own_message() -> None:
+    """Legacy degree 0/1 share one validation branch distinct from EPLv2."""
+    cfg = _config(degree=0, enable_eplb=True)
     with pytest.raises(ValueError, match="legacy EP .* does not support EPLB expert migration"):
         cfg.validate()
 
@@ -282,7 +279,13 @@ def test_source_admission_fails_closed(case: str) -> None:
         ctx.metadata.is_prefill = False
     if case == "graph":
         ctx = replace(ctx, execution_state=object())
-    with forward_context(ctx), pytest.raises((ValueError, TypeError)):
+    expected_message = {
+        "missing_mask": "typed active-token metadata",
+        "wrong_dtype": "requires BF16 or FP16",
+        "cp_decode": "CP decode is unsupported",
+        "graph": "requires eager execution",
+    }[case]
+    with forward_context(ctx), pytest.raises((ValueError, TypeError), match=expected_message):
         moe(hidden)
 
 

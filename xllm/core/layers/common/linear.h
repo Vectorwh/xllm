@@ -195,7 +195,6 @@ class QKVParallelLinearImpl : public torch::nn::Module {
     stream << name() << " " << weight().sizes() << " " << weight().device();
   }
 
-  // return the weight (for testing)
   torch::Tensor weight() const {
     if (qweight_is_loaded_) {
       return qweight_;
@@ -330,7 +329,6 @@ class RowParallelLinearImpl : public torch::nn::Module {
     stream << name() << " " << weight_.sizes() << " " << weight_.device();
   }
 
-  // return the weight (for testing)
   torch::Tensor weight() const {
     if (qweight_is_loaded_) {
       return qweight_;
@@ -438,7 +436,6 @@ class ReplicatedLinearImpl : public torch::nn::Module {
     stream << name() << " " << weight_.sizes() << " " << weight_.device();
   }
 
-  // return the weight (for testing)
   torch::Tensor weight() const { return weight_; }
   bool is_weight_loaded() const {
     if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {

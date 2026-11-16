@@ -58,9 +58,7 @@ class RecordingBackend final : public c10d::FakeProcessGroup {
   c10::intrusive_ptr<c10d::Work> send(std::vector<torch::Tensor>& tensors,
                                       int destination_rank,
                                       int tag) override {
-    storage_offsets_.push_back(tensors.front().storage_offset());
-    data_ptrs_.push_back(
-        reinterpret_cast<uintptr_t>(tensors.front().data_ptr()));
+    sent_tensors_.emplace_back(tensors.front().clone());
     (void)destination_rank;
     (void)tag;
     return record_operation();
@@ -69,9 +67,7 @@ class RecordingBackend final : public c10d::FakeProcessGroup {
   c10::intrusive_ptr<c10d::Work> recv(std::vector<torch::Tensor>& tensors,
                                       int source_rank,
                                       int tag) override {
-    storage_offsets_.push_back(tensors.front().storage_offset());
-    data_ptrs_.push_back(
-        reinterpret_cast<uintptr_t>(tensors.front().data_ptr()));
+    tensors.front().fill_(7);
     (void)source_rank;
     (void)tag;
     return record_operation();
@@ -83,11 +79,9 @@ class RecordingBackend final : public c10d::FakeProcessGroup {
     return wait_posted_counts_;
   }
 
-  const std::vector<int64_t>& storage_offsets() const {
-    return storage_offsets_;
+  const std::vector<torch::Tensor>& sent_tensors() const {
+    return sent_tensors_;
   }
-
-  const std::vector<uintptr_t>& data_ptrs() const { return data_ptrs_; }
 
  private:
   c10::intrusive_ptr<c10d::Work> record_operation() {
@@ -98,8 +92,7 @@ class RecordingBackend final : public c10d::FakeProcessGroup {
 
   size_t posted_operation_count_ = 0;
   std::vector<size_t> wait_posted_counts_;
-  std::vector<int64_t> storage_offsets_;
-  std::vector<uintptr_t> data_ptrs_;
+  std::vector<torch::Tensor> sent_tensors_;
 };
 
 class RecordingProcessGroup final : public ProcessGroup {
@@ -196,22 +189,26 @@ TEST(ProcessGroupBatchTest, LargePayloadChunkingDoesNotDependOnStorageOffset) {
   EXPECT_EQ(offset_group.backend().posted_operation_count(), 2u);
 }
 
-TEST(ProcessGroupBatchTest, ContiguousOffsetViewUsesOwnedStaging) {
+TEST(ProcessGroupBatchTest, TransfersContiguousOffsetViewsAndCopiesBackOnWait) {
   RecordingProcessGroup process_group(/*rank=*/0, /*world_size=*/2);
-  std::vector<std::string> op_types = {"send"};
-  torch::Tensor storage = torch::zeros({4}, torch::kFloat32);
+  std::vector<std::string> op_types = {"send", "recv"};
+  torch::Tensor send_storage = torch::tensor({0.0f, 3.0f, 4.0f, 0.0f});
+  torch::Tensor recv_storage = torch::zeros({4}, torch::kFloat32);
   std::vector<torch::Tensor> tensors = {
-      storage.narrow(/*dim=*/0, /*start=*/1, /*length=*/2)};
-  std::vector<int64_t> remote_ranks = {1};
-  const uintptr_t expected_data_ptr =
-      reinterpret_cast<uintptr_t>(tensors.front().data_ptr());
+      send_storage.narrow(/*dim=*/0, /*start=*/1, /*length=*/2),
+      recv_storage.narrow(/*dim=*/0, /*start=*/1, /*length=*/2)};
+  std::vector<int64_t> remote_ranks = {1, 1};
 
-  process_group.batch_isend_irecv(op_types, tensors, remote_ranks);
-
-  ASSERT_EQ(process_group.backend().storage_offsets().size(), 1u);
-  EXPECT_EQ(process_group.backend().storage_offsets().front(), 0);
-  ASSERT_EQ(process_group.backend().data_ptrs().size(), 1u);
-  EXPECT_NE(process_group.backend().data_ptrs().front(), expected_data_ptr);
+  c10::intrusive_ptr<c10d::Work> work =
+      process_group.batch_isend_irecv(op_types, tensors, remote_ranks);
+  ASSERT_NE(work, nullptr);
+  ASSERT_EQ(process_group.backend().sent_tensors().size(), 1U);
+  EXPECT_TRUE(torch::equal(process_group.backend().sent_tensors().front(),
+                           torch::tensor({3.0f, 4.0f})));
+  EXPECT_TRUE(torch::equal(recv_storage, torch::zeros({4}, torch::kFloat32)));
+  ASSERT_TRUE(work->wait());
+  EXPECT_TRUE(
+      torch::equal(recv_storage, torch::tensor({0.0f, 7.0f, 7.0f, 0.0f})));
 }
 
 TEST(ProcessGroupBatchTest, CallerOwnedBuffersPostAcrossPayloadLimit) {

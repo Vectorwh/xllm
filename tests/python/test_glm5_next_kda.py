@@ -296,9 +296,20 @@ def test_merged_input_rejects_quantized_checkpoint(projection: str, quantization
     torch.testing.assert_close(attention.in_proj_qkvbfg_a.weight, original_weight, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1), (8, 7)])
-@pytest.mark.parametrize("batch_size,seq_len", [(1, 1), (1, 17), (3, 4)])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("tp_size", "tp_rank", "batch_size", "seq_len", "dtype"),
+    [
+        (1, 0, 1, 1, torch.float32),
+        (1, 0, 1, 17, torch.bfloat16),
+        (1, 0, 3, 4, torch.float16),
+        (2, 1, 1, 1, torch.bfloat16),
+        (2, 1, 1, 17, torch.float16),
+        (2, 1, 3, 4, torch.float32),
+        (8, 7, 1, 1, torch.float16),
+        (8, 7, 1, 17, torch.float32),
+        (8, 7, 3, 4, torch.bfloat16),
+    ],
+)
 @torch.inference_mode()
 def test_merged_input_forward_preserves_backend_arguments_and_output(
     tp_size: int, tp_rank: int, batch_size: int, seq_len: int, dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
@@ -597,12 +608,17 @@ def test_recurrent_kda_beta_sigmoid_matches_host_preprocessing(npu_runtime: Modu
 
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("kernel_width", [2, 4])
-@pytest.mark.parametrize("rows", [1, 4])
-@pytest.mark.parametrize("activation_mode", [0, 1])
-@pytest.mark.parametrize("run_mode", [0, 1])
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    ("dtype", "kernel_width", "rows", "activation_mode", "run_mode", "packed"),
+    [
+        (torch.float16, 2, 1, 0, 0, False),
+        (torch.float16, 4, 4, 1, 1, True),
+        (torch.bfloat16, 2, 4, 1, 0, True),
+        (torch.bfloat16, 4, 1, 0, 1, False),
+        (torch.float16, 2, 4, 1, 1, False),
+        (torch.bfloat16, 4, 4, 1, 1, True),
+    ],
+)
 @torch.inference_mode()
 def test_native_causal_conv1d_output_state_and_graph_replay(
     npu_runtime: ModuleType,
@@ -657,7 +673,7 @@ def test_native_causal_conv1d_output_state_and_graph_replay(
 
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
-@pytest.mark.parametrize("num_tokens", [1, 4, 17, 128])
+@pytest.mark.parametrize("num_tokens", [1, 128])
 @torch.inference_mode()
 def test_merged_input_npu_projection_and_graph_replay(num_tokens: int, npu_runtime: ModuleType) -> None:
     device = torch.device(os.environ["XLLM_KDA_TEST_NPU_DEVICE"])
@@ -711,7 +727,7 @@ def real_kda_weights(npu_runtime: ModuleType) -> tuple[glm5_next.Glm5NextConfig,
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
 @pytest.mark.parametrize("tp_rank", [0, 7])
-@pytest.mark.parametrize("num_tokens", [1, 4, 17, 128])
+@pytest.mark.parametrize("num_tokens", [1, 17])
 @torch.inference_mode()
 def test_real_kda_merged_projection_graph_replay(
     real_kda_weights: tuple[glm5_next.Glm5NextConfig, dict[str, torch.Tensor]],

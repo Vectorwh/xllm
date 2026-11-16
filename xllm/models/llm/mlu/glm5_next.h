@@ -285,8 +285,6 @@ class Glm5NextModelImpl final
   }
 
  private:
-  friend class Glm5NextModelTestPeer;
-
   void prepare_attention_metadata(ModelInputParams& params) const {
     const bool ordinary_prefill =
         params.meta.batch_forward_type.no_decode() && !params.is_spec_verify;

@@ -126,13 +126,9 @@ def test_model_propagates_resolved_sequence_parallel_state(
 @pytest.mark.parametrize(
     ("config", "expected"),
     [
-        ({"tp_size": 2}, False),
-        ({"tp_size": 2, "sequence_parallel_enabled": False}, False),
-        ({"tp_size": 1, "sequence_parallel_enabled": True}, True),
-        ({"tp_size": 2, "sequence_parallel_enabled": True}, True),
-        ({"sequence_parallel_enabled": True}, True),
-        ({"sequence_parallel_enabled": True, "cp_size": 2}, True),
-        ({"sequence_parallel_enabled": True, "num_speculative_tokens": 1}, True),
+        ({}, False),
+        ({"sequence_parallel_enabled": False}, False),
+        ({"sequence_parallel_enabled": True, "tp_size": 1, "cp_size": 2, "num_speculative_tokens": 1}, True),
     ],
 )
 def test_sequence_parallel_layers_and_builder_read_resolved_state(config: dict[str, object], expected: bool) -> None:

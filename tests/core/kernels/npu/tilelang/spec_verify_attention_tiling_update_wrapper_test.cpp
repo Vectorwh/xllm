@@ -17,11 +17,7 @@ limitations under the License.
 #include <torch/torch.h>
 #include <torch_npu/torch_npu.h>
 
-#include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <limits>
-#include <string>
 #include <vector>
 
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
@@ -39,13 +35,6 @@ PagedAttentionTilingLayout atb_v1_layout(int64_t buffer_words = 262144,
           /*kv_split_core_count_offset=*/24,
           /*row_kv_seq_len_offset=*/45,
           /*tiling_key=*/tiling_key};
-}
-
-std::string read_source(const std::filesystem::path& path) {
-  std::ifstream input(path);
-  EXPECT_TRUE(input.is_open()) << path;
-  return {std::istreambuf_iterator<char>(input),
-          std::istreambuf_iterator<char>()};
 }
 
 class TileLangSpecVerifyAttentionTilingUpdateTest : public ::testing::Test {
@@ -90,7 +79,7 @@ class TileLangSpecVerifyAttentionTilingUpdateTest : public ::testing::Test {
 };
 
 TEST_F(TileLangSpecVerifyAttentionTilingUpdateTest,
-       ReportsCompiledWidthsAndRuntimeBlockSizes) {
+       GraphUpdateRejectsUnsupportedGeometry) {
   for (const int64_t spec_width : {4, 5, 6}) {
     for (const int64_t block_size : {7, 16, 32, 48, 64, 128, 256}) {
       EXPECT_TRUE(has_spec_verify_attention_tiling_update_specialization(
@@ -111,6 +100,12 @@ TEST_F(TileLangSpecVerifyAttentionTilingUpdateTest,
   EXPECT_FALSE(has_spec_verify_attention_tiling_update_specialization(
       /*spec_width=*/4, /*block_size=*/0));
   EXPECT_FALSE(has_spec_verify_attention_tiling_update_specialization(
+      std::numeric_limits<int64_t>::max(), /*block_size=*/128));
+  EXPECT_FALSE(has_spec_verify_graph_update_specialization(
+      /*spec_width=*/4, /*block_size=*/0));
+  EXPECT_FALSE(has_spec_verify_graph_update_specialization(
+      /*spec_width=*/0, /*block_size=*/128));
+  EXPECT_FALSE(has_spec_verify_graph_update_specialization(
       std::numeric_limits<int64_t>::max(), /*block_size=*/128));
 }
 
@@ -163,10 +158,12 @@ TEST_F(TileLangSpecVerifyAttentionTilingUpdateTest,
     int64_t block_size;
     int32_t expected_split_length;
   };
+  // The ordinary update accepts non-ATB-aligned positive block sizes; graph
+  // specialization rejects them separately above. Keep distinct rounding
+  // regimes without enumerating every equivalent divisor.
   const std::vector<BlockSizeCase> test_cases = {
       {7, 98},
       {16, 96},
-      {32, 96},
       {48, 96},
       {64, 128},
       {128, 128},
@@ -237,63 +234,6 @@ TEST_F(TileLangSpecVerifyAttentionTilingUpdateTest,
   expect_rows(result, kv_seq_lens, layout);
   EXPECT_EQ(result[22].item<int32_t>(), -1);
   EXPECT_EQ(result[45].item<int32_t>(), -1);
-}
-
-TEST(PagedAttentionTilingLayoutTest, RejectsUnknownOrTruncatedAtbLayouts) {
-  EXPECT_FALSE(parse_custom_paged_attention_tiling_layout({}).has_value());
-  EXPECT_FALSE(
-      parse_custom_paged_attention_tiling_layout(std::vector<uint32_t>(18, 0))
-          .has_value());
-
-  std::vector<uint32_t> words(128, 0);
-  words[16] = 9;
-  words[17] = 44;
-  words[18] = 17;
-  const auto layout = parse_custom_paged_attention_tiling_layout(words);
-  ASSERT_TRUE(layout.has_value());
-  EXPECT_EQ(*layout, atb_v1_layout(/*buffer_words=*/128, /*tiling_key=*/9));
-  EXPECT_TRUE(paged_attention_tiling_required_words(*layout, /*num_rows=*/4)
-                  .has_value());
-  EXPECT_FALSE(paged_attention_tiling_required_words(*layout, /*num_rows=*/6)
-                   .has_value());
-
-  words[17] = 50;
-  EXPECT_FALSE(parse_custom_paged_attention_tiling_layout(words).has_value());
-  words[17] = 44;
-  words[18] = 19;
-  EXPECT_FALSE(parse_custom_paged_attention_tiling_layout(words).has_value());
-}
-
-TEST(PagedAttentionTilingLayoutTest, MatchesPinnedXllmOpsSourceContract) {
-  const std::filesystem::path tiling_dir =
-      std::filesystem::weakly_canonical(
-          std::filesystem::path(__FILE__).parent_path() / "../../../../..") /
-      "third_party/xllm_ops/atb_customize/ops/custom_paged_attention/"
-      "kernel_implement/tiling";
-  const std::string header =
-      read_source(tiling_dir / "custom_paged_attention_tiling_dependency.h");
-  const std::string source =
-      read_source(tiling_dir / "custom_paged_attention_tiling_dependency.cpp");
-  const std::string tiling_source =
-      read_source(tiling_dir / "custom_paged_attention_tiling.cpp");
-  EXPECT_NE(header.find(R"(constexpr int32_t BLOCK_SIZE = 16;
-constexpr int32_t BLOCK_SIZE_32 = 32;
-constexpr int32_t TILING_PARA_SIZE = 17;
-constexpr int32_t TILING_HEAD_SIZE = 44;)"),
-            std::string::npos);
-  EXPECT_NE(source.find(R"(const int32_t TILING_KEY = 16;
-const int32_t TILING_HEADSIZE = 17;
-const int32_t TILING_PARASIZE = 18;)"),
-            std::string::npos);
-  EXPECT_NE(source.find(R"(const int32_t TILING_MAX_KVSEQLEN = 22;
-const int32_t TILING_KVSPLIT = 23;
-const int32_t TILING_KVCORENUM = 24;)"),
-            std::string::npos);
-  EXPECT_NE(source.find("tilingParam[tilingOffset + 1] = "
-                        "static_cast<uint32_t>(kvSeqlen);"),
-            std::string::npos);
-  EXPECT_NE(tiling_source.find("mmInfo.blockSize % BLOCK_SIZE == 0"),
-            std::string::npos);
 }
 
 }  // namespace

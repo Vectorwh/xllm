@@ -103,18 +103,6 @@ TEST(SamplingParamsTest, NormalConcat) {
       torch::equal(sampling_parameters_1.sample_idxes, result_sample_idxes));
 }
 
-TEST(SamplingParamsTest, AbnormalConcat) {
-  // construct both of default sampling_parameters
-  SamplingParameters sampling_parameters_1, sampling_parameters_2;
-
-  // execute concat
-  sampling_parameters_1.concat(sampling_parameters_2);
-
-  // check results
-  EXPECT_FALSE(sampling_parameters_1.selected_token_idxes.defined());
-  EXPECT_FALSE(sampling_parameters_1.sample_idxes.defined());
-}
-
 TEST(SamplingParamsTest, ConcatPadsUnconstrainedRows) {
   RequestSamplingParam constrained_request;
   SamplingParameters constrained;

@@ -19,29 +19,17 @@ limitations under the License.
 
 namespace xllm {
 
-TEST(KVCacheStateTest, KvProgressDoesNotChangeLinearBlocks) {
+TEST(KVCacheStateTest, LinearBlocksKeepLogicalSlotsAsKvProgresses) {
   KVCacheState state;
   state.add_blocks(BlockType::LINEAR, std::vector<Block>{Block(1, nullptr)});
   state.set_kv_cache_tokens_num(4);
-  state.add_blocks(BlockType::LINEAR, std::vector<Block>{Block(2, nullptr)});
-  state.set_kv_cache_tokens_num(8);
-  ASSERT_EQ(state.num_blocks(BlockType::LINEAR), 2u);
-  EXPECT_EQ(state.blocks(BlockType::LINEAR)[0].id(), 1);
-  (*state.mutable_blocks(BlockType::LINEAR))[0] = Block();
-  EXPECT_FALSE(state.blocks(BlockType::LINEAR)[0].is_valid());
-  EXPECT_EQ(state.get_linear_block_id(), 2);
-}
-
-TEST(KVCacheStateTest, LinearBlocksPreserveUnallocatedLogicalIntervals) {
-  KVCacheState state;
   state.add_blocks(BlockType::LINEAR,
-                   std::vector<Block>{
-                       Block(1, nullptr), Block(), Block(), Block(2, nullptr)});
-  const Slice<Block> blocks = state.blocks(BlockType::LINEAR);
-  ASSERT_EQ(blocks.size(), 4u);
-  EXPECT_EQ(blocks[0].id(), 1);
-  EXPECT_FALSE(blocks[1].is_valid());
-  EXPECT_FALSE(blocks[2].is_valid());
+                   std::vector<Block>{Block(), Block(2, nullptr)});
+  state.set_kv_cache_tokens_num(8);
+  ASSERT_EQ(state.num_blocks(BlockType::LINEAR), 3u);
+  EXPECT_EQ(state.blocks(BlockType::LINEAR)[0].id(), 1);
+  EXPECT_FALSE(state.blocks(BlockType::LINEAR)[1].is_valid());
+  EXPECT_EQ(state.blocks(BlockType::LINEAR)[2].id(), 2);
   EXPECT_EQ(state.get_linear_block_id(), 2);
 }
 
@@ -105,10 +93,8 @@ TEST(KVCacheStateTest, PrefixMatchStateIsIndependentAndMovable) {
   state.set_prefix_cache_matched();
   EXPECT_TRUE(state.prefix_cache_matched());
 
-  std::vector<Block> blocks;
-  blocks.emplace_back(/*id=*/7, /*allocator=*/nullptr);
-  state.add_blocks(BlockType::KV, std::move(blocks));
-  EXPECT_TRUE(blocks.empty());
+  state.add_blocks(BlockType::KV,
+                   std::vector<Block>{Block(/*id=*/7, /*allocator=*/nullptr)});
   std::vector<Block> moved = state.take_blocks(BlockType::KV);
   ASSERT_EQ(moved.size(), 1u);
   EXPECT_FALSE(state.has_any_blocks());
@@ -118,29 +104,9 @@ TEST(KVCacheStateTest, PrefixMatchStateIsIndependentAndMovable) {
   EXPECT_FALSE(state.prefix_cache_matched());
 }
 
-TEST(KVCacheStateTest, ReusingConsumedVectorDoesNotAppendMovedFromSlots) {
-  KVCacheState state;
-  std::vector<Block> blocks;
-  blocks.reserve(2);
-  blocks.emplace_back(/*id=*/7, /*allocator=*/nullptr);
-  blocks.emplace_back();
-  state.add_blocks(BlockType::KV, std::move(blocks));
-  ASSERT_TRUE(blocks.empty());
-  blocks.emplace_back(/*id=*/8, /*allocator=*/nullptr);
-  state.add_blocks(BlockType::KV, std::move(blocks));
-  EXPECT_TRUE(blocks.empty());
-  const Slice<Block> owned = state.blocks(BlockType::KV);
-  ASSERT_EQ(owned.size(), 3u);
-  EXPECT_EQ(owned[0].id(), 7);
-  EXPECT_FALSE(owned[1].is_valid());
-  EXPECT_EQ(owned[2].id(), 8);
-}
-
-// Finding 2 regression: has_any_blocks() must report true for ANY
-// cache-bearing type (KV / SWA / C4 / C128) and IGNORE EMBEDDING. The pool's
-// "started_empty" rollback decision relies on this so that a DSV4 sequence
-// (which holds SWA/C4/C128 but no KV) is not treated as fresh on a failed grow.
-TEST(KVCacheStateTest, HasAnyBlocksIgnoresSingle) {
+// Cache-bearing types include the compressed-cache variants; EMBEDDING is a
+// per-sequence resource and must not make a sequence look cached.
+TEST(KVCacheStateTest, HasAnyBlocksIgnoresEmbedding) {
   auto make_block = [](int32_t id) {
     return std::vector<Block>{Block(id, /*manager=*/nullptr)};
   };
@@ -159,8 +125,12 @@ TEST(KVCacheStateTest, HasAnyBlocksIgnoresSingle) {
   }
 
   // Each cache-bearing type alone counts.
-  for (const BlockType type :
-       {BlockType::KV, BlockType::SWA, BlockType::C4, BlockType::C128}) {
+  for (const BlockType type : {BlockType::KV,
+                               BlockType::SWA,
+                               BlockType::C1,
+                               BlockType::C2,
+                               BlockType::C4,
+                               BlockType::C128}) {
     KVCacheState state;
     state.add_blocks(type, make_block(2));
     EXPECT_TRUE(state.has_any_blocks()) << "type=" << static_cast<int>(type);

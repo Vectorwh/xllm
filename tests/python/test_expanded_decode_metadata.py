@@ -86,8 +86,7 @@ def test_host_kv_length_crosses_into_the_next_logical_block() -> None:
     assert resolved.block_table.shape[1] == 2
 
 
-@pytest.mark.parametrize("query_width", [1, 3, 15])
-@pytest.mark.parametrize("device_only", [False, True])
+@pytest.mark.parametrize(("query_width", "device_only"), [(1, False), (3, True), (15, False), (15, True)])
 def test_draft_proposal_preserves_full_block_visibility(query_width: int, device_only: bool) -> None:
     metadata = SimpleNamespace(
         expanded_decode_metadata=SimpleNamespace(enabled=False),

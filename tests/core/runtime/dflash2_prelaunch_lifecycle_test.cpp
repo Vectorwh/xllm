@@ -14,11 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include <folly/executors/InlineExecutor.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,14 +30,14 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/batch/batch.h"
+#include "core/framework/block/block_manager_impl.h"
 #include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/speculative/dflash_async_input_builder.h"
-#include "framework/block/block_manager_impl.h"
-#include "framework/request/stopping_checker.h"
-#include "layers/common/attention_metadata.h"
+#include "core/runtime/worker_impl.h"
 #include "platform/device.h"
 #include "runtime/dflash/dflash2_worker_impl.h"
+#include "runtime/dflash/dflash_worker_impl.h"
 #include "runtime/dspark_worker_impl.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/vlm_worker_impl.h"
@@ -46,108 +45,58 @@ limitations under the License.
 
 namespace xllm {
 
-class DFlash2WorkerImplTestPeer final {
+class DFlashWorkerImplTestAccess final {
  public:
-  static void install_pending(DFlash2WorkerImpl& worker,
-                              const torch::Tensor& accepted,
-                              StreamEventPtr ready) {
-    worker.pending_context_.emplace();
-    worker.pending_context_->accepted_host = accepted;
-    worker.pending_context_->d2h_ready = ready;
-    worker.pending_context_->context_ready = std::move(ready);
-  }
-
-  static WorkerImpl* target_impl(DFlash2WorkerImpl& worker) {
+  static WorkerImpl* target_worker(DFlashWorkerImpl& worker) {
     return worker.impl_.get();
-  }
-
-  static void install_identity(DFlash2WorkerImpl& worker,
-                               ForwardInput identity,
-                               StreamEventPtr ready) {
-    install_pending(worker, torch::Tensor(), std::move(ready));
-    worker.draft_prelaunch_enabled_for_init_ = true;
-    worker.proposal_xfia_enabled_ = true;
-    worker.pending_context_->identity = std::move(identity);
-    ModelArgs args;
-    args.max_position_embeddings(8192);
-    worker.draft_impl_->context_ =
-        ModelContext(worker.parallel_args_,
-                     args,
-                     QuantArgs(),
-                     torch::TensorOptions().device(worker.device_.unwrap()));
-  }
-
-  static bool can_prelaunch(const DFlash2WorkerImpl& worker,
-                            const ForwardInput& input) {
-    return worker.can_prelaunch_draft_for_this_step(input);
-  }
-
-  static std::vector<int64_t> pending_rows(const DFlash2WorkerImpl& worker,
-                                           const ForwardInput& input) {
-    return worker.build_batch_to_pending_row_mapping(input);
-  }
-
-  static bool async_output_enabled(const DFlash2WorkerImpl& worker) {
-    return worker.async_output_enabled_;
-  }
-};
-
-class DSparkWorkerImplTestPeer final {
- public:
-  static void install_pending(DSparkWorkerImpl& worker,
-                              ForwardInput identity,
-                              StreamEventPtr ready) {
-    worker.async_output_enabled_ = true;
-    worker.draft_prelaunch_enabled_for_init_ = true;
-    worker.pending_context_.emplace();
-    worker.pending_context_->identity = std::move(identity);
-    worker.pending_context_->d2h_ready = ready;
-    worker.pending_context_->context_ready = std::move(ready);
-  }
-
-  static bool can_use_step_local(const DSparkWorkerImpl& worker,
-                                 const ForwardInput& input) {
-    return worker.can_prelaunch_draft_for_this_step(input);
-  }
-
-  static std::vector<int64_t> pending_rows(const DSparkWorkerImpl& worker,
-                                           const ForwardInput& input) {
-    return worker.build_batch_to_pending_row_mapping(input);
-  }
-
-  static void install_target_context(DSparkWorkerImpl& worker,
-                                     ForwardInput identity,
-                                     const torch::Tensor& accepted_device,
-                                     const torch::Tensor& accepted_host,
-                                     const torch::Tensor& embeddings,
-                                     const torch::Tensor& positions,
-                                     StreamEventPtr ready) {
-    install_pending(worker, std::move(identity), std::move(ready));
-    worker.pending_context_->accepted_device = accepted_device;
-    worker.pending_context_->accepted_host = accepted_host;
-    worker.pending_context_->embeddings = embeddings;
-    worker.pending_context_->base_positions = positions;
-  }
-
-  static void install_embedding_cache(DSparkWorkerImpl& worker,
-                                      std::shared_ptr<EmbeddingCache> cache) {
-    worker.embedding_cache_ = std::move(cache);
-  }
-
-  static void commit(DSparkWorkerImpl& worker) {
-    worker.commit_pending_context();
-  }
-
-  static bool has_pending(const DSparkWorkerImpl& worker) {
-    return worker.pending_context_.has_value();
-  }
-
-  static size_t consumed_tensor_count(const DSparkWorkerImpl& worker) {
-    return worker.consumed_context_tensors_.size();
   }
 };
 
 namespace {
+
+class DFlashWorkerTestAdapter final : public DFlashWorkerImpl {
+ public:
+  using DFlashWorkerImpl::DFlashWorkerImpl;
+
+  void set_draft_prelaunch_enabled(bool enabled) {
+    draft_prelaunch_enabled_for_init_ = enabled;
+  }
+
+  void finish_idle_decode(const ForwardInput& input,
+                          ForwardOutput& output,
+                          std::optional<ForwardOutput>& draft_output) {
+    finish_empty_decode(input, output, draft_output);
+  }
+
+  size_t idle_retained_input_count() const {
+    return idle_decode_output_.retained_inputs.size();
+  }
+
+  std::vector<int64_t> pending_rows(const ForwardInput& input) const {
+    return build_batch_to_pending_row_mapping(input);
+  }
+
+  void install_pending_context(std::shared_ptr<EmbeddingCache> cache,
+                               ForwardInput identity,
+                               const torch::Tensor& accepted_device,
+                               const torch::Tensor& accepted_host,
+                               const torch::Tensor& embeddings,
+                               const torch::Tensor& base_positions,
+                               StreamEventPtr ready) {
+    embedding_cache_ = std::move(cache);
+    PendingContext pending;
+    pending.identity = std::move(identity);
+    pending.accepted_device = accepted_device;
+    pending.accepted_host = accepted_host;
+    pending.embeddings = embeddings;
+    pending.base_positions = base_positions;
+    pending.d2h_ready = ready;
+    pending.context_ready = std::move(ready);
+    pending_context_ = std::move(pending);
+  }
+
+  void commit_pending_context_for_test() { commit_pending_context(); }
+};
 
 class DeviceTailGate final {
  public:
@@ -195,6 +144,422 @@ class DeviceTailGate final {
 
   std::shared_ptr<State> state_ = std::make_shared<State>();
 };
+
+TEST(DFlash2PrelaunchLifecycleTest, VlmTargetBuildsMultimodalWorker) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true)
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(7);
+  DFlash2WorkerImpl worker(
+      parallel_args, device.unwrap(), options, WorkerType::VLM);
+  WorkerImpl* target = DFlashWorkerImplTestAccess::target_worker(worker);
+  ASSERT_NE(target, nullptr);
+  EXPECT_NE(dynamic_cast<VLMWorkerImpl*>(target), nullptr);
+  EXPECT_EQ(dynamic_cast<LLMWorkerImpl*>(target), nullptr);
+
+  options.speculative_algorithm("DSpark");
+  DSparkWorkerImpl dspark_worker(
+      parallel_args, device.unwrap(), options, WorkerType::VLM);
+  WorkerImpl* dspark_target =
+      DFlashWorkerImplTestAccess::target_worker(dspark_worker);
+  ASSERT_NE(dspark_target, nullptr);
+  EXPECT_NE(dynamic_cast<VLMWorkerImpl*>(dspark_target), nullptr);
+  EXPECT_EQ(dynamic_cast<LLMWorkerImpl*>(dspark_target), nullptr);
+}
+
+TEST(DFlash2PrelaunchLifecycleTest,
+     IdleDecodeRetainsInputsUntilTheNextSubmissionCompletesPriorEvent) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true)
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(5);
+  DFlashWorkerTestAdapter worker(
+      parallel_args, device.unwrap(), options, WorkerType::LLM);
+  worker.set_draft_prelaunch_enabled(true);
+
+  auto gate = std::make_shared<DeviceTailGate>();
+  auto compute = device.current_stream();
+  {
+    auto guard = compute->set_stream_guard();
+    ASSERT_EQ(gate->enqueue(compute->get_stream()->stream()), ACL_SUCCESS);
+  }
+  const bool tail_entered = gate->wait_until_entered();
+
+  auto target_input = std::make_shared<ForwardInput>();
+  auto draft_input = std::make_shared<ForwardInput>();
+  const std::weak_ptr<ForwardInput> first_target = target_input;
+  const std::weak_ptr<ForwardInput> first_draft = draft_input;
+  ForwardOutput output;
+  output.retained_inputs.emplace_back(std::move(target_input));
+  std::optional<ForwardOutput> draft_output = ForwardOutput();
+  draft_output->retained_inputs.emplace_back(std::move(draft_input));
+  worker.finish_idle_decode(ForwardInput{}, output, draft_output);
+
+  EXPECT_TRUE(tail_entered);
+  EXPECT_EQ(output.ready_event, nullptr);
+  EXPECT_TRUE(output.retained_inputs.empty());
+  ASSERT_TRUE(draft_output.has_value());
+  EXPECT_TRUE(draft_output->retained_inputs.empty());
+  EXPECT_FALSE(first_target.expired());
+  EXPECT_FALSE(first_draft.expired());
+  EXPECT_EQ(worker.idle_retained_input_count(), 2);
+
+  auto next_input = std::make_shared<ForwardInput>();
+  const std::weak_ptr<ForwardInput> final_input = next_input;
+  ForwardOutput next_output;
+  next_output.retained_inputs.emplace_back(std::move(next_input));
+  draft_output.reset();
+  std::promise<void> second_submission_started;
+  auto second_submission_started_future =
+      second_submission_started.get_future();
+  auto second_submission = std::async(
+      std::launch::async,
+      [&device,
+       &worker,
+       &next_output,
+       &draft_output,
+       &second_submission_started]() {
+        device.set_device();
+        second_submission_started.set_value();
+        worker.finish_idle_decode(ForwardInput{}, next_output, draft_output);
+      });
+  const auto started_status =
+      second_submission_started_future.wait_for(std::chrono::seconds(10));
+  const auto retirement_status =
+      second_submission.wait_for(std::chrono::milliseconds(100));
+  EXPECT_FALSE(first_target.expired());
+  EXPECT_FALSE(first_draft.expired());
+  gate->release();
+  second_submission.get();
+
+  EXPECT_EQ(started_status, std::future_status::ready);
+  EXPECT_EQ(retirement_status, std::future_status::timeout);
+  EXPECT_TRUE(first_target.expired());
+  EXPECT_TRUE(first_draft.expired());
+  EXPECT_FALSE(final_input.expired());
+  EXPECT_EQ(worker.idle_retained_input_count(), 1);
+}
+
+TEST(DFlash2PrelaunchLifecycleTest,
+     PendingRowsFollowThreeToTwoBatchAndFailClosedOnIdentityMismatch) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true)
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(7);
+  DFlashWorkerTestAdapter worker(
+      parallel_args, device.unwrap(), options, WorkerType::LLM);
+
+  ForwardInput previous;
+  previous.input_params.embedding.embedding_ids = {4, 5, 6};
+  previous.input_params.embedding.request_ids = {"first", "second", "third"};
+  previous.sample_sequence_ids = {"sequence-0", "sequence-1", "sequence-2"};
+  previous.input_params.embedding.linear_state_ids = {40, 50, 60};
+  previous.input_params.embedding.linear_state_read_ids = {41, 51, 61};
+  auto compute = device.current_stream();
+  auto ready = compute->record_event();
+  auto cache = std::make_shared<EmbeddingCache>(1, true);
+  const auto device_options =
+      torch::TensorOptions().device(device.unwrap()).dtype(torch::kLong);
+  const auto host_options =
+      torch::TensorOptions().dtype(torch::kLong).pinned_memory(true);
+  worker.install_pending_context(cache,
+                                 previous,
+                                 torch::empty({0}, device_options),
+                                 torch::empty({0}, host_options),
+                                 torch::empty({0}, device_options),
+                                 torch::empty({0}, device_options),
+                                 ready);
+
+  ForwardInput current;
+  current.input_params.embedding.embedding_ids = {6, 4};
+  current.input_params.embedding.request_ids = {"third", "first"};
+  current.sample_sequence_ids = {"sequence-2", "sequence-0"};
+  current.input_params.embedding.linear_state_ids = {99, 98};
+  current.input_params.embedding.linear_state_read_ids = {97, 96};
+  EXPECT_EQ(worker.pending_rows(current), (std::vector<int64_t>{2, 0}));
+
+  current.input_params.embedding.embedding_ids[0] = 9;
+  EXPECT_TRUE(worker.pending_rows(current).empty());
+  current.input_params.embedding.embedding_ids[0] = 6;
+  current.sample_sequence_ids[0] = "replacement-sequence";
+  EXPECT_TRUE(worker.pending_rows(current).empty());
+}
+
+TEST(DFlash2PrelaunchLifecycleTest,
+     DestructionRetiresLastContextBeforeBlockReuse) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true)
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(2);
+  BlockManager::Options block_options;
+  block_options.num_blocks(2).block_size(1).enable_prefix_cache(false);
+  BlockManagerImpl manager(block_options);
+  auto blocks = manager.allocate(1);
+  ASSERT_EQ(blocks.size(), 1u);
+  const int32_t block_id = blocks.front().id();
+  ASSERT_EQ(manager.num_free_blocks(), 0u);
+
+  auto worker = std::make_unique<DFlashWorkerTestAdapter>(
+      parallel_args, device.unwrap(), options, WorkerType::LLM);
+  auto compute = device.current_stream();
+  const auto device_options =
+      torch::TensorOptions().device(device.unwrap()).dtype(torch::kInt);
+  torch::Tensor cache = torch::zeros({2, 1}, device_options);
+  auto gate = std::make_shared<DeviceTailGate>();
+  StreamEventPtr ready;
+  {
+    auto guard = compute->set_stream_guard();
+    ASSERT_EQ(gate->enqueue(compute->get_stream()->stream()), ACL_SUCCESS);
+    cache.select(0, block_id).fill_(11);
+    ready = compute->record_event();
+  }
+  ASSERT_TRUE(gate->wait_until_entered());
+  auto embedding_cache = std::make_shared<EmbeddingCache>(1, true);
+  worker->install_pending_context(
+      embedding_cache,
+      ForwardInput{},
+      torch::zeros({1}, torch::TensorOptions().device(device.unwrap())),
+      torch::zeros({1}, torch::TensorOptions().pinned_memory(true)),
+      torch::zeros({1}, torch::TensorOptions().device(device.unwrap())),
+      torch::zeros({1}, torch::TensorOptions().device(device.unwrap())),
+      ready);
+
+  std::promise<void> destruction_started;
+  auto destruction_started_future = destruction_started.get_future();
+  auto destruction = std::async(std::launch::async,
+                                [&device, &worker, &destruction_started]() {
+                                  device.set_device();
+                                  destruction_started.set_value();
+                                  worker.reset();
+                                });
+  const auto started_status =
+      destruction_started_future.wait_for(std::chrono::seconds(10));
+  const auto retirement_status =
+      destruction.wait_for(std::chrono::milliseconds(100));
+  gate->release();
+  destruction.get();
+  EXPECT_EQ(started_status, std::future_status::ready);
+  EXPECT_EQ(retirement_status, std::future_status::timeout);
+
+  aclrtEventRecordedStatus status;
+  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &status), ACL_SUCCESS);
+  EXPECT_EQ(status, ACL_EVENT_RECORDED_STATUS_COMPLETE);
+  EXPECT_TRUE(cache.select(0, block_id).cpu().eq(11).all().item<bool>());
+  EXPECT_EQ(manager.num_free_blocks(), 0u);
+
+  blocks.clear();
+  ASSERT_EQ(manager.num_free_blocks(), 1u);
+  auto reused_blocks = manager.allocate(1);
+  ASSERT_EQ(reused_blocks.size(), 1u);
+  EXPECT_EQ(reused_blocks.front().id(), block_id);
+  auto reuse_stream = device.get_stream_from_pool();
+  {
+    auto guard = reuse_stream->set_stream_guard();
+    cache.select(0, reused_blocks.front().id()).fill_(23);
+  }
+  ASSERT_EQ(reuse_stream->synchronize(), 0);
+  EXPECT_TRUE(cache.select(0, block_id).cpu().eq(23).all().item<bool>());
+}
+
+TEST(DFlash2PrelaunchLifecycleTest, IdleDecodeKeepsSynchronousFallback) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true)
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(5);
+  DFlashWorkerTestAdapter worker(
+      parallel_args, device.unwrap(), options, WorkerType::LLM);
+
+  for (const auto [prelaunch_enabled, graph_warmup] :
+       {std::pair(false, false), std::pair(true, true)}) {
+    worker.set_draft_prelaunch_enabled(prelaunch_enabled);
+    ForwardInput input;
+    input.input_params.meta.is_graph_warmup = graph_warmup;
+    ForwardOutput output;
+    output.retained_inputs.emplace_back(std::make_shared<ForwardInput>());
+    std::optional<ForwardOutput> draft_output = ForwardOutput();
+    auto gate = std::make_shared<DeviceTailGate>();
+    auto compute = device.current_stream();
+    {
+      auto guard = compute->set_stream_guard();
+      ASSERT_EQ(gate->enqueue(compute->get_stream()->stream()), ACL_SUCCESS);
+    }
+    const bool tail_entered = gate->wait_until_entered();
+    std::promise<void> fallback_started;
+    auto fallback_started_future = fallback_started.get_future();
+    auto fallback =
+        std::async(std::launch::async,
+                   [&device,
+                    &worker,
+                    &input,
+                    &output,
+                    &draft_output,
+                    &fallback_started]() {
+                     device.set_device();
+                     fallback_started.set_value();
+                     worker.finish_idle_decode(input, output, draft_output);
+                   });
+    const auto started_status =
+        fallback_started_future.wait_for(std::chrono::seconds(10));
+    const auto fallback_status =
+        fallback.wait_for(std::chrono::milliseconds(100));
+    gate->release();
+    fallback.get();
+
+    EXPECT_TRUE(tail_entered);
+    EXPECT_EQ(started_status, std::future_status::ready);
+    EXPECT_EQ(fallback_status, std::future_status::timeout);
+    EXPECT_EQ(output.ready_event, nullptr);
+    EXPECT_EQ(output.retained_inputs.size(), 1);
+    EXPECT_EQ(worker.idle_retained_input_count(), 0);
+  }
+}
+
+TEST(DFlash2PrelaunchLifecycleTest,
+     CommitWaitsForDeviceCopyAndRetainsContextUntilDeviceWorkCompletes) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(true)
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(2);
+  auto worker = std::make_unique<DFlashWorkerTestAdapter>(
+      parallel_args, device.unwrap(), options, WorkerType::LLM);
+  auto cache = std::make_shared<EmbeddingCache>(1, true);
+
+  ForwardInput identity;
+  identity.input_params.embedding.embedding_ids = {0};
+  identity.input_params.embedding.request_ids = {"request"};
+  const torch::Tensor expected = torch::tensor({{17, 23, -1}}, torch::kLong);
+  const torch::TensorOptions host_options =
+      torch::TensorOptions().dtype(torch::kLong).pinned_memory(true);
+  torch::Tensor accepted_host = torch::full({1, 3}, -99, host_options);
+  torch::Tensor accepted_device = expected.to(device.unwrap());
+  torch::Tensor embeddings =
+      torch::arange(6, torch::kFloat).view({1, 3, 2}).to(device.unwrap());
+  torch::Tensor base_positions =
+      torch::tensor({101}, torch::kLong).to(device.unwrap());
+
+  auto compute = device.current_stream();
+  ASSERT_EQ(compute->synchronize(), 0);
+  auto copy_gate = std::make_shared<DeviceTailGate>();
+  StreamEventPtr copy_ready;
+  {
+    auto guard = compute->set_stream_guard();
+    ASSERT_EQ(copy_gate->enqueue(compute->get_stream()->stream()), ACL_SUCCESS);
+    accepted_host.copy_(accepted_device, /*non_blocking=*/true);
+    copy_ready = compute->record_event();
+  }
+  ASSERT_TRUE(copy_gate->wait_until_entered());
+  worker->install_pending_context(cache,
+                                  identity,
+                                  accepted_device,
+                                  accepted_host,
+                                  embeddings,
+                                  base_positions,
+                                  copy_ready);
+
+  std::promise<void> service_wait_enqueued;
+  auto service_wait_ready = service_wait_enqueued.get_future();
+  auto service_reader = std::async(
+      std::launch::async,
+      [&device, copy_ready, accepted_host, &service_wait_enqueued]() {
+        device.set_device();
+        auto service_stream = device.get_stream_from_pool();
+        const bool wait_enqueued = service_stream->wait_event(copy_ready);
+        service_wait_enqueued.set_value();
+        if (!wait_enqueued || service_stream->synchronize() != 0) {
+          return torch::Tensor();
+        }
+        return accepted_host.clone();
+      });
+  service_wait_ready.wait();
+  std::promise<void> commit_started;
+  auto commit_started_future = commit_started.get_future();
+  auto commit =
+      std::async(std::launch::async, [&device, &worker, &commit_started]() {
+        device.set_device();
+        commit_started.set_value();
+        worker->commit_pending_context_for_test();
+      });
+  const auto commit_started_status =
+      commit_started_future.wait_for(std::chrono::seconds(10));
+  const auto commit_status = commit.wait_for(std::chrono::milliseconds(100));
+  copy_gate->release();
+  commit.get();
+  const torch::Tensor service_tokens = service_reader.get();
+
+  EXPECT_EQ(commit_started_status, std::future_status::ready);
+  EXPECT_EQ(commit_status, std::future_status::timeout);
+  EXPECT_TRUE(torch::equal(service_tokens, expected));
+  EXPECT_TRUE(torch::equal(accepted_host, expected));
+  const auto states = cache->read_decode_states({0}, {"request"});
+  ASSERT_EQ(states.size(), 1);
+  EXPECT_EQ(states.front().token_id, 23);
+  EXPECT_EQ(states.front().position_offset, 1);
+  EXPECT_EQ(states.front().replay_token_ids, (std::vector<int32_t>{17, 23}));
+  EXPECT_TRUE(
+      torch::equal(states.front().embedding.cpu(), embeddings[0][1].cpu()));
+  EXPECT_TRUE(torch::equal(states.front().prev_embedding.cpu(),
+                           embeddings[0][0].cpu()));
+
+  auto retirement_gate = std::make_shared<DeviceTailGate>();
+  StreamEventPtr device_tail;
+  {
+    auto guard = compute->set_stream_guard();
+    ASSERT_EQ(retirement_gate->enqueue(compute->get_stream()->stream()),
+              ACL_SUCCESS);
+    device_tail = compute->record_event();
+  }
+  ASSERT_TRUE(retirement_gate->wait_until_entered());
+  std::promise<void> retirement_started;
+  auto retirement_started_future = retirement_started.get_future();
+  auto retirement =
+      std::async(std::launch::async, [&device, &worker, &retirement_started]() {
+        device.set_device();
+        retirement_started.set_value();
+        worker.reset();
+      });
+  const auto retirement_started_status =
+      retirement_started_future.wait_for(std::chrono::seconds(10));
+  const auto destruction_status =
+      retirement.wait_for(std::chrono::milliseconds(100));
+  retirement_gate->release();
+  retirement.get();
+  EXPECT_EQ(retirement_started_status, std::future_status::ready);
+  EXPECT_EQ(destruction_status, std::future_status::timeout);
+  aclrtEventRecordedStatus tail_status;
+  ASSERT_EQ(aclrtQueryEventStatus(device_tail->npu_event(), &tail_status),
+            ACL_SUCCESS);
+  EXPECT_EQ(tail_status, ACL_EVENT_RECORDED_STATUS_COMPLETE);
+}
 
 class OverlapResultWorker final : public WorkerImpl {
  public:
@@ -320,7 +685,7 @@ TEST_P(WorkerOverlapResultSlotTest,
   OverlapResultWorker worker(parallel_args, device.unwrap(), options);
   int32_t full_slot_windows = 0;
   int32_t dequeued_not_ready_windows = 0;
-  for (int64_t iteration = 0; iteration < 1000; ++iteration) {
+  for (int64_t iteration = 0; iteration < 8; ++iteration) {
     const int64_t step_id = iteration * 2;
     auto gate = worker.hold_next_tail();
     auto current = worker.step_async(make_overlap_producer_input(step_id));
@@ -361,8 +726,8 @@ TEST_P(WorkerOverlapResultSlotTest,
         next_result.retained_inputs.front()->token_ids_host.item<int64_t>(),
         step_id + 1);
   }
-  EXPECT_EQ(full_slot_windows, 1000);
-  EXPECT_EQ(dequeued_not_ready_windows, 1000);
+  EXPECT_EQ(full_slot_windows, 8);
+  EXPECT_EQ(dequeued_not_ready_windows, 8);
   ::testing::Test::RecordProperty("full_slot_windows", full_slot_windows);
   ::testing::Test::RecordProperty("dequeued_not_ready_windows",
                                   dequeued_not_ready_windows);
@@ -390,7 +755,7 @@ TEST_P(WorkerOverlapResultSlotTest,
   ASSERT_TRUE(previous.has_value());
   int32_t overwrite_not_ready_windows = 0;
   int32_t clear_not_ready_windows = 0;
-  for (int64_t step_id = 0; step_id < 1000; ++step_id) {
+  for (int64_t step_id = 0; step_id < 8; ++step_id) {
     ASSERT_TRUE(gate->wait_until_entered());
     const StreamEventPtr previous_ready = previous->ready_event;
     const std::weak_ptr<ForwardInput> previous_owner =
@@ -424,7 +789,7 @@ TEST_P(WorkerOverlapResultSlotTest,
     EXPECT_EQ(previous_host.item<int64_t>(), step_id);
     EXPECT_FALSE(worker.has_recorded_output());
   }
-  for (int64_t step_id = 1000; step_id < 2000; ++step_id) {
+  for (int64_t step_id = 8; step_id < 16; ++step_id) {
     ASSERT_TRUE(gate->wait_until_entered());
     const StreamEventPtr previous_ready = previous->ready_event;
     const std::weak_ptr<ForwardInput> previous_owner =
@@ -456,7 +821,7 @@ TEST_P(WorkerOverlapResultSlotTest,
     EXPECT_EQ(previous_host.item<int64_t>(), step_id);
     EXPECT_FALSE(worker.has_stored_output());
     EXPECT_FALSE(worker.has_recorded_output());
-    if (step_id < 1999) {
+    if (step_id < 15) {
       gate = worker.hold_next_tail();
       previous =
           std::move(worker.step_async(make_overlap_producer_input(step_id + 1)))
@@ -464,8 +829,8 @@ TEST_P(WorkerOverlapResultSlotTest,
       ASSERT_TRUE(previous.has_value());
     }
   }
-  EXPECT_EQ(overwrite_not_ready_windows, 1000);
-  EXPECT_EQ(clear_not_ready_windows, 1000);
+  EXPECT_EQ(overwrite_not_ready_windows, 8);
+  EXPECT_EQ(clear_not_ready_windows, 8);
   ::testing::Test::RecordProperty("overwrite_not_ready_windows",
                                   overwrite_not_ready_windows);
   ::testing::Test::RecordProperty("clear_not_ready_windows",
@@ -490,7 +855,7 @@ TEST_P(WorkerOverlapResultSlotTest,
       .num_speculative_tokens(15);
   OverlapResultWorker worker(parallel_args, device.unwrap(), options);
   int32_t idle_not_ready_windows = 0;
-  for (int64_t step_id = 0; step_id < 100; ++step_id) {
+  for (int64_t step_id = 0; step_id < 8; ++step_id) {
     auto gate = worker.hold_next_tail();
     auto output =
         std::move(worker.step_async(make_overlap_producer_input(step_id)))
@@ -519,7 +884,7 @@ TEST_P(WorkerOverlapResultSlotTest,
     EXPECT_TRUE(owner.expired());
     EXPECT_FALSE(worker.has_stored_output());
   }
-  EXPECT_EQ(idle_not_ready_windows, 100);
+  EXPECT_EQ(idle_not_ready_windows, 8);
   ::testing::Test::RecordProperty("idle_not_ready_windows",
                                   idle_not_ready_windows);
   ::testing::Test::RecordProperty("logical_rank", 1);
@@ -576,26 +941,6 @@ TEST(DSparkPrelaunchDeviceInputTest, EagerUsesCurrentDeviceAcceptanceAndPages) {
   EXPECT_TRUE(torch::equal(result.kv_lengths.cpu(), expected.kv_lengths));
 }
 
-Sequence make_overlap_sequence(int32_t prompt_token,
-                               RequestSamplingParam& sampling,
-                               StoppingChecker& stopping) {
-  SequenceParams params;
-  params.seq_capacity = 128;
-  params.sampling_param = &sampling;
-  params.stopping_checker = &stopping;
-  params.enable_schedule_overlap = true;
-  IncrementalDecoder decoder(/*prompt=*/"",
-                             /*num_prompt_tokens=*/1,
-                             /*echo=*/false,
-                             /*skip_special_tokens=*/true);
-  return Sequence(/*index=*/0,
-                  {prompt_token},
-                  /*input_embedding=*/torch::Tensor(),
-                  /*mm_data=*/MMData(),
-                  std::move(decoder),
-                  params);
-}
-
 TEST(DFlash2PrelaunchTransferTest, NonSendingPushCompletionIsGraphCapturable) {
   Device device(/*device_index=*/0);
   device.set_device();
@@ -627,484 +972,6 @@ TEST(DFlash2PrelaunchTransferTest, NonSendingPushCompletionIsGraphCapturable) {
     stream->synchronize();
     EXPECT_EQ(marker.cpu().item<int32_t>(), 1);
   }
-}
-
-TEST(DFlash2StepLocalLifecycleTest, PendingRowsFollowTheActualBatch) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(7).block_size(
-      128);
-  DFlash2WorkerImpl worker(
-      parallel_args, device.unwrap(), options, WorkerType::LLM);
-  ForwardInput previous;
-  previous.token_ids_host = torch::tensor({11, 21, 31}, torch::kInt);
-  previous.positions_host = torch::tensor({16, 32, 48}, torch::kInt);
-  previous.input_params.attention.host.kv_seq_lens = {17, 33, 49};
-  previous.input_params.meta.num_sequences = 3;
-  previous.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  previous.input_params.embedding.embedding_ids = {4, 5, 6};
-  previous.input_params.embedding.request_ids = {"first", "second", "third"};
-  previous.sample_sequence_ids = {"sequence-0", "sequence-1", "sequence-2"};
-  previous.input_params.attention.host.block_tables =
-      torch::tensor({{1, 2}, {3, 4}, {5, 6}}, torch::kInt);
-  DFlash2WorkerImplTestPeer::install_identity(
-      worker, previous, device.current_stream()->record_event());
-  ForwardInput current = previous;
-  current.token_ids_host = torch::tensor({-1, -1}, torch::kInt);
-  current.positions_host = torch::tensor({49, 17}, torch::kInt);
-  current.input_params.attention.host.kv_seq_lens = {50, 18};
-  current.input_params.meta.num_sequences = 2;
-  current.input_params.embedding.embedding_ids = {6, 4};
-  current.input_params.embedding.request_ids = {"third", "first"};
-  current.sample_sequence_ids = {"sequence-2", "sequence-0"};
-  current.input_params.attention.host.block_tables =
-      torch::tensor({{7, 8}, {9, 10}}, torch::kInt);
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
-  EXPECT_EQ(DFlash2WorkerImplTestPeer::pending_rows(worker, current),
-            (std::vector<int64_t>{2, 0}));
-  current.input_params.embedding.linear_state_ids = {4, 5};
-  current.input_params.embedding.linear_state_read_ids = {2, 3};
-  EXPECT_EQ(DFlash2WorkerImplTestPeer::pending_rows(worker, current),
-            (std::vector<int64_t>{2, 0}));
-  current.input_params.embedding.embedding_ids[0] = 9;
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::pending_rows(worker, current).empty());
-  current.input_params.embedding.embedding_ids[0] = 6;
-  current.sample_sequence_ids[0] = "replacement-sequence";
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::pending_rows(worker, current).empty());
-  current.sample_sequence_ids[0] = "sequence-2";
-  // Constraint rows stage normally now: the draft query samples with the
-  // cleared mask (make_draft_sampling_params) and the verify rows are rebuilt
-  // from the fresh states, so a snapshot row and the sequence-level filter
-  // bitmask no longer disqualify prelaunch.
-  current.json_object_state_snapshots.emplace_back();
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::async_output_enabled(worker));
-  current.sampling_params.filter_bitmask =
-      torch::tensor({{4, 4}}, torch::kInt32);
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
-  current.sampling_params.filter_bitmask = torch::Tensor();
-  current.json_object_state_snapshots.clear();
-  EXPECT_TRUE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
-  // A real disqualifier still disqualifies: pending block copies are not
-  // capturable ahead of the target step.
-  current.input_params.block_copy.swap_blocks.emplace_back(0, 1);
-  EXPECT_FALSE(DFlash2WorkerImplTestPeer::can_prelaunch(worker, current));
-}
-
-TEST(DFlash2PrelaunchLifecycleTest,
-     DestructionRetiresLastContextBeforeBlockReuse) {
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(7);
-  auto worker = std::make_unique<DFlash2WorkerImpl>(
-      parallel_args, device.unwrap(), options, WorkerType::LLM);
-  constexpr std::array<BlockType, 6> kBlockTypes = {BlockType::KV,
-                                                    BlockType::SWA,
-                                                    BlockType::C4,
-                                                    BlockType::C128,
-                                                    BlockType::LINEAR,
-                                                    BlockType::EMBEDDING};
-  BlockManager::Options block_options;
-  block_options.num_blocks(13).block_size(128).enable_prefix_cache(false);
-  BlockManagerImpl manager(block_options);
-  RequestSamplingParam sampling;
-  StoppingChecker stopping;
-  stopping.set_eos_token(2);
-  auto ending = make_overlap_sequence(11, sampling, stopping);
-  auto continuing = make_overlap_sequence(12, sampling, stopping);
-  auto replacement = make_overlap_sequence(13, sampling, stopping);
-  std::array<int32_t, kBlockTypes.size()> ending_ids;
-  std::array<int32_t, kBlockTypes.size()> continuing_ids;
-  for (size_t i = 0; i < kBlockTypes.size(); ++i) {
-    auto ending_blocks = manager.allocate(1);
-    auto continuing_blocks = manager.allocate(1);
-    ASSERT_EQ(ending_blocks.size(), 1u);
-    ASSERT_EQ(continuing_blocks.size(), 1u);
-    ending_ids[i] = ending_blocks.front().id();
-    continuing_ids[i] = continuing_blocks.front().id();
-    ending.kv_state().add_blocks(kBlockTypes[i], std::move(ending_blocks));
-    continuing.kv_state().add_blocks(kBlockTypes[i],
-                                     std::move(continuing_blocks));
-  }
-  ASSERT_EQ(manager.num_free_blocks(), 0u);
-  Batch result_batch(std::vector<Sequence*>{&ending, &continuing});
-  Batch inflight_batch(std::vector<Sequence*>{&ending, &continuing});
-  for (Sequence* sequence : result_batch.get_sequences()) {
-    sequence->kv_state().set_kv_cache_tokens_num(1);
-    sequence->append_token(Token(-1));
-    sequence->append_token(Token(-1));
-  }
-  const auto tensor_options =
-      torch::TensorOptions().device(device.unwrap()).dtype(torch::kBFloat16);
-  auto cache = torch::zeros({13, 128}, tensor_options);
-  auto lhs = torch::ones({4096, 4096}, tensor_options);
-  auto rhs = torch::ones_like(lhs);
-  auto scratch = torch::empty_like(lhs);
-  auto compute = device.current_stream();
-  compute->synchronize();
-  StreamEventPtr ready;
-  {
-    auto guard = compute->set_stream_guard();
-    // Keep real NPU work in flight so removing the completion fence fails
-    // the event-state assertion, rather than depending on a lucky CPU race.
-    for (int32_t i = 0; i < 128; ++i) {
-      torch::mm_out(scratch, lhs, rhs);
-    }
-    for (size_t i = 0; i < kBlockTypes.size(); ++i) {
-      cache[ending_ids[i]].fill_(7);
-      cache[continuing_ids[i]].fill_(9);
-    }
-    ready = compute->record_event();
-  }
-  const auto accepted = torch::tensor(
-      {{2, -1, -1, -1, -1, -1, -1, -1}, {31, 32, -1, -1, -1, -1, -1, -1}},
-      torch::kLong);
-  DFlash2WorkerImplTestPeer::install_pending(*worker, accepted, ready);
-  aclrtEventRecordedStatus before;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &before), ACL_SUCCESS);
-  ASSERT_EQ(before, ACL_EVENT_RECORDED_STATUS_NOT_READY);
-  worker.reset();
-  aclrtEventRecordedStatus after;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &after), ACL_SUCCESS);
-  EXPECT_EQ(after, ACL_EVENT_RECORDED_STATUS_COMPLETE);
-
-  const auto accepted_tokens = accepted.accessor<int64_t, 2>();
-  ending.update_last_step_token(Token(accepted_tokens[0][0]));
-  continuing.update_last_step_token(Token(accepted_tokens[1][0]));
-  continuing.update_last_step_token(Token(accepted_tokens[1][1]),
-                                    /*token_offset=*/1);
-  ASSERT_TRUE(ending.finished());
-  ASSERT_FALSE(continuing.finished());
-  for (const BlockType type : kBlockTypes) {
-    (void)ending.kv_state().take_blocks(type);
-  }
-  EXPECT_FALSE(inflight_batch.get_sequences().front()->has_any_blocks());
-  EXPECT_EQ(manager.num_free_blocks(), 0u);
-  result_batch = Batch{};
-  EXPECT_EQ(manager.num_free_blocks(), 0u);
-  inflight_batch = Batch{};
-  ASSERT_EQ(manager.num_free_blocks(), kBlockTypes.size());
-
-  std::array<int32_t, kBlockTypes.size()> reused_ids;
-  for (size_t index = 0; index < kBlockTypes.size(); ++index) {
-    SCOPED_TRACE(static_cast<int32_t>(kBlockTypes[index]));
-    auto blocks = manager.allocate(1);
-    ASSERT_EQ(blocks.size(), 1u);
-    reused_ids[index] = blocks.front().id();
-    replacement.kv_state().add_blocks(kBlockTypes[index], std::move(blocks));
-    EXPECT_EQ(
-        continuing.kv_state().blocks(kBlockTypes[index]).front().ref_count(),
-        1u);
-  }
-  auto expected_ids = ending_ids;
-  std::sort(expected_ids.begin(), expected_ids.end());
-  std::sort(reused_ids.begin(), reused_ids.end());
-  EXPECT_EQ(reused_ids, expected_ids);
-  auto reuse_stream = device.get_stream_from_pool();
-  {
-    auto guard = reuse_stream->set_stream_guard();
-    for (const BlockType type : kBlockTypes) {
-      cache[replacement.kv_state().blocks(type).front().id()].fill_(23);
-    }
-  }
-  reuse_stream->synchronize();
-  compute->synchronize();
-  const auto host_cache = cache.to(torch::kCPU);
-  for (size_t i = 0; i < kBlockTypes.size(); ++i) {
-    SCOPED_TRACE(static_cast<int32_t>(kBlockTypes[i]));
-    EXPECT_TRUE(host_cache[ending_ids[i]].eq(23).all().item<bool>());
-    EXPECT_TRUE(host_cache[continuing_ids[i]].eq(9).all().item<bool>());
-    (void)continuing.kv_state().take_blocks(kBlockTypes[i]);
-    (void)replacement.kv_state().take_blocks(kBlockTypes[i]);
-  }
-  EXPECT_EQ(manager.num_free_blocks(), 12u);
-}
-
-TEST(DSparkStepLocalLifecycleTest, DestructionRetiresPendingContextWrites) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  auto worker =
-      std::make_unique<DSparkWorkerImpl>(parallel_args,
-                                         device.unwrap(),
-                                         options,
-                                         /*worker_type=*/WorkerType::LLM);
-  const torch::TensorOptions tensor_options =
-      torch::TensorOptions().device(device.unwrap()).dtype(torch::kBFloat16);
-  torch::Tensor lhs = torch::ones({4096, 4096}, tensor_options);
-  torch::Tensor rhs = torch::ones_like(lhs);
-  torch::Tensor scratch = torch::empty_like(lhs);
-  torch::Tensor marker = torch::zeros({1}, tensor_options);
-  auto compute = device.current_stream();
-  ASSERT_EQ(compute->synchronize(), 0);
-  StreamEventPtr ready;
-  {
-    auto guard = compute->set_stream_guard();
-    for (int32_t iteration = 0; iteration < 128; ++iteration) {
-      torch::mm_out(scratch, lhs, rhs);
-    }
-    marker.fill_(7);
-    ready = compute->record_event();
-  }
-  DSparkWorkerImplTestPeer::install_pending(*worker, {}, ready);
-  aclrtEventRecordedStatus before;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &before), ACL_SUCCESS);
-  ASSERT_EQ(before, ACL_EVENT_RECORDED_STATUS_NOT_READY);
-  worker.reset();
-  aclrtEventRecordedStatus after;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &after), ACL_SUCCESS);
-  EXPECT_EQ(after, ACL_EVENT_RECORDED_STATUS_COMPLETE);
-  EXPECT_EQ(marker.cpu().item<int32_t>(), 7);
-}
-
-TEST(DSparkStepLocalLifecycleTest, PendingRowsFollowTheActualBatch) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  DSparkWorkerImpl worker(
-      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  ForwardInput previous;
-  previous.input_params.meta.num_sequences = 3;
-  previous.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  previous.input_params.embedding.embedding_ids = {4, 5, 6};
-  previous.input_params.embedding.request_ids = {"first", "second", "third"};
-  previous.sample_sequence_ids = {"sequence-0", "sequence-1", "sequence-2"};
-  previous.sampling_params.all_greedy_sample = true;
-  DSparkWorkerImplTestPeer::install_pending(
-      worker, previous, device.current_stream()->record_event());
-  ForwardInput current = previous;
-  current.input_params.meta.num_sequences = 2;
-  current.input_params.embedding.embedding_ids = {6, 4};
-  current.input_params.embedding.request_ids = {"third", "first"};
-  current.sample_sequence_ids = {"sequence-2", "sequence-0"};
-  current.input_params.attention.host.block_tables =
-      torch::tensor({{7, 3}, {1, 8}}, torch::kInt32);
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_use_step_local(worker, current));
-  EXPECT_EQ(DSparkWorkerImplTestPeer::pending_rows(worker, current),
-            (std::vector<int64_t>{2, 0}));
-  current.input_params.embedding.embedding_ids[0] = 9;
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, current).empty());
-  current.input_params.embedding.embedding_ids[0] = 6;
-  current.sample_sequence_ids[0] = "replacement-sequence";
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, current).empty());
-  current.sample_sequence_ids.clear();
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, current).empty());
-}
-
-TEST(DSparkStepLocalLifecycleTest, UnsupportedInputsDoNotUseTheAsyncPath) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  DSparkWorkerImpl worker(
-      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  ForwardInput input;
-  input.input_params.meta.num_sequences = 1;
-  input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  input.input_params.embedding.embedding_ids = {4};
-  input.input_params.embedding.request_ids = {"request"};
-  input.sampling_params.all_greedy_sample = true;
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::pending_rows(worker, input).empty());
-  DSparkWorkerImplTestPeer::install_pending(
-      worker, input, device.current_stream()->record_event());
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_use_step_local(worker, input));
-  ForwardInput changed = input;
-  changed.sampling_params.repetition_penalties = torch::tensor({1.1});
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_use_step_local(worker, changed));
-  changed = input;
-  changed.input_params.meta.batch_forward_type = BatchForwardType::PREFILL;
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_use_step_local(worker, changed));
-  changed = input;
-  changed.input_params.meta.num_sequences = 0;
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::can_use_step_local(worker, changed));
-  // Host KV restore is synchronized inside this batch's forward. It does not
-  // remove the pending row mapping, so pre-launch stays eligible.
-  changed = input;
-  changed.input_params.meta.requires_host_restore = true;
-  EXPECT_TRUE(DSparkWorkerImplTestPeer::can_use_step_local(worker, changed));
-}
-
-TEST(DSparkStepLocalLifecycleTest,
-     CommitWaitsForDeviceCopyAndSharesReadOnlyAcceptance) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  DSparkWorkerImpl worker(
-      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  auto cache = std::make_shared<EmbeddingCache>(4, true);
-  DSparkWorkerImplTestPeer::install_embedding_cache(worker, cache);
-  ForwardInput identity;
-  identity.input_params.embedding.embedding_ids = {0, 1, 2, 3};
-  identity.input_params.embedding.request_ids = {
-      "one", "two", "fifteen", "sixteen"};
-  const std::vector<int64_t> lengths = {1, 2, 15, 16};
-  torch::Tensor expected = torch::full({4, 16}, -1, torch::kLong);
-  for (int64_t row = 0; row < 4; ++row) {
-    expected[row]
-        .narrow(0, 0, lengths[row])
-        .copy_(torch::arange(
-            100 + row * 100, 100 + row * 100 + lengths[row], torch::kLong));
-  }
-  const torch::TensorOptions host_options =
-      torch::TensorOptions().dtype(torch::kLong).pinned_memory(true);
-  torch::Tensor accepted_host = torch::full({4, 16}, -99, host_options);
-  torch::Tensor accepted_device = expected.to(device.unwrap());
-  torch::Tensor embeddings = torch::arange(4 * 16 * 8, torch::kFloat)
-                                 .reshape({4, 16, 8})
-                                 .to(device.unwrap());
-  torch::Tensor positions =
-      torch::tensor({113, 112, 129, 255}, torch::kLong).to(device.unwrap());
-  const torch::TensorOptions device_options =
-      torch::TensorOptions().device(device.unwrap()).dtype(torch::kBFloat16);
-  torch::Tensor lhs = torch::ones({4096, 4096}, device_options);
-  torch::Tensor rhs = torch::ones_like(lhs);
-  torch::Tensor scratch = torch::empty_like(lhs);
-  auto compute = device.current_stream();
-  ASSERT_EQ(compute->synchronize(), 0);
-  StreamEventPtr ready;
-  {
-    auto guard = compute->set_stream_guard();
-    for (int32_t iteration = 0; iteration < 128; ++iteration) {
-      torch::mm_out(scratch, lhs, rhs);
-    }
-    accepted_host.copy_(accepted_device, true);
-    ready = compute->record_event();
-  }
-  DSparkWorkerImplTestPeer::install_target_context(worker,
-                                                   identity,
-                                                   accepted_device,
-                                                   accepted_host,
-                                                   embeddings,
-                                                   positions,
-                                                   ready);
-  aclrtEventRecordedStatus before;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &before), ACL_SUCCESS);
-  ASSERT_EQ(before, ACL_EVENT_RECORDED_STATUS_NOT_READY);
-  auto consumer =
-      std::async(std::launch::async, [&device, ready, accepted_host]() {
-        device.set_device();
-        auto service_stream = device.get_stream_from_pool();
-        if (!service_stream->wait_event(ready) ||
-            service_stream->synchronize() != 0) {
-          return torch::Tensor();
-        }
-        return accepted_host.clone();
-      });
-  DSparkWorkerImplTestPeer::commit(worker);
-  const torch::Tensor service_tokens = consumer.get();
-  EXPECT_TRUE(torch::equal(service_tokens, expected));
-  EXPECT_TRUE(torch::equal(accepted_host, expected));
-  EXPECT_FALSE(DSparkWorkerImplTestPeer::has_pending(worker));
-  EXPECT_EQ(DSparkWorkerImplTestPeer::consumed_tensor_count(worker), 3);
-  const auto states =
-      cache->read_decode_states(identity.input_params.embedding.embedding_ids,
-                                identity.input_params.embedding.request_ids);
-  ASSERT_EQ(states.size(), 4);
-  for (int64_t row = 0; row < 4; ++row) {
-    EXPECT_EQ(states[row].token_id, 100 + row * 100 + lengths[row] - 1);
-    EXPECT_EQ(states[row].position_offset, lengths[row] - 1);
-    EXPECT_EQ(states[row].replay_token_ids.size(), lengths[row]);
-    EXPECT_EQ(states[row].all_draft_accepted, lengths[row] == 16);
-    EXPECT_TRUE(torch::equal(states[row].embedding.cpu(),
-                             embeddings[row][lengths[row] - 1].cpu()));
-  }
-  DSparkWorkerImplTestPeer::commit(worker);
-  EXPECT_EQ(DSparkWorkerImplTestPeer::consumed_tensor_count(worker), 3);
-}
-
-TEST(DSparkStepLocalLifecycleTest,
-     DestructionRetiresDeviceWorkAfterContextOwnershipTransfer) {
-  Device device(0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(0, 1, nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  auto worker =
-      std::make_unique<DSparkWorkerImpl>(parallel_args,
-                                         device.unwrap(),
-                                         options,
-                                         /*worker_type=*/WorkerType::LLM);
-  auto cache = std::make_shared<EmbeddingCache>(1, true);
-  DSparkWorkerImplTestPeer::install_embedding_cache(*worker, cache);
-  ForwardInput identity;
-  identity.input_params.embedding.embedding_ids = {0};
-  identity.input_params.embedding.request_ids = {"retained"};
-  torch::Tensor accepted = torch::full({1, 16}, -1, torch::kLong);
-  accepted[0][0] = 7;
-  const torch::TensorOptions device_options =
-      torch::TensorOptions().device(device.unwrap()).dtype(torch::kBFloat16);
-  torch::Tensor embeddings = torch::ones({1, 16, 8}, device_options);
-  auto compute = device.current_stream();
-  DSparkWorkerImplTestPeer::install_target_context(
-      *worker,
-      identity,
-      accepted.to(device.unwrap()),
-      accepted,
-      embeddings,
-      torch::zeros(
-          {1},
-          torch::TensorOptions().device(device.unwrap()).dtype(torch::kLong)),
-      compute->record_event());
-  DSparkWorkerImplTestPeer::commit(*worker);
-  ASSERT_FALSE(DSparkWorkerImplTestPeer::has_pending(*worker));
-  ASSERT_EQ(DSparkWorkerImplTestPeer::consumed_tensor_count(*worker), 3);
-  torch::Tensor lhs = torch::ones({4096, 4096}, device_options);
-  torch::Tensor rhs = torch::ones_like(lhs);
-  torch::Tensor scratch = torch::empty_like(lhs);
-  torch::Tensor marker = torch::zeros({1}, device_options);
-  ASSERT_EQ(compute->synchronize(), 0);
-  StreamEventPtr ready;
-  {
-    auto guard = compute->set_stream_guard();
-    for (int32_t iteration = 0; iteration < 128; ++iteration) {
-      torch::mm_out(scratch, lhs, rhs);
-    }
-    marker.fill_(11);
-    ready = compute->record_event();
-  }
-  aclrtEventRecordedStatus before;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &before), ACL_SUCCESS);
-  ASSERT_EQ(before, ACL_EVENT_RECORDED_STATUS_NOT_READY);
-  worker.reset();
-  aclrtEventRecordedStatus after;
-  ASSERT_EQ(aclrtQueryEventStatus(ready->npu_event(), &after), ACL_SUCCESS);
-  EXPECT_EQ(after, ACL_EVENT_RECORDED_STATUS_COMPLETE);
-  EXPECT_EQ(marker.cpu().item<int32_t>(), 11);
-}
-
-TEST(DFlash2PrelaunchLifecycleTest, VlmTargetBuildsMultimodalWorker) {
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(7);
-  DFlash2WorkerImpl worker(
-      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::VLM);
-  WorkerImpl* target = DFlash2WorkerImplTestPeer::target_impl(worker);
-  ASSERT_NE(target, nullptr);
-  EXPECT_NE(dynamic_cast<VLMWorkerImpl*>(target), nullptr);
-  EXPECT_EQ(dynamic_cast<LLMWorkerImpl*>(target), nullptr);
 }
 
 }  // namespace

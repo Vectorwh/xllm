@@ -38,8 +38,6 @@ class DFlash2WorkerImpl final : public DFlashWorkerImpl {
       const std::vector<int64_t>& rows) override;
 
  private:
-  friend class DFlash2WorkerImplTestPeer;
-
   torch::Tensor prepare_draft_noise(const ForwardInput& input) const;
   DraftBlock execute_draft_query(const ForwardInput& input,
                                  ForwardInput query_input,

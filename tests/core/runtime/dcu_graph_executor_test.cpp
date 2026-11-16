@@ -24,8 +24,10 @@ limitations under the License.
 #include <numeric>
 #include <vector>
 
-#include "core/common/global_flags.h"
 #include "core/framework/batch/batch_forward_type.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_args.h"
@@ -60,9 +62,10 @@ class DcuGraphExecutorTestEnvironment final : public ::testing::Environment {
       xllm_device.set_device();
     }
 
-    FLAGS_block_size = 1;
-    FLAGS_max_tokens_per_batch = 128;
-    FLAGS_enable_graph_mode_decode_no_padding = true;
+    KVCacheConfig::get_instance().block_size(1);
+    SchedulerConfig::get_instance().max_tokens_per_batch(128);
+    ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding() =
+        true;
 
     torch::manual_seed(0);
   }
@@ -117,13 +120,14 @@ class FakeSimpleCausalLM final : public CausalLM {
     (void)kv_caches;
     (void)params;
 
+    ++forward_calls_;
     auto token_ids = tokens.to(torch::kInt64);
     auto x = embedding_->forward(token_ids).to(torch::kBFloat16);
     auto y = proj_->forward(x);
 
     auto pos_bias =
         positions.to(y.scalar_type()).reshape({positions.size(0), 1}) *
-        static_cast<double>(0.001);
+        static_cast<double>(1.0);
 
     return ModelOutput(y + pos_bias);
   }
@@ -153,7 +157,10 @@ class FakeSimpleCausalLM final : public CausalLM {
 
   void update_expert_weight(int32_t expert_id) override { (void)expert_id; }
 
+  int32_t forward_calls() const { return forward_calls_; }
+
  private:
+  int32_t forward_calls_ = 0;
   ModelArgs args_;
   torch::Device device_;
   torch::TensorOptions options_;
@@ -310,11 +317,12 @@ TEST(DcuGraphExecutorTest, DecodeCaptureAndReplay) {
     GTEST_SKIP() << "DCU/HIP is not available at runtime.";
   }
 
-  const bool old_enable_graph = FLAGS_enable_graph;
-  const bool old_decode_no_padding = FLAGS_enable_graph_mode_decode_no_padding;
+  const bool old_enable_graph = ExecutionConfig::get_instance().enable_graph();
+  const bool old_decode_no_padding =
+      ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding();
 
-  FLAGS_enable_graph = true;
-  FLAGS_enable_graph_mode_decode_no_padding = true;
+  ExecutionConfig::get_instance().enable_graph(true);
+  ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding(true);
 
   const torch::Device device = InitXllmDcuDeviceForTest(0);
 
@@ -345,21 +353,21 @@ TEST(DcuGraphExecutorTest, DecodeCaptureAndReplay) {
       graph_exec->run(tokens, positions, kv, params).hidden_states.clone();
   DcuSynchronize();
 
+  tokens.add_(1);
+  positions.add_(3);
+  const auto updated_eager =
+      model->forward(tokens, positions, kv, params).hidden_states.clone();
+  const int32_t before_replay = model->forward_calls();
   auto out2 =
       graph_exec->run(tokens, positions, kv, params).hidden_states.clone();
   DcuSynchronize();
+  EXPECT_TRUE(AllCloseBf16(out1, eager_out));
+  EXPECT_TRUE(AllCloseBf16(out2, updated_eager));
+  EXPECT_EQ(model->forward_calls(), before_replay);
 
-  EXPECT_TRUE(AllCloseBf16(out1, eager_out))
-      << "DCU graph capture output should match eager output";
-
-  EXPECT_TRUE(AllCloseBf16(out2, eager_out))
-      << "DCU graph replay output should match eager output";
-
-  EXPECT_TRUE(AllCloseBf16(out1, out2))
-      << "DCU graph capture and replay outputs should match";
-
-  FLAGS_enable_graph = old_enable_graph;
-  FLAGS_enable_graph_mode_decode_no_padding = old_decode_no_padding;
+  ExecutionConfig::get_instance().enable_graph(old_enable_graph);
+  ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding(
+      old_decode_no_padding);
 }
 
 TEST(DcuGraphExecutorTest, PrefillFallsBackToEager) {
@@ -367,9 +375,9 @@ TEST(DcuGraphExecutorTest, PrefillFallsBackToEager) {
     GTEST_SKIP() << "DCU/HIP is not available at runtime.";
   }
 
-  const bool old_enable_graph = FLAGS_enable_graph;
+  const bool old_enable_graph = ExecutionConfig::get_instance().enable_graph();
 
-  FLAGS_enable_graph = true;
+  ExecutionConfig::get_instance().enable_graph(true);
 
   const torch::Device device = InitXllmDcuDeviceForTest(0);
 
@@ -402,6 +410,7 @@ TEST(DcuGraphExecutorTest, PrefillFallsBackToEager) {
       graph_exec->run(tokens, positions, kv, params).hidden_states.clone();
   DcuSynchronize();
 
+  EXPECT_EQ(model->forward_calls(), 2);
   EXPECT_EQ(out.size(0), kNumTokens);
   EXPECT_EQ(out.size(1), args.hidden_size());
 
@@ -409,7 +418,7 @@ TEST(DcuGraphExecutorTest, PrefillFallsBackToEager) {
   EXPECT_TRUE(AllCloseBf16(out, eager_out))
       << "DCU prefill path should fallback to eager and match eager output";
 
-  FLAGS_enable_graph = old_enable_graph;
+  ExecutionConfig::get_instance().enable_graph(old_enable_graph);
 }
 
 }  // namespace

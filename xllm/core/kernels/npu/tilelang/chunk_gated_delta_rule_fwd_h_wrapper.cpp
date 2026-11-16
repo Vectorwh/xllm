@@ -144,7 +144,8 @@ run_tilelang_chunk_gated_delta_rule_fwd_h(
   {
     const auto seq_lens = cu_seqlens.slice(0, 1, cu_seqlens.size(0)) -
                           cu_seqlens.slice(0, 0, cu_seqlens.size(0) - 1);
-    const auto nt_per_seq = (seq_lens + kCompileBT - 1) / kCompileBT;
+    const auto nt_per_seq =
+        torch::floor_divide(seq_lens + kCompileBT - 1, kCompileBT);
     actual_nt_max = nt_per_seq.max().item<int64_t>();
     nt_all = nt_per_seq.sum().item<int64_t>();
     const auto options_int32_npu = k.options().dtype(torch::kInt32);

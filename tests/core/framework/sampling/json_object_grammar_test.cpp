@@ -160,21 +160,31 @@ TEST(JsonObjectGrammarTest, TemporaryAdvanceDoesNotCommitState) {
   EXPECT_TRUE(state.is_complete());
 }
 
-TEST(JsonObjectGrammarTest, MtpDraftStatesAccumulateAcceptedTokens) {
+TEST(JsonObjectGrammarTest, DraftStatesAccumulateAndTrialsDoNotCommit) {
   JsonObjectGrammar grammar = make_grammar();
   std::vector<JsonObjectGrammarState> original_states = {
       grammar.initial_state()};
+  auto after_d0 = original_states;
+  ASSERT_TRUE(after_d0[0].accept_token(/*open_object=*/0));
+  auto cumulative_states = after_d0;
+  ASSERT_TRUE(cumulative_states[0].accept_token(/*quote=*/2));
+  EXPECT_TRUE(cumulative_states[0].can_accept_token(/*key_a=*/3));
+  EXPECT_FALSE(original_states[0].can_accept_token(/*key_a=*/3));
 
-  // The second draft row must be built from S+d0, not from the original S.
-  std::vector<JsonObjectGrammarState> after_d0 = original_states;
-  ASSERT_TRUE(after_d0[0].accept_token(/*d0=*/0));
-  std::vector<JsonObjectGrammarState> cumulative_states = after_d0;
-  ASSERT_TRUE(cumulative_states[0].accept_token(/*d1=*/2));
-  std::vector<JsonObjectGrammarState> reset_states = original_states;
-  ASSERT_FALSE(reset_states[0].can_accept_token(/*d1=*/2));
+  JsonObjectGrammarState state = grammar.initial_state();
+  ASSERT_TRUE(state.accept_piece("{\"a\":"));
+  for (int32_t index = 0; index < 64; ++index) {
+    ASSERT_TRUE(state.accept_token(/*digit_one=*/12));
+  }
+  const std::vector<int32_t> committed_tokens = state.snapshot().token_ids;
+  ASSERT_EQ(committed_tokens.size(), 64u);
+  const uint64_t committed_fingerprint = state.fingerprint();
 
-  EXPECT_TRUE(cumulative_states[0].can_accept_token(/*d2=*/3));
-  EXPECT_FALSE(reset_states[0].can_accept_token(/*d2=*/3));
+  EXPECT_TRUE(state.can_accept_token(/*digit_one=*/12));
+  EXPECT_TRUE(state.can_accept_piece("}"));
+  EXPECT_FALSE(state.can_accept_piece("x"));
+  EXPECT_EQ(state.snapshot().token_ids, committed_tokens);
+  EXPECT_EQ(state.fingerprint(), committed_fingerprint);
 }
 
 TEST(JsonObjectGrammarTest, SnapshotRestoresCommittedState) {
@@ -310,6 +320,8 @@ TEST(JsonObjectGrammarTest, BitmaskMatchesFloatMaskAndCaches) {
   EXPECT_EQ(grammar.allowed_token_bitmask(state), bitmask);
 
   const torch::Tensor float_mask = grammar.build_filter_mask(state);
+  EXPECT_EQ(float_mask.index({12}).item<float>(), 0.0F);
+  EXPECT_LT(float_mask.index({1}).item<float>(), -1.0F);
   const torch::Tensor packed = grammar.build_filter_bitmask(state);
   ASSERT_EQ(
       packed.sizes(),
@@ -341,16 +353,6 @@ TEST(JsonObjectGrammarTest, BuildsMixedBatchBitmask) {
   EXPECT_NE(bitmask.index({0, 0}).item<int32_t>() & 0x1, 0);
   // Unconstrained row is all-ones.
   EXPECT_EQ(bitmask.index({1, 0}).item<int32_t>(), -1);
-}
-
-TEST(JsonObjectGrammarTest, MaskHasNoUnrestrictedFailureFallback) {
-  JsonObjectGrammar grammar = make_grammar();
-  JsonObjectGrammarState state = grammar.initial_state();
-  torch::Tensor mask = grammar.build_filter_mask(state);
-
-  EXPECT_EQ(mask.size(0), static_cast<int64_t>(grammar.vocab_size()));
-  EXPECT_EQ(mask.index({0}).item<float>(), 0.0F);
-  EXPECT_LT(mask.index({1}).item<float>(), -1.0F);
 }
 
 TEST(JsonObjectGrammarTest, KeepsModelOnlyTokensMasked) {
@@ -447,6 +449,8 @@ TEST(JsonObjectGrammarTest, FrozenRowInBatchDeniesEverythingWithoutAborting) {
   const torch::Tensor live_alone = build_filter_bitmask({live});
   ASSERT_EQ(live_alone.size(0), 1);
   EXPECT_TRUE(torch::equal(mask[0], live_alone[0]));
+  EXPECT_NE(mask[0][0].item<int32_t>() & 0x1, 0);
+  EXPECT_EQ(mask[0][0].item<int32_t>() & 0x2, 0);
 }
 
 TEST(JsonObjectGrammarTest, MixedWidthRowIsDeniedInsteadOfAborting) {
@@ -552,6 +556,9 @@ TEST(JsonObjectGrammarTest, BuildsCachedMasksConcurrently) {
     thread.join();
   }
 
+  ASSERT_EQ(masks[0].size(0), static_cast<int64_t>(grammar.vocab_size()));
+  EXPECT_EQ(masks[0].index({0}).item<float>(), 0.0F);
+  EXPECT_LT(masks[0].index({1}).item<float>(), -1.0F);
   for (size_t mask_idx = 1; mask_idx < masks.size(); ++mask_idx) {
     EXPECT_TRUE(torch::equal(masks[0], masks[mask_idx]));
   }
@@ -628,22 +635,6 @@ TEST(JsonObjectGrammarTest, UsesStableDecodeTokenPiecesForGrammar) {
   ASSERT_TRUE(state.accept_token(2));
 
   EXPECT_TRUE(state.can_accept_token(3));
-  EXPECT_FALSE(state.can_accept_piece("x"));
-}
-
-TEST(JsonObjectGrammarTest, TrialAcceptIgnoresCommittedTokenHistorySize) {
-  JsonObjectGrammar grammar = make_grammar();
-  JsonObjectGrammarState state = grammar.initial_state();
-  ASSERT_TRUE(state.accept_piece("{\"a\":"));
-
-  // Grow committed history with digit tokens; can_accept must stay equivalent
-  // without depending on O(generated) vector copies.
-  constexpr int32_t kDigitOneTokenId = 12;
-  for (int32_t i = 0; i < 64; ++i) {
-    ASSERT_TRUE(state.accept_token(kDigitOneTokenId));
-  }
-  EXPECT_TRUE(state.can_accept_token(kDigitOneTokenId));
-  EXPECT_TRUE(state.can_accept_piece("}"));
   EXPECT_FALSE(state.can_accept_piece("x"));
 }
 

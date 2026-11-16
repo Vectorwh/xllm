@@ -185,6 +185,9 @@ TEST(DcpIndexerCandidateTest, MluPrefillSortAllowsRepeatedPadding) {
 }
 
 TEST(DcpIndexerCandidateTest, DecodeGraphRefreshesSlotsAndLengthsOnReplay) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
   const torch::Device device(Platform::type_torch(), 0);
   const auto options =
       torch::TensorOptions().dtype(torch::kInt32).device(device);

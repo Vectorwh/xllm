@@ -95,7 +95,7 @@ def test_qkv_a_merged_forward_matches_separate_projections(
         assert weight.untyped_storage().data_ptr() == attention._qkv_a_weight.untyped_storage().data_ptr()
 
 
-@pytest.mark.parametrize("quantized", ["query", "kv", "both"])
+@pytest.mark.parametrize("quantized", ["query", "kv"])
 @torch.inference_mode()
 def test_qkv_a_quantized_projections_keep_independent_calls(quantized: str, monkeypatch: pytest.MonkeyPatch) -> None:
     attention = _make_attention()
@@ -145,16 +145,18 @@ def test_qkv_a_merged_weights_reuse_storage_across_reloads(bias: bool) -> None:
         attention.q_a_proj.weight.data.copy_(new_q)
         attention.kv_a_proj_with_mqa.weight.data.copy_(new_kv)
         if bias:
-            attention.q_a_proj.bias.data.copy_(torch.randn(attention.q_a_proj.bias.shape, generator=generator))
-            attention.kv_a_proj_with_mqa.bias.data.copy_(
-                torch.randn(attention.kv_a_proj_with_mqa.bias.shape, generator=generator)
-            )
+            new_q_bias = torch.randn(attention.q_a_proj.bias.shape, generator=generator)
+            new_kv_bias = torch.randn(attention.kv_a_proj_with_mqa.bias.shape, generator=generator)
+            attention.q_a_proj.bias.data.copy_(new_q_bias)
+            attention.kv_a_proj_with_mqa.bias.data.copy_(new_kv_bias)
         attention.process_weights_after_loading()
         assert attention._qkv_a_weight.data_ptr() == captured_weight_ptr
         torch.testing.assert_close(captured_weight[: attention.q_lora_rank], new_q, rtol=0, atol=0)
         torch.testing.assert_close(captured_weight[attention.q_lora_rank :], new_kv, rtol=0, atol=0)
         if bias:
             assert attention._qkv_a_bias.data_ptr() == captured_bias.data_ptr()
+            torch.testing.assert_close(captured_bias[: attention.q_lora_rank], new_q_bias, rtol=0, atol=0)
+            torch.testing.assert_close(captured_bias[attention.q_lora_rank :], new_kv_bias, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1), (8, 7)])

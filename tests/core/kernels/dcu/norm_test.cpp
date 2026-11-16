@@ -138,7 +138,8 @@ TEST_F(RmsNormDcuTest, MatchesReference) {
       {"SingleToken", {1, 256}},
       {"ZeroInput", {64, 256}, true},
       {"StridedInput", {64, 256}, false, true},
-      {"3D_12x8192x4096", {12, 8192, 4096}},
+      // Keep the large-row 3D grid; LargeHidden covers the wide-row path.
+      {"3D_12x8192x64", {12, 8192, 64}},
   };
   for (auto dtype : dtypes) {
     for (const auto& c : cases) {
@@ -159,33 +160,32 @@ TEST_F(RmsNormDcuTest, FluxQKTransposedInputMatchesReference) {
   const double eps = 1e-6;
 
   torch::Tensor qkv = torch::randn({batch, seq_len, 3 * hidden}, opts);
-  std::vector<torch::Tensor> chunks = qkv.chunk(3, -1);
   torch::Tensor weight =
       (torch::randn({head_dim}, Opts(torch::kFloat32, device_)) * 0.5 + 1.0)
           .to(dtype);
 
-  for (int32_t chunk_idx : {0, 1}) {
-    torch::Tensor input = chunks[static_cast<size_t>(chunk_idx)]
-                              .view({batch, seq_len, heads, head_dim})
-                              .transpose(1, 2);
+  // Q and K have the same transposed layout and rms_norm has no role-specific
+  // behavior, so one view covers the stride-materialization contract.
+  torch::Tensor input = qkv.slice(-1, 0, hidden)
+                            .view({batch, seq_len, heads, head_dim})
+                            .transpose(1, 2);
 
-    ASSERT_FALSE(input.is_contiguous());
-    ASSERT_EQ(input.stride(-1), 1);
+  ASSERT_FALSE(input.is_contiguous());
+  ASSERT_EQ(input.stride(-1), 1);
 
-    torch::Tensor output = torch::empty(input.sizes(), opts);
-    xllm::kernel::cuda::rms_norm(output, input, weight, eps);
-    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+  torch::Tensor output = torch::empty(input.sizes(), opts);
+  xllm::kernel::cuda::rms_norm(output, input, weight, eps);
+  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    torch::Tensor expected =
-        at::rms_norm(input.cpu(), {head_dim}, weight.cpu(), eps);
-    torch::Tensor diff =
-        (output.cpu().to(torch::kFloat32) - expected.to(torch::kFloat32)).abs();
+  torch::Tensor expected =
+      at::rms_norm(input.cpu(), {head_dim}, weight.cpu(), eps);
+  torch::Tensor diff =
+      (output.cpu().to(torch::kFloat32) - expected.to(torch::kFloat32)).abs();
 
-    EXPECT_TRUE(torch::allclose(output.cpu(), expected, 1e-2, 1e-2))
-        << "Flux q/k transposed input mismatch, chunk_idx=" << chunk_idx
-        << ", max_abs_diff=" << diff.max().item<float>()
-        << ", mean_abs_diff=" << diff.mean().item<float>();
-  }
+  EXPECT_TRUE(torch::allclose(output.cpu(), expected, 1e-2, 1e-2))
+      << "Flux q/k transposed input mismatch"
+      << ", max_abs_diff=" << diff.max().item<float>()
+      << ", mean_abs_diff=" << diff.mean().item<float>();
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +252,9 @@ TEST_F(FusedAddRmsNormDcuTest, MatchesReference) {
       {"Unaligned_100", {64, 100}},
       {"LargeHidden_4096", {64, 4096}},
       {"ManyTokens_8192", {8192, 128}},
-      {"3D_12x8192x4096", {12, 8192, 4096}},
+      // Preserve the 3D shape and 256-token dispatch boundary without an
+      // unnecessary multi-gigabyte allocation.
+      {"3D_2x128x4096", {2, 128, 4096}},
   };
   for (auto dtype : dtypes) {
     for (const auto& c : cases) {

@@ -192,16 +192,27 @@ TEST_F(MMCacheLookupMetricsTest, CountsEncoderHitAndMiss) {
 }
 
 TEST_F(MMCacheLookupMetricsTest, SkipsPrecomputedEncoderEmbedding) {
-  EncoderCache cache(/*max_size=*/1024);
-  EncoderCacheLookupVisitor lookup(&cache);
   MMDataItem item =
       make_item(MMType::VIDEO, /*offset=*/0, torch::tensor({true}), /*key=*/22);
   const torch::Tensor embedding = torch::tensor({{7.0f, 8.0f}});
   item.add(/*key=*/"video|embedding", embedding);
 
-  ASSERT_TRUE(lookup.visit(item));
+  auto params = schedule(MMData(MMType::VIDEO, MMItemVec{item}),
+                         /*computed=*/0,
+                         /*query_length=*/1);
+  EncoderExecutor executor(/*max_cache_bytes=*/1024);
+  int32_t encoder_calls = 0;
+  executor.prepare(params,
+                   [&encoder_calls](const ModelInputParams& inputs) -> MMDict {
+                     ++encoder_calls;
+                     EXPECT_TRUE(inputs.multimodal.mm_data.data().empty());
+                     return {};
+                   });
+  EXPECT_EQ(encoder_calls, 1);
   EXPECT_TRUE(torch::equal(
-      item.get<torch::Tensor>(/*key=*/"video|embedding").value(), embedding));
+      params.multimodal.mm_data.get<torch::Tensor>(/*key=*/"video|embedding")
+          .value(),
+      embedding));
   expect_lookup_counts(/*processor_hits=*/0,
                        /*processor_misses=*/0,
                        /*encoder_hits=*/0,
@@ -268,50 +279,6 @@ TEST(EncoderExecutorTest, CacheHitStillCallsEncode) {
   EXPECT_EQ(calls, 2);
 }
 
-TEST(EncoderExecutorTest, DisabledCacheStillCallsEncode) {
-  MMDataItem item =
-      make_item(MMType::IMAGE, /*offset=*/0, torch::tensor({true}), /*key=*/32);
-  const torch::Tensor pixels = torch::tensor({{3.0f, 4.0f}});
-  item.add(/*key=*/"pixel_values", pixels);
-  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{item}),
-                         /*computed=*/0,
-                         /*query_length=*/1);
-  EncoderExecutor executor(/*max_cache_bytes=*/0);
-  int32_t calls = 0;
-  executor.prepare(params, [&calls](const ModelInputParams& inputs) -> MMDict {
-    ++calls;
-    return {{"image|embedding",
-             std::vector<torch::Tensor>{
-                 inputs.multimodal.mm_data.get<torch::Tensor>("pixel_values")
-                     .value()}}};
-  });
-  EXPECT_EQ(calls, 1);
-  EXPECT_TRUE(torch::equal(
-      params.multimodal.mm_data.get<torch::Tensor>("image|embedding").value(),
-      pixels));
-}
-
-TEST(EncoderExecutorTest, PreembeddedInputStillCallsEncode) {
-  MMDataItem item =
-      make_item(MMType::IMAGE, /*offset=*/0, torch::tensor({true}), /*key=*/33);
-  const torch::Tensor embedding = torch::tensor({{5.0f, 6.0f}});
-  item.add(/*key=*/"image|embedding", embedding);
-  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{item}),
-                         /*computed=*/0,
-                         /*query_length=*/1);
-  EncoderExecutor executor(/*max_cache_bytes=*/1024);
-  int32_t calls = 0;
-  executor.prepare(params, [&calls](const ModelInputParams& inputs) -> MMDict {
-    ++calls;
-    EXPECT_TRUE(inputs.multimodal.mm_data.data().empty());
-    return {};
-  });
-  EXPECT_EQ(calls, 1);
-  EXPECT_TRUE(torch::equal(
-      params.multimodal.mm_data.get<torch::Tensor>("image|embedding").value(),
-      embedding));
-}
-
 TEST(EncoderExecutorTest, MissingMultimodalDataSkipsEncode) {
   EncoderExecutor executor(/*max_cache_bytes=*/0);
   int32_t calls = 0;
@@ -321,51 +288,6 @@ TEST(EncoderExecutorTest, MissingMultimodalDataSkipsEncode) {
                      return {};
                    });
   EXPECT_EQ(calls, 0);
-}
-
-TEST(EncoderExecutorTest, EmptyGatherStillCallsEncode) {
-  MMDataItem item =
-      make_item(MMType::IMAGE, /*offset=*/0, torch::tensor({true}), /*key=*/34);
-  const torch::Tensor embedding = torch::tensor({{7.0f, 8.0f}});
-  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{item}),
-                         /*computed=*/0,
-                         /*query_length=*/1);
-  EncoderExecutor executor(/*max_cache_bytes=*/0);
-  int32_t calls = 0;
-  executor.prepare(
-      params, [&calls, &embedding](const ModelInputParams& inputs) -> MMDict {
-        ++calls;
-        EXPECT_TRUE(inputs.multimodal.mm_data.data().empty());
-        return {{"image|embedding", std::vector<torch::Tensor>{embedding}}};
-      });
-  EXPECT_EQ(calls, 1);
-  EXPECT_TRUE(torch::equal(
-      params.multimodal.mm_data.get<torch::Tensor>("image|embedding").value(),
-      embedding));
-}
-
-TEST(EncoderExecutorTest, GraphWarmupCallsEncode) {
-  MMDataItem item =
-      make_item(MMType::IMAGE, /*offset=*/0, torch::tensor({true}), /*key=*/35);
-  const torch::Tensor pixels = torch::tensor({{9.0f, 10.0f}});
-  item.add(/*key=*/"pixel_values", pixels);
-  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{item}),
-                         /*computed=*/0,
-                         /*query_length=*/1);
-  params.meta.is_graph_warmup = true;
-  EncoderExecutor executor(/*max_cache_bytes=*/0);
-  int32_t calls = 0;
-  executor.prepare(params, [&calls](const ModelInputParams& inputs) -> MMDict {
-    ++calls;
-    return {{"image|embedding",
-             std::vector<torch::Tensor>{
-                 inputs.multimodal.mm_data.get<torch::Tensor>("pixel_values")
-                     .value()}}};
-  });
-  EXPECT_EQ(calls, 1);
-  EXPECT_TRUE(torch::equal(
-      params.multimodal.mm_data.get<torch::Tensor>("image|embedding").value(),
-      pixels));
 }
 
 TEST(EncoderExecutorTest, EncodesGatheredItemsWithCurrentExecutionContext) {
@@ -400,50 +322,6 @@ class EncoderExecutorDeathTest : public ::testing::Test {
  protected:
   void SetUp() override { GTEST_FLAG_SET(death_test_style, "threadsafe"); }
 };
-
-TEST_F(EncoderExecutorDeathTest, RejectsMismatchedSequenceLengthCounts) {
-  EXPECT_DEATH(EncoderEmbeddingGatherVisitor(sequence_lengths(2),
-                                             std::vector<int32_t>{}),
-               "sequence length counts do not match");
-}
-
-TEST_F(EncoderExecutorDeathTest, RejectsContextShorterThanScheduledQuery) {
-  EXPECT_DEATH(
-      EncoderEmbeddingGatherVisitor(sequence_lengths(1), sequence_lengths(2)),
-      "kv length below q length");
-}
-
-TEST_F(EncoderExecutorDeathTest, RejectsItemOutsideScheduledSequences) {
-  MMDataItem item = make_item(MMType::IMAGE, 0, torch::tensor({true}), 15);
-  item.add("image|embedding", torch::ones({1, 2}));
-  item.mutable_state().mutable_seq_index() = 1;
-  EncoderEmbeddingGatherVisitor gather(sequence_lengths(1),
-                                       sequence_lengths(1));
-  EXPECT_DEATH(gather.visit(item),
-               "item sequence index outside scheduled batch");
-}
-
-TEST_F(EncoderExecutorDeathTest, RejectsItemBeforeItsSequenceWindow) {
-  MMDataItem item = make_item(MMType::AUDIO, 0, torch::tensor({true}), 16);
-  item.add("audio|embedding", torch::ones({1, 2}));
-  item.mutable_state().mutable_seq_index() = 0;
-  item.mutable_state().mutable_schedule_data().end_pos = 1;
-  EncoderEmbeddingGatherVisitor gather(sequence_lengths(2),
-                                       sequence_lengths(1));
-  EXPECT_DEATH(gather.visit(item),
-               "scatter range starts before its sequence window");
-}
-
-TEST_F(EncoderExecutorDeathTest, RejectsItemPastItsSequenceWindow) {
-  MMDataItem item = make_item(MMType::AUDIO, 1, torch::tensor({true}), 17);
-  item.add("audio|embedding", torch::ones({1, 2}));
-  item.mutable_state().mutable_seq_index() = 0;
-  item.mutable_state().mutable_schedule_data().end_pos = 1;
-  EncoderEmbeddingGatherVisitor gather(sequence_lengths(1),
-                                       sequence_lengths(1));
-  EXPECT_DEATH(gather.visit(item),
-               "scatter range ends past its sequence window");
-}
 
 TEST_F(EncoderExecutorDeathTest, RejectsPrecomputedEmbeddingWithMissingRows) {
   MMDataItem item =

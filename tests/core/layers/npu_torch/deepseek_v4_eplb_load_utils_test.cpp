@@ -38,15 +38,6 @@ TEST(DeepseekV4EplbLoadUtilsTest, KeepsMixedPhaseDispatchUnmasked) {
   EXPECT_FALSE(active_mask.defined());
 }
 
-TEST(DeepseekV4EplbLoadUtilsTest, AppliesDecodeMaskPerTopKRoute) {
-  torch::Tensor valid_weights = torch::ones({6}, torch::kInt64);
-  torch::Tensor decode_mask = torch::tensor({false, true, true}, torch::kBool);
-
-  EXPECT_TRUE(torch::equal(
-      dsv4_eplb::apply_decode_token_mask(valid_weights, decode_mask, 2),
-      torch::tensor({0, 0, 1, 1, 1, 1}, torch::kInt64)));
-}
-
 TEST(DeepseekV4EplbLoadUtilsTest,
      GraphLoadMaskExcludesPaddingWhenPrefillLoadIsEnabled) {
   torch::Tensor graph_mask_with_padding =

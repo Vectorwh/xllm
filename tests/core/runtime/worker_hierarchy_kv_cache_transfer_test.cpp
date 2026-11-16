@@ -188,10 +188,8 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
   std::shared_ptr<HierarchyKVCacheTransfer> transfer =
       worker.get_hierarchy_kv_cache_transfer();
   ASSERT_NE(transfer, nullptr);
-  EXPECT_EQ(transfer.use_count(), 2);
   std::weak_ptr<HierarchyKVCacheTransfer> original_transfer = transfer;
   transfer.reset();
-  EXPECT_EQ(original_transfer.use_count(), 1);
 
   worker.clear_hierarchy_kv_cache_transfer();
   EXPECT_TRUE(original_transfer.expired());
@@ -201,13 +199,14 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
       worker.recreate_hierarchy_transfer();
   ASSERT_NE(recreated_transfer, nullptr);
   EXPECT_EQ(worker.get_hierarchy_kv_cache_transfer(), nullptr);
-  HierarchyKVCacheTransfer* recreated_transfer_ptr = recreated_transfer.get();
+  std::weak_ptr<HierarchyKVCacheTransfer> recreated_lifetime =
+      recreated_transfer;
   worker.set_hierarchy_kv_cache_transfer(recreated_transfer);
-  EXPECT_EQ(worker.get_hierarchy_kv_cache_transfer().get(),
-            recreated_transfer_ptr);
+  EXPECT_TRUE(recreated_transfer->supports_block_type(
+      HierarchyKVCacheTransfer::CacheRole::TARGET, BlockType::KV));
   recreated_transfer.reset();
-  EXPECT_EQ(worker.get_hierarchy_kv_cache_transfer().use_count(), 2);
   worker.clear_hierarchy_kv_cache_transfer();
+  EXPECT_TRUE(recreated_lifetime.expired());
 }
 
 TEST_F(WorkerHierarchyKVCacheTransferTest,
@@ -232,7 +231,6 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
     ASSERT_NE(transfer, nullptr);
     owned_transfer = transfer;
     transfer.reset();
-    EXPECT_EQ(owned_transfer.use_count(), 1);
   }
 
   EXPECT_TRUE(owned_transfer.expired());

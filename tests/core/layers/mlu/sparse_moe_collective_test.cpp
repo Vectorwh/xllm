@@ -239,24 +239,33 @@ int32_t run_rank(int32_t rank,
     for (const std::vector<int32_t>& counts :
          {std::vector<int32_t>{3, 5}, {1, 5}, {5, 1}}) {
       // A count of one also represents V4.1's empty-rank collective row.
-      torch::Tensor local = make_values(counts[rank],
-                                        model_args.hidden_size(),
-                                        0.5f + static_cast<float>(rank),
-                                        options)
-                                .mul(10.0f);
+      // The ragged case also checks hyper-connection rows: DP metadata counts
+      // tokens, while selected expert execution and slicing operate on rows.
+      const int64_t row_factor = counts[0] == 3 ? 2 : 1;
+      torch::Tensor local_rows = make_values(counts[rank] * row_factor,
+                                             model_args.hidden_size(),
+                                             0.5f + static_cast<float>(rank),
+                                             options)
+                                     .mul(10.0f);
+      torch::Tensor local =
+          row_factor == 1
+              ? local_rows
+              : local_rows.reshape(
+                    {counts[rank], row_factor, model_args.hidden_size()});
       ModelInputParams input;
       input.parallel.dp_global_token_nums = counts;
-      const auto route = block->prep_route(local);
+      const auto route = block->prep_route(local_rows);
       const torch::Tensor actual = block->forward_selected(
           local, route.reduce_weight, route.expert_id, input);
-      const auto reference_route = reference->prep_route(local, std::nullopt);
+      const auto reference_route =
+          reference->prep_route(local_rows, std::nullopt);
       torch::Tensor expected = reference->forward_experts(
-          local, /*enable_all2all_communication=*/false, reference_route);
-      const torch::Tensor shared = reference->forward_shared(local);
+          local_rows, /*enable_all2all_communication=*/false, reference_route);
+      const torch::Tensor shared = reference->forward_shared(local_rows);
       if (shared.defined()) {
         expected.add_(shared);
       }
-      check_output(actual, expected);
+      check_output(actual, expected.reshape(local.sizes()));
     }
     torch_mlu::synchronize();
     return 0;
@@ -500,6 +509,9 @@ class SparseMoECollectiveTest : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
     failed_ = false;
+    start_session();
+  }
+  static void start_session() {
     const int32_t port = net::get_local_free_port();
     ASSERT_GT(port, 0);
     session_ = std::make_unique<::xllm::test::ForkedRankSession>(
@@ -530,7 +542,16 @@ class SparseMoECollectiveTest : public ::testing::Test {
       failed_ =
           result.status == ::xllm::test::ForkedRankSession::Status::FAILED;
       ::xllm::test::expect_rank_result(result);
-      ::xllm::test::expect_rank_result(fresh.close());
+      const auto closed_fresh = fresh.close();
+      failed_ |= closed_fresh.status ==
+                 ::xllm::test::ForkedRankSession::Status::FAILED;
+      ::xllm::test::expect_rank_result(closed_fresh);
+      // The single-rank case may run first under GTest shuffle. Recreate the
+      // shared session rather than leaving later cases with a closed channel.
+      session_.reset();
+      if (!failed_) {
+        start_session();
+      }
     } else {
       const auto result = session_->run(name);
       failed_ =

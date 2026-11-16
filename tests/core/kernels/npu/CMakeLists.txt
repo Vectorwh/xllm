@@ -2,6 +2,16 @@ include(cc_test)
 
 cc_test(
   NAME
+    paged_attention_tiling_layout_test
+  CPU_ONLY
+  SRCS
+    paged_attention_tiling_layout_test.cpp
+  DEPS
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     paged_attention_graph_operation_test
   RUN_SERIAL
   SRCS
@@ -71,21 +81,25 @@ cc_test(
     pybind11::embed
 )
 
-# Temporarily disabled: Dsv4ScatterCache tests are unstable in the current
-# NPU test environment.
-# cc_test(
-#   NAME
-#     dsv4_scatter_cache_write_test
-#   SRCS
-#     dsv4_scatter_cache_write_test.cpp
-#   DEPS
-#     ascendcl
-#     torch
-#     torch_npu
-#     xllm_ops
-#     GTest::gtest_main
-#     glog::glog
-# )
+option(XLLM_ENABLE_DSV4_SCATTER_CACHE_WRITE_TEST
+       "Build opt-in DSV4 scatter cache tests (unstable on some NPU setups)"
+       OFF)
+if(XLLM_ENABLE_DSV4_SCATTER_CACHE_WRITE_TEST)
+  cc_test(
+    NAME
+      dsv4_scatter_cache_write_test
+    RUN_SERIAL
+    SRCS
+      dsv4_scatter_cache_write_test.cpp
+    DEPS
+      ascendcl
+      torch
+      torch_npu
+      xllm_ops
+      GTest::gtest_main
+      glog::glog
+  )
+endif()
 
 cc_test(
   NAME

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,7 +27,6 @@ from torch import nn
 from xllm.python import registry
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.kimi_k3 import KimiK3ForConditionalGeneration
-from xllm.python.models.multimodal import SupportsMultimodal
 
 
 class _TextModel(PyModelBase):
@@ -87,14 +88,6 @@ def test_vlm_exposes_text_model_to_executor(vlm: KimiK3ForConditionalGeneration)
     )
 
 
-def test_vlm_text_only_keeps_token_embeddings(vlm: KimiK3ForConditionalGeneration) -> None:
-    tokens = torch.tensor([1, 2, 3])
-    torch.testing.assert_close(
-        vlm.get_input_embeddings(tokens),
-        vlm.language_model.get_input_embeddings(tokens),
-    )
-
-
 def test_vlm_encode_and_merge_preserves_text_rows(vlm: KimiK3ForConditionalGeneration) -> None:
     pixels = torch.randn(8, 3, 2, 2)
     encoded = vlm.encode(pixels, torch.tensor([[2, 2, 2]]))
@@ -106,20 +99,6 @@ def test_vlm_encode_and_merge_preserves_text_rows(vlm: KimiK3ForConditionalGener
     merged = vlm.get_input_embeddings(tokens, encoded, image_mask=mask)
     torch.testing.assert_close(merged[mask], encoded)
     torch.testing.assert_close(merged[~mask], text[~mask])
-
-
-def test_chunk_mask_places_identical_media_pad_tokens_independently(
-    vlm: KimiK3ForConditionalGeneration,
-) -> None:
-    # The C++ gather visitor owns positions: image/video use the same pad ID.
-    # Replacing by token ID would also overwrite the unselected placeholder.
-    tokens = torch.tensor([3, 3, 3])
-    image = torch.randn(1, 8)
-    mask = torch.tensor([False, True, False])
-    text = vlm.language_model.get_input_embeddings(tokens)
-    merged = vlm.get_input_embeddings(tokens, image, image_mask=mask)
-    torch.testing.assert_close(merged[1], image[0])
-    torch.testing.assert_close(merged[[0, 2]], text[[0, 2]])
 
 
 @pytest.mark.parametrize(
@@ -152,8 +131,17 @@ def test_vlm_dispatches_weights_to_vision_and_text(vlm: KimiK3ForConditionalGene
 
 
 @pytest.mark.parametrize("name", ["kimi_k3", "KimiK3ForConditionalGeneration"])
-def test_vlm_service_registry_resolves_config_only_factory(name: str) -> None:
-    assert registry.get_model_class(name) is KimiK3ForConditionalGeneration
+@pytest.mark.parametrize("platform", ["npu", "cpu"])
+def test_vlm_service_registry_resolves_config_only_factory(
+    name: str, platform: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Registry admission only; this does not initialize an accelerator.
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: platform)
+    if platform == "cpu":
+        with pytest.raises(NotImplementedError, match="not supported on platform"):
+            registry.get_model_class(name)
+    else:
+        assert registry.get_model_class(name) is KimiK3ForConditionalGeneration
 
 
 @pytest.mark.parametrize("include_image", [False, True])
@@ -175,8 +163,11 @@ def test_vlm_merges_video_and_image_by_independent_masks(
 
 
 def test_vlm_requires_video_embedding_and_mask_together(vlm: KimiK3ForConditionalGeneration) -> None:
+    tokens = torch.tensor([1, 2])
     with pytest.raises(ValueError, match="video embeddings require a scheduled mask"):
-        vlm.get_input_embeddings(torch.tensor([1, 2]), None, torch.ones(1, 8))
+        vlm.get_input_embeddings(tokens, None, torch.ones(1, 8))
+    with pytest.raises(ValueError, match="video mask requires embeddings"):
+        vlm.get_input_embeddings(tokens, video_mask=torch.tensor([False, True]))
 
 
 def test_vlm_rejects_overlapping_image_and_video_masks_without_writing(vlm: KimiK3ForConditionalGeneration) -> None:
@@ -235,9 +226,11 @@ def test_empty_chunk_mask_needs_no_encoder_rows(vlm: KimiK3ForConditionalGenerat
 def test_merge_returns_explicit_embeddings_without_retaining_them(vlm: KimiK3ForConditionalGeneration) -> None:
     tokens = torch.tensor([1, 2])
     image = torch.ones(1, 8)
+    image_ref = weakref.ref(image)
     merged = vlm.get_input_embeddings(tokens, image, image_mask=torch.tensor([False, True]))
-    assert isinstance(vlm, SupportsMultimodal)
     torch.testing.assert_close(merged[1], image[0])
-    assert not hasattr(vlm.model, "_inputs_embeds")
     # A following text/decode step cannot reuse a previous media embedding.
     torch.testing.assert_close(vlm.get_input_embeddings(tokens), vlm.language_model.get_input_embeddings(tokens))
+    del merged, image
+    gc.collect()
+    assert image_ref() is None

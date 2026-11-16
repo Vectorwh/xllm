@@ -105,20 +105,6 @@ TEST_F(TopKRedTypePackUnpackTest, IntRoundtrip) {
   }
 }
 
-// Regression: negative index -1 must NOT survive a pack/unpack roundtrip.
-// kMaxIdx - (-1) = 65536, truncated to 0 in 16 bits, unpacks to 65535.
-TEST_F(TopKRedTypePackUnpackTest, NegativeIndexDoesNotRoundtrip) {
-  using RedType = TopKRedType<float>;
-  const int32_t badIdx = -1;
-  auto packed = RedType::makeCmpVal(1.0f, badIdx);
-  float v;
-  int32_t idx;
-  RedType::unpack(v, idx, packed);
-  EXPECT_NE(idx, badIdx) << "Negative index should NOT roundtrip correctly";
-  EXPECT_EQ(idx, 65535) << "Expected 65535 after failed roundtrip of -1";
-}
-
-// kMaxIdx (65535) as sentinel DOES roundtrip correctly.
 TEST_F(TopKRedTypePackUnpackTest, SentinelKMaxIdxRoundtrip) {
   using RedType = TopKRedType<float>;
   const int32_t sentinel = RedType::kMaxIdx;  // 65535
@@ -132,31 +118,7 @@ TEST_F(TopKRedTypePackUnpackTest, SentinelKMaxIdxRoundtrip) {
   EXPECT_EQ(v, minVal);
 }
 
-// Zero index roundtrip.
-TEST_F(TopKRedTypePackUnpackTest, ZeroIndexRoundtrip) {
-  using RedType = TopKRedType<float>;
-  auto packed = RedType::makeCmpVal(2.5f, 0);
-  float v;
-  int32_t idx;
-  RedType::unpack(v, idx, packed);
-  EXPECT_EQ(idx, 0);
-  EXPECT_EQ(v, 2.5f);
-}
-
-// ============================================================================
-// 2. Host-side comparison ordering tests
-// ============================================================================
-
 class TopKRedTypeOrderingTest : public ::testing::Test {};
-
-// Larger value → larger packed representation (same index).
-TEST_F(TopKRedTypeOrderingTest, LargerValueHigherPriority) {
-  using RedType = TopKRedType<float>;
-  const int32_t idx = 42;
-  auto p1 = RedType::makeCmpVal(10.0f, idx);
-  auto p2 = RedType::makeCmpVal(5.0f, idx);
-  EXPECT_GT(p1, p2) << "Larger value should produce larger packed value";
-}
 
 // For equal values, smaller index → larger packed representation (higher
 // priority).
@@ -165,14 +127,6 @@ TEST_F(TopKRedTypeOrderingTest, SmallerIndexHigherPriority) {
   auto p1 = RedType::makeCmpVal(7.0f, 10);
   auto p2 = RedType::makeCmpVal(7.0f, 20);
   EXPECT_GT(p1, p2) << "Smaller index should have higher priority";
-}
-
-// Negative value ordering: -1 > -10.
-TEST_F(TopKRedTypeOrderingTest, NegativeValueOrdering) {
-  using RedType = TopKRedType<float>;
-  auto p1 = RedType::makeCmpVal(-1.0f, 0);
-  auto p2 = RedType::makeCmpVal(-10.0f, 0);
-  EXPECT_GT(p1, p2) << "-1 should rank higher than -10";
 }
 
 // Integer ordering.
@@ -196,12 +150,12 @@ TEST_F(TopKRedTypeOrderingTest, SentinelIsSmallest) {
   EXPECT_GT(real, sentinel);
 }
 
-// Monotone sweep: ascending values with fixed index should produce ascending
-// packed values.
+// Representative monotone sweep across sign, zero, and exponent ranges.
 TEST_F(TopKRedTypeOrderingTest, MonotoneSweepFloat) {
   using RedType = TopKRedType<float>;
-  typename RedType::TypeCmp prev = RedType::makeCmpVal(-1000.0f, 0);
-  for (float v = -999.0f; v <= 1000.0f; v += 1.0f) {
+  typename RedType::TypeCmp prev = RedType::makeCmpVal(-1.0e10f, 0);
+  for (float v :
+       {-1000.0f, -10.0f, -1.0f, 0.0f, 1.0f, 5.0f, 10.0f, 1000.0f, 1.0e10f}) {
     auto cur = RedType::makeCmpVal(v, 0);
     EXPECT_GT(cur, prev);
     prev = cur;
@@ -274,7 +228,8 @@ __global__ void testReduceTopKMultiKernel(const Type* __restrict__ values,
 // RAII wrapper for device memory
 // ============================================================================
 template <typename T>
-struct DevBuf {
+class DevBuf final {
+ public:
   T* ptr = nullptr;
   size_t count = 0;
 

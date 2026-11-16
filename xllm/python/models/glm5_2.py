@@ -121,13 +121,6 @@ _QLI_NO_WINDOW_LIMIT = 9223372036854775807
 # index, so its output stays bit-exact; see research/s0-probe-results.md, task
 # 10-19-glm52-indexer-cp).
 #
-# ALWAYS ON in a shipped build, and deliberately NOT an environment variable: a
-# process-wide knob that silently changes numerics is a footgun (it would also
-# let one rank of a CP group differ from its peers). The remaining terms of the
-# gate below are correctness conditions, not toggles. This constant exists only
-# as a test seam so the CPU suite can exercise the byte-identical full-stream
-# path for comparison -- nothing outside tests may assign it.
-_INDEXER_CP_QUERY_PARTITION = True
 
 
 @dataclass
@@ -898,8 +891,7 @@ class Glm52Indexer(nn.Module):
         # back to the full stream -- the opposite of what this gate is for. The
         # CPU suite caught it (test_sfa_dcp.py passes a MagicMock plan).
         alpha_active = (
-            _INDEXER_CP_QUERY_PARTITION
-            and isinstance(ctx.cp_context, CpContext)
+            isinstance(ctx.cp_context, CpContext)
             and ctx.cp_context.cp_size > 1
             and not in_acl_graph()
             and (not ctx.has_kv_shard or cp_index_write_replicated())

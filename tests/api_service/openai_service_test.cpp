@@ -25,8 +25,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <utility>
@@ -38,38 +40,38 @@ struct TestConfig {
   std::string base_url;
   std::string model;
   std::string api_key;
-
-  static TestConfig get() {
-    TestConfig config;
-    const char* url_env = std::getenv("XLLM_TEST_BASE_URL");
-    config.base_url = url_env ? url_env : "http://127.0.0.1:9977";
-
-    const char* model_env = std::getenv("XLLM_TEST_MODEL");
-    config.model = model_env ? model_env : "my_model";
-
-    const char* key_env = std::getenv("XLLM_TEST_API_KEY");
-    config.api_key = key_env ? key_env : "xllm-test-123456";
-    return config;
-  }
 };
+
+TestConfig load_test_config() {
+  TestConfig config;
+  const char* url_env = std::getenv("XLLM_TEST_BASE_URL");
+  config.base_url = url_env ? url_env : "http://127.0.0.1:9977";
+
+  const char* model_env = std::getenv("XLLM_TEST_MODEL");
+  config.model = model_env ? model_env : "my_model";
+
+  const char* key_env = std::getenv("XLLM_TEST_API_KEY");
+  config.api_key = key_env ? key_env : "xllm-test-123456";
+  return config;
+}
 
 struct HttpResult {
   bool controller_failed = false;
-  int status_code = 0;
+  int32_t status_code = 0;
   std::string content_type;
   std::string error_text;
   std::string body;
   nlohmann::json json = nullptr;
 };
 
-class HttpClient {
+class HttpClient final {
  public:
   explicit HttpClient(const std::string& base_url) {
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_HTTP;
     options.connection_type = brpc::CONNECTION_TYPE_POOLED;
     options.timeout_ms = 60000;
-    options.max_retry = 3;
+    options.max_retry = 0;
 
     if (channel_.Init(base_url.c_str(), &options) != 0) {
       LOG(ERROR) << "Failed to init channel for " << base_url;
@@ -124,13 +126,25 @@ std::string describe_result(const HttpResult& result) {
   return description;
 }
 
-void expect_error_contains(const HttpResult& result,
-                           const std::string& expected_fragment) {
-  const std::string haystack =
-      result.error_text + "\n" + result.body + "\n" + result.json.dump();
-  EXPECT_NE(haystack.find(expected_fragment), std::string::npos)
-      << "Expected fragment '" << expected_fragment
-      << "' in response, got: " << describe_result(result);
+void expect_json_success(const HttpResult& result) {
+  ASSERT_FALSE(result.controller_failed) << describe_result(result);
+  ASSERT_EQ(result.status_code, 200) << describe_result(result);
+  EXPECT_EQ(result.content_type.find("application/json"), 0u)
+      << describe_result(result);
+  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+}
+
+void expect_invalid_parameter(const HttpResult& result,
+                              const std::string& parameter,
+                              const std::string& expected_fragment) {
+  ASSERT_EQ(result.status_code, 400) << describe_result(result);
+  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+  EXPECT_EQ(result.json["error"]["code"], "invalid_parameter");
+  EXPECT_EQ(result.json["error"]["param"], parameter);
+  ASSERT_TRUE(result.json["error"]["message"].is_string());
+  EXPECT_NE(result.json["error"]["message"].get<std::string>().find(
+                expected_fragment),
+            std::string::npos);
 }
 
 void expect_logprobs_shape(const nlohmann::json& choice) {
@@ -151,7 +165,7 @@ void expect_logprobs_shape(const nlohmann::json& choice) {
 class DISABLED_OpenAIServerFeaturesTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    config_ = TestConfig::get();
+    config_ = load_test_config();
     client_ = std::make_unique<HttpClient>(config_.base_url);
   }
 
@@ -161,7 +175,7 @@ class DISABLED_OpenAIServerFeaturesTest : public ::testing::Test {
   }
 
   nlohmann::json make_sample_request(const std::string& prompt,
-                                     int logprobs = 3) const {
+                                     int32_t logprobs = 3) const {
     return {{"model", config_.model},
             {"prompt", prompt},
             {"selector", {{"type", "literal"}, {"value", "<emb_0>"}}},
@@ -199,10 +213,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest, SampleSingleMatch) {
                     make_sample_request("Classify <emb_0> in one token."),
                     get_headers());
 
-  ASSERT_FALSE(result.controller_failed) << describe_result(result);
-  ASSERT_EQ(result.status_code, 200) << describe_result(result);
-  EXPECT_EQ(result.content_type, "application/json") << describe_result(result);
-  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+  ASSERT_NO_FATAL_FAILURE(expect_json_success(result));
   EXPECT_EQ(result.json["id"], "sample-it");
   EXPECT_EQ(result.json["object"], "sample_completion");
   EXPECT_EQ(result.json["model"], config_.model);
@@ -215,9 +226,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest, SampleMultipleMatchesStayOrdered) {
   const HttpResult result = client_->post(
       "/v1/sample", make_sample_request("A<emb_0>B<emb_0>C"), get_headers());
 
-  ASSERT_FALSE(result.controller_failed) << describe_result(result);
-  ASSERT_EQ(result.status_code, 200) << describe_result(result);
-  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+  ASSERT_NO_FATAL_FAILURE(expect_json_success(result));
   ASSERT_TRUE(result.json.contains("choices"));
   ASSERT_EQ(result.json["choices"].size(), 2);
   expect_sample_choice(result.json["choices"][0], 0, 3);
@@ -229,9 +238,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest,
   const HttpResult result = client_->post(
       "/v1/sample", make_sample_request("plain text"), get_headers());
 
-  ASSERT_FALSE(result.controller_failed) << describe_result(result);
-  ASSERT_EQ(result.status_code, 200) << describe_result(result);
-  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+  ASSERT_NO_FATAL_FAILURE(expect_json_success(result));
   EXPECT_EQ(result.json["id"], "sample-it");
   EXPECT_EQ(result.json["object"], "sample_completion");
   ASSERT_TRUE(result.json.contains("choices"));
@@ -244,8 +251,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest,
   request["selector"]["type"] = "regex";
   const HttpResult result = client_->post("/v1/sample", request, get_headers());
 
-  EXPECT_NE(result.status_code, 200) << describe_result(result);
-  expect_error_contains(result, "literal");
+  expect_invalid_parameter(result, "selector.type", "literal");
 }
 
 TEST_F(DISABLED_OpenAIServerFeaturesTest, SampleRejectsOutOfRangeLogprobs) {
@@ -253,8 +259,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest, SampleRejectsOutOfRangeLogprobs) {
   request["logprobs"] = 0;
   const HttpResult result = client_->post("/v1/sample", request, get_headers());
 
-  EXPECT_NE(result.status_code, 200) << describe_result(result);
-  expect_error_contains(result, "between 1 and 5");
+  expect_invalid_parameter(result, "logprobs", "between 1 and 5");
 }
 
 TEST_F(DISABLED_OpenAIServerFeaturesTest, CompletionsRegressionSmoke) {
@@ -265,10 +270,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest, CompletionsRegressionSmoke) {
   const HttpResult result =
       client_->post("/v1/completions", request, get_headers());
 
-  ASSERT_FALSE(result.controller_failed) << describe_result(result);
-  ASSERT_EQ(result.status_code, 200) << describe_result(result);
-  EXPECT_EQ(result.content_type, "application/json") << describe_result(result);
-  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+  ASSERT_NO_FATAL_FAILURE(expect_json_success(result));
   ASSERT_TRUE(result.json.contains("choices"));
   ASSERT_EQ(result.json["choices"].size(), 1);
   EXPECT_EQ(result.json["choices"][0]["index"], 0);
@@ -284,10 +286,7 @@ TEST_F(DISABLED_OpenAIServerFeaturesTest, ChatCompletionsRegressionSmoke) {
   const HttpResult result =
       client_->post("/v1/chat/completions", request, get_headers());
 
-  ASSERT_FALSE(result.controller_failed) << describe_result(result);
-  ASSERT_EQ(result.status_code, 200) << describe_result(result);
-  EXPECT_EQ(result.content_type, "application/json") << describe_result(result);
-  ASSERT_TRUE(result.json.is_object()) << describe_result(result);
+  ASSERT_NO_FATAL_FAILURE(expect_json_success(result));
   ASSERT_TRUE(result.json.contains("choices"));
   ASSERT_EQ(result.json["choices"].size(), 1);
   ASSERT_TRUE(result.json["choices"][0].contains("message"));

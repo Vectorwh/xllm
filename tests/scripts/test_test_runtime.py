@@ -30,7 +30,6 @@ class TestEnvironmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as build_dir:
             result = testing.prepare_test_environment(parent, build_dir)
             self.assertEqual(result, parent)
-            self.assertIsNot(result, parent)
             self.assertEqual(list(Path(build_dir).iterdir()), [])
 
     def test_empty_cache_setting_gets_isolated_directory(self) -> None:
@@ -80,38 +79,24 @@ class TestRunnerIntegrationTest(unittest.TestCase):
             self.assertTrue(Path(popen.call_args.kwargs["env"]["TORCH_EXTENSIONS_DIR"]).is_dir())
 
     def test_single_target_uses_isolated_cache(self) -> None:
-        command = self.setup_module.ExtBuildSingleTest(Distribution())
-        command.test_name = "example_test"
-        with (
-            tempfile.TemporaryDirectory() as build_dir,
-            mock.patch.object(self.setup_module, "get_cmake_dir", return_value=build_dir),
-            mock.patch.object(self.setup_module.subprocess, "check_call") as check_call,
-        ):
-            executable = Path(build_dir) / command.test_name
-            executable.touch(mode=0o755)
-            command.build_cmake_targets(None, [], [], {"PATH": "/bin"}, build_dir, "unused")
-            invocation = check_call.call_args
-            self.assertEqual(
-                invocation.args[0],
-                ["ctest", "-L", "^target:example_test$", "--no-tests=error", "--verbose"],
-            )
-            self.assertTrue(Path(invocation.kwargs["env"]["TORCH_EXTENSIONS_DIR"]).is_dir())
-
-    def test_single_target_without_executable_uses_ctest(self) -> None:
-        command = self.setup_module.ExtBuildSingleTest(Distribution())
-        command.test_name = "example_test"
-        with (
-            tempfile.TemporaryDirectory() as build_dir,
-            mock.patch.object(self.setup_module, "get_cmake_dir", return_value=build_dir),
-            mock.patch.object(self.setup_module.subprocess, "check_call") as check_call,
-        ):
-            command.build_cmake_targets(None, [], [], {"PATH": "/bin"}, build_dir, "unused")
-            invocation = check_call.call_args
-            self.assertEqual(
-                invocation.args[0],
-                ["ctest", "-L", "^target:example_test$", "--no-tests=error", "--verbose"],
-            )
-            self.assertTrue(Path(invocation.kwargs["env"]["TORCH_EXTENSIONS_DIR"]).is_dir())
+        for has_executable in (False, True):
+            command = self.setup_module.ExtBuildSingleTest(Distribution())
+            command.test_name = "example_test"
+            with (
+                self.subTest(has_executable=has_executable),
+                tempfile.TemporaryDirectory() as build_dir,
+                mock.patch.object(self.setup_module, "get_cmake_dir", return_value=build_dir),
+                mock.patch.object(self.setup_module.subprocess, "check_call") as check_call,
+            ):
+                if has_executable:
+                    (Path(build_dir) / command.test_name).touch(mode=0o755)
+                command.build_cmake_targets(None, [], [], {"PATH": "/bin"}, build_dir, "unused")
+                invocation = check_call.call_args
+                self.assertEqual(
+                    invocation.args[0],
+                    ["ctest", "-L", "^target:example_test$", "--no-tests=error", "--verbose"],
+                )
+                self.assertTrue(Path(invocation.kwargs["env"]["TORCH_EXTENSIONS_DIR"]).is_dir())
 
     def test_single_target_ctest_failure_is_propagated(self) -> None:
         command = self.setup_module.ExtBuildSingleTest(Distribution())

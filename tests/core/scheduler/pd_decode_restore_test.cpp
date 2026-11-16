@@ -45,6 +45,7 @@ limitations under the License.
 #include "core/framework/request/request_state.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/scheduler/disagg_pd_scheduler.h"
+#include "core/scheduler/scheduler_test_adapter.h"
 
 namespace xllm {
 namespace {
@@ -175,10 +176,14 @@ class FakeEngine final : public Engine {
   ModelArgs model_args_;
 };
 
-class TestDisaggPDScheduler final : public DisaggPDScheduler {
+class TestDisaggPDScheduler final
+    : public scheduler_test::SchedulerAdapter<DisaggPDScheduler> {
  public:
   TestDisaggPDScheduler(Engine* engine, const Options& options)
-      : DisaggPDScheduler(engine, options, /*start_services=*/false) {}
+      : scheduler_test::SchedulerAdapter<DisaggPDScheduler>(
+            engine,
+            options,
+            /*start_services=*/false) {}
 };
 
 DisaggPDScheduler::Options make_decode_options() {
@@ -423,11 +428,11 @@ class HostRestoreSchedulerTest : public ::testing::Test {
     EXPECT_TRUE(deliver(later));
     EXPECT_TRUE(deliver(earlier));
     for (int32_t step = 0; step < 2; ++step) {
-      auto batches = scheduler_->prepare_batch_test();
+      auto batches = scheduler_->prepare();
       EXPECT_EQ(batches[0].size(), 2u);
       advance(batches);
     }
-    EXPECT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+    EXPECT_EQ(scheduler_->prepare()[0].size(), 1u);
     EXPECT_TRUE(earlier->preempted());
     EXPECT_TRUE(later->preempted());
     first->set_cancel();
@@ -463,7 +468,7 @@ TEST_F(HostRestoreSchedulerTest, PreemptionClosesAdmissionOnEveryRank) {
   auto accepted = reserve("accepted", /*rank=*/1, {11, 12});
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   ASSERT_EQ(batches[0][0], first->sequences()[0].get());
   ASSERT_TRUE(victim->preempted());
@@ -489,12 +494,12 @@ TEST_F(HostRestoreSchedulerTest, RestoreDoesNotWaitForOtherRankReservations) {
   ASSERT_EQ(scheduler_->try_admit(allocated), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   ASSERT_TRUE(victim->preempted());
   first->set_cancel();
 
   // Rank-1 reservations hold their own blocks and do not delay the restore.
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
   EXPECT_TRUE(batches[1].empty());
@@ -514,14 +519,14 @@ TEST_F(HostRestoreSchedulerTest, WaitsWhileRankHoldsForeignBlocks) {
   };
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   ASSERT_TRUE(victim->preempted());
   auto* pool =
       dynamic_cast<RestoreBlockManager*>(engine_->block_manager_pool());
   ASSERT_NE(pool, nullptr);
   pool->set_pending_release(true);
   first->set_cancel();
-  EXPECT_TRUE(scheduler_->prepare_batch_test()[0].empty());
+  EXPECT_TRUE(scheduler_->prepare()[0].empty());
   // A transfer still holds 2 of the 4 rank-0 blocks; the victim needs 3.
   auto retained = make_request({30, 30, 30, 30}, "retained");
   retained->sequences()[0]->set_dp_rank(0);
@@ -529,13 +534,13 @@ TEST_F(HostRestoreSchedulerTest, WaitsWhileRankHoldsForeignBlocks) {
       engine_->block_manager_pool()->allocate(retained->sequences()[0].get()));
   pool->set_pending_release(false);
 
-  EXPECT_TRUE(scheduler_->prepare_batch_test()[0].empty());
+  EXPECT_TRUE(scheduler_->prepare()[0].empty());
   EXPECT_EQ(result.wait_for(std::chrono::milliseconds(100)),
             std::future_status::timeout);
   EXPECT_TRUE(victim->preempted());
 
   engine_->block_manager_pool()->deallocate(retained.get());
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
 }
@@ -545,7 +550,7 @@ TEST_F(HostRestoreSchedulerTest, ReturnsFromStepWhileRestoreWaits) {
   auto victim = reserve("victim", /*rank=*/0, {5, 6, 7, 8});
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   ASSERT_TRUE(victim->preempted());
   auto* pool =
       dynamic_cast<RestoreBlockManager*>(engine_->block_manager_pool());
@@ -571,7 +576,7 @@ TEST_F(HostRestoreSchedulerTest, RestoresFifoDespiteBusinessPriority) {
   for (int32_t step = 0;
        step < 8 && earlier->sequences()[0]->is_prefill_stage();
        ++step) {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     EXPECT_EQ(batches[0][0], earlier->sequences()[0].get());
     EXPECT_TRUE(batches[1].empty());
@@ -583,7 +588,7 @@ TEST_F(HostRestoreSchedulerTest, RestoresFifoDespiteBusinessPriority) {
   // as soon as `earlier` releases them.
   bool later_restored = false;
   for (int32_t step = 0; step < 8 && !later_restored; ++step) {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     later_restored = batches[0][0] == later->sequences()[0].get();
     EXPECT_TRUE(later_restored || !earlier->finished());
@@ -601,7 +606,7 @@ TEST_F(HostRestoreSchedulerTest,
   for (int32_t step = 0;
        step < 8 && earlier->sequences()[0]->is_prefill_stage();
        ++step) {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     ASSERT_EQ(batches[0][0], earlier->sequences()[0].get());
     advance(batches);
@@ -609,7 +614,7 @@ TEST_F(HostRestoreSchedulerTest,
   ASSERT_FALSE(earlier->sequences()[0]->is_prefill_stage());
   ASSERT_FALSE(earlier->finished());
   later->set_cancel();
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], earlier->sequences()[0].get());
   auto probe = reserve("probe", /*rank=*/1, {21, 22});
@@ -632,12 +637,12 @@ TEST_F(HostRestoreSchedulerTest, FailsRestoreHeadOnIdleRankThenContinuesFifo) {
   ASSERT_NE(pool, nullptr);
   // Nothing else holds rank-0 blocks, so a failed restore cannot wait.
   pool->fail_allocate_for(earlier->sequences()[0].get());
-  EXPECT_TRUE(scheduler_->prepare_batch_test()[0].empty());
+  EXPECT_TRUE(scheduler_->prepare()[0].empty());
   ASSERT_EQ(result.wait_for(std::chrono::seconds(5)),
             std::future_status::ready);
   EXPECT_EQ(result.get().code(), StatusCode::RESOURCE_EXHAUSTED);
   EXPECT_FALSE(earlier->sequences()[0]->kv_state().has_any_blocks());
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], later->sequences()[0].get());
 }
@@ -653,11 +658,11 @@ TEST_F(HostRestoreSchedulerTest, RequeuesBlockedRestoreContinuation) {
   };
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   first->set_cancel();
   engine_->block_manager_pool()->reset_prefix_cache();
   {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     advance(batches);
   }
@@ -668,14 +673,14 @@ TEST_F(HostRestoreSchedulerTest, RequeuesBlockedRestoreContinuation) {
       engine_->block_manager_pool()->allocate(retained->sequences()[0].get()));
 
   // The continuation goes back to the restore queue instead of failing.
-  EXPECT_TRUE(scheduler_->prepare_batch_test()[0].empty());
+  EXPECT_TRUE(scheduler_->prepare()[0].empty());
   EXPECT_EQ(result.wait_for(std::chrono::milliseconds(100)),
             std::future_status::timeout);
   EXPECT_TRUE(victim->preempted());
   EXPECT_FALSE(victim->sequences()[0]->kv_state().has_any_blocks());
 
   engine_->block_manager_pool()->deallocate(retained.get());
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
 }
@@ -685,20 +690,20 @@ TEST_F(HostRestoreSchedulerTest, WaitsForAsyncReleaseAfterAllRequestsCancel) {
   auto victim = reserve("victim", /*rank=*/0, {5, 6, 7, 8});
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   auto* pool =
       dynamic_cast<RestoreBlockManager*>(engine_->block_manager_pool());
   ASSERT_NE(pool, nullptr);
   pool->set_pending_release(true);
   first->set_cancel();
   victim->set_cancel();
-  EXPECT_TRUE(scheduler_->prepare_batch_test()[0].empty());
+  EXPECT_TRUE(scheduler_->prepare()[0].empty());
   auto probe = make_request({21, 22}, "probe");
   probe->state().pd_reservation_id = "probe-reservation";
   probe->sequences()[0]->set_dp_rank(1);
   EXPECT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::RETRY_LATER);
   pool->set_pending_release(false);
-  EXPECT_TRUE(scheduler_->prepare_batch_test()[0].empty());
+  EXPECT_TRUE(scheduler_->prepare()[0].empty());
   ASSERT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(scheduler_->decode_schedule(probe, "prefill"));
   EXPECT_TRUE(scheduler_->release_reservation("probe", "probe-reservation"));
@@ -709,25 +714,25 @@ TEST_F(HostRestoreSchedulerTest, RepausesAdmissionOnNextPreemption) {
   auto victim = reserve("victim", /*rank=*/0, {5, 6, 7, 8});
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   first->set_cancel();
   engine_->block_manager_pool()->reset_prefix_cache();
   for (int32_t step = 0; step < 8 && victim->sequences()[0]->is_prefill_stage();
        ++step) {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     advance(batches);
   }
   ASSERT_FALSE(victim->sequences()[0]->is_prefill_stage());
   {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     advance(batches);
   }
   ASSERT_FALSE(victim->finished());
   auto next = reserve("next", /*rank=*/0, {31, 32});
   ASSERT_TRUE(deliver(next));
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
   ASSERT_TRUE(next->preempted());
@@ -745,7 +750,7 @@ TEST_P(CancelRestoreTest, CancelsRestoredRequestAndContinuesFifo) {
   ASSERT_TRUE(later->preempted());
   engine_->block_manager_pool()->reset_prefix_cache();
   {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     ASSERT_EQ(batches[0][0], earlier->sequences()[0].get());
     advance(batches);
@@ -755,7 +760,7 @@ TEST_P(CancelRestoreTest, CancelsRestoredRequestAndContinuesFifo) {
     for (int32_t step = 0;
          step < 8 && earlier->sequences()[0]->is_prefill_stage();
          ++step) {
-      auto batches = scheduler_->prepare_batch_test();
+      auto batches = scheduler_->prepare();
       ASSERT_EQ(batches[0].size(), 1u);
       ASSERT_EQ(batches[0][0], earlier->sequences()[0].get());
       advance(batches);
@@ -764,7 +769,7 @@ TEST_P(CancelRestoreTest, CancelsRestoredRequestAndContinuesFifo) {
     ASSERT_FALSE(earlier->finished());
   }
   earlier->set_cancel();
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], later->sequences()[0].get());
   EXPECT_FALSE(earlier->sequences()[0]->kv_state().has_any_blocks());
@@ -783,12 +788,12 @@ TEST_F(HostRestoreSchedulerTest, FailedAdmissionHandoffDoesNotBlockRestore) {
   ASSERT_EQ(scheduler_->try_admit(duplicate), DecodeAdmissionResult::ADMITTED);
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   ASSERT_TRUE(victim->preempted());
   EXPECT_FALSE(scheduler_->decode_schedule(duplicate, "prefill"));
   EXPECT_EQ(engine_->block_manager_pool()->num_used_blocks()[1], 1u);
   first->set_cancel();
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
   ASSERT_TRUE(scheduler_->release_reservation(
@@ -803,7 +808,7 @@ TEST_F(HostRestoreSchedulerTest, DecodeReserveGatesAdmission) {
     init_scheduler(/*block_size=*/2, /*speculative_tokens=*/0);
     auto first = reserve("first", /*rank=*/0, {1, 2, 3, 4});
     ASSERT_TRUE(deliver(first));
-    ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+    ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
     const auto used = engine_->block_manager_pool()->num_used_blocks();
 
     // Rank 0 has 1 free block. With the reserve, `first` keeps 2 blocks to
@@ -820,7 +825,7 @@ TEST_F(HostRestoreSchedulerTest, DecodeReserveGatesAdmission) {
     }
     EXPECT_EQ(engine_->block_manager_pool()->num_used_blocks(), used);
     first->set_cancel();
-    scheduler_->prepare_batch_test();
+    scheduler_->prepare();
   }
 }
 
@@ -831,7 +836,7 @@ TEST_F(HostRestoreSchedulerTest, ReservationsCountTowardDecodeReserve) {
   // Registered but not yet delivered: holds 1 block and, as the first request
   // on its rank, keeps 1 more for its next decode step.
   auto accepted = reserve("accepted", /*rank=*/1, {11, 12});
-  scheduler_->prepare_batch_test();
+  scheduler_->prepare();
   auto probe = make_request({21, 22}, "probe");
   probe->sequences()[0]->set_dp_rank(1);
   EXPECT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::RETRY_LATER);
@@ -849,7 +854,7 @@ TEST_F(HostRestoreSchedulerTest, AdmittedRequestKeepsReserveUntilScheduled) {
   auto admitted = make_request({11, 12}, "admitted");
   admitted->sequences()[0]->set_dp_rank(1);
   ASSERT_EQ(scheduler_->try_admit(admitted), DecodeAdmissionResult::ADMITTED);
-  scheduler_->prepare_batch_test();
+  scheduler_->prepare();
   auto probe = make_request({21, 22}, "probe");
   probe->sequences()[0]->set_dp_rank(1);
   EXPECT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::RETRY_LATER);
@@ -857,7 +862,7 @@ TEST_F(HostRestoreSchedulerTest, AdmittedRequestKeepsReserveUntilScheduled) {
   // Once the admitted request is dropped, its reserve goes with it.
   admitted->sequences()[0]->reset();
   admitted.reset();
-  scheduler_->prepare_batch_test();
+  scheduler_->prepare();
   EXPECT_EQ(scheduler_->try_admit(probe), DecodeAdmissionResult::ADMITTED);
   probe->sequences()[0]->reset();
 }
@@ -897,7 +902,7 @@ TEST_P(HostRestoreReadyTest, OpensAdmissionAfterFinalChunkCompletes) {
   auto victim = reserve("victim", /*rank=*/0, std::vector<int32_t>(32, 2));
   ASSERT_TRUE(deliver(first));
   ASSERT_TRUE(deliver(victim));
-  ASSERT_EQ(scheduler_->prepare_batch_test()[0].size(), 1u);
+  ASSERT_EQ(scheduler_->prepare()[0].size(), 1u);
   ASSERT_TRUE(victim->preempted());
   first->set_cancel();
   engine_->block_manager_pool()->reset_prefix_cache();
@@ -906,7 +911,7 @@ TEST_P(HostRestoreReadyTest, OpensAdmissionAfterFinalChunkCompletes) {
   incoming->sequences()[0]->set_dp_rank(1);
 
   for (uint32_t chunk_tokens : {16u, 16u, 1u}) {
-    auto batches = scheduler_->prepare_batch_test();
+    auto batches = scheduler_->prepare();
     ASSERT_EQ(batches[0].size(), 1u);
     EXPECT_TRUE(batches[1].empty());
     EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
@@ -918,7 +923,7 @@ TEST_P(HostRestoreReadyTest, OpensAdmissionAfterFinalChunkCompletes) {
   }
   ASSERT_FALSE(victim->sequences()[0]->is_prefill_stage());
   victim->sequences()[0]->append_token(Token(10));
-  auto batches = scheduler_->prepare_batch_test();
+  auto batches = scheduler_->prepare();
   ASSERT_EQ(batches[0].size(), 1u);
   EXPECT_EQ(batches[0][0], victim->sequences()[0].get());
   EXPECT_FALSE(victim->finished());

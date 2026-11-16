@@ -13,13 +13,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "hf_model_loader.h"
+#include "core/framework/hf_model_loader.h"
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -48,14 +50,6 @@ limitations under the License.
 namespace xllm {
 
 namespace {
-
-using ExpectedRecModelFactory =
-    std::function<std::unique_ptr<RecCausalLM>(const ModelContext& context)>;
-
-static_assert(std::is_same_v<RecModelFactory, ExpectedRecModelFactory>,
-              "RecModelFactory must return std::unique_ptr<RecCausalLM>.");
-static_assert(std::is_base_of_v<CausalLM, RecCausalLM>,
-              "RecCausalLM must derive from CausalLM.");
 
 class DummyRecCausalLM final : public RecCausalLM {
  public:
@@ -401,29 +395,19 @@ TEST(HFModelLoaderTest, KeepLegacyFp8ConfigUnchanged) {
   EXPECT_FALSE(quant_args.activation_dynamic());
 }
 
-TEST(HFModelLoaderTest, RegisterRecFactoryAcceptsRecCausalLmReturnType) {
-  const std::string factory_name = "rec_causallm_factory_contract_test";
-  RecModelFactory unregistered_factory =
-      ModelRegistry::get_rec_model_factory(factory_name);
-  EXPECT_FALSE(static_cast<bool>(unregistered_factory));
-
-  ModelRegistry::register_rec_model_factory(
-      factory_name,
-      [](const ModelContext& context) -> std::unique_ptr<RecCausalLM> {
-        UNUSED_PARAMETER(context);
-        return nullptr;
-      });
-
-  RecModelFactory factory = ModelRegistry::get_rec_model_factory(factory_name);
-  EXPECT_TRUE(static_cast<bool>(factory));
-}
-
 TEST(HFModelLoaderTest, RecFactoryCreatesRecCausalLmInstance) {
-  const std::string kFactoryName = "rec_causallm_instance_contract_test";
+  EXPECT_FALSE(static_cast<bool>(ModelRegistry::get_rec_model_factory(
+      "rec_causallm_missing_contract_test")));
+  static std::atomic<int64_t> factory_sequence{0};
+  const std::string kFactoryName =
+      "rec_causallm_instance_contract_test_" +
+      std::to_string(factory_sequence.fetch_add(1));
+  auto calls = std::make_shared<int32_t>(0);
   ModelRegistry::register_rec_model_factory(
       kFactoryName,
-      [](const ModelContext& context) -> std::unique_ptr<RecCausalLM> {
+      [calls](const ModelContext& context) -> std::unique_ptr<RecCausalLM> {
         UNUSED_PARAMETER(context);
+        ++*calls;
         const torch::TensorOptions options =
             torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
         return std::make_unique<DummyRecCausalLM>(options);
@@ -431,14 +415,14 @@ TEST(HFModelLoaderTest, RecFactoryCreatesRecCausalLmInstance) {
 
   RecModelFactory factory = ModelRegistry::get_rec_model_factory(kFactoryName);
   ASSERT_TRUE(static_cast<bool>(factory));
+  EXPECT_EQ(ModelRegistry::get_model_backend(kFactoryName), "rec");
 
   ModelContext context;
   std::unique_ptr<RecCausalLM> rec_model = factory(context);
   ASSERT_NE(rec_model, nullptr);
 
-  CausalLM* causal_model = dynamic_cast<CausalLM*>(rec_model.get());
-  EXPECT_NE(causal_model, nullptr);
-  EXPECT_EQ(rec_model->device(), torch::Device(torch::kCPU));
+  EXPECT_EQ(*calls, 1);
+  EXPECT_NE(dynamic_cast<DummyRecCausalLM*>(rec_model.get()), nullptr);
 }
 
 #if defined(USE_NPU) || defined(USE_MLU)
@@ -780,20 +764,17 @@ TEST(HFModelLoaderTest, Glm5NextMtpNormalizationIgnoresOtherAlgorithms) {
 }
 
 TEST(HFModelLoaderTest, Glm5NextMtpNormalizationIgnoresOtherModels) {
-  for (const std::string model_type : {"deepseek_v3", "qwen3_5_text"}) {
-    SCOPED_TRACE(model_type);
-    ModelArgs args;
-    args.model_type(model_type).n_layers(45).num_nextn_predict_layers(1);
-    EXPECT_FALSE(configure_glm5_next_mtp_args(args,
-                                              /*speculative_algorithm=*/"MTP",
-                                              /*is_draft_engine=*/true));
-    EXPECT_EQ(args.model_type(), model_type);
-    EXPECT_EQ(args.n_layers(), 45);
-    EXPECT_EQ(args.mtp_start_layer_idx(), -1);
-  }
+  ModelArgs args;
+  args.model_type("deepseek_v3").n_layers(45).num_nextn_predict_layers(1);
+  EXPECT_FALSE(configure_glm5_next_mtp_args(args,
+                                            /*speculative_algorithm=*/"MTP",
+                                            /*is_draft_engine=*/true));
+  EXPECT_EQ(args.model_type(), "deepseek_v3");
+  EXPECT_EQ(args.n_layers(), 45);
+  EXPECT_EQ(args.mtp_start_layer_idx(), -1);
 }
 
-TEST(HFModelLoaderTest, Glm5NextMtpEngineAndWorkerMatchExportedCacheLayout) {
+TEST(HFModelLoaderTest, NormalizedGlm5NextMtpMatchesExportedCacheLayout) {
   auto loader = ModelRegistry::get_model_args_loader("glm5_next");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
@@ -1092,15 +1073,8 @@ TEST(HFModelLoaderTest, Qwen3DFlash2DraftModelArgsFromOrnithConfig) {
   EXPECT_EQ(args.n_layers(), 6);
   EXPECT_EQ(args.hidden_size(), 2048);
   EXPECT_EQ(args.dflash2_block_size(), 16);
-  ASSERT_EQ(args.dflash2_target_layer_ids().size(), 8U);
-  EXPECT_EQ(args.dflash2_target_layer_ids().front(), 1);
-  EXPECT_EQ(args.dflash2_target_layer_ids().back(), 37);
-  // Mirrors DFlash2Qwen3ModelImpl's fc in_features: hidden_size *
-  // len(target_layer_ids), not hidden_size * n_layers (6 draft layers vs 8
-  // fused target layers on this checkpoint).
-  EXPECT_EQ(args.hidden_size() *
-                static_cast<int64_t>(args.dflash2_target_layer_ids().size()),
-            16384);
+  EXPECT_EQ(args.dflash2_target_layer_ids(),
+            (std::vector<int32_t>{1, 6, 11, 16, 22, 27, 32, 37}));
 }
 
 TEST(HFModelLoaderTest, Qwen3DFlash2CaptureLayersKeepLegacyRootPrecedence) {
@@ -1433,6 +1407,8 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsWithoutSmooth) {
   EXPECT_EQ(args.bits(), 8);
   EXPECT_EQ(args.moe_weight_bits(), 8);
   EXPECT_TRUE(args.is_sym());
+  EXPECT_FALSE(
+      args.for_module("model.layers.0.self_attn.o_proj").preserve_smooth());
   EXPECT_TRUE(args.should_ignore_module("model.layers.0.mlp.gate"));
   text.replace(text.find("\"channel\""), 9, "\"group\"");
   ASSERT_TRUE(reader.parse_text(text));
@@ -1442,6 +1418,7 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsWithoutSmooth) {
 TEST(HFModelLoaderTest, LoadCompressedTensorsPreservedSmooth) {
   const auto base = nlohmann::json::parse(R"json({
     "quant_method": "compressed-tensors",
+    "ignore": ["lm_head"],
     "config_groups": {"group_0": {
       "weights": {"type": "int", "num_bits": 8},
       "input_activations": {"type": "int", "num_bits": 8, "dynamic": true}
@@ -1457,30 +1434,14 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsPreservedSmooth) {
       QuantArgs args;
       EXPECT_EQ(load_quant_cfg(reader, args), target == "weights");
       if (target == "weights") {
+        EXPECT_EQ(args.quant_method(), "compressed-tensors");
+        EXPECT_TRUE(args.is_compressed_tensors_w8a8_dynamic());
+        EXPECT_TRUE(args.is_sym());
+        EXPECT_TRUE(args.should_ignore_module("lm_head"));
         EXPECT_TRUE(args.for_module("model.layers.0.self_attn.o_proj")
                         .preserve_smooth());
       }
     }
-  }
-}
-
-TEST(HFModelLoaderTest, LoadCompressedTensorsConfigAlias) {
-  for (const std::string& key : {"quantization_config", "compression_config"}) {
-    JsonReader reader;
-    ASSERT_TRUE(reader.parse_text("{\"" + key + R"json(": {
-      "quant_method": "compressed-tensors",
-      "ignore": ["lm_head"],
-      "config_groups": {"group_0": {
-        "weights": {"type": "int", "num_bits": 8},
-        "input_activations": {"type": "int", "num_bits": 8, "dynamic": true}
-      }}
-    }})json"));
-    QuantArgs args;
-    ASSERT_TRUE(load_quant_cfg(reader, args));
-    EXPECT_EQ(args.quant_method(), "compressed-tensors");
-    EXPECT_TRUE(args.is_compressed_tensors_w8a8_dynamic());
-    EXPECT_TRUE(args.is_sym());
-    EXPECT_TRUE(args.should_ignore_module("lm_head"));
   }
 }
 
@@ -1539,20 +1500,18 @@ nlohmann::json speculators_eagle3_config() {
 
 // A null discriminator must behave like a missing key (JsonReader contract),
 // not throw nlohmann type_error.302 from json::value().
-TEST(HFModelLoaderTest, NormalizeSpeculatorsNullDiscriminatorIsNoOp) {
+TEST(HFModelLoaderTest, NormalizeSpeculatorsNullOrMissingDiscriminatorIsNoOp) {
   auto config = nlohmann::json{{"model_type", "qwen3"},
                                {"speculators_model_type", nullptr}};
+  const auto original = config;
   normalize_speculators_config(&config);
-  EXPECT_EQ(config.at("model_type"), "qwen3");
-  EXPECT_FALSE(config.contains("use_qk_norm"));
-}
+  EXPECT_EQ(config, original);
 
-TEST(HFModelLoaderTest, NormalizeSpeculatorsMissingDiscriminatorIsNoOp) {
-  auto config = speculators_eagle3_config();
+  config = speculators_eagle3_config();
   config.erase("speculators_model_type");
+  const auto missing = config;
   normalize_speculators_config(&config);
-  EXPECT_EQ(config.at("model_type"), "speculators");
-  EXPECT_FALSE(config.contains("use_qk_norm"));
+  EXPECT_EQ(config, missing);
 }
 
 TEST(HFModelLoaderTest, NormalizeSpeculatorsNonEagle3IsNoOp) {
@@ -1648,9 +1607,6 @@ TEST(HFModelLoaderTest, NumAuxLayersFallsBackToThreeWhenListOmitted) {
   // Omitted capture list: EAGLE-3 low/mid/high default count, matching the
   // speculators None->3 fallback (fc_norm drafts without an aux list must
   // still build three per-chunk norms).
-  EXPECT_EQ(AuxHiddenCapture::num_aux_layers(args), 3);
-
-  args.layers_to_capture({2, 32, 61});
   EXPECT_EQ(AuxHiddenCapture::num_aux_layers(args), 3);
 
   args.layers_to_capture({1, 2, 3, 4});

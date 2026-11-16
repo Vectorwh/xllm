@@ -48,7 +48,16 @@ def test_all_to_all_single_rank_returns_independent_storage(
         assert actual.data_ptr() != value.data_ptr()
 
 
-@pytest.mark.parametrize("outputs,inputs", [([0, -1], [0, 0]), ([0, 0], [-1, 1]), ([0], [0, 0])])
+@pytest.mark.parametrize(
+    "outputs,inputs",
+    [
+        ([0, -1], [0, 0]),
+        ([0, 0], [-1, 1]),
+        ([0], [0, 0]),
+        ([0, 0], [0]),
+        ([0, 0], [1, 0]),
+    ],
+)
 def test_all_to_all_rejects_invalid_splits(
     monkeypatch: pytest.MonkeyPatch, outputs: list[int], inputs: list[int]
 ) -> None:

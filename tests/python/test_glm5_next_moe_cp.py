@@ -62,7 +62,10 @@ def _config(rank: int, ep_size: int) -> glm5_next.Glm5NextConfig:
 @pytest.mark.parametrize("rank", range(4))
 def test_cp_config_preserves_independent_attention_and_moe_axes(rank: int, ep_size: int) -> None:
     config = _config(rank, ep_size)
+    assert (config.tp_size, config.tp_rank) == (2, rank % 2)
     assert (config.cp_size, config.cp_rank) == (2, rank // 2)
+    assert (config.ep_size, config.ep_rank) == (ep_size, rank // (4 // ep_size))
+    assert (config.moe_tp_size, config.moe_tp_rank) == (4 // ep_size, rank % (4 // ep_size))
     assert config.tp_size * config.cp_size == config.ep_size * config.moe_tp_size
 
 

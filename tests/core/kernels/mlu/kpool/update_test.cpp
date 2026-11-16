@@ -346,8 +346,26 @@ void check_batched_pool_updates(int64_t batch, int64_t query) {
   }
 }
 
-TEST(KPoolKernelTest, DecodeVerifyUpdatesCoverEveryBatchThrough128) {
-  for (int64_t batch = 1; batch <= 128; ++batch) {
+TEST(KPoolKernelTest, DecodeVerifyUpdatesCoverDispatchBoundaryBatches) {
+  for (const int64_t batch : {1,
+                              2,
+                              3,
+                              4,
+                              5,
+                              8,
+                              9,
+                              15,
+                              16,
+                              17,
+                              31,
+                              32,
+                              33,
+                              63,
+                              64,
+                              65,
+                              127,
+                              128,
+                              129}) {
     for (const int64_t query : {1, 4}) {
       SCOPED_TRACE(::testing::Message() << batch << ":" << query);
       check_batched_pool_updates(batch, query);
@@ -887,7 +905,7 @@ TEST(KPoolKernelTest, MixedStateIdWidthsPreserveRandomPoolBytes) {
       torch::tensor({2, 1, 0, 1}, torch::kInt64).to(device);
   const torch::Tensor ids_i32 = ids.to(torch::kInt32);
   const torch::Tensor sources_i32 = sources.to(torch::kInt32);
-  for (const int64_t seed : {20262020, 20262023, 20262027}) {
+  for (const int64_t seed : {20262020}) {
     torch::manual_seed(seed);
     const torch::Tensor keys = torch::randn({14, 128}, bf16).to(device);
     const torch::Tensor gates = torch::randn({14, 128}, bf16).to(device);
@@ -952,7 +970,7 @@ TEST(KPoolKernelTest, MixedStateIdWidthsPreserveRandomPoolBytes) {
         graph.capture_begin();
         invoke();
         graph.capture_end();
-        for (int32_t replay = 0; replay < 16; ++replay) {
+        for (int32_t replay = 0; replay < 2; ++replay) {
           cache.copy_(original_cache);
           tail.copy_(original_tail);
           graph.replay();

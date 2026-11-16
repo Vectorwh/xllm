@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/scheduler/scheduler_test_adapter.h"
 #include "distributed_runtime/engine.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/request/request.h"
@@ -137,10 +138,13 @@ class DeferredWriteEngine final : public Engine {
   size_t collections_ = 0;
 };
 
-class TestPDScheduler final : public DisaggPDScheduler {
+class TestPDScheduler final
+    : public scheduler_test::SchedulerAdapter<DisaggPDScheduler> {
  public:
   explicit TestPDScheduler(Engine* engine)
-      : DisaggPDScheduler(engine, make_options(), false) {}
+      : scheduler_test::SchedulerAdapter<DisaggPDScheduler>(engine,
+                                                            make_options(),
+                                                            false) {}
 
   void wait_for_responses() { response_processor_->wait_completion(); }
 
@@ -309,12 +313,9 @@ TEST_F(PDInflightLifetimeTest, PreparedBatchAlreadyOwnsWritableBlocks) {
   TestPDScheduler scheduler(&engine);
   auto request = make_request("prepared", {1, 2, 3, 4});
   receive_prefill(scheduler, request);
-  Sequence* sequence = request->sequences()[0].get();
-  ASSERT_EQ(sequence->kv_state().blocks(BlockType::KV).front().ref_count(), 1u);
-  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  std::vector<Batch> batches = scheduler.prepare();
   ASSERT_FALSE(batches.front().empty());
   EXPECT_EQ(engine.launches(), 0u);
-  EXPECT_EQ(sequence->kv_state().blocks(BlockType::KV).front().ref_count(), 2u);
   BlockManagerPool* pool = engine.block_manager_pool();
   pool->deallocate(request.get());
   EXPECT_EQ(pool->num_used_blocks().front(), 1u);

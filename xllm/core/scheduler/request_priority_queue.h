@@ -34,7 +34,6 @@ class BaseIterator {
   virtual std::shared_ptr<Request> operator*() const = 0;
   virtual void operator++() = 0;
   virtual bool operator!=(const BaseIterator& other) const = 0;
-  virtual std::unique_ptr<BaseIterator> clone() const = 0;
 };
 
 template <typename Iterator>
@@ -51,10 +50,6 @@ class ConcreteIterator : public BaseIterator {
   bool operator!=(const BaseIterator& other) const override {
     const auto* derived = dynamic_cast<const ConcreteIterator*>(&other);
     return derived && iter_ != derived->iter_;
-  }
-
-  std::unique_ptr<BaseIterator> clone() const override {
-    return std::make_unique<ConcreteIterator>(iter_);
   }
 };
 
@@ -89,7 +84,6 @@ class RequestPriorityQueue {
   virtual std::shared_ptr<Request> back() const = 0;
   virtual bool empty() const = 0;
   virtual size_t size() const = 0;
-  virtual std::unique_ptr<RequestPriorityQueue> clone() const = 0;
   virtual ~RequestPriorityQueue() = default;
   virtual bool supports_sort() const { return false; }
   virtual void sort(const Comparator&) {}
@@ -126,9 +120,6 @@ class HeapQueue final : public RequestPriorityQueue {
   }
   bool empty() const override { return queue_.empty(); }
   size_t size() const override { return queue_.size(); }
-  std::unique_ptr<RequestPriorityQueue> clone() const override {
-    return std::make_unique<HeapQueue>(*this);
-  }
   bool supports_sort() const override { return false; }
   void sort(const Comparator&) override { NOT_IMPLEMENTED(); }
 
@@ -176,13 +167,6 @@ class SetQueue final : public RequestPriorityQueue {
   std::shared_ptr<Request> back() const override { return *queue_.rbegin(); }
   bool empty() const override { return queue_.empty(); }
   size_t size() const override { return queue_.size(); }
-  std::unique_ptr<RequestPriorityQueue> clone() const override {
-    auto copied = std::make_unique<SetQueue>(lower_priority_comparator_);
-    for (const auto& request : queue_) {
-      copied->push(request);
-    }
-    return copied;
-  }
 
   Iterator begin() const override {
     return Iterator(std::make_unique<ConcreteIterator<QueueType::iterator>>(
@@ -229,9 +213,6 @@ class DequeQueue final : public RequestPriorityQueue {
   std::shared_ptr<Request> back() const override { return queue_.back(); }
   bool empty() const override { return queue_.empty(); }
   size_t size() const override { return queue_.size(); }
-  std::unique_ptr<RequestPriorityQueue> clone() const override {
-    return std::make_unique<DequeQueue>(*this);
-  }
   bool supports_sort() const override { return true; }
   void sort(const Comparator& comparator) override {
     std::stable_sort(queue_.begin(), queue_.end(), comparator);

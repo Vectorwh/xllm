@@ -26,6 +26,7 @@ limitations under the License.
 #include <unistd.h>
 
 #include <cerrno>
+#include <csignal>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -355,7 +356,17 @@ void run_ranks(int32_t world_size, RankCheck check) {
   children.reserve(world_size);
   for (int32_t rank = 0; rank < world_size; ++rank) {
     const pid_t child = ::fork();
-    ASSERT_GE(child, 0);
+    if (child < 0) {
+      for (const pid_t started : children) {
+        ::kill(started, SIGKILL);
+      }
+      for (const pid_t started : children) {
+        int32_t status = 0;
+        while (::waitpid(started, &status, 0) < 0 && errno == EINTR) {
+        }
+      }
+      FAIL() << "fork failed: " << errno;
+    }
     if (child == 0) {
       ::_exit(run_rank(rank, world_size, port, check));
     }

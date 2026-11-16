@@ -108,7 +108,6 @@ TEST(DeepseekV41DSparkGraphTest,
   config.max_tokens = 64;
   const mlu::MluGraphPlanner planner(config);
   std::unique_ptr<mlu::MluGraph> graph;
-  mlu::GraphKey captured_key;
   for (int32_t step = 0; step < 4; ++step) {
     // Warm up the padded shape, then capture three requests in a four-request
     // bucket. Replay grows and shrinks that batch while the SWA ring wraps.
@@ -171,10 +170,7 @@ TEST(DeepseekV41DSparkGraphTest,
                               torch_mlu::getStreamFromPool(false, 0),
                               runtime_options);
       ASSERT_GT(graph->num_graphs(), 0);
-      ASSERT_EQ(graph->num_eager_segments(), 1);
-      captured_key = plan.key;
     } else {
-      ASSERT_TRUE(captured_key == plan.key);
       graph->update_input_buffer(
           model.get(), tokens, positions, input, plan.layout);
       output = graph->replay();

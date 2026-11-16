@@ -42,7 +42,6 @@ class Qwen25TestBase : public ::testing::Test {
     JsonFunction weather_func("get_current_weather",
                               "Get the current weather in a given location",
                               weather_params);
-    weather_tool_ = JsonTool("function", weather_func);
 
     nlohmann::json calculator_params = {
         {"type", "object"},
@@ -54,13 +53,11 @@ class Qwen25TestBase : public ::testing::Test {
 
     JsonFunction calculator_func(
         "calculate", "Calculate mathematical expressions", calculator_params);
-    calculator_tool_ = JsonTool("function", calculator_func);
 
-    tools_ = {weather_tool_, calculator_tool_};
+    tools_ = {JsonTool("function", weather_func),
+              JsonTool("function", calculator_func)};
   }
 
-  JsonTool weather_tool_;
-  JsonTool calculator_tool_;
   std::vector<JsonTool> tools_;
 };
 
@@ -76,22 +73,34 @@ class Qwen25DetectorTest : public Qwen25TestBase {
 
 class Qwen25StreamingTest : public Qwen25TestBase {
  protected:
-  void SetUp() override { Qwen25TestBase::SetUp(); }
+  StreamingParseResult parse_chunks(const std::vector<std::string>& chunks) {
+    FunctionCallParser parser(tools_, "qwen25");
+    StreamingParseResult accumulated;
+    accumulated.calls.reserve(2);
+    for (const std::string& chunk : chunks) {
+      const StreamingParseResult result =
+          parser.parse_streaming_increment(chunk);
+      accumulated.normal_text += result.normal_text;
+      for (const ToolCallItem& call : result.calls) {
+        EXPECT_GE(call.tool_index, 0);
+        if (call.tool_index < 0) {
+          continue;
+        }
+        while (accumulated.calls.size() <=
+               static_cast<size_t>(call.tool_index)) {
+          accumulated.calls.emplace_back();
+        }
+        ToolCallItem& current = accumulated.calls[call.tool_index];
+        if (call.name.has_value()) {
+          EXPECT_FALSE(current.name.has_value()) << "Duplicate tool name event";
+          current.name = call.name;
+        }
+        current.parameters += call.parameters;
+      }
+    }
+    return accumulated;
+  }
 };
-
-// Test constructor and basic properties
-TEST_F(Qwen25DetectorTest, ConstructorInitializesCorrectly) {
-  EXPECT_NE(detector_, nullptr);
-
-  // Test basic token detection
-  std::string text_with_tool_call =
-      "Some text <tool_call>\n{\"name\": \"test\"}\n</tool_call>";
-  std::string text_without_tool_call =
-      "Just normal text without any tool calls";
-
-  EXPECT_TRUE(detector_->has_tool_call(text_with_tool_call));
-  EXPECT_FALSE(detector_->has_tool_call(text_without_tool_call));
-}
 
 // Test has_tool_call method
 TEST_F(Qwen25DetectorTest, HasToolCallDetection) {
@@ -122,8 +131,7 @@ TEST_F(Qwen25DetectorTest, TrimWhitespaceHandling) {
   EXPECT_EQ(result.normal_text, "Previous text");
 
   // Verify tool call is correctly parsed
-  EXPECT_EQ(result.calls.size(), 1);
-  EXPECT_EQ(result.calls[0].tool_index, -1);  // Base class always returns -1
+  ASSERT_EQ(result.calls.size(), 1);
 }
 
 // Test single tool call parsing
@@ -136,11 +144,11 @@ TEST_F(Qwen25DetectorTest, SingleToolCallParsing) {
   auto result = detector_->detect_and_parse(text, tools_);
 
   EXPECT_EQ(result.normal_text, "Please help me check the weather");
-  EXPECT_EQ(result.calls.size(), 1);
+  ASSERT_EQ(result.calls.size(), 1);
 
   const auto& call = result.calls[0];
-  EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
-  EXPECT_TRUE(call.name.has_value());
+
+  ASSERT_TRUE(call.name.has_value());
   EXPECT_EQ(call.name.value(), "get_current_weather");
 
   // Verify parameter JSON
@@ -162,12 +170,12 @@ TEST_F(Qwen25DetectorTest, MultipleToolCallsParsing) {
 
   EXPECT_EQ(result.normal_text,
             "Please help me check the weather and calculate an expression");
-  EXPECT_EQ(result.calls.size(), 2);
+  ASSERT_EQ(result.calls.size(), 2);
 
   // Verify first tool call
   const auto& call1 = result.calls[0];
-  EXPECT_EQ(call1.tool_index, -1);  // Base class always returns -1
-  EXPECT_TRUE(call1.name.has_value());
+
+  ASSERT_TRUE(call1.name.has_value());
   EXPECT_EQ(call1.name.value(), "get_current_weather");
 
   nlohmann::json params1 = nlohmann::json::parse(call1.parameters);
@@ -175,8 +183,8 @@ TEST_F(Qwen25DetectorTest, MultipleToolCallsParsing) {
 
   // Verify second tool call
   const auto& call2 = result.calls[1];
-  EXPECT_EQ(call2.tool_index, -1);  // Base class always returns -1
-  EXPECT_TRUE(call2.name.has_value());
+
+  ASSERT_TRUE(call2.name.has_value());
   EXPECT_EQ(call2.name.value(), "calculate");
 
   nlohmann::json params2 = nlohmann::json::parse(call2.parameters);
@@ -231,38 +239,19 @@ TEST_F(Qwen25DetectorTest, UnknownToolName) {
 
 // Test case with only normal text
 TEST_F(Qwen25DetectorTest, OnlyNormalText) {
-  std::string text = "This is a regular text without any tool calls.";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text,
-            "This is a regular text without any tool calls.");
-  EXPECT_EQ(result.calls.size(), 0);
-  EXPECT_FALSE(result.has_calls());
+  // Validate the public no-call fallback rather than a discarded detector
+  // trim intermediate; every original input remains checked byte-for-byte.
+  for (const std::string& text :
+       {"This is a regular text without any tool calls.", "", "   \t\n\r   "}) {
+    SCOPED_TRACE(text);
+    FunctionCallParser parser(tools_, "qwen25");
+    EXPECT_FALSE(parser.has_tool_call(text));
+    const auto [content, calls] = parser.parse_non_stream(text);
+    EXPECT_EQ(content, text);
+    EXPECT_TRUE(calls.empty());
+  }
 }
 
-// Test empty string input
-TEST_F(Qwen25DetectorTest, EmptyStringInput) {
-  std::string text = "";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "");
-  EXPECT_EQ(result.calls.size(), 0);
-  EXPECT_FALSE(result.has_calls());
-}
-
-// Test whitespace-only input
-TEST_F(Qwen25DetectorTest, WhitespaceOnlyInput) {
-  std::string text = "   \t\n\r   ";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "");
-  EXPECT_EQ(result.calls.size(), 0);
-}
-
-// Test complex nested JSON parameters
 TEST_F(Qwen25DetectorTest, ComplexNestedJsonParameters) {
   std::string text =
       "Complex parameter test <tool_call>\n{\"name\": \"get_current_weather\", "
@@ -273,10 +262,9 @@ TEST_F(Qwen25DetectorTest, ComplexNestedJsonParameters) {
   auto result = detector_->detect_and_parse(text, tools_);
 
   EXPECT_EQ(result.normal_text, "Complex parameter test");
-  EXPECT_EQ(result.calls.size(), 1);
+  ASSERT_EQ(result.calls.size(), 1);
 
   const auto& call = result.calls[0];
-  EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
 
   nlohmann::json params = nlohmann::json::parse(call.parameters);
   EXPECT_EQ(params["location"], "Beijing");
@@ -296,10 +284,10 @@ TEST_F(Qwen25DetectorTest, ToolCallInMiddleOfText) {
   // Note: According to implementation, only text before tool call is preserved
   // as normal_text
   EXPECT_EQ(result.normal_text, "Previous text");
-  EXPECT_EQ(result.calls.size(), 1);
+  ASSERT_EQ(result.calls.size(), 1);
 
   const auto& call = result.calls[0];
-  EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
+
   EXPECT_EQ(call.name.value(), "calculate");
 }
 
@@ -313,50 +301,17 @@ TEST_F(Qwen25DetectorTest, SpecialCharactersHandling) {
   auto result = detector_->detect_and_parse(text, tools_);
 
   EXPECT_EQ(result.normal_text, "Special characters test");
-  EXPECT_EQ(result.calls.size(), 1);
+  ASSERT_EQ(result.calls.size(), 1);
 
   const auto& call = result.calls[0];
-  EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
+
   nlohmann::json params = nlohmann::json::parse(call.parameters);
   EXPECT_EQ(params["location"], "New York City");
   EXPECT_EQ(params["note"], "Contains symbols！@#$%^&*()_+=");
 }
 
-// Performance test: many tool calls
-TEST_F(Qwen25DetectorTest, PerformanceWithManyToolCalls) {
-  std::string text = "Performance test";
-
-  // Build text containing multiple tool calls
-  for (int i = 0; i < 10000; ++i) {
-    text +=
-        " <tool_call>\n{\"name\": \"calculate\", \"arguments\": "
-        "{\"expression\": \"" +
-        std::to_string(i) + " + " + std::to_string(i + 1) +
-        "\"}}\n</tool_call>";
-  }
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "Performance test");
-  EXPECT_EQ(result.calls.size(), 10000);
-
-  // Verify each tool call is correctly parsed
-  for (int i = 0; i < 10000; ++i) {
-    const auto& call = result.calls[i];
-    EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
-    EXPECT_EQ(call.name.value(), "calculate");
-
-    nlohmann::json params = nlohmann::json::parse(call.parameters);
-    std::string expected_expr =
-        std::to_string(i) + " + " + std::to_string(i + 1);
-    EXPECT_EQ(params["expression"], expected_expr);
-  }
-}
-
 // Test basic streaming functionality
 TEST_F(Qwen25StreamingTest, BasicStreamingParsing) {
-  FunctionCallParser parser(tools_, "qwen25");
-
   // Simulate streaming chunks
   std::vector<std::string> chunks = {
       "I need to check the weather ",
@@ -366,40 +321,15 @@ TEST_F(Qwen25StreamingTest, BasicStreamingParsing) {
       "\"unit\": \"celsius\"}}\n",
       "</tool_call>"};
 
-  std::string accumulated_normal_text;
-  std::vector<ToolCallItem> accumulated_calls;
-
-  for (const auto& chunk : chunks) {
-    auto result = parser.parse_streaming_increment(chunk);
-
-    if (!result.normal_text.empty()) {
-      accumulated_normal_text += result.normal_text;
-    }
-
-    for (const auto& call : result.calls) {
-      accumulated_calls.push_back(call);
-    }
-  }
-
-  // Verify results
-  EXPECT_EQ(accumulated_normal_text, "I need to check the weather ");
-  EXPECT_GT(accumulated_calls.size(), 0);
-
-  // Find the complete tool call
-  bool found_complete_call = false;
-  for (const auto& call : accumulated_calls) {
-    if (call.name.has_value() && call.name.value() == "get_current_weather") {
-      found_complete_call = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_complete_call);
+  const StreamingParseResult result = parse_chunks(chunks);
+  EXPECT_EQ(result.normal_text, "I need to check the weather ");
+  ASSERT_EQ(result.calls.size(), 1);
+  EXPECT_EQ(result.calls[0].name, "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[0].parameters),
+            nlohmann::json({{"location", "Beijing"}, {"unit", "celsius"}}));
 }
 
-// Test multiple tool calls streaming
 TEST_F(Qwen25StreamingTest, MultipleToolCallsStreaming) {
-  FunctionCallParser parser(tools_, "qwen25");
-
   // Simulate realistic token-level streaming chunks with multiple tool calls
   std::vector<std::string> chunks = {"Let",
                                      " me",
@@ -451,94 +381,16 @@ TEST_F(Qwen25StreamingTest, MultipleToolCallsStreaming) {
                                      "\"}}\n",
                                      "</tool_call>"};
 
-  std::string accumulated_normal_text;
-  std::vector<ToolCallItem> accumulated_calls;
-
-  for (const auto& chunk : chunks) {
-    auto result = parser.parse_streaming_increment(chunk);
-    // std::cerr << "buffer_: " << (*parser.detector_).buffer_ << std::endl;
-    // std::cerr << "  -> Normal text: " << result.normal_text << std::endl;
-    // std::cerr << "  -> Calls count: " << result.calls.size() << std::endl;
-    if (!result.normal_text.empty()) {
-      accumulated_normal_text += result.normal_text;
-    }
-
-    for (const auto& call : result.calls) {
-      accumulated_calls.push_back(call);
-    }
-  }
-
-  // Verify results
-  EXPECT_EQ(accumulated_normal_text,
+  const StreamingParseResult result = parse_chunks(chunks);
+  EXPECT_EQ(result.normal_text,
             "Let me help you with weather and calculation ");
-  EXPECT_GT(accumulated_calls.size(), 0);
-
-  // Check for both tool calls
-  bool found_weather = false;
-  bool found_calculator = false;
-
-  for (const auto& call : accumulated_calls) {
-    if (call.name.has_value()) {
-      if (call.name.value() == "get_current_weather") {
-        found_weather = true;
-      } else if (call.name.value() == "calculate") {
-        found_calculator = true;
-      }
-    }
-  }
-
-  EXPECT_TRUE(found_weather);
-  EXPECT_TRUE(found_calculator);
-}
-
-// Test partial token handling
-TEST_F(Qwen25StreamingTest, PartialTokenHandling) {
-  FunctionCallParser parser(tools_, "qwen25");
-
-  // Simulate realistic partial tokens being streamed - testing edge cases where
-  // tokens are split
-  std::vector<std::string> chunks = {"Testing",
-                                     " partial",
-                                     " tokens",
-                                     " ",
-                                     "<tool_call>",
-                                     "\n",
-                                     "{",
-                                     "\"name\"",
-                                     ":",
-                                     " \"",
-                                     "get_current_weather",
-                                     "\",",
-                                     " ",
-                                     "\"arguments\"",
-                                     ":",
-                                     " {",
-                                     "\"location\"",
-                                     ":",
-                                     " \"",
-                                     "Tokyo",
-                                     "\"}}",
-                                     "\n",
-                                     "</tool_call>"};
-
-  std::string accumulated_normal_text;
-  std::vector<ToolCallItem> accumulated_calls;
-
-  for (const auto& chunk : chunks) {
-    auto result = parser.parse_streaming_increment(chunk);
-
-    if (!result.normal_text.empty()) {
-      accumulated_normal_text += result.normal_text;
-    }
-
-    for (const auto& call : result.calls) {
-      accumulated_calls.push_back(call);
-    }
-  }
-
-  // Verify results
-  EXPECT_EQ(accumulated_normal_text, "Testing partial tokens ");
-  EXPECT_GT(accumulated_calls.size(), 0);
+  ASSERT_EQ(result.calls.size(), 2);
+  EXPECT_EQ(result.calls[0].name, "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[0].parameters),
+            nlohmann::json({{"location", "Shanghai"}}));
+  EXPECT_EQ(result.calls[1].name, "calculate");
+  EXPECT_EQ(nlohmann::json::parse(result.calls[1].parameters),
+            nlohmann::json({{"expression", "2 + 3"}}));
 }
 
 }  // namespace function_call

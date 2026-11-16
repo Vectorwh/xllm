@@ -600,6 +600,7 @@ TEST(FusedCompressKvCacheTest,
   }
 }
 
+// Opt-in: the tensors require more than 6 GiB of device memory.
 TEST(FusedCompressKvCacheTest, DISABLED_RealAddressesBeyondTwoGiB) {
   const torch::DeviceGuard guard(torch::Device(torch::kPrivateUse1, 0));
   auto d = make_inputs({6}, {131071}, 2);
@@ -611,5 +612,6 @@ TEST(FusedCompressKvCacheTest, DISABLED_RealAddressesBeyondTwoGiB) {
   d.state_table.fill_(2 * kPage);
   check(d);
 }
+
 }  // namespace
 }  // namespace xllm::kernel::mlu::bangc

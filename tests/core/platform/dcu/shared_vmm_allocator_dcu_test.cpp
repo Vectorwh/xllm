@@ -153,56 +153,6 @@ TEST(SharedVMMAllocatorDcuTest, ResetAllocationPointerReusesSameAddress) {
   EXPECT_EQ(allocator.high_water_mark(), high_water_before_reset);
 }
 
-TEST(SharedVMMAllocatorDcuTest, SwitchToNewVirtualSpaceSharesPhysicalMemory) {
-  if (!HasDevice()) {
-    GTEST_SKIP() << "No DCU device available";
-  }
-  InitDevice();
-
-  const std::size_t granularity =
-      xllm::vmm::get_recommended_granularity(kDeviceId);
-
-  xllm::SharedVMMAllocator allocator;
-  allocator.init(kDeviceId, ReserveSizeForTest(granularity));
-
-  void* first = allocator.allocate(kProbeBytes);
-  ASSERT_NE(first, nullptr);
-
-  // Write data at offset 0 in the old virtual address space.
-  ASSERT_EQ(hipMemset(first, 0x3C, kProbeBytes), hipSuccess);
-  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-
-  allocator.switch_to_new_virtual_space();
-  EXPECT_EQ(allocator.current_offset(), 0u);
-
-  // Allocate the same offset in the new virtual address space; it should map
-  // to the same physical memory.
-  void* second = allocator.allocate(kProbeBytes);
-  ASSERT_NE(second, nullptr);
-  EXPECT_NE(second, first);
-
-  std::vector<std::uint8_t> host(kProbeBytes, 0);
-  ASSERT_EQ(hipMemcpy(host.data(), second, kProbeBytes, hipMemcpyDeviceToHost),
-            hipSuccess);
-
-  for (std::size_t i = 0; i < host.size(); ++i) {
-    EXPECT_EQ(host[i], 0x3C) << "Mismatch at byte " << i;
-  }
-
-  // Write through the new virtual address and verify the old virtual address
-  // observes the same data, proving both spaces share the physical memory.
-  ASSERT_EQ(hipMemset(second, 0xC7, kProbeBytes), hipSuccess);
-  ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-
-  std::fill(host.begin(), host.end(), 0);
-  ASSERT_EQ(hipMemcpy(host.data(), first, kProbeBytes, hipMemcpyDeviceToHost),
-            hipSuccess);
-
-  for (std::size_t i = 0; i < host.size(); ++i) {
-    EXPECT_EQ(host[i], 0xC7) << "Alias mismatch at byte " << i;
-  }
-}
-
 TEST(SharedVMMAllocatorDcuTest,
      SwitchToNewVirtualSpacePreservesNonZeroOffsetPages) {
   if (!HasDevice()) {

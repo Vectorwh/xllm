@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <c10/core/DeviceGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -114,21 +115,24 @@ void populate_indexer_metadata(AttentionMetadata& metadata,
 
   metadata.kv_seq_lens = torch::full({batch_size}, max_query_len, int_options);
 
-  metadata.block_table =
-      torch::zeros({batch_size, max_num_blocks_per_seq}, int_options);
-
-  for (int64_t b = 0; b < batch_size; ++b) {
-    auto seq = torch::arange(b * max_query_len + 1,
-                             b * max_query_len + 1 + max_query_len,
-                             int_options);
-    metadata.block_table[b].index_put_(
-        {torch::indexing::Slice(0, max_query_len)}, seq);
+  const int64_t block_size = KVCacheConfig::get_instance().block_size();
+  const int64_t blocks_per_request =
+      (max_query_len + block_size - 1) / block_size;
+  std::vector<int32_t> pages, slots;
+  pages.reserve(batch_size * blocks_per_request);
+  slots.reserve(batch_size * max_query_len);
+  for (int64_t batch = 0; batch < batch_size; ++batch) {
+    const int64_t first = 1 + batch * blocks_per_request;
+    for (int64_t page = 0; page < blocks_per_request; ++page) {
+      pages.emplace_back(first + page);
+    }
+    for (int64_t token = 0; token < max_query_len; ++token) {
+      slots.emplace_back(first * block_size + token);
+    }
   }
-
-  // slot_mapping
-  metadata.slot_mapping =
-      torch::arange(1, batch_size * max_query_len + 1, int_options);
-
+  metadata.block_table = torch::tensor(pages, int_options)
+                             .reshape({batch_size, blocks_per_request});
+  metadata.slot_mapping = torch::tensor(slots, int_options);
   metadata.max_query_len = max_query_len;
   metadata.max_seq_len = max_seq_len;
   metadata.total_kv_len = batch_size * max_query_len;
@@ -215,6 +219,9 @@ struct TestInputs {
   torch::Tensor q_norm;
   torch::Tensor positions;
   torch::Tensor k_cache;
+  torch::Tensor expected_k;
+  torch::Tensor initial_cache;
+  torch::Tensor initial_scale;
   std::optional<torch::Tensor> k_cache_scale;
   std::unordered_map<std::string, torch::Tensor> weights;
   AttentionMetadata metadata;
@@ -447,6 +454,9 @@ TestInputs idx_create_inputs(TestConfig& test_config_,
                                     is_prefill,
                                     num_tokens);
   }
+  if (chunked_prefill) {
+    inputs.positions.add_(history_len);
+  }
   return inputs;
 }
 TestInputs idx_create_quantized_inputs(
@@ -517,7 +527,43 @@ DeepseekV32Indexer idx_create_indexer(
                                                 parallel_args_,
                                                 options_));
   indexer->load_state_dict(state_dict);
+  if (inputs.k_cache.defined() &&
+      inputs.k_cache.scalar_type() == torch::kChar) {
+    inputs.initial_cache = inputs.k_cache.cpu().clone();
+    inputs.initial_scale = inputs.k_cache_scale->cpu().clone();
+    inputs.expected_k =
+        indexer
+            ->cp_pre(inputs.x, inputs.q_norm, inputs.positions, inputs.metadata)
+            .k_local.cpu();
+  }
   return indexer;
+}
+void idx_set_dcp_metadata(TestInputs& inputs, int32_t shards) {
+  const int64_t stripe = inputs.k_cache.size(2) * shards;
+  const auto q_offsets = inputs.metadata.q_cu_seq_lens.cpu().to(torch::kInt64);
+  const auto kv_lengths = inputs.metadata.kv_seq_lens.cpu().to(torch::kInt64);
+  const int64_t columns =
+      (kv_lengths.max().item<int64_t>() + stripe - 1) / stripe;
+  std::vector<int32_t> pages, slots;
+  pages.reserve(kv_lengths.numel() * columns);
+  slots.reserve(inputs.positions.numel());
+  for (int64_t batch = 0; batch < kv_lengths.numel(); ++batch) {
+    const int64_t first = 1 + batch * columns;
+    for (int64_t page = 0; page < columns; ++page) {
+      pages.emplace_back(first + page);
+    }
+    const int64_t q_length =
+        q_offsets[batch + 1].item<int64_t>() - q_offsets[batch].item<int64_t>();
+    const int64_t begin = kv_lengths[batch].item<int64_t>() - q_length;
+    for (int64_t position = begin; position < begin + q_length; ++position) {
+      slots.emplace_back(first * stripe + position);
+    }
+  }
+  inputs.metadata.block_table =
+      torch::tensor(pages, inputs.metadata.block_table.options())
+          .reshape({kv_lengths.numel(), columns});
+  inputs.metadata.slot_mapping =
+      torch::tensor(slots, inputs.metadata.slot_mapping.options());
 }
 void idx_expect_dcp_local_prefill_candidates(
     ParallelArgs& parallel_args_,
@@ -532,6 +578,7 @@ void idx_expect_dcp_local_prefill_candidates(
       static_cast<int32_t>(KVCacheConfig::get_instance().block_size()),
       /*dcp_size=*/2,
       kDcpRank);
+  idx_set_dcp_metadata(inputs, /*shards=*/2);
   const KVShardIndexerMetadata selector_metadata =
       build_kv_shard_indexer_metadata(inputs.metadata);
   AttentionMetadata prefill_metadata = inputs.metadata;
@@ -570,6 +617,27 @@ void idx_expect_dcp_local_prefill_candidates(
                   .isneginf()
                   .all()
                   .item<bool>());
+  const auto table = inputs.metadata.block_table.cpu().to(torch::kInt64);
+  const auto positions = selector_metadata.query_positions.cpu();
+  const int64_t block_size = inputs.k_cache.size(2);
+  for (int64_t row = 0; row < token_count; ++row) {
+    std::vector<int32_t> expected;
+    const int64_t visible = positions[row].item<int32_t>() + 1;
+    expected.reserve(visible);
+    for (int64_t token = 0; token < visible; ++token) {
+      const int64_t slot =
+          table[0][token / (block_size * 2)].item<int64_t>() * block_size * 2 +
+          token % (block_size * 2);
+      if (slot / block_size % 2 == kDcpRank) {
+        expected.emplace_back(slot);
+      }
+    }
+    const auto actual =
+        candidates.global_slots[row].cpu().narrow(0, 0, expected.size());
+    EXPECT_TRUE(torch::equal(
+        std::get<0>(actual.sort()),
+        std::get<0>(torch::tensor(expected, torch::kInt32).sort())));
+  }
 }
 std::tuple<torch::Tensor, torch::Tensor> idx_run_indexer(
     ParallelArgs& parallel_args_,
@@ -603,20 +671,66 @@ void idx_expect_select_output(TestConfig& test_config_,
   EXPECT_EQ(context_lens.scalar_type(), torch::kInt32);
   EXPECT_EQ(context_lens.sizes(), (torch::IntArrayRef{num_tokens}));
 }
+void idx_expect_all_visible(const TestInputs& inputs,
+                            const torch::Tensor& tables,
+                            const torch::Tensor& lengths) {
+  const auto offsets = inputs.metadata.q_cu_seq_lens.cpu().to(torch::kInt64);
+  const auto kv_lengths = inputs.metadata.kv_seq_lens.cpu().to(torch::kInt64);
+  const auto pages = inputs.metadata.block_table.cpu().to(torch::kInt64);
+  const auto actual = tables.cpu();
+  const auto lens = lengths.cpu();
+  const int64_t block_size = inputs.k_cache.size(2);
+  for (int64_t batch = 0; batch < kv_lengths.numel(); ++batch) {
+    const int64_t begin = offsets[batch].item<int64_t>();
+    const int64_t end = offsets[batch + 1].item<int64_t>();
+    for (int64_t row = begin; row < end; ++row) {
+      const int64_t visible =
+          kv_lengths[batch].item<int64_t>() - (end - begin) + row - begin + 1;
+      ASSERT_LE(visible, actual.size(1));
+      ASSERT_EQ(lens[row].item<int32_t>(), visible);
+      std::vector<int32_t> expected;
+      expected.reserve(visible);
+      for (int64_t token = 0; token < visible; ++token) {
+        expected.emplace_back(pages[batch][token / block_size].item<int64_t>() *
+                                  block_size +
+                              token % block_size);
+      }
+      EXPECT_TRUE(torch::equal(
+          std::get<0>(actual[row].narrow(0, 0, visible).sort()),
+          std::get<0>(torch::tensor(expected, torch::kInt32).sort())));
+    }
+  }
+}
 void idx_expect_quantized_cache_updated(const TestInputs& inputs) {
-  EXPECT_EQ(inputs.k_cache.scalar_type(), torch::kChar);
-  torch::Tensor k_cache_cpu = inputs.k_cache.cpu();
-  EXPECT_TRUE(k_cache_cpu.ne(0).any().item<bool>());
+  ASSERT_EQ(inputs.k_cache.scalar_type(), torch::kInt8);
   ASSERT_TRUE(inputs.k_cache_scale.has_value());
-  EXPECT_EQ(inputs.k_cache_scale->scalar_type(), torch::kFloat32);
-  torch::Tensor k_cache_scale_cpu = inputs.k_cache_scale->cpu();
-  EXPECT_TRUE(torch::isfinite(k_cache_scale_cpu).all().item<bool>());
-  EXPECT_TRUE(k_cache_scale_cpu.gt(0).all().item<bool>());
-  const torch::Tensor slots =
-      inputs.metadata.slot_mapping.cpu().flatten().to(torch::kInt64);
-  const torch::Tensor active = k_cache_scale_cpu.flatten().index_select(
-      0, slots.masked_select(slots.ge(0)));
-  EXPECT_TRUE(active.ne(0.125f).any().item<bool>());
+  ASSERT_EQ(inputs.k_cache_scale->scalar_type(), torch::kFloat32);
+  ASSERT_EQ(inputs.expected_k.scalar_type(), torch::kBFloat16);
+
+  ASSERT_TRUE(inputs.k_cache_scale.has_value());
+  const auto cache =
+      inputs.k_cache.cpu().reshape({-1, inputs.k_cache.size(-1)});
+  const auto scales = inputs.k_cache_scale->cpu().flatten();
+  const auto slots = inputs.metadata.slot_mapping.cpu().to(torch::kInt64);
+  const auto selected_scales = scales.index_select(0, slots);
+  ASSERT_TRUE(torch::isfinite(selected_scales).all().item<bool>());
+  ASSERT_TRUE(selected_scales.gt(0).all().item<bool>());
+  const auto dequantized = cache.index_select(0, slots).to(torch::kFloat32) *
+                           selected_scales.unsqueeze(1);
+  const auto expected = inputs.expected_k.to(torch::kFloat32);
+  ASSERT_EQ(dequantized.sizes(), expected.sizes());
+  EXPECT_TRUE((dequantized - expected)
+                  .abs()
+                  .le(selected_scales.unsqueeze(1) * 1.01 + 1e-6)
+                  .all()
+                  .item<bool>());
+  auto untouched = torch::ones({scales.numel()}, torch::kBool);
+  untouched.index_fill_(0, slots, false);
+  EXPECT_TRUE(
+      torch::equal(cache.index({untouched}),
+                   inputs.initial_cache.reshape_as(cache).index({untouched})));
+  EXPECT_TRUE(torch::equal(scales.index({untouched}),
+                           inputs.initial_scale.flatten().index({untouched})));
 }
 v32_cp::DeepseekV32CPContext idx_make_single_rank_cp_context(
     torch::TensorOptions& options_,
@@ -658,7 +772,32 @@ v32_cp::DeepseekV32CPContext idx_make_single_rank_cp_context(
 }
 }  // namespace
 
-TEST(IndexerTest, PrefillBatch) {
+namespace {
+class IndexerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    original_block_size_ = KVCacheConfig::get_instance().block_size();
+    device_guard_ = std::make_unique<c10::DeviceGuard>(
+        torch::Device(Platform::type_torch(), 0));
+  }
+  void TearDown() override {
+    if (original_block_size_) {
+      KVCacheConfig::get_instance().block_size(*original_block_size_);
+    }
+  }
+
+ private:
+  std::optional<int32_t> original_block_size_;
+  std::unique_ptr<c10::DeviceGuard> device_guard_;
+};
+using DcpIndexerScoreTest = IndexerTest;
+}  // namespace
+
+TEST_F(IndexerTest, PrefillBatch) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -681,9 +820,8 @@ TEST(IndexerTest, PrefillBatch) {
   parallel_args_ = test::create_default_parallel_args(mock_process_group_);
   KVCacheConfig::get_instance().block_size(1);
 
-  LOG(INFO) << "Testing Prefill (Small Batch)";
   int64_t batch_size = 2;
-  int64_t max_query_len = 4096;
+  int64_t max_query_len = 33;
   const bool is_prefill = true;
   const bool enable_fused_qk = false;
   int64_t num_tokens = batch_size * max_query_len;
@@ -710,13 +848,10 @@ TEST(IndexerTest, PrefillBatch) {
   EXPECT_EQ(new_block_tables.size(1), test_config_.index_topk)
       << "Top-k should match";
 
-  // Verify that the first value in new_block_tables is 1 (calculated via vLLM
-  // MLU)
-  EXPECT_EQ(new_block_tables.index({0, 0}).item<int64_t>(), 1)
-      << "The first value in new_block_tables should be 1";
+  idx_expect_all_visible(inputs, new_block_tables, new_context_lens);
 }
 
-TEST(IndexerTest, ChunkedPrefillBatch) {
+TEST_F(IndexerTest, ChunkedPrefillBatch) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -739,7 +874,6 @@ TEST(IndexerTest, ChunkedPrefillBatch) {
   parallel_args_ = test::create_default_parallel_args(mock_process_group_);
   KVCacheConfig::get_instance().block_size(1);
 
-  LOG(INFO) << "Testing Chunked Prefill";
   const int64_t batch_size = 2;
   const int64_t history_len = 128;
   const int64_t current_len = 64;
@@ -770,25 +904,10 @@ TEST(IndexerTest, ChunkedPrefillBatch) {
   EXPECT_EQ(new_block_tables.size(0), num_new_tokens);  // [batch * current_len]
   EXPECT_EQ(new_block_tables.size(1), test_config_.index_topk);
 
-  // Value Verification
-  auto top1_indices = new_block_tables.index({torch::indexing::Slice(), 0})
-                          .to(torch::kInt64)
-                          .cpu();
-  auto top1_sum = top1_indices.sum().item<int64_t>();
-  auto top1_max = top1_indices.max().item<int64_t>();
-
-  LOG(INFO) << "[top-1 block index] sum: " << top1_sum << ", max: " << top1_max;
-
-  // The expected value is calculated via vLLM MLU
-  int64_t expected_sum = 12288;
-  int64_t expected_max = 192;
-  EXPECT_EQ(top1_sum, expected_sum)
-      << "top-1 block index sum does not match ground truth";
-  EXPECT_EQ(top1_max, expected_max)
-      << "top-1 block index max does not match ground truth";
+  idx_expect_all_visible(inputs, new_block_tables, new_context_lens);
 }
 
-TEST(IndexerTest, DcpLocalCausalPrefillSelectsRankLocalCandidates) {
+TEST_F(IndexerTest, DcpLocalCausalPrefillSelectsRankLocalCandidates) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -828,7 +947,7 @@ TEST(IndexerTest, DcpLocalCausalPrefillSelectsRankLocalCandidates) {
       parallel_args_, test_config_, options_, rotary_emb_, inputs);
 }
 
-TEST(IndexerTest, DcpLocalCausalChunkedPrefillSelectsRankLocalCandidates) {
+TEST_F(IndexerTest, DcpLocalCausalChunkedPrefillSelectsRankLocalCandidates) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -920,11 +1039,6 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
   parallel_args_.kv_split_size() = 2;
   const KVShardLayout layout(
       /*physical_block_size=*/16, /*dcp_size=*/2, /*dcp_rank=*/0);
-  // The single packed prompt starts at zero, including chunked prefill;
-  // decode uses position zero in both fused and eager rotary paths.
-  inputs.positions = inputs.metadata.is_prefill
-                         ? torch::arange(inputs.positions.numel(), int_option_)
-                         : torch::zeros_like(inputs.positions);
   // Fixed projections produce opposite query heads and signed head weights.
   inputs.x.fill_(1);
   inputs.q_norm.fill_(1);
@@ -935,6 +1049,14 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
   inputs.weights.at("weights_proj.weight").zero_();
   inputs.weights.at("weights_proj.weight").index_put_({0, 0}, 1);
   inputs.weights.at("weights_proj.weight").index_put_({1, 0}, -2);
+  if (!is_prefill) {
+    inputs.metadata.kv_seq_lens.fill_(8);
+    inputs.metadata.kv_cu_seq_lens = torch::tensor({0, 8}, int_option_);
+    inputs.metadata.max_seq_len = 8;
+    inputs.metadata.total_kv_len = 8;
+    inputs.positions.fill_(7);
+  }
+  idx_set_dcp_metadata(inputs, /*shards=*/2);
   DeepseekV32Indexer indexer = idx_create_indexer(parallel_args_,
                                                   test_config_,
                                                   options_,
@@ -947,32 +1069,44 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
   if (is_prefill) {
     const KVShardIndexerMetadata selector =
         build_kv_shard_indexer_metadata(inputs.metadata);
-    inputs.metadata.slot_mapping =
+    auto local_metadata = inputs.metadata;
+    local_metadata.slot_mapping =
         localize_kv_shard_slots(inputs.metadata.slot_mapping, layout);
     candidates = indexer->forward_dcp_local_prefill(inputs.x,
                                                     inputs.q_norm,
                                                     inputs.positions,
                                                     inputs.k_cache,
-                                                    inputs.metadata,
+                                                    local_metadata,
                                                     selector);
   } else {
     // Include cached history with both signs in the decode score check.
-    inputs.metadata.kv_seq_lens.fill_(8);
-    inputs.metadata.block_table = torch::arange(8, int_option_).view({1, 8});
-    candidates = indexer->forward_dcp_local(
-        inputs.x,
-        inputs.q_norm,
-        inputs.positions,
-        inputs.k_cache,
-        inputs.metadata,
-        build_kv_shard_indexer_metadata(inputs.metadata));
+
+    const auto selector = build_kv_shard_indexer_metadata(inputs.metadata);
+    auto local_metadata = inputs.metadata;
+    local_metadata.slot_mapping =
+        localize_kv_shard_slots(inputs.metadata.slot_mapping, layout);
+    candidates = indexer->forward_dcp_local(inputs.x,
+                                            inputs.q_norm,
+                                            inputs.positions,
+                                            inputs.k_cache,
+                                            local_metadata,
+                                            selector);
   }
+  const auto local_slots =
+      localize_kv_shard_slots(inputs.metadata.slot_mapping, layout)
+          .to(torch::kInt64);
+  const auto owned = local_slots.ge(0);
+  const auto actual_keys =
+      inputs.k_cache.reshape({-1, test_config_.index_head_dim})
+          .index_select(0, local_slots.masked_select(owned));
+  const auto expected_keys = reference.k_local.index({owned});
+  test::verify_tensor_close(actual_keys, expected_keys, 0.02, 0.002);
   idx_expect_scores(
       candidates, reference, inputs.k_cache, inputs.k_cache_scale, layout);
 }
 }  // namespace
 
-TEST(DcpIndexerScoreTest, DecodeMatchesReluReference) {
+TEST_F(DcpIndexerScoreTest, DecodeMatchesReluReference) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1006,7 +1140,7 @@ TEST(DcpIndexerScoreTest, DecodeMatchesReluReference) {
                           /*chunked=*/false);
 }
 
-TEST(DcpIndexerScoreTest, PrefillMatchesReluReference) {
+TEST_F(DcpIndexerScoreTest, PrefillMatchesReluReference) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1040,7 +1174,7 @@ TEST(DcpIndexerScoreTest, PrefillMatchesReluReference) {
                           /*chunked=*/false);
 }
 
-TEST(DcpIndexerScoreTest, ChunkedPrefillMatchesReluReference) {
+TEST_F(DcpIndexerScoreTest, ChunkedPrefillMatchesReluReference) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1074,7 +1208,7 @@ TEST(DcpIndexerScoreTest, ChunkedPrefillMatchesReluReference) {
                           /*chunked=*/true);
 }
 
-TEST(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
+TEST_F(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1188,7 +1322,7 @@ TEST(TritonLaunchCfgTest, CompileOptionsSeparateCachedKernels) {
   }
 }
 
-TEST(IndexerTest, DcpRejectsUnsupportedHeads) {
+TEST_F(IndexerTest, DcpRejectsUnsupportedHeads) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1223,7 +1357,7 @@ TEST(IndexerTest, DcpRejectsUnsupportedHeads) {
                "requires BF16, 32 heads");
 }
 
-TEST(DcpIndexerScoreTest, RejectsUnsupportedDtype) {
+TEST_F(DcpIndexerScoreTest, RejectsUnsupportedDtype) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1264,7 +1398,7 @@ TEST(DcpIndexerScoreTest, RejectsUnsupportedDtype) {
       "requires BF16, 32 heads");
 }
 
-TEST(DcpIndexerScoreTest, RejectsUnsupportedHeadDim) {
+TEST_F(DcpIndexerScoreTest, RejectsUnsupportedHeadDim) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1302,7 +1436,7 @@ TEST(DcpIndexerScoreTest, RejectsUnsupportedHeadDim) {
                "head dimension 128");
 }
 
-TEST(DcpIndexerScoreTest, RejectsInt8CacheConfig) {
+TEST_F(DcpIndexerScoreTest, RejectsInt8CacheConfig) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1343,219 +1477,57 @@ TEST(DcpIndexerScoreTest, RejectsInt8CacheConfig) {
       "does not support INT8");
 }
 
-TEST(IndexerTest, CompareFusedVsNonFusedDecode) {
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  TestConfig test_config_;
-  torch::TensorOptions options_;
-  torch::TensorOptions int_option_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::shared_ptr<RotaryEmbeddingBase> rotary_emb_;
-
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for indexer kernel tests.";
-  }
-  torch::Device torch_device(Platform::type_torch(), 0);
-  Device setup_device(torch_device);
-  setup_device.set_seed();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(torch_device)
-                 .requires_grad(false);
-  int_option_ = options_.dtype(torch::kInt32);
-
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
-
-  LOG(INFO) << "Testing Decode";
-  TestInputs inputs = idx_create_inputs(
-      test_config_, options_, int_option_, rotary_emb_, 128, 1, false);
-
-  auto [base_block_tables, base_context_lens] = idx_run_indexer(parallel_args_,
-                                                                test_config_,
-                                                                options_,
-                                                                rotary_emb_,
-                                                                inputs,
-                                                                false,
-                                                                false);
-  auto [fused_block_tables, fused_context_lens] = idx_run_indexer(
-      parallel_args_, test_config_, options_, rotary_emb_, inputs, false, true);
-
-  auto fused_block_tables_slice = fused_block_tables.slice(1, 0, 1);
-  auto base_block_tables_slice = base_block_tables.slice(1, 0, 1);
-  test::verify_tensor_close(fused_context_lens.to(torch::kFloat32),
-                            base_context_lens.to(torch::kFloat32));
-  test::verify_tensor_close(fused_block_tables_slice.to(torch::kFloat32),
-                            base_block_tables_slice.to(torch::kFloat32));
-}
-
-TEST(IndexerTest, CompareFusedVsNonFusedMultipleRuns) {
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  TestConfig test_config_;
-  torch::TensorOptions options_;
-  torch::TensorOptions int_option_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::shared_ptr<RotaryEmbeddingBase> rotary_emb_;
-
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for indexer kernel tests.";
-  }
-  torch::Device torch_device(Platform::type_torch(), 0);
-  Device setup_device(torch_device);
-  setup_device.set_seed();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(torch_device)
-                 .requires_grad(false);
-  int_option_ = options_.dtype(torch::kInt32);
-
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
-
-  LOG(INFO) << "Testing with multiple random seeds";
-
-  Device device(options_.device());
-  for (int i = 0; i < 3; ++i) {
-    LOG(INFO) << "Random seed iteration: " << i;
-    device.set_seed(i * 100);
-    TestInputs inputs = idx_create_inputs(
-        test_config_, options_, int_option_, rotary_emb_, 128, 1, false);
-    inputs.x = test::seeded_tensor("indexer.multi.x." + std::to_string(i),
-                                   inputs.x.sizes(),
-                                   torch::kBFloat16,
-                                   torch::kCPU)
-                   .mul(2)
-                   .sub(1)
-                   .to(options_.device());
-    inputs.q_norm = test::seeded_tensor("indexer.multi.q." + std::to_string(i),
-                                        inputs.q_norm.sizes(),
-                                        torch::kBFloat16,
-                                        torch::kCPU)
-                        .mul(2)
-                        .sub(1)
-                        .to(options_.device());
-
-    auto [base_block_tables, base_context_lens] =
-        idx_run_indexer(parallel_args_,
-                        test_config_,
-                        options_,
-                        rotary_emb_,
-                        inputs,
-                        false,
-                        false);
-    auto [fused_block_tables, fused_context_lens] =
-        idx_run_indexer(parallel_args_,
-                        test_config_,
-                        options_,
-                        rotary_emb_,
-                        inputs,
-                        false,
-                        true);
-
-    auto fused_block_tables_slice = fused_block_tables.slice(1, 0, 1);
-    auto base_block_tables_slice = base_block_tables.slice(1, 0, 1);
-    test::verify_tensor_close(fused_context_lens.to(torch::kFloat32),
-                              base_context_lens.to(torch::kFloat32));
-    test::verify_tensor_close(fused_block_tables_slice.to(torch::kFloat32),
-                              base_block_tables_slice.to(torch::kFloat32));
+TEST_F(IndexerTest, CompareFusedVsNonFusedDecode) {
+  const auto options = torch::TensorOptions()
+                           .dtype(torch::kBFloat16)
+                           .device(Platform::type_torch(), 0);
+  auto ints = options.dtype(torch::kInt32);
+  std::unique_ptr<ProcessGroup> group;
+  auto parallel = test::create_default_parallel_args(group);
+  for (bool default_rope : {false, true}) {
+    SCOPED_TRACE(default_rope);
+    TestConfig config;
+    std::shared_ptr<RotaryEmbeddingBase> rope;
+    auto opts = options;
+    auto input = idx_create_inputs(
+        config, opts, ints, rope, 2, 1, false, true, 4096, default_rope);
+    input.metadata.is_prefill = false;
+    input.metadata.is_chunked_prefill = false;
+    const auto original = input.k_cache.clone();
+    auto [base, base_lens] =
+        idx_run_indexer(parallel, config, opts, rope, input, false, false);
+    const auto slots = input.metadata.slot_mapping.to(torch::kInt64);
+    const auto base_keys = input.k_cache.reshape({-1, config.index_head_dim})
+                               .index_select(0, slots)
+                               .clone();
+    input.k_cache = original;
+    auto [fused, fused_lens] =
+        idx_run_indexer(parallel, config, opts, rope, input, false, true);
+    EXPECT_TRUE(torch::equal(base_lens, fused_lens));
+    const auto fused_keys = input.k_cache.reshape({-1, config.index_head_dim})
+                                .index_select(0, slots);
+    test::verify_tensor_close(fused_keys, base_keys, 0.02, 0.002);
+    const double scale =
+        torch::norm(base_keys.to(torch::kFloat32)).item<double>();
+    ASSERT_GT(scale, 0.0);
+    EXPECT_LE(torch::norm((fused_keys - base_keys).to(torch::kFloat32))
+                      .item<double>() /
+                  scale,
+              0.02);
+    for (int64_t row = 0; row < 2; ++row) {
+      const auto expected = base[row].cpu().narrow(0, 0, config.index_topk);
+      const auto actual = fused[row].cpu().narrow(0, 0, config.index_topk);
+      EXPECT_TRUE(std::get<0>(actual.sort()).diff().gt(0).all().item<bool>());
+      EXPECT_TRUE(actual.ge(row * 4097).all().item<bool>());
+      EXPECT_TRUE(actual.lt((row + 1) * 4097).all().item<bool>());
+      const int64_t matches =
+          torch::isin(actual, expected).sum().item<int64_t>();
+      EXPECT_GE(100 * matches, 99 * config.index_topk);
+    }
   }
 }
 
-TEST(IndexerTest, CompareFusedVsNonFusedEdgeCaseSmall) {
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  TestConfig test_config_;
-  torch::TensorOptions options_;
-  torch::TensorOptions int_option_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::shared_ptr<RotaryEmbeddingBase> rotary_emb_;
-
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for indexer kernel tests.";
-  }
-  torch::Device torch_device(Platform::type_torch(), 0);
-  Device setup_device(torch_device);
-  setup_device.set_seed();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(torch_device)
-                 .requires_grad(false);
-  int_option_ = options_.dtype(torch::kInt32);
-
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
-
-  LOG(INFO) << "Testing Edge Case (Very Small Input)";
-  TestInputs inputs = idx_create_inputs(
-      test_config_, options_, int_option_, rotary_emb_, 16, 1, false);
-
-  auto [base_block_tables, base_context_lens] = idx_run_indexer(parallel_args_,
-                                                                test_config_,
-                                                                options_,
-                                                                rotary_emb_,
-                                                                inputs,
-                                                                false,
-                                                                false);
-  auto [fused_block_tables, fused_context_lens] = idx_run_indexer(
-      parallel_args_, test_config_, options_, rotary_emb_, inputs, false, true);
-
-  auto fused_block_tables_slice = fused_block_tables.slice(1, 0, 1);
-  auto base_block_tables_slice = base_block_tables.slice(1, 0, 1);
-  test::verify_tensor_close(fused_context_lens.to(torch::kFloat32),
-                            base_context_lens.to(torch::kFloat32));
-  test::verify_tensor_close(fused_block_tables_slice.to(torch::kFloat32),
-                            base_block_tables_slice.to(torch::kFloat32));
-}
-
-TEST(IndexerTest, DefaultRopeDecodePath) {
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  TestConfig test_config_;
-  torch::TensorOptions options_;
-  torch::TensorOptions int_option_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::shared_ptr<RotaryEmbeddingBase> rotary_emb_;
-
-  if (Platform::device_count() < 1) {
-    GTEST_SKIP() << "MLU device is required for indexer kernel tests.";
-  }
-  torch::Device torch_device(Platform::type_torch(), 0);
-  Device setup_device(torch_device);
-  setup_device.set_seed();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(torch_device)
-                 .requires_grad(false);
-  int_option_ = options_.dtype(torch::kInt32);
-
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  KVCacheConfig::get_instance().block_size(1);
-
-  LOG(INFO) << "Testing default rope decode path";
-  TestInputs inputs = idx_create_inputs(test_config_,
-                                        options_,
-                                        int_option_,
-                                        rotary_emb_,
-                                        32,
-                                        1,
-                                        false,
-                                        false,
-                                        0,
-                                        true);
-
-  auto [block_tables, context_lens] = idx_run_indexer(parallel_args_,
-                                                      test_config_,
-                                                      options_,
-                                                      rotary_emb_,
-                                                      inputs,
-                                                      false,
-                                                      false);
-
-  EXPECT_EQ(block_tables.dim(), 2);
-  EXPECT_EQ(block_tables.size(0), 32);
-  EXPECT_EQ(block_tables.size(1), test_config_.index_topk);
-  EXPECT_EQ(context_lens.dim(), 1);
-  EXPECT_EQ(context_lens.size(0), 32);
-}
-
-TEST(IndexerTest, Int8NormalPrefillWritesCacheScaleAndSelectsBlocks) {
+TEST_F(IndexerTest, Int8NormalPrefillWritesCacheScaleAndSelectsBlocks) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1599,9 +1571,10 @@ TEST(IndexerTest, Int8NormalPrefillWritesCacheScaleAndSelectsBlocks) {
   idx_expect_select_output(
       test_config_, block_tables, context_lens, kBatchSize * kQueryLen);
   idx_expect_quantized_cache_updated(inputs);
+  idx_expect_all_visible(inputs, block_tables, context_lens);
 }
 
-TEST(IndexerTest, Int8ChunkedPrefillSelectsAcrossNoncontiguousPages) {
+TEST_F(IndexerTest, Int8ChunkedPrefillSelectsAcrossNoncontiguousPages) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1653,9 +1626,10 @@ TEST(IndexerTest, Int8ChunkedPrefillSelectsAcrossNoncontiguousPages) {
   idx_expect_select_output(
       test_config_, block_tables, context_lens, kBatchSize * kQueryLen);
   idx_expect_quantized_cache_updated(inputs);
+  idx_expect_all_visible(inputs, block_tables, context_lens);
 }
 
-TEST(IndexerTest, Int8DecodeWritesCacheScaleAndSelectsBlocks) {
+TEST_F(IndexerTest, Int8DecodeWritesCacheScaleAndSelectsBlocks) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1698,9 +1672,10 @@ TEST(IndexerTest, Int8DecodeWritesCacheScaleAndSelectsBlocks) {
   idx_expect_select_output(
       test_config_, block_tables, context_lens, kBatchSize);
   idx_expect_quantized_cache_updated(inputs);
+  idx_expect_all_visible(inputs, block_tables, context_lens);
 }
 
-TEST(IndexerTest, Int8CpPrefillWritesCacheScaleAndSelectsBlocks) {
+TEST_F(IndexerTest, Int8CpPrefillWritesCacheScaleAndSelectsBlocks) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1756,9 +1731,10 @@ TEST(IndexerTest, Int8CpPrefillWritesCacheScaleAndSelectsBlocks) {
 
   idx_expect_select_output(test_config_, block_tables, context_lens, kTokenNum);
   idx_expect_quantized_cache_updated(inputs);
+  idx_expect_all_visible(inputs, block_tables, context_lens);
 }
 
-TEST(IndexerTest, Int8CpChunkedPrefillMatchesSingleRankNormalPath) {
+TEST_F(IndexerTest, Int8CpChunkedPrefillMatchesSingleRankNormalPath) {
   ParallelArgs parallel_args_{0, 1, nullptr};
   TestConfig test_config_;
   torch::TensorOptions options_;
@@ -1835,9 +1811,12 @@ TEST(IndexerTest, Int8CpChunkedPrefillMatchesSingleRankNormalPath) {
       test_config_, cp_block_tables, cp_context_lens, kQueryLen);
   idx_expect_quantized_cache_updated(cp_inputs);
   EXPECT_TRUE(torch::equal(cp_context_lens, normal_context_lens));
-  EXPECT_TRUE(torch::equal(
-      cp_block_tables.slice(/*dim=*/1, /*start=*/0, /*end=*/1),
-      normal_block_tables.slice(/*dim=*/1, /*start=*/0, /*end=*/1)));
+  idx_expect_all_visible(
+      normal_inputs, normal_block_tables, normal_context_lens);
+  idx_expect_all_visible(cp_inputs, cp_block_tables, cp_context_lens);
+  EXPECT_TRUE(torch::equal(cp_inputs.k_cache, normal_inputs.k_cache));
+  EXPECT_TRUE(
+      torch::equal(*cp_inputs.k_cache_scale, *normal_inputs.k_cache_scale));
 }
 
 }  // namespace layer

@@ -52,50 +52,12 @@ class DecoderReshapeAndCacheTest : public ::testing::Test {
 // 2) per-sequence slice correctness at the target decode step
 void torch_reference(const torch::Tensor& proj_k,
                      const torch::Tensor& proj_v,
-                     torch::Tensor& unshared_k_cache,
-                     torch::Tensor& unshared_v_cache,
+                     torch::Tensor& key_cache,
+                     torch::Tensor& value_cache,
                      const torch::Tensor& step) {
-  const int64_t batch_size = proj_k.size(0);
-  const int64_t beam_size = proj_k.size(1);
-  const int64_t kv_heads = proj_k.size(2);
-  const int64_t head_dim = proj_k.size(3);
-
-  const int64_t max_num_request = unshared_k_cache.size(0);
-  const int64_t max_decode_step = unshared_k_cache.size(2);
-
-  CHECK_EQ(proj_k.dim(), 4) << "proj_k must be 4-dimensional";
-  CHECK_EQ(proj_v.dim(), 4) << "proj_v must be 4-dimensional";
-  CHECK_EQ(proj_v.sizes(), proj_k.sizes())
-      << "proj_v and proj_k must have same shape";
-
-  CHECK_EQ(unshared_k_cache.dim(), 5)
-      << "unshared_k_cache must be 5-dimensional";
-  CHECK_EQ(unshared_v_cache.sizes(), unshared_k_cache.sizes())
-      << "unshared_v_cache and unshared_k_cache must have same shape";
-  CHECK_EQ(unshared_k_cache.size(3), kv_heads)
-      << "unshared_k_cache kv_heads mismatch";
-  CHECK_EQ(unshared_k_cache.size(4), head_dim)
-      << "unshared_k_cache head_dim mismatch";
-  CHECK_LE(batch_size, max_num_request)
-      << "batch_size must be <= max_num_request";
-
-  CHECK_EQ(step.dim(), 1) << "step must be 1-dimensional";
-  CHECK_EQ(step.size(0), 1) << "step must have shape [1]";
-  const int64_t step_value = step[0].item<int64_t>();
-  CHECK_GE(step_value, 0) << "step must be >= 0";
-  CHECK_LT(step_value, max_decode_step)
-      << "step must be less than max_decode_step";
-
-  for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-    for (int64_t beam_idx = 0; beam_idx < beam_size; ++beam_idx) {
-      unshared_k_cache[batch_idx][beam_idx]
-          .select(0, step_value)
-          .copy_(proj_k[batch_idx][beam_idx]);
-      unshared_v_cache[batch_idx][beam_idx]
-          .select(0, step_value)
-          .copy_(proj_v[batch_idx][beam_idx]);
-    }
-  }
+  const int64_t position = step.item<int32_t>();
+  key_cache.narrow(0, 0, proj_k.size(0)).select(2, position).copy_(proj_k);
+  value_cache.narrow(0, 0, proj_v.size(0)).select(2, position).copy_(proj_v);
 }
 
 TEST_F(DecoderReshapeAndCacheTest, CorrectnessTest) {
@@ -109,8 +71,6 @@ TEST_F(DecoderReshapeAndCacheTest, CorrectnessTest) {
   torch::Tensor step = torch::tensor({1}, torch::kInt32).to(device_);
 
   const auto float_opts = torch::TensorOptions().device(device_).dtype(dtype_);
-  const auto int_opts =
-      torch::TensorOptions().device(device_).dtype(torch::kInt32);
 
   torch::Tensor proj_k =
       torch::randn({batch_size, beam_size, kv_heads, head_dim}, float_opts);
@@ -134,16 +94,6 @@ TEST_F(DecoderReshapeAndCacheTest, CorrectnessTest) {
 
   EXPECT_TRUE(torch::allclose(unshared_k_cache, ref_k_cache, 1e-5, 1e-5));
   EXPECT_TRUE(torch::allclose(unshared_v_cache, ref_v_cache, 1e-5, 1e-5));
-
-  const int64_t step_value = step[0].item<int64_t>();
-  for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-    for (int64_t beam_idx = 0; beam_idx < beam_size; ++beam_idx) {
-      torch::Tensor copied_k =
-          unshared_k_cache[batch_idx][beam_idx].select(0, step_value);
-      torch::Tensor source_k = proj_k[batch_idx][beam_idx];
-      EXPECT_TRUE(torch::allclose(copied_k, source_k, 1e-5, 1e-5));
-    }
-  }
 }
 
 }  // namespace test

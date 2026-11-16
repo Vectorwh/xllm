@@ -15,7 +15,6 @@ limitations under the License.
 
 #include "core/framework/parallel_state/mapping_npu.h"
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -76,7 +75,6 @@ TEST(TestMappingNPU, ToJson) {
   MappingNPU::Options options = get_mapping_options();
   MappingNPU mapping(rank_table_file, 16, 6, options);
   nlohmann::json data = mapping.to_json();
-  LOG(INFO) << "Mapping INFO:\n" << data.dump(2);
   nlohmann::json attn_dp = data["attnDp"];
   int32_t attn_dp_group_id = attn_dp["groupId"];
   EXPECT_EQ(attn_dp_group_id, 6);
@@ -122,6 +120,8 @@ TEST(TestMappingNPU, BufferOffsetIsExplicitAndRankIndependent) {
 }
 
 TEST(TestMappingNPU, ModelOffsetsSeparateActualAtbCommunicationCache) {
+  ScopedEnvVar hccl_buffsize("HCCL_BUFFSIZE");
+  hccl_buffsize.set("128");
   atb_speed::ExternalCommManager manager;
   manager.SetLcclCommDomainRange(/*lowerBound=*/0, /*upperBound=*/65536);
   manager.Init(/*worldSize=*/2,
@@ -129,7 +129,11 @@ TEST(TestMappingNPU, ModelOffsetsSeparateActualAtbCommunicationCache) {
                /*backend=*/"lccl",
                /*rankTableFile=*/"",
                /*streamId=*/0);
-  const auto domain = [&manager](uint32_t buffer_size) {
+  const auto domain = [&manager](int32_t buffer_offset) {
+    MappingNPU::Options options = get_mapping_options();
+    options.buffer_offset(buffer_offset);
+    MappingNPU mapping("", /*world_size=*/16, /*rank=*/0, options);
+    const uint32_t buffer_size = mapping.to_json()["attnTp"]["bufferSize"];
     return manager.GetCommDomain(/*groupId=*/0,
                                  /*rankIds=*/{0, 1},
                                  /*subCommRankId=*/0,
@@ -137,12 +141,12 @@ TEST(TestMappingNPU, ModelOffsetsSeparateActualAtbCommunicationCache) {
                                  buffer_size,
                                  /*streamId=*/0);
   };
-  const std::string target = domain(128);
-  const std::string draft = domain(129);
-  const std::string second_target = domain(130);
-  const std::string second_draft = domain(131);
-  EXPECT_EQ(domain(128), target);
-  EXPECT_EQ(domain(130), second_target);
+  const std::string target = domain(0);
+  const std::string draft = domain(1);
+  const std::string second_target = domain(2);
+  const std::string second_draft = domain(3);
+  EXPECT_EQ(domain(0), target);
+  EXPECT_EQ(domain(2), second_target);
   EXPECT_NE(target, draft);
   EXPECT_NE(target, second_target);
   EXPECT_NE(draft, second_target);

@@ -68,21 +68,9 @@ def test_release_drops_only_the_requested_device(monkeypatch: pytest.MonkeyPatch
     assert set(npu_streams._SHARED_EXPERT_STREAMS) == {(other_device.type, other_device.index)}
     assert npu_streams.shared_expert_stream(other_device) is other
     assert npu_streams.shared_expert_stream(device) is not first
-
-
-def test_release_of_uncached_device_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_stream_creation(monkeypatch)
-    npu_streams.release_shared_expert_stream(torch.device("privateuseone:7"))
-    assert npu_streams._SHARED_EXPERT_STREAMS == {}
-
-
-def test_indexed_and_unindexed_devices_do_not_alias(monkeypatch: pytest.MonkeyPatch) -> None:
-    created = _stub_stream_creation(monkeypatch)
-    indexed = npu_streams.shared_expert_stream(torch.device("privateuseone:0"))
-    unindexed = npu_streams.shared_expert_stream(torch.device("privateuseone"))
-
-    assert indexed is not unindexed
-    assert len(created) == 2
+    npu_streams.release_shared_expert_stream(device)
+    npu_streams.release_shared_expert_stream(device)
+    assert npu_streams.shared_expert_stream(other_device) is other
 
 
 def test_import_without_npu_does_not_create_streams(monkeypatch: pytest.MonkeyPatch) -> None:

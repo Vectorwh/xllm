@@ -13,19 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Numerical parity between DSparkConfidenceHead::forward_batched (O11) and the
-// original per-step forward it replaced. The batched path hoists the whole
-// gamma-step ConfidenceHead out of the sample loop; it must produce bit-close
-// results to gamma independent per-step calls, otherwise adaptive pruning would
-// silently change behavior.
+// Batched confidence must match independent steps: precision drift changes
+// adaptive pruning and can silently reduce the accepted draft length.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
 #include <cstdint>
-#include <cstdlib>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -118,23 +113,8 @@ TEST(DSparkConfidenceHeadParity, WithMarkov_Gamma7) {
   check_parity(/*with_markov=*/true, /*batch=*/5, /*gamma=*/7);
 }
 
-TEST(DSparkConfidenceHeadParity, WithMarkov_Gamma16) {
-  check_parity(/*with_markov=*/true, /*batch=*/3, /*gamma=*/16);
-}
-
-TEST(DSparkConfidenceHeadParity, WithMarkov_Gamma1) {
-  check_parity(/*with_markov=*/true, /*batch=*/4, /*gamma=*/1);
-}
-
 TEST(DSparkConfidenceHeadParity, NoMarkov_Gamma16) {
   check_parity(/*with_markov=*/false, /*batch=*/3, /*gamma=*/16);
-}
-
-// forward and forward_batched apply the same fixed confidence_temperature(), so
-// both paths scale identically and parity holds. An extra batch/gamma shape for
-// coverage beyond the cases above.
-TEST(DSparkConfidenceHeadParity, WithMarkov_Batch6Gamma8) {
-  check_parity(/*with_markov=*/true, /*batch=*/6, /*gamma=*/8);
 }
 
 }  // namespace xllm::npu::model

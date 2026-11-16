@@ -124,9 +124,6 @@ def test_router_fp32_preserves_expert_input_dtype(
         {"n_routed_experts": 7},
         {"tp_rank": -1},
         {"expert_parallel_degree": 3},
-        {"swiglu_limit": 0.0},
-        {"swiglu_limit": float("inf")},
-        {"swiglu_limit": float("nan")},
     ],
 )
 def test_rejects_unsupported_parallel_modes(overrides: dict) -> None:

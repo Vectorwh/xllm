@@ -20,13 +20,10 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(EplbOptionsTest, AcceptsDocumentedDefaults) {
-  EplbOptions options;
-  options.validate();
-  EXPECT_EQ(options.eplb_policy_kind, "balanced");
-}
-
 TEST(EplbOptionsTest, RejectsInvalidValuesBeforeRuntime) {
+  EplbOptions defaults;
+  EXPECT_NO_FATAL_FAILURE(defaults.validate());
+  EXPECT_EQ(defaults.eplb_policy_kind, "balanced");
   EXPECT_DEATH(
       {
         EplbOptions options;

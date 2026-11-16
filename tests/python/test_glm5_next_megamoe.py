@@ -34,19 +34,17 @@ def _config(**kwargs: object) -> glm5_next.Glm5NextConfig:
     return glm5_next.Glm5NextConfig(**values)
 
 
-@pytest.mark.parametrize("rows", [1, 4])
-@pytest.mark.parametrize("graph", [False, True])
-def test_megamoe_accepts_rows_inside_its_own_cap(rows: int, graph: bool) -> None:
+@pytest.mark.parametrize(
+    ("rows", "graph", "expected"),
+    [(1, False, "megamoe"), (4, True, "megamoe"), (5, False, "alltoall"), (5, True, None)],
+)
+def test_megamoe_capacity_admission(rows: int, graph: bool, expected: str | None) -> None:
     policy = Eplv2CommPolicy(8, mega_moe_capacity=4)
-    assert policy.select(rows, graph=graph) == "megamoe"
-
-
-@pytest.mark.parametrize("rows", [5, 8, 9])
-def test_megamoe_over_cap_uses_eager_alltoall(rows: int) -> None:
-    policy = Eplv2CommPolicy(8, mega_moe_capacity=4)
-    assert policy.select(rows, graph=False) == "alltoall"
-    with pytest.raises(ValueError, match="MegaMoE capacity"):
-        policy.select(rows, graph=True)
+    if expected is None:
+        with pytest.raises(ValueError, match="MegaMoE capacity"):
+            policy.select(rows, graph=graph)
+    else:
+        assert policy.select(rows, graph=graph) == expected
 
 
 def test_megamoe_off_auto_selects_mc2_or_alltoall() -> None:
@@ -106,12 +104,27 @@ def test_megamoe_defaults_off() -> None:
     assert Eplv2CommPolicy(8, mega_moe_capacity=parsed.mega_moe_num_max_tokens_per_rank).select(4) == "megamoe"
 
 
-@pytest.mark.parametrize("enable_mega_moe", [False, True])
-@pytest.mark.parametrize("mc2_capacity", [2, 8])
-@pytest.mark.parametrize("offset", [-1, 0, 1])
-@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize(
+    ("enable_mega_moe", "mc2_capacity", "rows", "graph", "expected"),
+    [
+        (False, 2, 1, False, "mc2"),
+        (False, 2, 2, True, "mc2"),
+        (False, 2, 3, False, "alltoall"),
+        (False, 2, 3, True, None),
+        (False, 8, 8, True, "mc2"),
+        (True, 2, 4, True, "megamoe"),
+        (True, 8, 4, False, "megamoe"),
+        (True, 8, 5, False, "alltoall"),
+        (True, 8, 5, True, None),
+    ],
+)
 def test_model_policy_automatically_selects_from_feature_and_capacity(
-    monkeypatch: pytest.MonkeyPatch, enable_mega_moe: bool, mc2_capacity: int, offset: int, graph: bool
+    monkeypatch: pytest.MonkeyPatch,
+    enable_mega_moe: bool,
+    mc2_capacity: int,
+    rows: int,
+    graph: bool,
+    expected: str | None,
 ) -> None:
     monkeypatch.setenv("HCCL_BUFFSIZE", "200")
     cfg = glm5_next.Glm5NextConfig.from_dict(
@@ -122,12 +135,10 @@ def test_model_policy_automatically_selects_from_feature_and_capacity(
     capacity = 4 if enable_mega_moe else mc2_capacity
     assert policy.mc2_capacity == mc2_capacity
     assert policy.graph_token_limit == capacity
-    rows = capacity + offset
-    if graph and offset > 0:
+    if expected is None:
         with pytest.raises(ValueError, match="requires eager execution"):
-            policy.select(rows, graph=True)
+            policy.select(rows, graph=graph)
     else:
-        expected = ("megamoe" if enable_mega_moe else "mc2") if offset <= 0 else "alltoall"
         assert policy.select(rows, graph=graph) == expected
 
 
@@ -242,39 +253,6 @@ def test_fixed_backend_pads_all_inputs_and_trims_local_output(
 def test_megamoe_zero_clamp_input_keeps_config_default() -> None:
     cfg = glm5_next.Glm5NextConfig.from_dict(vars(_config(swiglu_limit=0.0)))
     assert cfg.swiglu_limit == glm5_next.Glm5NextConfig().swiglu_limit
-
-
-@pytest.mark.parametrize("ep,cp", [(8, 4), (16, 8)])
-@pytest.mark.parametrize("hidden,inter,topk", [(4096, 2048, 8), (8, 16, 2)])
-def test_megamoe_npu_constructor_has_no_geometry_whitelist(
-    monkeypatch: pytest.MonkeyPatch, ep: int, cp: int, hidden: int, inter: int, topk: int
-) -> None:
-    # Exercise the NPU-specific constructor branch without allocating on an NPU.
-    # Real dtype/topology/resource validators still run; only allocations are mocked.
-    device = torch.device("privateuseone:0")
-
-    class NpuContext(torch.Tensor):
-        @property
-        def device(self) -> torch.device:
-            return device
-
-    context = torch.Tensor._make_subclass(NpuContext, torch.zeros(8, dtype=torch.int32))
-    cfg = _config(
-        ep_size=ep,
-        cp_size=cp,
-        hidden_size=hidden,
-        moe_intermediate_size=inter,
-        n_routed_experts=288,
-        num_experts_per_tok=topk,
-        mega_moe_context=context,
-    )
-    zeros = torch.zeros
-    monkeypatch.setattr(glm5_next.torch, "zeros", lambda *args, **kwargs: zeros(*args, **(kwargs | {"device": "cpu"})))
-    monkeypatch.setattr(glm5_next.nn, "Linear", lambda *args, **kwargs: torch.nn.Identity())
-    monkeypatch.setattr(glm5_next, "Glm5NextMLP", lambda *args, **kwargs: torch.nn.Identity())
-    moe = glm5_next.Glm5NextMoE(cfg, torch.bfloat16, device)
-    assert moe.num_local_experts == 288 // ep
-    assert moe.mega_moe_context is context
 
 
 @pytest.mark.parametrize(

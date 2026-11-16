@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <vector>
 
 #include "core/framework/speculative/speculative_profile_registry.h"
@@ -36,17 +37,34 @@ runtime::Options make_options() {
   return options;
 }
 
-void setup_registry() {
-  SpeculativeProfileRegistry::ValidateTimePredictor predictor;
-  predictor.intercept_ms = 1.0;
-  predictor.query_token_ms = 0.5;
-  predictor.query_prefix_ms = 0.001;
-  SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
-      predictor);
-}
+class ScopedPredictor final {
+ public:
+  ScopedPredictor()
+      : previous_(SpeculativeProfileRegistry::get_instance()
+                      .validate_time_predictor()) {
+    SpeculativeProfileRegistry::ValidateTimePredictor predictor;
+    predictor.intercept_ms = 1.0;
+    predictor.query_token_ms = 0.5;
+    predictor.query_prefix_ms = 0.001;
+    SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
+        predictor);
+  }
+  ~ScopedPredictor() {
+    if (previous_) {
+      SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
+          *previous_);
+    } else {
+      SpeculativeProfileRegistry::get_instance()
+          .reset_validate_time_predictor();
+    }
+  }
+
+ private:
+  std::optional<SpeculativeProfileRegistry::ValidateTimePredictor> previous_;
+};
 
 TEST(AdaptiveSpeculativeControllerTest, SelectsPrunedPrefixesByPathProb) {
-  setup_registry();
+  ScopedPredictor predictor;
   AdaptiveSpeculativeController controller(make_options());
   torch::Tensor probs = torch::tensor({
       {0.95, 0.90, 0.20},
@@ -56,16 +74,15 @@ TEST(AdaptiveSpeculativeControllerTest, SelectsPrunedPrefixesByPathProb) {
 
   const std::vector<int32_t> prefix_lengths =
       controller.select_pruned_prefix_lengths(probs,
-                                              /*full_draft_time_ms=*/1.0,
+                                              /*full_draft_time_ms=*/0.0,
                                               per_seq_kv_lens);
 
   ASSERT_EQ(prefix_lengths.size(), 2);
-  EXPECT_GE(prefix_lengths[0], 1);
-  EXPECT_GE(prefix_lengths[1], 0);
+  EXPECT_EQ(prefix_lengths, (std::vector<int32_t>{2, 1}));
 }
 
 TEST(AdaptiveSpeculativeControllerTest, AllowsZeroPrefixWhenNoGain) {
-  setup_registry();
+  ScopedPredictor predictor;
   AdaptiveSpeculativeController controller(make_options());
   torch::Tensor probs = torch::tensor({
       {0.0, 0.0, 0.0},
@@ -75,7 +92,7 @@ TEST(AdaptiveSpeculativeControllerTest, AllowsZeroPrefixWhenNoGain) {
 
   const std::vector<int32_t> prefix_lengths =
       controller.select_pruned_prefix_lengths(probs,
-                                              /*full_draft_time_ms=*/1.0,
+                                              /*full_draft_time_ms=*/0.0,
                                               per_seq_kv_lens);
 
   ASSERT_EQ(prefix_lengths.size(), 2);
@@ -84,22 +101,26 @@ TEST(AdaptiveSpeculativeControllerTest, AllowsZeroPrefixWhenNoGain) {
 }
 
 TEST(AdaptiveSpeculativeControllerTest, ContinuesAfterNonImprovingCandidate) {
-  setup_registry();
-  AdaptiveSpeculativeController controller(make_options());
+  ScopedPredictor predictor;
+  runtime::Options options = make_options();
+  options.adaptive_speculative_min_gain(0.09);
+  AdaptiveSpeculativeController controller(options);
   torch::Tensor probs = torch::tensor({
       {0.99, 0.98},
       {0.90, 0.00},
   });
-  std::vector<double> per_seq_kv_lens = {100.0, 100.0};
+  // Serving callers use full_draft_time_ms=0 for deterministic pruning.
+  // These costs give about 13% gain for the first prefix, 7% for its second,
+  // and 11% for the later cheap row. The 9% threshold must keep scanning.
+  std::vector<double> per_seq_kv_lens = {200.0, 1.0};
 
   const std::vector<int32_t> prefix_lengths =
       controller.select_pruned_prefix_lengths(probs,
-                                              /*full_draft_time_ms=*/1.0,
+                                              /*full_draft_time_ms=*/0.0,
                                               per_seq_kv_lens);
 
   ASSERT_EQ(prefix_lengths.size(), 2);
-  EXPECT_GE(prefix_lengths[0], 1);
-  EXPECT_GE(prefix_lengths[1], 0);
+  EXPECT_EQ(prefix_lengths, (std::vector<int32_t>{1, 1}));
 }
 
 }  // namespace

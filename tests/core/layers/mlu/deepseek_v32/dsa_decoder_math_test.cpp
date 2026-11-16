@@ -495,6 +495,9 @@ DsaTopkState fixed_topk(const torch::Device& device, bool decode) {
 }
 
 void run_decoder_math(bool moe, bool decode) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
   torch::NoGradGuard no_grad;
   BlockSizeGuard block_size;
   Device dev(/*device_index=*/0);

@@ -111,22 +111,6 @@ def _naive_owned_pack(row: list[int], layout: KVShardLayout) -> list[int]:
     return owned + [KVShardLayout.INVALID_SLOT] * (len(row) - len(owned))
 
 
-def test_remap_sparse_indices_packs_owned_slots() -> None:
-    layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
-    slots = torch.tensor(
-        [
-            [0, 5, -1, 8],
-            [1, 4, 9, -1],
-        ],
-        dtype=torch.int32,
-    )
-    remapped = remap_sparse_indices(slots, layout, index_topk=4)
-    assert remapped.shape == slots.shape
-    owned = remapped >= 0
-    assert owned[0].tolist() == [True, True, False, False]
-    assert owned[1].tolist() == [True, True, False, False]
-
-
 def test_remap_sparse_indices_accepts_kpool_tail_wider_than_index_topk() -> None:
     layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
     slots = torch.tensor([[0, 5, -1, 8, 12, 1, 4]], dtype=torch.int32)

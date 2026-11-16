@@ -93,13 +93,6 @@ struct All2AllTestParams {
   bool is_smoothquant;
   int64_t moe_weight_bits = 8;
   int64_t group_size = 0;
-  // Expected output stats (used when perform_precise_validation is true)
-  double expected_min = 0.0;
-  double expected_max = 0.0;
-  double expected_sum = 0.0;
-  // When true, validate output against expected_min/max/sum (avoids fragile
-  // "any non-zero expected" heuristic; allows validation when all are 0.0).
-  bool perform_precise_validation = false;
 };
 
 // Helper to create model args
@@ -108,7 +101,7 @@ ModelArgs create_model_args(const All2AllTestParams& params) {
   args.n_routed_experts() = static_cast<int32_t>(params.num_experts);
   args.num_experts_per_tok() = static_cast<int32_t>(params.top_k);
   args.n_group() = 1;
-  args.topk_group() = static_cast<int32_t>(params.top_k);
+  args.topk_group() = 1;
   args.routed_scaling_factor() = 1.0f;
   args.hidden_size() = params.hidden_size;
   args.moe_intermediate_size() = static_cast<int32_t>(params.intermediate_size);
@@ -247,6 +240,32 @@ std::unordered_map<std::string, torch::Tensor> create_all2all_test_weights(
   return weight_dict;
 }
 
+// No EP/TP sharding or collective in this reference: it runs every expert.
+// It validates distributed routing/orchestration, not independent GEMM math.
+torch::Tensor reference_ep_one(const ModelArgs& model_args,
+                               const QuantArgs& quant_args,
+                               const torch::TensorOptions& options,
+                               const StateDict& weights,
+                               const torch::Tensor& input,
+                               ModelStreamRegistry& streams) {
+  ProcessGroup single(0, 1, options.device());
+  ParallelArgs args(0, 1, &single);
+  args.tp_group_ = &single;
+  args.single_rank_group_ = &single;
+  FusedMoE reference(
+      model_args,
+      FusedMoEArgs{.is_gated = true, .enable_result_reduction = false},
+      quant_args,
+      args,
+      options,
+      streams.get(ExecutionStreamRole::COMMUNICATION),
+      streams.get(ExecutionStreamRole::AUXILIARY_COMPUTE));
+  reference->load_state_dict(weights);
+  const auto output = reference->forward_experts(input, false);
+  Device(options.device()).synchronize_default_stream();
+  return output;
+}
+
 // Child process test function for basic All2All test
 int32_t run_all2all_basic_test_child(All2AllTestParams params) {
   try {
@@ -276,10 +295,14 @@ int32_t run_all2all_basic_test_child(All2AllTestParams params) {
                          << ": Failed to create ProcessGroup";
 
     // 4. Create ParallelArgs with EP mode
-    ParallelArgs parallel_args(params.rank, params.world_size, process_group);
+    ProcessGroup single_rank(0, 1, device);
+    ParallelArgs parallel_args(
+        params.rank, params.world_size, params.world_size, process_group);
+    parallel_args.tp_group_ = &single_rank;
+    parallel_args.single_rank_group_ = &single_rank;
     parallel_args.moe_ep_group_ = process_group;
     parallel_args.ep_size_ = params.world_size;
-    parallel_args.moe_tp_group_ = process_group;
+    parallel_args.moe_tp_group_ = &single_rank;
 
     // 5. Create tensor options
     // Note: smoothquant mode still uses BF16 for input/output, with int8 for
@@ -313,7 +336,7 @@ int32_t run_all2all_basic_test_child(All2AllTestParams params) {
                                                    params.is_smoothquant,
                                                    params.moe_weight_bits,
                                                    params.group_size,
-                                                   params.world_size,
+                                                   /*tp_size=*/1,
                                                    device);
     StateDict state_dict(weight_dict);
     fused_moe->load_state_dict(state_dict);
@@ -342,30 +365,16 @@ int32_t run_all2all_basic_test_child(All2AllTestParams params) {
     CHECK_EQ(output.size(0), num_tokens) << "Token count should match";
     CHECK_EQ(output.size(1), params.hidden_size) << "Hidden size should match";
 
-    // Compute and log output stats for setting expected values
-    auto flat_output = output.flatten().to(torch::kFloat32).cpu();
-    double actual_min = torch::min(flat_output).item<double>();
-    double actual_max = torch::max(flat_output).item<double>();
-    double actual_sum = torch::sum(flat_output).item<double>();
-
-    LOG(INFO) << "Rank " << params.rank << ": Output stats - "
-              << "min=" << actual_min << ", max=" << actual_max
-              << ", sum=" << actual_sum;
-
-    // Basic sanity check (will be replaced with precise validation later)
-    CHECK_NE(actual_sum, 0.0) << "Output should not be all zeros";
-
-    if (params.perform_precise_validation) {
-      test::expect_tensor_stats(output,
-                                params.expected_min,
-                                params.expected_max,
-                                params.expected_sum);
-      LOG(INFO) << "Rank " << params.rank
-                << ": All2All test passed with precise validation.";
-    } else {
-      LOG(INFO) << "Rank " << params.rank
-                << ": All2All test passed (basic validation only).";
-    }
+    const auto expected = reference_ep_one(model_args,
+                                           quant_args,
+                                           options,
+                                           state_dict,
+                                           hidden_states,
+                                           stream_registry);
+    CHECK(torch::isfinite(output).all().item<bool>());
+    CHECK_GT(expected.abs().max().item<float>(), 1e-4);
+    CHECK(torch::allclose(output, expected, 0.02, 2e-4))
+        << "All2All output differs from the unsharded reference";
 
     return 0;
 
@@ -402,10 +411,14 @@ int32_t run_all2all_selected_route_test_child(All2AllTestParams params) {
     CHECK(process_group) << "Rank " << params.rank
                          << ": Failed to create ProcessGroup";
 
-    ParallelArgs parallel_args(params.rank, params.world_size, process_group);
+    ProcessGroup single_rank(0, 1, device);
+    ParallelArgs parallel_args(
+        params.rank, params.world_size, params.world_size, process_group);
+    parallel_args.tp_group_ = &single_rank;
+    parallel_args.single_rank_group_ = &single_rank;
     parallel_args.moe_ep_group_ = process_group;
     parallel_args.ep_size_ = params.world_size;
-    parallel_args.moe_tp_group_ = process_group;
+    parallel_args.moe_tp_group_ = &single_rank;
 
     auto options = torch::TensorOptions()
                        .dtype(torch::kBFloat16)
@@ -431,7 +444,7 @@ int32_t run_all2all_selected_route_test_child(All2AllTestParams params) {
                                                    params.is_smoothquant,
                                                    params.moe_weight_bits,
                                                    params.group_size,
-                                                   params.world_size,
+                                                   /*tp_size=*/1,
                                                    device);
     StateDict state_dict(weight_dict);
     fused_moe->load_state_dict(state_dict);
@@ -453,6 +466,13 @@ int32_t run_all2all_selected_route_test_child(All2AllTestParams params) {
                                    route_info);
 
     xllm_device.synchronize_default_stream();
+    const auto unsharded = reference_ep_one(model_args,
+                                            quant_args,
+                                            options,
+                                            state_dict,
+                                            hidden_states,
+                                            stream_registry);
+    CHECK(torch::allclose(actual, unsharded, 0.02, 2e-4));
     CHECK(torch::allclose(actual, expected, /*rtol=*/1e-3, /*atol=*/1e-4))
         << "Selected MoE route all2all output mismatch";
     return 0;
@@ -464,43 +484,8 @@ int32_t run_all2all_selected_route_test_child(All2AllTestParams params) {
 
 std::vector<::xllm::test::ForkedRankSession::Case> all2all_cases() {
   return {
-      {"BasicAll2AllFlow",
-       [](int32_t rank, int32_t port) {
-         torch::manual_seed(0);
-         All2AllTestParams params{};
-         params.device_index = -1;
-         params.hidden_size = 512;
-         params.intermediate_size = 256;
-         params.num_experts = 4;
-         params.top_k = 2;
-         params.batch_size = 2;
-         params.seq_len = 4;
-         params.is_smoothquant = false;
-         params.rank = rank;
-         params.world_size = 2;
-         params.port = port;
-         params.host = "127.0.0.1";
-         return run_all2all_basic_test_child(params);
-       }},
-      {"SmoothQuantAll2AllFlow",
-       [](int32_t rank, int32_t port) {
-         torch::manual_seed(0);
-         All2AllTestParams params{};
-         params.device_index = -1;
-         params.hidden_size = 512;
-         params.intermediate_size = 256;
-         params.num_experts = 4;
-         params.top_k = 2;
-         params.batch_size = 2;
-         params.seq_len = 4;
-         params.is_smoothquant = true;
-         params.rank = rank;
-         params.world_size = 2;
-         params.port = port;
-         params.host = "127.0.0.1";
-         return run_all2all_smoothquant_test_child(params);
-       }},
-      {"BasicAll2AllPreciseValidation",
+
+      {"UnquantizedAll2AllMatchesEpOne",
        [](int32_t rank, int32_t port) {
          torch::manual_seed(0);
          All2AllTestParams params = ([]() {
@@ -513,10 +498,6 @@ std::vector<::xllm::test::ForkedRankSession::Case> all2all_cases() {
            params.batch_size = 2;
            params.seq_len = 4;
            params.is_smoothquant = false;
-           params.expected_min = 835584.0;
-           params.expected_max = 1269760.0;
-           params.expected_sum = 4209990000.0;
-           params.perform_precise_validation = true;
            return params;
          })();
          params.rank = rank;
@@ -525,7 +506,7 @@ std::vector<::xllm::test::ForkedRankSession::Case> all2all_cases() {
          params.host = "127.0.0.1";
          return run_all2all_basic_test_child(params);
        }},
-      {"SmoothQuantAll2AllPreciseValidation",
+      {"SmoothQuantAll2AllMatchesEpOne",
        [](int32_t rank, int32_t port) {
          torch::manual_seed(0);
          All2AllTestParams params = ([]() {
@@ -538,11 +519,6 @@ std::vector<::xllm::test::ForkedRankSession::Case> all2all_cases() {
            params.batch_size = 2;
            params.seq_len = 4;
            params.is_smoothquant = true;
-           // Note: min=0 is valid for SmoothQuant due to quantization effects
-           params.expected_min = 0.0;
-           params.expected_max = 0.104004;
-           params.expected_sum = 3.88289;
-           params.perform_precise_validation = true;
            return params;
          })();
          params.rank = rank;
@@ -551,7 +527,7 @@ std::vector<::xllm::test::ForkedRankSession::Case> all2all_cases() {
          params.host = "127.0.0.1";
          return run_all2all_smoothquant_test_child(params);
        }},
-      {"W4A8All2AllSmoke",
+      {"W4A8All2AllMatchesEpOne",
        [](int32_t rank, int32_t port) {
          torch::manual_seed(0);
          All2AllTestParams params = ([]() {
@@ -566,7 +542,6 @@ std::vector<::xllm::test::ForkedRankSession::Case> all2all_cases() {
            params.is_smoothquant = true;
            params.moe_weight_bits = 4;
            params.group_size = 128;
-           params.perform_precise_validation = false;
            return params;
          })();
          params.rank = rank;
@@ -622,24 +597,16 @@ class FusedMoEAll2AllMultiDeviceTest : public ::testing::Test {
   inline static std::unique_ptr<::xllm::test::ForkedRankSession> session_;
 };
 
-TEST_F(FusedMoEAll2AllMultiDeviceTest, BasicAll2AllFlow) {
-  run_case("BasicAll2AllFlow");
+TEST_F(FusedMoEAll2AllMultiDeviceTest, UnquantizedAll2AllMatchesEpOne) {
+  run_case("UnquantizedAll2AllMatchesEpOne");
 }
 
-TEST_F(FusedMoEAll2AllMultiDeviceTest, SmoothQuantAll2AllFlow) {
-  run_case("SmoothQuantAll2AllFlow");
+TEST_F(FusedMoEAll2AllMultiDeviceTest, SmoothQuantAll2AllMatchesEpOne) {
+  run_case("SmoothQuantAll2AllMatchesEpOne");
 }
 
-TEST_F(FusedMoEAll2AllMultiDeviceTest, BasicAll2AllPreciseValidation) {
-  run_case("BasicAll2AllPreciseValidation");
-}
-
-TEST_F(FusedMoEAll2AllMultiDeviceTest, SmoothQuantAll2AllPreciseValidation) {
-  run_case("SmoothQuantAll2AllPreciseValidation");
-}
-
-TEST_F(FusedMoEAll2AllMultiDeviceTest, W4A8All2AllSmoke) {
-  run_case("W4A8All2AllSmoke");
+TEST_F(FusedMoEAll2AllMultiDeviceTest, W4A8All2AllMatchesEpOne) {
+  run_case("W4A8All2AllMatchesEpOne");
 }
 
 TEST_F(FusedMoEAll2AllMultiDeviceTest, SelectedRouteMatchesGateRouteAll2All) {

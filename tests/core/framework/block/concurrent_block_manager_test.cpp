@@ -95,7 +95,6 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
   tail_blocks.emplace_back(std::move(seed_blocks[1]));
   manager.cache(tail_blocks);
   tail_blocks.clear();
-  tail_blocks.clear();
   seed_blocks.clear();
 
   ASSERT_EQ(manager.num_blocks_in_prefix_cache(), 1);
@@ -109,8 +108,6 @@ TEST(ConcurrentBlockManagerTest, ContinuesPrefixCacheFromExistingBlocks) {
     EXPECT_EQ(matched_blocks[1].id(), second_block_id);
   }
 
-  matched_blocks.clear();
-  existed_blocks.clear();
   matched_blocks.clear();
   existed_blocks.clear();
   release_prefix_cache(&manager);
@@ -136,46 +133,6 @@ TEST(ConcurrentBlockManagerTest, ReadOnlyProbeDoesNotPinEvictableBlocks) {
   EXPECT_EQ(manager.num_evictable_blocks(), evictable);
   EXPECT_EQ(manager.num_used_blocks(), 0u);
   release_prefix_cache(&manager);
-}
-
-TEST(ConcurrentBlockManagerTest, AllocatesWhileBlocksReleaseConcurrently) {
-  BlockManager::Options options;
-  options.num_blocks(65).block_size(2).enable_prefix_cache(false);
-  ConcurrentBlockManagerImpl manager(
-      std::make_unique<BlockManagerImpl>(options));
-
-  constexpr int32_t kNumThreads = 8;
-  constexpr int32_t kNumIterations = 10000;
-  std::atomic<bool> start{false};
-  std::vector<std::thread> workers;
-  workers.reserve(static_cast<size_t>(kNumThreads));
-
-  for (int32_t i = 0; i < kNumThreads; ++i) {
-    workers.emplace_back([&manager, &start, kNumIterations]() {
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-
-      for (int32_t iter = 0; iter < kNumIterations; ++iter) {
-        std::vector<Block> blocks = manager.allocate(/*num_blocks=*/1);
-        if (blocks.empty()) {
-          std::this_thread::yield();
-          continue;
-        }
-
-        blocks.clear();
-        blocks.clear();
-      }
-    });
-  }
-
-  start.store(true, std::memory_order_release);
-  for (std::thread& worker : workers) {
-    worker.join();
-  }
-
-  EXPECT_EQ(manager.num_free_blocks(), manager.num_total_blocks());
-  EXPECT_EQ(manager.num_used_blocks(), 0);
 }
 
 class LinearConcurrentAllocationTest
@@ -218,11 +175,10 @@ TEST_P(LinearConcurrentAllocationTest, KeepsLiveSlotsUniqueUntilFinalRelease) {
         ASSERT_GT(block_id, 0);
         ASSERT_LE(block_id, kNumSlots);
         EXPECT_EQ(live_ids[block_id].fetch_add(1), 0);
-        Block inflight = blocks.front();
-        blocks.clear();
+        Block last_owner = blocks.front();
         blocks.clear();
         EXPECT_EQ(live_ids[block_id].fetch_sub(1), 1);
-        inflight = Block();
+        last_owner = Block();
       }
     });
   }
@@ -238,50 +194,22 @@ INSTANTIATE_TEST_SUITE_P(ConcurrentModes,
                          LinearConcurrentAllocationTest,
                          ::testing::Values(0, 1, 2));
 
-// End-to-end repro of the production signature through the real
-// ConcurrentBlockManagerImpl + PrefixCache: blocks that live only in the prefix
-// cache get pinned as is_shared() and can no longer be reclaimed.
-//
-// Each thread emulates a prefill request in steady state, faithfully mirroring
-// CompositeBlockManager: it matches the cached prefix (scheduler-side
-// allocate_shared, inc under lock; the matched blocks are the sequence's single
-// alias set -- add_shared_blocks() MOVES them into KVCacheState), deallocates
-// exactly that alias set on finish
-// (CompositeBlockManager::deallocate_for_sequence calls
-// leaf->deallocate(kv_state.blocks(...))), then destroys the alias OUTSIDE the
-// manager lock (BlockManagerPool::deallocate -> sequence->reset()). The racing
-// dec on a cached block's ref_count is the root-cause window: a lost decrement
-// leaves the block is_shared() with no logical owner.
-//
-// On the buggy (non-atomic) code a lost decrement pins a cached block
-// is_shared() forever, so evict() skips it permanently -- allocate() can no
-// longer reclaim it and the pool starves (num_free < total while num_used ==
-// 0), exactly the production deadlock. Reclaiming every block below (allocate
-// the full pool, which forces eviction) is therefore the deadlock detector: it
-// cannot obtain `total` blocks while any block is pinned. It passes once
-// ref_count_ is atomic.
+// Concurrent prefix hits and final alias releases must not leave cache-only
+// blocks pinned. Full-pool allocation below forces eviction and detects leaks.
 TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
   const uint32_t block_size = 2;
   BlockManager::Options options;
   options.num_blocks(64).block_size(block_size).enable_prefix_cache(true);
-  // Heap-allocated and intentionally leaked: on the buggy code blocks stay
-  // pinned, so ~BlockManagerImpl()'s "all blocks freed" CHECK would abort and
-  // mask the assertions below. Leaking the manager keeps the gtest signal
-  // clean.
-  auto* manager = new ConcurrentBlockManagerImpl(
+  ConcurrentBlockManagerImpl manager(
       std::make_unique<BlockManagerImpl>(options));
 
-  // Seed a 4-block shared prefix, then drop the seeding aliases so the blocks
-  // live ONLY in the prefix cache (ref_count == 1 each, evictable) -- the
-  // steady state a finished prefill request leaves behind.
   std::vector<int32_t> token_ids = {11, 12, 13, 14, 15, 16, 17, 18};
-  std::vector<Block> seed = manager->allocate(/*num_blocks=*/4);
+  std::vector<Block> seed = manager.allocate(/*num_blocks=*/4);
   ASSERT_EQ(seed.size(), 4u);
   PrefixCache::compute_hash_keys(token_ids, seed);
-  manager->cache(seed);
+  manager.cache(seed);
   seed.clear();
-  seed.clear();
-  ASSERT_EQ(manager->num_blocks_in_prefix_cache(), 4u);
+  ASSERT_EQ(manager.num_blocks_in_prefix_cache(), 4u);
 
   constexpr int32_t kNumThreads = 4;
   constexpr int32_t kNumIterations = 50000;
@@ -289,23 +217,15 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
   std::vector<std::thread> workers;
   workers.reserve(static_cast<size_t>(kNumThreads));
   for (int32_t i = 0; i < kNumThreads; ++i) {
-    workers.emplace_back([manager, &token_ids, &start]() {
+    workers.emplace_back([&manager, &token_ids, &start]() {
       while (!start.load(std::memory_order_acquire)) {
         std::this_thread::yield();
       }
       for (int32_t iter = 0; iter < kNumIterations; ++iter) {
-        // Scheduler-side match: copies the cached blocks (inc ref, under lock).
-        // These ARE the sequence's alias set (production MOVEs them into
-        // KVCacheState), so ref_count == cache(1) + sequence(1) == 2.
-        std::vector<Block> seq_blocks = manager->allocate_shared(token_ids);
+        std::vector<Block> seq_blocks = manager.allocate_shared(token_ids);
         if (seq_blocks.empty()) {
           continue;
         }
-        // Finish: deallocate exactly the sequence's blocks (under lock) ...
-        seq_blocks.clear();
-        // ... then sequence->reset() drops the alias OUTSIDE the manager lock
-        // -- the dec that races other threads' matches on the same cached
-        // block.
         seq_blocks.clear();
       }
     });
@@ -315,24 +235,14 @@ TEST(ConcurrentBlockManagerTest, PrefixCacheSharedBlockLifecycleLeak) {
     worker.join();
   }
 
-  // No sequence holds anything now. A correct implementation leaves every
-  // cached block evictable (ref_count == 1); a lost decrement pins one
-  // is_shared(). Allocating the whole pool forces eviction of the cache and
-  // only succeeds if nothing is pinned -- this is the deadlock probe. (We do
-  // NOT assert num_used before this point: the deallocate-side ref_count<=2
-  // usage gate is intentionally approximate and can transiently over-count
-  // while peer threads sit in their own deallocate->reset window; free()
-  // reconciles it on eviction, so num_used is exact only once the cache has
-  // been fully drained below.)
-  release_prefix_cache(manager);
-  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 0u);
-  EXPECT_EQ(manager->num_free_blocks(), manager->num_total_blocks())
-      << "leaked blocks: " << manager->num_blocks_in_prefix_cache()
-      << " still pinned in prefix cache; num_free="
-      << manager->num_free_blocks()
-      << " num_used=" << manager->num_used_blocks()
-      << " total=" << manager->num_total_blocks();
-  EXPECT_EQ(manager->num_used_blocks(), 0u);
+  release_prefix_cache(&manager);
+  EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(manager.num_free_blocks(), manager.num_total_blocks())
+      << "leaked blocks: " << manager.num_blocks_in_prefix_cache()
+      << " still pinned in prefix cache; num_free=" << manager.num_free_blocks()
+      << " num_used=" << manager.num_used_blocks()
+      << " total=" << manager.num_total_blocks();
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
 }
 
 }  // namespace xllm

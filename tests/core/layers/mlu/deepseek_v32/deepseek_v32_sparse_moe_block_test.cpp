@@ -24,6 +24,7 @@ limitations under the License.
 #include <unordered_map>
 #include <utility>
 
+#include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -105,22 +106,6 @@ Weights create_moe_bf16_weights(const ModelArgs& model_args,
 }
 
 }  // namespace
-
-class DeepseekV2SparseMoEBlockTestPeer {
- public:
-  static FusedMoE moe(DeepseekV32SparseMoEBlockImpl& block) {
-    return block.moe_;
-  }
-
-  static ProcessGroup* routed_pg(DeepseekV32SparseMoEBlockImpl& block) {
-    return block.routed_pg();
-  }
-
-  static void set_enable_deep_ep(DeepseekV32SparseMoEBlockImpl& block,
-                                 bool enable) {
-    block.enable_deep_ep_ = enable;
-  }
-};
 
 namespace {
 void moe_set_pg_ctx(ParallelArgs& parallel_args_,
@@ -326,7 +311,33 @@ v32_cp::DeepseekV32CPContext moe_make_cp_ctx(
 }
 }  // namespace
 
-TEST(DeepseekV2SparseMoEBlockTest, PlanExecEnablesAll2AllOnlyForDecode) {
+namespace {
+
+class DeepseekV2SparseMoEBlockTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    options_ = torch::TensorOptions()
+                   .dtype(torch::kBFloat16)
+                   .device(Platform::type_torch(), 0)
+                   .requires_grad(false);
+    stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
+    model_args_ = test::create_default_model_args();
+    model_args_.hidden_size() = 256;
+    model_args_.moe_intermediate_size() = 256;
+    model_args_.n_routed_experts() = 4;
+    model_args_.num_experts_per_tok() = 2;
+    model_args_.n_group() = 1;
+    model_args_.topk_group() = 2;
+    model_args_.n_shared_experts() = 1;
+    model_args_.routed_scaling_factor() = 1.0f;
+    model_args_.norm_topk_prob() = true;
+    model_args_.hidden_act() = "silu";
+    model_args_.scoring_func() = "softmax";
+    model_args_.topk_method() = "greedy";
+    moe_set_pg_ctx(
+        parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
+  }
+
   ModelArgs model_args_;
   QuantArgs quant_args_;
   ParallelArgs parallel_args_{0, 1, nullptr};
@@ -336,138 +347,30 @@ TEST(DeepseekV2SparseMoEBlockTest, PlanExecEnablesAll2AllOnlyForDecode) {
   std::unique_ptr<test::MockProcessGroup> dp_pg_;
   std::unique_ptr<test::MockProcessGroup> tp_pg_;
   std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
+};
 
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
+}  // namespace
 
-  moe_set_tp_ctx(parallel_args_,
-                 options_,
-                 global_pg_,
-                 dp_pg_,
-                 tp_pg_,
-                 single_rank_pg_,
-                 /*world_size=*/2,
-                 /*ep_size=*/2);
-  auto block = moe_create_block(
-      model_args_, quant_args_, parallel_args_, options_, stream_registry_);
-  DeepseekV2SparseMoEBlockTestPeer::set_enable_deep_ep(*block, true);
+namespace {
 
-  ModelInputParams decode_params;
-  decode_params.parallel.dp_global_token_nums = {1, 1};
-  decode_params.parallel.dp_is_decode = {1, 1};
-  auto decode_cfg = block->plan_exec(decode_params);
-  EXPECT_TRUE(decode_cfg.enable_all2all);
-  EXPECT_FALSE(decode_cfg.need_dp_gather);
+class ScopedExpertParallelDegree final {
+ public:
+  explicit ScopedExpertParallelDegree(int32_t value)
+      : config_(xllm::EPLBConfig::get_instance()),
+        original_(config_.expert_parallel_degree()) {
+    config_.expert_parallel_degree(value);
+  }
 
-  ModelInputParams mixed_params;
-  mixed_params.parallel.dp_global_token_nums = {2, 1};
-  mixed_params.parallel.dp_is_decode = {0, 1};
-  auto mixed_cfg = block->plan_exec(mixed_params);
-  EXPECT_FALSE(mixed_cfg.enable_all2all);
-  EXPECT_FALSE(mixed_cfg.need_dp_gather);
-}
+  ~ScopedExpertParallelDegree() { config_.expert_parallel_degree(original_); }
 
-TEST(DeepseekV2SparseMoEBlockTest, PlanExecSetsDpGatherWhenAll2AllOff) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
+ private:
+  xllm::EPLBConfig& config_;
+  int32_t original_;
+};
 
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
+}  // namespace
 
-  moe_set_tp_dp_ctx(parallel_args_,
-                    options_,
-                    global_pg_,
-                    dp_pg_,
-                    tp_pg_,
-                    single_rank_pg_,
-                    /*world_size=*/4,
-                    /*dp_size=*/2,
-                    /*tp_size=*/2,
-                    /*ep_size=*/4);
-  auto block = moe_create_block(
-      model_args_, quant_args_, parallel_args_, options_, stream_registry_);
-
-  ModelInputParams input_params;
-  input_params.parallel.dp_global_token_nums = {3, 1};
-  input_params.parallel.dp_is_decode = {0, 0};
-
-  auto cfg = block->plan_exec(input_params);
-  EXPECT_FALSE(cfg.enable_all2all);
-  EXPECT_TRUE(cfg.need_dp_gather);
-}
-
-TEST(DeepseekV2SparseMoEBlockTest, PrepInDpGatherBuildsLocalSkip) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, PrepInDpGatherBuildsLocalSkip) {
   moe_set_tp_dp_ctx(parallel_args_,
                     options_,
                     global_pg_,
@@ -512,37 +415,39 @@ TEST(DeepseekV2SparseMoEBlockTest, PrepInDpGatherBuildsLocalSkip) {
           options_, /*rows=*/3, {11.0f, 22.0f, 33.0f, 44.0f, 55.0f, 66.0f}));
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, GatherInDpGatherRebuildsGlobalTokens) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
+TEST_F(DeepseekV2SparseMoEBlockTest,
+       PlanExecUsesAll2AllOnlyWhenEveryDpRankDecodes) {
+  ScopedExpertParallelDegree expert_parallel_degree(/*value=*/2);
+  moe_set_tp_dp_ctx(parallel_args_,
+                    options_,
+                    global_pg_,
+                    dp_pg_,
+                    tp_pg_,
+                    single_rank_pg_,
+                    /*world_size=*/4,
+                    /*dp_size=*/2,
+                    /*tp_size=*/2,
+                    /*ep_size=*/4);
+  parallel_args_.tp_size(2);
+  auto block = moe_create_block(
+      model_args_, quant_args_, parallel_args_, options_, stream_registry_);
 
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
+  ModelInputParams decode_params;
+  decode_params.parallel.dp_global_token_nums = {1, 1};
+  decode_params.parallel.dp_is_decode = {1, 1};
+  const auto decode_cfg = block->plan_exec(decode_params);
+  EXPECT_TRUE(decode_cfg.enable_all2all);
+  EXPECT_FALSE(decode_cfg.need_dp_gather);
 
+  ModelInputParams mixed_params;
+  mixed_params.parallel.dp_global_token_nums = {2, 1};
+  mixed_params.parallel.dp_is_decode = {0, 1};
+  const auto mixed_cfg = block->plan_exec(mixed_params);
+  EXPECT_FALSE(mixed_cfg.enable_all2all);
+  EXPECT_TRUE(mixed_cfg.need_dp_gather);
+}
+
+TEST_F(DeepseekV2SparseMoEBlockTest, GatherInDpGatherRebuildsGlobalTokens) {
   moe_set_tp_dp_ctx(parallel_args_,
                     options_,
                     global_pg_,
@@ -575,37 +480,7 @@ TEST(DeepseekV2SparseMoEBlockTest, GatherInDpGatherRebuildsGlobalTokens) {
               {11.0f, 22.0f, 33.0f, 44.0f, 55.0f, 66.0f, 101.0f, 202.0f}));
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, PrepInAll2AllPadsTpShardInput) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, PrepInAll2AllPadsTpShardInput) {
   moe_set_tp_ctx(parallel_args_,
                  options_,
                  global_pg_,
@@ -616,7 +491,6 @@ TEST(DeepseekV2SparseMoEBlockTest, PrepInAll2AllPadsTpShardInput) {
                  /*ep_size=*/2);
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
-  DeepseekV2SparseMoEBlockTestPeer::set_enable_deep_ep(*block, true);
 
   ModelInputParams input_params;
   input_params.parallel.dp_global_token_nums = {1, 1};
@@ -626,11 +500,13 @@ TEST(DeepseekV2SparseMoEBlockTest, PrepInAll2AllPadsTpShardInput) {
   auto residual =
       moe_mat(options_, /*rows=*/3, {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f});
 
-  auto prep = block->prep_in(attn_out,
-                             residual,
-                             input_params,
-                             block->plan_exec(input_params),
-                             PostAttnLayout::TP_SHARD);
+  auto prep =
+      block->prep_in(attn_out,
+                     residual,
+                     input_params,
+                     DeepseekV32SparseMoEBlockImpl::ExecCfg{
+                         .enable_all2all = true, .need_dp_gather = false},
+                     PostAttnLayout::TP_SHARD);
 
   EXPECT_FALSE(prep.need_dp_gather);
   EXPECT_TRUE(prep.need_tp_pad);
@@ -642,105 +518,7 @@ TEST(DeepseekV2SparseMoEBlockTest, PrepInAll2AllPadsTpShardInput) {
   test::verify_tensor_close(prep.skip_local, prep.ffn_in);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, PrepInUsesProvidedExecCfg) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
-  moe_set_tp_dp_ctx(parallel_args_,
-                    options_,
-                    global_pg_,
-                    dp_pg_,
-                    tp_pg_,
-                    single_rank_pg_,
-                    /*world_size=*/4,
-                    /*dp_size=*/2,
-                    /*tp_size=*/2,
-                    /*ep_size=*/4);
-  auto block = moe_create_block(
-      model_args_, quant_args_, parallel_args_, options_, stream_registry_);
-
-  ModelInputParams input_params;
-  input_params.parallel.dp_global_token_nums = {3, 1};
-  input_params.parallel.dp_is_decode = {0, 0};
-  auto planned_cfg = block->plan_exec(input_params);
-  EXPECT_FALSE(planned_cfg.enable_all2all);
-  EXPECT_TRUE(planned_cfg.need_dp_gather);
-
-  DeepseekV32SparseMoEBlockImpl::ExecCfg forced_cfg;
-  forced_cfg.enable_all2all = true;
-  forced_cfg.need_dp_gather = false;
-  auto attn_out =
-      moe_mat(options_, /*rows=*/3, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
-  auto residual =
-      moe_mat(options_, /*rows=*/3, {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f});
-
-  auto prep = block->prep_in(
-      attn_out, residual, input_params, forced_cfg, PostAttnLayout::TP_SHARD);
-
-  EXPECT_FALSE(prep.need_dp_gather);
-  EXPECT_TRUE(prep.need_tp_pad);
-  EXPECT_TRUE(prep.pad_info.active);
-  test::verify_tensor_close(prep.skip_local, prep.ffn_in);
-}
-
-TEST(DeepseekV2SparseMoEBlockTest, MergeOutTpPadGathersAndUnpads) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, MergeOutTpPadGathersAndUnpads) {
   moe_set_tp_ctx(parallel_args_,
                  options_,
                  global_pg_,
@@ -768,37 +546,7 @@ TEST(DeepseekV2SparseMoEBlockTest, MergeOutTpPadGathersAndUnpads) {
       moe_mat(options_, /*rows=*/3, {2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f}));
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, MergeOutDpGatherSlicesLocalTokens) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, MergeOutDpGatherSlicesLocalTokens) {
   moe_set_tp_dp_ctx(parallel_args_,
                     options_,
                     global_pg_,
@@ -832,38 +580,8 @@ TEST(DeepseekV2SparseMoEBlockTest, MergeOutDpGatherSlicesLocalTokens) {
               {112.0f, 124.0f, 136.0f, 148.0f, 160.0f, 172.0f}));
 }
 
-TEST(DeepseekV2SparseMoEBlockTest,
-     Glm5NextClampedExpertsRepeatWithCachedKernel) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest,
+       Glm5NextClampedExpertsRepeatWithCachedKernel) {
   model_args_.model_type() = "glm5_next";
   model_args_.swiglu_limit() = 10.0f;
   moe_set_tp_ctx(parallel_args_,
@@ -896,37 +614,7 @@ TEST(DeepseekV2SparseMoEBlockTest,
   EXPECT_TRUE(torch::equal(input.cpu(), original.cpu()));
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardReducePathCombinesSharedAndRouted) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardReducePathCombinesSharedAndRouted) {
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
   auto raw_moe = moe_create_raw_moe(
@@ -943,9 +631,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardReducePathCombinesSharedAndRouted) {
   auto routed = raw_moe->forward_experts(
       hidden_states, /*enable_all2all_communication=*/false);
   auto shared = raw_moe->forward_shared(hidden_states);
-  auto* shared_pg = raw_moe->shared_pg();
   ASSERT_TRUE(shared.defined());
-  ASSERT_EQ(shared_pg, single_rank_pg_.get());
 
   int comm_calls = 0;
   int reduce_calls = 0;
@@ -976,37 +662,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardReducePathCombinesSharedAndRouted) {
   test::verify_tensor_close(result.output, expected, 1e-3, 1e-4);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardReduceOverlapUsesAsyncReduceFns) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardReduceOverlapUsesAsyncReduceFns) {
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
   auto raw_moe = moe_create_raw_moe(
@@ -1073,37 +729,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardReduceOverlapUsesAsyncReduceFns) {
   test::verify_tensor_close(result.output, expected, 1e-3, 1e-4);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardKeepLocalUsesCommPath) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardKeepLocalUsesCommPath) {
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
   auto raw_moe = moe_create_raw_moe(
@@ -1120,9 +746,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardKeepLocalUsesCommPath) {
   auto routed = raw_moe->forward_experts(
       hidden_states, /*enable_all2all_communication=*/false);
   auto shared = raw_moe->forward_shared(hidden_states);
-  auto* shared_pg = raw_moe->shared_pg();
   ASSERT_TRUE(shared.defined());
-  ASSERT_EQ(shared_pg, single_rank_pg_.get());
 
   int comm_calls = 0;
   int reduce_calls = 0;
@@ -1147,44 +771,14 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardKeepLocalUsesCommPath) {
   moe_sync_dev(options_);
 
   auto expected = moe_run_comm(tp_pg_, routed, tp_pg_.get()) +
-                  moe_run_comm(tp_pg_, shared, shared_pg);
+                  moe_run_comm(tp_pg_, shared, single_rank_pg_.get());
   EXPECT_TRUE(result.keep_local_output);
   EXPECT_EQ(comm_calls, 2);
   EXPECT_EQ(reduce_calls, 0);
   test::verify_tensor_close(result.output, expected, 1e-3, 1e-4);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardIgnoresSharedLocalGate) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardIgnoresSharedLocalGate) {
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
   auto raw_moe = moe_create_raw_moe(
@@ -1204,10 +798,10 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardIgnoresSharedLocalGate) {
   auto shared = raw_moe->forward_shared(hidden_states);
   ASSERT_TRUE(shared.defined());
 
-  auto* routed_pg = DeepseekV2SparseMoEBlockTestPeer::routed_pg(*block);
-  auto* shared_pg = DeepseekV2SparseMoEBlockTestPeer::moe(*block)->shared_pg();
+  ProcessGroup* routed_pg = tp_pg_.get();
+  ProcessGroup* shared_pg = single_rank_pg_.get();
   ASSERT_NE(routed_pg, shared_pg);
-  ASSERT_EQ(shared_pg, single_rank_pg_.get());
+  ASSERT_NE(shared_pg, nullptr);
 
   int comm_calls = 0;
   int reduce_calls = 0;
@@ -1239,37 +833,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardIgnoresSharedLocalGate) {
   test::verify_tensor_close(result.output, expected, 1e-3, 1e-4);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardWithoutSharedIgnoresNullSharedPg) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardWithoutSharedIgnoresNullSharedPg) {
   model_args_.n_shared_experts() = 0;
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
@@ -1289,7 +853,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardWithoutSharedIgnoresNullSharedPg) {
       hidden_states, /*enable_all2all_communication=*/false);
   ASSERT_FALSE(raw_moe->forward_shared(hidden_states).defined());
 
-  auto* routed_pg = DeepseekV2SparseMoEBlockTestPeer::routed_pg(*block);
+  ProcessGroup* routed_pg = tp_pg_.get();
 
   int comm_calls = 0;
   int reduce_calls = 0;
@@ -1320,37 +884,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardWithoutSharedIgnoresNullSharedPg) {
   test::verify_tensor_close(result.output, expected, 1e-3, 1e-4);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardCPAddsLocalSharedAfterRoutedComm) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardCPAddsLocalSharedAfterRoutedComm) {
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
   auto raw_moe = moe_create_raw_moe(
@@ -1375,7 +909,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardCPAddsLocalSharedAfterRoutedComm) {
   auto routed = raw_moe->forward_experts(
       gathered, /*enable_all2all_communication=*/false);
   auto shared = raw_moe->forward_shared(local);
-  auto* routed_pg = DeepseekV2SparseMoEBlockTestPeer::routed_pg(*block);
+  ProcessGroup* routed_pg = tp_pg_.get();
   const int64_t local_token_num = local.size(0);
 
   int comm_calls = 0;
@@ -1412,37 +946,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardCPAddsLocalSharedAfterRoutedComm) {
   test::verify_tensor_close(result.output, expected, 1e-3, 1e-4);
 }
 
-TEST(DeepseekV2SparseMoEBlockTest, ForwardCPFallsBackWhenLocalKeepOff) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  stream_registry_ = std::make_shared<ModelStreamRegistry>(options_.device());
-  model_args_ = test::create_default_model_args();
-  model_args_.hidden_size() = 256;
-  model_args_.moe_intermediate_size() = 256;
-  model_args_.n_routed_experts() = 4;
-  model_args_.num_experts_per_tok() = 2;
-  model_args_.n_group() = 1;
-  model_args_.topk_group() = 2;
-  model_args_.n_shared_experts() = 1;
-  model_args_.routed_scaling_factor() = 1.0f;
-  model_args_.norm_topk_prob() = true;
-  model_args_.hidden_act() = "silu";
-  model_args_.scoring_func() = "softmax";
-  model_args_.topk_method() = "greedy";
-  moe_set_pg_ctx(parallel_args_, options_, global_pg_, tp_pg_, single_rank_pg_);
-
+TEST_F(DeepseekV2SparseMoEBlockTest, ForwardCPFallsBackWhenLocalKeepOff) {
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
   auto raw_moe = moe_create_raw_moe(
@@ -1469,7 +973,7 @@ TEST(DeepseekV2SparseMoEBlockTest, ForwardCPFallsBackWhenLocalKeepOff) {
   auto routed = raw_moe->forward_experts(
       gathered, /*enable_all2all_communication=*/false);
   auto shared = raw_moe->forward_shared(gathered);
-  auto* routed_pg = DeepseekV2SparseMoEBlockTestPeer::routed_pg(*block);
+  ProcessGroup* routed_pg = tp_pg_.get();
 
   int comm_calls = 0;
   int reduce_calls = 0;

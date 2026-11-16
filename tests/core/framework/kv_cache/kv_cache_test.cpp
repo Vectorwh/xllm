@@ -243,12 +243,14 @@ TEST(Dsv4StateCacheTest, MissingPackedFallsBackWithoutSwappingSplit) {
   EXPECT_EQ(state.score().data_ptr(), score.data_ptr());
   EXPECT_FALSE(state.packed().defined());
 
+  const torch::Tensor original_kv = kv.clone();
+  const torch::Tensor original_score = score.clone();
   torch::Tensor src = torch::tensor({0}, torch::kLong);
   torch::Tensor dst = torch::tensor({1}, torch::kLong);
   state.swap_blocks(src, dst);
 
-  EXPECT_TRUE(torch::equal(state.kv(), kv));
-  EXPECT_TRUE(torch::equal(state.score(), score));
+  EXPECT_TRUE(torch::equal(state.kv(), original_kv));
+  EXPECT_TRUE(torch::equal(state.score(), original_score));
 }
 
 // Platform page-locked host allocation requires a live device context.

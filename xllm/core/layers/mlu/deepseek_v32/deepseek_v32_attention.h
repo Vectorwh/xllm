@@ -82,8 +82,6 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
   void verify_loaded_weights() const;
 
  private:
-  friend class DeepseekV2AttentionTestPeer;
-
   std::string weight_prefix_;
   struct QueryPrep {
     torch::Tensor q;

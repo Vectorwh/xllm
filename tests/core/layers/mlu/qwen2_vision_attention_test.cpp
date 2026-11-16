@@ -26,6 +26,7 @@ limitations under the License.
 #include "layers/mlu/tests_utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "util/net.h"
 
 namespace xllm {
 namespace layer {
@@ -33,6 +34,9 @@ namespace layer {
 class Qwen2VisionAttentionTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
     torch::Device device(Platform::type_torch(), 0);
     Device xllm_device(device);
     xllm_device.set_seed(42);
@@ -43,8 +47,10 @@ class Qwen2VisionAttentionTest : public ::testing::Test {
 
     options_ = torch::TensorOptions().dtype(torch::kBFloat16).device(device);
 
+    const int32_t port = net::get_local_free_port();
+    ASSERT_GT(port, 0);
     process_group_ = create_process_group(
-        0, 1, 1, 3332, false, "localhost", "tp_group", device);
+        0, 1, 1, port, false, "localhost", "tp_group", device);
     parallel_args_.tp_group_ = process_group_.get();
 
     context_ = ModelContext(parallel_args_, model_args_, QuantArgs(), options_);
@@ -205,10 +211,14 @@ TEST_F(Qwen2VisionAttentionTest, SmoothQuantQkvLoadsAndRuns) {
       torch::matmul(input.to(torch::kFloat32) * smooth,
                     (qweight.to(torch::kFloat32) * scale.unsqueeze(1)).t()) +
       bias.to(torch::kFloat32);
-  EXPECT_TRUE(torch::allclose(output.to(torch::kFloat32),
-                              expected,
-                              /*rtol=*/3e-2,
-                              /*atol=*/3e-2));
+  EXPECT_TRUE(
+      torch::allclose(output.to(torch::kFloat32), expected, 3e-2, 3e-2));
+  const double norm = torch::norm(expected, 2.0).item<double>();
+  ASSERT_GT(norm, 0.0);
+  EXPECT_LE(
+      torch::norm(output.to(torch::kFloat32) - expected, 2.0).item<double>() /
+          norm,
+      3e-2);
 }
 
 }  // namespace layer

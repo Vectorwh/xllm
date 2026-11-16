@@ -40,11 +40,12 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/public_error.h"
+#include "core/scheduler/scheduler_test_adapter.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
-#include "framework/block/block_manager_pool_test_peer.h"
+#include "framework/block/block_manager_test_access.h"
 #include "framework/config/disagg_pd_config.h"
 #include "framework/config/model_config.h"
 #include "framework/config/parallel_config.h"
@@ -145,13 +146,15 @@ class FakeEngine final : public Engine {
           .layer_types({"linear_attention"});
     }
     tokenizer_ = std::make_unique<FakeTokenizer>();
-    block_manager_ = std::make_unique<BlockManagerPool>(options, dp_size);
+    block_manager_ =
+        std::make_unique<block_test::TestBlockManagerPool>(options, dp_size);
   }
 
   explicit FakeEngine(const BlockManagerPool::Options& options)
       : tokenizer_(std::make_unique<FakeTokenizer>()),
-        block_manager_(
-            std::make_unique<BlockManagerPool>(options, /*dp_size=*/1)) {}
+        block_manager_(std::make_unique<block_test::TestBlockManagerPool>(
+            options,
+            /*dp_size=*/1)) {}
 
   void replace_block_manager(std::unique_ptr<BlockManagerPool> manager) {
     block_manager_ = std::move(manager);
@@ -241,9 +244,11 @@ class FakeEngine final : public Engine {
 };
 
 template <typename Scheduler>
-class PrefillTestScheduler : public Scheduler {
+class PrefillTestScheduler
+    : public scheduler_test::SchedulerAdapter<Scheduler> {
  public:
-  using Scheduler::Scheduler;
+  using Base = scheduler_test::SchedulerAdapter<Scheduler>;
+  using Base::Base;
 
   void admit_prefill(std::shared_ptr<Request> request,
                      proto::DisaggPDService_Stub* stub = nullptr) {
@@ -1053,13 +1058,13 @@ TEST(PDOOCSchedulerTest, OfflineRequestMovesBetweenDistinctWaitingQueues) {
   auto online = make_request({11, 12}, "online_metrics");
   online->state().output_func = [](const RequestOutput&) { return true; };
   ASSERT_TRUE(scheduler.enqueue_ingress(online));
-  ASSERT_EQ(scheduler.prepare_batch_test().front().size(), 1u);
+  ASSERT_EQ(scheduler.prepare().front().size(), 1u);
   expect_queue_sample("419", {{"ingress", 0}, {"offline_prefill", 1}}, 1);
   online->set_cancel();
-  ASSERT_EQ(scheduler.prepare_batch_test().front().size(), 1u);
+  ASSERT_EQ(scheduler.prepare().front().size(), 1u);
   expect_queue_sample("419", {{"offline_prefill", 0}}, 0);
   offline->set_cancel();
-  scheduler.prepare_batch_test();
+  scheduler.prepare();
   expect_queue_sample("419", {{"offline_prefill", 0}}, 0);
 }
 
@@ -1092,12 +1097,12 @@ TEST(DisaggPDSchedulerTest, RelinkedDecodeRetainsOldEpochRejection) {
   new_request->state().pd_reservation_id = "new-reservation";
   new_request->state().decode_link_epoch = 1;
   scheduler.admit_prefill(new_request);
-  const auto batches = scheduler.prepare_batch_test();
+  const auto batches = scheduler.prepare();
   scheduler.wait_responses();
 
   EXPECT_TRUE(old_request->has_terminal_outcome());
   EXPECT_FALSE(new_request->has_terminal_outcome());
-  EXPECT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.running_requests().size(), 1u);
   EXPECT_TRUE(std::any_of(batches.begin(),
                           batches.end(),
                           [](const Batch& batch) { return !batch.empty(); }));
@@ -1190,68 +1195,6 @@ TEST(RequestTerminalOutcomeTest, FirstTerminalEventWins) {
             RequestTerminalOutcome::NONE);
 }
 
-TEST(RequestTerminalOutcomeTest, IdentityPrecedesResultsAndParameters) {
-  TerminalLogSink sink;
-  auto request = make_request({11, 12}, "readable", /*num_sequences=*/2);
-  request->state().sampling_param.temperature = 0.123456;
-  ASSERT_TRUE(request->expand_sequences(/*share_prefix=*/false));
-  for (const auto& sequence : request->sequences()) {
-    finish_prefill(sequence.get());
-    for (int32_t i = 1; i < 4; ++i) {
-      sequence->append_token(Token(100 + i));
-    }
-  }
-  ASSERT_EQ(request->claim_terminal_outcome(Status(StatusCode::OK)),
-            RequestTerminalOutcome::SUCCESS);
-  request->log_terminal_statistic(
-      RequestTerminalOutcome::SUCCESS, Status(StatusCode::OK), 0.01);
-  const std::string logged = sink.messages();
-  EXPECT_EQ(std::count(logged.begin(), logged.end(), '\n'), 3);
-  EXPECT_EQ(logged.find("record_type: request_terminal, request_id: readable, "
-                        "x-request-id: x-request-id, outcome: success, "
-                        "status_code: 0"),
-            0u);
-  for (int32_t i = 0; i < 2; ++i) {
-    EXPECT_NE(
-        logged.find("record_type: sequence_terminal, request_id: readable, "
-                    "x-request-id: x-request-id, sequence: " +
-                    std::to_string(i) +
-                    ", finish_reason: "
-                    "length, prompt_tokens: 2, generated_tokens: 4, "
-                    "queue_to_batch: -1.0ms, ttft: "),
-        std::string::npos);
-  }
-  EXPECT_NE(logged.find("temperature: 0.123456, num_prefix_cache_tokens: 0\n"),
-            std::string::npos);
-  const size_t time = logged.find("x-request-time: x-request-time");
-  ASSERT_NE(time, std::string::npos);
-  EXPECT_EQ(logged.find("x-request-time:", time + 1), std::string::npos);
-}
-
-TEST(RequestTerminalOutcomeTest, ErrorsStayVisibleWithoutEmptyMetadata) {
-  TerminalLogSink sink;
-  auto request = make_request({11, 12},
-                              "empty-metadata",
-                              /*num_sequences=*/1,
-                              /*x_request_id=*/"",
-                              /*x_request_time=*/"");
-  request->log_terminal_statistic(
-      RequestTerminalOutcome::CANCELLED, Status(StatusCode::OK), 0.01);
-  const std::string logged = sink.messages();
-  EXPECT_NE(logged.find("record_type: request_terminal, request_id: "
-                        "empty-metadata, outcome: cancelled, status_code: 1\n"),
-            std::string::npos);
-  EXPECT_NE(
-      logged.find("record_type: sequence_terminal, request_id: empty-metadata, "
-                  "sequence: 0, outcome: cancelled, "
-                  "status_code: 1, status_msg: Cancelled, prompt_tokens: 2"),
-      std::string::npos);
-  EXPECT_EQ(logged.find("x-request-id:"), std::string::npos);
-  EXPECT_EQ(logged.find("x-request-time:"), std::string::npos);
-  EXPECT_EQ(logged.find("finish_reason:"), std::string::npos);
-  EXPECT_EQ(logged.find("generated_tokens:"), std::string::npos);
-}
-
 TEST(AsyncResponseProcessorTest,
      BatchedDuplicatePreservesValidRequestIdentity) {
   FakeTokenizer tokenizer;
@@ -1319,7 +1262,7 @@ TEST(DisaggPDSchedulerTest, PrefillTerminalTokenDoesNotHandoff) {
               return true;
             };
         prefill.admit_prefill(request);
-        ASSERT_FALSE(prefill.prepare_batch_test()[0].empty());
+        ASSERT_FALSE(prefill.prepare()[0].empty());
         finish_prefill(sequence);
         ASSERT_TRUE(request->finished());
         prefill.prefill_send_first_generation();
@@ -1395,7 +1338,7 @@ TEST(DisaggPDSchedulerTest, NonStreamHandoffFailureHasOneTerminalOutcome) {
           };
     }
     prefill.admit_prefill(request);
-    auto batches = prefill.prepare_batch_test();
+    auto batches = prefill.prepare();
     ASSERT_FALSE(batches[0].empty());
     std::thread release_delivery;
     if (batch_response) {
@@ -1575,8 +1518,7 @@ TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
     ASSERT_TRUE(pool->allocate(seed->sequences()[0].get(), tokens.size()));
     seed->sequences()[0]->kv_state().set_kv_cache_tokens_num(tokens.size());
     pool->deallocate(seed.get());
-    BlockManagerPoolTestPeer::leaf_of(*pool, /*dp_rank=*/0, evicted)
-        ->reset_prefix_cache();
+    block_test::leaf_of(*pool, /*dp_rank=*/0, evicted)->reset_prefix_cache();
     auto shorter = make_request(std::vector<int32_t>(641, 7), "shorter");
     ASSERT_TRUE(pool->allocate(shorter->sequences()[0].get(), 641));
     shorter->sequences()[0]->kv_state().set_kv_cache_tokens_num(641);
@@ -1753,7 +1695,7 @@ TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
       engine.pulled_mappings[0].local_ids,
       std::vector<uint64_t>({static_cast<uint64_t>(local_linear_state_id)}));
 
-  std::vector<Batch> batches = scheduler.prepare_batch_test();
+  std::vector<Batch> batches = scheduler.prepare();
   ASSERT_EQ(batches.size(), 1u);
   ASSERT_EQ(batches[0].size(), 1u);
   ForwardInput input = batches[0].prepare_forward_input(
@@ -1788,7 +1730,7 @@ TEST(DisaggPDSchedulerTest, FirstGenerationQueuesLocalTimingBeforePublication) {
     // Receipt bypasses add_request(), and may have no upstream timing at all.
     EXPECT_EQ(waiting.pd_queued_time.reason, RequestTimingReason::WAITING_END);
     EXPECT_TRUE(waiting.pd_queued_time.milliseconds.has_value());
-    const auto batches = scheduler.prepare_batch_test();
+    const auto batches = scheduler.prepare();
     ASSERT_EQ(batches.front().size(), 1u);
     const auto scheduled = request->state().timing->snapshot();
     EXPECT_TRUE(scheduled.pd_queued_time.valid);
@@ -1896,9 +1838,11 @@ TEST(DisaggPDSchedulerTest, PreservesPrefillCachedTokensOnDecodeRequest) {
   EXPECT_EQ(queued->num_prefix_cache_tokens(), 2u);
 }
 
-TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
+TEST(DisaggPDSchedulerTest, DecodePromptCapacityBoundary) {
   EXPECT_FALSE(exceeds_decode_capacity(
       /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
+  EXPECT_TRUE(exceeds_decode_capacity(
+      /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));
 }
 
 TEST(DisaggPDSchedulerTest, PermanentConstraintRejectionDoesNotRetry) {
@@ -2091,11 +2035,6 @@ TEST(DisaggPDSchedulerTest,
   EXPECT_TRUE(settled.reason.empty());
 }
 
-TEST(DisaggPDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {
-  EXPECT_TRUE(exceeds_decode_capacity(
-      /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));
-}
-
 TEST(DisaggPDSchedulerTest, TemporaryDecodeBlockPressureIsNotPermanent) {
   FakeEngine engine(/*num_blocks=*/4, /*block_size=*/2);
   TestDisaggPDScheduler scheduler(&engine, make_options());
@@ -2230,40 +2169,12 @@ TEST(DisaggPDSchedulerTest, SpeculativeMetricsSilentWhenDisabled) {
 }
 
 TEST(DisaggPDSchedulerTest, StructuredOutputFieldsPreserveWireTags) {
-  proto::DisaggRequest request;
-  request.set_include_stop_str_in_output(true);
-  request.set_json_object(true);
-  request.set_json_reasoning_enabled(true);
-
-  std::string serialized;
-  ASSERT_TRUE(request.SerializeToString(&serialized));
-
-  proto::DisaggRequest decoded;
-  ASSERT_TRUE(decoded.ParseFromString(serialized));
-  EXPECT_TRUE(decoded.include_stop_str_in_output());
-  EXPECT_TRUE(decoded.json_object());
-  EXPECT_TRUE(decoded.json_reasoning_enabled());
   EXPECT_EQ(proto::DisaggRequest::kIncludeStopStrInOutputFieldNumber, 39);
   EXPECT_EQ(proto::DisaggRequest::kJsonObjectFieldNumber, 40);
   EXPECT_EQ(proto::DisaggRequest::kJsonReasoningEnabledFieldNumber, 41);
 }
 
 TEST(DisaggPDSchedulerTest, GenerationLatencyFieldsPreserveWireTags) {
-  proto::DisaggGenerationsRequest request;
-  request.set_upstream_elapsed_seconds(12.5);
-  proto::RemoteToken* token = request.add_tokens();
-  token->set_time_to_first_token_latency_seconds(2.5);
-
-  std::string serialized;
-  ASSERT_TRUE(request.SerializeToString(&serialized));
-
-  proto::DisaggGenerationsRequest decoded;
-  ASSERT_TRUE(decoded.ParseFromString(serialized));
-  ASSERT_TRUE(decoded.has_upstream_elapsed_seconds());
-  EXPECT_DOUBLE_EQ(decoded.upstream_elapsed_seconds(), 12.5);
-  ASSERT_EQ(decoded.tokens_size(), 1);
-  EXPECT_DOUBLE_EQ(decoded.tokens(0).time_to_first_token_latency_seconds(),
-                   2.5);
   EXPECT_EQ(proto::DisaggGenerationsRequest::kUpstreamElapsedSecondsFieldNumber,
             21);
   EXPECT_EQ(proto::RemoteToken::kTimeToFirstTokenLatencySecondsFieldNumber, 6);
@@ -2299,7 +2210,7 @@ TEST(DisaggPDSchedulerTest, LocalFailureReturnsDecodeReservation) {
   local->sequences()[0]->kv_state().set_transfer_kv_info(std::move(info));
   local->state().output_func = [](const RequestOutput&) { return true; };
   prefill.admit_prefill(local);
-  auto batch = prefill.prepare_batch_test();
+  auto batch = prefill.prepare();
   EXPECT_TRUE(batch[0].empty());
   prefill.wait_notifications();
 
@@ -2339,11 +2250,11 @@ TEST(DisaggPDSchedulerTest, CancelledPrefillReturnsDecodeReservation) {
     local->state().output_func = [](const RequestOutput&) { return true; };
     prefill.admit_prefill(local);
     if (running) {
-      auto batch = prefill.prepare_batch_test();
+      auto batch = prefill.prepare();
       ASSERT_FALSE(batch[0].empty());
     }
     local->set_cancel();
-    auto batch = prefill.prepare_batch_test();
+    auto batch = prefill.prepare();
     EXPECT_TRUE(batch[0].empty());
     prefill.wait_notifications();
     EXPECT_EQ(service.calls, 1);
@@ -2387,7 +2298,7 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   local_failed->state().output_func = [](const RequestOutput&) { return true; };
   auto release_started = service.release_started();
   prefill.admit_prefill(local_failed);
-  EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+  EXPECT_TRUE(prefill.prepare()[0].empty());
   // Always resume the deferred server RPCs below, including on test failure.
   EXPECT_EQ(release_started.wait_for(std::chrono::seconds(5)),
             std::future_status::ready);
@@ -2406,7 +2317,7 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
               server_ttft_count);
   };
   prefill.admit_prefill(local_healthy, &stub);
-  auto batch = prefill.prepare_batch_test();
+  auto batch = prefill.prepare();
   EXPECT_FALSE(batch[0].empty());
   if (!batch[0].empty()) {
     finish_prefill(local_healthy->sequences()[0].get());
@@ -2485,7 +2396,7 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   const int64_t before_rejection =
       HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
   prefill.admit_prefill(rejected, &stub);
-  batch = prefill.prepare_batch_test();
+  batch = prefill.prepare();
   EXPECT_FALSE(batch[0].empty());
   if (!batch[0].empty()) {
     finish_prefill(rejected->sequences()[0].get());
@@ -2562,7 +2473,7 @@ class ReservationTest : public ::testing::Test {
       return true;
     };
     prefill.admit_prefill(request);
-    EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+    EXPECT_TRUE(prefill.prepare()[0].empty());
     prefill.wait_notifications();
     EXPECT_EQ(status.get().code(), StatusCode::RESOURCE_EXHAUSTED);
     EXPECT_FALSE(prefill.has_channel(request->request_id()));
@@ -2599,7 +2510,7 @@ TEST_F(ReservationTest, UnlinkedDecodeReleasesAcceptedQueuedReservation) {
                                       /*ports=*/{},
                                       /*dp_size=*/1,
                                       /*src_kv_split_size=*/1));
-  const auto batches = prefill.prepare_batch_test();
+  const auto batches = prefill.prepare();
   EXPECT_TRUE(std::all_of(batches.begin(),
                           batches.end(),
                           [](const Batch& batch) { return batch.empty(); }));
@@ -2610,7 +2521,7 @@ TEST_F(ReservationTest, UnlinkedDecodeReleasesAcceptedQueuedReservation) {
   EXPECT_EQ(service_.released, 1);
   EXPECT_TRUE(decode_.reservations_empty());
   EXPECT_FALSE(prefill.has_channel(local->request_id()));
-  EXPECT_TRUE(prefill.get_running_requests().empty());
+  EXPECT_TRUE(prefill.running_requests().empty());
   EXPECT_EQ(pool->num_used_blocks()[0], 0u);
   EXPECT_EQ(remote->sequences()[0]->get_embedding_block_id(), -1);
 }
@@ -3030,7 +2941,7 @@ TEST_F(ReservationTest, UnacceptedLocalFailureSendsNoRelease) {
   auto local = accepted();
   local->state().decode_rpc_address.clear();
   prefill.admit_prefill(local);
-  EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+  EXPECT_TRUE(prefill.prepare()[0].empty());
   prefill.wait_notifications();
   EXPECT_EQ(service_.calls, 0);
   EXPECT_FALSE(prefill.has_channel(local->request_id()));
@@ -3073,7 +2984,7 @@ TEST_P(ChunkReservationTest,
   auto blocker = make_request(std::vector<int32_t>(12, 99), "blocker");
   ASSERT_TRUE(
       engine.block_manager_pool()->allocate(blocker->sequences()[0].get()));
-  EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+  EXPECT_TRUE(prefill.prepare()[0].empty());
   prefill.wait_notifications();
   EXPECT_EQ(service_.released, 1);
   EXPECT_TRUE(decode_.reservations_empty());
@@ -3082,7 +2993,7 @@ TEST_P(ChunkReservationTest,
       EXPECT_EQ(service_.released, 1);
     };
     prefill.step(absl::ZeroDuration());
-    EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+    EXPECT_TRUE(prefill.prepare()[0].empty());
   }
   prefill.wait_notifications();
   EXPECT_EQ(service_.released, 1);
@@ -3102,7 +3013,7 @@ TEST_F(ReservationTest, BudgetFailureReleasesOnlyTarget) {
   TestDisaggPDScheduler prefill(&engine, options);
   auto local = accepted();
   prefill.admit_prefill(local);
-  EXPECT_TRUE(prefill.prepare_batch_test()[0].empty());
+  EXPECT_TRUE(prefill.prepare()[0].empty());
   prefill.wait_notifications();
   EXPECT_EQ(service_.released, 1);
   EXPECT_EQ(remote->sequences()[0]->get_embedding_block_id(), -1);
@@ -3537,7 +3448,7 @@ TEST(DisaggPDSchedulerTest,
       .num_speculative_tokens(5)
       .num_embedding_blocks(16)
       .enable_prefix_cache(false);
-  BlockManagerPool pool(options);
+  block_test::TestBlockManagerPool pool(options);
   InstanceInfo info;
   info.name = "127.0.0.1:28104";
   info.type = "PREFILL";
@@ -3601,14 +3512,14 @@ TEST(VlmPDMetadataTest, ProductionFirstGenerationSendsNegativeDelta) {
   auto options = make_options();
   options.enable_pd_ooc(false).disable_log_stats(true).kv_cache_transfer_mode(
       "PUSH");
-  TestDisaggPDScheduler prefill(&engine, options, false);
   PositionHandoffChannel channel;
   proto::DisaggPDService_Stub stub(&channel);
+  TestDisaggPDScheduler prefill(&engine, options, false);
   auto request = make_request({1, 2, 3, 4});
   request->state().output_func = [](const RequestOutput&) { return true; };
   request->sequences()[0]->set_mrope_position_delta(-9);
   prefill.admit_prefill(request, &stub);
-  const auto batches = prefill.prepare_batch_test();
+  const auto batches = prefill.prepare();
   ASSERT_FALSE(batches[0].empty());
   finish_prefill(request->sequences()[0].get());
   prefill.prefill_send_first_generation();

@@ -42,15 +42,6 @@ def test_native_test_oracle_uses_glm_clamp_not_the_operator_under_test() -> None
     torch.testing.assert_close(scale, torch.tensor([1.0 / 127.0]))
 
 
-def test_native_npu_cases_do_not_replace_production_bindings() -> None:
-    path = Path(__file__).parents[1] / "core/kernels/npu/glm5_next_moe_cases.py"
-    source = path.read_text()
-    assert "monkeypatch" not in source
-    assert "torch_npu.npu_dequant_swiglu_quant" not in source
-    assert "_dispatch_has_kernel_for_dispatch_key" in source
-    assert not (Path(__file__).parent / "test_glm5_next_moe_npu.py").exists()
-
-
 def _config(**overrides: object) -> glm5_next.Glm5NextConfig:
     values = dict(
         hidden_size=8,
@@ -97,12 +88,6 @@ def test_config_preserves_tp_defaults_and_nested_text_fields() -> None:
     assert (config.ep_size, config.moe_tp_size, config.moe_tp_rank) == (2, 2, 1)
     config = _config(tp_size=2, tp_rank=1)
     assert (config.moe_tp_size, config.moe_tp_rank) == (2, 1)
-
-
-def test_direct_config_construction_preserves_tp_defaults() -> None:
-    config = glm5_next.Glm5NextConfig(tp_size=4, tp_rank=3)
-    assert (config.moe_tp_size, config.moe_tp_rank) == (4, 3)
-    config._validate_moe_parallelism()
 
 
 @pytest.mark.parametrize(
@@ -304,7 +289,8 @@ def test_shared_experts_keep_attention_tp_layout(dp_size: int, ep_size: int, moe
 
 
 @pytest.mark.parametrize(
-    "dp_size,tp_size,ep_size", [(1, 1, 1), (1, 8, 1), (1, 8, 8), (2, 4, 8), (2, 4, 4), (4, 2, 2), (2, 4, 1)]
+    "dp_size,tp_size,ep_size",
+    [(1, 1, 1), (1, 8, 1), (1, 8, 8), (2, 4, 8), (2, 4, 4), (4, 2, 2), (2, 4, 1)],
 )
 @pytest.mark.parametrize("empty_rank", [False, True])
 def test_joint_reduction_injects_shared_once_in_its_dp_rows(

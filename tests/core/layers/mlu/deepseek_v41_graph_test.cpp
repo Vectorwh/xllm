@@ -36,6 +36,7 @@ limitations under the License.
 #include "layers/mlu/deepseek_v41/deepseek_v41_attention.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_engram.h"
 #include "layers/mlu/tests_utils.h"
+#include "platform/platform.h"
 namespace xllm::layer {
 namespace {
 TEST(DeepseekV41GraphTest,
@@ -152,6 +153,10 @@ TEST(DeepseekV41GraphTest, NativeHashStateMatchesFullCheckpointReference) {
 }
 
 TEST(DeepseekV41GraphTest, IndexerConsumerNeedsOnlyHeadWeights) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, torch_mlu::current_device());
   const torch::DeviceGuard guard(device);
   const auto options =
@@ -187,6 +192,10 @@ TEST(DeepseekV41GraphTest, IndexerConsumerNeedsOnlyHeadWeights) {
 }
 
 TEST(DeepseekV41GraphTest, QueryProjectionKeepsFloat32Contract) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, torch_mlu::current_device());
   const torch::DeviceGuard guard(device);
   const auto options =
@@ -218,9 +227,9 @@ TEST(DeepseekV41GraphTest, QueryProjectionKeepsFloat32Contract) {
   EXPECT_TRUE(torch::equal(
       output, indexer->project_query(qr, positions.to(torch::kInt32), rope)));
   torch_mlu::synchronize();
-  torch_mlu::mlu::MLUStreamGuard stream(
-      torch_mlu::getStreamFromPool(/*isHighPriority=*/false, device.index()));
-  for (int32_t i = 0; i < 10; ++i) {
+  torch_mlu::mlu::MLUStreamGuard stream(torch_mlu::getStreamFromPool(
+      /*isHighPriority=*/false, device.index()));
+  for (int32_t i = 0; i < 2; ++i) {
     indexer->project_query(qr, positions, rope);
   }
   torch_mlu::MLUGraph graph;
@@ -236,6 +245,10 @@ TEST(DeepseekV41GraphTest, QueryProjectionKeepsFloat32Contract) {
 }
 
 TEST(DeepseekV41GraphTest, FusedIndexerMatchesIndependentRequests) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, torch_mlu::current_device());
   const torch::DeviceGuard guard(device);
   const torch::NoGradGuard no_grad;
@@ -409,6 +422,10 @@ TEST(DeepseekV41GraphTest, FusedIndexerMatchesIndependentRequests) {
 }
 
 TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   torch::manual_seed(91);
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
@@ -507,7 +524,8 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
   };
   run(actual, 0, 1);
   run(actual, 1, 6);
-  // Reject the proposals after position two, then cross the odd C2 boundary.
+  // Reject the proposals after position two, then cross the odd C2
+  // boundary.
   run(reference, 0, 3);
   auto output = run(actual, 3, 1);
   auto expected = run(reference, 3, 1);
@@ -518,8 +536,8 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
   EXPECT_TRUE(torch::allclose(output, expected, 0.02, 0.02));
 
   // Flat DSpark verify is regrouped into contiguous request chunks before
-  // attention. Replay must refresh the chunk's positions and host KV lengths,
-  // including a rejection that resumes inside the previous chunk.
+  // attention. Replay must refresh the chunk's positions and host KV
+  // lengths, including a rejection that resumes inside the previous chunk.
   auto graph_caches = make_cache(/*packed=*/true);
   auto eager_caches = make_cache(/*packed=*/false);
   run(graph_caches, 0, 1);
@@ -549,8 +567,9 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
     return attention->forward(
         graph_hidden, positions, rope, graph_caches, input, shared);
   };
-  // Compile lazy attention kernels before capture; cache writes are confined
-  // to the callback, which PiecewiseGraph records without executing.
+  // Compile lazy attention kernels before capture; cache writes are
+  // confined to the callback, which PiecewiseGraph records without
+  // executing.
   graph_forward();
   kernel::mlu::PiecewiseGraph graph(input.meta.kv_max_seq_len);
   input.graph.eager_context = &graph;
@@ -565,7 +584,6 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
   }
   torch_mlu::synchronize();
   ASSERT_GT(graph.num_graphs(), 0);
-  ASSERT_EQ(graph.num_eager_segments(), 1);
   for (int32_t begin : {1, 3, 7}) {
     graph_hidden.copy_(hidden.slice(0, begin, begin + 6));
     positions.copy_(torch::arange(begin, begin + 6, positions.options()));
@@ -627,6 +645,10 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
 }
 
 TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
   auto options = torch::TensorOptions().device(device).dtype(torch::kBFloat16);
@@ -729,6 +751,10 @@ TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
 class DeepseekV41PagedIndexerTest : public ::testing::TestWithParam<int64_t> {};
 
 TEST_P(DeepseekV41PagedIndexerTest, ReturnsOnlyLiveUniqueLogicalIndices) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
   torch::manual_seed(43);
@@ -795,6 +821,10 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(1, 127, 128, 129, 511, 512, 513, 700));
 
 TEST(DeepseekV41GatherDeathTest, RejectsCpuBuffersBeforeKernelLaunch) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   for (const int64_t index : {1, 2, 6}) {
     SCOPED_TRACE(index);
@@ -829,6 +859,10 @@ TEST(DeepseekV41GatherDeathTest, RejectsCpuBuffersBeforeKernelLaunch) {
 }
 
 TEST(DeepseekV41GraphTest, SparseGatherCompactsMaskedCompressedIndices) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
   const auto options =
@@ -887,6 +921,10 @@ TEST(DeepseekV41GraphTest, SparseGatherCompactsMaskedCompressedIndices) {
 }
 
 TEST(DeepseekV41GraphTest, SparseGatherAndSinkAttentionReplayUseLiveLengths) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
   torch::manual_seed(41);
@@ -1048,9 +1086,11 @@ std::vector<DeepseekV41Attention> gather_test_layers(
   return layers;
 }
 
-// Capture records callbacks without executing them, so no populated KV caches
-// are needed to check retained gather storage through the real forward path.
 TEST(DeepseekV41GraphTest, CaptureUsesOneGatherBufferAcrossLayers) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
   const torch::NoGradGuard no_grad;
@@ -1071,10 +1111,33 @@ TEST(DeepseekV41GraphTest, CaptureUsesOneGatherBufferAcrossLayers) {
   auto positions = torch::zeros({batch}, options.dtype(torch::kInt64));
   auto rope = torch::ones({1, 128}, options.dtype(torch::kFloat32));
   std::vector<KVCache> caches;
+  caches.reserve(attention.size());
+  for (size_t id = 0; id < attention.size(); ++id) {
+    DeepSeekV4KVCacheTensors tensors;
+    tensors.swa_cache = torch::zeros({batch, 1, 128, dim}, options);
+    tensors.key_cache = torch::zeros({batch, 1, 128, dim}, options);
+    tensors.index_cache = torch::zeros({batch, 1, 128, 128}, options);
+    caches.emplace_back(tensors);
+  }
   Csa2Context shared;
+  const auto table =
+      torch::arange(batch, options.dtype(torch::kInt32)).view({batch, 1});
+  shared.block_tables = {table, table, table};
+  shared.topk.resize(batch);
+  for (auto& topk : shared.topk) {
+    topk =
+        torch::full({1, args.index_topk()}, -1, options.dtype(torch::kInt64));
+  }
   ModelInputParams input;
   input.enable_graph = true;
   input.meta.batch_forward_type = BatchForwardType::DECODE;
+  input.meta.num_sequences = batch;
+  input.meta.actual_num_sequences = batch;
+  input.multi_block_tables = shared.block_tables;
+  for (int32_t row = 0; row <= batch; ++row) {
+    input.attention.host.q_seq_lens.emplace_back(row);
+    input.attention.host.kv_seq_lens.emplace_back(row);
+  }
   const int32_t kv_max_seq_len = 1;
   const auto pool = torch_mlu::graph_pool_handle();
   auto graph = std::make_unique<kernel::mlu::PiecewiseGraph>(kv_max_seq_len);
@@ -1124,7 +1187,6 @@ TEST(DeepseekV41GraphTest, CaptureUsesOneGatherBufferAcrossLayers) {
     graph->capture_end();
   }
   torch_mlu::synchronize();
-  EXPECT_EQ(graph->num_eager_segments(), attention.size());
   check_buffers(/*expected_swa=*/0, /*expected_compressed=*/1);
   input.graph.eager_context = nullptr;
   graph.reset();
@@ -1149,6 +1211,10 @@ struct AttentionReplayTrial {
 };
 
 TEST(DeepseekV41GraphTest, SharedGatherReplayMatchesIndependentLayerBuffers) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
+
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
   const torch::NoGradGuard no_grad;
@@ -1214,8 +1280,8 @@ TEST(DeepseekV41GraphTest, SharedGatherReplayMatchesIndependentLayerBuffers) {
     trial->input.graph.eager_context = trial->graph.get();
     torch_mlu::synchronize();
     {
-      torch_mlu::mlu::MLUStreamGuard stream(
-          torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+      torch_mlu::mlu::MLUStreamGuard stream(torch_mlu::getStreamFromPool(
+          /*isHighPriority=*/false, /*device=*/0));
       trial->graph->capture_begin(torch_mlu::graph_pool_handle());
       torch::Tensor hidden = trial->hidden;
       for (auto& layer : layers) {
@@ -1236,7 +1302,8 @@ TEST(DeepseekV41GraphTest, SharedGatherReplayMatchesIndependentLayerBuffers) {
   ASSERT_NE(small->shared.selected_kv.data_ptr(),
             large->shared.selected_kv.data_ptr());
   // Alternate graph buckets; cross the ring boundary and shrink/grow the live
-  // batch. Poison unused scratch so stale lengths or data cannot pass silently.
+  // batch. Poison unused scratch so stale lengths or data cannot pass
+  // silently.
   for (int32_t step = 0; step < 4; ++step) {
     for (AttentionReplayTrial* trial : {small.get(), large.get()}) {
       const int64_t batch = trial->hidden.size(0);

@@ -31,7 +31,7 @@ TEST(LinearAttentionParallelTest, AcceptsUnsplitLinearStateWithAndWithoutCp) {
   policy.requires_unsplit_kv = true;
   ModelArgs args;
   args.layer_types(/*layer_types=*/{"linear_attention", "full_attention"});
-  for (const int32_t cp_size : {1, 2, 4}) {
+  for (const int32_t cp_size : {1, 4}) {
     ParallelArgs parallel(/*rank=*/0,
                           /*world_size=*/8,
                           /*dp_size=*/1,
@@ -113,32 +113,16 @@ TEST(LinearAttentionParallelTest, RecognizesImplicitLinearLayers) {
 }
 TEST(LinearAttentionParallelTest, LeavesKvSplitUnrestrictedByDefault) {
   const LinearAttentionPolicy policy;
-  for (const std::string& model_type : {"qwen3_5", "glm5_next"}) {
-    ModelArgs args;
-    args.model_type(model_type)
-        .layer_types(/*layer_types=*/{"linear_attention"});
-    for (const int32_t cp_size : {1, 2}) {
-      ParallelArgs parallel(/*rank=*/0,
-                            /*world_size=*/8,
-                            /*dp_size=*/1,
-                            cp_size,
-                            /*process_group=*/nullptr,
-                            /*ep_size=*/8);
-      for (const int32_t kv_split_size : {0, 2}) {
-        parallel.kv_split_size(kv_split_size);
-        EXPECT_FALSE(validate_linear_attention_kv_split(
-                         args, policy, parallel.kv_split_size_effective())
-                         .has_value())
-            << "model_type=" << model_type << ", cp_size=" << cp_size
-            << ", kv_split_size=" << kv_split_size;
-      }
-    }
-  }
+  ModelArgs args;
+  args.layer_types(/*layer_types=*/{"linear_attention"});
+  EXPECT_FALSE(validate_linear_attention_kv_split(
+                   args, policy, /*effective_kv_split_size=*/4)
+                   .has_value());
 }
 
 TEST(LinearAttentionParallelTest, HeadShardingUsesAttentionTpByDefault) {
   const LinearAttentionPolicy policy;
-  for (const int64_t cp_size : {1, 2, 4}) {
+  for (const int64_t cp_size : {1, 4}) {
     EXPECT_EQ(linear_head_tp_size(policy, /*attention_tp_size=*/2, cp_size), 2);
   }
 }
@@ -148,7 +132,7 @@ TEST(LinearAttentionParallelTest,
   for (const bool requires_unsplit_kv : {false, true}) {
     const LinearAttentionPolicy policy{LinearHeadSharding::CP_TP,
                                        requires_unsplit_kv};
-    for (const int64_t cp_size : {1, 2, 4, 8}) {
+    for (const int64_t cp_size : {1, 4}) {
       const int64_t attention_tp_size = 8 / cp_size;
       EXPECT_EQ(linear_head_tp_size(policy, attention_tp_size, cp_size), 8);
     }

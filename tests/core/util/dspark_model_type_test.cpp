@@ -44,11 +44,4 @@ TEST(DsparkModelTypeTest, TargetsAreNotDraftNames) {
   EXPECT_FALSE(is_deepseek_v4_dspark_model_type(""));
 }
 
-// Locks the constants that the worker draft routing and the Python registry
-// must agree on.
-TEST(DsparkModelTypeTest, ConstantsMatchTheDraftNames) {
-  EXPECT_EQ(kDeepseekV4DSparkModelType, "deepseek_v4_dspark");
-  EXPECT_EQ(kDeepseekV41DSparkModelType, "deepseek_v41_dspark");
-}
-
 }  // namespace xllm::util

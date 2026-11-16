@@ -27,7 +27,6 @@ limitations under the License.
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
-#include "kernels/ops_api.h"
 #include "layers/common/dense_mlp.h"
 #include "layers/common/linear.h"
 #include "platform/device.h"
@@ -110,6 +109,12 @@ class NpuLinearW8A8TestBase : public ::testing::Test {
     auto actual_fp32 = actual.to(torch::kFloat32).cpu();
     auto expected_fp32 = expected.to(torch::kFloat32).cpu();
     ASSERT_TRUE(torch::allclose(actual_fp32, expected_fp32, 5e-2, 5e-2));
+    const double reference_norm =
+        torch::norm(expected_fp32, 2.0).item<double>();
+    ASSERT_GT(reference_norm, 0.0);
+    EXPECT_LE(torch::norm(actual_fp32 - expected_fp32, 2.0).item<double>() /
+                  reference_norm,
+              5e-2);
     ASSERT_TRUE(torch::isfinite(actual_fp32).all().item<bool>())
         << "Output has non-finite values";
   }
@@ -122,7 +127,12 @@ class NpuLinearW8A8TestBase : public ::testing::Test {
 
 class NpuLinearW8A8DynamicTest : public NpuLinearW8A8TestBase {
  protected:
-  void SetUp() override { init_quant_args("w8a8_dynamic", true); }
+  void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "NPU device is required";
+    }
+    init_quant_args("w8a8_dynamic", true);
+  }
 
   torch::Tensor make_reference_output(const torch::Tensor& input,
                                       const torch::Tensor& qweight,
@@ -134,92 +144,6 @@ class NpuLinearW8A8DynamicTest : public NpuLinearW8A8TestBase {
       output = output + bias;
     }
     return output;
-  }
-
-  torch::Tensor make_unflattened_kernel_reference_output(
-      const torch::Tensor& input,
-      const torch::Tensor& qweight,
-      const torch::Tensor& weight_scale,
-      const std::optional<torch::Tensor>& bias) const {
-    xllm::kernel::NpuQuantizeParams quant_params;
-    quant_params.input = input;
-
-    torch::Tensor quantized_input;
-    std::optional<torch::Tensor> pertoken_scale;
-    std::tie(quantized_input, pertoken_scale) =
-        xllm::kernel::dynamic_quant(quant_params);
-    CHECK(pertoken_scale.has_value() && pertoken_scale->defined());
-
-    xllm::kernel::QuantMatmulParams matmul_params;
-    matmul_params.x1 = quantized_input;
-    matmul_params.x2 = qweight;
-    matmul_params.transpose2 = true;
-    matmul_params.scale = weight_scale;
-    matmul_params.pertoken_scale = pertoken_scale;
-    matmul_params.output_dtype = input.scalar_type();
-
-    auto output = xllm::kernel::quant_matmul(matmul_params);
-    if (bias.has_value() && bias->defined()) {
-      output = output + bias.value();
-    }
-    return output;
-  }
-};
-
-class NpuLinearW8A8StaticTest : public NpuLinearW8A8TestBase {
- protected:
-  void SetUp() override { init_quant_args("w8a8", false); }
-
-  torch::Tensor make_input_scale() const {
-    return torch::full({1},
-                       0.02f,
-                       torch::TensorOptions()
-                           .dtype(torch::kFloat32)
-                           .device(options_.device()));
-  }
-
-  torch::Tensor make_input_offset() const {
-    return torch::zeros(
-        {1},
-        torch::TensorOptions().dtype(torch::kInt8).device(options_.device()));
-  }
-
-  torch::Tensor make_deq_scale(const std::string& key,
-                               int64_t out_features) const {
-    return make_weight_scale(key, out_features);
-  }
-
-  torch::Tensor make_quant_bias(const std::string& key,
-                                int64_t out_features) const {
-    auto bias = test::seeded_tensor(
-        key, {out_features}, torch::kFloat32, options_.device());
-    return (bias * 8.0f).to(torch::kInt32);
-  }
-
-  torch::Tensor make_unflattened_kernel_reference_output(
-      const torch::Tensor& input,
-      const torch::Tensor& qweight,
-      const torch::Tensor& input_scale,
-      const torch::Tensor& input_offset,
-      const torch::Tensor& deq_scale,
-      const std::optional<torch::Tensor>& quant_bias) const {
-    xllm::kernel::NpuQuantizeParams quant_params;
-    quant_params.input = input;
-    quant_params.scale = input_scale;
-    quant_params.zero_point = input_offset;
-    quant_params.axis = -1;
-
-    auto quantized_input = xllm::kernel::quantize(quant_params);
-
-    xllm::kernel::QuantMatmulParams matmul_params;
-    matmul_params.x1 = quantized_input;
-    matmul_params.x2 = qweight;
-    matmul_params.transpose2 = true;
-    matmul_params.scale = deq_scale;
-    matmul_params.bias = quant_bias;
-    matmul_params.output_dtype = input.scalar_type();
-
-    return xllm::kernel::quant_matmul(matmul_params);
   }
 };
 

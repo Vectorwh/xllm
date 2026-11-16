@@ -19,7 +19,6 @@ Extracted from the monolithic ``test_deepseek_v41_fused_ops.py``.
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -31,7 +30,6 @@ import torch.nn as nn
 import xllm.python.models.deepseek_v4 as v4
 import xllm.python.models.deepseek_v41 as v41
 from tests.python._deepseek_v41_fused_testkit import (
-    _npu_ready,
     _SpyLogger,
 )
 from tests.python.test_deepseek_v41_hc import _make_stubbed_layer, _run_layer
@@ -119,15 +117,9 @@ def test_npu_bf16_rms_norm_matches_fp32_path(
 # R9: fused RMSNorm+cast MoE norm (always on)
 # ---------------------------------------------------------------------------
 #
-# The decoder layer delegates the MoE FFN RMSNorm to ``DeepseekV4MoE.forward``
-# (``post_norm=``) instead of running it in the layer. ``DeepseekV4MoE`` pads
-# and all-gathers ``hidden`` across DP BEFORE it takes the gate/expert input, so
-# the norm now runs on the gathered stream: ``DeepseekV41W8A8MoE._apply_post_norm``
-# fuses it with the gate's fp32 widening via ``rms_norm_cast`` when the guard
-# passes, else runs the eager norm once. RMSNorm is row-wise, so this equals
-# "norm then gather" per row, which is why the fusion also holds for
-# ``dp_size > 1``. Tests marked ``_npu_ready`` need an NPU + the fused-ops lib;
-# the rest run on CPU with a mocked op / mocked all-gather.
+# The decoder delegates the unnormalized FFN input and post_norm module to MoE.
+# V4.1 normalizes/gates local rows before DP communication. CPU cases adapt the
+# native-op dependency; numeric device coverage requires a healthy NPU.
 
 
 class _StopForward(Exception):
@@ -185,30 +177,17 @@ def _make_norm_cast_layer(seed: int) -> tuple[Any, dict[str, Any], _RecordingMoe
     return layer, inputs, moe
 
 
-def test_rms_norm_cast_guard_is_strict(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fused switch needs bf16 activation/weight + op + NPU."""
-    op = lambda x, gamma, epsilon=1e-6: (x, x.float())  # noqa: E731 - registered-op stand-in
-    x = torch.randn(4, 8, dtype=torch.bfloat16)
-    weight = torch.ones(8, dtype=torch.bfloat16)
-
-    monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: None)
-    assert v41._rms_norm_cast_supported(x, weight) is False
-
-    monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: op)
-    assert v41._rms_norm_cast_supported(x.to(torch.float32), weight) is False
-    assert v41._rms_norm_cast_supported(x, weight.to(torch.float32)) is False
-    if not _npu_ready():
-        # Every non-platform condition holds; a CPU tensor must still stay eager.
-        assert v41._rms_norm_cast_supported(x, weight) is False
-
-
 class _GuardTensor:
-    """Duck-typed tensor stand-in so the guard's NPU clauses run on a CPU host.
-    The fused switch is device-gated, so a real CPU tensor can never reach the op/shape clauses."""
+    """Metadata-only input makes each guard negative independent of CPU veto."""
 
-    def __init__(self, shape: tuple[int, ...] = (4, 8), device_type: str = "npu") -> None:
+    def __init__(
+        self,
+        shape: tuple[int, ...] = (4, 8),
+        device_type: str = "npu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         self.shape = shape
-        self.dtype = torch.bfloat16
+        self.dtype = dtype
         self.device = SimpleNamespace(type=device_type)
 
     def dim(self) -> int:
@@ -219,9 +198,7 @@ class _GuardTensor:
 
 
 def test_rms_norm_cast_guard_is_shape_and_device_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The guarded predicate is static (dtype/op/device), never keyed on DP.
-    ``dp_size`` is deliberately absent: the norm now runs inside the MoE AFTER the DP all-gather, so a DP-gathering tier"""
-    assert "dp_size" not in inspect.signature(v41._rms_norm_cast_supported).parameters
+    """Vary one eligibility condition from a passing metadata-only NPU input."""
 
     op = lambda x, gamma, epsilon=1e-6: (x, x.float())  # noqa: E731 - registered-op stand-in
     monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: op)
@@ -229,6 +206,12 @@ def test_rms_norm_cast_guard_is_shape_and_device_only(monkeypatch: pytest.Monkey
 
     # Non-vacuity: every non-platform clause passes on the fake NPU tensor.
     assert v41._rms_norm_cast_supported(_GuardTensor(), weight) is True
+    assert v41._rms_norm_cast_supported(_GuardTensor(shape=(2, 4, 8)), weight) is True
+    assert v41._rms_norm_cast_supported(_GuardTensor(dtype=torch.float32), weight) is False
+    assert v41._rms_norm_cast_supported(_GuardTensor(), weight.float()) is False
+    monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: None)
+    assert v41._rms_norm_cast_supported(_GuardTensor(), weight) is False
+    monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: op)
     # Shape / numel hardening.
     assert v41._rms_norm_cast_supported(_GuardTensor(shape=(8,)), weight) is False  # not 2D/3D
     assert v41._rms_norm_cast_supported(_GuardTensor(shape=(4, 8, 8, 8)), weight) is False  # 4D
@@ -242,8 +225,7 @@ def test_rms_norm_cast_guard_is_shape_and_device_only(monkeypatch: pytest.Monkey
 def test_rms_norm_cast_layer_delegates_the_un_normalised_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The layer hands the raw collapsed input + norm module to the MoE.
-    It must NOT normalise itself: that would both bypass the fused op and, under DP, normalise the local rows the MoE is"""
+    """Delegate non-normalized input and the norm module, without eager norm."""
     layer, inputs, moe = _make_norm_cast_layer(seed=91)
     norm = layer.post_attention_layernorm
     original_forward = norm.forward
@@ -318,7 +300,7 @@ class _FakeAllGather:
         return tensor.repeat(world_size, *([1] * (tensor.dim() - 1)))
 
 
-@pytest.mark.parametrize("dp_size", [2, 4])
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
 def test_v41_moe_fused_norm_cast_runs_before_the_dp_gather(
     monkeypatch: pytest.MonkeyPatch,
     dp_size: int,
@@ -335,7 +317,7 @@ def test_v41_moe_fused_norm_cast_runs_before_the_dp_gather(
     # Records ``(input, y, gamma, epsilon)``.
     op_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] = []
 
-    def fake_op(x: torch.Tensor, gamma: torch.Tensor, epsilon: float = 1e-6):
+    def fake_op(x: torch.Tensor, gamma: torch.Tensor, epsilon: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
         y = (x.float() * 0.5).to(x.dtype)
         op_calls.append((x.clone(), y.clone(), gamma, epsilon))
         return y, y.float()
@@ -345,6 +327,14 @@ def test_v41_moe_fused_norm_cast_runs_before_the_dp_gather(
     monkeypatch.setattr(v41, "_rms_norm_cast_active_logged", False)
 
     norm = v41.DeepseekV41RMSNorm(8, 1e-6, torch.bfloat16)
+    eager_calls: list[torch.Tensor] = []
+    original_norm = norm.forward
+
+    def record_eager(value: torch.Tensor) -> torch.Tensor:
+        eager_calls.append(value)
+        return original_norm(value)
+
+    monkeypatch.setattr(norm, "forward", record_eager)
     moe = _make_w8a8_moe(dp_size, gate_logits=capture_gate_input)
     hidden = torch.randn(3, 8, dtype=torch.bfloat16)
 
@@ -352,6 +342,7 @@ def test_v41_moe_fused_norm_cast_runs_before_the_dp_gather(
         v4.DeepseekV4MoE.forward(moe, hidden, post_norm=norm)
 
     assert len(op_calls) == 1
+    assert eager_calls == []
     op_input, op_y, op_gamma, op_epsilon = op_calls[0]
     assert op_input.shape[0] == 3
     assert torch.equal(op_input, hidden)
@@ -425,67 +416,6 @@ def test_v4_moe_fused_norm_cast_falls_back_to_eager(monkeypatch: pytest.MonkeyPa
     assert len([message for message in spy.warnings if "RMSNorm+cast" in message]) == 1
 
 
-def test_v4_moe_fused_norm_cast_is_applied_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Guard on: the fused op runs once and the eager norm module not at all."""
-    captured: dict[str, torch.Tensor] = {}
-
-    def capture_gate_input(gate_input: torch.Tensor, gate_input_ids: Any) -> torch.Tensor:
-        captured["gate_input"] = gate_input
-        raise _StopForward
-
-    norm = v41.DeepseekV41RMSNorm(8, 1e-6, torch.bfloat16)
-    original_forward = norm.forward
-    norm_calls: list[torch.Tensor] = []
-
-    def recording_forward(x: torch.Tensor) -> torch.Tensor:
-        norm_calls.append(x)
-        return original_forward(x)
-
-    monkeypatch.setattr(norm, "forward", recording_forward)
-    op_calls: list[torch.Tensor] = []
-
-    def fake_op(x: torch.Tensor, gamma: torch.Tensor, epsilon: float = 1e-6):
-        op_calls.append(x)
-        return x, x.float()
-
-    monkeypatch.setattr(v41, "_rms_norm_cast_supported", lambda x, w: True)
-    monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: fake_op)
-    monkeypatch.setattr(v41, "_rms_norm_cast_active_logged", False)
-
-    moe = _make_w8a8_moe(1, gate_logits=capture_gate_input)
-    hidden = torch.randn(3, 8, dtype=torch.bfloat16)
-    with pytest.raises(_StopForward):
-        v4.DeepseekV4MoE.forward(moe, hidden, post_norm=norm)
-
-    assert len(op_calls) == 1
-    assert norm_calls == []
-    # The gate routes the widened op result, never a second normalisation.
-    assert torch.equal(captured["gate_input"], op_calls[0].float())
-
-
-def test_rms_norm_cast_logging_states(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A missing op warns once; an active path logs once."""
-    spy = _SpyLogger()
-    monkeypatch.setattr(v41, "logger", spy)
-    monkeypatch.setattr(v41, "_rms_norm_cast_active_logged", False)
-    monkeypatch.setattr(v41, "_rms_norm_cast_fallback_logged", False)
-    x = torch.randn(4, 8, dtype=torch.bfloat16)
-    weight = torch.ones(8, dtype=torch.bfloat16)
-
-    # missing op: warn once, no active info.
-    monkeypatch.setattr(v41, "_get_rms_norm_cast_op", lambda: None)
-    v41._log_rms_norm_cast_fallback(x, weight)
-    v41._log_rms_norm_cast_fallback(x, weight)
-    assert len([message for message in spy.warnings if "RMSNorm+cast" in message]) == 1
-    assert spy.infos == []
-
-    # active path: info once.
-    monkeypatch.setattr(v41, "_rms_norm_cast_active_logged", False)
-    v41._log_rms_norm_cast_active()
-    v41._log_rms_norm_cast_active()
-    assert len([message for message in spy.infos if "rms_norm_cast" in message]) == 1
-
-
 def test_pure_torch_moe_applies_post_norm_before_routing() -> None:
     """The pure-torch MoE norms the delegated input exactly once, before routing."""
     captured: dict[str, torch.Tensor] = {}
@@ -507,12 +437,3 @@ def test_pure_torch_moe_applies_post_norm_before_routing() -> None:
     with pytest.raises(_StopForward):
         v41.DeepseekV41MoE.forward(moe, hidden)
     assert torch.equal(captured["x"], hidden.reshape(-1, 8))
-
-
-def test_moe_forwards_accept_post_norm_and_drop_hidden_states_fp32() -> None:
-    """Both MoE tiers take the ``post_norm`` module; the old fp32 kwarg is gone."""
-    for cls in (v41.DeepseekV41MoE, v4.DeepseekV4MoE):
-        parameters = inspect.signature(cls.forward).parameters
-        assert "post_norm" in parameters, cls.__name__
-        assert parameters["post_norm"].default is None, cls.__name__
-        assert "hidden_states_fp32" not in parameters, cls.__name__

@@ -216,17 +216,8 @@ TEST_F(FastTokenizerTest, AddBosToken) {
   FastTokenizer tokenizer(args);
 
   std::vector<int32_t> ids;
-  bool success = tokenizer.encode("hello world", &ids);
-
-  ASSERT_TRUE(success);
-  ASSERT_FALSE(ids.empty());
-
-  // Check that BOS token (ID 0) is at the beginning
-  EXPECT_EQ(ids[0], 0) << "BOS token should be at the beginning";
-
-  // Verify that the rest of the tokens are present
-  // The tokenizer should encode "hello world" into token IDs
-  EXPECT_GT(ids.size(), 1) << "Should have more than just BOS token";
+  ASSERT_TRUE(tokenizer.encode("hello world", &ids));
+  EXPECT_EQ(ids, (std::vector<int32_t>{0, 2, 3}));
 }
 
 // Test that EOS token is added when add_eos_token is true
@@ -241,16 +232,8 @@ TEST_F(FastTokenizerTest, AddEosToken) {
   FastTokenizer tokenizer(args);
 
   std::vector<int32_t> ids;
-  bool success = tokenizer.encode("hello world", &ids);
-
-  ASSERT_TRUE(success);
-  ASSERT_FALSE(ids.empty());
-
-  // Check that EOS token (ID 1) is at the end
-  EXPECT_EQ(ids.back(), 1) << "EOS token should be at the end";
-
-  // Verify that the rest of the tokens are present
-  EXPECT_GT(ids.size(), 1) << "Should have more than just EOS token";
+  ASSERT_TRUE(tokenizer.encode("hello world", &ids));
+  EXPECT_EQ(ids, (std::vector<int32_t>{2, 3, 1}));
 }
 
 // Test that both BOS and EOS tokens are added when both flags are true
@@ -266,19 +249,12 @@ TEST_F(FastTokenizerTest, AddBothBosAndEosTokens) {
   FastTokenizer tokenizer(args);
 
   std::vector<int32_t> ids;
-  bool success = tokenizer.encode("hello world", &ids);
+  ASSERT_TRUE(tokenizer.encode("hello world", &ids));
+  const std::vector<int32_t> expected = {0, 2, 3, 1};
+  EXPECT_EQ(ids, expected);
 
-  ASSERT_TRUE(success);
-  ASSERT_GE(ids.size(), 2) << "Should have at least BOS and EOS tokens";
-
-  // Check that BOS token (ID 0) is at the beginning
-  EXPECT_EQ(ids[0], 0) << "BOS token should be at the beginning";
-
-  // Check that EOS token (ID 1) is at the end
-  EXPECT_EQ(ids.back(), 1) << "EOS token should be at the end";
-
-  // Verify that there are tokens in between
-  EXPECT_GT(ids.size(), 2) << "Should have tokens between BOS and EOS";
+  ASSERT_TRUE(tokenizer.encode("<|bos|> hello world <|eos|>", &ids));
+  EXPECT_EQ(ids, expected);
 }
 
 // Test that no special tokens are added when both flags are false
@@ -292,16 +268,8 @@ TEST_F(FastTokenizerTest, NoSpecialTokens) {
   FastTokenizer tokenizer(args);
 
   std::vector<int32_t> ids;
-  bool success = tokenizer.encode("hello world", &ids);
-
-  ASSERT_TRUE(success);
-  ASSERT_FALSE(ids.empty());
-
-  // Check that BOS token (ID 0) is NOT at the beginning
-  EXPECT_NE(ids[0], 0) << "BOS token should not be present";
-
-  // Check that EOS token (ID 1) is NOT at the end
-  EXPECT_NE(ids.back(), 1) << "EOS token should not be present";
+  ASSERT_TRUE(tokenizer.encode("hello world", &ids));
+  EXPECT_EQ(ids, (std::vector<int32_t>{2, 3}));
 }
 
 TEST_F(FastTokenizerTest, CallLevelFalseSuppressesConfiguredSpecialTokens) {
@@ -323,12 +291,8 @@ TEST_F(FastTokenizerTest, CallLevelFalseSuppressesConfiguredSpecialTokens) {
                                &ids_with_special_tokens,
                                /*add_special_tokens=*/true));
 
-  ASSERT_FALSE(ids_without_special_tokens.empty());
-  ASSERT_FALSE(ids_with_special_tokens.empty());
-  EXPECT_NE(ids_without_special_tokens.front(), 0);
-  EXPECT_NE(ids_without_special_tokens.back(), 1);
-  EXPECT_EQ(ids_with_special_tokens.front(), 0);
-  EXPECT_EQ(ids_with_special_tokens.back(), 1);
+  EXPECT_EQ(ids_without_special_tokens, (std::vector<int32_t>{2}));
+  EXPECT_EQ(ids_with_special_tokens, (std::vector<int32_t>{0, 2, 1}));
 }
 
 TEST_F(FastTokenizerTest, DecodeTokenPreservesByteLevelPieces) {
@@ -392,168 +356,25 @@ TEST_F(FastTokenizerTest, ProxyForwardsDecodeToken) {
   EXPECT_EQ(proxy.decode_token(4), "\xE4\xB8\x80");
 }
 
-// Test that BOS token is not added when bos_token is empty
-TEST_F(FastTokenizerTest, AddBosTokenWithEmptyToken) {
+TEST_F(FastTokenizerTest, EmptyConfiguredSpecialTokenIsSkippedIndependently) {
   TokenizerArgs args;
   args.tokenizer_type() = "fast";
   args.vocab_file() = tokenizer_json_path_.string();
   args.add_bos_token() = true;
-  args.bos_token() = "";  // Empty token
-  args.add_eos_token() = false;
-
-  FastTokenizer tokenizer(args);
-
-  std::vector<int32_t> ids;
-  bool success = tokenizer.encode("hello world", &ids);
-
-  ASSERT_TRUE(success);
-  ASSERT_FALSE(ids.empty());
-
-  // BOS token should not be added because bos_token is empty
-  EXPECT_NE(ids[0], 0)
-      << "BOS token should not be added when bos_token is empty";
-}
-
-// Test that EOS token is not added when eos_token is empty
-TEST_F(FastTokenizerTest, AddEosTokenWithEmptyToken) {
-  TokenizerArgs args;
-  args.tokenizer_type() = "fast";
-  args.vocab_file() = tokenizer_json_path_.string();
-  args.add_bos_token() = false;
-  args.add_eos_token() = true;
-  args.eos_token() = "";  // Empty token
-
-  FastTokenizer tokenizer(args);
-
-  std::vector<int32_t> ids;
-  bool success = tokenizer.encode("hello world", &ids);
-
-  ASSERT_TRUE(success);
-  ASSERT_FALSE(ids.empty());
-
-  // EOS token should not be added because eos_token is empty
-  EXPECT_NE(ids.back(), 1)
-      << "EOS token should not be added when eos_token is empty";
-}
-
-// Test that BOS token is not duplicated when it already exists
-// This simulates the case where the underlying tokenizer already added BOS
-TEST_F(FastTokenizerTest, SkipBosTokenWhenAlreadyPresent) {
-  TokenizerArgs args;
-  args.tokenizer_type() = "fast";
-  args.vocab_file() = tokenizer_json_path_.string();
-  args.add_bos_token() = true;
-  args.bos_token() = "<|bos|>";
-  args.add_eos_token() = false;
-
-  FastTokenizer tokenizer(args);
-
-  // First encode a text that doesn't start with BOS
-  std::vector<int32_t> ids1;
-  bool success1 = tokenizer.encode("hello world", &ids1);
-  ASSERT_TRUE(success1);
-  ASSERT_FALSE(ids1.empty());
-
-  // Verify BOS token was added
-  EXPECT_EQ(ids1[0], 0) << "BOS token should be added";
-  size_t size_with_bos = ids1.size();
-
-  // Now encode text that starts with BOS token directly
-  // We'll encode the BOS token itself, which should result in BOS being the
-  // first token
-  std::vector<int32_t> ids2;
-  bool success2 = tokenizer.encode("<|bos|> hello world", &ids2);
-  ASSERT_TRUE(success2);
-  ASSERT_FALSE(ids2.empty());
-
-  // The BOS token should be present, but we should not have added it twice
-  // Count how many times BOS token (ID 0) appears at the beginning
-  int bos_count_at_start = 0;
-  for (size_t i = 0; i < ids2.size() && ids2[i] == 0; ++i) {
-    bos_count_at_start++;
-  }
-
-  // Should have at most one BOS token at the beginning
-  EXPECT_LE(bos_count_at_start, 1)
-      << "BOS token should not be duplicated when already present";
-}
-
-// Test that EOS token is not duplicated when it already exists
-TEST_F(FastTokenizerTest, SkipEosTokenWhenAlreadyPresent) {
-  TokenizerArgs args;
-  args.tokenizer_type() = "fast";
-  args.vocab_file() = tokenizer_json_path_.string();
-  args.add_bos_token() = false;
+  args.bos_token() = "";
   args.add_eos_token() = true;
   args.eos_token() = "<|eos|>";
 
-  FastTokenizer tokenizer(args);
-
-  // First encode a text that doesn't end with EOS
-  std::vector<int32_t> ids1;
-  bool success1 = tokenizer.encode("hello world", &ids1);
-  ASSERT_TRUE(success1);
-  ASSERT_FALSE(ids1.empty());
-
-  // Verify EOS token was added
-  EXPECT_EQ(ids1.back(), 1) << "EOS token should be added";
-  size_t size_with_eos = ids1.size();
-
-  // Now encode text that ends with EOS token directly
-  std::vector<int32_t> ids2;
-  bool success2 = tokenizer.encode("hello world <|eos|>", &ids2);
-  ASSERT_TRUE(success2);
-  ASSERT_FALSE(ids2.empty());
-
-  // The EOS token should be present, but we should not have added it twice
-  // Count how many times EOS token (ID 1) appears at the end
-  int eos_count_at_end = 0;
-  for (int i = ids2.size() - 1; i >= 0 && ids2[i] == 1; --i) {
-    eos_count_at_end++;
-  }
-
-  // Should have at most one EOS token at the end
-  EXPECT_LE(eos_count_at_end, 1)
-      << "EOS token should not be duplicated when already present";
-}
-
-// Test that both BOS and EOS tokens are not duplicated when both already exist
-TEST_F(FastTokenizerTest, SkipBothBosAndEosTokensWhenAlreadyPresent) {
-  TokenizerArgs args;
-  args.tokenizer_type() = "fast";
-  args.vocab_file() = tokenizer_json_path_.string();
-  args.add_bos_token() = true;
-  args.bos_token() = "<|bos|>";
-  args.add_eos_token() = true;
-  args.eos_token() = "<|eos|>";
-
-  FastTokenizer tokenizer(args);
-
-  // Encode text that already contains both BOS and EOS tokens
+  FastTokenizer missing_bos(args);
   std::vector<int32_t> ids;
-  bool success = tokenizer.encode("<|bos|> hello world <|eos|>", &ids);
-  ASSERT_TRUE(success);
-  ASSERT_FALSE(ids.empty());
+  ASSERT_TRUE(missing_bos.encode("hello world", &ids));
+  EXPECT_EQ(ids, (std::vector<int32_t>{2, 3, 1}));
 
-  // Count BOS tokens at the beginning
-  int bos_count_at_start = 0;
-  for (size_t i = 0; i < ids.size() && ids[i] == 0; ++i) {
-    bos_count_at_start++;
-  }
-
-  // Count EOS tokens at the end
-  int eos_count_at_end = 0;
-  for (int i = ids.size() - 1; i >= 0 && ids[i] == 1; --i) {
-    eos_count_at_end++;
-  }
-
-  // Should have at most one BOS token at the beginning
-  EXPECT_LE(bos_count_at_start, 1)
-      << "BOS token should not be duplicated when already present";
-
-  // Should have at most one EOS token at the end
-  EXPECT_LE(eos_count_at_end, 1)
-      << "EOS token should not be duplicated when already present";
+  args.bos_token() = "<|bos|>";
+  args.eos_token() = "";
+  FastTokenizer missing_eos(args);
+  ASSERT_TRUE(missing_eos.encode("hello world", &ids));
+  EXPECT_EQ(ids, (std::vector<int32_t>{0, 2, 3}));
 }
 
 TEST_F(FastTokenizerTest, IgnoreTokenizerJsonPaddingAndTruncation) {
@@ -574,9 +395,11 @@ TEST_F(FastTokenizerTest, IgnoreTokenizerJsonPaddingAndTruncation) {
 
   std::vector<int32_t> ids;
   ASSERT_TRUE(tokenizer.encode("hello", &ids));
-  EXPECT_EQ(ids.size(), 1)
+  EXPECT_EQ(ids, (std::vector<int32_t>{2}));
+
+  ASSERT_TRUE(tokenizer.encode("hello world test hello world", &ids));
+  EXPECT_EQ(ids, (std::vector<int32_t>{2, 3, 4, 2, 3}))
       << "FastTokenizer should ignore tokenizer.json padding/truncation.";
-  EXPECT_EQ(ids[0], 2);
 }
 
 }  // namespace xllm

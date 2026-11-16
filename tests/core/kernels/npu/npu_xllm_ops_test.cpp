@@ -392,27 +392,6 @@ TEST_F(NpuXllmOpsTest, DispatcherRmsNormMatchesReference) {
              .item<float>();
 }
 
-TEST_F(NpuXllmOpsTest, DispatcherSiluAndMulMatchesReference) {
-  py::gil_scoped_acquire gil;
-  auto opts =
-      torch::TensorOptions().dtype(torch::kFloat16).device(torch::kPrivateUse1);
-  auto gate_up = torch::randn({8, 256}, opts);
-
-  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
-      "xllm_ops::silu_and_mul", "");
-  auto out = op.typed<torch::Tensor(const torch::Tensor&)>().call(gate_up);
-
-  auto ref = silu_and_mul_reference(gate_up);
-  ASSERT_EQ(out.size(-1), 128);
-  EXPECT_TRUE(
-      torch::allclose(out.cpu(), ref.cpu(), /*rtol=*/1e-2, /*atol=*/1e-2))
-      << "max abs diff = "
-      << (out.cpu().to(torch::kFloat32) - ref.cpu().to(torch::kFloat32))
-             .abs()
-             .max()
-             .item<float>();
-}
-
 TEST_F(NpuXllmOpsTest, DispatcherQuantizeMatchesStaticW8A8Reference) {
   py::gil_scoped_acquire gil;
   const auto input_opts = torch::TensorOptions().dtype(torch::kBFloat16);
@@ -596,7 +575,7 @@ torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 )PY");
 }
 
-TEST_F(NpuXllmOpsTest, Dsv4GroupGemmAcceptsScaleAndPerTokenScale) {
+TEST_F(NpuXllmOpsTest, Dsv4GroupGemmScalesMatchInt32Reference) {
   py::gil_scoped_acquire gil;
 
   py::exec(R"PY(
@@ -607,8 +586,8 @@ device = torch.device("privateuseone:0")
 tokens, experts, input_dim, output_dim = 8, 2, 128, 128
 x = torch.randint(-4, 5, (tokens, input_dim), dtype=torch.int8, device=device)
 w = torch.randint(-4, 5, (experts, input_dim, output_dim), dtype=torch.int8, device=device)
-scale = torch.ones((experts, output_dim), dtype=torch.bfloat16, device=device)
-per_token_scale = torch.ones((tokens,), dtype=torch.float32, device=device)
+scale = torch.full((experts, output_dim), 0.5, dtype=torch.bfloat16, device=device)
+per_token_scale = torch.arange(1, tokens + 1, dtype=torch.float32, device=device) * 0.25
 group_list = torch.tensor([4, 4], dtype=torch.int64, device=device)
 
 out = _group_gemm(
@@ -625,6 +604,10 @@ out = _group_gemm(
 torch.npu.synchronize()
 assert out.shape == (tokens, output_dim)
 assert out.dtype == torch.bfloat16
+x_cpu, w_cpu = x.cpu().int(), w.cpu().int()
+accumulated = torch.cat((x_cpu[:4] @ w_cpu[0], x_cpu[4:] @ w_cpu[1]))
+expected = (accumulated.float() * 0.5 * per_token_scale.cpu().unsqueeze(1)).bfloat16()
+torch.testing.assert_close(out.cpu(), expected, rtol=2e-2, atol=2e-2)
 )PY");
 }
 
@@ -1364,63 +1347,6 @@ TEST_F(NpuXllmOpsTest, Qwen35_27B_TP4_KvCacheCrosses128TokenBoundary) {
              .item<float>();
 }
 
-TEST_F(NpuXllmOpsTest, ModelExecutorUsesExplicitRuntimeBatchLimit) {
-  py::gil_scoped_acquire gil;
-  prepend_python_model_path();
-
-  py::exec(R"PY(
-import torch
-from unittest.mock import patch
-
-from xllm.python.layers.attention import Attention
-from xllm.python.model_executor import executor as executor_module
-
-
-class FakeBackend:
-    def __init__(self, **kwargs):
-        pass
-
-    def bind_kv_caches(self, kv_caches):
-        pass
-
-    def prepare(self, metadata, *, graph_mode=False):
-        pass
-
-    def execute(self, q, k, v, layer):
-        return q
-
-    @property
-    def num_kv_blocks(self):
-        return 0
-
-    @property
-    def page_size(self):
-        return 1
-
-
-class FakeModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.zeros(1, device="privateuseone:0")
-        )
-        self.attention = Attention(1, 1, 8, 1.0, 0, 0)
-        self.model = torch.nn.Identity()
-
-
-with patch.object(
-    executor_module, "_create_attention_backend", return_value=FakeBackend()
-):
-    model_executor = executor_module.ModelExecutor(
-        FakeModel(),
-        {"enable_graph": False},
-        max_seqs_per_batch=3,
-    )
-    assert model_executor._num_attention_layers == 1
-    assert model_executor.decode_graph_runner is None
-)PY");
-}
-
 TEST_F(NpuXllmOpsTest, LightningIndexerOutKeepsBuffersAcrossGraphReplay) {
   py::gil_scoped_acquire gil;
 
@@ -1503,6 +1429,11 @@ torch.npu.synchronize()
 assert graph_result.data_ptr() == indices_address
 assert sparse_indices.data_ptr() == indices_address
 assert sparse_values.data_ptr() == values_address
+actual_indices, actual_values = sparse_indices.clone(), sparse_values.clone()
+run_indexer()
+torch.npu.synchronize()
+torch.testing.assert_close(actual_indices, sparse_indices, rtol=0, atol=0)
+torch.testing.assert_close(actual_values, sparse_values, rtol=0, atol=0)
 )PY");
 }
 

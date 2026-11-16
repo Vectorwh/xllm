@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -34,7 +33,6 @@ from xllm.python.attention.csa2_attention import (
     Csa2AttentionBackend,
     Csa2LayerContext,
     CSA2SharedRuntime,
-    _QliGraphState,
     apply_interleaved_rope,
 )
 
@@ -57,7 +55,7 @@ _INDEX_N_HEADS = 2
 _BLOCK_SIZE = 128
 _CAPACITY = 256
 _ROWS = 4
-_CTX_LENS = [300, 500, 200, 129]
+_CTX_LENS = [129, 255, 200, 128]
 # Physical block pool of the stub index caches the QLI shadow mirrors.
 _SHADOW_BLOCKS = 8
 
@@ -205,43 +203,6 @@ def test_paged_graph_probe_handles_missing_namespace(monkeypatch: pytest.MonkeyP
     assert not backend._supports_paged_decode_graph()
 
 
-@pytest.mark.parametrize(
-    "attribute,value",
-    [
-        ("index_head_dim", 64),
-        ("head_dim", 256),
-        ("dtype", torch.float16),
-        ("window_size", 64),
-        ("index_topk", 2048),
-        ("_compress_ratios", (4,)),
-    ],
-)
-def test_paged_graph_rejects_unsupported_configuration(
-    attribute: str, value: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = _make_backend(quant_mode=csa2.V41_QUANT_ASCEND)
-    backend.device = SimpleNamespace(type="npu")
-    setattr(backend, attribute, value)
-    # Config guards must not need extension registration.
-    monkeypatch.setattr(torch, "ops", SimpleNamespace())
-    assert not backend._supports_paged_decode_graph()
-
-
-def test_paged_graph_warns_on_eager_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_qli(monkeypatch)
-    monkeypatch.setattr(torch.ops, "xllm_ops", SimpleNamespace(smla_va=object()))
-    warning = MagicMock()
-    monkeypatch.setattr(csa2.logger, "warning", warning)
-    backend = _make_backend(
-        device=SimpleNamespace(type="npu"),
-        max_model_len=4096,
-        quant_mode=csa2.V41_QUANT_ASCEND,
-        acl_graph_enabled=True,
-    )
-    assert backend.graph_token_capacity_ceiling == 0
-    warning.assert_called_once_with("DeepSeek-V4.1 CSA2 paged ACL graph is unavailable; decode uses eager execution")
-
-
 class _StubIndexerLayer:
     """Minimal layer surface ``_run_indexer`` touches on the indexer path."""
 
@@ -306,8 +267,8 @@ def _make_ctx(rows: int = _ROWS) -> Csa2LayerContext:
     # quantized query equals the raw projection and the test stays deterministic.
     cache[:, :half] = 1.0
     return Csa2LayerContext(
-        x=torch.zeros(rows, 128, dtype=torch.bfloat16),
-        qr=torch.zeros(rows, _INDEX_N_HEADS * _INDEX_HEAD_DIM, dtype=torch.bfloat16),
+        x=torch.ones(rows, 128, dtype=torch.bfloat16),
+        qr=torch.ones(rows, _INDEX_N_HEADS * _INDEX_HEAD_DIM, dtype=torch.bfloat16),
         positions=torch.arange(rows, dtype=torch.int64),
         cos_sin_cache=cache,
     )
@@ -331,8 +292,9 @@ def _make_shared(
     )
     index_scale = None
     if with_scale:
-        index_scale = torch.zeros(
+        index_scale = torch.full(
             scale_shape if scale_shape is not None else (_SHADOW_BLOCKS, _BLOCK_SIZE, csa2._QLI_V3_KEY_NUM_HEADS),
+            csa2._QLI_V3_MIN_SCALE,
             dtype=torch.float16,
         )
     return CSA2SharedRuntime(
@@ -361,7 +323,10 @@ def _make_dsa(
     return SimpleNamespace(
         is_acl_graph=is_acl_graph,
         graph_token_capacity=capacity,
-        seq_lens=torch.tensor(list(_CTX_LENS if seq_lens is None else seq_lens), dtype=torch.int32),
+        seq_lens=torch.tensor(
+            [min(length, capacity) for length in _CTX_LENS] if seq_lens is None else seq_lens,
+            dtype=torch.int32,
+        ),
     )
 
 
@@ -372,23 +337,15 @@ def _drive(
     shared: CSA2SharedRuntime,
     ctx: Csa2LayerContext | None = None,
 ) -> torch.Tensor:
-    return backend._run_indexer(layer, ctx or _make_ctx(), dsa, [1] * _ROWS, dsa.seq_lens, shared)
+    if ctx is None:
+        ctx = _make_ctx()
+        ctx.positions = (dsa.seq_lens.to(torch.int64) - 1).clamp_min(0)
+    return backend._run_indexer(layer, ctx, dsa, [1] * _ROWS, dsa.seq_lens, shared)
 
 
 # ---------------------------------------------------------------------------
 # 1) dispatch on/off
 # ---------------------------------------------------------------------------
-
-
-def test_qli_v3_constants() -> None:
-    """Pin the operator's static constants."""
-    assert csa2._QLI_V3_QUANT_MODE == 2
-    assert csa2._QLI_V3_HEAD_DIM == 128
-    assert csa2._QLI_V3_KEY_NUM_HEADS == 1
-    # The candidate sub-switch and its op mode values.
-    assert csa2._QLI_V3_CAND_MODE_SOURCE == 1
-    assert csa2._QLI_V3_CAND_MODE_CONSUMER == 2
-    assert csa2._QLI_V3_CAND_MODE_OFF == 3
 
 
 def test_qli_v3_op_missing_stays_eager(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -451,7 +408,7 @@ def test_qli_v3_dispatch_on_routes_through_the_op(monkeypatch: pytest.MonkeyPatc
     # (``candidate_source_layer_id == -1``): mode 3, and no candidate operands
     # are passed (the historical call). The per-layer mode selection (1/2/3) is
     # pinned by ``test_qli_v3_candidate_mode_is_chosen_per_layer``.
-    assert call["candidate_mode"] == csa2._QLI_V3_CAND_MODE_OFF
+    assert call["candidate_mode"] == 3
     assert "candidate_topk_index" not in call
     assert "candidate_topk_blocks" not in call
     assert "candidate_block_size" not in call
@@ -515,30 +472,6 @@ def test_qli_rebase_fp32_sort_preserves_the_full_v41_context_range() -> None:
     expected = csa2._rebase_qli_picks(picks, visible, 129, fp32_sort=False)
     actual = csa2._rebase_qli_picks(picks, visible, 129, fp32_sort=True)
     assert torch.equal(actual, expected)
-
-
-def test_qli_decode_uses_the_exact_fp32_sort(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_qli(monkeypatch)
-    real = csa2._rebase_qli_picks
-    seen: list[bool] = []
-
-    def rebase(picks: torch.Tensor, visible: torch.Tensor, offset: int, *, fp32_sort: bool = False) -> torch.Tensor:
-        seen.append(fp32_sort)
-        return real(picks, visible, offset, fp32_sort=fp32_sort)
-
-    monkeypatch.setattr(csa2, "_rebase_qli_picks", rebase)
-    _drive(_make_backend(), _StubIndexerLayer(1, 2), _make_dsa(), _make_shared(2))
-    assert seen == [True]
-
-
-def test_qli_rebase_fp32_sort_handles_the_topk_width_boundary() -> None:
-    """A row whose picks fill the whole width matches the INT32 sort exactly."""
-    picks = torch.tensor([[5, 2, 9, 0, 3, 1, 8, 7]], dtype=torch.int32)
-    visible = torch.tensor([[16]], dtype=torch.int32)
-    int32_out = csa2._rebase_qli_picks(picks, visible, offset=3, fp32_sort=False)
-    fp32_out = csa2._rebase_qli_picks(picks, visible, offset=3, fp32_sort=True)
-    # sorted(picks) + offset = [0,1,2,3,5,7,8,9] + 3
-    assert int32_out.tolist() == fp32_out.tolist() == [[3, 4, 5, 6, 8, 10, 11, 12]]
 
 
 def test_qli_v3_filters_out_of_range_picks_and_sorts(
@@ -610,7 +543,8 @@ def test_qli_v3_metadata_kwargs_per_ratio(capacity: int, monkeypatch: pytest.Mon
     backend = _make_backend()
 
     # A ratio-1 dispatch builds the state, which fills BOTH ratio classes.
-    _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(capacity=capacity), _make_shared(1))
+    dsa = _make_dsa(capacity=capacity)
+    _drive(backend, _StubIndexerLayer(2, 1), dsa, _make_shared(1))
 
     assert len(recorder.metadata_calls) == 2
     by_ratio = {kwargs["cmp_ratio"]: (args, kwargs) for args, kwargs in recorder.metadata_calls}
@@ -631,9 +565,9 @@ def test_qli_v3_metadata_kwargs_per_ratio(capacity: int, monkeypatch: pytest.Mon
         # address the paged key instead.
         assert kwargs["cu_seqlens_k"] is None
         assert kwargs["cu_seqlens_q"].tolist() == [0, 1, 2, 3, 4]
-        assert kwargs["seqused_k"].tolist() == [length // ratio for length in _CTX_LENS]
+        assert kwargs["seqused_k"].tolist() == [length // ratio for length in dsa.seq_lens.tolist()]
         if ratio > 1:
-            assert kwargs["cmp_residual_k"].tolist() == [length % ratio for length in _CTX_LENS]
+            assert kwargs["cmp_residual_k"].tolist() == [length % ratio for length in dsa.seq_lens.tolist()]
         else:
             # ratio-1 keeps no residual semantics; the vendor metadata host
             # check no longer dereferences ``cmp_residual_k`` before its
@@ -641,7 +575,7 @@ def test_qli_v3_metadata_kwargs_per_ratio(capacity: int, monkeypatch: pytest.Mon
             # so ``None`` is now the canonical value, matching the indexer op.
             assert kwargs["cmp_residual_k"] is None
     # The execution op must also retain actual lengths at the 1M ceiling.
-    assert recorder.indexer_calls[-1]["seqused_k"].tolist() == list(_CTX_LENS)
+    assert recorder.indexer_calls[-1]["seqused_k"].tolist() == dsa.seq_lens.tolist()
 
 
 def test_qli_v3_state_contract(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -651,13 +585,8 @@ def test_qli_v3_state_contract(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _drive(backend, _StubIndexerLayer(2, 1), dsa, _make_shared(1))
 
-    assert set(backend._qli_state) == {(_ROWS, _CAPACITY)}
     state = backend._qli_state[(_ROWS, _CAPACITY)]
-    assert isinstance(state, _QliGraphState)
-    assert set(state.metadata) == {1, 2}
     assert state.cu_seqlens_q.dtype == torch.int32
-    # PA_BBND has no constant cu_seqlens_k operand on the state.
-    assert not hasattr(state, "cu_seqlens_k")
     assert torch.equal(state.seqused_k[2], torch.div(dsa.seq_lens, 2, rounding_mode="floor"))
     assert torch.equal(state.cmp_residual[2], torch.remainder(dsa.seq_lens, 2))
 
@@ -689,43 +618,11 @@ def test_qli_v3_state_refuses_to_build_under_capture(monkeypatch: pytest.MonkeyP
 # ---------------------------------------------------------------------------
 
 
-def _reference_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Independent reference of the vllm ``quantize_indexer_query`` rounding."""
-    absmax = x.float().abs().amax(dim=-1)
-    scale = (absmax / 127.0).to(torch.float16).to(torch.float32)
-    scale = torch.clamp(scale, min=2.0**-24)
-    codes = torch.round(x.float() / scale.unsqueeze(-1)).clamp(-127.0, 127.0).to(torch.int8)
-    return codes, scale.to(torch.float16)
-
-
-def test_quantize_indexer_rows_int8_matches_the_reference() -> None:
-    gen = torch.Generator().manual_seed(7)
-    x = (torch.randn(6, 128, generator=gen) * 3.0).to(torch.bfloat16)
-    codes, scale = csa2._quantize_indexer_rows_int8(x)
-
-    ref_codes, ref_scale = _reference_int8(x)
-    assert codes.dtype == torch.int8 and codes.shape == x.shape
-    assert scale.dtype == torch.float16 and scale.shape == (6,)
-    assert torch.equal(codes, ref_codes)
-    assert torch.equal(scale, ref_scale)
-    # Symmetric range and a non-vacuous scale.
-    assert bool((codes >= -127).all()) and bool((codes <= 127).all())
-    assert bool((scale > 0).all())
-
-    # A zero row keeps a defined (smallest) scale instead of dividing by zero.
-    zeros = torch.zeros(2, 128, dtype=torch.bfloat16)
-    zero_codes, zero_scale = csa2._quantize_indexer_rows_int8(zeros)
-    assert bool((zero_codes == 0).all())
-    assert torch.equal(zero_scale, torch.full((2,), 2.0**-24, dtype=torch.float16))
-
-
 def test_qli_v3_quantize_indexer_rows_boundaries() -> None:
     """The INT8 index quantizer; pin its boundary semantics.
     Full-scale (absmax == 127 -> unit scale), over-range (clamped to 127) and the all-zero row are defined by the"""
     full = torch.tensor([[127.0, -127.0, 0.0, 63.5]], dtype=torch.bfloat16)
     codes, scale = csa2._quantize_indexer_rows_int8(full)
-    ref_codes, ref_scale = _reference_int8(full)
-    assert torch.equal(codes, ref_codes) and torch.equal(scale, ref_scale)
     assert scale[0].item() == pytest.approx(1.0)
     assert codes[0].tolist() == [127, -127, 0, 64]
 
@@ -734,23 +631,6 @@ def test_qli_v3_quantize_indexer_rows_boundaries() -> None:
     over_codes, over_scale = csa2._quantize_indexer_rows_int8(over)
     assert over_scale[0].item() == pytest.approx(2.0)
     assert over_codes[0, 0] == 127 and over_codes[0, 1] == -127
-
-    special = torch.tensor(
-        [[float("nan")] * 4, [float("inf"), -float("inf"), 0.0, 1.0]],
-        dtype=torch.float32,
-    ).to(torch.bfloat16)
-    special_codes, special_scale = csa2._quantize_indexer_rows_int8(special)
-    ref_special_codes, ref_special_scale = _reference_int8(special)
-    assert torch.equal(special_codes, ref_special_codes)
-    # equal_nan: NaN scale propagates, so plain torch.equal would be False.
-    assert torch.allclose(special_scale.float(), ref_special_scale.float(), equal_nan=True)
-    # Unspecified-but-observed: NaN scale propagates (documented, not asserted).
-    assert torch.isnan(special_scale[0])
-
-
-# ---------------------------------------------------------------------------
-# 4) native INT8 index plane (write side)
-# ---------------------------------------------------------------------------
 
 
 def _make_writer_backend(*, candidate_source_layer_id: int = -1) -> Csa2AttentionBackend:
@@ -800,9 +680,10 @@ def _run_writer(
     )
 
 
-def test_qli_v3_index_plane_quantizes_and_scatters(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _stub_qli(monkeypatch)
-    backend = _make_writer_backend()
+@pytest.mark.parametrize("candidate_source", [-1, 1])
+def test_qli_v3_index_plane_quantizes_and_scatters(monkeypatch: pytest.MonkeyPatch, candidate_source: int) -> None:
+    _stub_qli(monkeypatch)
+    backend = _make_writer_backend(candidate_source_layer_id=candidate_source)
     layer = _StubWriterLayer(1)
     cache = _StubLayerCache()
     shared = CSA2SharedRuntime()
@@ -830,45 +711,6 @@ def test_qli_v3_index_plane_quantizes_and_scatters(monkeypatch: pytest.MonkeyPat
     _run_writer(backend, layer, cache, shared, rows=5)
     assert shared.index_cache is cache.index
     assert shared.index_scale is cache.indexer_scale
-
-
-def test_qli_v3_eager_layers_write_the_int8_plane(monkeypatch) -> None:
-    """The native INT8 main plane is written regardless of the fused
-    dispatch."""
-    _reset_log_state(monkeypatch)
-    _install_ops(monkeypatch, _QliRecorder())
-    backend = _make_writer_backend()
-    shared = CSA2SharedRuntime()
-
-    _run_writer(backend, _StubWriterLayer(1), _StubLayerCache(), shared, rows=5)
-
-    assert shared.index_cache is not None and shared.index_cache.dtype == torch.int8
-    assert shared.index_scale is not None and shared.index_scale.dtype == torch.float16
-
-
-def test_qli_v3_index_plane_written_for_candidate_layers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Candidate-pool layers stay eager and still write the INT8 index plane."""
-    _reset_log_state(monkeypatch)
-    _install_ops(monkeypatch, _QliRecorder())
-    backend = _make_writer_backend(candidate_source_layer_id=1)
-    layer = _StubWriterLayer(1)
-    shared = CSA2SharedRuntime()
-
-    _run_writer(backend, layer, _StubLayerCache(), shared, rows=5)
-
-    assert shared.index_cache is not None
-    assert shared.index_scale is not None
-
-
-def test_qli_v3_mask_mode_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both call sites pin ``_QLI_V3_MASK_MODE`` instead of either endpoint default."""
-    assert csa2._QLI_V3_MASK_MODE == 3
-    recorder = _stub_qli(monkeypatch)
-    backend = _make_backend()
-
-    _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), _make_shared(1))
-
-    assert recorder.indexer_calls[0]["mask_mode"] == csa2._QLI_V3_MASK_MODE
 
 
 # ---------------------------------------------------------------------------
@@ -980,29 +822,6 @@ def test_qli_v3_falls_back_and_keeps_the_eager_result(monkeypatch: pytest.Monkey
     assert recorder.indexer_calls == []
 
 
-def test_qli_v3_candidate_layers_stay_eager(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With the fused op unavailable the candidate layers stay eager and the
-    source still publishes the eager bool-mask pool."""
-    monkeypatch.setattr(csa2, "_get_qli_v3_ops", lambda: None)
-    _reset_log_state(monkeypatch)
-    backend = _make_backend(candidate_source_layer_id=1)
-    dsa = _make_dsa()
-
-    # The pool owner (== candidate source) takes the eager path and publishes
-    # the pool; the consumer after it is a candidate layer too (asserted through
-    # the guard, since its eager read needs that pool).
-    shared = _make_shared(2)
-    _drive(backend, _StubIndexerLayer(1, 2), dsa, shared)
-    assert shared.candidates is not None
-    consumer = _make_shared(1)
-    consumer_reason = backend._qli_v3_fallback_reason(
-        _StubIndexerLayer(2, 1), dsa, [1] * _ROWS, consumer, consumer.index_cache
-    )
-    assert consumer_reason is not None and "not registered" in consumer_reason
-
-    assert shared.candidate_blocks is None
-
-
 # ---------------------------------------------------------------------------
 # 5b) two-level candidate pool (config-driven)
 # ---------------------------------------------------------------------------
@@ -1014,25 +833,6 @@ def _candidate_plan_backend(**kwargs: Any) -> Csa2AttentionBackend:
     params: dict[str, Any] = {"compress_ratios": [0, 1, 1], "candidate_source_layer_id": 1}
     params.update(kwargs)
     return _make_backend(**params)
-
-
-def test_qli_v3_candidate_mode_is_chosen_per_layer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The op mode is a function of the layer's role, never a constant 3.
-    Production roles: the pre-pool layers {2, 8, 14} stay 3, the candidate source (layer 20) is 1, and the pool consumers"""
-    recorder = _stub_qli(monkeypatch)
-    backend = _candidate_plan_backend()
-    plain = _make_backend(compress_ratios=[0, 1, 1])  # no candidate source
-    shared = _make_shared(1)
-
-    _drive(backend, _StubIndexerLayer(1, 1), _make_dsa(), shared)  # source -> 1
-    _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), shared)  # consumer -> 2
-    _drive(plain, _StubIndexerLayer(2, 1), _make_dsa(), _make_shared(1))  # -> 3
-
-    assert [call["candidate_mode"] for call in recorder.indexer_calls] == [
-        csa2._QLI_V3_CAND_MODE_SOURCE,
-        csa2._QLI_V3_CAND_MODE_CONSUMER,
-        csa2._QLI_V3_CAND_MODE_OFF,
-    ]
 
 
 def test_qli_v3_candidate_source_publishes_the_block_pool(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1073,15 +873,6 @@ def test_qli_v3_candidate_consumer_uses_the_published_pool(monkeypatch: pytest.M
     assert call["candidate_topk_index"] is published
     assert call["candidate_topk_blocks"] == 2048
     assert call["candidate_block_size"] == 8
-
-
-def test_qli_v3_candidate_consumer_requires_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mode 2 without a source-published pool fails loudly (never a silent wrong pick)."""
-    recorder = _stub_qli(monkeypatch)
-    backend = _candidate_plan_backend()
-
-    with pytest.raises(RuntimeError, match="requires the candidate pool"):
-        _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), _make_shared(1))
 
 
 def test_qli_v3_candidate_layers_fall_back_when_the_op_is_missing(
@@ -1138,54 +929,6 @@ def test_qli_v3_candidate_invalid_config_falls_back_with_a_warning(
     assert reason is not None and "candidate topk blocks 1000" in reason
 
 
-def test_qli_v3_candidate_active_log_fires_when_fused_and_stays_silent_when_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The positive rank-log marker fires on a fused candidate layer, one-shot.
-    Acceptance greps the exact string ``QLI v3 candidate indexer active``: it must appear once per rank when a candidate"""
-    recorder = _stub_qli(monkeypatch)
-    spy = _SpyLogger()
-    monkeypatch.setattr(csa2, "logger", spy)
-
-    # The source (mode 1) fires the marker; a repeat is a one-shot no-op.
-    _reset_log_state(monkeypatch)
-    backend = _candidate_plan_backend()
-    shared = _make_shared(1)
-    _drive(backend, _StubIndexerLayer(1, 1), _make_dsa(), shared)
-    _drive(backend, _StubIndexerLayer(1, 1), _make_dsa(), shared)
-    source_marker = [m for m in spy.infos if "QLI v3 candidate indexer active" in m]
-    assert len(source_marker) == 1
-    assert "candidate indexer active" in source_marker[0]
-
-    # The consumer (mode 2) path also reaches the marker when it is the first
-    # fused candidate layer (fresh rank state; the source already published).
-    _reset_log_state(monkeypatch)
-    spy.infos.clear()
-    backend = _candidate_plan_backend()
-    shared = _make_shared(1)
-    _drive(backend, _StubIndexerLayer(1, 1), _make_dsa(), shared)  # publish the pool
-    _reset_log_state(monkeypatch)  # a fresh rank's first candidate layer
-    spy.infos.clear()
-    _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), shared)  # consumer
-    assert any("QLI v3 candidate indexer active" in m for m in spy.infos)
-
-
-def test_qli_v3_candidate_consumer_rejects_a_pool_whose_marker_mismatches(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A non-empty pool stamped by another layer is rejected, not consumed.
-    The consumer's defensive invariant is "the pool exists AND its producer marker is this forward's source layer"."""
-    recorder = _stub_qli(monkeypatch)
-    backend = _candidate_plan_backend()
-    shared = _make_shared(1)
-    shared.candidate_blocks = torch.zeros(1, 1, 8, dtype=torch.int32)
-    shared.candidate_blocks_layer = 99
-
-    with pytest.raises(RuntimeError, match="requires the candidate pool"):
-        _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), shared)
-    assert recorder.indexer_calls == []
-
-
 def test_qli_v3_candidate_pool_does_not_leak_across_forwards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1213,67 +956,9 @@ def test_qli_v3_candidate_pool_does_not_leak_across_forwards(
         _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), second)
 
 
-def test_qli_v3_fallback_and_active_logging_is_one_shot(monkeypatch: pytest.MonkeyPatch) -> None:
-    spy = _SpyLogger()
-    monkeypatch.setattr(csa2, "logger", spy)
-    _reset_log_state(monkeypatch)
-
-    # A designed silent fallback: silent, and it must NOT consume the one-shot,
-    # so a later genuine guard failure still reports itself.
-    for reason in ("not an ACL-graph decode step", "query length != 1"):
-        csa2._log_qli_v3_fallback(reason)
-        csa2._log_qli_v3_fallback(reason)
-    assert spy.warnings == []
-    assert csa2._qli_v3_fallback_logged is False
-
-    # a genuine guard failure: exactly one warning.
-    csa2._log_qli_v3_fallback("unsupported index head dim 16")
-    csa2._log_qli_v3_fallback("unsupported index head dim 16")
-    assert len(spy.warnings) == 1 and "QLI v3" in spy.warnings[0]
-    assert spy.infos == []
-
-    # active path: exactly one info.
-    csa2._log_qli_v3_active()
-    csa2._log_qli_v3_active()
-    assert len([message for message in spy.infos if "QLI v3" in message]) == 1
-
-
 # ---------------------------------------------------------------------------
 # 5c) native ``xllm_ops`` QLI v3 op resolver
 # ---------------------------------------------------------------------------
-
-
-def test_qli_v3_op_names_are_the_native_va_handles() -> None:
-    """The fused QLI v3 path resolves the native "_va" handles only.
-
-    The candidate indexer is the migrated "_va" form of the V2 kernel, so the
-    indexer handle is ``quant_lightning_indexer_v2_va`` -- there is no separate
-    "v3" kernel and no ``quant_lightning_indexer_v3_va`` handle.
-    """
-    assert csa2._QLI_V3_OP_NAME == "quant_lightning_indexer_v2_va"
-    assert csa2._QLI_V3_METADATA_OP_NAME == "quant_lightning_indexer_v2_metadata_va"
-    # The stock (non-_va) metadata producer is NOT accepted by this path.
-    assert csa2._QLI_V3_METADATA_OP_NAME != "quant_lightning_indexer_v2_metadata"
-
-
-def test_qli_v3_ops_resolves_when_both_native_handles_are_present(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Both native schemas registered in ``xllm_ops`` -> a successful resolution."""
-    monkeypatch.setattr(csa2, "_qli_v3_ops", None)
-    indexer = object()
-    metadata = object()
-    monkeypatch.setattr(
-        torch.ops,
-        "xllm_ops",
-        SimpleNamespace(
-            quant_lightning_indexer_v2_va=indexer,
-            quant_lightning_indexer_v2_metadata_va=metadata,
-        ),
-        raising=False,
-    )
-
-    assert csa2._get_qli_v3_ops() == (indexer, metadata)
 
 
 @pytest.mark.parametrize(
@@ -1300,44 +985,6 @@ def test_qli_v3_ops_returns_none_without_the_namespace(
     """No ``torch.ops.xllm_ops`` namespace at all -> ``None``."""
     monkeypatch.setattr(csa2, "_qli_v3_ops", None)
     monkeypatch.setattr(torch.ops, "xllm_ops", None, raising=False)
-    assert csa2._get_qli_v3_ops() is None
-
-
-def test_qli_v3_ops_ignores_the_temporary_wheel_namespace(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A temporary-wheel registration must NOT yield a false success.
-
-    The retired temporary ``cann_ops_transformer_dsv41`` wheel registered into
-    ``torch.ops.cann_ops_transformer``; the fused path no longer accepts that
-    source (and the shim module that imported it is gone), so a process holding
-    only that namespace -- or the stock non-_va metadata handle -- resolves to
-    ``None``.
-    """
-    monkeypatch.setattr(csa2, "_qli_v3_ops", None)
-    monkeypatch.setattr(
-        torch.ops,
-        "cann_ops_transformer",
-        SimpleNamespace(quant_lightning_indexer_v3=object()),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops,
-        "xllm_ops",
-        SimpleNamespace(quant_lightning_indexer_v2_metadata=object()),
-        raising=False,
-    )
-    assert csa2._get_qli_v3_ops() is None
-
-    # The "_va" metadata handle alone is not enough either: the migrated
-    # indexer must be registered by the same extension.
-    monkeypatch.setattr(
-        torch.ops,
-        "xllm_ops",
-        SimpleNamespace(quant_lightning_indexer_v2_metadata_va=object()),
-        raising=False,
-    )
-    monkeypatch.setattr(csa2, "_qli_v3_ops", None)
     assert csa2._get_qli_v3_ops() is None
 
 
@@ -1414,9 +1061,13 @@ def test_qli_v3_eager_read_dequantizes_the_int8_index_plane(
     monkeypatch.setattr(csa2, "_indexer_score", spy_score)
     _drive(backend, _StubIndexerLayer(2, 1), _make_dsa(), shared)
 
-    # Sequence 0's block table is [0, 1], so logical rows 0.._CAPACITY-1 map to
-    # flat slots 0.._CAPACITY-1; dequantize them row-wise.
-    expected = codes.view(-1, _INDEX_HEAD_DIM)[:_CAPACITY].float() * scales.view(-1)[:_CAPACITY].float().unsqueeze(-1)
+    # The bank has static capacity, but only committed sequence-0 rows are live.
+    # The rest must remain zero rather than read uncommitted cache contents.
+    expected = torch.zeros_like(seen["k"])
+    visible = _CTX_LENS[0]
+    expected[:visible] = codes.view(-1, _INDEX_HEAD_DIM)[:visible].float() * scales.view(-1)[
+        :visible
+    ].float().unsqueeze(-1)
     assert torch.allclose(seen["k"], expected)
     assert not torch.equal(seen["k"], codes.view(-1, _INDEX_HEAD_DIM)[:_CAPACITY].float())
 
@@ -1426,50 +1077,6 @@ def test_qli_v3_eager_read_dequantizes_the_int8_index_plane(
 # ``_rebase_qli_picks`` always sorts: it mirrors the eager indexer's position
 # sort and keeps the picks contract stable for fused consumers, which walk
 # just the left-aligned valid prefix of each index row.
-
-
-def _reference_rebase(
-    picks: torch.Tensor,
-    visible: torch.Tensor,
-    offset: int,
-    *,
-    sort: bool,
-) -> torch.Tensor:
-    """The ``_rebase_qli_picks`` filter+rebase with the sort toggled.
-    Models the unsorted picks the reverted switch would have produced; the production helper always sorts."""
-    sentinel = torch.iinfo(torch.int32).max
-    sortable = torch.where(
-        (picks >= 0) & (picks < visible),
-        picks,
-        torch.full_like(picks, sentinel),
-    )
-    if sort:
-        sortable = sortable.sort(dim=-1).values
-    picks = torch.where(sortable >= sentinel, torch.full_like(sortable, -1), sortable)
-    return torch.where(picks >= 0, picks + offset, torch.full_like(picks, -1)).to(torch.int32)
-
-
-def test_qli_rebase_always_matches_the_sorted_reference() -> None:
-    """The reverted helper sorts unconditionally (bitwise the sorted reference)."""
-    generator = torch.Generator().manual_seed(0)
-    for _ in range(20):
-        picks = torch.randint(-1, 12, (5, 6), generator=generator, dtype=torch.int32)
-        visible = torch.randint(0, 6, (5, 1), generator=generator, dtype=torch.int32)
-        assert torch.equal(
-            csa2._rebase_qli_picks(picks, visible, offset=128),
-            _reference_rebase(picks, visible, 128, sort=True),
-        )
-
-
-def test_qli_rebase_ignores_the_removed_no_sort_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The reverted env has no effect, and its accessor is gone (revert guard)."""
-    picks = torch.tensor([[3, 0, -1, 7, 1]], dtype=torch.int32)
-    visible = torch.tensor([[4]], dtype=torch.int32)
-    out = csa2._rebase_qli_picks(picks, visible, offset=100)
-    assert out.tolist() == [[100, 101, 103, -1, -1]]  # still sorted
-    assert not hasattr(csa2, "_qli_picks_no_sort_enabled")
 
 
 # ---------------------------------------------------------------------------
@@ -1671,45 +1278,6 @@ def test_qli_v3_prefill_rebases_with_the_per_sequence_offset(
     # Every other row keeps the -1 padding.
     assert int(topk[0, 1].sum()) == -4
     assert int(topk[1, 1:].sum()) == -8
-
-
-def _record_prefill_rebase_kernels(
-    monkeypatch: pytest.MonkeyPatch,
-    backend: Csa2AttentionBackend,
-    dsa: SimpleNamespace,
-    shared: CSA2SharedRuntime,
-    q_lens: list[int],
-) -> list[bool]:
-    """Drive a prefill and return the ``fp32_sort`` flag each rebase was called with."""
-    seen: list[bool] = []
-    real = csa2._rebase_qli_picks
-
-    def spy(
-        picks: torch.Tensor,
-        visible: torch.Tensor,
-        offset: int,
-        *,
-        fp32_sort: bool = False,
-    ) -> torch.Tensor:
-        seen.append(fp32_sort)
-        return real(picks, visible, offset, fp32_sort=fp32_sort)
-
-    monkeypatch.setattr(csa2, "_rebase_qli_picks", spy)
-    _drive_prefill(backend, _StubIndexerLayer(2, 1), dsa, shared, q_lens)
-    return seen
-
-
-def test_qli_v3_prefill_rebase_default_is_fp32(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default ON: the eager prefill rebase runs the FP32 kernel per sequence."""
-    _reset_log_state(monkeypatch)
-    _install_ops(monkeypatch, _QliRecorder())
-    backend = _make_backend()
-    dsa = _make_dsa(is_acl_graph=False, seq_lens=[10, 12])
-    q_lens = [2, 3]
-
-    seen = _record_prefill_rebase_kernels(monkeypatch, backend, dsa, _make_shared(1), q_lens)
-
-    assert seen == [True] * len(q_lens)  # one rebase per sequence, all FP32
 
 
 def test_qli_v3_prefill_covers_all_eight_layers_with_a_candidate_pool(

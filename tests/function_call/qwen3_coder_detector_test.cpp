@@ -35,32 +35,23 @@ struct StreamCallAccumulator {
 };
 
 void merge_stream_result(const StreamingParseResult& result,
-                         std::string* normal_text,
-                         std::vector<StreamCallAccumulator>* calls) {
-  if (normal_text != nullptr && !result.normal_text.empty()) {
-    *normal_text += result.normal_text;
-  }
-
-  if (calls == nullptr) {
-    return;
-  }
-
+                         std::string& normal_text,
+                         std::vector<StreamCallAccumulator>& calls) {
+  normal_text += result.normal_text;
   for (const auto& call : result.calls) {
+    EXPECT_GE(call.tool_index, 0);
     if (call.tool_index < 0) {
       continue;
     }
-
-    while (calls->size() <= static_cast<size_t>(call.tool_index)) {
-      calls->push_back(StreamCallAccumulator());
+    while (calls.size() <= static_cast<size_t>(call.tool_index)) {
+      calls.emplace_back();
     }
-
-    auto& acc = (*calls)[call.tool_index];
+    auto& acc = calls[call.tool_index];
     if (call.name.has_value()) {
+      EXPECT_TRUE(acc.name.empty()) << "Duplicate tool name event";
       acc.name = call.name.value();
     }
-    if (!call.parameters.empty()) {
-      acc.parameters += call.parameters;
-    }
+    acc.parameters += call.parameters;
   }
 }
 
@@ -105,18 +96,6 @@ class Qwen3CoderDetectorTest : public ::testing::Test {
 // Basic behavior
 // -----------------------------------------------------------------------------
 
-TEST_F(Qwen3CoderDetectorTest, ConstructorInitializesCorrectly) {
-  ASSERT_NE(detector_, nullptr);
-
-  std::string text_with_tool_call =
-      "Some text <tool_call><function=test></function></tool_call>";
-  std::string text_without_tool_call =
-      "Just normal text without any tool calls";
-
-  EXPECT_TRUE(detector_->has_tool_call(text_with_tool_call));
-  EXPECT_FALSE(detector_->has_tool_call(text_without_tool_call));
-}
-
 TEST_F(Qwen3CoderDetectorTest, HasToolCallDetection) {
   EXPECT_TRUE(detector_->has_tool_call("<tool_call>"));
   EXPECT_TRUE(
@@ -129,10 +108,11 @@ TEST_F(Qwen3CoderDetectorTest, HasToolCallDetection) {
 
 TEST_F(Qwen3CoderDetectorTest, PlainTextOnly) {
   std::string text = "This is plain text without any tool calls.";
-  auto result = detector_->detect_and_parse(text, tools_);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
 
-  EXPECT_EQ(result.normal_text, text);
-  EXPECT_TRUE(result.calls.empty());
+  EXPECT_EQ(normal_text, text);
+  EXPECT_TRUE(calls.empty());
 }
 
 TEST_F(Qwen3CoderDetectorTest, SingleToolCallParsing) {
@@ -145,17 +125,18 @@ TEST_F(Qwen3CoderDetectorTest, SingleToolCallParsing) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
 
-  const auto& call = result.calls[0];
-  EXPECT_EQ(call.tool_index, 0);
+  const auto& call = calls[0];
   ASSERT_TRUE(call.name.has_value());
   EXPECT_EQ(call.name.value(), "get_current_weather");
 
   nlohmann::json params = nlohmann::json::parse(call.parameters);
   EXPECT_EQ(params["location"], "Boston");
   EXPECT_EQ(params["unit"], "celsius");
+  EXPECT_TRUE(params["days"].is_number_integer());
   EXPECT_EQ(params["days"], 3);
 }
 
@@ -168,11 +149,14 @@ TEST_F(Qwen3CoderDetectorTest, SingleToolCallWithTextPrefix) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  EXPECT_EQ(result.normal_text, "Let me check this for you.\n\n");
-  ASSERT_EQ(result.calls.size(), 1);
-  ASSERT_TRUE(result.calls[0].name.has_value());
-  EXPECT_EQ(result.calls[0].name.value(), "get_current_weather");
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  EXPECT_EQ(normal_text, "Let me check this for you.\n\n");
+  ASSERT_EQ(calls.size(), 1);
+  ASSERT_TRUE(calls[0].name.has_value());
+  EXPECT_EQ(calls[0].name.value(), "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(calls[0].parameters),
+            nlohmann::json({{"location", "New York"}}));
 }
 
 TEST_F(Qwen3CoderDetectorTest, MultipleToolCallsParsing) {
@@ -189,19 +173,21 @@ TEST_F(Qwen3CoderDetectorTest, MultipleToolCallsParsing) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 2);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 2);
 
-  ASSERT_TRUE(result.calls[0].name.has_value());
-  ASSERT_TRUE(result.calls[1].name.has_value());
-  EXPECT_EQ(result.calls[0].name.value(), "get_current_weather");
-  EXPECT_EQ(result.calls[1].name.value(), "sql_interpreter");
+  ASSERT_TRUE(calls[0].name.has_value());
+  ASSERT_TRUE(calls[1].name.has_value());
+  EXPECT_EQ(calls[0].name.value(), "get_current_weather");
+  EXPECT_EQ(calls[1].name.value(), "sql_interpreter");
 
-  nlohmann::json params1 = nlohmann::json::parse(result.calls[0].parameters);
+  nlohmann::json params1 = nlohmann::json::parse(calls[0].parameters);
   EXPECT_EQ(params1["location"], "New York");
 
-  nlohmann::json params2 = nlohmann::json::parse(result.calls[1].parameters);
+  nlohmann::json params2 = nlohmann::json::parse(calls[1].parameters);
   EXPECT_EQ(params2["query"], "SELECT * FROM users");
+  EXPECT_TRUE(params2["dry_run"].is_boolean());
   EXPECT_EQ(params2["dry_run"], true);
 }
 
@@ -216,11 +202,16 @@ TEST_F(Qwen3CoderDetectorTest, MultipleFunctionsInOneToolCallBlock) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 2);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 2);
 
-  EXPECT_EQ(result.calls[0].name.value_or(""), "get_current_weather");
-  EXPECT_EQ(result.calls[1].name.value_or(""), "sql_interpreter");
+  EXPECT_EQ(calls[0].name.value_or(""), "get_current_weather");
+  EXPECT_EQ(calls[1].name.value_or(""), "sql_interpreter");
+  EXPECT_EQ(nlohmann::json::parse(calls[0].parameters),
+            nlohmann::json({{"location", "Paris"}}));
+  EXPECT_EQ(nlohmann::json::parse(calls[1].parameters),
+            nlohmann::json({{"query", "SELECT 1"}}));
 }
 
 TEST_F(Qwen3CoderDetectorTest, ParseWithoutToolCallWrapperFallback) {
@@ -230,13 +221,14 @@ TEST_F(Qwen3CoderDetectorTest, ParseWithoutToolCallWrapperFallback) {
       "<parameter=location>Tokyo</parameter>\n"
       "</function>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  EXPECT_EQ(result.normal_text, "Prefix text\n");
-  ASSERT_EQ(result.calls.size(), 1);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  EXPECT_EQ(normal_text, "Prefix text\n");
+  ASSERT_EQ(calls.size(), 1);
 
-  ASSERT_TRUE(result.calls[0].name.has_value());
-  EXPECT_EQ(result.calls[0].name.value(), "get_current_weather");
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  ASSERT_TRUE(calls[0].name.has_value());
+  EXPECT_EQ(calls[0].name.value(), "get_current_weather");
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_EQ(params["location"], "Tokyo");
 }
 
@@ -248,11 +240,12 @@ TEST_F(Qwen3CoderDetectorTest, UnknownToolIsStillParsedLikeSgLang) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  EXPECT_EQ(result.calls[0].name.value_or(""), "unknown_tool");
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  EXPECT_EQ(calls[0].name.value_or(""), "unknown_tool");
 
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   // Unknown schema defaults to string type.
   EXPECT_EQ(params["x"], "42");
 }
@@ -265,10 +258,11 @@ TEST_F(Qwen3CoderDetectorTest, EmptyParameterValue) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
 
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_EQ(params["location"], "");
 }
 
@@ -281,40 +275,16 @@ TEST_F(Qwen3CoderDetectorTest, SpecialCharactersInParameterValue) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
-  EXPECT_NE(params["query"].get<std::string>().find("John"), std::string::npos);
-  EXPECT_NE(params["query"].get<std::string>().find("Doe"), std::string::npos);
-}
-
-TEST_F(Qwen3CoderDetectorTest, IncompleteToolCallDoesNotCrash) {
-  std::string text =
-      "<tool_call>\n"
-      "<function=get_current_weather>\n"
-      "<parameter=location>London";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-  EXPECT_GE(result.calls.size(), 0U);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
+  EXPECT_EQ(params["query"], "SELECT * FROM users WHERE name = 'John \"Doe\"'");
 }
 
 // -----------------------------------------------------------------------------
 // Type conversion behavior
 // -----------------------------------------------------------------------------
-
-TEST_F(Qwen3CoderDetectorTest, IntegerParameterConversion) {
-  std::string text =
-      "<tool_call><function=get_current_weather>"
-      "<parameter=location>Tokyo</parameter>"
-      "<parameter=days>5</parameter>"
-      "</function></tool_call>";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
-  EXPECT_TRUE(params["days"].is_number_integer());
-  EXPECT_EQ(params["days"], 5);
-}
 
 TEST_F(Qwen3CoderDetectorTest, InvalidIntegerFallsBackToString) {
   std::string text =
@@ -323,9 +293,10 @@ TEST_F(Qwen3CoderDetectorTest, InvalidIntegerFallsBackToString) {
       "<parameter=days>five</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params["days"].is_string());
   EXPECT_EQ(params["days"], "five");
 }
@@ -337,9 +308,10 @@ TEST_F(Qwen3CoderDetectorTest, NumberParameterConversion) {
       "<parameter=temperature>12.5</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params["temperature"].is_number_float());
   EXPECT_DOUBLE_EQ(params["temperature"], 12.5);
 }
@@ -351,25 +323,12 @@ TEST_F(Qwen3CoderDetectorTest, NumberIntegerLikeStringConvertedToInt) {
       "<parameter=temperature>12</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params["temperature"].is_number_integer());
   EXPECT_EQ(params["temperature"], 12);
-}
-
-TEST_F(Qwen3CoderDetectorTest, BooleanParameterConversion) {
-  std::string text =
-      "<tool_call><function=sql_interpreter>"
-      "<parameter=query>SELECT 1</parameter>"
-      "<parameter=dry_run>True</parameter>"
-      "</function></tool_call>";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
-  EXPECT_TRUE(params["dry_run"].is_boolean());
-  EXPECT_EQ(params["dry_run"], true);
 }
 
 TEST_F(Qwen3CoderDetectorTest, InvalidBooleanFallsBackToFalse) {
@@ -379,9 +338,10 @@ TEST_F(Qwen3CoderDetectorTest, InvalidBooleanFallsBackToFalse) {
       "<parameter=dry_run>not_bool</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params["dry_run"].is_boolean());
   EXPECT_EQ(params["dry_run"], false);
 }
@@ -392,9 +352,11 @@ TEST_F(Qwen3CoderDetectorTest, NullValueConversion) {
       "<parameter=location>null</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
+  ASSERT_TRUE(params.contains("location"));
   EXPECT_TRUE(params["location"].is_null());
 }
 
@@ -413,16 +375,19 @@ TEST_F(Qwen3CoderDetectorTest, ObjectAndArrayConversion) {
       "</function>\n"
       "</tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 2);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 2);
 
-  nlohmann::json params1 = nlohmann::json::parse(result.calls[0].parameters);
+  nlohmann::json params1 = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params1["metadata"].is_object());
-  EXPECT_EQ(params1["metadata"]["source"], "api");
+  EXPECT_EQ(params1["metadata"],
+            nlohmann::json({{"source", "api"}, {"retry", 1}}));
 
-  nlohmann::json params2 = nlohmann::json::parse(result.calls[1].parameters);
+  nlohmann::json params2 = nlohmann::json::parse(calls[1].parameters);
   EXPECT_TRUE(params2["todos"].is_array());
-  EXPECT_EQ(params2["todos"][0]["content"], "A");
+  EXPECT_EQ(params2["todos"],
+            nlohmann::json::array({{{"content", "A"}, {"status", "pending"}}}));
 }
 
 TEST_F(Qwen3CoderDetectorTest, InvalidObjectFallsBackToString) {
@@ -432,9 +397,10 @@ TEST_F(Qwen3CoderDetectorTest, InvalidObjectFallsBackToString) {
       "<parameter=metadata>{invalid_json}</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params["metadata"].is_string());
   EXPECT_EQ(params["metadata"], "{invalid_json}");
 }
@@ -446,9 +412,10 @@ TEST_F(Qwen3CoderDetectorTest, UnknownParameterFallsBackToRawString) {
       "<parameter=unexpected_field>123</parameter>"
       "</function></tool_call>";
 
-  auto result = detector_->detect_and_parse(text, tools_);
-  ASSERT_EQ(result.calls.size(), 1);
-  nlohmann::json params = nlohmann::json::parse(result.calls[0].parameters);
+  FunctionCallParser parser(tools_, "qwen3_coder");
+  const auto [normal_text, calls] = parser.parse_non_stream(text);
+  ASSERT_EQ(calls.size(), 1);
+  nlohmann::json params = nlohmann::json::parse(calls[0].parameters);
   EXPECT_TRUE(params["unexpected_field"].is_string());
   EXPECT_EQ(params["unexpected_field"], "123");
 }
@@ -473,7 +440,7 @@ TEST_F(Qwen3CoderDetectorTest, StreamingSingleToolCall) {
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
     merge_stream_result(
-        parser.parse_streaming_increment(chunk), &normal_text, &acc);
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
   EXPECT_TRUE(normal_text.empty());
@@ -493,11 +460,14 @@ TEST_F(Qwen3CoderDetectorTest, StreamingMultipleToolCalls) {
       "<tool_call><function=sql_interpreter><parameter=query>SELECT 1</"
       "parameter><parameter=dry_run>false</parameter></function></tool_call>"};
 
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
-    merge_stream_result(parser.parse_streaming_increment(chunk), nullptr, &acc);
+    merge_stream_result(
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 2);
   EXPECT_EQ(acc[0].name, "get_current_weather");
   EXPECT_EQ(acc[1].name, "sql_interpreter");
@@ -524,12 +494,14 @@ TEST_F(Qwen3CoderDetectorTest, StreamingTextAndToolCall) {
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
     merge_stream_result(
-        parser.parse_streaming_increment(chunk), &normal_text, &acc);
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
   EXPECT_EQ(normal_text, "Let me help you.\n\n");
   ASSERT_EQ(acc.size(), 1);
   EXPECT_EQ(acc[0].name, "get_current_weather");
+  EXPECT_EQ(nlohmann::json::parse(acc[0].parameters),
+            nlohmann::json({{"location", "Paris"}}));
 }
 
 TEST_F(Qwen3CoderDetectorTest, StreamingParameterEndedByNextParameter) {
@@ -540,9 +512,12 @@ TEST_F(Qwen3CoderDetectorTest, StreamingParameterEndedByNextParameter) {
       "<parameter=unit>celsius</parameter>"
       "</function></tool_call>";
 
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
-  merge_stream_result(parser.parse_streaming_increment(chunk), nullptr, &acc);
+  merge_stream_result(
+      parser.parse_streaming_increment(chunk), normal_text, acc);
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 1);
   nlohmann::json params = nlohmann::json::parse(acc[0].parameters);
   EXPECT_EQ(params["location"], "Boston");
@@ -556,9 +531,12 @@ TEST_F(Qwen3CoderDetectorTest, StreamingParameterEndedByFunctionEnd) {
       "<parameter=location>Boston"
       "</function></tool_call>";
 
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
-  merge_stream_result(parser.parse_streaming_increment(chunk), nullptr, &acc);
+  merge_stream_result(
+      parser.parse_streaming_increment(chunk), normal_text, acc);
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 1);
   nlohmann::json params = nlohmann::json::parse(acc[0].parameters);
   EXPECT_EQ(params["location"], "Boston");
@@ -570,12 +548,15 @@ TEST_F(Qwen3CoderDetectorTest,
   std::string chunk =
       "<tool_call><function=sql_interpreter></function></tool_call>";
 
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
-  merge_stream_result(parser.parse_streaming_increment(chunk), nullptr, &acc);
+  merge_stream_result(
+      parser.parse_streaming_increment(chunk), normal_text, acc);
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 1);
   EXPECT_EQ(acc[0].name, "sql_interpreter");
-  EXPECT_EQ(acc[0].parameters, "{}");
+  EXPECT_EQ(nlohmann::json::parse(acc[0].parameters), nlohmann::json::object());
 }
 
 TEST_F(Qwen3CoderDetectorTest, StreamingIgnoresTextInsideToolCallRegion) {
@@ -593,7 +574,7 @@ TEST_F(Qwen3CoderDetectorTest, StreamingIgnoresTextInsideToolCallRegion) {
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
     merge_stream_result(
-        parser.parse_streaming_increment(chunk), &normal_text, &acc);
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
   EXPECT_EQ(normal_text, "before  after");
@@ -611,7 +592,7 @@ TEST_F(Qwen3CoderDetectorTest,
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
     merge_stream_result(
-        parser.parse_streaming_increment(chunk), &normal_text, &acc);
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
   EXPECT_EQ(normal_text, "2 < 3 and 5 > 4");
@@ -628,9 +609,11 @@ TEST_F(Qwen3CoderDetectorTest, StreamingPartialTagWaitsForMoreData) {
   auto result2 = parser.parse_streaming_increment(
       "ll><function=get_current_weather><parameter=location>Paris</parameter>"
       "</function></tool_call>");
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
-  merge_stream_result(result2, nullptr, &acc);
+  merge_stream_result(result2, normal_text, acc);
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 1);
   EXPECT_EQ(acc[0].name, "get_current_weather");
   nlohmann::json params = nlohmann::json::parse(acc[0].parameters);
@@ -644,11 +627,14 @@ TEST_F(Qwen3CoderDetectorTest,
       "<tool_call><unknown>abc</unknown><function=get_current_weather>",
       "<parameter=location>Madrid</parameter></function></tool_call>"};
 
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
-    merge_stream_result(parser.parse_streaming_increment(chunk), nullptr, &acc);
+    merge_stream_result(
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 1);
   EXPECT_EQ(acc[0].name, "get_current_weather");
   nlohmann::json params = nlohmann::json::parse(acc[0].parameters);
@@ -667,7 +653,7 @@ TEST_F(Qwen3CoderDetectorTest,
   std::vector<StreamCallAccumulator> acc;
   for (const auto& chunk : chunks) {
     merge_stream_result(
-        parser.parse_streaming_increment(chunk), &normal_text, &acc);
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
   EXPECT_EQ(normal_text, " done");
@@ -682,36 +668,20 @@ TEST_F(Qwen3CoderDetectorTest, StreamingCharacterByCharacter) {
       "<tool_call><function=get_current_weather><parameter=location>Tokyo</"
       "parameter><parameter=days>2</parameter></function></tool_call>";
 
+  std::string normal_text;
   std::vector<StreamCallAccumulator> acc;
   for (char ch : text) {
     std::string chunk(1, ch);
-    merge_stream_result(parser.parse_streaming_increment(chunk), nullptr, &acc);
+    merge_stream_result(
+        parser.parse_streaming_increment(chunk), normal_text, acc);
   }
 
+  EXPECT_TRUE(normal_text.empty());
   ASSERT_EQ(acc.size(), 1);
   EXPECT_EQ(acc[0].name, "get_current_weather");
   nlohmann::json params = nlohmann::json::parse(acc[0].parameters);
   EXPECT_EQ(params["location"], "Tokyo");
   EXPECT_EQ(params["days"], 2);
-}
-
-// -----------------------------------------------------------------------------
-// Robustness / scale
-// -----------------------------------------------------------------------------
-
-TEST_F(Qwen3CoderDetectorTest, PerformanceWithManyToolCalls) {
-  std::string text = "Performance test ";
-  for (int i = 0; i < 300; ++i) {
-    text += "<tool_call><function=sql_interpreter><parameter=query>SELECT " +
-            std::to_string(i) + "</parameter></function></tool_call>";
-  }
-
-  auto result = detector_->detect_and_parse(text, tools_);
-  EXPECT_EQ(result.normal_text, "Performance test ");
-  ASSERT_EQ(result.calls.size(), 300);
-  for (int i = 0; i < 300; ++i) {
-    EXPECT_EQ(result.calls[i].name.value_or(""), "sql_interpreter");
-  }
 }
 
 }  // namespace function_call

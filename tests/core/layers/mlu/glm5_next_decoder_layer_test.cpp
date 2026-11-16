@@ -29,6 +29,7 @@ limitations under the License.
 #include "kernels/mlu/chunk_kda.h"
 #include "layers/mlu/tests_utils.h"
 #include "platform/device.h"
+#include "platform/platform.h"
 
 namespace xllm::layer {
 namespace {
@@ -117,6 +118,9 @@ void verify_capture_boundary(Glm5NextDecoderLayer& layer,
 }
 
 void run_layer_chain(LayerTestMode mode) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
   const bool chunked_prefill = mode == LayerTestMode::CHUNKED_PREFILL;
   torch::InferenceMode guard;
   const torch::Device device(torch::kPrivateUse1, /*index=*/0);
@@ -215,6 +219,12 @@ void run_layer_chain(LayerTestMode mode) {
         torch::zeros({2, kHeads, kHeadDim, kHeadDim}, fp32_options)});
   };
   std::array<KVCache, 2> caches = {make_cache(), make_cache()};
+  std::vector<KVCache> reference_caches;
+  reference_caches.reserve(caches.size());
+  for (const auto& cache : caches) {
+    reference_caches.emplace_back(LinearAttentionKVCacheTensors{
+        cache.get_conv_cache().clone(), cache.get_ssm_cache().clone()});
+  }
   ModelInputParams input_params;
   input_params.embedding.linear_state_ids = {1};
   input_params.embedding.linear_state_indices =
@@ -252,6 +262,7 @@ void run_layer_chain(LayerTestMode mode) {
     torch::Tensor hidden = torch::randn({tokens, 4, kHiddenSize}, options);
     torch::Tensor positions = torch::arange(
         start_position, start_position + tokens, options.dtype(torch::kInt64));
+    auto reference_hidden = hidden.clone();
     std::optional<torch::Tensor> residual;
     std::optional<PendingMHC> pending;
     torch::Tensor output = first_layer->forward(hidden,
@@ -277,6 +288,38 @@ void run_layer_chain(LayerTestMode mode) {
     ASSERT_EQ(output.sizes(), (torch::IntArrayRef{tokens, 4, kHiddenSize}));
     ASSERT_TRUE(torch::isfinite(output).all().item<bool>());
     ASSERT_GT(output.abs().sum().item<float>(), 0.0f);
+    std::optional<torch::Tensor> reference_residual;
+    reference_hidden = first_layer->forward(reference_hidden,
+                                            reference_residual,
+                                            positions,
+                                            metadata,
+                                            reference_caches[0],
+                                            input_params);
+    const auto reference_output = second_layer->forward(reference_hidden,
+                                                        reference_residual,
+                                                        positions,
+                                                        metadata,
+                                                        reference_caches[1],
+                                                        input_params);
+    EXPECT_TRUE(torch::allclose(output, reference_output, 0.02, 0.02));
+    const double scale =
+        torch::norm(reference_output.to(torch::kFloat32)).item<double>();
+    ASSERT_GT(scale, 0.0);
+    EXPECT_LE(torch::norm(output.to(torch::kFloat32) -
+                          reference_output.to(torch::kFloat32))
+                      .item<double>() /
+                  scale,
+              0.02);
+    for (size_t index = 0; index < caches.size(); ++index) {
+      EXPECT_TRUE(torch::allclose(caches[index].get_conv_cache(),
+                                  reference_caches[index].get_conv_cache(),
+                                  0.02,
+                                  0.002));
+      EXPECT_TRUE(torch::allclose(caches[index].get_ssm_cache(),
+                                  reference_caches[index].get_ssm_cache(),
+                                  0.02,
+                                  0.002));
+    }
     for (const KVCache& cache : caches) {
       ASSERT_TRUE(torch::isfinite(cache.get_ssm_cache()).all().item<bool>());
       ASSERT_GT(cache.get_ssm_cache()[1].abs().sum().item<float>(), 0.0f);

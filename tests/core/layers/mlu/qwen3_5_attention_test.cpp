@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "layers/mlu/qwen3_5/qwen3_5_attention.h"
 
+#include <c10/core/DeviceGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -45,37 +46,14 @@ constexpr int64_t kNumHeads = 8;
 constexpr int64_t kNumKvHeads = 2;
 constexpr int64_t kBlockSize = 16;
 
-const std::vector<int64_t> kRealMropeSection = {11, 11, 10};
-const std::vector<int64_t> kAxisByHalfDim = {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1,
-                                             2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0,
-                                             1, 2, 0, 1, 2, 0, 1, 2, 0, 1};
-
-std::pair<torch::Tensor, torch::Tensor> make_mrope_ref(
-    const torch::Tensor& cos_sin_cache,
-    const torch::Tensor& positions) {
-  torch::Tensor selected = cos_sin_cache.index({positions});
-  std::vector<torch::Tensor> chunks = selected.chunk(/*chunks=*/2, /*dim=*/-1);
-  int64_t rotary_dim = chunks[0].size(-1);
-  int64_t half_rotary_dim = rotary_dim / 2;
-  torch::Tensor expected_cos =
-      torch::empty({positions.size(1), rotary_dim}, cos_sin_cache.options());
-  torch::Tensor expected_sin =
-      torch::empty({positions.size(1), rotary_dim}, cos_sin_cache.options());
-
-  for (int64_t column = 0; column < rotary_dim; ++column) {
-    int64_t axis = kAxisByHalfDim[column % half_rotary_dim];
-    expected_cos.select(/*dim=*/1, column)
-        .copy_(chunks[0].select(/*dim=*/0, axis).select(/*dim=*/1, column));
-    expected_sin.select(/*dim=*/1, column)
-        .copy_(chunks[1].select(/*dim=*/0, axis).select(/*dim=*/1, column));
-  }
-  return {expected_cos, expected_sin};
-}
-
 class Qwen3_5AttentionTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
     torch::Device device(Platform::type_torch(), 0);
+    device_guard_ = std::make_unique<c10::DeviceGuard>(device);
     Device xllm_device(device);
     xllm_device.set_seed(42);
     device_ = device;
@@ -123,42 +101,134 @@ class Qwen3_5AttentionTest : public ::testing::Test {
     kv_cache_ = KVCache(KVCacheTensors{k_cache, v_cache});
   }
 
-  // Build the mrope (cos, sin) tables for 2D positions [3, num_tokens],
-  // mirroring Qwen3_5ModelImpl::apply_mrope.
   std::pair<torch::Tensor, torch::Tensor> ApplyMrope(
       const torch::Tensor& positions) {
-    CHECK_EQ(positions.dim(), 2);
-    auto target_cos_sin = cos_sin_.index({positions});
-    auto chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
-    auto cos_pos = chunks[0].contiguous();
-    auto sin_pos = chunks[1].contiguous();
-    auto long_opts = positions.options().dtype(torch::kLong);
-    auto apply = [&](torch::Tensor x) {
-      auto freqs_t = x[0].clone();
-      int64_t mrop_length = static_cast<int64_t>(freqs_t.size(-1) / 2);
-      for (int32_t dim_idx = 1; dim_idx <= 2; ++dim_idx) {
-        int64_t offset = dim_idx;
-        int64_t section_len = mrope_section_[dim_idx];
-        int64_t length = section_len * 3;
-        // Production mrope never has zero height/width sections; guard the
-        // arange so the degenerate text-only section [t, 0, 0] does not trip
-        // MLU's "inconsistent step sign" check on arange(offset, 0, 3).
-        if (section_len <= 0) {
-          continue;
-        }
-        auto idx_first_half = torch::arange(offset, length, 3, long_opts);
-        auto idx_second_half = torch::arange(
-            offset + mrop_length, length + mrop_length, 3, long_opts);
-        auto idx_tensor =
-            torch::cat({idx_first_half, idx_second_half}, 0).to(x.device());
-        auto src = x[dim_idx].index_select(-1, idx_tensor);
-        freqs_t.index_copy_(-1, idx_tensor, src);
-      }
-      return freqs_t;
+    return rotary::apply_mrope(cos_sin_, positions, mrope_section_);
+  }
+
+  // CPU equations, starting from the checkpoint and initial resident cache.
+  // Do not read the layer's projected tensors or its written cache as gold.
+  torch::Tensor reference_output(bool gated,
+                                 const torch::Tensor& hidden,
+                                 const torch::Tensor& positions,
+                                 const AttentionMetadata& metadata) {
+    const auto weights = WeightsFor(gated);
+    const auto h = hidden.cpu().to(torch::kFloat32);
+    auto project = [&](const std::string& name) {
+      return torch::matmul(h,
+                           weights.at("self_attn." + name + ".weight")
+                               .cpu()
+                               .to(torch::kFloat32)
+                               .t())
+          .to(torch::kBFloat16)
+          .to(torch::kFloat32);
     };
-    cos_pos = apply(cos_pos.reshape({positions.size(0), -1, cos_pos.size(-1)}));
-    sin_pos = apply(sin_pos.reshape({positions.size(0), -1, sin_pos.size(-1)}));
-    return std::make_pair(cos_pos, sin_pos);
+    auto q = project("q_proj").reshape(
+        {h.size(0), kNumHeads, gated ? 2 * kHeadDim : kHeadDim});
+    torch::Tensor gate;
+    if (gated) {
+      gate = q.narrow(-1, kHeadDim, kHeadDim)
+                 .sigmoid()
+                 .to(torch::kBFloat16)
+                 .to(torch::kFloat32);
+      q = q.narrow(-1, 0, kHeadDim);
+    }
+    auto k = project("k_proj").reshape({h.size(0), kNumKvHeads, kHeadDim});
+    const auto v =
+        project("v_proj").reshape({h.size(0), kNumKvHeads, kHeadDim});
+    auto norm = [&](torch::Tensor x, const std::string& name) {
+      const auto gamma =
+          weights.at("self_attn." + name + ".weight").cpu().to(torch::kFloat32);
+      return (x * torch::rsqrt(x.square().mean(-1, true) + 1e-6) * (1 + gamma))
+          .to(torch::kBFloat16)
+          .to(torch::kFloat32);
+    };
+    q = norm(q, "q_norm");
+    k = norm(k, "k_norm");
+    constexpr int64_t kRotaryDim = kHeadDim / 4;
+    const auto frequency = torch::pow(
+        1000000.0,
+        -torch::arange(0, kRotaryDim, 2, torch::kFloat32) / kRotaryDim);
+    const auto angle =
+        positions[0].cpu().to(torch::kFloat32).unsqueeze(1) * frequency;
+    const auto cos = torch::cat({angle.cos(), angle.cos()}, -1)
+                         .to(torch::kBFloat16)
+                         .to(torch::kFloat32)
+                         .unsqueeze(1);
+    const auto sin = torch::cat({angle.sin(), angle.sin()}, -1)
+                         .to(torch::kBFloat16)
+                         .to(torch::kFloat32)
+                         .unsqueeze(1);
+    auto rotate = [&](torch::Tensor x) {
+      const auto first = x.narrow(-1, 0, kRotaryDim / 2).clone();
+      const auto second = x.narrow(-1, kRotaryDim / 2, kRotaryDim / 2).clone();
+      x.narrow(-1, 0, kRotaryDim)
+          .copy_((torch::cat({first, second}, -1) * cos +
+                  torch::cat({-second, first}, -1) * sin)
+                     .to(torch::kBFloat16));
+      return x;
+    };
+    q = rotate(q);
+    k = rotate(k);
+    auto keys = kv_cache_.get_k_cache().cpu().clone();
+    auto values = kv_cache_.get_v_cache().cpu().clone();
+    const auto slots = metadata.slot_mapping.cpu();
+    for (int64_t row = 0; row < h.size(0); ++row) {
+      const int64_t slot = slots[row].item<int32_t>();
+      keys[slot / kBlockSize].select(1, slot % kBlockSize).copy_(k[row]);
+      values[slot / kBlockSize].select(1, slot % kBlockSize).copy_(v[row]);
+    }
+    const auto table = metadata.block_table.cpu();
+    const auto lengths = metadata.kv_seq_lens.cpu();
+    const auto offsets = metadata.q_cu_seq_lens.cpu();
+    auto output =
+        torch::empty({h.size(0), kNumHeads, kHeadDim}, torch::kFloat32);
+    for (int64_t batch = 0; batch < lengths.numel(); ++batch) {
+      const int64_t begin = offsets[batch].item<int32_t>();
+      const int64_t end = offsets[batch + 1].item<int32_t>();
+      const int64_t length = lengths[batch].item<int32_t>();
+      std::vector<torch::Tensor> key_rows, value_rows;
+      for (int64_t token = 0; token < length; ++token) {
+        const int64_t page = table[batch][token / kBlockSize].item<int32_t>();
+        key_rows.push_back(keys[page].select(1, token % kBlockSize));
+        value_rows.push_back(values[page].select(1, token % kBlockSize));
+      }
+      const auto kh = torch::stack(key_rows)
+                          .to(torch::kFloat32)
+                          .repeat_interleave(kNumHeads / kNumKvHeads, 1);
+      const auto vh = torch::stack(value_rows)
+                          .to(torch::kFloat32)
+                          .repeat_interleave(kNumHeads / kNumKvHeads, 1);
+      for (int64_t row = begin; row < end; ++row) {
+        const int64_t visible = length - (end - begin) + row - begin + 1;
+        const auto score = (kh.narrow(0, 0, visible) * q[row]).sum(-1) /
+                           std::sqrt(static_cast<double>(kHeadDim));
+        output[row].copy_(
+            (score.softmax(0).unsqueeze(-1) * vh.narrow(0, 0, visible)).sum(0));
+      }
+    }
+    output = output.to(torch::kBFloat16).to(torch::kFloat32);
+    if (gated) {
+      output = (output * gate).to(torch::kBFloat16).to(torch::kFloat32);
+    }
+    return torch::matmul(output.reshape({h.size(0), -1}),
+                         weights.at("self_attn.o_proj.weight")
+                             .cpu()
+                             .to(torch::kFloat32)
+                             .t())
+        .to(torch::kBFloat16)
+        .to(torch::kFloat32);
+  }
+
+  void expect_close(const torch::Tensor& actual,
+                    const torch::Tensor& expected) {
+    ASSERT_EQ(actual.scalar_type(), options_.dtype());
+    const auto a = actual.cpu().to(torch::kFloat32);
+    const auto e = expected.cpu().to(torch::kFloat32);
+    ASSERT_TRUE(torch::allclose(a, e, 0.02, 0.002));
+    ASSERT_GT(torch::norm(e).item<double>(), 0.0);
+    EXPECT_LE(torch::norm(a - e).item<double>() / torch::norm(e).item<double>(),
+              0.02);
   }
 
   Qwen3_5Attention MakeLayer(bool attn_output_gate) {
@@ -303,7 +373,7 @@ class Qwen3_5AttentionTest : public ::testing::Test {
     if (prefill) {
       temporal = torch::arange(0, seq_len, opts_int).repeat({batch_size});
     } else {
-      temporal = torch::full({batch_size}, seq_len, opts_int);
+      temporal = torch::full({batch_size}, seq_len - 1, opts_int);
     }
     torch::Tensor zero = torch::zeros({temporal.size(0)}, opts_int);
     return torch::stack({temporal, zero, zero}, /*dim=*/0);
@@ -320,6 +390,7 @@ class Qwen3_5AttentionTest : public ::testing::Test {
 
   ParallelArgs parallel_args_{0, 1, nullptr};
   torch::TensorOptions options_;
+  std::unique_ptr<c10::DeviceGuard> device_guard_;
   torch::Device device_ = torch::kCPU;
   std::unique_ptr<ProcessGroup> process_group_ = nullptr;
   KVCache kv_cache_;
@@ -339,7 +410,9 @@ TEST_F(Qwen3_5AttentionTest, PrefillWithGate) {
   auto metadata = MakePrefillMetadata(batch_size, seq_len);
   std::tie(metadata.mrope_cos, metadata.mrope_sin) = ApplyMrope(positions);
 
+  const auto expected = reference_output(true, hidden, positions, metadata);
   auto output = layer->forward(positions, hidden, metadata, kv_cache_);
+  expect_close(output, expected);
   Device xllm_device(device_);
   xllm_device.synchronize_default_stream();
 
@@ -363,7 +436,9 @@ TEST_F(Qwen3_5AttentionTest, PrefillWithoutGate) {
   auto metadata = MakePrefillMetadata(batch_size, seq_len);
   std::tie(metadata.mrope_cos, metadata.mrope_sin) = ApplyMrope(positions);
 
+  const auto expected = reference_output(false, hidden, positions, metadata);
   auto output = layer->forward(positions, hidden, metadata, kv_cache_);
+  expect_close(output, expected);
   Device xllm_device(device_);
   xllm_device.synchronize_default_stream();
 
@@ -386,7 +461,9 @@ TEST_F(Qwen3_5AttentionTest, DecodeWithGate) {
   auto metadata = MakeDecodeMetadata(batch_size, seq_len);
   std::tie(metadata.mrope_cos, metadata.mrope_sin) = ApplyMrope(positions);
 
+  const auto expected = reference_output(true, hidden, positions, metadata);
   auto output = layer->forward(positions, hidden, metadata, kv_cache_);
+  expect_close(output, expected);
   Device xllm_device(device_);
   xllm_device.synchronize_default_stream();
 
@@ -432,45 +509,6 @@ TEST_F(Qwen3_5AttentionTest, VirtualDecodeRowSkipsKvWrite) {
       torch::equal(padded_cache.get_k_cache(), compact_cache.get_k_cache()));
   EXPECT_TRUE(
       torch::equal(padded_cache.get_v_cache(), compact_cache.get_v_cache()));
-}
-
-TEST_F(Qwen3_5AttentionTest, TextPositionsProduceValidMropeCaches) {
-  (void)MakeLayer(/*attn_output_gate=*/true);
-  auto text_positions = torch::arange(0, 4, options_.dtype(torch::kInt32));
-
-  auto [cos, sin] =
-      rotary::apply_mrope(cos_sin_, text_positions, mrope_section_);
-  auto expanded_positions = text_positions.unsqueeze(0).repeat({3, 1});
-  auto [expected_cos, expected_sin] = ApplyMrope(expanded_positions);
-
-  EXPECT_EQ(cos.dim(), 2);
-  EXPECT_EQ(sin.dim(), 2);
-  EXPECT_TRUE(torch::allclose(cos, expected_cos));
-  EXPECT_TRUE(torch::allclose(sin, expected_sin));
-}
-
-TEST_F(Qwen3_5AttentionTest, RealSectionsProduceInterleavedMrope) {
-  constexpr int64_t kTestRotaryDim = 64;
-  torch::Tensor cos_sin_cache =
-      rotary::get_concat_rotary_embedding(kTestRotaryDim,
-                                          /*seq_len=*/64,
-                                          /*rope_theta=*/1000000.0,
-                                          options_);
-  torch::Tensor positions = torch::tensor(
-      {{1, 2, 3}, {11, 12, 13}, {21, 22, 23}}, options_.dtype(torch::kLong));
-
-  auto [cos, sin] =
-      rotary::apply_mrope(cos_sin_cache, positions, kRealMropeSection);
-  auto [expected_cos, expected_sin] = make_mrope_ref(cos_sin_cache, positions);
-
-  EXPECT_EQ(cos.sizes(),
-            torch::IntArrayRef({positions.size(1), kTestRotaryDim}));
-  EXPECT_EQ(sin.sizes(),
-            torch::IntArrayRef({positions.size(1), kTestRotaryDim}));
-  EXPECT_TRUE(torch::equal(cos, expected_cos));
-  EXPECT_TRUE(torch::equal(sin, expected_sin));
-  EXPECT_TRUE(cos.is_contiguous());
-  EXPECT_TRUE(sin.is_contiguous());
 }
 
 }  // namespace

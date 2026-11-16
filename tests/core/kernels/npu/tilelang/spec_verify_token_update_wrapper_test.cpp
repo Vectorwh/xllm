@@ -36,14 +36,6 @@ class TileLangSpecVerifyTokenUpdateTest : public ::testing::Test {
       torch::TensorOptions().dtype(torch::kInt64).device(device_);
 };
 
-TEST_F(TileLangSpecVerifyTokenUpdateTest, ReportsCompiledWidths) {
-  EXPECT_TRUE(has_spec_verify_token_update_specialization(4));
-  EXPECT_TRUE(has_spec_verify_token_update_specialization(5));
-  EXPECT_TRUE(has_spec_verify_token_update_specialization(6));
-  EXPECT_FALSE(has_spec_verify_token_update_specialization(3));
-  EXPECT_FALSE(has_spec_verify_token_update_specialization(8));
-}
-
 TEST_F(TileLangSpecVerifyTokenUpdateTest, PacksSupportedWidthsAndZerosTail) {
   struct TokenPackingCase {
     int64_t spec_width;

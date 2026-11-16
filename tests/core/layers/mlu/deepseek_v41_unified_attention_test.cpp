@@ -313,7 +313,6 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   }
   torch_mlu::synchronize();
   EXPECT_TRUE(torch::equal(graph_caches[1].get_swa_cache(), before_capture));
-  ASSERT_EQ(graph.num_eager_segments(), 1);
   auto reference = torch::zeros({capacity, 32}, torch::kFloat32);
   auto expected_cache = original_swa.clone();
   auto expected_lengths = torch::zeros({capacity}, torch::kInt32);

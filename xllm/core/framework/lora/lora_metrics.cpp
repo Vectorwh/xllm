@@ -317,11 +317,6 @@ std::vector<LoRAMetrics::Snapshot> LoRAMetrics::snapshot_all() const {
   return out;
 }
 
-size_t LoRAMetrics::adapter_count() const {
-  std::shared_lock lock(mu_);
-  return per_adapter_.size();
-}
-
 // Observe a scheduler batch's LoRA distribution. Fast path is
 // (0 or 1) distinct adapters, slow path is 2+. total_seqs unused today
 // but included for future hit-rate weighting.

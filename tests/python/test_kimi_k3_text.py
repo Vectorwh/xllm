@@ -232,7 +232,8 @@ def test_prefix_continuation_restores_framework_read_slot() -> None:
     torch.testing.assert_close(caches[0].ssm[4], full_caches[0].ssm[2])
 
 
-def test_registered_vlm_constructs_real_text_with_config_only() -> None:
+def test_registered_vlm_constructs_real_text_with_config_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
     model = registry.get_model_class("kimi_k3")(_config())
     assert isinstance(model.language_model, KimiK3ForCausalLM)
     assert model.model.layers[0].self_attn.attention_kind == "linear"

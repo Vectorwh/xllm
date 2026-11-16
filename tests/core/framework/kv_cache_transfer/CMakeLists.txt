@@ -104,17 +104,31 @@ cc_test(
 # Resolve static link order between xtensor and xllm_server for this test target.
 target_link_libraries(mooncake_transfer_engine_test PRIVATE
   "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
+
+# These cases initialize local Mooncake RPC endpoints from a shared port
+# range. Serialize only endpoint users; pure layout/service tests stay parallel.
+set_tests_properties(
+  MooncakeKVCacheTransferLayoutTest.PublishedTpWidthAndRankAlwaysAgree
+  MooncakeKVCacheTransferLayoutTest.LinearHeadPolicyKeepsWidthAndRankTogether
+  MooncakeKVCacheTransferDefaultTest.RegistersCheckpointedSsmAsLogicalSequenceSlots
+  MooncakeKVCacheTransferDefaultTest.Dsv4FingerprintIncludesCompressedCacheGeometry
+  MooncakeKVCacheTransferDefaultTest.Dsv41FingerprintIncludesGroupedCacheGeometry
+  MooncakeKVCacheTransferDefaultTest.Dsv41GroupedPoolsCarryStateRingWithSwa
+  MooncakeKVCacheTransferDefaultTest.RegistersCompressedIndexAndKpoolTail
+  MooncakeKVCacheTransferDefaultTest.RegistersDsv4TypedPoolsWithPerPoolSpans
+  MooncakeKVCacheTransferDefaultTest.RegistersDraftTp8BesideMainCp4Tp2
+  MooncakeKVCacheTransferDefaultTest.Glm5NextTransfersMainAndDraftPagesAndRequestState
+  MooncakeKVCacheTransferDefaultTest.RegistersTp1SpecDraftBesideTp2MainCache
+  MooncakeKVCacheTransferDefaultTest.NpuLinearIndexerScalePushAndPullRoundTrip
+  MooncakeKVCacheTransferDefaultTest.PushStopsAfterLayerFailure
+  MooncakeKVCacheTransferDefaultTest.Glm5NextRequestStateRoundTripsLogicalSlots
+  MooncakeKVCacheTransferDefaultTest.IndexScaleRegistersAndRoundTripsWithKvBlocks
+  PROPERTIES RESOURCE_LOCK mooncake_transfer_engine)
 endif()
 
-# Drives the source->destination KV block mapping for a P kv_split_size that
-# differs from the destination's declared width. Needs the batch builder, the
-# block manager and the scheduler's group-type predicate, all reachable through
-# xllm_server; the source declares kv_split_size = 2 while the settled decode
-# declares 1.
-# CPU_ONLY like the sibling host-only targets in this directory: the whole TU
-# builds BlockManagerImpl/Sequence/InstanceInfo records and calls the width
-# planning helpers directly -- no device, no kernel, no RPC -- so it must not
-# inherit the NPU bootstrap sources nor drop out of the `cpu` ctest label set.
+# Host-only width admission, transfer filtering, and byte-region binding.
+# Keep CPU_ONLY so this target does not inherit accelerator bootstrap.
+# The block manager and scheduler predicate need xllm_server.
 cc_test(
   NAME
     kv_split_width_mismatch_test
@@ -153,16 +167,59 @@ cc_test(
 
 endif()
 
+# The unit executable supplies an in-memory Mooncake backend. Compile Store
+# directly so the real Mooncake backend implementation is not linked here.
 cc_test(
   NAME
     kv_cache_store_test
   CPU_ONLY
   SRCS
     kv_cache_store_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/framework/kv_cache_transfer/kv_cache_store.cpp
+  DEPS
+    :kv_cache
+    :config
+    :util
+    mooncake_store
+    GTest::gtest_main
+)
+
+# Resolve the existing config/platform/util static-library cycle.
+target_link_libraries(kv_cache_store_test PRIVATE
+  "$<LINK_GROUP:RESCAN,config,platform,util>")
+
+# Pure Mooncake backend policy/validation tests need the real backend code but
+# do not require a running master or storage node.
+cc_test(
+  NAME
+    mooncake_store_backend_test
+  CPU_ONLY
+  SRCS
+    mooncake_store_backend_test.cpp
   DEPS
     :kv_cache_transfer
     GTest::gtest_main
 )
+
+# Live Mooncake checks need a configured master and TCP storage node. Keep
+# this heavier executable out of the default all_tests and CTest sets; build it
+# explicitly with XLLM_ENABLE_MOONCAKE_INTEGRATION_TESTS for manual validation.
+# Requires XLLM_TEST_STORE_MASTER to name an active TCP storage service.
+option(XLLM_ENABLE_MOONCAKE_INTEGRATION_TESTS
+  "Build live Mooncake KV cache store integration tests" OFF)
+if(XLLM_ENABLE_MOONCAKE_INTEGRATION_TESTS)
+  cc_test(
+    NAME
+      kv_cache_store_integration_test
+    CPU_ONLY
+    RUN_SERIAL
+    SRCS
+      kv_cache_store_integration_test.cpp
+    DEPS
+      :kv_cache_transfer
+      GTest::gtest_main
+  )
+endif()
 
 if(USE_NPU OR USE_MLU)
 cc_test(

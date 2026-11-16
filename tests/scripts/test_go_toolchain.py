@@ -123,23 +123,7 @@ class GoToolchainTest(unittest.TestCase):
                 self.assertEqual(filename, "go1.26.10.linux-arm64.tar.gz")
                 shutil.copyfile(tarball, destination)
 
-            original_is_file = Path.is_file
-            original_exists = Path.exists
-
-            def is_file(path: Path) -> bool:
-                # Simulate a usable host Go independently of what the CI image contains.
-                if path == Path("/usr/local/go/bin/go"):
-                    return True
-                return original_is_file(path)
-
-            def exists(path: Path) -> bool:
-                if path == Path("/usr/local/go/src/internal/abi/map_swiss.go"):
-                    return False
-                return original_exists(path)
-
             with (
-                mock.patch.object(Path, "is_file", autospec=True, side_effect=is_file),
-                mock.patch.object(Path, "exists", autospec=True, side_effect=exists),
                 mock.patch.dict(
                     os.environ, {"XDG_CACHE_HOME": temp_dir, "PATH": "/usr/bin", "GOROOT": str(image_root)}
                 ),

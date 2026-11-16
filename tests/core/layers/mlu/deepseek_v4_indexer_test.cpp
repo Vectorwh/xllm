@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "layers/mlu/deepseek_v4/deepseek_v4_indexer.h"
 
+#include <c10/core/DeviceGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
@@ -22,6 +23,7 @@ limitations under the License.
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -281,48 +283,6 @@ void expect_context_lens_shape(const torch::Tensor& context_lens,
   EXPECT_EQ(context_lens.scalar_type(), torch::kInt32);
 }
 
-void expect_topk_prefix_equal(const torch::Tensor& actual,
-                              const torch::Tensor& expected,
-                              const torch::Tensor& actual_context_lens,
-                              const torch::Tensor& expected_context_lens) {
-  torch::Tensor actual_cpu = actual.cpu().to(torch::kInt32);
-  torch::Tensor expected_cpu = expected.cpu().to(torch::kInt32);
-  torch::Tensor actual_context_lens_cpu =
-      actual_context_lens.cpu().to(torch::kInt32);
-  torch::Tensor context_lens_cpu =
-      expected_context_lens.cpu().to(torch::kInt32);
-  ASSERT_EQ(actual_cpu.sizes(), expected_cpu.sizes());
-  ASSERT_EQ(actual_cpu.size(0), context_lens_cpu.size(0));
-  EXPECT_TRUE(torch::equal(actual_context_lens_cpu, context_lens_cpu))
-      << "actual context lens=" << actual_context_lens_cpu
-      << "\nexpected context lens=" << context_lens_cpu;
-  for (int64_t row = 0; row < actual_cpu.size(0); ++row) {
-    const int64_t selected_count = context_lens_cpu[row].item<int32_t>();
-    ASSERT_LE(selected_count, actual_cpu.size(1));
-    if (selected_count == 0) {
-      continue;
-    }
-    torch::Tensor actual_prefix = actual_cpu[row].slice(0, 0, selected_count);
-    torch::Tensor expected_prefix =
-        expected_cpu[row].slice(0, 0, selected_count);
-    if (torch::equal(actual_prefix, expected_prefix)) {
-      continue;
-    }
-    torch::Tensor mismatch = actual_prefix.ne(expected_prefix).nonzero();
-    const int64_t col = mismatch[0][0].item<int64_t>();
-    ADD_FAILURE() << "topk prefix mismatch at row " << row << ", col " << col
-                  << ", actual=" << actual_prefix[col].item<int32_t>()
-                  << ", expected=" << expected_prefix[col].item<int32_t>()
-                  << "\nactual first column=" << actual_cpu.select(1, 0)
-                  << "\nexpected first column=" << expected_cpu.select(1, 0)
-                  << "\nactual context lens=" << actual_context_lens_cpu
-                  << "\nexpected context lens=" << context_lens_cpu
-                  << "\nactual prefix=" << actual_prefix
-                  << "\nexpected prefix=" << expected_prefix;
-    return;
-  }
-}
-
 void expect_topk_prefix_set_equal(const torch::Tensor& actual,
                                   const torch::Tensor& expected,
                                   const torch::Tensor& actual_context_lens,
@@ -443,8 +403,13 @@ TEST(DeepseekV4DSAMetadataBuilderTest, SkipsC128MetadataForEmptyBatch) {
 class DeepseekV4IndexerTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    original_block_size_ = FLAGS_block_size;
     FLAGS_block_size = 1;
     torch::Device torch_device(Platform::type_torch(), 0);
+    device_guard_ = std::make_unique<c10::DeviceGuard>(torch_device);
     Device device(torch_device);
     device.set_seed();
     device_ = torch_device;
@@ -454,6 +419,12 @@ class DeepseekV4IndexerTest : public ::testing::Test {
                    .requires_grad(false);
     cpu_options_ =
         torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCPU);
+  }
+
+  void TearDown() override {
+    if (original_block_size_.has_value()) {
+      FLAGS_block_size = *original_block_size_;
+    }
   }
 
   std::unordered_map<std::string, torch::Tensor> make_weights() {
@@ -713,17 +684,19 @@ class DeepseekV4IndexerTest : public ::testing::Test {
     return {index_cache, compress_index_state};
   }
 
-  // Returns [kv, score] narrow views of the owning compress_index_state,
-  // sharing its storage. Used to feed the CPU reference, which expects split
-  // pools.
-  std::tuple<torch::Tensor, torch::Tensor> split_index_state(
-      torch::Tensor& compress_index_state) const {
-    const int64_t idx_coff_dim = 2 * config_.index_head_dim;
-    torch::Tensor kv = compress_index_state.narrow(
-        /*dim=*/2, /*start=*/0, /*length=*/idx_coff_dim);
-    torch::Tensor score = compress_index_state.narrow(
-        /*dim=*/2, /*start=*/idx_coff_dim, /*length=*/idx_coff_dim);
-    return {kv, score};
+  std::optional<int32_t> original_block_size_;
+  std::unique_ptr<c10::DeviceGuard> device_guard_;
+  void verify_cache(const torch::Tensor& actual,
+                    const torch::Tensor& expected) {
+    const auto a = actual.cpu().to(torch::kFloat32);
+    const auto e = expected.cpu().to(torch::kFloat32);
+    test::verify_tensor_close(a, e, 0.02, 0.02);
+    const double scale = torch::norm(e).item<double>();
+    if (scale == 0.0) {
+      EXPECT_TRUE(torch::equal(a, e));
+    } else {
+      EXPECT_LE(torch::norm(a - e).item<double>() / scale, 0.02);
+    }
   }
 
   TestConfig config_;
@@ -780,12 +753,9 @@ TEST_F(DeepseekV4IndexerTest, PrefillReturnsKernelSparseSlots) {
                                                       compressed_sin,
                                                       compressed_cos);
 
-  test::verify_tensor_close(
-      index_cache.cpu().slice(0, 1, 5).squeeze(1).squeeze(1).to(
-          torch::kFloat32),
-      expected.kv.to(torch::kFloat32),
-      /*rtol=*/2e-2,
-      /*atol=*/2e-2);
+  verify_cache(index_cache.cpu().slice(0, 1, 5).squeeze(1).squeeze(1).to(
+                   torch::kFloat32),
+               expected.kv.to(torch::kFloat32));
   EXPECT_EQ(actual_topk.dim(), 2);
   EXPECT_EQ(actual_topk.size(0), 16);
   EXPECT_EQ(actual_topk.size(1), config_.index_topk);
@@ -860,10 +830,8 @@ TEST_F(DeepseekV4IndexerTest, UsesExplicitC4RefsWithDuplicateTokenCaches) {
       expected.topk, expected.context_lens, metadata, selected_block_table);
   expect_topk_prefix_set_equal(
       actual_topk, expected_sparse, context_lens, expected.context_lens);
-  test::verify_tensor_close(index_cache.cpu()[3][0][0].to(torch::kFloat32),
-                            expected.kv[0].to(torch::kFloat32),
-                            /*rtol=*/2e-2,
-                            /*atol=*/2e-2);
+  verify_cache(index_cache.cpu()[3][0][0].to(torch::kFloat32),
+               expected.kv[0].to(torch::kFloat32));
   torch::Tensor wrong_sparse = sparse_slot_ref(
       expected.topk, expected.context_lens, metadata, metadata.block_table);
   EXPECT_EQ(context_lens.cpu()[3].item<int32_t>(), 1);
@@ -920,15 +888,17 @@ TEST_F(DeepseekV4IndexerTest, DecodeReturnsKernelSparseSlots) {
       seeded("dsv4.indexer.decode.x", {1, config_.dim}, torch::kBFloat16);
   torch::Tensor qr = seeded(
       "dsv4.indexer.decode.qr", {1, config_.q_lora_rank}, torch::kBFloat16);
-  auto [kv_view, score_view] = split_index_state(compress_index_state);
-  torch::Tensor ref_kv_state = kv_view.cpu().clone();
-  torch::Tensor ref_score_state = score_view.cpu().clone();
-  int64_t ratio = 4;
-  ref_kv_state.slice(/*dim=*/1, /*start=*/ratio)
-      .copy_(ref_kv_state.slice(/*dim=*/1, /*start=*/0, /*length=*/ratio));
-  ref_score_state.slice(/*dim=*/1, /*start=*/ratio)
-      .copy_(ref_score_state.slice(
-          /*dim=*/1, /*start=*/0, /*length=*/ratio));
+  auto ref_kv_state =
+      torch::zeros({1, 8, 2 * config_.index_head_dim}, cpu_options_);
+  auto ref_score_state = torch::full({1, 8, 2 * config_.index_head_dim},
+                                     -std::numeric_limits<float>::infinity(),
+                                     torch::kFloat32);
+  (void)reference(warmup_x,
+                  warmup_qr,
+                  weights,
+                  ref_kv_state,
+                  ref_score_state,
+                  warmup_metadata);
   RefOut expected =
       reference(x, qr, weights, ref_kv_state, ref_score_state, metadata);
 
@@ -941,10 +911,8 @@ TEST_F(DeepseekV4IndexerTest, DecodeReturnsKernelSparseSlots) {
                                                       false,
                                                       compressed_sin,
                                                       compressed_cos);
-  test::verify_tensor_close(index_cache.cpu()[1][0][0].to(torch::kFloat32),
-                            expected.kv[0].to(torch::kFloat32),
-                            /*rtol=*/2e-2,
-                            /*atol=*/2e-2);
+  verify_cache(index_cache.cpu()[1][0][0].to(torch::kFloat32),
+               expected.kv[0].to(torch::kFloat32));
   EXPECT_EQ(actual_topk.dim(), 2);
   EXPECT_EQ(actual_topk.size(0), 1);
   EXPECT_EQ(actual_topk.size(1), config_.index_topk);
@@ -1032,10 +1000,8 @@ TEST_F(DeepseekV4IndexerTest, ChunkedPrefillReturnsKernelSparseSlots) {
                                                       compressed_sin,
                                                       compressed_cos);
 
-  test::verify_tensor_close(index_cache.cpu()[2][0][0].to(torch::kFloat32),
-                            expected.kv[0].to(torch::kFloat32),
-                            /*rtol=*/2e-2,
-                            /*atol=*/2e-2);
+  verify_cache(index_cache.cpu()[2][0][0].to(torch::kFloat32),
+               expected.kv[0].to(torch::kFloat32));
   EXPECT_EQ(actual_topk.dim(), 2);
   EXPECT_EQ(actual_topk.size(0), 3);
   EXPECT_EQ(actual_topk.size(1), config_.index_topk);

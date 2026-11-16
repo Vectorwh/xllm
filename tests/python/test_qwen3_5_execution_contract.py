@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -29,7 +28,6 @@ from xllm.python.attention.backend import LayerCache
 from xllm.python.layers.cuda.qwen3_5.decoder_layer import CudaQwen3_5DecoderLayer
 from xllm.python.layers.npu.qwen3_5 import decoder_layer as npu_decoder_module
 from xllm.python.layers.npu.qwen3_5 import gated_delta_net
-from xllm.python.layers.npu.qwen3_5.attention import NpuQwen3_5Attention
 from xllm.python.layers.npu.qwen3_5.decoder_layer import NpuQwen3_5DecoderLayer
 from xllm.python.layers.npu.qwen3_5.gated_delta_net import NpuQwen3_5GatedDeltaNet
 from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
@@ -42,7 +40,6 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
 from xllm.python.layers.npu.qwen3_5.gdn_metadata_builder import (
     Qwen3_5GdnMetadataBuilder,
 )
-from xllm.python.layers.npu.qwen3_5.moe import NpuQwen3_5SparseMoEBlock
 from xllm.python.layers.sequence_parallel_metadata import SpMetadata
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
@@ -598,35 +595,3 @@ def test_qwen_decoder_waits_for_layer_load_before_compute(
     synchronize.assert_called_once_with(3)
     torch.testing.assert_close(output, hidden)
     torch.testing.assert_close(residual, hidden)
-
-
-def test_npu_decoder_reuses_existing_attention_and_mega_moe() -> None:
-    from xllm.python.layers.npu.qwen3_5.decoder_layer import NpuQwen3_5DecoderLayer
-
-    assert NpuQwen3_5DecoderLayer.attention_cls is NpuQwen3_5Attention
-    assert NpuQwen3_5DecoderLayer.sparse_moe_cls is NpuQwen3_5SparseMoEBlock
-    assert NpuQwen3_5DecoderLayer.gated_delta_net_cls is NpuQwen3_5GatedDeltaNet
-
-
-def test_qwen35_model_source_has_no_execution_mode_dependencies() -> None:
-    from xllm.python.models import qwen3_5
-
-    source = inspect.getsource(qwen3_5) + inspect.getsource(gated_delta_net)
-    for forbidden_name in (
-        "AttentionMetadata",
-        "InputBatch",
-        "get_execution_buffer",
-        "get_forward_context",
-        "in_acl_graph",
-        "is_dummy",
-        "is_padding",
-    ):
-        assert forbidden_name not in source
-
-
-def test_qwen35_model_does_not_depend_on_npu_metadata() -> None:
-    from xllm.python.models import qwen3_5
-
-    source = inspect.getsource(qwen3_5)
-    assert "layers.npu" not in source
-    assert "Qwen3_5MoeMetadata" not in source

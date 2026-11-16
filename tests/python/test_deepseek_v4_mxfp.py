@@ -33,8 +33,6 @@ import torch.nn as nn
 
 _REPO_ROOT = Path(__file__).parents[2]
 
-torch.manual_seed(0)
-
 
 def _load_module(relpath: str, name: str) -> ModuleType:
     path = _REPO_ROOT / relpath
@@ -45,11 +43,13 @@ def _load_module(relpath: str, name: str) -> ModuleType:
     return module
 
 
-def _load_mx_kernels() -> ModuleType:
+def _load_mx_kernels(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    if "torch_npu" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
     return _load_module("xllm/python/kernels_npu/mxfp.py", "pr_mx_kernels")
 
 
-def _import_mx_layers() -> ModuleType:
+def _import_mx_layers(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Import the MXFP8 layers with the kernels stub wired to the real MX kernels.
 
     conftest stubs ``xllm.python.kernels`` so tests run without compiled
@@ -57,11 +57,11 @@ def _import_mx_layers() -> ModuleType:
     so attaching the file-loaded functions to the stub first exercises the
     real math through the canonical package import.
     """
-    mx_kernels = _load_mx_kernels()
+    mx_kernels = _load_mx_kernels(monkeypatch)
     kernels_stub = sys.modules["xllm.python.kernels"]
     if not isinstance(kernels_stub, ModuleType) or kernels_stub.__name__ != "xllm.python.kernels":
         kernels_stub = ModuleType("xllm.python.kernels")
-        sys.modules["xllm.python.kernels"] = kernels_stub
+        monkeypatch.setitem(sys.modules, "xllm.python.kernels", kernels_stub)
     for name in (
         "clipped_swiglu",
         "dynamic_mx_quant",
@@ -69,12 +69,17 @@ def _import_mx_layers() -> ModuleType:
         "quant_matmul_mx",
         "rms_norm_dynamic_mx_quant",
     ):
-        setattr(kernels_stub, name, getattr(mx_kernels, name))
+        monkeypatch.setattr(kernels_stub, name, getattr(mx_kernels, name), raising=False)
     # kernels_npu is build-safe to import as a package (no runtime init
     # needed); moe.py resolves its MX kernel module through the package context.
     from xllm.python.kernels_npu import moe
 
-    kernels_stub.moe_with_selected_experts_mxfp4 = moe.moe_with_selected_experts_mxfp4
+    monkeypatch.setattr(
+        kernels_stub,
+        "moe_with_selected_experts_mxfp4",
+        moe.moe_with_selected_experts_mxfp4,
+        raising=False,
+    )
     from xllm.python.layers.npu import deepseek_v4 as mx_layers
 
     return mx_layers
@@ -108,8 +113,8 @@ def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def test_expand_dense_block_scale_layout() -> None:
-    mx_kernels = _load_mx_kernels()
+def test_expand_dense_block_scale_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_kernels = _load_mx_kernels(monkeypatch)
     # 4 output blocks x 2 input blocks; distinct bytes track the mapping.
     scale = torch.arange(8, dtype=torch.uint8).reshape(4, 2)
     expanded = mx_kernels.expand_dense_block_scale(scale, n_out=512, n_in=256)
@@ -117,14 +122,14 @@ def test_expand_dense_block_scale_layout() -> None:
     # Row n, group k must see byte scale[n // 128, k // 4]; the [K/64, N, 2]
     # layout packs two adjacent k-groups per last-dim pair.
     for n in (0, 129, 300, 511):
-        for k in (0, 1, 2, 3):
+        for k in range(8):
             expect = scale[n // 128, k // 4].item()
             got = expanded[k // 2, n, k % 2].item()
             assert got == expect, (n, k, got, expect)
 
 
-def test_prepare_scale_mxfp4_keeps_strided_view() -> None:
-    mx_kernels = _load_mx_kernels()
+def test_prepare_scale_mxfp4_keeps_strided_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_kernels = _load_mx_kernels(monkeypatch)
     scale = torch.arange(4 * 8 * 6, dtype=torch.uint8).reshape(4, 8, 6)
     viewed = mx_kernels.prepare_scale_mxfp4(scale)
     assert viewed.shape == (4, 3, 8, 2)
@@ -152,58 +157,23 @@ def test_e8m0_reference_semantics() -> None:
     assert vals[0, 3].item() == 0.0
 
 
-def test_grouped_o_projection_processing_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
-    linear_module = _load_module("xllm/python/layers/npu/deepseek_v4/linear.py", "pr_mx_linear")
-    kernels_stub = sys.modules["xllm.python.kernels"]
-    monkeypatch.setattr(
-        kernels_stub,
-        "expand_dense_block_scale",
-        lambda scale, n_out, n_in: scale,
-        raising=False,
-    )
-    GroupedOProjection = linear_module.NpuDeepseekV4GroupedOProjectionMXFP8
-    projection = GroupedOProjection(
-        group_hidden=256,
-        o_lora_rank=128,
-        n_local_groups=2,
-        device=torch.device("cpu"),
-    )
-    weight = torch.arange(256 * 256, dtype=torch.uint8).reshape(256, 256).to(torch.float8_e4m3fn)
-    scale = torch.arange(4, dtype=torch.uint8).reshape(2, 2)
-    projection.weight.data.copy_(weight)
-    projection.weight_scale.copy_(scale)
-
-    projection.process_weights_after_loading()
-    expected_weights = [group_weight.clone() for group_weight in projection._group_weights]
-    expected_scales = [group_scale.clone() for group_scale in projection._group_scales]
-    projection.process_weights_after_loading()
-
-    assert len(projection._group_weights) == len(expected_weights)
-    assert len(projection._group_scales) == len(expected_scales)
-    assert all(
-        torch.equal(actual, expected)
-        for actual, expected in zip(projection._group_weights, expected_weights, strict=True)
-    )
-    assert all(
-        torch.equal(actual, expected)
-        for actual, expected in zip(projection._group_scales, expected_scales, strict=True)
-    )
-
-
 # ---------------------------------------------------------------------------
 # Device numerical goldens (Ascend 950)
 # ---------------------------------------------------------------------------
 
-_npu = pytest.importorskip("torch_npu")
+try:
+    import torch_npu as _npu
+except ImportError:
+    _npu = None
 
-DEVICE = torch.device("npu:0") if torch.npu.is_available() else None
+DEVICE = torch.device("npu:0") if _npu is not None and torch.npu.is_available() else None
 
 _A5_SOC_VERSION = 260
 _A5_SOC_VERSION_MIN = 300
 
 
 def _is_a5_npu() -> bool:
-    if DEVICE is None:
+    if DEVICE is None or _npu is None:
         return False
     soc_version = int(_npu.npu.get_soc_version())
     return soc_version == _A5_SOC_VERSION or soc_version >= _A5_SOC_VERSION_MIN
@@ -231,10 +201,10 @@ def _random_linear_mxfp8(
 
 
 @requires_a5
-def test_dynamic_linear_mxfp8_golden() -> None:
-    mx_layers = _import_mx_layers()
+def test_dynamic_linear_mxfp8_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_layers = _import_mx_layers(monkeypatch)
     DynamicLinear = mx_layers.NpuDeepseekV4DynamicLinearMXFP8
-    mx_kernels = _load_mx_kernels()
+    mx_kernels = _load_mx_kernels(monkeypatch)
     in_features, out_features, m_rows = 256, 128, 5
     linear, scale, weight_orig = _random_linear_mxfp8(in_features, out_features, DynamicLinear)
     linear.process_weights_after_loading()
@@ -250,8 +220,8 @@ def test_dynamic_linear_mxfp8_golden() -> None:
 
 
 @requires_a5
-def test_rms_norm_dynamic_mx_quant_matches_manual_chain() -> None:
-    mx_kernels = _load_mx_kernels()
+def test_rms_norm_dynamic_mx_quant_matches_manual_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_kernels = _load_mx_kernels(monkeypatch)
     m_rows, k = 37, 4096
     x = torch.randn(m_rows, k, dtype=torch.bfloat16, device=DEVICE) * 2.3
     gamma = torch.rand(k, dtype=torch.bfloat16, device=DEVICE) * 2 + 0.5
@@ -275,8 +245,8 @@ def test_rms_norm_dynamic_mx_quant_matches_manual_chain() -> None:
 
 
 @requires_a5
-def test_grouped_o_projection_mxfp8_golden() -> None:
-    mx_layers = _import_mx_layers()
+def test_grouped_o_projection_mxfp8_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_layers = _import_mx_layers(monkeypatch)
     GroupedOProjection = mx_layers.NpuDeepseekV4GroupedOProjectionMXFP8
 
     group_hidden, lora, n_local, m_rows = 256, 128, 2, 13
@@ -292,7 +262,7 @@ def test_grouped_o_projection_mxfp8_golden() -> None:
     out = proj(x)
     assert out.shape == (m_rows, n_local * lora)
 
-    mx_kernels = _load_mx_kernels()
+    mx_kernels = _load_mx_kernels(monkeypatch)
     xq, xs = mx_kernels.dynamic_mx_quant(x)
     s_f = _e8m0_to_float(scale)
     w_ref = weight_orig.float() * s_f.repeat_interleave(128, 0).repeat_interleave(128, 1)
@@ -304,8 +274,8 @@ def test_grouped_o_projection_mxfp8_golden() -> None:
 
 
 @requires_a5
-def test_row_parallel_linear_mxfp8_shard_golden() -> None:
-    mx_layers = _import_mx_layers()
+def test_row_parallel_linear_mxfp8_shard_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_layers = _import_mx_layers(monkeypatch)
     RowParallelLinear = mx_layers.NpuDeepseekV4RowParallelLinearMXFP8
 
     in_features, out_features, m_rows = 512, 256, 9
@@ -320,7 +290,7 @@ def test_row_parallel_linear_mxfp8_shard_golden() -> None:
 
     x = torch.randn(m_rows, in_features, dtype=torch.bfloat16, device=DEVICE) * 2.1
     out = row(x)
-    mx_kernels = _load_mx_kernels()
+    mx_kernels = _load_mx_kernels(monkeypatch)
     xq, xs = mx_kernels.dynamic_mx_quant(x)
     w_ref = weight_orig.float() * _e8m0_to_float(scale).repeat_interleave(128, 0).repeat_interleave(128, 1)
     a_ref = xq.cpu().float() * _e8m0_to_float(xs.cpu().reshape(m_rows, -1)).repeat_interleave(32, dim=1)
@@ -334,12 +304,22 @@ def test_row_parallel_linear_mxfp8_shard_golden() -> None:
     row2.weight.data.copy_(weight.to(torch.float8_e4m3fn))
     row2.weight_scale.copy_(scale)
     row2.process_weights_after_loading()
+    monkeypatch.setattr(mx_layers.linear.distributed, "tp_all_reduce", lambda value: value)
     assert row2.weight.data.shape == (in_features // 2, out_features)
     # rank 1 owns K columns [256, 512); scale cols [2, 4).
-    w2_ref = weight[None, :, 256:].cpu().float() * _e8m0_to_float(scale[:, 2:]).repeat_interleave(
-        128, 0
-    ).repeat_interleave(128, 1)
-    got = row2._kernel_scale  # noqa: SLF001 - layout assertion
+    partial_x = x[:, 256:]
+    partial_out = row2(partial_x)
+    xq2, xs2 = mx_kernels.dynamic_mx_quant(partial_x)
+    w2_ref = weight_orig[:, 256:].float() * _e8m0_to_float(scale[:, 2:]).repeat_interleave(128, 0).repeat_interleave(
+        128, 1
+    )
+    a2_ref = xq2.cpu().float() * _e8m0_to_float(xs2.cpu().reshape(m_rows, -1)).repeat_interleave(32, dim=1)
+    partial_ref = a2_ref @ w2_ref.t()
+    partial_err = (
+        ((partial_out.cpu().float() - partial_ref).abs() / partial_ref.abs().max().clamp_min(1e-6)).max().item()
+    )
+    assert partial_err < 0.02, f"rank-1 rel_err={partial_err}"
+    got = row2._kernel_scale  # noqa: SLF001 - validates kernel scale layout
     expect = (
         scale[:, 2:]
         .repeat_interleave(4, dim=1)
@@ -351,8 +331,8 @@ def test_row_parallel_linear_mxfp8_shard_golden() -> None:
 
 
 @requires_a5
-def test_mlp_mxfp8_golden() -> None:
-    mx_layers = _import_mx_layers()
+def test_mlp_mxfp8_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_layers = _import_mx_layers(monkeypatch)
     MLP = mx_layers.NpuDeepseekV4MLPMXFP8
 
     hidden, inter, m_rows, limit = 256, 256, 7, 10.0
@@ -375,7 +355,7 @@ def test_mlp_mxfp8_golden() -> None:
     x = torch.randn(m_rows, hidden, dtype=torch.bfloat16, device=DEVICE) * 3.3
     out = mlp(x)
 
-    mx_kernels = _load_mx_kernels()
+    mx_kernels = _load_mx_kernels(monkeypatch)
 
     def deq_w(name):
         weight_orig, scale = originals[name]
@@ -399,9 +379,9 @@ def test_mlp_mxfp8_golden() -> None:
 
 
 @requires_a5
-def test_moe_with_selected_experts_mxfp4_golden() -> None:
-    mx_kernels = _load_mx_kernels()
-    _import_mx_layers()  # wires the MXFP4 op onto the kernels stub
+def test_moe_with_selected_experts_mxfp4_golden(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_kernels = _load_mx_kernels(monkeypatch)
+    _import_mx_layers(monkeypatch)  # wires the MXFP4 op onto the kernels stub
     kernels = sys.modules["xllm.python.kernels"]
     num_experts, hidden, inter, topk, m_rows, limit = 4, 256, 128, 2, 7, 10.0
     # Packed fp4 weights + ue8m0 scales for all experts.
@@ -455,8 +435,8 @@ def test_moe_with_selected_experts_mxfp4_golden() -> None:
 
 
 @requires_a5
-def test_linear_mxfp8_graph_capture() -> None:
-    mx_layers = _import_mx_layers()
+def test_linear_mxfp8_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    mx_layers = _import_mx_layers(monkeypatch)
     DynamicLinear = mx_layers.NpuDeepseekV4DynamicLinearMXFP8
 
     in_features, out_features, m_rows = 256, 128, 16

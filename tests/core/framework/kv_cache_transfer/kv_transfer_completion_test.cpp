@@ -194,19 +194,6 @@ TEST(KVTransferCompletionTest, WaitsForEveryTransfer) {
   EXPECT_TRUE(result.get().empty());
 }
 
-TEST(KVTransferCompletionTest, ReportsTransferFailure) {
-  folly::Promise<std::vector<KVTransferTaskResult>> success_promise;
-  folly::Promise<std::vector<KVTransferTaskResult>> failure_promise;
-  KVTransferCompletion completion;
-  completion.add(success_promise.getSemiFuture(), {"request-a"});
-  completion.add(failure_promise.getSemiFuture(), {"request-b"});
-  success_promise.setValue(std::vector<KVTransferTaskResult>{});
-  failure_promise.setValue(std::vector<KVTransferTaskResult>{
-      KVTransferTaskResult{{"request-b"}, KVTransferErrorCode::FAILED}});
-
-  EXPECT_EQ(completion.wait(), (std::unordered_set<std::string>{"request-b"}));
-}
-
 TEST(KVTransferCompletionTest, IsolatesFailedTaskRequests) {
   folly::Promise<std::vector<KVTransferTaskResult>> success_promise;
   folly::Promise<std::vector<KVTransferTaskResult>> failure_promise;

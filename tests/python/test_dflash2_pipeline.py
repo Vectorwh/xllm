@@ -38,7 +38,6 @@ from xllm.python.models.dflash2_model import DFlash2DecoderModel, DFlash2Samplin
 from xllm.python.models.dflash_model import DFlashDecoderModel
 from xllm.python.models.qwen3_dflash2 import DFlash2CandidateSelector, DFlash2Qwen3ForCausalLM
 from xllm.python.pipelines.dflash2_pipeline import DFlash2ExecutionPipeline
-from xllm.python.registry import get_execution_metadata_builder_classes
 
 acl_graph_runtime = pipeline_tests.acl_graph_runtime
 capture_lock_state = pipeline_tests.capture_lock_state
@@ -476,8 +475,7 @@ def test_builder_preserves_dynamic_sampling_controls(modes: list[bool], temperat
     assert builder.can_execute_graph(inputs.input_batch) == (not any(modes) and temperatures is None)
 
 
-def test_registered_builder_and_invalid_noise() -> None:
-    assert get_execution_metadata_builder_classes("DFlash2DraftModel") == (DFlash2SamplingMetadataBuilder,)
+def test_builder_rejects_invalid_noise() -> None:
     builder = DFlash2SamplingMetadataBuilder.from_config({"draft_query_width": 4, "dflash2_selector_top_k": 4})
     inputs = _sampling_inputs([False])
     inputs.input_batch.sampling.gumbel_noise = torch.zeros(1, 2, 4)

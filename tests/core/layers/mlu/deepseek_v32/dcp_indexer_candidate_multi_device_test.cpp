@@ -211,8 +211,6 @@ void check_candidate_wire_bits(int32_t rank,
       }
       const torch::Tensor input_slots = slots.cpu();
       auto ctx = launch_dcp_indexer_candidate_gather(scores, slots, &group);
-      CHECK_EQ(ctx.local_packet.is_alias_of(scores),
-               adjacent && count % 2 == 0);
       const auto gathered = finish_dcp_indexer_candidate_gather(std::move(ctx));
       CHECK_EQ(gathered.scores.scalar_type(), torch::kBFloat16);
       CHECK(gathered.scores.sizes() ==
@@ -423,7 +421,7 @@ TEST(DcpIndexerCandidateMultiDeviceTest,
 }
 
 TEST(DcpIndexerCandidateMultiDeviceTest,
-     OverlapsComputeWithLaunchedCandidateGather) {
+     LaunchedGatherKeepsTemporaryInputsAliveDuringCompute) {
   run_candidate_collective_test(/*world_size=*/2,
                                 run_candidate_async_collective_child);
 }

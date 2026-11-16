@@ -641,46 +641,6 @@ TEST(DiTRequestParamsTest, VideoGenerationCountValidatesAfterParsing) {
   EXPECT_TRUE(verify_fails_with_invalid_argument(params));
 }
 
-TEST(DiTRequestParamsTest, PromptAudioUsesCanonicalSourceIdentity) {
-  std::string wav_base64;
-  butil::Base64Encode(TinyWavBytes(), &wav_base64);
-  proto::AudioGenerationRequest request = MakeAudioRequest();
-  proto::MediaSource* source = request.mutable_input()->mutable_prompt_audio();
-  source->set_type("base64");
-  source->set_name("ignored-name");
-  source->set_modality("image");
-  source->set_base64(wav_base64);
-  const std::string original_request = request.SerializeAsString();
-
-  DiTRequestParams params(request, "rid", "rtime");
-  const DiTInputParams& input_params = decode_input(params);
-
-  ASSERT_EQ(input_params.media_sources.size(), 1u);
-  EXPECT_EQ(input_params.media_sources.at(0).name, "prompt_audio");
-  EXPECT_EQ(input_params.media_sources.at(0).modality, "audio");
-  EXPECT_EQ(request.SerializeAsString(), original_request);
-}
-
-TEST(DiTRequestParamsTest, BinaryPromptAudioUsesCanonicalSourceIdentity) {
-  proto::AudioGenerationRequest request = MakeAudioRequest();
-  proto::MediaSource* source = request.mutable_input()->mutable_prompt_audio();
-  source->set_type("binary");
-  source->set_name("ignored-name");
-  source->set_modality("image");
-  source->mutable_binary()->set_offset(2);
-  source->mutable_binary()->set_length(TinyWavBytes().size());
-  const std::string original_request = request.SerializeAsString();
-
-  DiTRequestParams params(
-      request, "rid", "rtime", BinaryPayload("xx" + TinyWavBytes()));
-  const DiTInputParams& input_params = decode_input(params);
-
-  ASSERT_EQ(input_params.media_sources.size(), 1u);
-  EXPECT_EQ(input_params.media_sources.at(0).name, "prompt_audio");
-  EXPECT_EQ(input_params.media_sources.at(0).modality, "audio");
-  EXPECT_EQ(request.SerializeAsString(), original_request);
-}
-
 TEST(DiTRequestParamsTest, VideoDefaultAudioSamplingRateIs32000) {
   proto::VideoGenerationRequest request = MakeVideoRequest();
 
@@ -697,6 +657,8 @@ TEST(DiTRequestParamsTest, PromptAudioSupportsBase64AndBinary) {
   proto::MediaSource* base64_source =
       base64_request.mutable_input()->mutable_prompt_audio();
   base64_source->set_type("base64");
+  base64_source->set_name("ignored-name");
+  base64_source->set_modality("image");
   base64_source->set_base64(wav_base64);
   const std::string original_base64_request =
       base64_request.SerializeAsString();
@@ -706,6 +668,8 @@ TEST(DiTRequestParamsTest, PromptAudioSupportsBase64AndBinary) {
   proto::MediaSource* binary_source =
       binary_request.mutable_input()->mutable_prompt_audio();
   binary_source->set_type("binary");
+  binary_source->set_name("ignored-name");
+  binary_source->set_modality("image");
   binary_source->mutable_binary()->set_offset(2);
   binary_source->mutable_binary()->set_length(TinyWavBytes().size());
   const std::string original_binary_request =

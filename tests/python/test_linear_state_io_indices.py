@@ -17,13 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
-def _resolve_linear_state_io_indices(
-    metadata: SimpleNamespace,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    from xllm.python.attention.backend import resolve_linear_state_io_indices
-
-    return resolve_linear_state_io_indices(metadata)
+from xllm.python.attention.backend import resolve_linear_state_io_indices
 
 
 def _metadata(
@@ -47,7 +41,7 @@ def _metadata(
 def test_missing_read_indices_reuses_write_indices() -> None:
     write_indices = torch.tensor([3, 7], dtype=torch.int32)
 
-    read_indices, resolved_write_indices = _resolve_linear_state_io_indices(
+    read_indices, resolved_write_indices = resolve_linear_state_io_indices(
         _metadata(write_indices, None, is_prefill=True)
     )
 
@@ -60,7 +54,7 @@ def test_none_write_indices_reuses_legacy_indices() -> None:
     metadata = _metadata(None, None, is_prefill=True)
     metadata.linear_state_indices = legacy_indices
 
-    read_indices, write_indices = _resolve_linear_state_io_indices(metadata)
+    read_indices, write_indices = resolve_linear_state_io_indices(metadata)
 
     assert read_indices is legacy_indices
     assert write_indices is legacy_indices
@@ -70,7 +64,7 @@ def test_prefill_accepts_distinct_read_and_write_indices() -> None:
     read_indices = torch.tensor([2, 5], dtype=torch.int32)
     write_indices = torch.tensor([3, 7], dtype=torch.int32)
 
-    resolved_read_indices, resolved_write_indices = _resolve_linear_state_io_indices(
+    resolved_read_indices, resolved_write_indices = resolve_linear_state_io_indices(
         _metadata(write_indices, read_indices, is_prefill=True)
     )
 
@@ -82,7 +76,7 @@ def test_chunked_prefill_accepts_distinct_read_and_write_indices() -> None:
     read_indices = torch.tensor([2], dtype=torch.int32)
     write_indices = torch.tensor([3], dtype=torch.int32)
 
-    resolved_read_indices, resolved_write_indices = _resolve_linear_state_io_indices(
+    resolved_read_indices, resolved_write_indices = resolve_linear_state_io_indices(
         _metadata(
             write_indices,
             read_indices,
@@ -99,7 +93,7 @@ def test_decode_rejects_distinct_read_and_write_indices() -> None:
     read_indices = torch.tensor([2], dtype=torch.int32)
     write_indices = read_indices.clone()
 
-    resolved_read_indices, resolved_write_indices = _resolve_linear_state_io_indices(
+    resolved_read_indices, resolved_write_indices = resolve_linear_state_io_indices(
         _metadata(write_indices, read_indices, is_prefill=False)
     )
 
@@ -110,9 +104,7 @@ def test_decode_rejects_distinct_read_and_write_indices() -> None:
         RuntimeError,
         match="read/write separation is only supported for non-speculative prefill",
     ):
-        _resolve_linear_state_io_indices(
-            _metadata(torch.tensor([3], dtype=torch.int32), read_indices, is_prefill=False)
-        )
+        resolve_linear_state_io_indices(_metadata(torch.tensor([3], dtype=torch.int32), read_indices, is_prefill=False))
 
 
 def test_spec_verify_rejects_distinct_read_and_write_indices() -> None:
@@ -123,7 +115,7 @@ def test_spec_verify_rejects_distinct_read_and_write_indices() -> None:
         RuntimeError,
         match="read/write separation is only supported for non-speculative prefill",
     ):
-        _resolve_linear_state_io_indices(
+        resolve_linear_state_io_indices(
             _metadata(
                 write_indices,
                 read_indices,
@@ -138,20 +130,18 @@ def test_read_and_write_indices_must_have_matching_shapes() -> None:
     write_indices = torch.tensor([3, 7], dtype=torch.int32)
 
     with pytest.raises(RuntimeError, match="must have the same shape"):
-        _resolve_linear_state_io_indices(_metadata(write_indices, read_indices, is_prefill=True))
+        resolve_linear_state_io_indices(_metadata(write_indices, read_indices, is_prefill=True))
 
 
 def test_read_indices_require_write_indices() -> None:
     read_indices = torch.tensor([2], dtype=torch.int32)
 
     with pytest.raises(RuntimeError, match="require write indices"):
-        _resolve_linear_state_io_indices(_metadata(None, read_indices, is_prefill=True))
+        resolve_linear_state_io_indices(_metadata(None, read_indices, is_prefill=True))
 
 
 @pytest.mark.parametrize("is_spec_verify", [False, True])
 def test_capable_backend_accepts_distinct_decode_slots(is_spec_verify: bool) -> None:
-    from xllm.python.attention.backend import resolve_linear_state_io_indices
-
     read_indices = torch.tensor([2, 5], dtype=torch.int32)
     write_indices = torch.tensor([3, 7], dtype=torch.int32)
     metadata = _metadata(write_indices, read_indices, is_prefill=False, is_spec_verify=is_spec_verify)

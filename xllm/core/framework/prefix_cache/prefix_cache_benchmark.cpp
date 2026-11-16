@@ -120,9 +120,6 @@ static void BM_HashSearch(benchmark::State& state) {
   const uint32_t total_blocks = state.range(0);
   const uint32_t token_id_count = state.range(1);
 
-  // LOG(INFO) << "total blocks " << total_blocks << ", token_id_count " <<
-  // token_id_count;
-
   assert((token_id_count / block_size) < total_blocks);
   uint32_t n_blocks = token_id_count / block_size;
 

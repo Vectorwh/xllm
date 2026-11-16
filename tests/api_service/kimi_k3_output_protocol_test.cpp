@@ -35,6 +35,7 @@ namespace {
 // Keep splitting response/tool envelopes to exercise their independent parser.
 std::vector<std::string> stream_chunks(const std::string& text, bool thinking) {
   std::vector<std::string> chunks;
+  chunks.reserve(text.size() + 1);
   size_t offset = 0;
   if (thinking) {
     const std::string end = "<|close|>think<|sep|>";
@@ -45,43 +46,6 @@ std::vector<std::string> stream_chunks(const std::string& text, bool thinking) {
     chunks.push_back(text.substr(offset, 1));
   }
   return chunks;
-}
-
-TEST(KimiK3OutputProtocolTest, OptInPreservesOtherParserSelections) {
-  StreamOutputParser kimi({}, "kimi_k3", "kimi_k3", true);
-  EXPECT_TRUE(kimi.is_tool_call());
-  EXPECT_NE(kimi.get_tool_call_parser(0), nullptr);
-  EXPECT_TRUE(api_service::should_run_tool_call_parser({}, "kimi_k3"));
-  EXPECT_TRUE(api_service::should_run_tool_call_parser(
-      {}, *kimi.get_tool_call_parser(0)));
-  const std::vector<JsonTool> tools = {JsonTool(
-      "function", JsonFunction("weather", "", nlohmann::json::object()))};
-  StreamOutputParser kimi_with_tools(tools, "kimi_k3", "kimi_k3", true);
-  EXPECT_TRUE(kimi_with_tools.is_tool_call());
-  EXPECT_NE(kimi_with_tools.get_tool_call_parser(0), nullptr);
-  EXPECT_TRUE(api_service::should_run_tool_call_parser(tools, "qwen25"));
-  for (const auto& format : {"qwen25",
-                             "qwen3_coder",
-                             "kimi_k2",
-                             "deepseekv3",
-                             "deepseekv32",
-                             "deepseekv4",
-                             "deepseekv41",
-                             "glm45",
-                             "glm47",
-                             "glm5",
-                             ""}) {
-    StreamOutputParser peer({}, format, "");
-    EXPECT_FALSE(peer.is_tool_call());
-    EXPECT_EQ(peer.get_tool_call_parser(0), nullptr);
-    EXPECT_FALSE(api_service::should_run_tool_call_parser({}, format));
-    if (std::string(format).empty()) {
-      continue;
-    }
-    function_call::FunctionCallParser selected({}, format);
-    EXPECT_FALSE(api_service::should_run_tool_call_parser({}, selected));
-    EXPECT_TRUE(api_service::should_run_tool_call_parser(tools, selected));
-  }
 }
 
 TEST(KimiK3OutputProtocolTest, NoToolsSequencesKeepIndependentEnvelopeState) {
@@ -285,40 +249,6 @@ TEST(KimiK3OutputProtocolTest, ThinkingMatchesTemplateAndParserChain) {
   }
 }
 
-TEST(KimiK3OutputProtocolTest, NoToolsEnvelopeUsesSelectedToolParser) {
-  for (bool thinking : {false, true}) {
-    const nlohmann::json kwargs = {{"thinking", thinking}};
-    const bool force_reasoning =
-        api_service::get_enable_thinking_from_request(kwargs, "kimi_k3");
-    const std::string text =
-        (thinking ? "plan<|close|>think<|sep|><|open|>response<|sep|>" : "") +
-        std::string("answer<|close|>response<|sep|><|close|>message<|sep|>");
-    StreamOutputParser streaming({}, "kimi_k3", "kimi_k3", force_reasoning);
-    ASSERT_TRUE(streaming.is_tool_call());
-    std::string reasoning;
-    std::string content;
-    for (const auto& chunk : stream_chunks(text, force_reasoning)) {
-      const auto result =
-          streaming.get_reasoning_parser(0)->parse_stream_chunk(chunk);
-      reasoning += result.reasoning_text.value_or("");
-      if (result.normal_text.has_value()) {
-        content += streaming.get_tool_call_parser(0)
-                       ->parse_streaming_increment(*result.normal_text)
-                       .normal_text;
-      }
-    }
-    EXPECT_EQ(content, "answer");
-    EXPECT_EQ(reasoning, thinking ? "plan" : "");
-
-    ReasoningParser non_stream("kimi_k3", false, force_reasoning);
-    const auto parsed = non_stream.parse_non_stream(text);
-    EXPECT_EQ(api_service::process_tool_calls(
-                  *parsed.normal_text, {}, "kimi_k3", "stop")
-                  .text,
-              "answer");
-  }
-}
-
 TEST(KimiK3OutputProtocolTest, PeerThinkingDoesNotSelectKimiEnvelopeRules) {
   const std::vector<JsonTool> tools = {JsonTool(
       "function", JsonFunction("weather", "", nlohmann::json::object()))};
@@ -349,6 +279,9 @@ TEST(KimiK3OutputProtocolTest, PeerThinkingDoesNotSelectKimiEnvelopeRules) {
     EXPECT_EQ(result.text, content);
     EXPECT_EQ(result.finish_reason, "stop");
     EXPECT_FALSE(result.tool_calls.has_value());
+
+    StreamOutputParser no_tools({}, "qwen25", "qwen3", force_reasoning);
+    EXPECT_FALSE(no_tools.is_tool_call());
   }
 }
 

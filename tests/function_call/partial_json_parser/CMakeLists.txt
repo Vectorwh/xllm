@@ -6,7 +6,6 @@ cc_test(
     partial_json_parser_test
   SRCS
     test_examples.cpp
-    test_property_based.cpp
   DEPS
     :partial_json_parser
     GTest::gtest

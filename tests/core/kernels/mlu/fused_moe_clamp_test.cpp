@@ -50,9 +50,9 @@ torch::Tensor make_counts(int64_t total,
                           int64_t experts,
                           torch::ScalarType dtype) {
   torch::Tensor counts = torch::zeros({experts}, torch::kInt64);
-  for (int64_t i = 0; i < total; ++i) {
-    counts[(i * 7) % experts] += 1;
-  }
+  const torch::Tensor indices =
+      (torch::arange(total, torch::kInt64) * 7).remainder(experts);
+  counts.scatter_add_(/*dim=*/0, indices, torch::ones_like(indices));
   return counts.to(dtype);
 }
 
@@ -61,17 +61,25 @@ TEST(FusedMoeClampTest, MatchesReferenceForDtypesWidthsAndSpecials) {
   torch::DeviceGuard guard(device);
   for (const torch::ScalarType dtype :
        {torch::kBFloat16, torch::kFloat16, torch::kFloat32}) {
-    for (const int64_t width : {2, 14, 258, 4096, 6144}) {
-      for (const int64_t rows : {1, 9, 257, 4096}) {
-        const torch::Tensor input = with_specials(
-            torch::randn({rows, width}).mul(/*other=*/12).to(dtype));
-        const torch::Tensor expected = reference_clamp(input, /*limit=*/10);
-        torch::Tensor output = input.to(device);
-        kernel::mlu::fused_moe_clamp(output, /*limit=*/10, std::nullopt);
-        EXPECT_TRUE(torch::allclose(
-            output.cpu(), expected, /*rtol=*/0, /*atol=*/0, /*equal_nan=*/true))
-            << "dtype " << dtype << " width " << width << " rows " << rows;
-      }
+    // Minimum width, unaligned patterns, idle cores, and partial/full DMA
+    // pipelines. Both wide rows have their own pattern and tile-size risks.
+    for (const auto& [rows, width] :
+         std::vector<std::pair<int64_t, int64_t>>{{1, 2},
+                                                  {9, 14},
+                                                  {257, 258},
+                                                  {9, 4096},
+                                                  {257, 4096},
+                                                  {4096, 4096},
+                                                  {257, 6144},
+                                                  {4096, 6144}}) {
+      const torch::Tensor input = with_specials(
+          torch::randn({rows, width}).mul(/*other=*/12).to(dtype));
+      const torch::Tensor expected = reference_clamp(input, /*limit=*/10);
+      torch::Tensor output = input.to(device);
+      kernel::mlu::fused_moe_clamp(output, /*limit=*/10, std::nullopt);
+      EXPECT_TRUE(torch::allclose(
+          output.cpu(), expected, /*rtol=*/0, /*atol=*/0, /*equal_nan=*/true))
+          << "dtype " << dtype << " width " << width << " rows " << rows;
     }
   }
 }

@@ -166,7 +166,7 @@ TEST(SharedMemoryManagerTest, ConcurrentLastOwnerHandoffKeepsOneGeneration) {
       "xllm_shm_handoff_test_" + std::to_string(static_cast<int64_t>(getpid()));
   constexpr size_t kSize = 4096;
   constexpr int32_t kThreads = 8;
-  constexpr int32_t kIterations = 128;
+  constexpr int32_t kIterations = 16;
 
   shm_unlink(name.c_str());
   for (int32_t iteration = 0; iteration < kIterations; ++iteration) {

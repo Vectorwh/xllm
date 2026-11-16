@@ -15,11 +15,15 @@ limitations under the License.
 
 #include "layers/mlu/fused_moe.h"
 
+#include <c10/core/DeviceGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <future>
+#include <mutex>
 
 #include "framework/model/model_args.h"
 #include "framework/model_context.h"
@@ -34,22 +38,34 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+namespace {
+
+class CountingReduceProcessGroup : public test::MockProcessGroup {
+ public:
+  CountingReduceProcessGroup(const torch::Device& device, int64_t size)
+      : test::MockProcessGroup(device, 0, size) {}
+  void allreduce(torch::Tensor& input) override {
+    ++calls;
+    input.mul_(world_size());
+  }
+  int32_t calls = 0;
+};
 
 class FusedMoETest : public ::testing::Test {
  protected:
   void SetUp() override {
-    // Initialize default model arguments for testing
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    device_guard_ = std::make_unique<c10::DeviceGuard>(
+        torch::Device(Platform::type_torch(), 0));
     model_args_ = test::create_default_model_args();
-
-    // Initialize w8a8 quantization arguments
     quant_args_ = test::create_default_quant_args();
-
-    // Initialize tensor options
     options_ = torch::TensorOptions()
                    .dtype(torch::kBFloat16)
                    .device(Platform::type_torch(), 0)
                    .requires_grad(false);
-    // Create mock ProcessGroup and initialize ParallelArgs
     parallel_args_ = test::create_default_parallel_args(mock_process_group_);
     model_context_ =
         ModelContext(parallel_args_, model_args_, quant_args_, options_);
@@ -57,169 +73,37 @@ class FusedMoETest : public ::testing::Test {
         ExecutionStreamRole::COMMUNICATION);
     shared_compute_stream_ = model_context_.stream_registry()->get(
         ExecutionStreamRole::AUXILIARY_COMPUTE);
-
-    // Note: FusedMoE will be created by individual test cases with their
-    // desired dimensions
-  }
-
-  void TearDown() override {
-    // Clean up if needed
-  }
-
-  // Helper function to create router logits tensor
-  torch::Tensor create_router_logits(const std::vector<int64_t>& shape,
-                                     const std::vector<float>& values) {
-    return test::create_custom_input(shape, values, options_);
   }
 
   std::unordered_map<std::string, torch::Tensor> create_default_test_weights(
       int64_t num_experts,
       int64_t hidden_size,
       int64_t intermediate_size) {
-    // Create test weights for each expert
-    std::unordered_map<std::string, torch::Tensor> weight_dict;
-
-    for (size_t expert_id = 0; expert_id < num_experts; ++expert_id) {
-      std::string expert_prefix = "experts." + std::to_string(expert_id) + ".";
-
-      // Create gate_proj weights (ColumnParallelLinear)
-      // Shape: [intermediate_size, hidden_size]
-      auto gate_weight =
-          torch::full({intermediate_size, hidden_size}, 2.0f, options_);
-      auto gate_qweight = gate_weight.to(torch::kInt8);
-      auto gate_scale = torch::full({intermediate_size},
-                                    0.1f,
-                                    torch::TensorOptions()
-                                        .dtype(torch::kFloat32)
-                                        .device(options_.device()));
-      auto gate_smooth = torch::full({hidden_size},
-                                     0.05f,
-                                     torch::TensorOptions()
-                                         .dtype(torch::kFloat32)
-                                         .device(options_.device()));
-
-      // Create up_proj weights (ColumnParallelLinear)
-      // Shape: [intermediate_size, hidden_size]
-      auto up_weight =
-          torch::full({intermediate_size, hidden_size}, 2.0f, options_);
-      auto up_qweight = up_weight.to(torch::kInt8);
-      auto up_scale = torch::full({intermediate_size},
-                                  0.1f,
-                                  torch::TensorOptions()
-                                      .dtype(torch::kFloat32)
-                                      .device(options_.device()));
-      auto up_smooth = torch::full({hidden_size},
-                                   0.05f,
-                                   torch::TensorOptions()
-                                       .dtype(torch::kFloat32)
-                                       .device(options_.device()));
-
-      // Create down_proj weights (RowParallelLinear)
-      // Shape: [hidden_size, intermediate_size]
-      auto down_weight =
-          torch::full({hidden_size, intermediate_size}, 3.0f, options_);
-      auto down_qweight = down_weight.to(torch::kInt8);
-      auto down_scale = torch::full({hidden_size},
-                                    0.1f,
-                                    torch::TensorOptions()
-                                        .dtype(torch::kFloat32)
-                                        .device(options_.device()));
-      auto down_smooth = torch::full({intermediate_size},
-                                     0.05f,
-                                     torch::TensorOptions()
-                                         .dtype(torch::kFloat32)
-                                         .device(options_.device()));
-
-      // Add weights to dictionary
-      // expert
-      weight_dict[expert_prefix + "gate_proj.qweight"] = gate_qweight;
-      weight_dict[expert_prefix + "gate_proj.per_channel_scale"] = gate_scale;
-      weight_dict[expert_prefix + "gate_proj.smooth"] = gate_smooth;
-
-      weight_dict[expert_prefix + "up_proj.qweight"] = up_qweight;
-      weight_dict[expert_prefix + "up_proj.per_channel_scale"] = up_scale;
-      weight_dict[expert_prefix + "up_proj.smooth"] = up_smooth;
-
-      weight_dict[expert_prefix + "down_proj.qweight"] = down_qweight;
-      weight_dict[expert_prefix + "down_proj.per_channel_scale"] = down_scale;
-      weight_dict[expert_prefix + "down_proj.smooth"] = down_smooth;
+    std::unordered_map<std::string, torch::Tensor> weights;
+    auto projection = [&](const std::string& prefix, bool down, int8_t value) {
+      const int64_t rows = down ? hidden_size : intermediate_size;
+      const int64_t columns = down ? intermediate_size : hidden_size;
+      weights[prefix + "qweight"] =
+          torch::full({rows, columns}, value, options_.dtype(torch::kInt8));
+      weights[prefix + "per_channel_scale"] =
+          torch::full({rows}, 0.1f, options_.dtype(torch::kFloat32));
+      weights[prefix + "smooth"] =
+          torch::full({columns}, 0.05f, options_.dtype(torch::kFloat32));
+    };
+    for (int64_t expert = 0; expert < num_experts; ++expert) {
+      const std::string prefix = "experts." + std::to_string(expert) + ".";
+      projection(prefix + "gate_proj.", false, 2);
+      projection(prefix + "up_proj.", false, 2);
+      projection(prefix + "down_proj.", true, 3);
     }
-
-    // gate weight generation
-    auto gate_weight = torch::full({num_experts, hidden_size}, 5.0f, options_);
-    auto e_score_correction_bias = torch::full({num_experts}, 0.1f, options_);
-
-    // Create shared experts weights
-    auto shared_expert_up_weight =
-        torch::full({intermediate_size, hidden_size}, 1.5f, options_);
-    auto shared_expert_up_qweight = shared_expert_up_weight.to(torch::kInt8);
-    auto shared_expert_up_scale = torch::full({intermediate_size},
-                                              0.1f,
-                                              torch::TensorOptions()
-                                                  .dtype(torch::kFloat32)
-                                                  .device(options_.device()));
-    auto shared_expert_up_smooth = torch::full({hidden_size},
-                                               0.05f,
-                                               torch::TensorOptions()
-                                                   .dtype(torch::kFloat32)
-                                                   .device(options_.device()));
-    auto shared_expert_gate_weight =
-        torch::full({intermediate_size, hidden_size}, 1.5f, options_);
-    auto shared_expert_gate_qweight =
-        shared_expert_gate_weight.to(torch::kInt8);
-    auto shared_expert_gate_scale = torch::full({intermediate_size},
-                                                0.1f,
-                                                torch::TensorOptions()
-                                                    .dtype(torch::kFloat32)
-                                                    .device(options_.device()));
-    auto shared_expert_gate_smooth =
-        torch::full({hidden_size},
-                    0.05f,
-                    torch::TensorOptions()
-                        .dtype(torch::kFloat32)
-                        .device(options_.device()));
-    auto shared_expert_down_weight =
-        torch::full({hidden_size, intermediate_size}, 1.3f, options_);
-    auto shared_expert_down_qweight =
-        shared_expert_down_weight.to(torch::kInt8);
-    auto shared_expert_down_scale = torch::full({hidden_size},
-                                                0.1f,
-                                                torch::TensorOptions()
-                                                    .dtype(torch::kFloat32)
-                                                    .device(options_.device()));
-    auto shared_expert_down_smooth =
-        torch::full({intermediate_size},
-                    0.05f,
-                    torch::TensorOptions()
-                        .dtype(torch::kFloat32)
-                        .device(options_.device()));
-
-    // gate
-    weight_dict["gate.weight"] = gate_weight;
-    weight_dict["gate.e_score_correction_bias"] = e_score_correction_bias;
-
-    // shared experts
-    weight_dict["shared_experts.up_proj.qweight"] = shared_expert_up_qweight;
-    weight_dict["shared_experts.up_proj.per_channel_scale"] =
-        shared_expert_up_scale;
-    weight_dict["shared_experts.up_proj.smooth"] = shared_expert_up_smooth;
-    weight_dict["shared_experts.gate_proj.qweight"] =
-        shared_expert_gate_qweight;
-    weight_dict["shared_experts.gate_proj.per_channel_scale"] =
-        shared_expert_gate_scale;
-    weight_dict["shared_experts.gate_proj.smooth"] = shared_expert_gate_smooth;
-    weight_dict["shared_experts.down_proj.qweight"] =
-        shared_expert_down_qweight;
-    weight_dict["shared_experts.down_proj.per_channel_scale"] =
-        shared_expert_down_scale;
-    weight_dict["shared_experts.down_proj.smooth"] = shared_expert_down_smooth;
-
-    LOG(INFO) << "Test w8a8 smoothquant weights created successfully for "
-              << num_experts << " experts";
-    LOG(INFO) << "Hidden size: " << hidden_size
-              << ", Intermediate size: " << intermediate_size;
-
-    return weight_dict;
+    projection("shared_experts.gate_proj.", false, 1);
+    projection("shared_experts.up_proj.", false, 1);
+    projection("shared_experts.down_proj.", true, 1);
+    weights["gate.weight"] =
+        torch::full({num_experts, hidden_size}, 5.0f, options_);
+    weights["gate.e_score_correction_bias"] =
+        torch::full({num_experts}, 0.1f, options_);
+    return weights;
   }
 
   std::unordered_map<std::string, torch::Tensor>
@@ -227,29 +111,54 @@ class FusedMoETest : public ::testing::Test {
                                      int64_t hidden_size,
                                      int64_t intermediate_size,
                                      int64_t group_size) {
-    std::unordered_map<std::string, torch::Tensor> weight_dict;
-
-    for (size_t expert_id = 0; expert_id < num_experts; ++expert_id) {
-      std::string expert_prefix = "experts." + std::to_string(expert_id) + ".";
-      std::string seed_prefix =
-          "fused_moe_tests.expert_" + std::to_string(expert_id);
-      test::append_w4a8_expert_weights(weight_dict,
-                                       expert_prefix,
-                                       seed_prefix,
-                                       hidden_size,
-                                       intermediate_size,
-                                       intermediate_size,
-                                       intermediate_size,
-                                       group_size,
-                                       options_.device());
+    std::unordered_map<std::string, torch::Tensor> weights;
+    for (int64_t expert = 0; expert < num_experts; ++expert) {
+      for (const std::string name : {"gate_proj", "up_proj", "down_proj"}) {
+        const bool down = name == "down_proj";
+        const int64_t rows = down ? hidden_size : intermediate_size;
+        const int64_t columns = down ? intermediate_size : hidden_size;
+        const std::string prefix =
+            "experts." + std::to_string(expert) + "." + name + ".";
+        // Two equal signed nibbles per byte; group scales, not packed order,
+        // distinguish columns. Gate/up smooth factors must be paired.
+        weights[prefix + "qweight"] =
+            torch::full({rows, columns / 2},
+                        name == "up_proj" ? 0x22 : 0x11,
+                        options_.dtype(torch::kInt8));
+        const auto scale = torch::tensor(down ? std::vector<float>{0.3f, 0.4f}
+                                              : std::vector<float>{0.1f, 0.2f},
+                                         options_.dtype(torch::kFloat32));
+        weights[prefix + "per_channel_scale"] =
+            scale.unsqueeze(0).repeat({rows, 1});
+        weights[prefix + "smooth"] =
+            torch::full({columns}, 0.05f, options_.dtype(torch::kFloat32));
+        CHECK_EQ(columns / group_size, 2);
+      }
     }
-
-    weight_dict["gate.weight"] =
+    weights["gate.weight"] =
         torch::full({num_experts, hidden_size}, 5.0f, options_);
-    weight_dict["gate.e_score_correction_bias"] =
+    weights["gate.e_score_correction_bias"] =
         torch::full({num_experts}, 0.1f, options_);
+    return weights;
+  }
 
-    return weight_dict;
+  static float bf16(float value) {
+    return torch::tensor(value).to(torch::kBFloat16).item<float>();
+  }
+
+  float uniform_expert_reference(int64_t hidden,
+                                 int64_t intermediate,
+                                 float input,
+                                 int32_t gate_q,
+                                 int32_t down_q,
+                                 std::optional<float> limit = std::nullopt) {
+    float projected = bf16(hidden * bf16(input) * bf16(0.05f) * gate_q * 0.1f);
+    if (limit) {
+      projected = std::min(projected, *limit);
+    }
+    const auto gate = torch::tensor(projected);
+    const float activation = bf16((torch::silu(gate) * gate).item<float>());
+    return bf16(intermediate * activation * 0.05f * down_q * 0.1f);
   }
 
   FusedMoE create_fused_moe(int64_t num_experts,
@@ -292,8 +201,8 @@ class FusedMoETest : public ::testing::Test {
   }
 
   void set_tp_ctx(int64_t world_size) {
-    mock_process_group_ = std::make_unique<test::MockProcessGroup>(
-        options_.device(), /*rank=*/0, world_size);
+    mock_process_group_ = std::make_unique<CountingReduceProcessGroup>(
+        options_.device(), world_size);
     single_rank_pg_ = std::make_unique<test::MockProcessGroup>(
         options_.device(), /*rank=*/0, /*world_size=*/1);
     parallel_args_ = ParallelArgs(/*rank=*/0,
@@ -304,14 +213,11 @@ class FusedMoETest : public ::testing::Test {
     parallel_args_.tp_group_ = mock_process_group_.get();
     parallel_args_.single_rank_group_ = single_rank_pg_.get();
   }
-
-  // Helper function to create test weights for the FusedMoE (w8a8 smoothquant
   // format)
   std::unordered_map<std::string, torch::Tensor> create_test_weights(
       int64_t num_experts,
       int64_t custom_hidden_size = -1,
       int64_t custom_intermediate_size = -1) {
-    // Use custom sizes if provided, otherwise use model_args_ values
     int64_t test_hidden_size = (custom_hidden_size > 0)
                                    ? custom_hidden_size
                                    : model_args_.hidden_size();
@@ -322,33 +228,26 @@ class FusedMoETest : public ::testing::Test {
     return create_default_test_weights(
         num_experts, test_hidden_size, test_intermediate_size);
   }
-
-  // Helper function to verify tensor values are close to expected
   void verify_tensor_close(const torch::Tensor& actual,
                            const torch::Tensor& expected,
                            double rtol = 1e-5,
                            double atol = 1e-8) {
     test::verify_tensor_close(actual, expected, rtol, atol);
+    const auto a = actual.cpu().to(torch::kFloat32);
+    const auto e = expected.cpu().to(torch::kFloat32);
+    const double scale = torch::norm(e).item<double>();
+    if (scale == 0.0) {
+      EXPECT_TRUE(torch::equal(a, e));
+    } else {
+      EXPECT_LE(torch::norm(a - e).item<double>() / scale, rtol);
+    }
   }
-
-  // Helper function to create custom input tensor for precision testing
   torch::Tensor create_custom_input(const std::vector<int64_t>& shape,
                                     const std::vector<float>& values) {
     return test::create_custom_input(shape, values, options_);
   }
 
-  // Helper function to set expected output for precision verification
-  void set_expected_output(const std::vector<float>& expected_values) {
-    expected_output_ = expected_values;
-  }
-
-  // Helper function to verify precision against expected output
-  void verify_precision(const torch::Tensor& actual_output,
-                        double rtol = 1e-3,
-                        double atol = 1e-4) {
-    test::verify_precision(actual_output, expected_output_, rtol, atol);
-  }
-
+  std::unique_ptr<c10::DeviceGuard> device_guard_;
   ModelArgs model_args_;
   QuantArgs quant_args_;
   ParallelArgs parallel_args_{0, 1, nullptr};
@@ -357,43 +256,32 @@ class FusedMoETest : public ::testing::Test {
   std::shared_ptr<Stream> routed_comm_stream_;
   std::shared_ptr<Stream> shared_compute_stream_;
 
-  // Helper to create a mock ProcessGroup for testing
   std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
   std::unique_ptr<xllm::ProcessGroup> single_rank_pg_;
-
-  // Expected output for precision verification
-  std::vector<float> expected_output_;
 };
 
 TEST_F(FusedMoETest, ContextConstructorResolvesModelScopedRoleStreams) {
+  ModelArgs args = model_args_;
+  args.n_routed_experts() = 4;
+  args.num_experts_per_tok() = 2;
+  args.n_group() = 1;
+  args.topk_group() = 1;
+  args.hidden_size() = 256;
+  args.moe_intermediate_size() = 128;
+  args.n_shared_experts() = 0;
+  ModelContext context(parallel_args_, args, quant_args_, options_);
   const FusedMoEArgs moe_args{.is_gated = true};
-  FusedMoE fused_moe(model_context_, moe_args);
-
-  EXPECT_EQ(fused_moe->routed_stream(), routed_comm_stream_.get());
-  EXPECT_EQ(fused_moe->shared_stream(), shared_compute_stream_.get());
-}
-
-TEST_F(FusedMoETest, SharesModelScopedRoleStreamsAcrossLayers) {
-  FusedMoE first = create_fused_moe(/*num_experts=*/4,
-                                    /*top_k=*/2,
-                                    /*num_expert_group=*/1,
-                                    /*topk_group=*/1,
-                                    /*route_scale=*/1.0,
-                                    /*hidden_size=*/256,
-                                    /*intermediate_size=*/128);
-  FusedMoE second = create_fused_moe(/*num_experts=*/4,
-                                     /*top_k=*/2,
-                                     /*num_expert_group=*/1,
-                                     /*topk_group=*/1,
-                                     /*route_scale=*/1.0,
-                                     /*hidden_size=*/256,
-                                     /*intermediate_size=*/128);
-
+  FusedMoE first(context, moe_args), second(context, moe_args);
+  EXPECT_EQ(
+      first->routed_stream(),
+      context.stream_registry()->get(ExecutionStreamRole::COMMUNICATION).get());
+  EXPECT_EQ(first->shared_stream(),
+            context.stream_registry()
+                ->get(ExecutionStreamRole::AUXILIARY_COMPUTE)
+                .get());
   EXPECT_EQ(first->routed_stream(), second->routed_stream());
   EXPECT_EQ(first->shared_stream(), second->shared_stream());
   EXPECT_NE(first->routed_stream(), first->shared_stream());
-  EXPECT_EQ(first->routed_stream(), routed_comm_stream_.get());
-  EXPECT_EQ(first->shared_stream(), shared_compute_stream_.get());
 }
 
 TEST_F(FusedMoETest, ModelContextReusesStreamsByExecutionRole) {
@@ -445,145 +333,59 @@ TEST_F(FusedMoETest, ConcurrentRoleRequestsReturnOneStream) {
       parallel_args_, model_args_, quant_args_, options_);
   const std::shared_ptr<ModelStreamRegistry>& registry =
       context.stream_registry();
+  std::mutex mutex;
+  std::condition_variable cv;
+  int arrived = 0;
+  std::promise<void> start;
+  const auto ready = start.get_future().share();
   std::vector<std::future<std::shared_ptr<Stream>>> futures;
   futures.reserve(kThreadCount);
   for (int32_t i = 0; i < kThreadCount; ++i) {
-    futures.emplace_back(std::async(std::launch::async, [registry]() {
-      return registry->get(ExecutionStreamRole::COMMUNICATION);
-    }));
+    futures.emplace_back(std::async(
+        std::launch::async, [registry, ready, &mutex, &cv, &arrived]() {
+          {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++arrived;
+          }
+          cv.notify_one();
+          ready.wait();
+          return registry->get(ExecutionStreamRole::COMMUNICATION);
+        }));
   }
 
+  bool all_arrived;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    all_arrived = cv.wait_for(lock, std::chrono::seconds(30), [&] {
+      return arrived == kThreadCount;
+    });
+  }
+  start.set_value();
+  ASSERT_TRUE(all_arrived);
   std::shared_ptr<Stream> expected = futures.front().get();
   for (int32_t i = 1; i < kThreadCount; ++i) {
     EXPECT_EQ(expected, futures[i].get());
   }
 }
 
-TEST_F(FusedMoETest, LoadStateDictTest) {
-  // Test loading weights into the FusedMoE
-  const int64_t batch_size = 16;
-  const int64_t seq_len = 32;
-  const int64_t hidden_size = 7168;
-  const int64_t intermediate_size = 2048;
-  const int64_t num_experts = 16;
-  const int64_t num_expert_group = 4;
-  const int64_t topk_group = 4;
-  const int64_t top_k = 2;
-  const double route_scale = 2.5;
-  const bool gated = true;
-  const int64_t renormalize = 1;
-  const int64_t n_shared_experts = 1;
-
-  // Create FusedMoE with default dimensions
-  auto fused_moe = create_fused_moe(num_experts,
-                                    top_k,
-                                    num_expert_group,
-                                    topk_group,
-                                    route_scale,
-                                    hidden_size,
-                                    intermediate_size,
-                                    n_shared_experts,
-                                    gated,
-                                    renormalize);
-
-  // Create test weights and load them
-  auto weight_dict =
-      create_test_weights(num_experts, hidden_size, intermediate_size);
-
-  // Load weights into the FusedMoE
-  StateDict state_dict(weight_dict);
-  fused_moe->load_state_dict(state_dict);
-
-  // Create input tensors
-  auto hidden_states = create_custom_input(
-      {batch_size * seq_len, hidden_size},
-      std::vector<float>(batch_size * seq_len * hidden_size, 0.05f));
-
-  auto output =
-      fused_moe->forward_experts(hidden_states,
-                                 /*enable_all2all_communication=*/false);
-
-  CHECK_EQ(output.sizes().size(), 2) << "Output should be 2D tensor";
-  CHECK_EQ(output.size(0), batch_size * seq_len)
-      << "The number of tokens should match";
-  CHECK_EQ(output.size(1), hidden_size) << "The hidden size should match";
-  auto output_sum = torch::sum(output).item<float>();
-  CHECK_NE(output_sum, 0.0f)
-      << "Output should not be all zeros after loading weights";
-
-  LOG(INFO) << "State dict loading test passed - output sum: " << output_sum;
-}
-
 TEST_F(FusedMoETest, PrecisionVerificationTest) {
-  // Test loading weights into the FusedMoE
-  const int64_t batch_size = 16;
-  const int64_t seq_len = 32;
-  const int64_t hidden_size = 7168;
-  const int64_t intermediate_size = 2048;
-  const int64_t num_experts = 16;
-  const int64_t num_expert_group = 4;
-  const int64_t topk_group = 4;
-  const int64_t top_k = 2;
-  const double route_scale = 2.5;
-  const bool gated = true;
-  const int64_t renormalize = 1;
-  const int64_t n_shared_experts = 1;
-
-  // Create FusedMoE with default dimensions
-  auto fused_moe = create_fused_moe(num_experts,
-                                    top_k,
-                                    num_expert_group,
-                                    topk_group,
-                                    route_scale,
-                                    hidden_size,
-                                    intermediate_size,
-                                    n_shared_experts,
-                                    gated,
-                                    renormalize);
-
-  // Create test weights and load them
-  auto weight_dict =
-      create_test_weights(num_experts, hidden_size, intermediate_size);
-
-  // Load weights into the FusedMoE
-  StateDict state_dict(weight_dict);
-  fused_moe->load_state_dict(state_dict);
-
-  // Create input tensors
-  auto hidden_states = create_custom_input(
-      {batch_size * seq_len, hidden_size},
-      std::vector<float>(batch_size * seq_len * hidden_size, 0.05f));
-
-  auto output =
-      fused_moe->forward_experts(hidden_states,
-                                 /*enable_all2all_communication=*/false);
-
-  xllm::Device device(options_.device());
-  device.synchronize_default_stream();
-
-  // Verify output shape
-  CHECK_EQ(output.sizes().size(), 2) << "Output should be 2D tensor";
-  CHECK_EQ(output.size(0), batch_size * seq_len)
-      << "Batch size * seq_len should match";
-  CHECK_EQ(output.size(1), hidden_size) << "Hidden size should match";
-
-  // Set expected output values for precision verification
-  // The expected values should be calculated based on your specific test case
-  std::vector<float> expected_values;
-
-  // Fill expected_values with placeholder data using custom dimensions
-  expected_values.reserve(batch_size * seq_len * hidden_size);
-  for (size_t i = 0; i < batch_size; ++i) {
-    for (size_t j = 0; j < seq_len; ++j) {
-      for (size_t k = 0; k < hidden_size; ++k) {
-        expected_values.push_back(992.0f);  // calculated via vLLM MLU
-      }
-    }
-  }
-
-  set_expected_output(expected_values);
-
-  verify_precision(output, 1e-3, 1e-4);
+  constexpr int64_t kHidden = 256, kIntermediate = 256, kExperts = 4;
+  auto moe = create_fused_moe(
+      kExperts, 2, 1, 1, 2.5, kHidden, kIntermediate, 1, true, 1);
+  moe->load_state_dict(
+      StateDict(create_test_weights(kExperts, kHidden, kIntermediate)));
+  const auto actual =
+      moe->forward_experts(torch::full({2, kHidden}, 0.05f, options_), false);
+  // The uniform router is normalized: sum(route weights) = 2.5. Model BF16
+  // projection/activation/output boundaries; this reproduces old 7168/2048
+  // gold 992 independently without allocating a multi-GiB fixture.
+  const float routed =
+      uniform_expert_reference(kHidden, kIntermediate, 0.05f, 2, 3);
+  const float shared =
+      uniform_expert_reference(kHidden, kIntermediate, 0.05f, 1, 1);
+  const auto expected = torch::full(
+      {2, kHidden}, bf16(bf16(routed * 2.5f) + shared), torch::kBFloat16);
+  verify_tensor_close(actual.cpu(), expected, 0.02, 0.001);
 }
 
 TEST_F(FusedMoETest, W4A8GroupwiseSmokeTest) {
@@ -608,7 +410,9 @@ TEST_F(FusedMoETest, W4A8GroupwiseSmokeTest) {
                                     route_scale,
                                     hidden_size,
                                     intermediate_size,
-                                    /*n_shared_experts=*/0);
+                                    /*n_shared_experts=*/0,
+                                    /*is_gated=*/true,
+                                    /*renormalize=*/1);
 
   auto weight_dict = create_w4a8_groupwise_test_weights(
       num_experts, hidden_size, intermediate_size, group_size);
@@ -629,51 +433,17 @@ TEST_F(FusedMoETest, W4A8GroupwiseSmokeTest) {
   EXPECT_EQ(output.dim(), 2);
   EXPECT_EQ(output.size(0), batch_size * seq_len);
   EXPECT_EQ(output.size(1), hidden_size);
-  EXPECT_NE(torch::sum(output).item<float>(), 0.0f);
-}
-
-TEST_F(FusedMoETest, PrepRouteMatchesBaseForward) {
-  const int64_t batch_size = 4;
-  const int64_t seq_len = 8;
-  const int64_t hidden_size = 256;
-  const int64_t intermediate_size = 256;
-  const int64_t num_experts = 8;
-  const int64_t num_expert_group = 4;
-  const int64_t topk_group = 4;
-  const int64_t top_k = 2;
-  const double route_scale = 2.5;
-
-  auto fused_moe = create_fused_moe(num_experts,
-                                    top_k,
-                                    num_expert_group,
-                                    topk_group,
-                                    route_scale,
-                                    hidden_size,
-                                    intermediate_size,
-                                    /*n_shared_experts=*/0);
-
-  auto weight_dict =
-      create_test_weights(num_experts, hidden_size, intermediate_size);
-  StateDict state_dict(weight_dict);
-  fused_moe->load_state_dict(state_dict);
-
-  auto hidden_states = create_custom_input(
-      {batch_size * seq_len, hidden_size},
-      std::vector<float>(batch_size * seq_len * hidden_size, 0.05f));
-
-  auto expected =
-      fused_moe->forward_experts(hidden_states,
-                                 /*enable_all2all_communication=*/false);
-  auto route_info = fused_moe->prep_route(hidden_states);
-  auto actual =
-      fused_moe->forward_experts(hidden_states,
-                                 /*enable_all2all_communication=*/false,
-                                 route_info);
-
-  xllm::Device device(options_.device());
-  device.synchronize_default_stream();
-
-  verify_tensor_close(actual, expected, 1e-3, 1e-4);
+  const float g = bf16(hidden_size * bf16(0.05f) * bf16(0.05f) * 0.15f);
+  const float u = bf16(hidden_size * bf16(0.05f) * bf16(0.05f) * 2.0f * 0.15f);
+  const float activation =
+      bf16((torch::silu(torch::tensor(g)) * u).item<float>());
+  const float value =
+      bf16(bf16(intermediate_size * activation * 0.05f * 0.35f) * route_scale);
+  verify_tensor_close(
+      output.cpu(),
+      torch::full({batch_size * seq_len, hidden_size}, value, torch::kBFloat16),
+      0.03,
+      0.001);
 }
 
 TEST_F(FusedMoETest, SelectedRouteMatchesGateRouteWith3DInput) {
@@ -813,9 +583,14 @@ TEST_F(FusedMoETest, NoReductionModeMatchesExternalReduce) {
 
   auto expected = reduced_moe->forward_experts(
       hidden_states, /*enable_all2all_communication=*/false);
+  auto* counted =
+      static_cast<CountingReduceProcessGroup*>(mock_process_group_.get());
+  ASSERT_EQ(counted->calls, 1);
   auto actual = raw_moe->forward_experts(
       hidden_states, /*enable_all2all_communication=*/false);
+  EXPECT_EQ(counted->calls, 1);
   actual = parallel_state::reduce(actual, parallel_args_.tp_group_);
+  EXPECT_EQ(counted->calls, 2);
 
   auto shared = raw_moe->forward_shared(hidden_states);
   ASSERT_TRUE(shared.defined());
@@ -868,12 +643,14 @@ TEST_F(FusedMoETest, DeepSeekV4MoETest) {
 
   auto weight_dict =
       create_test_weights(num_experts, hidden_size, intermediate_size);
+  weight_dict["gate.bias"] =
+      torch::zeros({num_experts}, options_.dtype(torch::kFloat32));
   StateDict state_dict(weight_dict);
   fused_moe->load_state_dict(state_dict);
 
   auto hidden_states = create_custom_input(
       {batch_size * seq_len, hidden_size},
-      std::vector<float>(batch_size * seq_len * hidden_size, 1.0f));
+      std::vector<float>(batch_size * seq_len * hidden_size, 10.0f));
 
   auto output = fused_moe->forward_experts(
       hidden_states, /*enable_all2all_communication=*/false);
@@ -885,12 +662,16 @@ TEST_F(FusedMoETest, DeepSeekV4MoETest) {
   ASSERT_EQ(output.size(0), batch_size * seq_len);
   ASSERT_EQ(output.size(1), hidden_size);
 
-  auto output_sum = torch::sum(output).item<float>();
-  ASSERT_TRUE(std::isfinite(output_sum))
-      << "Output should be finite with swiglu_limit";
-
-  LOG(INFO) << "DeepSeek V4 MoE forward test passed, output sum: "
-            << output_sum;
+  const float routed = uniform_expert_reference(
+      hidden_size, intermediate_size, 10.0f, 2, 3, swiglu_limit);
+  const float shared = uniform_expert_reference(
+      hidden_size, intermediate_size, 10.0f, 1, 1, swiglu_limit);
+  verify_tensor_close(output.cpu(),
+                      torch::full({batch_size * seq_len, hidden_size},
+                                  bf16(routed + shared),
+                                  torch::kBFloat16),
+                      0.02,
+                      0.02);
 }
 
 TEST_F(FusedMoETest, DeepSeekV4HashMoETest) {
@@ -934,16 +715,21 @@ TEST_F(FusedMoETest, DeepSeekV4HashMoETest) {
 
   auto weight_dict =
       create_test_weights(num_experts, hidden_size, intermediate_size);
+  const auto token = torch::arange(vocab_size, options_.dtype(torch::kInt32));
   weight_dict["gate.tid2eid"] =
-      torch::full({vocab_size, top_k}, 0.1f, options_);
+      torch::stack({token % num_experts, (token + 1) % num_experts}, 1);
+  for (int64_t expert = 0; expert < num_experts; ++expert) {
+    weight_dict["experts." + std::to_string(expert) + ".down_proj.qweight"]
+        .fill_(expert + 3);
+  }
   StateDict state_dict(weight_dict);
   fused_moe->load_state_dict(state_dict);
 
   auto hidden_states = create_custom_input(
       {batch_size * seq_len, hidden_size},
-      std::vector<float>(batch_size * seq_len * hidden_size, 1.0f));
-  auto input_ids = torch::randint(
-      0, vocab_size, {batch_size * seq_len}, options_.dtype(torch::kInt32));
+      std::vector<float>(batch_size * seq_len * hidden_size, 10.0f));
+  const auto input_ids =
+      torch::arange(batch_size * seq_len, options_.dtype(torch::kInt32));
   auto output =
       fused_moe->forward_experts(hidden_states,
                                  /*enable_all2all_communication=*/false,
@@ -957,12 +743,20 @@ TEST_F(FusedMoETest, DeepSeekV4HashMoETest) {
   ASSERT_EQ(output.size(0), batch_size * seq_len);
   ASSERT_EQ(output.size(1), hidden_size);
 
-  auto output_sum = torch::sum(output).item<float>();
-  ASSERT_TRUE(std::isfinite(output_sum))
-      << "Output should be finite with swiglu_limit";
-
-  LOG(INFO) << "DeepSeek V4 hash MoE forward test passed, output sum: "
-            << output_sum;
+  const float shared = uniform_expert_reference(
+      hidden_size, intermediate_size, 10.0f, 1, 1, swiglu_limit);
+  auto expected =
+      torch::empty({batch_size * seq_len, hidden_size}, torch::kBFloat16);
+  for (int64_t row = 0; row < batch_size * seq_len; ++row) {
+    const int32_t first = row % num_experts, second = (row + 1) % num_experts;
+    const float a = uniform_expert_reference(
+        hidden_size, intermediate_size, 10.0f, 2, first + 3, swiglu_limit);
+    const float b = uniform_expert_reference(
+        hidden_size, intermediate_size, 10.0f, 2, second + 3, swiglu_limit);
+    expected[row].fill_(bf16(bf16((a + b) * 0.5f) + shared));
+  }
+  verify_tensor_close(output.cpu(), expected, 0.02, 0.02);
 }
+}  // namespace
 }  // namespace layer
 }  // namespace xllm

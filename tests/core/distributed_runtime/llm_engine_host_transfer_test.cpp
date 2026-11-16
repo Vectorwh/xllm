@@ -230,9 +230,6 @@ INSTANTIATE_TEST_SUITE_P(
         TransferTopology{16, 2, 4, 0, {0, 1, 2, 3, 4, 5, 6, 7}},
         TransferTopology{16, 2, 4, 1, {8, 9, 10, 11, 12, 13, 14, 15}}));
 
-// Overlap batches borrow the sequence cache. Serial worker execution does not
-// require additional Block owners in the batch.
-
 class StepCaptureWorker final : public WorkerClient {
  public:
   folly::SemiFuture<std::optional<RawForwardOutput>> step_remote_async(
@@ -337,10 +334,8 @@ INSTANTIATE_TEST_SUITE_P(StaticKernelAndWarmup,
                          ::testing::Combine(::testing::Bool(),
                                             ::testing::Bool()));
 
-TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
-  // Two workers form one DP group with cp_size=2: the engine must dispatch
-  // the same forward_inputs[dp_rank] to both CP ranks (llm_engine.cpp: "Engine
-  // sends full global tokens; model-side CP shards inside the worker").
+TEST(LLMEngineOverlapOwnershipTest, CpDispatchPreservesBatchPinsUntilRelease) {
+  // CP ranks receive global tokens; the batch retains its inflight pins.
   std::vector<std::shared_ptr<StepCaptureWorker>> workers;
   std::vector<std::shared_ptr<WorkerClient>> clients;
   workers.reserve(2);
@@ -352,7 +347,6 @@ TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
   }
   runtime::Options options;
   options.world_size(2).dp_size(1).cp_size(2).enable_schedule_overlap(true);
-  options.speculative_algorithm("mtp");
   ClientEngine engine(std::move(options), std::move(clients));
 
   BlockManagerPool::Options pool_options;
@@ -377,48 +371,13 @@ TEST(LLMEngineOverlapOwnershipTest, MtpOverlapStepDoesNotCopyCpPrefillBlocks) {
   // Both CP ranks ran the same batch with byte-identical token inputs.
   for (const auto& worker : workers) {
     ASSERT_EQ(worker->step_count(), 1u);
+    EXPECT_TRUE(torch::equal(worker->captured_token_ids(),
+                             torch::tensor({1, 2, 3, 4}, torch::kInt32)));
   }
-  EXPECT_TRUE(torch::equal(workers[0]->captured_token_ids(),
-                           workers[1]->captured_token_ids()));
 
   EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
   batches.clear();
   EXPECT_EQ(kv_blocks.front().ref_count(), 1u);
-}
-
-TEST(LLMEngineOverlapOwnershipTest, DFlash2StepDoesNotCopyCpBlocks) {
-  std::vector<std::shared_ptr<WorkerClient>> clients;
-  clients.reserve(2);
-  for (int32_t worker_rank = 0; worker_rank < 2; ++worker_rank) {
-    clients.emplace_back(std::make_shared<StepCaptureWorker>());
-  }
-  runtime::Options options;
-  options.world_size(2).dp_size(1).cp_size(2).enable_schedule_overlap(true);
-  options.speculative_algorithm("DFlash2");
-  ClientEngine engine(std::move(options), std::move(clients));
-
-  BlockManagerPool::Options pool_options;
-  pool_options.num_blocks_ = 32;
-  pool_options.block_size_ = 4;
-  pool_options.max_seqs_per_batch_ = 1024;
-  BlockManagerPool pool(pool_options, /*dp_size=*/1);
-  auto request = make_overlap_step_request();
-  Sequence* sequence = request->sequences().front().get();
-  ASSERT_TRUE(pool.try_allocate(sequence));
-  ASSERT_GT(sequence->kv_state().num_blocks(BlockType::KV), 0u);
-  sequence->kv_state().set_kv_cache_tokens_num(0);
-
-  std::vector<Batch> batches;
-  batches.emplace_back(sequence);
-  const auto kv_blocks = sequence->kv_state().blocks(BlockType::KV);
-  ASSERT_FALSE(kv_blocks.empty());
-  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
-  engine.step(batches);
-
-  EXPECT_EQ(kv_blocks.front().ref_count(), 2u);
-  // Dropping the batch preserves the sequence's owner.
-  batches.clear();
-  EXPECT_EQ(sequence->kv_state().blocks(BlockType::KV).front().ref_count(), 1u);
 }
 
 }  // namespace

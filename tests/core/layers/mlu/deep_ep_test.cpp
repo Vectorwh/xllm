@@ -21,7 +21,9 @@ limitations under the License.
 #include <torch/torch.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cmath>
+#include <csignal>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -76,6 +78,7 @@ struct TestParams {
 
 // Child process test function
 int32_t run_deep_ep_test_child(TestParams params) {
+  ::alarm(120);
   try {
     // 1. Check devices
     int32_t dev_count = xllm::Platform::device_count();
@@ -239,6 +242,7 @@ class DeepEPMultiDeviceTest : public ::testing::Test {
 
   void run_test() {
     std::vector<pid_t> child_pids;
+    child_pids.reserve(world_size_);
 
     for (int32_t rank = 0; rank < world_size_; ++rank) {
       pid_t pid = fork();
@@ -258,20 +262,31 @@ class DeepEPMultiDeviceTest : public ::testing::Test {
       } else if (pid > 0) {
         child_pids.push_back(pid);
       } else {
-        LOG(FATAL) << "Failed to fork rank " << rank;
+        for (pid_t started : child_pids) {
+          ::kill(started, SIGKILL);
+        }
+        for (pid_t started : child_pids) {
+          int32_t status = 0;
+          while (::waitpid(started, &status, 0) < 0 && errno == EINTR) {
+          }
+        }
+        FAIL() << "Failed to fork rank " << rank;
       }
     }
 
     bool any_failed = false;
-    bool any_skipped = false;
+    int32_t skip_count = 0;
 
     for (size_t i = 0; i < child_pids.size(); ++i) {
-      int32_t status;
-      waitpid(child_pids[i], &status, 0);
-      if (WIFEXITED(status)) {
+      int32_t status = 0;
+      pid_t waited;
+      do {
+        waited = ::waitpid(child_pids[i], &status, 0);
+      } while (waited < 0 && errno == EINTR);
+      if (waited == child_pids[i] && WIFEXITED(status)) {
         int32_t exit_code = WEXITSTATUS(status);
         if (exit_code == EXIT_CODE_SKIP) {
-          any_skipped = true;
+          ++skip_count;
         } else if (exit_code != 0) {
           any_failed = true;
           LOG(ERROR) << "Rank " << i << " failed with code " << exit_code;
@@ -282,11 +297,12 @@ class DeepEPMultiDeviceTest : public ::testing::Test {
       }
     }
 
-    if (any_skipped) {
+    if (!any_failed && skip_count == world_size_) {
       GTEST_SKIP() << "Test skipped due to insufficient devices.";
-    } else {
-      ASSERT_FALSE(any_failed) << "DeepEP End-to-End Test Failed.";
     }
+    ASSERT_FALSE(any_failed) << "DeepEP End-to-End Test Failed.";
+    EXPECT_EQ(skip_count, 0)
+        << "Only some ranks skipped; collective is invalid.";
   }
 
   int32_t world_size_;

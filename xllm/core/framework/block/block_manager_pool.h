@@ -163,8 +163,6 @@ class BlockManagerPool : public KVCacheManager {
   bool process_beam_search(Sequence* sequence, bool need_swap = false);
 
  private:
-  friend class BlockManagerPoolTestPeer;
-
   struct PoolMetric {
     // Non-owning: the pool keeps its fixed leaf topology alive through
     // teardown.

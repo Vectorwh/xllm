@@ -45,7 +45,6 @@ def test_store_rounds_propagate_failure_cleanup_and_isolate_reinitialization() -
 
 def test_idle_rank_joins_preparation_without_dump_and_forward_failure_resets_runner() -> None:
     worker = StaticKernelWorker.__new__(StaticKernelWorker)
-    worker.device = None
     worker.round_id = 0
     worker.state = SimpleNamespace(seal=MagicMock(return_value=[]), group=("local",), api=MagicMock())
     worker.rendezvous = SimpleNamespace(

@@ -59,8 +59,6 @@ class LinearStateBlockManager final : public BlockManagerImpl {
                                                      KVCacheState& kv_state);
   std::optional<std::vector<Block>> allocate_decode(Sequence* seq,
                                                     KVCacheState& kv_state);
-
-  friend class BlockManagerPoolTestPeer;
 };
 
 }  // namespace xllm

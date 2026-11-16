@@ -31,7 +31,9 @@ torch::Tensor create_custom_input(const std::vector<int64_t>& shape,
   // Only support 2D or 3D
   CHECK(shape.size() == 2 || shape.size() == 3) << "Shape must be 2D or 3D";
   int64_t numel = 1;
-  for (auto d : shape) numel *= d;
+  for (auto d : shape) {
+    numel *= d;
+  }
   CHECK_EQ(values.size(), numel) << "Values size must match tensor size";
 
   // Create tensor from values directly with given shape
@@ -59,77 +61,6 @@ void verify_tensor_close(const torch::Tensor& actual,
 
   ASSERT_TRUE(torch::allclose(actual, expected, rtol, atol))
       << "Tensors are not close enough. Max diff: " << max_diff;
-}
-
-void verify_precision(const torch::Tensor& actual_output,
-                      const std::vector<float>& expected_values,
-                      double rtol,
-                      double atol) {
-  ASSERT_FALSE(expected_values.empty())
-      << "Expected output not set. Call SetExpectedOutput() first.";
-
-  // Support both 2D and 3D outputs
-  std::vector<int64_t> output_shape(actual_output.sizes().begin(),
-                                    actual_output.sizes().end());
-  int64_t numel = actual_output.numel();
-
-  ASSERT_TRUE(output_shape.size() == 2 || output_shape.size() == 3)
-      << "Output tensor must be 2D or 3D";
-  ASSERT_EQ(expected_values.size(), numel)
-      << "Expected output size mismatch: expected " << expected_values.size()
-      << ", actual tensor numel " << numel;
-
-  // Create expected tensor from values and shape
-  auto expected_tensor = create_custom_input(
-      output_shape, expected_values, actual_output.options());
-
-  LOG(INFO) << "Verifying precision with rtol=" << rtol << ", atol=" << atol;
-  verify_tensor_close(actual_output, expected_tensor, rtol, atol);
-}
-
-void expect_tensor_stats(const torch::Tensor& t,
-                         double expected_min,
-                         double expected_max,
-                         double expected_sum,
-                         double rtol,
-                         double atol) {
-  EXPECT_TRUE(t.defined() && t.numel() > 0)
-      << "Tensor must be defined and non-empty";
-  torch::Tensor flat = t.flatten().to(torch::kFloat32);
-  if (t.device() != torch::kCPU) {
-    flat = flat.cpu();
-  }
-  double actual_min = torch::min(flat).item<double>();
-  double actual_max = torch::max(flat).item<double>();
-  double actual_sum = torch::sum(flat).item<double>();
-
-  auto within_tol = [rtol, atol](double actual, double expected) {
-    double tol = atol + rtol * std::abs(expected);
-    return std::abs(actual - expected) <= tol;
-  };
-
-  EXPECT_TRUE(within_tol(actual_min, expected_min))
-      << "min mismatch: actual=" << actual_min << ", expected=" << expected_min;
-  EXPECT_TRUE(within_tol(actual_max, expected_max))
-      << "max mismatch: actual=" << actual_max << ", expected=" << expected_max;
-  EXPECT_TRUE(within_tol(actual_sum, expected_sum))
-      << "sum mismatch: actual=" << actual_sum << ", expected=" << expected_sum;
-}
-
-ModelArgs create_default_model_args() {
-  ModelArgs model_args;
-  model_args.hidden_size() = 7168;
-  model_args.intermediate_size() = 18432;
-  model_args.hidden_act() = "silu";
-  return model_args;
-}
-
-QuantArgs create_default_quant_args() {
-  QuantArgs quant_args;
-  quant_args.quant_method() = kQuantMethodSmoothquant;
-  quant_args.bits() = 8;
-  quant_args.activation_dynamic() = true;
-  return quant_args;
 }
 
 ParallelArgs create_default_parallel_args(
@@ -194,7 +125,9 @@ torch::Tensor seeded_tensor(const std::string& key,
   SplitMix64 rng(fnv1a64(key));
   std::vector<uint64_t> buf;
   buf.reserve(N);
-  for (int64_t i = 0; i < N; ++i) buf.push_back(rng.next_u64());
+  for (int64_t i = 0; i < N; ++i) {
+    buf.push_back(rng.next_u64());
+  }
 
   // Map and build CPU tensor according to dtype
   torch::Tensor out_cpu;
@@ -204,8 +137,9 @@ torch::Tensor seeded_tensor(const std::string& key,
     std::vector<double> vals;
     vals.reserve(N);
     const double inv_2_53 = 1.0 / static_cast<double>(1ULL << 53);
-    for (uint64_t u : buf)
+    for (uint64_t u : buf) {
       vals.push_back(static_cast<double>(u >> 11) * inv_2_53);
+    }
     out_cpu =
         torch::from_blob(
             vals.data(), {N}, torch::TensorOptions().dtype(torch::kDouble))
@@ -214,7 +148,9 @@ torch::Tensor seeded_tensor(const std::string& key,
   } else if (dtype == torch::kBool) {
     std::vector<uint8_t> vals;
     vals.reserve(N);
-    for (uint64_t u : buf) vals.push_back(static_cast<uint8_t>(u & 1ULL));
+    for (uint64_t u : buf) {
+      vals.push_back(static_cast<uint8_t>(u & 1ULL));
+    }
     out_cpu = torch::from_blob(
                   vals.data(), {N}, torch::TensorOptions().dtype(torch::kBool))
                   .clone();
@@ -271,77 +207,6 @@ torch::Tensor seeded_tensor(const std::string& key,
     return out_cpu.to(device);
   }
   return out_cpu;
-}
-
-void append_w4a8_expert_weights(
-    std::unordered_map<std::string, torch::Tensor>& weight_dict,
-    const std::string& expert_prefix,
-    const std::string& seed_prefix,
-    int64_t hidden_size,
-    int64_t gate_up_intermediate_size,
-    int64_t down_qweight_intermediate_size,
-    int64_t down_scale_intermediate_size,
-    int64_t group_size,
-    const torch::Device& device) {
-  CHECK_GT(group_size, 0);
-  CHECK_EQ(hidden_size % 2, 0);
-  CHECK_EQ(gate_up_intermediate_size % 2, 0);
-  CHECK_EQ(down_qweight_intermediate_size % 2, 0);
-  CHECK_EQ(hidden_size % group_size, 0);
-  CHECK_EQ(down_scale_intermediate_size % group_size, 0);
-
-  const int64_t hidden_packed = hidden_size / 2;
-  const int64_t down_packed = down_qweight_intermediate_size / 2;
-  const int64_t hidden_group_cols = hidden_size / group_size;
-  const int64_t down_group_cols = down_scale_intermediate_size / group_size;
-
-  auto gate_qweight = seeded_tensor(seed_prefix + ".gate_proj.qweight.w4",
-                                    {gate_up_intermediate_size, hidden_packed},
-                                    torch::kInt8,
-                                    device);
-  auto gate_scale =
-      seeded_tensor(seed_prefix + ".gate_proj.scale.w4",
-                    {gate_up_intermediate_size, hidden_group_cols},
-                    torch::kFloat32,
-                    device);
-  auto gate_smooth = seeded_tensor(seed_prefix + ".gate_proj.smooth",
-                                   {hidden_size},
-                                   torch::kFloat32,
-                                   device);
-
-  auto up_qweight = seeded_tensor(seed_prefix + ".up_proj.qweight.w4",
-                                  {gate_up_intermediate_size, hidden_packed},
-                                  torch::kInt8,
-                                  device);
-  auto up_scale = seeded_tensor(seed_prefix + ".up_proj.scale.w4",
-                                {gate_up_intermediate_size, hidden_group_cols},
-                                torch::kFloat32,
-                                device);
-
-  auto down_qweight = seeded_tensor(seed_prefix + ".down_proj.qweight.w4",
-                                    {hidden_size, down_packed},
-                                    torch::kInt8,
-                                    device);
-  auto down_scale = seeded_tensor(seed_prefix + ".down_proj.scale.w4",
-                                  {hidden_size, down_group_cols},
-                                  torch::kFloat32,
-                                  device);
-  auto down_smooth = seeded_tensor(seed_prefix + ".down_proj.smooth",
-                                   {gate_up_intermediate_size},
-                                   torch::kFloat32,
-                                   device);
-
-  weight_dict[expert_prefix + "gate_proj.qweight"] = gate_qweight;
-  weight_dict[expert_prefix + "gate_proj.per_channel_scale"] = gate_scale;
-  weight_dict[expert_prefix + "gate_proj.smooth"] = gate_smooth;
-
-  weight_dict[expert_prefix + "up_proj.qweight"] = up_qweight;
-  weight_dict[expert_prefix + "up_proj.per_channel_scale"] = up_scale;
-  weight_dict[expert_prefix + "up_proj.smooth"] = gate_smooth;
-
-  weight_dict[expert_prefix + "down_proj.qweight"] = down_qweight;
-  weight_dict[expert_prefix + "down_proj.per_channel_scale"] = down_scale;
-  weight_dict[expert_prefix + "down_proj.smooth"] = down_smooth;
 }
 
 }  // namespace test

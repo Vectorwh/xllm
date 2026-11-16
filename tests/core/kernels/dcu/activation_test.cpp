@@ -95,7 +95,8 @@ TEST_F(ActAndMulKernelTest, MatchesTorchReference) {
   const std::vector<torch::ScalarType> dtypes = {
       torch::kFloat32, torch::kFloat16, torch::kBFloat16};
   const std::vector<std::string> act_modes = {"silu", "gelu", "gelu_tanh"};
-  // Cover scalar fallback (d < kVecSize), vectorized path, and tail cleanup.
+  // Small scalar path, aligned vector path, and large unaligned scalar path.
+  // d=129 does not enter vector-tail cleanup because the gate is misaligned.
   const std::vector<int64_t> dims = {3, 64, 129};
 
   for (auto dtype : dtypes) {

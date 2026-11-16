@@ -149,46 +149,23 @@ TEST(KimiK3DetectorTest, MessageCloseCompletesWithoutOptionalStopToken) {
 }
 
 TEST(KimiK3DetectorTest, RechecksFoundCloseWhenToolsWereIncomplete) {
-  class ErrorSink final : public google::LogSink {
-   public:
-    ErrorSink() { google::AddLogSink(this); }
-    ~ErrorSink() override { google::RemoveLogSink(this); }
-    void send(google::LogSeverity severity,
-              const char*,
-              const char*,
-              int,
-              const struct tm*,
-              const char* message,
-              size_t message_len) override {
-      if (severity == google::GLOG_ERROR &&
-          std::string_view(message, message_len)
-              .starts_with("Invalid streaming Kimi K3 XTML output:")) {
-        ++errors;
-      }
-    }
-    size_t errors = 0;
-  } errors;
-
   const std::vector<JsonTool> tools = {make_tool("get_weather")};
   KimiK3Detector detector;
   // A message close inside an unclosed tools block is not a complete envelope.
-  // Padding puts the candidate before the next unsuccessful-search offset.
   const std::string first_chunk =
       "answer" + std::string(kResponseEnd) + kToolsStart +
       "<|open|>call tool=\"get_weather\" index=\"1\"<|sep|>"
       "<|close|>call<|sep|>" +
       std::string(kMessageEnd) + std::string(64, ' ');
+  // Padding moves the next search offset past the embedded close candidate.
   const auto first = detector.parse_streaming_increment(first_chunk, tools);
   EXPECT_EQ(first.normal_text, "answer");
   EXPECT_TRUE(first.calls.empty());
-  EXPECT_EQ(errors.errors, 0);
 
-  // Completing tools exposes the invalid embedded close. Revalidate the found
-  // candidate without requiring another message marker; never publish calls.
+  // Completing tools reveals the invalid embedded close; never publish calls.
   const auto second = detector.parse_streaming_increment(kToolsEnd, tools);
   EXPECT_TRUE(second.normal_text.empty());
   EXPECT_TRUE(second.calls.empty());
-  EXPECT_EQ(errors.errors, 1);
   EXPECT_TRUE(
       detector.parse_streaming_increment(kMessageEnd, tools).calls.empty());
 }

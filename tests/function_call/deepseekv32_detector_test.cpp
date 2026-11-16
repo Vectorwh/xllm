@@ -176,25 +176,6 @@ TYPED_TEST(DeepSeekTextStreamingTest, ParsesToolCallsAcrossChunkSizes) {
   }
 }
 
-// Test constructor and basic properties
-TEST_F(DeepSeek32DetectorTest, ConstructorInitializesCorrectly) {
-  EXPECT_NE(detector_, nullptr);
-
-  // Test basic token detection
-  std::string text_with_tool_call =
-      "Some text "
-      "<｜DSML｜function_calls><｜DSML｜invoke "
-      "name=\"get_weather\"><｜DSML｜parameter "
-      "name=\"city\" "
-      "string=\"true\">Beijing</｜DSML｜parameter></｜DSML｜invoke></"
-      "｜DSML｜function_calls>";
-  std::string text_without_tool_call =
-      "Just normal text without any tool calls";
-
-  EXPECT_TRUE(detector_->has_tool_call(text_with_tool_call));
-  EXPECT_FALSE(detector_->has_tool_call(text_without_tool_call));
-}
-
 // Test has_tool_call method
 TEST_F(DeepSeek32DetectorTest, HasToolCallDetection) {
   // Test text containing tool calls
@@ -556,14 +537,10 @@ TEST_F(DeepSeek32DetectorTest, IncrementalArgumentStreaming) {
     }
   }
 
-  EXPECT_TRUE(tool_name_sent)
-      << "Tool name should be sent when tool call is complete";
-  if (!accumulated_args.empty()) {
-    EXPECT_TRUE(accumulated_args.find("Beijing") != std::string::npos)
-        << "Should contain city argument";
-    EXPECT_TRUE(accumulated_args.find("2024-06-27") != std::string::npos)
-        << "Should contain date argument";
-  }
+  ASSERT_TRUE(tool_name_sent);
+  const nlohmann::json args = nlohmann::json::parse(accumulated_args);
+  EXPECT_EQ(args["city"], "Beijing");
+  EXPECT_EQ(args["date"], "2024-06-27");
 }
 
 TEST_F(DeepSeek32DetectorTest,
@@ -733,56 +710,6 @@ TEST_F(DeepSeek32DetectorTest, NestedBracesInJsonValues) {
   nlohmann::json params = nlohmann::json::parse(call.parameters);
   EXPECT_EQ(params["city"], "Beijing");
   EXPECT_EQ(params["config"]["nested"]["deep"], "value");
-}
-
-// Test mixed format (XML and JSON in same invoke)
-TEST_F(DeepSeek32DetectorTest, MixedFormatNotSupported) {
-  // Note: This test verifies that the parser handles the format correctly
-  // In practice, an invoke should use either XML or JSON, not both
-  std::string text =
-      "Mixed format test "
-      "<｜DSML｜function_calls><｜DSML｜invoke "
-      "name=\"get_weather\"><｜DSML｜parameter "
-      "name=\"city\" string=\"true\">Beijing</｜DSML｜parameter>{\"date\": "
-      "\"2024-06-27\"}</｜DSML｜invoke></｜DSML｜function_calls>";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "Mixed format test");
-  // The parser should handle this gracefully
-  ASSERT_GE(result.calls.size(), 0);
-}
-
-// Test performance with many tool calls
-TEST_F(DeepSeek32DetectorTest, PerformanceWithManyToolCalls) {
-  std::string text = "Performance test <｜DSML｜function_calls>";
-
-  // Build text containing multiple tool calls
-  for (int i = 0; i < 10; ++i) {
-    text +=
-        "<｜DSML｜invoke name=\"calculate\"><｜DSML｜parameter "
-        "name=\"expression\" string=\"true\">" +
-        std::to_string(i) + " + " + std::to_string(i + 1) +
-        "</｜DSML｜parameter></｜DSML｜invoke>";
-  }
-  text += "</｜DSML｜function_calls>";
-
-  auto result = detector_->detect_and_parse(text, tools_);
-
-  EXPECT_EQ(result.normal_text, "Performance test");
-  ASSERT_EQ(result.calls.size(), 10);
-
-  // Verify each tool call is correctly parsed
-  for (int i = 0; i < 10; ++i) {
-    const auto& call = result.calls[i];
-    EXPECT_EQ(call.tool_index, -1);  // Base class always returns -1
-    EXPECT_EQ(call.name.value(), "calculate");
-
-    nlohmann::json params = nlohmann::json::parse(call.parameters);
-    std::string expected_expr =
-        std::to_string(i) + " + " + std::to_string(i + 1);
-    EXPECT_EQ(params["expression"], expected_expr);
-  }
 }
 
 // Test array parameter with string="false"

@@ -49,7 +49,6 @@ class WordEmbeddingImpl : public torch::nn::Module {
     stream << name() << " " << weight_.sizes() << " " << weight_.device();
   }
 
-  // return the weight (for testing)
   torch::Tensor weight() const { return weight_; }
 
   bool is_weight_loaded() const { return weight_is_loaded_; }

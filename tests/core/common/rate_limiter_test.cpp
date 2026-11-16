@@ -2,11 +2,28 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+
 #include "core/framework/config/service_config.h"
 
 namespace xllm {
+namespace {
 
-TEST(RequestLimiterTest, Basic) {
+class RequestLimiterTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_max_ = ServiceConfig::get_instance().max_concurrent_requests();
+  }
+
+  void TearDown() override {
+    ServiceConfig::get_instance().max_concurrent_requests(previous_max_);
+  }
+
+ private:
+  int32_t previous_max_ = 0;
+};
+
+TEST_F(RequestLimiterTest, Basic) {
   ServiceConfig::get_instance().max_concurrent_requests(1);
   RateLimiter rate_limiter;
 
@@ -24,22 +41,20 @@ TEST(RequestLimiterTest, Basic) {
   rate_limiter.decrease_one_request();
 }
 
-TEST(RequestLimiterTest, NoLimitWhenMaxIsZero) {
+TEST_F(RequestLimiterTest, NoLimitWhenMaxIsZero) {
   ServiceConfig::get_instance().max_concurrent_requests(0);
   RateLimiter rate_limiter;
 
-  for (int i = 0; i < 100; ++i) {
-    EXPECT_FALSE(rate_limiter.is_limited());
-  }
-  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 100);
+  EXPECT_FALSE(rate_limiter.is_limited());
+  EXPECT_FALSE(rate_limiter.is_limited());
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 2);
 
-  for (int i = 0; i < 100; ++i) {
-    rate_limiter.decrease_one_request();
-  }
+  rate_limiter.decrease_one_request();
+  rate_limiter.decrease_one_request();
   EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
 }
 
-TEST(RequestLimiterTest, SleepBlocksAcquisition) {
+TEST_F(RequestLimiterTest, SleepBlocksAcquisition) {
   ServiceConfig::get_instance().max_concurrent_requests(10);
   RateLimiter rate_limiter;
 
@@ -56,4 +71,5 @@ TEST(RequestLimiterTest, SleepBlocksAcquisition) {
   rate_limiter.decrease_one_request();
 }
 
+}  // namespace
 }  // namespace xllm

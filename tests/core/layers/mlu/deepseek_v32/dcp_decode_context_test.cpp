@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "layers/mlu/deepseek_v32/dcp_decode_context.h"
 
+#include <c10/util/ScopeExit.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
@@ -39,6 +40,12 @@ TEST(DcpDecodeContextTest, LocalizesOnlyOwnedCacheWriteSlots) {
 }
 
 TEST(DcpDecodeContextTest, PacksTopkAcrossTopologiesAndEmptyRows) {
+  const int32_t threads = torch::get_num_threads();
+  const auto restore_threads =
+      c10::make_scope_exit([threads] { torch::set_num_threads(threads); });
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU device is required";
+  }
   torch::set_num_threads(1);
   {
     SCOPED_TRACE("PacksOwnedTopkAndUpdatesEachContextLength");

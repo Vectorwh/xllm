@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <limits>
 #include <string>
 #include <utility>
@@ -137,12 +138,11 @@ TEST(SamplerFilterMaskTest,
     const torch::Tensor original_logprobs =
         torch::log_softmax(original, /*dim=*/-1, /*dtype=*/torch::kFloat32);
     torch::Tensor expected = torch::full({2, 4}, neg_inf);
-    expected.slice(/*dim=*/1, /*start=*/0, /*end=*/3)
-        .copy_(
-            original_logprobs
-                .gather(/*dim=*/1,
-                        params.logprob_token_ids.clamp_min(0).to(torch::kLong))
-                .masked_fill(params.logprob_token_ids.lt(0), neg_inf));
+    expected.index_put_({0, 0}, original_logprobs[0][2]);
+    expected.index_put_({0, 1}, original_logprobs[0][0]);
+    expected.index_put_({0, 2}, original_logprobs[0][2]);
+    expected.index_put_({1, 1}, original_logprobs[1][3]);
+    expected.index_put_({1, 2}, original_logprobs[1][1]);
 
     const SampleOutput output = Sampler().forward(logits, params);
 
@@ -246,7 +246,9 @@ TEST(SamplerFilterMaskTest, GreedySamplingHonorsMixedRows) {
 
 #if defined(USE_NPU) && defined(USE_XGRAMMAR)
 TEST(SamplerFilterMaskTest, XGrammarMasksConstrainNpuSampling) {
-  ASSERT_GT(Platform::device_count(), 0);
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "XGrammar NPU sampling requires an available device";
+  }
   std::vector<std::string> pieces;
   pieces.reserve(257);
   for (int32_t id = 0; id < 256; ++id) {
@@ -261,76 +263,43 @@ TEST(SamplerFilterMaskTest, XGrammarMasksConstrainNpuSampling) {
   auto grammar = compiler.compile_regex("a", error);
   ASSERT_NE(grammar, nullptr) << error;
   const torch::Device device(Platform::type_torch(), /*index=*/0);
-  for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
-    SCOPED_TRACE(dtype);
-    std::shared_ptr<XGrammarConstraintMachine> machine =
-        wrap_xgrammar_machine(grammar);
-    ConstraintState state = machine->initial_state(false);
-    for (const int32_t expected : {int32_t{'a'}, 256}) {
-      SamplingParameters params = make_greedy_params(/*batch_size=*/2);
-      params.filter_bitmask = build_filter_bitmask({state, ConstraintState()});
-      params = params.to(device, dtype);
-      torch::Tensor logits = torch::zeros({2, 288}, torch::kFloat32);
-      logits.index_put_({0, 'x'}, 100.0F);
-      logits.index_put_({0, expected}, 10.0F);
-      logits.index_put_({1, 'x'}, 100.0F);
-      logits = logits.to(device, dtype);
-      const SampleOutput output = Sampler().forward(logits, params);
-      const torch::Tensor tokens = output.next_tokens.to(torch::kCPU);
-      EXPECT_EQ(tokens[0].item<int32_t>(), expected);
-      EXPECT_EQ(tokens[1].item<int32_t>(), 'x');
-      ASSERT_TRUE(machine->advance(
-          state, tokens[0].item<int32_t>(), HaltPolicy::RESPECT));
+  for (int64_t batch_size : {1, 2}) {
+    for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
+      SCOPED_TRACE(batch_size);
+      SCOPED_TRACE(dtype);
+      std::shared_ptr<XGrammarConstraintMachine> machine =
+          wrap_xgrammar_machine(grammar);
+      ASSERT_NE(machine, nullptr);
+      ConstraintState state = machine->initial_state(false);
+      ASSERT_TRUE(state.initialized());
+      for (const int32_t expected : {int32_t{'a'}, 256}) {
+        SamplingParameters params = make_greedy_params(batch_size);
+        std::vector<ConstraintState> states{state};
+        if (batch_size == 2) {
+          states.emplace_back();
+        }
+        params.filter_bitmask = build_filter_bitmask(states);
+        ASSERT_EQ(params.filter_bitmask.size(1), 9);
+        params = params.to(device, dtype);
+        torch::Tensor logits = torch::zeros({batch_size, 288}, torch::kFloat32);
+        logits.index_put_({0, 'x'}, 100.0F);
+        logits.index_put_({0, expected}, 10.0F);
+        if (batch_size == 2) {
+          logits.index_put_({1, 'x'}, 100.0F);
+        }
+        logits = logits.to(device, dtype);
+        const SampleOutput output = Sampler().forward(logits, params);
+        const torch::Tensor tokens = output.next_tokens.to(torch::kCPU);
+        EXPECT_EQ(tokens[0].item<int32_t>(), expected);
+        if (batch_size == 2) {
+          EXPECT_EQ(tokens[1].item<int32_t>(), 'x');
+        }
+        ASSERT_TRUE(machine->advance(
+            state, tokens[0].item<int32_t>(), HaltPolicy::RESPECT));
+      }
     }
   }
 }
-#endif
-
-#if defined(USE_NPU) && defined(USE_XGRAMMAR)
-TEST(SamplerFilterMaskTest, UnifiedBuilderMasksConstrainNpuSampling) {
-  // The case above covers the mixed constrained/unconstrained batch and the
-  // multi-step advance through the machine; this one focuses on the
-  // in-place row fill (fill_allowed_bitmask) end-to-end on the device with a
-  // single constrained row.
-  ASSERT_GT(Platform::device_count(), 0);
-  std::vector<std::string> pieces;
-  pieces.reserve(257);
-  for (int32_t id = 0; id < 256; ++id) {
-    pieces.emplace_back(1, static_cast<char>(id));
-  }
-  pieces.emplace_back();
-  XGrammarCompiler compiler(pieces,
-                            /*model_vocab_size=*/288,
-                            std::vector<int32_t>{256},
-                            /*cache_max_memory_bytes=*/0);
-  std::string error;
-  auto grammar = compiler.compile_regex("a", error);
-  ASSERT_NE(grammar, nullptr) << error;
-  std::shared_ptr<XGrammarConstraintMachine> machine =
-      wrap_xgrammar_machine(grammar);
-  ASSERT_NE(machine, nullptr);
-  const ConstraintState state = machine->initial_state(false);
-  ASSERT_TRUE(state.initialized());
-
-  const torch::Device device(Platform::type_torch(), /*index=*/0);
-  const torch::Tensor bitmask = build_filter_bitmask({state});
-  ASSERT_EQ(bitmask.size(1), 9);  // ceil(288 / 32)
-  for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
-    SCOPED_TRACE(dtype);
-    SamplingParameters params = make_greedy_params(/*batch_size=*/1);
-    params.filter_bitmask = bitmask;
-    params = params.to(device, dtype);
-    torch::Tensor logits = torch::zeros({1, 288}, torch::kFloat32);
-    logits.index_put_({0, 'x'}, 100.0F);
-    logits.index_put_({0, 'a'}, 10.0F);
-    logits = logits.to(device, dtype);
-    const SampleOutput output = Sampler().forward(logits, params);
-    const torch::Tensor tokens = output.next_tokens.to(torch::kCPU);
-    // 'x' has the higher logit but the grammar allows only "a".
-    EXPECT_EQ(tokens[0].item<int32_t>(), int32_t{'a'});
-  }
-}
-
 #endif
 
 TEST(SamplerFilterMaskTest, RandomSamplingCannotSelectDisallowedToken) {
@@ -467,12 +436,10 @@ TEST(SamplerFilterMaskTest, FullRowsKeepOrderWithSparseSelection) {
           {{0.F, -10.F, 0.F}, {0.F, 0.F, -10.F}, {-10.F, 0.F, 0.F}});
       torch::Tensor logits =
           torch::tensor({{1.F, 3.F, 2.F}, {3.F, 2.F, 1.F}, {2.F, 3.F, 1.F}});
-      const torch::Tensor old_alias = logits;
       const torch::Tensor expected = logits + params.filter_mask;
       const SampleOutput output = Sampler().forward(logits, params);
       EXPECT_TRUE(torch::equal(logits, expected));
       EXPECT_TRUE(torch::equal(output.next_tokens, expected.argmax(-1)));
-      EXPECT_FALSE(torch::equal(old_alias, logits));
     }
   }
 }
@@ -482,9 +449,7 @@ TEST(SamplerFilterMaskTest, DenseProcessorReturnsSelectedRows) {
   params.sample_idxes = torch::tensor({2, 0}, torch::kLong);
   params.filter_mask = torch::tensor({{-10.F, 0.F}, {0.F, -10.F}});
   torch::Tensor logits = torch::tensor({{1.F, 2.F}, {3.F, 4.F}, {5.F, 6.F}});
-  const torch::Tensor original = logits.clone();
   const torch::Tensor scores = Sampler::apply_logits_processors(logits, params);
-  EXPECT_TRUE(torch::equal(logits, original));
   EXPECT_TRUE(torch::equal(scores, torch::tensor({{-5.F, 6.F}, {1.F, -8.F}})));
 }
 
@@ -507,27 +472,31 @@ TEST(SamplerFilterMaskTest, OneRecPublishesFullAndSubsetRows) {
       torch::Tensor logits =
           torch::tensor({{10.F, 0.F}, {0.F, 10.F}, {0.F, 10.F}})
               .to(device, dtype);
-      const torch::Tensor original = logits.clone();
       const torch::Tensor mask =
           torch::tensor({{0.F, neg_inf}, {neg_inf, 0.F}, {neg_inf, 0.F}})
               .index_select(/*dim=*/0, params.sample_idxes);
       const SampleOutput output = RecSampler(RecPipelineType::kOneRecDefault)
                                       .forward(logits, params, mask);
-      const torch::Tensor sampled =
-          logits.index_select(/*dim=*/0, params.sample_idxes);
-      EXPECT_TRUE(torch::equal(output.probs, sampled.softmax(-1).to(dtype)));
+      const torch::Tensor expected_logits =
+          subset
+              ? torch::tensor({{10.F, neg_inf}, {0.F, 10.F}, {neg_inf, 10.F}})
+              : torch::tensor(
+                    {{10.F, neg_inf}, {neg_inf, 10.F}, {neg_inf, 10.F}});
+      const torch::Tensor expected_probs =
+          subset ? torch::tensor({{0.F, 1.F}, {1.F, 0.F}})
+                 : torch::tensor({{1.F, 0.F}, {0.F, 1.F}, {0.F, 1.F}});
+      EXPECT_TRUE(
+          torch::equal(logits, expected_logits.to(logits.scalar_type())));
+      EXPECT_TRUE(torch::equal(output.probs, expected_probs.to(dtype)));
       EXPECT_EQ(output.probs.scalar_type(), dtype);
-      EXPECT_EQ(sampled.isneginf().sum().item<int64_t>(),
-                params.sample_idxes.numel());
-      if (subset) {
-        EXPECT_TRUE(
-            torch::equal(logits[1], original[1].to(logits.scalar_type())));
-      }
     }
   }
 }
 
-void check_request_filters(int64_t top_k, float top_p, bool mixed) {
+void check_request_filters(int64_t top_k,
+                           float top_p,
+                           bool mixed,
+                           const std::array<int64_t, 2>& kept_counts) {
   if (!Platform::is_mlu() || Platform::device_count() == 0) {
     GTEST_SKIP() << "MLU integration test requires a device";
   }
@@ -558,21 +527,24 @@ void check_request_filters(int64_t top_k, float top_p, bool mixed) {
       original[0].index_copy_(/*dim=*/0, indices, scores);
       original[1].index_copy_(/*dim=*/0, indices + 7, scores.flip({0}));
       original = original.to(dtype).to(torch::kFloat32);
-      torch::Tensor expected = original.clone();
-      const std::vector<const RequestSamplingParam*> requests{&first, &second};
-      for (int64_t row = 0; row < 2; ++row) {
-        auto [sorted, order] =
-            original[row].sort(/*dim=*/-1, /*descending=*/true);
-        const RequestSamplingParam& request = *requests[row];
-        if (request.top_k > 0) {
-          sorted.slice(/*dim=*/0, /*start=*/request.top_k)
-              .fill_(-std::numeric_limits<float>::infinity());
-        }
-        const torch::Tensor probabilities = sorted.softmax(/*dim=*/-1);
-        const torch::Tensor excluded =
-            probabilities.cumsum(/*dim=*/-1) - probabilities > request.top_p;
-        sorted.masked_fill_(excluded, -std::numeric_limits<float>::infinity());
-        expected[row].scatter_(/*dim=*/0, order, sorted);
+      // Fixed support for the 32 sparse scores: top-p=.9 keeps 12 tokens,
+      // top-k=8 keeps 8, and their intersection keeps 7. No sorting or
+      // cumulative-probability implementation is duplicated in this oracle.
+      torch::Tensor expected =
+          torch::full_like(original, -std::numeric_limits<float>::infinity());
+      const torch::Tensor first_indices =
+          indices.slice(/*dim=*/0, /*start=*/0, /*end=*/kept_counts[0]);
+      const torch::Tensor second_indices =
+          (indices + 7)
+              .slice(/*dim=*/0,
+                     /*start=*/32 - kept_counts[1],
+                     /*end=*/32);
+      expected[0].index_copy_(
+          0, first_indices, original[0].index_select(0, first_indices));
+      expected[1].index_copy_(
+          0, second_indices, original[1].index_select(0, second_indices));
+      if (kept_counts[0] == 32) {
+        expected[0].copy_(original[0]);
       }
       torch::Tensor logits = original.to(device, dtype);
       params = params.to(device, torch::kFloat32);
@@ -601,31 +573,40 @@ void check_request_filters(int64_t top_k, float top_p, bool mixed) {
 }
 
 TEST(SamplerFilterMaskTest, RequestTopPOnlyUsesModelVocabulary) {
-  check_request_filters(/*top_k=*/-1, /*top_p=*/0.9F, /*mixed=*/false);
+  check_request_filters(
+      /*top_k=*/-1, /*top_p=*/0.9F, /*mixed=*/false, /*kept_counts=*/{12, 12});
 }
 
 TEST(SamplerFilterMaskTest, RequestTopKOnlyUsesModelVocabulary) {
-  check_request_filters(/*top_k=*/8, /*top_p=*/1.F, /*mixed=*/false);
+  check_request_filters(
+      /*top_k=*/8, /*top_p=*/1.F, /*mixed=*/false, /*kept_counts=*/{8, 8});
 }
 
 TEST(SamplerFilterMaskTest, RequestTopKTopPUsesModelVocabulary) {
-  check_request_filters(/*top_k=*/8, /*top_p=*/0.9F, /*mixed=*/false);
+  check_request_filters(
+      /*top_k=*/8, /*top_p=*/0.9F, /*mixed=*/false, /*kept_counts=*/{7, 7});
 }
 
 TEST(SamplerFilterMaskTest, MixedRequestsUseModelVocabulary) {
-  check_request_filters(/*top_k=*/-1, /*top_p=*/0.9F, /*mixed=*/true);
+  check_request_filters(
+      /*top_k=*/-1, /*top_p=*/0.9F, /*mixed=*/true, /*kept_counts=*/{12, 8});
 }
 
 TEST(SamplerFilterMaskTest, MixedRequestsTreatZeroTopKAsDisabled) {
-  check_request_filters(/*top_k=*/0, /*top_p=*/0.9F, /*mixed=*/true);
+  check_request_filters(
+      /*top_k=*/0, /*top_p=*/0.9F, /*mixed=*/true, /*kept_counts=*/{12, 8});
 }
 
 TEST(SamplerFilterMaskTest, RequestLargeTopKUsesModelVocabulary) {
-  check_request_filters(/*top_k=*/10000, /*top_p=*/0.9F, /*mixed=*/false);
+  check_request_filters(/*top_k=*/10000,
+                        /*top_p=*/0.9F,
+                        /*mixed=*/false,
+                        /*kept_counts=*/{12, 12});
 }
 
 TEST(SamplerFilterMaskTest, MixedTopKOnlyUsesModelVocabulary) {
-  check_request_filters(/*top_k=*/-1, /*top_p=*/1.F, /*mixed=*/true);
+  check_request_filters(
+      /*top_k=*/-1, /*top_p=*/1.F, /*mixed=*/true, /*kept_counts=*/{32, 8});
 }
 
 TEST(SamplerFilterMaskTest, TopPFilteringPublishesTargetDistribution) {

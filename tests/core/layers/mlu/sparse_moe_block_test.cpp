@@ -37,31 +37,39 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+namespace {
 
-class SparseMoEBlockTestPeer final {
+class RecordingProcessGroup final : public test::MockProcessGroup {
  public:
-  static FusedMoE moe(SparseMoEBlockImpl& block) { return block.moe_; }
+  RecordingProcessGroup(const torch::Device& device,
+                        int64_t rank = 0,
+                        int64_t world_size = 1)
+      : test::MockProcessGroup(device, rank, world_size) {}
 
-  static ProcessGroup* routed_pg(SparseMoEBlockImpl& block) {
-    return block.routed_pg();
+  void allreduce(torch::Tensor& input) override {
+    ++allreduce_calls_;
+    test::MockProcessGroup::allreduce(input);
   }
 
-  static bool need_gather(SparseMoEBlockImpl& block) {
-    return block.need_gather();
+  c10::intrusive_ptr<c10d::Work> allgather_base_async(
+      const torch::Tensor& input,
+      torch::Tensor& output) override {
+    allgather_input_rows_.push_back(input.size(0));
+    return test::MockProcessGroup::allgather_base_async(input, output);
   }
 
-  static void set_enable_deep_ep(SparseMoEBlockImpl& block,
-                                 bool enable_deep_ep) {
-    block.enable_deep_ep_ = enable_deep_ep;
+  int32_t allreduce_calls() const { return allreduce_calls_; }
+
+  const std::vector<int64_t>& allgather_input_rows() const {
+    return allgather_input_rows_;
   }
 
-  static std::vector<int32_t> row_dp_tokens(
-      SparseMoEBlockImpl& block,
-      int64_t hidden_rows,
-      const ModelInputParams& input_params) {
-    return block.get_row_dp_tokens(hidden_rows, input_params);
-  }
+ private:
+  int32_t allreduce_calls_ = 0;
+  std::vector<int64_t> allgather_input_rows_;
 };
+
+}  // namespace
 
 class SparseMoEBlockTest : public ::testing::TestWithParam<std::string> {
  protected:
@@ -95,13 +103,13 @@ class SparseMoEBlockTest : public ::testing::TestWithParam<std::string> {
   }
 
   void set_tp_ctx(int64_t world_size, int64_t ep_size) {
-    global_pg_ = std::make_unique<test::MockProcessGroup>(
+    global_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, world_size);
-    tp_pg_ = std::make_unique<test::MockProcessGroup>(
+    tp_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, world_size);
-    ep_pg_ = std::make_unique<test::MockProcessGroup>(
+    ep_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, ep_size);
-    single_rank_pg_ = std::make_unique<test::MockProcessGroup>(
+    single_rank_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, /*world_size=*/1);
     dp_pg_.reset();
 
@@ -116,19 +124,22 @@ class SparseMoEBlockTest : public ::testing::TestWithParam<std::string> {
     parallel_args_.moe_tp_group_ = tp_pg_.get();
   }
 
-  void set_dp_ep_ctx(int64_t dp_size, bool with_dp_group) {
+  void set_dp_ep_ctx(int64_t dp_size,
+                     bool with_dp_group,
+                     int64_t ep_size = 2,
+                     int64_t dp_rank = 0) {
     const int64_t world_size = dp_size;
-    global_pg_ = std::make_unique<test::MockProcessGroup>(
+    global_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, world_size);
-    tp_pg_ = std::make_unique<test::MockProcessGroup>(
+    tp_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, /*world_size=*/1);
-    ep_pg_ = std::make_unique<test::MockProcessGroup>(
-        options_.device(), /*rank=*/0, /*world_size=*/2);
-    single_rank_pg_ = std::make_unique<test::MockProcessGroup>(
+    ep_pg_ = std::make_unique<RecordingProcessGroup>(
+        options_.device(), /*rank=*/0, ep_size);
+    single_rank_pg_ = std::make_unique<RecordingProcessGroup>(
         options_.device(), /*rank=*/0, /*world_size=*/1);
     if (with_dp_group) {
-      dp_pg_ = std::make_unique<test::MockProcessGroup>(
-          options_.device(), /*rank=*/0, dp_size);
+      dp_pg_ = std::make_unique<RecordingProcessGroup>(
+          options_.device(), dp_rank, dp_size);
     } else {
       dp_pg_.reset();
     }
@@ -141,7 +152,7 @@ class SparseMoEBlockTest : public ::testing::TestWithParam<std::string> {
     parallel_args_.cp_group_ = tp_pg_.get();
     parallel_args_.dp_local_process_group_ =
         with_dp_group ? dp_pg_.get() : nullptr;
-    parallel_args_.ep_size_ = 2;
+    parallel_args_.ep_size_ = ep_size;
     parallel_args_.moe_ep_group_ = ep_pg_.get();
     parallel_args_.moe_tp_group_ = tp_pg_.get();
   }
@@ -258,71 +269,94 @@ class SparseMoEBlockTest : public ::testing::TestWithParam<std::string> {
   ParallelArgs parallel_args_{0, 1, nullptr};
   torch::TensorOptions options_;
   std::shared_ptr<ModelStreamRegistry> stream_registry_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> ep_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
+  std::unique_ptr<RecordingProcessGroup> global_pg_;
+  std::unique_ptr<RecordingProcessGroup> dp_pg_;
+  std::unique_ptr<RecordingProcessGroup> tp_pg_;
+  std::unique_ptr<RecordingProcessGroup> ep_pg_;
+  std::unique_ptr<RecordingProcessGroup> single_rank_pg_;
 };
 
-TEST_P(SparseMoEBlockTest, RoutedPgUsesEpGroupWhenEpEnabled) {
+TEST_P(SparseMoEBlockTest, SelectedRouteReducesOverTheRoutedGroup) {
+  auto run_selected = [&] {
+    SparseMoEBlock block = create_block();
+    block->load_state_dict(StateDict(create_fp_weights()));
+
+    torch::Tensor hidden_states = make_hidden({2, model_args_.hidden_size()});
+    torch::Tensor topk_weights = torch::ones({2, 2}, options_);
+    torch::Tensor topk_ids =
+        torch::zeros({2, 2}, options_.dtype(torch::kInt64));
+    torch::Tensor output = block->forward_selected(
+        hidden_states, topk_weights, topk_ids, ModelInputParams());
+
+    sync_dev();
+    EXPECT_EQ(output.sizes(), hidden_states.sizes());
+  };
+
   set_tp_ctx(/*world_size=*/2, /*ep_size=*/2);
-  SparseMoEBlock block = create_block();
+  run_selected();
+  EXPECT_EQ(ep_pg_->allreduce_calls(), 1);
+  EXPECT_EQ(tp_pg_->allreduce_calls(), 0);
 
-  EXPECT_EQ(SparseMoEBlockTestPeer::routed_pg(*block), ep_pg_.get());
-}
-
-TEST_P(SparseMoEBlockTest, RoutedPgFallsBackToTpGroup) {
   set_tp_ctx(/*world_size=*/2, /*ep_size=*/1);
-  SparseMoEBlock block = create_block();
-
-  EXPECT_EQ(SparseMoEBlockTestPeer::routed_pg(*block), tp_pg_.get());
+  run_selected();
+  EXPECT_EQ(tp_pg_->allreduce_calls(), 1);
+  EXPECT_EQ(ep_pg_->allreduce_calls(), 0);
 }
 
-TEST_P(SparseMoEBlockTest, NeedGatherOnlyForDpEp) {
-  set_dp_ep_ctx(/*dp_size=*/2, /*with_dp_group=*/true);
-  SparseMoEBlock block = create_block();
-  EXPECT_TRUE(SparseMoEBlockTestPeer::need_gather(*block));
+TEST_P(SparseMoEBlockTest, SelectedRouteGathersAndConvertsRowsOnlyForDpEp) {
+  set_dp_ep_ctx(/*dp_size=*/2,
+                /*with_dp_group=*/true,
+                /*ep_size=*/2,
+                /*dp_rank=*/1);
+  {
+    SparseMoEBlock block = create_block();
+    block->load_state_dict(StateDict(create_fp_weights()));
 
-  set_tp_ctx(/*world_size=*/2, /*ep_size=*/2);
-  block = create_block();
-  EXPECT_FALSE(SparseMoEBlockTestPeer::need_gather(*block));
-}
+    // This rank owns one model token expanded to two rows; the other rank's
+    // three model tokens therefore require six gathered rows.
+    torch::Tensor hidden_states =
+        make_hidden({1, 2, model_args_.hidden_size()});
+    torch::Tensor topk_weights = torch::ones({1, 2, 2}, options_);
+    torch::Tensor topk_ids =
+        torch::zeros({1, 2, 2}, options_.dtype(torch::kInt64));
+    ModelInputParams input_params;
+    input_params.parallel.dp_global_token_nums = {3, 1};
 
-TEST_P(SparseMoEBlockTest, ConvertsModelTokensToRowTokens) {
-  set_dp_ep_ctx(/*dp_size=*/2, /*with_dp_group=*/true);
-  SparseMoEBlock block = create_block();
-  ModelInputParams input_params;
-  input_params.parallel.dp_global_token_nums = {3, 1};
+    torch::Tensor output = block->forward_selected(
+        hidden_states, topk_weights, topk_ids, input_params);
+    sync_dev();
 
-  std::vector<int32_t> row_tokens = SparseMoEBlockTestPeer::row_dp_tokens(
-      *block, /*hidden_rows=*/6, input_params);
+    EXPECT_EQ(output.sizes(), hidden_states.sizes());
+    EXPECT_EQ(dp_pg_->allgather_input_rows(), std::vector<int64_t>({6, 6, 6}));
+  }
 
-  EXPECT_EQ(row_tokens, std::vector<int32_t>({6, 2}));
-}
+  // DP without EP must keep local rows and must not require DP token metadata.
+  set_dp_ep_ctx(/*dp_size=*/2,
+                /*with_dp_group=*/true,
+                /*ep_size=*/1);
+  {
+    SparseMoEBlock block = create_block();
+    block->load_state_dict(StateDict(create_fp_weights()));
 
-TEST_P(SparseMoEBlockTest, LoadStateDictAcceptsUnprefixedMoeKeys) {
-  SparseMoEBlock block = create_block();
-  FusedMoE raw_moe = create_raw_moe();
-  StateDict state_dict(create_fp_weights());
-  block->load_state_dict(state_dict);
-  raw_moe->load_state_dict(state_dict);
+    torch::Tensor hidden_states = make_hidden({2, model_args_.hidden_size()});
+    torch::Tensor topk_weights = torch::ones({2, 2}, options_);
+    torch::Tensor topk_ids =
+        torch::zeros({2, 2}, options_.dtype(torch::kInt64));
+    torch::Tensor output = block->forward_selected(
+        hidden_states, topk_weights, topk_ids, ModelInputParams());
+    sync_dev();
 
-  torch::Tensor hidden_states = make_hidden({4, model_args_.hidden_size()});
-  FusedMoEImpl::RouteInfo route = route_for(raw_moe, hidden_states);
-  torch::Tensor expected = raw_moe->forward_experts(
-      hidden_states, /*enable_all2all_communication=*/false, route);
-  torch::Tensor actual = block->forward_selected(
-      hidden_states, route.reduce_weight, route.expert_id, ModelInputParams());
-
-  sync_dev();
-  test::verify_tensor_close(actual, expected, 1e-3, 1e-4);
+    EXPECT_EQ(output.sizes(), hidden_states.sizes());
+    EXPECT_TRUE(dp_pg_->allgather_input_rows().empty());
+  }
 }
 
 TEST_P(SparseMoEBlockTest, SelectedRouteMergesSharedAndRouted) {
   SparseMoEBlock block = create_block();
   FusedMoE raw_moe = create_raw_moe(/*enable_result_reduction=*/false);
   StateDict state_dict(create_fp_weights());
+  ASSERT_TRUE(state_dict.has("experts.0.gate_proj.weight"));
+  ASSERT_FALSE(state_dict.has("moe.experts.0.gate_proj.weight"));
   block->load_state_dict(state_dict);
   raw_moe->load_state_dict(state_dict);
 

@@ -100,6 +100,9 @@ torch::Tensor make_slots(const std::vector<int64_t>& start_pos,
 class DeepseekV4DecoderLayerTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    if (Platform::device_count() == 0) {
+      GTEST_SKIP() << "MLU device is required";
+    }
     torch::Device torch_device(Platform::type_torch(), 0);
     Device device(torch_device);
     device.set_seed();
@@ -412,6 +415,7 @@ class DeepseekV4DecoderLayerTest : public ::testing::Test {
           seq_len, torch::TensorOptions().dtype(torch::kInt64).device(device_));
     }
 
+    const torch::Tensor original_input = hidden.clone();
     torch::Tensor output = layer->forward(hidden,
                                           residual,
                                           positions,
@@ -428,6 +432,26 @@ class DeepseekV4DecoderLayerTest : public ::testing::Test {
     ASSERT_TRUE(torch::isfinite(output_cpu).all().item<bool>());
     const double abs_sum = torch::abs(output_cpu).sum().item<double>();
     ASSERT_GT(abs_sum, 0.0);
+    if (use_ffn_alias) {
+      DeepseekV4DecoderLayer ordinary(context, layer_id);
+      ordinary->set_cache_mapping(mapping);
+      ordinary->load_state_dict(make_state_dict(args));
+      ordinary->verify_loaded_weights();
+      auto original = original_input.clone();
+      std::optional<torch::Tensor> plain_residual;
+      KVCache plain_cache = make_kv_cache(args, 1);
+      const auto plain = ordinary->forward(original,
+                                           plain_residual,
+                                           positions,
+                                           metadata,
+                                           plain_cache,
+                                           input_params,
+                                           input_ids);
+      Device(device_).synchronize_default_stream();
+      EXPECT_TRUE(torch::allclose(output, plain, 0.02, 0.002));
+      EXPECT_TRUE(
+          torch::equal(kv_cache.get_swa_cache(), plain_cache.get_swa_cache()));
+    }
   }
 
   torch::Device device_{torch::kCPU};

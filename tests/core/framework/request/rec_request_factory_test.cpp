@@ -151,7 +151,6 @@ TEST_F(RecRequestFactoryTest, LlmRecRejectsEmptyInputReleasesRateLimitSlot) {
                                  make_capture_callback(&capture));
 
   EXPECT_EQ(request, nullptr);
-  ASSERT_TRUE(capture.called);
   ASSERT_TRUE(capture.status.has_value());
   EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(),
@@ -172,11 +171,12 @@ TEST_F(RecRequestFactoryTest, LlmRecFailsWhenPromptTokenizationFails) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "Failed to tokenize prompt");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
-TEST_F(RecRequestFactoryTest, LlmRecRejectsPromptLongerThanContext) {
+TEST_F(RecRequestFactoryTest, LlmRecRejectsPromptAtContextLimit) {
   auto factory = make_llmrec_factory(/*vocab_size=*/1000, /*max_position=*/8);
   CallbackCapture capture;
   RequestParams sp;
@@ -210,6 +210,7 @@ TEST_F(RecRequestFactoryTest, LlmRecFailsWhenStopSequenceEncodingFails) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "Failed to encode stop sequence");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
@@ -229,6 +230,7 @@ TEST_F(RecRequestFactoryTest, LlmRecCreatesRequestForValidPromptTokens) {
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().prompt_tokens, (std::vector<int32_t>{1, 2, 3}));
   EXPECT_EQ(request->state().timing, sp.timing);
   EXPECT_EQ(request->sequences().front()->request_timing(), sp.timing);
   EXPECT_FALSE(capture.called);
@@ -382,6 +384,7 @@ TEST_F(RecRequestFactoryTest, LlmRecAcceptsTopLogprobsEqualToVocabulary) {
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().sampling_param.top_logprobs, 1000);
   EXPECT_FALSE(capture.called);
 }
 
@@ -422,6 +425,9 @@ TEST_F(RecRequestFactoryTest, LlmRecCreatesRequestForValidPromptString) {
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().prompt_tokens,
+            (std::vector<int32_t>{
+                'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'}));
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
 }
@@ -441,6 +447,7 @@ TEST_F(RecRequestFactoryTest, LlmRecMmDataOverloadCreatesRequestWithoutMmData) {
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().prompt_tokens, (std::vector<int32_t>{1, 2, 3}));
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
 }
@@ -461,6 +468,7 @@ TEST_F(RecRequestFactoryTest, OneRecRejectsBothPromptTokensAndInputTensors) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(),
             "prompt_tokens and input_tensors cannot both be set");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
@@ -479,6 +487,7 @@ TEST_F(RecRequestFactoryTest, OneRecRejectsEmptyInput) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(),
             "Rec model requires prompt_tokens or input_tensors to be provided");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
@@ -498,6 +507,7 @@ TEST_F(RecRequestFactoryTest, OneRecRejectsEmptyInputTensors) {
 
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_EQ(capture.status->message(), "OneRec input_tensors cannot be empty");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
@@ -516,6 +526,7 @@ TEST_F(RecRequestFactoryTest, OneRecCreatesRequestForPromptTokens) {
                                  make_capture_callback(&capture));
 
   ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().prompt_tokens, (std::vector<int32_t>{1, 2, 3}));
   EXPECT_FALSE(capture.called);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
 }

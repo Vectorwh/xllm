@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
-from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
+from xllm.python.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
 
 
 @pytest.mark.parametrize("module_name", ["attn", "self_attn"])
@@ -71,7 +71,7 @@ def test_attention_loader_accepts_supported_prefixes_and_sink_alias(module_name:
     layer.self_attn = attention
     owner = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     torch.nn.Module.__init__(owner)
-    owner.cfg = SimpleNamespace(n_heads=4, tp_size=2, tp_rank=1)
+    owner.cfg = DeepseekV4Config(n_heads=4, tp_size=2, tp_rank=1)
     owner.model = torch.nn.Module()
     owner.model.layers = torch.nn.ModuleList([layer])
     loader = FakeLoader()

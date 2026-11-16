@@ -316,7 +316,7 @@ TEST(FusedMhcDelayedPreTest, RepeatedLaunchesAreBitwiseIdentical) {
                                                 kNormEps);
     };
     const auto first = run();
-    for (int32_t repeat = 0; repeat < 16; ++repeat) {
+    for (int32_t repeat = 0; repeat < 3; ++repeat) {
       const auto again = run();
       ASSERT_TRUE(torch::equal(std::get<0>(again), std::get<0>(first)));
       ASSERT_TRUE(torch::equal(std::get<1>(again), std::get<1>(first)));

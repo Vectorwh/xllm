@@ -145,7 +145,11 @@ function(cc_test)
       file(READ "${source_path}" source_contents)
       string(APPEND _cc_test_scan_contents "${source_contents}\n")
     endforeach()
-    string(REGEX REPLACE "[\r\n\t]" " " _cc_test_scan_contents "${_cc_test_scan_contents}")
+    # Keep source-line boundaries for modern GoogleTest discovery. Normalize
+    # only multiline macro declarations for older CMake versions.
+    string(REGEX REPLACE
+      "(TYPED_TEST_P|TYPED_TEST|TEST_F|TEST_P|TEST)[\r\n\t ]*\\([\r\n\t ]*([A-Za-z0-9_]+)[\r\n\t ]*,[\r\n\t ]*([A-Za-z0-9_]+)[\r\n\t ]*\\)"
+      "\\1(\\2, \\3)" _cc_test_scan_contents "${_cc_test_scan_contents}")
     set(_cc_test_scan_file "${CMAKE_CURRENT_BINARY_DIR}/${CC_TEST_NAME}_gtest_scan.txt")
     file(WRITE "${_cc_test_scan_file}" "${_cc_test_scan_contents}")
     gtest_add_tests(

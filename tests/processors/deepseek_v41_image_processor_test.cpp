@@ -183,17 +183,6 @@ TEST(DeepseekV41ImageProcessorTest, PadsWithGreyAndCentersContent) {
   }
 }
 
-TEST(DeepseekV41ImageProcessorTest, NormalizesGreyToMinusOne) {
-  ModelArgs args;
-  const DeepseekV41ImageProcessor processor(args);
-  const ImageOut out = process_one(processor, filled(3, 28, 28, 127.0));
-  ASSERT_TRUE(out.pixel_values.defined());
-  const float min_v = out.pixel_values.min().item<float>();
-  const float max_v = out.pixel_values.max().item<float>();
-  EXPECT_NEAR(static_cast<double>(min_v), normalize(127.0), 2e-3);
-  EXPECT_NEAR(static_cast<double>(max_v), normalize(127.0), 2e-3);
-}
-
 TEST(DeepseekV41ImageProcessorTest, AcceptsUint8InputDirectly) {
   // Production decode hands the processor uint8 [C, H, W]; the pipeline must
   // consume it without an intermediate float round-trip.

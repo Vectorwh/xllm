@@ -106,6 +106,8 @@ TEST_P(PagedAttentionGraphOperationTest, ReplayRetilesAcrossSequenceLengths) {
       /*isHighPriority=*/false, device.index());
   // Cross KV-block and split-plan boundaries in both directions. The same
   // graph and output addresses must remain valid throughout all replays.
+  std::vector<int32_t> lengths(query_rows);
+  torch::Tensor expected;
   int32_t step = 0;
   for (const int32_t length :
        {16, 17, 128, 129, 2048, 2049, 32824, 32825, 32826, 2048, 16}) {
@@ -120,7 +122,6 @@ TEST_P(PagedAttentionGraphOperationTest, ReplayRetilesAcrossSequenceLengths) {
     const torch::Tensor current_block_table =
         canonical_block_table.index_select(1, block_order);
     block_table.copy_(current_block_table);
-    std::vector<int32_t> lengths(query_rows);
     std::vector<torch::Tensor> reference;
     reference.reserve(query_rows);
     for (int64_t query_row = 0; query_row < query_rows; ++query_row) {
@@ -161,7 +162,7 @@ TEST_P(PagedAttentionGraphOperationTest, ReplayRetilesAcrossSequenceLengths) {
     }
     ASSERT_EQ(aclrtSynchronizeStream(stream.stream()), ACL_SUCCESS);
     const torch::Tensor actual = output.to(torch::kCPU).to(torch::kFloat32);
-    const torch::Tensor expected = torch::stack(reference);
+    expected = torch::stack(reference);
     ASSERT_TRUE(
         torch::allclose(actual, expected, /*rtol=*/0.02, /*atol=*/0.002))
         << "length=" << length << ", batch=" << batch_size
@@ -170,16 +171,41 @@ TEST_P(PagedAttentionGraphOperationTest, ReplayRetilesAcrossSequenceLengths) {
         << ", max_abs_error=" << (actual - expected).abs().max().item<float>();
   }
   graph.reset();
-  EXPECT_EQ(resources->stream_count(), 1);
-  // A second node reuses the stream's context; another stream gets its own.
-  PagedAttentionGraphOperation same_stream(
-      resources, query, key, value, block_table, output, /*scale=*/1.0 / 16.0);
-  EXPECT_EQ(resources->stream_count(), 1);
-  const auto other_stream = c10_npu::getStreamFromPool(false, device.index());
+  // Verify usable results from shared resources, not an internal pool count.
+  torch::Tensor same_output = torch::empty_like(query);
+  PagedAttentionGraphOperation same_stream(resources,
+                                           query,
+                                           key,
+                                           value,
+                                           block_table,
+                                           same_output,
+                                           /*scale=*/1.0 / 16.0);
+  same_stream.prepare(lengths);
+  same_stream.execute();
+  ASSERT_EQ(aclrtSynchronizeStream(stream.stream()), ACL_SUCCESS);
+  EXPECT_TRUE(torch::allclose(same_output.cpu().to(torch::kFloat32),
+                              expected,
+                              /*rtol=*/0.02,
+                              /*atol=*/0.002));
+
+  const auto other_stream = c10_npu::getStreamFromPool(
+      /*isHighPriority=*/false, device.index());
   const c10_npu::NPUStreamGuard other_guard(other_stream);
-  PagedAttentionGraphOperation other(
-      resources, query, key, value, block_table, output, /*scale=*/1.0 / 16.0);
-  EXPECT_EQ(resources->stream_count(), 2);
+  torch::Tensor other_output = torch::empty_like(query);
+  PagedAttentionGraphOperation other(resources,
+                                     query,
+                                     key,
+                                     value,
+                                     block_table,
+                                     other_output,
+                                     /*scale=*/1.0 / 16.0);
+  other.prepare(lengths);
+  other.execute();
+  ASSERT_EQ(aclrtSynchronizeStream(other_stream.stream()), ACL_SUCCESS);
+  EXPECT_TRUE(torch::allclose(other_output.cpu().to(torch::kFloat32),
+                              expected,
+                              /*rtol=*/0.02,
+                              /*atol=*/0.002));
 }
 
 INSTANTIATE_TEST_SUITE_P(

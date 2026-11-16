@@ -27,7 +27,6 @@ import pytest
 import torch
 
 from xllm.python.models import deepseek_v4 as v4
-from xllm.python.models import deepseek_v41 as v41
 
 
 class _FakeEvent:
@@ -80,11 +79,8 @@ def _owner(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-@pytest.mark.parametrize("model_type", ["v4", "v41"])
 @pytest.mark.parametrize("device_type", ["cpu", "npu", "privateuseone"])
-def test_overlap_is_selected_at_construction_without_config(
-    monkeypatch: pytest.MonkeyPatch, model_type: str, device_type: str
-) -> None:
+def test_overlap_is_selected_at_construction_without_config(monkeypatch: pytest.MonkeyPatch, device_type: str) -> None:
     """Exercise the constructor's default without allocating NPU tensors."""
     empty = torch.empty
     linear = torch.nn.Linear
@@ -102,12 +98,13 @@ def test_overlap_is_selected_at_construction_without_config(
 
     monkeypatch.setattr(torch, "empty", host_empty)
     monkeypatch.setattr(torch.nn, "Linear", host_linear)
-    cls = v4.DeepseekV4MoE if model_type == "v4" else v41.DeepseekV41W8A8MoE
-    cfg_cls = v4.DeepseekV4Config if model_type == "v4" else v41.DeepseekV41Config
+    cls = v4.DeepseekV4MoE
+    cfg_cls = v4.DeepseekV4Config
     monkeypatch.setattr(cls, "_SHARED_MLP_CLS", staticmethod(shared_mlp))
     cfg = cfg_cls(hidden_size=4, n_routed_experts=4, moe_intermediate_size=4, n_hash_layers=0)
     assert "enable_shared_expert_overlap" not in cfg.__dataclass_fields__
-    moe = cls(cfg, 0, torch.bfloat16, SimpleNamespace(type=device_type))
+    device = torch.device("cpu") if device_type == "cpu" else SimpleNamespace(type=device_type)
+    moe = cls(cfg, 0, torch.bfloat16, device)
     assert moe._shared_expert_overlap_enabled is (device_type != "cpu")
 
 

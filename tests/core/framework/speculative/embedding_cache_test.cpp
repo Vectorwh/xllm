@@ -22,8 +22,6 @@ limitations under the License.
 #include "core/framework/speculative/mtp_async_replay_builder.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/runtime/forward_params.h"
-#include "platform/device.h"
-#include "platform/platform.h"
 
 namespace xllm {
 
@@ -36,7 +34,6 @@ bool tensor_equal(const torch::Tensor& lhs, const torch::Tensor& rhs) {
 }  // namespace
 
 TEST(EmbeddingCacheTest, WritePrefillTargetContextAndClear) {
-  torch::Device device(Platform::type_torch(), 0);
   EmbeddingCache cache(/*total_nums=*/4);
 
   std::vector<int32_t> ids = {3, 2};
@@ -97,7 +94,6 @@ TEST(EmbeddingCacheTest, WritePrefillTargetContextSelectsEmbeddings) {
 }
 
 TEST(EmbeddingCacheTest, WriteValidateTargetContext) {
-  torch::Device device(Platform::type_torch(), 0);
   EmbeddingCache cache(/*total_nums=*/2);
   std::vector<int32_t> ids = {0, 1};
   std::vector<std::string> request_ids = {"req_0", "req_1"};
@@ -368,10 +364,15 @@ TEST(EmbeddingCacheTest,
         std::vector<int32_t>(all_slots.begin(), all_slots.begin() + span));
     EXPECT_EQ(replay.selected_rows, std::vector<int32_t>({span - 1}));
     EXPECT_TRUE(torch::equal(torch::stack(replay.embeddings), expected_hidden));
-    std::vector<int32_t> expected_kv_lens;
-    for (int32_t len = 5; len < 5 + span; ++len) {
-      specBuilder::append_seq_len_by_layout(expected_kv_lens, len);
-    }
+#if defined(USE_NPU)
+    const std::vector<int32_t> kv_lens = {5, 6, 7, 8};
+    const std::vector<int32_t> expected_kv_lens(kv_lens.begin(),
+                                                kv_lens.begin() + span);
+#else
+    const std::vector<int32_t> cumulative_kv_lens = {0, 5, 11, 18, 26};
+    const std::vector<int32_t> expected_kv_lens(
+        cumulative_kv_lens.begin(), cumulative_kv_lens.begin() + span + 1);
+#endif
     EXPECT_EQ(replay.rows.out_kv_seq_lens, expected_kv_lens);
   }
 }

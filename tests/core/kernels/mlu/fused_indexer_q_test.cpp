@@ -13,12 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <cnrt.h>
 #include <framework/core/MLUStream.h>
 #include <framework/core/device.h>
 #include <framework/core/stream_guard.h>
 #include <framework/graphs/MLUGraph.h>
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
@@ -206,9 +204,8 @@ TEST(FusedIndexerQTest, UsesCurrentStreamAndReplaysUpdatedInputs) {
     torch_mlu::synchronize();
     torch_mlu::mlu::MLUStreamGuard stream(torch_mlu::getStreamFromPool(
         /*isHighPriority=*/false, in.qr.device().index()));
-    for (int32_t i = 0; i < 10; ++i) {
-      run(in);
-    }
+    run(in);
+    torch_mlu::synchronize();
     torch_mlu::MLUGraph graph;
     graph.capture_begin();
     const torch::Tensor output = run(in);
@@ -251,49 +248,6 @@ TEST(FusedIndexerQTest, UsesCurrentStreamAndReplaysUpdatedInputs) {
     }
     graph.replay();
     EXPECT_TRUE(exact(initial, output));
-    for (int32_t i = 0; i < 200; ++i) {
-      graph.replay();
-    }
-    EXPECT_TRUE(exact(initial, output));
-  }
-}
-
-// Opt-in latency evidence, excluded from default CTest correctness checks.
-TEST(FusedIndexerQTest, DISABLED_ReportsPairedLatency) {
-  for (const int64_t tokens :
-       {6, 12, 24, 27, 34, 48, 96, 97, 576, 1024, 2048, 4096}) {
-    const Inputs in = make_inputs(tokens);
-    std::vector<float> fused, base;
-    fused.reserve(3);
-    base.reserve(3);
-    for (int32_t path = 0; path < 2; ++path) {
-      auto call = [&]() { return path == 0 ? run(in) : reference(in, false); };
-      for (int32_t i = 0; i < 10; ++i) {
-        call();
-      }
-      for (int32_t group = 0; group < 3; ++group) {
-        cnrtNotifier_t start, end;
-        ASSERT_EQ(cnrtNotifierCreate(&start), cnrtSuccess);
-        ASSERT_EQ(cnrtNotifierCreate(&end), cnrtSuccess);
-        ASSERT_EQ(cnrtPlaceNotifier(start, torch_mlu::getCurMLUStream()),
-                  cnrtSuccess);
-        for (int32_t i = 0; i < 100; ++i) {
-          call();
-        }
-        ASSERT_EQ(cnrtPlaceNotifier(end, torch_mlu::getCurMLUStream()),
-                  cnrtSuccess);
-        torch_mlu::synchronize();
-        float duration = 0;
-        ASSERT_EQ(cnrtNotifierDuration(start, end, &duration), cnrtSuccess);
-        (path == 0 ? fused : base).emplace_back(duration / 100);
-        ASSERT_EQ(cnrtNotifierDestroy(start), cnrtSuccess);
-        ASSERT_EQ(cnrtNotifierDestroy(end), cnrtSuccess);
-      }
-    }
-    std::sort(fused.begin(), fused.end());
-    std::sort(base.begin(), base.end());
-    LOG(INFO) << "T=" << tokens << " fused_us=" << fused[1]
-              << " decomposed_us=" << base[1];
   }
 }
 

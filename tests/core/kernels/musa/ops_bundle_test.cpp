@@ -15,12 +15,10 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <string_view>
 
 #include "core/kernels/musa/gdn_ops.h"
 #include "core/kernels/musa/musa_aot_config.h"
@@ -54,9 +52,6 @@ class MusaOpsBundleTest : public ::testing::Test {
 };
 
 TEST_F(MusaOpsBundleTest, AcceptsMatchingBundleAndRejectsDamagedArtifacts) {
-  for (const char* uri : aot::kOperatorUris) {
-    EXPECT_TRUE(is_musa_operator_built(uri));
-  }
   constexpr const char* kLegacyGdnUri = "mate_gdn_prefill_hq16_hv48_bf16";
   EXPECT_FALSE(is_musa_operator_built(kLegacyGdnUri));
   EXPECT_DEATH(get_module(kLegacyGdnUri),
@@ -86,23 +81,16 @@ TEST_F(MusaOpsBundleTest, AcceptsMatchingBundleAndRejectsDamagedArtifacts) {
       ::testing::ExitedWithCode(0),
       "");
 
-  for (const std::string_view suffix : {".so", ".o", ".mubin", ".json"}) {
-    const auto artifact =
-        std::find_if(aot::kArtifacts.begin(),
-                     aot::kArtifacts.end(),
-                     [suffix](const aot::Artifact& entry) {
-                       return std::string_view(entry.path).ends_with(suffix);
-                     });
-    ASSERT_NE(artifact, aot::kArtifacts.end());
-    SCOPED_TRACE(artifact->path);
-    const auto path = std::filesystem::path(root_) / artifact->path;
-    std::ofstream(path, std::ios::binary | std::ios::trunc) << "corrupted";
-    EXPECT_DEATH(validate_musa_ops_bundle(root_), "artifact checksum mismatch");
-    std::filesystem::remove(path);
-    EXPECT_DEATH(validate_musa_ops_bundle(root_),
-                 "unreadable MUSA operator artifact");
-    std::filesystem::copy_file(source_ / artifact->path, path);
-  }
+  // Every artifact uses the same checksum/readability path, irrespective of
+  // extension. A single damaged artifact exercises each failure mode.
+  ASSERT_FALSE(aot::kArtifacts.empty());
+  const auto path = std::filesystem::path(root_) / aot::kArtifacts.front().path;
+  std::ofstream(path, std::ios::binary | std::ios::trunc) << "corrupted";
+  EXPECT_DEATH(validate_musa_ops_bundle(root_), "artifact checksum mismatch");
+  std::filesystem::remove(path);
+  EXPECT_DEATH(validate_musa_ops_bundle(root_),
+               "unreadable MUSA operator artifact");
+  std::filesystem::copy_file(source_ / aot::kArtifacts.front().path, path);
 
   const auto marker = std::filesystem::path(root_) / ".bundle-id";
   std::ofstream(marker) << "stale\n";

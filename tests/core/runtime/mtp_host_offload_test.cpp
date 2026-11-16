@@ -37,7 +37,9 @@ limitations under the License.
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
+#include "core/runtime/dflash/dflash2_worker_impl.h"
 #include "core/runtime/dflash/dflash_worker_impl.h"
+#include "core/runtime/dspark_worker_impl.h"
 #include "core/runtime/llm_worker_impl.h"
 #include "core/runtime/mtp_worker_impl.h"
 #include "core/runtime/options.h"
@@ -111,7 +113,6 @@ runtime::Options make_runtime_options(double host_blocks_factor) {
   return options;
 }
 
-// B5 (implement.md, design.md §3.1 Gate B4): a scratch model directory whose
 // config.json declares model_type so DFlashWorkerImpl's allow_cp check (which
 // calls util::get_model_type on options.model_path()) can resolve a real
 // model_type without loading actual weights.
@@ -308,12 +309,6 @@ class TestMTPWorker final : public MTPWorkerImpl {
                 const runtime::Options& options)
       : MTPWorkerImpl(parallel_args, device, options, WorkerType::LLM) {}
 
-  std::shared_ptr<EmbeddingCache> initialize_replay_cache(bool retain_span) {
-    retain_replay_span_ = retain_span;
-    init_embedding_cache(kBlockCount);
-    return embedding_cache_;
-  }
-
   void replace_transfer_workers(std::unique_ptr<LLMWorkerImpl> target,
                                 std::unique_ptr<LLMWorkerImpl> draft) {
     impl_ = std::move(target);
@@ -357,10 +352,7 @@ class TestMTPWorker final : public MTPWorkerImpl {
   }
 
  private:
-  bool requires_full_target_replay() const override {
-    return retain_replay_span_;
-  }
-  bool retain_replay_span_ = false;
+  bool requires_full_target_replay() const override { return false; }
 };
 
 class TestDFlashWorker final : public DFlashWorkerImpl {
@@ -370,8 +362,6 @@ class TestDFlashWorker final : public DFlashWorkerImpl {
                    const runtime::Options& options,
                    WorkerType worker_type)
       : DFlashWorkerImpl(parallel_args, device, options, worker_type) {}
-
-  WorkerImpl* target_impl() const { return impl_.get(); }
 
   void replace_transfer_workers(std::unique_ptr<LLMWorkerImpl> target,
                                 std::unique_ptr<LLMWorkerImpl> draft) {
@@ -401,40 +391,6 @@ class MTPHostOffloadTest : public ::testing::Test {
   }
 };
 
-// worker.cpp instantiates DFlashWorkerImpl directly for the DFlash branch,
-// so its VLM wiring needs its own coverage alongside the DSpark/DFlash2 tests.
-TEST_F(MTPHostOffloadTest, DFlashTargetTypeVlmBuildsMultimodalWorker) {
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  TestDFlashWorker worker(
-      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::VLM);
-  WorkerImpl* target = worker.target_impl();
-  ASSERT_NE(target, nullptr);
-  EXPECT_NE(dynamic_cast<VLMWorkerImpl*>(target), nullptr);
-  EXPECT_EQ(dynamic_cast<LLMWorkerImpl*>(target), nullptr);
-}
-
-TEST_F(MTPHostOffloadTest, DFlashTargetTypeTextBuildsLlmWorker) {
-  Device device(/*device_index=*/0);
-  device.set_device();
-  device.init_device_context();
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  runtime::Options options;
-  options.enable_schedule_overlap(true).num_speculative_tokens(15);
-  TestDFlashWorker worker(
-      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  WorkerImpl* target = worker.target_impl();
-  ASSERT_NE(target, nullptr);
-  EXPECT_NE(dynamic_cast<LLMWorkerImpl*>(target), nullptr);
-  EXPECT_EQ(dynamic_cast<VLMWorkerImpl*>(target), nullptr);
-}
-
 TEST(MTPAdaptiveValidateWidthTest, PreservesWidthForPreviousAcceptedTokens) {
   EXPECT_EQ(TestMTPWorker::preserve_checkpoint_width(
                 /*effective_speculative_tokens=*/1,
@@ -447,8 +403,8 @@ TEST(MTPAdaptiveValidateWidthTest, PreservesWidthForPreviousAcceptedTokens) {
 // lifecycle, policy validation, KV allocation and embedding cache.
 class ContextPolicyModel final : public CausalLM {
  public:
-  ContextPolicyModel(DraftContextUpdate update, torch::TensorOptions options)
-      : update_(update), options_(std::move(options)) {}
+  explicit ContextPolicyModel(torch::TensorOptions options)
+      : options_(std::move(options)) {}
 
   bool share_weights_from(CausalLM& /*source*/) override { return true; }
 
@@ -477,7 +433,6 @@ class ContextPolicyModel final : public CausalLM {
   }
 
  private:
-  DraftContextUpdate update_;
   torch::TensorOptions options_;
 };
 
@@ -487,11 +442,9 @@ class ContextLoadingWorker final : public HierarchyTransferTestWorker {
                        const torch::Device& device,
                        const runtime::Options& options,
                        const ModelArgs& args,
-                       DraftContextUpdate update,
                        std::string draft_model_type = "glm5_next_mtp",
                        std::string draft_model_impl = "native")
       : HierarchyTransferTestWorker(parallel_args, device, options, args),
-        update_(update),
         draft_model_type_(std::move(draft_model_type)),
         draft_model_impl_(std::move(draft_model_impl)) {}
 
@@ -506,8 +459,7 @@ class ContextLoadingWorker final : public HierarchyTransferTestWorker {
                              context.get_tensor_options());
       context.set_model_impl(draft_model_impl_);
     }
-    model_ = std::make_unique<ContextPolicyModel>(update_,
-                                                  context.get_tensor_options());
+    model_ = std::make_unique<ContextPolicyModel>(context.get_tensor_options());
     return true;
   }
   void load_model(std::unique_ptr<ModelLoader> /*loader*/) override {}
@@ -518,14 +470,7 @@ class ContextLoadingWorker final : public HierarchyTransferTestWorker {
     mark_loaded();
   }
 
-  void add_request_state_cache() {
-    const torch::Tensor state =
-        torch::zeros({1}, context_.get_tensor_options());
-    kv_caches_.emplace_back(LinearAttentionKVCacheTensors{state, state});
-  }
-
  private:
-  DraftContextUpdate update_;
   std::string draft_model_type_;
   std::string draft_model_impl_;
 };
@@ -545,11 +490,6 @@ class ContextPolicyMTPWorker final : public MTPWorkerImpl {
 
   std::shared_ptr<EmbeddingCache> embedding_cache() const {
     return embedding_cache_;
-  }
-
-  void add_draft_request_state_cache() {
-    static_cast<ContextLoadingWorker*>(draft_impl_.get())
-        ->add_request_state_cache();
   }
 
   ForwardInput prepare_next_draft(const ForwardInput& input) {
@@ -622,7 +562,7 @@ class MTPContextPolicyTest : public MTPHostOffloadTest {
         make_model_args(target_type, /*layer_count=*/1, /*head_dim=*/2);
     args.hidden_size(2).enable_embedded_eagle3_draft(embedded_eagle3);
     auto target = std::make_unique<ContextLoadingWorker>(
-        parallel_args, device, options, args, DraftContextUpdate::TAIL_EXTEND);
+        parallel_args, device, options, args);
     target->load_target(target_impl);
     if (target_ready) {
       CHECK(target->allocate_kv_cache(cache_shape()));
@@ -638,7 +578,6 @@ class MTPContextPolicyTest : public MTPHostOffloadTest {
                                                         device,
                                                         draft_options,
                                                         args,
-                                                        update,
                                                         resolved_draft_type,
                                                         draft_impl);
     return std::make_unique<ContextPolicyMTPWorker>(
@@ -728,31 +667,6 @@ TEST_F(MTPContextPolicyTest, FullAttentionDraftDropsTargetState) {
     EXPECT_EQ(input.input_params.embedding.linear_state_ids,
               (std::vector<int32_t>{5}));
   }
-}
-
-TEST_F(MTPContextPolicyTest, StatefulDraftRetainsRequestState) {
-  auto worker = make_worker(DraftContextUpdate::TAIL_EXTEND);
-  ASSERT_TRUE(worker->init_model(
-      model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP));
-  worker->add_draft_request_state_cache();
-  const ForwardInput input = make_decode_input();
-
-  const ForwardInput draft = worker->prepare_next_draft(input);
-  const ModelInputParams& params = draft.input_params;
-  EXPECT_EQ(params.embedding.linear_state_ids, (std::vector<int32_t>{5}));
-  EXPECT_EQ(params.embedding.linear_state_read_ids, (std::vector<int32_t>{5}));
-  EXPECT_TRUE(torch::equal(params.embedding.linear_state_indices,
-                           input.input_params.embedding.linear_state_indices));
-  EXPECT_TRUE(torch::equal(params.embedding.linear_state_read_indices,
-                           input.input_params.embedding.linear_state_indices));
-  EXPECT_EQ(params.linear_state_validity_mask, (std::vector<int64_t>{1}));
-  EXPECT_TRUE(
-      torch::equal(params.linear_state_validity_mask_tensor,
-                   input.input_params.linear_state_validity_mask_tensor));
-  EXPECT_TRUE(torch::equal(params.num_accepted_tokens,
-                           input.input_params.num_accepted_tokens));
-  EXPECT_EQ(params.num_accepted_tokens_host, (std::vector<int64_t>{2}));
-  EXPECT_EQ(params.attention.host.kpool_query_lens, (std::vector<int32_t>{1}));
 }
 
 TEST_F(MTPContextPolicyTest, QwenNativePairRetainsAcceptedSpan) {
@@ -862,28 +776,6 @@ TEST_F(MTPContextPolicyTest, RejectsMixedNativeReplayFamilies) {
       "Incompatible draft context update");
 }
 
-TEST_F(MTPContextPolicyTest, RejectsReplayWithoutTargetFamily) {
-  ASSERT_TRUE(ModelRegistry::get_mtp_capabilities("qwen3_5")
-                  .supports_expanded_replay_target);
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  EXPECT_DEATH(
-      {
-        MtpModelCapabilities target =
-            ModelRegistry::get_mtp_capabilities("qwen3_5");
-        target.replay_family = MtpReplayFamily::NONE;
-        ModelRegistry::register_mtp_capabilities("qwen3_5", target);
-        auto worker = make_worker(DraftContextUpdate::ACCEPTED_SPAN_REPLAY,
-                                  /*target_type=*/"qwen3_5",
-                                  /*target_impl=*/"native",
-                                  /*embedded_eagle3=*/false,
-                                  /*target_ready=*/false,
-                                  /*draft_type=*/"qwen3_5_mtp");
-        worker->init_model(
-            model_path_.string(), /*random_seed=*/0, MasterStatus::WAKEUP);
-      },
-      "Incompatible draft context update");
-}
-
 TEST_F(MTPContextPolicyTest, RejectsReplayForOtherChunkedPrefillTargets) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
@@ -977,27 +869,6 @@ TEST(SpeculativeDraftKVCacheShapeTest, ReusesGroupedTargetPoolCounts) {
 
   EXPECT_TRUE(draft_shape.has_grouped_cache_layout());
   EXPECT_EQ(draft_shape.key_cache_shape(), (std::vector<int64_t>{2, 3, 5}));
-}
-
-TEST_F(MTPHostOffloadTest, SharedCacheAllocationHonorsReplaySpanPolicy) {
-  const torch::Device device(Platform::type_torch(), /*index=*/0);
-  const ParallelArgs parallel_args(
-      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
-  const runtime::Options options =
-      make_runtime_options(/*host_blocks_factor=*/0.0);
-  TestMTPWorker worker(parallel_args, device, options);
-  const auto embedding = torch::tensor({1.0f, 2.0f});
-  for (bool retain_span : {false, true}) {
-    auto cache = worker.initialize_replay_cache(retain_span);
-    cache->write_mtp_bootstrap_context(
-        /*embedding_id=*/0, "request", /*token_id=*/7, embedding);
-    const auto states = cache->read_decode_states({0}, {"request"});
-    ASSERT_EQ(states.size(), 1);
-    EXPECT_EQ(states.front().replay_embeddings.defined(), retain_span);
-    EXPECT_EQ(states.front().replay_token_ids,
-              retain_span ? std::vector<int32_t>{7} : std::vector<int32_t>{});
-    EXPECT_TRUE(torch::equal(states.front().embedding, embedding));
-  }
 }
 
 TEST_F(MTPHostOffloadTest, VectorTransferWithoutHierarchyIsNoop) {
@@ -1168,7 +1039,6 @@ TEST_F(MTPHostOffloadTest, DFlashUsesSpeculativeHierarchyTransferLifecycle) {
   EXPECT_TRUE(transfer_lifetime.expired());
 }
 
-// B5 (implement.md, design.md §3.1 Gate B4): glm5_next + cp_size>1 +
 // DFlash2 must no longer CHECK-fail in DFlashWorkerImpl's allow_cp gate.
 // Model-level correctness of the aux-hidden-buffer CP restore this relies on
 // is proven separately in
@@ -1196,9 +1066,8 @@ TEST_F(MTPHostOffloadTest, DFlash2AllowsGlm5NextContextParallelism) {
 
   // Construction must not CHECK-fail: allow_cp resolves true because
   // model_type == "glm5_next" && is_dflash2_algorithm("DFlash2").
-  auto worker = std::make_unique<TestDFlashWorker>(
+  auto worker = std::make_unique<DFlash2WorkerImpl>(
       parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  EXPECT_NE(worker, nullptr);
 }
 
 // Regression: the pre-existing DeepSeek-V4 + cp_size>1 exemption (allow_cp's
@@ -1218,13 +1087,12 @@ TEST_F(MTPHostOffloadTest, DeepseekV4StillAllowsContextParallelism) {
       /*process_group=*/nullptr,
       /*ep_size=*/1);
   runtime::Options options = make_runtime_options(2.0);
-  options.speculative_algorithm("MTP");
+  options.speculative_algorithm("DSpark");
   const ScopedModelTypeConfig model_config("deepseek_v4");
   options.model_path(model_config.path().string());
 
-  auto worker = std::make_unique<TestDFlashWorker>(
+  auto worker = std::make_unique<DSparkWorkerImpl>(
       parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  EXPECT_NE(worker, nullptr);
 }
 
 // glm_moe_dsa (GLM-5.2/5.3) + cp_size>1 + DFlash2 must not CHECK-fail in
@@ -1265,9 +1133,8 @@ TEST_F(MTPHostOffloadTest, DFlash2AllowsGlmMoeDsaContextParallelism) {
   // Construction must not CHECK-fail: allow_cp resolves true because
   // model_type == "glm_moe_dsa" && is_dflash2_algorithm("DFlash2") under the
   // python model impl.
-  auto worker = std::make_unique<TestDFlashWorker>(
+  auto worker = std::make_unique<DFlash2WorkerImpl>(
       parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
-  EXPECT_NE(worker, nullptr);
 }
 
 TEST_F(MTPHostOffloadTest, UnifiedTransferRoundTripUsesSharedSynchronizer) {

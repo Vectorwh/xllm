@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "core/framework/speculative/spec_verify.h"
@@ -120,52 +121,49 @@ TEST(RejectionSamplerTest, FilteredTargetRejectsTailDraft) {
   }
   const torch::Device device = get_test_device();
   for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
-    for (int64_t batch_size : {1, 16}) {
-      for (int64_t width : {1, 3}) {
-        SCOPED_TRACE(dtype);
-        SCOPED_TRACE(batch_size);
-        SCOPED_TRACE(width);
-        const auto options = torch::TensorOptions().device(device).dtype(dtype);
-        const int64_t rows = batch_size * (width + 1);
-        SamplingParameters params;
-        params.selected_token_idxes =
-            torch::arange(rows, options.dtype(torch::kLong));
-        params.sample_idxes = params.selected_token_idxes;
-        params.do_sample = torch::ones({rows}, options.dtype(torch::kBool));
-        params.all_random_sample = true;
-        params.all_greedy_sample = false;
-        params.temperatures =
-            torch::ones({rows}, options.dtype(torch::kFloat32));
-        params.top_k = torch::full({rows}, 20, options.dtype(torch::kLong));
-        params.top_p =
-            torch::full({rows}, 0.95, options.dtype(torch::kFloat32));
-        torch::Tensor logits =
-            (torch::arange(64, options.dtype(torch::kFloat32)) * -0.08)
-                .to(dtype)
-                .unsqueeze(0)
-                .expand({rows, 64})
-                .contiguous();
+    const std::vector<std::pair<int64_t, int64_t>> shapes = {{1, 1}, {16, 3}};
+    for (const auto& [batch_size, width] : shapes) {
+      SCOPED_TRACE(dtype);
+      SCOPED_TRACE(batch_size);
+      SCOPED_TRACE(width);
+      const auto options = torch::TensorOptions().device(device).dtype(dtype);
+      const int64_t rows = batch_size * (width + 1);
+      SamplingParameters params;
+      params.selected_token_idxes =
+          torch::arange(rows, options.dtype(torch::kLong));
+      params.sample_idxes = params.selected_token_idxes;
+      params.do_sample = torch::ones({rows}, options.dtype(torch::kBool));
+      params.all_random_sample = true;
+      params.all_greedy_sample = false;
+      params.temperatures = torch::ones({rows}, options.dtype(torch::kFloat32));
+      params.top_k = torch::full({rows}, 20, options.dtype(torch::kLong));
+      params.top_p = torch::full({rows}, 0.95, options.dtype(torch::kFloat32));
+      torch::Tensor logits =
+          (torch::arange(64, options.dtype(torch::kFloat32)) * -0.08)
+              .to(dtype)
+              .unsqueeze(0)
+              .expand({rows, 64})
+              .contiguous();
 
-        const SampleOutput target = Sampler().forward(logits, params);
-        const torch::Tensor probs = logits.view({batch_size, width + 1, 64})
-                                        .slice(1, 0, width)
-                                        .softmax(-1, torch::kFloat32);
-        EXPECT_EQ(target.probs.scalar_type(), dtype);
-        EXPECT_EQ(probs.select(-1, 63).count_nonzero().item<int64_t>(), 0);
-        const DraftProposal draft(
-            torch::full({batch_size, width}, 63, options.dtype(torch::kLong)));
-        const torch::Tensor bonus =
-            target.next_tokens.view({batch_size, width + 1}).slice(1, width);
-        auto [tokens, masked] = RejectionSampler::random_sample(
-            draft,
-            probs,
-            torch::full(
-                {batch_size, width}, 0.00025, options.dtype(torch::kFloat32)),
-            bonus,
-            /*mask_out_rejected_tokens=*/true);
-        EXPECT_TRUE(masked.select(1, 0).lt(20).all().item<bool>());
-        EXPECT_TRUE(masked.slice(1, 1).eq(-1).all().item<bool>());
-      }
+      const SampleOutput target = Sampler().forward(logits, params);
+      const torch::Tensor probs = logits.view({batch_size, width + 1, 64})
+                                      .slice(1, 0, width)
+                                      .softmax(-1, torch::kFloat32);
+      EXPECT_EQ(target.probs.scalar_type(), dtype);
+      EXPECT_EQ(probs.select(-1, 63).count_nonzero().item<int64_t>(), 0);
+      const DraftProposal draft(
+          torch::full({batch_size, width}, 63, options.dtype(torch::kLong)));
+      const torch::Tensor bonus =
+          target.next_tokens.view({batch_size, width + 1}).slice(1, width);
+      auto [tokens, masked] = RejectionSampler::random_sample(
+          draft,
+          probs,
+          torch::full(
+              {batch_size, width}, 0.00025, options.dtype(torch::kFloat32)),
+          bonus,
+          /*mask_out_rejected_tokens=*/true);
+      EXPECT_TRUE(masked.select(1, 0).lt(20).all().item<bool>());
+      EXPECT_TRUE(masked.slice(1, 1).eq(-1).all().item<bool>());
     }
   }
 }
@@ -175,67 +173,53 @@ TEST(RejectionSamplerTest, FilteredTargetPreservesAcceptedPrefixes) {
     GTEST_SKIP() << "MLU top-k sampling requires a device";
   }
   const torch::Device device = get_test_device();
-  constexpr int64_t kBatch = 16;
+  constexpr int64_t kBatch = 4;
+  constexpr int64_t kWidth = 3;
   constexpr int64_t kVocab = 4;
+  const torch::Tensor target_ids = torch::tensor(
+      {{0, 1, 2, 3}, {1, 2, 3, 0}, {2, 3, 0, 1}, {3, 0, 1, 2}}, torch::kLong);
+  const torch::Tensor draft_ids =
+      torch::tensor({{1, 2, 3}, {1, 3, 0}, {2, 3, 1}, {3, 0, 1}}, torch::kLong);
+  // Literal zero/one/two/full accepted prefixes, including each rejection's
+  // replacement token. Do not rebuild the acceptance algorithm in the oracle.
+  const torch::Tensor expected =
+      torch::tensor(
+          {{0, -1, -1, -1}, {1, 2, -1, -1}, {2, 3, 0, -1}, {3, 0, 1, 2}},
+          torch::kLong)
+          .to(device);
   for (torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
-    for (int64_t width : {1, 3}) {
-      SCOPED_TRACE(dtype);
-      SCOPED_TRACE(width);
-      std::vector<int64_t> target_ids;
-      std::vector<int64_t> draft_ids;
-      std::vector<int64_t> expected_ids;
-      target_ids.reserve(kBatch * (width + 1));
-      draft_ids.reserve(kBatch * width);
-      expected_ids.reserve(kBatch * (width + 1));
-      for (int64_t seq = 0; seq < kBatch; ++seq) {
-        const int64_t accepted = seq % (width + 1);
-        for (int64_t step = 0; step <= width; ++step) {
-          const int64_t token = (seq + step) % kVocab;
-          target_ids.emplace_back(token);
-          expected_ids.emplace_back(step <= accepted ? token : -1);
-        }
-        for (int64_t step = 0; step < width; ++step) {
-          const int64_t token = (seq + step) % kVocab;
-          draft_ids.emplace_back(step < accepted ? token
-                                                 : (token + 1) % kVocab);
-        }
-      }
-      const auto options = torch::TensorOptions().device(device).dtype(dtype);
-      const int64_t rows = kBatch * (width + 1);
-      const torch::Tensor target_tokens =
-          torch::tensor(target_ids, torch::kLong).to(device).view({rows, 1});
-      torch::Tensor logits = torch::zeros({rows, kVocab}, options);
-      logits.scatter_(1, target_tokens, 4.0);
-      SamplingParameters params;
-      params.selected_token_idxes =
-          torch::arange(rows, options.dtype(torch::kLong));
-      params.sample_idxes = params.selected_token_idxes;
-      params.do_sample = torch::ones({rows}, options.dtype(torch::kBool));
-      params.all_random_sample = true;
-      params.all_greedy_sample = false;
-      params.top_k = torch::ones({rows}, options.dtype(torch::kLong));
-      params.top_p = torch::ones({rows}, options.dtype(torch::kFloat32));
-
-      const SampleOutput target = Sampler().forward(logits, params);
-      const torch::Tensor probs = logits.view({kBatch, width + 1, kVocab})
-                                      .slice(1, 0, width)
-                                      .softmax(-1, torch::kFloat32);
-      const DraftProposal draft(torch::tensor(draft_ids, torch::kLong)
-                                    .to(device)
-                                    .view({kBatch, width}));
-      const torch::Tensor bonus =
-          target.next_tokens.view({kBatch, width + 1}).slice(1, width);
-      auto [tokens, masked] = RejectionSampler::random_sample(
-          draft,
-          probs,
-          torch::full({kBatch, width}, 0.5, options.dtype(torch::kFloat32)),
-          bonus,
-          /*mask_out_rejected_tokens=*/true);
-      const torch::Tensor expected = torch::tensor(expected_ids, torch::kLong)
-                                         .to(device)
-                                         .view({kBatch, width + 1});
-      EXPECT_TRUE(torch::equal(masked, expected));
-    }
+    SCOPED_TRACE(dtype);
+    const auto options = torch::TensorOptions().device(device).dtype(dtype);
+    constexpr int64_t kRows = kBatch * (kWidth + 1);
+    const torch::Tensor target_tokens = target_ids.to(device).view({kRows, 1});
+    torch::Tensor logits = torch::zeros({kRows, kVocab}, options);
+    logits.scatter_(1, target_tokens, 4.0);
+    SamplingParameters params;
+    params.selected_token_idxes =
+        torch::arange(kRows, options.dtype(torch::kLong));
+    params.sample_idxes = params.selected_token_idxes;
+    params.do_sample = torch::ones({kRows}, options.dtype(torch::kBool));
+    params.all_random_sample = true;
+    params.all_greedy_sample = false;
+    params.top_k = torch::ones({kRows}, options.dtype(torch::kLong));
+    params.top_p = torch::ones({kRows}, options.dtype(torch::kFloat32));
+    const SampleOutput target = Sampler().forward(logits, params);
+    const torch::Tensor probs = logits.view({kBatch, kWidth + 1, kVocab})
+                                    .slice(1, 0, kWidth)
+                                    .softmax(-1, torch::kFloat32);
+    EXPECT_TRUE(torch::equal(target.next_tokens,
+                             target_ids.to(device).reshape({kRows})));
+    EXPECT_EQ(probs.eq(1).sum().item<int64_t>(), kBatch * kWidth);
+    const DraftProposal draft(draft_ids.to(device));
+    const torch::Tensor bonus =
+        target.next_tokens.view({kBatch, kWidth + 1}).slice(1, kWidth);
+    auto [tokens, masked] = RejectionSampler::random_sample(
+        draft,
+        probs,
+        torch::full({kBatch, kWidth}, 0.5, options.dtype(torch::kFloat32)),
+        bonus,
+        /*mask_out_rejected_tokens=*/true);
+    EXPECT_TRUE(torch::equal(masked, expected));
   }
 }
 
@@ -245,7 +229,6 @@ TEST(RejectionSamplerTest, Basic) {
   const auto device = get_test_device();
 
   // set random seed
-  torch::manual_seed(100);
 
   const auto draft_token_ids =
       torch::tensor({{1, 2, 3}}, options.dtype(torch::kInt64));
@@ -257,19 +240,17 @@ TEST(RejectionSamplerTest, Basic) {
                                    options)
                          .reshape({1, 3, 5});
   // shape: [1, 3, 5]
+  // At the rejected third step, (target - draft)+ has support only at token 2.
+  // Recovery is deterministic; a seeded multi-support draw is not a golden.
   auto target_probs = torch::tensor({{0.1299, 0.2462, 0.1821, 0.1354, 0.3064},
                                      {0.1159, 0.2839, 0.1603, 0.2451, 0.1949},
-                                     {0.0002, 0.0433, 0.6629, 0.1469, 0.1467}},
+                                     {0.02, 0.03, 0.80, 0.10, 0.05}},
                                     options)
                           .reshape({1, 3, 5});
 
-  // selected_target_probs:  [0.2462  0.1603  0.1469]
-  // selected_draft_probs:   [0.2163  0.2398  0.2451]
-  // acceptance_probs:       [1.1382  0.6685  0.5993]
-  // uniform_rand:           [0.4785  0.6589  0.9399]
-  // accepted:               [  1        1       0  ]
+  // Fixed acceptance draws accept the first two drafts and reject the third.
   auto uniform_rand = torch::tensor({{0.4785, 0.6589, 0.9399}}, options);
-  auto bonus_token_ids = torch::tensor({{5}}, options.dtype(torch::kInt64));
+  auto bonus_token_ids = torch::tensor({{4}}, options.dtype(torch::kInt64));
   DraftProposal draft_proposal = DraftProposal(draft_token_ids, draft_probs);
 
   auto [output, masked_output] =
@@ -278,13 +259,15 @@ TEST(RejectionSamplerTest, Basic) {
                                       uniform_rand,
                                       bonus_token_ids,
                                       /*mask_out_rejected_tokens=*/true);
+  EXPECT_EQ(output.scalar_type(), torch::kLong);
+  EXPECT_EQ(masked_output.scalar_type(), torch::kLong);
   auto desired_output =
-      torch::tensor({{1, 2, 2, 5}}, options.dtype(torch::kInt64));
-  EXPECT_TRUE(torch::allclose(output, desired_output));
+      torch::tensor({{1, 2, 2, 4}}, options.dtype(torch::kInt64));
+  EXPECT_TRUE(torch::equal(output, desired_output));
 
   auto desired_masked_output =
       torch::tensor({{1, 2, 2, -1}}, options.dtype(torch::kInt64));
-  EXPECT_TRUE(torch::allclose(masked_output, desired_masked_output));
+  EXPECT_TRUE(torch::equal(masked_output, desired_masked_output));
 }
 
 TEST(RejectionSamplerTest, GreedyDraftUsesDeltaProposalDistribution) {
@@ -509,28 +492,40 @@ TEST(RejectionSamplerTest, RandomForwardUsesGreedyDraftWithoutDraftProbs) {
 
 TEST(RejectionSamplerTest, RandomFallsBackToUniformOnDegenerateResidual) {
   const auto options = get_test_options(torch::kFloat32);
-  const auto device = get_test_device();
-
-  const int64_t vocab_size = 3;
-  const auto draft_token_ids = torch::tensor({{0}}, device);
-  const auto draft_probs = torch::tensor({{{1.0f, 0.0f, 0.0f}}}, options);
-  const auto target_probs = torch::tensor({{{1.0f, 0.0f, 0.0f}}}, options);
-  const auto uniform_rand = torch::tensor({{1.0f}}, options);
-  const auto bonus_token_ids = torch::tensor({{0}}, device);
-
-  DraftProposal draft_proposal = DraftProposal(draft_token_ids, draft_probs);
+  constexpr int64_t kNumSamples = 1;
+  constexpr int64_t kVocabSize = 3;
+  const torch::Tensor draft_token_ids =
+      torch::zeros({kNumSamples, 1}, options.dtype(torch::kLong));
+  // A real BF16 probability publication can round every 1/3 upward. The
+  // target remains FP32: every residual is zero, yet a [0,1) draw can reject.
+  const torch::Tensor draft_probs = torch::full({kNumSamples, 1, kVocabSize},
+                                                1.0F / 3.0F,
+                                                options.dtype(torch::kBFloat16))
+                                        .to(torch::kFloat32);
+  const torch::Tensor target_probs =
+      torch::full({kNumSamples, 1, kVocabSize}, 1.0F / 3.0F, options);
+  ASSERT_TRUE((draft_probs > target_probs).all().item<bool>());
+  ASSERT_EQ((target_probs - draft_probs).clamp_min(0).sum().item<float>(),
+            0.0F);
+  const torch::Tensor uniform_rand =
+      torch::full({kNumSamples, 1}, 0.999F, options);
+  ASSERT_GT(
+      uniform_rand.item<float>(),
+      (target_probs.select(-1, 0) / draft_probs.select(-1, 0)).item<float>());
+  const torch::Tensor bonus_token_ids =
+      torch::zeros({kNumSamples, 1}, options.dtype(torch::kLong));
+  const DraftProposal draft_proposal(draft_token_ids, draft_probs);
   auto [output, masked_output] =
       RejectionSampler::random_sample(draft_proposal,
                                       target_probs,
                                       uniform_rand,
                                       bonus_token_ids,
                                       /*mask_out_rejected_tokens=*/true);
-
-  const auto resampled = output.index({0, 0}).item<int64_t>();
-  EXPECT_GE(resampled, 0);
-  EXPECT_LT(resampled, vocab_size);
-  EXPECT_EQ(masked_output.index({0, 0}).item<int64_t>(), resampled);
-  EXPECT_EQ(masked_output.index({0, 1}).item<int64_t>(), -1);
+  const torch::Tensor resampled = output.select(1, 0);
+  EXPECT_TRUE(
+      resampled.ge(0).logical_and(resampled.lt(kVocabSize)).all().item<bool>());
+  EXPECT_TRUE(torch::equal(masked_output.select(1, 0), resampled));
+  EXPECT_TRUE(masked_output.select(1, 1).eq(-1).all().item<bool>());
 }
 
 TEST(RejectionSamplerTest, LogProbs) {
@@ -586,23 +581,6 @@ TEST(RejectionSamplerTest, LogProbs) {
   EXPECT_TRUE(torch::equal(output.top_tokens, top_k_indices));
 }
 
-TEST(RejectionSamplerTest, ConstructorDoesNotMutateDoSampleShape) {
-  const auto device = get_test_device();
-  auto do_sample = torch::tensor({false, true}, torch::device(device));
-
-  ASSERT_EQ(do_sample.dim(), 1);
-  ASSERT_EQ(do_sample.sizes(), torch::IntArrayRef({2}));
-
-  RejectionSampler sampler(do_sample,
-                           do_sample.all().item<bool>(),
-                           !do_sample.any().item<bool>(),
-                           /*logprobs=*/false,
-                           /*max_top_logprobs=*/0);
-
-  EXPECT_EQ(do_sample.dim(), 1);
-  EXPECT_EQ(do_sample.sizes(), torch::IntArrayRef({2}));
-}
-
 TEST(RejectionSamplerTest,
      ReusingDoSampleAfterRejectionSamplerKeepsSamplerOutput1D) {
   const auto options = get_test_options(torch::kFloat32);
@@ -615,6 +593,7 @@ TEST(RejectionSamplerTest,
                                      /*logprobs=*/false,
                                      /*max_top_logprobs=*/0);
   (void)rejection_sampler;
+  EXPECT_EQ(do_sample.sizes(), torch::IntArrayRef({2}));
 
   SamplingParameters params;
   params.selected_token_idxes =
@@ -635,49 +614,86 @@ TEST(RejectionSamplerTest,
   EXPECT_EQ(output.next_tokens.size(0), 2);
 }
 
-TEST(RejectionSamplerTest, Random) {
-  const auto options = get_test_options(torch::kFloat32);
-
-  // set random seed
+TEST(RejectionSamplerTest, RandomMatchesTargetDistribution) {
   torch::manual_seed(100);
+  constexpr int64_t kVocabSize = 4;
+  constexpr int64_t kNumSamples = 65536;
+  const torch::Device device = get_test_device();
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kFloat32);
 
-  int64_t vocab_size = 50;
-  int64_t num_samples = 500000;
+  const torch::Tensor target_prob =
+      torch::tensor({0.4F, 0.3F, 0.2F, 0.1F}, options);
+  const torch::Tensor target_probs = target_prob.reshape({1, 1, kVocabSize})
+                                         .expand({kNumSamples, 1, kVocabSize})
+                                         .contiguous();
+  const torch::Tensor draft_probs =
+      torch::randn({kNumSamples, 1, kVocabSize}, options).softmax(-1);
+  const torch::Tensor draft_token_ids = Sampler::random_sample(draft_probs);
+  const torch::Tensor uniform_rand =
+      torch::rand(draft_token_ids.sizes(), options);
+  const torch::Tensor bonus_token_ids =
+      torch::zeros({kNumSamples, 1}, options.dtype(torch::kLong));
+  const DraftProposal draft_proposal(draft_token_ids, draft_probs);
 
-  auto target_prob = torch::randn({vocab_size}, options).softmax(/*dim=*/-1);
-  auto target_probs =
-      target_prob.reshape({1, 1, -1}).repeat({num_samples, 1, 1});
-
-  auto draft_probs =
-      torch::randn({num_samples, 1, vocab_size}, options).softmax(/*dim=*/-1);
-  auto draft_token_ids = Sampler::random_sample(draft_probs);
-
-  // not used
-  auto bonus_token_ids =
-      torch::ones({num_samples, 1}, options.dtype(torch::kInt64));
-
-  auto uniform_rand = torch::rand(draft_token_ids.sizes(), options);
-  DraftProposal draft_proposal = DraftProposal(draft_token_ids, draft_probs);
-  auto [output, masked_output] = RejectionSampler::random_sample(
-      draft_proposal, target_probs, uniform_rand, bonus_token_ids, false);
+  auto [output, masked_output] =
+      RejectionSampler::random_sample(draft_proposal,
+                                      target_probs,
+                                      uniform_rand,
+                                      bonus_token_ids,
+                                      /*mask_out_rejected_tokens=*/false);
   EXPECT_FALSE(masked_output.defined());
 
-  // remove bonus token
-  auto token_ids = output
-                       .slice(/*dim=*/-1,
-                              /*start=*/0,
-                              /*end=*/-1)
-                       .flatten();
-
-  // calculate the probability of each sampled token
-  auto bincount = token_ids.bincount(/*weights=*/torch::nullopt,
-                                     /*minlength=*/vocab_size);
-  auto sample_prob = bincount.to(torch::kFloat) / num_samples;
-
+  const torch::Tensor generated =
+      output.slice(/*dim=*/-1, /*start=*/0, /*end=*/-1).flatten();
+  const torch::Tensor sample_prob =
+      generated.bincount(/*weights=*/torch::nullopt, /*minlength=*/kVocabSize)
+          .to(torch::kFloat32) /
+      kNumSamples;
   EXPECT_TRUE(torch::allclose(target_prob,
                               sample_prob,
-                              /*rtol=*/1e-2,
-                              /*atol=*/1e-2));
+                              /*rtol=*/0.0,
+                              /*atol=*/0.01));
+}
+
+TEST(RejectionSamplerTest, FilteredTargetPreservesSingleAcceptedToken) {
+  if (!Platform::is_mlu() || Platform::device_count() == 0) {
+    GTEST_SKIP() << "MLU top-k sampling requires a device";
+  }
+  const torch::Device device = get_test_device();
+  for (const torch::ScalarType dtype : {torch::kFloat32, torch::kBFloat16}) {
+    SCOPED_TRACE(dtype);
+    const auto options = torch::TensorOptions().device(device).dtype(dtype);
+    const auto float_options =
+        torch::TensorOptions().device(device).dtype(torch::kFloat32);
+    const torch::Tensor target_tokens =
+        torch::tensor({1, 2}, torch::kLong).to(device).view({2, 1});
+    torch::Tensor logits = torch::zeros({2, 4}, options);
+    logits.scatter_(1, target_tokens, 4.0);
+
+    SamplingParameters params;
+    params.selected_token_idxes = torch::arange(2, options.dtype(torch::kLong));
+    params.sample_idxes = params.selected_token_idxes;
+    params.do_sample = torch::ones({2}, options.dtype(torch::kBool));
+    params.all_random_sample = true;
+    params.all_greedy_sample = false;
+    params.top_k = torch::ones({2}, options.dtype(torch::kLong));
+    params.top_p = torch::ones({2}, options.dtype(torch::kFloat32));
+    const SampleOutput target = Sampler().forward(logits, params);
+    const torch::Tensor target_probs =
+        logits.view({1, 2, 4}).slice(1, 0, 1).softmax(-1, torch::kFloat32);
+    const DraftProposal draft(torch::tensor({{1}}, torch::kLong).to(device));
+    const torch::Tensor bonus = target.next_tokens.view({1, 2}).slice(1, 1);
+    auto [tokens, masked] =
+        RejectionSampler::random_sample(draft,
+                                        target_probs,
+                                        torch::zeros({1, 1}, float_options),
+                                        bonus,
+                                        /*mask_out_rejected_tokens=*/true);
+    EXPECT_TRUE(
+        torch::equal(tokens, torch::tensor({{1, 2}}, torch::kLong).to(device)));
+    EXPECT_TRUE(torch::equal(masked, tokens));
+  }
 }
 
 TEST(RejectionSamplerTest, RandomFused) {

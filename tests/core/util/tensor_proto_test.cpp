@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 
 #include "core/util/binary_payload.h"
@@ -69,16 +70,22 @@ TEST(TensorProtoTest, SegmentedBinaryPayloadCopiesDirectlyToTensor) {
   std::string flat_payload;
   ASSERT_TRUE(util::torch_to_proto(input, &proto_tensor, flat_payload));
 
-  butil::IOBuf first;
-  butil::IOBuf second;
-  first.append(flat_payload.data(), 3);
-  second.append(flat_payload.data() + 3, flat_payload.size() - 3);
   butil::IOBuf segmented;
-  segmented.append(first);
-  segmented.append(second);
-
-  const torch::Tensor output =
-      util::proto_to_torch(proto_tensor, BinaryPayload(std::move(segmented)));
+  size_t offset = 0;
+  for (const size_t length : {size_t{3}, flat_payload.size() - 3}) {
+    auto bytes = std::make_unique<char[]>(length);
+    flat_payload.copy(bytes.get(), length, offset);
+    ASSERT_EQ(segmented.append_user_data(
+                  bytes.get(),
+                  length,
+                  [](void* data) { delete[] static_cast<char*>(data); }),
+              0);
+    bytes.release();
+    offset += length;
+  }
+  BinaryPayload payload(std::move(segmented));
+  ASSERT_FALSE(payload.contiguous_view(0, flat_payload.size()).has_value());
+  const torch::Tensor output = util::proto_to_torch(proto_tensor, payload);
 
   ASSERT_TRUE(output.defined());
   EXPECT_TRUE(torch::equal(output, input));

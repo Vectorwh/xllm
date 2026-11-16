@@ -23,35 +23,27 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(SpeculativeProfileRegistryTest, StoresAndRetrievesPredictor) {
-  SpeculativeProfileRegistry& registry =
-      SpeculativeProfileRegistry::get_instance();
-  registry.reset_validate_time_predictor();
-  EXPECT_FALSE(registry.has_validate_time_predictor());
-
-  SpeculativeProfileRegistry::ValidateTimePredictor predictor;
-  predictor.intercept_ms = 1.0;
-  predictor.query_token_ms = 3.0;
-  predictor.query_prefix_ms = 0.5;
-  registry.set_validate_time_predictor(predictor);
-
-  const std::optional<SpeculativeProfileRegistry::ValidateTimePredictor>
-      registered_predictor = registry.validate_time_predictor();
-  ASSERT_TRUE(registered_predictor.has_value());
-  EXPECT_DOUBLE_EQ(registered_predictor->intercept_ms, 1.0);
-  EXPECT_DOUBLE_EQ(registered_predictor->query_token_ms, 3.0);
-  EXPECT_DOUBLE_EQ(registered_predictor->query_prefix_ms, 0.5);
-  registry.reset_validate_time_predictor();
-  EXPECT_FALSE(registry.has_validate_time_predictor());
-}
-
 TEST(SpeculativeProfileRegistryTest,
      SanitizesNonFiniteAndNegativeCoefficients) {
   SpeculativeProfileRegistry& registry =
       SpeculativeProfileRegistry::get_instance();
   registry.reset_validate_time_predictor();
 
+  EXPECT_FALSE(registry.has_validate_time_predictor());
+  EXPECT_FALSE(registry.validate_time_predictor().has_value());
+
   SpeculativeProfileRegistry::ValidateTimePredictor predictor;
+  predictor.intercept_ms = 1.0;
+  predictor.query_token_ms = 3.0;
+  predictor.query_prefix_ms = 0.5;
+  registry.set_validate_time_predictor(predictor);
+  ASSERT_TRUE(registry.has_validate_time_predictor());
+  const auto valid = registry.validate_time_predictor();
+  ASSERT_TRUE(valid.has_value());
+  EXPECT_DOUBLE_EQ(valid->intercept_ms, 1.0);
+  EXPECT_DOUBLE_EQ(valid->query_token_ms, 3.0);
+  EXPECT_DOUBLE_EQ(valid->query_prefix_ms, 0.5);
+
   predictor.intercept_ms = -1.0;
   predictor.query_token_ms = std::numeric_limits<double>::quiet_NaN();
   predictor.query_prefix_ms = 0.5;
@@ -64,6 +56,8 @@ TEST(SpeculativeProfileRegistryTest,
   EXPECT_DOUBLE_EQ(got->query_token_ms, 0.0);
   EXPECT_DOUBLE_EQ(got->query_prefix_ms, 0.5);
   registry.reset_validate_time_predictor();
+  EXPECT_FALSE(registry.has_validate_time_predictor());
+  EXPECT_FALSE(registry.validate_time_predictor().has_value());
 }
 
 }  // namespace

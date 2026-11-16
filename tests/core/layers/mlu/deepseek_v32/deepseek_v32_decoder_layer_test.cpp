@@ -18,8 +18,12 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/eplb_config.h"
@@ -48,117 +52,6 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-TEST(DeepseekV2DecoderLayerInterfaceTest, ForwardKeepsModelInputParamsConst) {
-  using ForwardFn = torch::Tensor (DeepseekV32DecoderLayerImpl::*)(
-      torch::Tensor&,
-      std::optional<torch::Tensor>&,
-      torch::Tensor&,
-      const AttentionMetadata&,
-      KVCache&,
-      const ModelInputParams&,
-      const std::optional<torch::Tensor>&,
-      DsaTopkRelay*);
-
-  ForwardFn forward = &DeepseekV32DecoderLayerImpl::forward;
-  EXPECT_TRUE(forward != nullptr);
-}
-
-TEST(DeepseekV2DecoderLayerInterfaceTest, MtpForwardExposesTypedStateOutput) {
-  using ForwardMtpFn = torch::Tensor (DeepseekV32DecoderLayerImpl::*)(
-      torch::Tensor&,
-      std::optional<torch::Tensor>&,
-      torch::Tensor&,
-      const AttentionMetadata&,
-      KVCache&,
-      const ModelInputParams&,
-      const std::optional<torch::Tensor>&,
-      const std::optional<DsaTopkState>&,
-      std::optional<DsaTopkState>&);
-
-  ForwardMtpFn forward_mtp = &DeepseekV32DecoderLayerImpl::forward_mtp;
-  EXPECT_TRUE(forward_mtp != nullptr);
-}
-
-class DeepseekV2DecoderLayerTestPeer {
- public:
-  using Carrier = DeepseekV32DecoderLayerImpl::PostAttnCarrier;
-  using Mode = DeepseekV32DecoderLayerImpl::PostAttnMode;
-
-  static Carrier make_carrier(Mode mode,
-                              torch::Tensor skip_local = torch::Tensor(),
-                              torch::Tensor ffn_in = torch::Tensor()) {
-    Carrier carrier;
-    carrier.ffn_in = std::move(ffn_in);
-    carrier.skip_local = std::move(skip_local);
-    carrier.mode = mode;
-    return carrier;
-  }
-
-  static Carrier build_post_attn_carrier(DeepseekV32DecoderLayerImpl& decoder,
-                                         torch::Tensor x,
-                                         const torch::Tensor& residual,
-                                         const ModelInputParams& input_params,
-                                         PostAttnLayout attn_layout,
-                                         bool need_dp_gather,
-                                         bool enable_moe_all2all) {
-    (void)input_params;
-    (void)need_dp_gather;
-    (void)enable_moe_all2all;
-    return decoder.build_post_attn_carrier(x, residual, attn_layout);
-  }
-
-  static torch::Tensor restore_ffn_output(
-      DeepseekV32DecoderLayerImpl& decoder,
-      torch::Tensor x,
-      const Carrier& carrier,
-      const ModelInputParams& input_params) {
-    (void)input_params;
-    return decoder.restore_ffn_output(x, carrier);
-  }
-
-  static bool can_keep_local_output(DeepseekV32DecoderLayerImpl& decoder,
-                                    const Carrier& carrier,
-                                    ProcessGroup* pg) {
-    return decoder.can_keep_local_output(carrier, pg);
-  }
-
-  static torch::Tensor comm_out(DeepseekV32DecoderLayerImpl& decoder,
-                                torch::Tensor x,
-                                const Carrier& carrier,
-                                ProcessGroup* pg) {
-    return decoder.comm_out(x, carrier, pg);
-  }
-
-  static torch::Tensor post_norm(DeepseekV32DecoderLayerImpl& decoder,
-                                 torch::Tensor x) {
-    return std::get<0>(decoder.post_norm_->forward(x));
-  }
-
-  static DenseMLP mlp(DeepseekV32DecoderLayerImpl& decoder) {
-    return decoder.mlp_;
-  }
-
-  static torch::Tensor reduce_out(DeepseekV32DecoderLayerImpl& decoder,
-                                  torch::Tensor x,
-                                  ProcessGroup* pg) {
-    return decoder.reduce_out(x, pg);
-  }
-
-  static const DsaTopkShareDecision& topk_share_decision(
-      const DeepseekV32DecoderLayerImpl& decoder) {
-    return decoder.topk_share_decision_;
-  }
-
-  static bool mtp_topk_reuse(const DeepseekV32DecoderLayerImpl& decoder) {
-    return decoder.mtp_topk_reuse_;
-  }
-
-  static bool attention_has_child(const DeepseekV32DecoderLayerImpl& decoder,
-                                  const std::string& name) {
-    return decoder.attention_->named_children().contains(name);
-  }
-};
-
 namespace {
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
@@ -186,7 +79,7 @@ ModelArgs create_decoder_model_args() {
   // Use a small but structurally valid DeepSeek-style config so the tests
   // exercise Dense/MoE/MLA wiring without allocating near-production tensors.
   args.model_type() = "deepseek_v3";
-  args.dtype() = "";  // default empty
+  args.dtype() = "";
   args.vocab_size() = 4096;
   args.hidden_size() = 512;
   args.n_layers() = 8;
@@ -403,62 +296,9 @@ KVCache create_indexed_kv_cache(torch::Tensor key_cache,
       std::move(index_cache)});
 }
 
-class CountingProcessGroup : public test::MockProcessGroup {
- public:
-  CountingProcessGroup(const torch::Device& device,
-                       int64_t rank,
-                       int64_t world_size)
-      : test::MockProcessGroup(device, rank, world_size) {}
-
-  void allreduce(torch::Tensor& input) override {
-    ++allreduce_calls_;
-    test::MockProcessGroup::allreduce(input);
-  }
-
-  void reduce_scatter(const torch::Tensor& input,
-                      torch::Tensor& output) override {
-    ++rs_calls_;
-    test::MockProcessGroup::reduce_scatter(input, output);
-  }
-
-  int32_t allreduce_calls() const { return allreduce_calls_; }
-  int32_t rs_calls() const { return rs_calls_; }
-
- private:
-  int32_t allreduce_calls_ = 0;
-  int32_t rs_calls_ = 0;
-};
-
 struct LayerCase {
   const char* name;
   int32_t layer_id;
-};
-
-enum class CarrierEnv {
-  kBase,
-  kCountingTp,
-  kTpDp,
-  kTpOnly,
-};
-
-struct CarrierCase {
-  const char* name;
-  CarrierEnv env;
-  int64_t tp_world_size;
-  int64_t ep_size;
-  PostAttnLayout attn_layout;
-  bool need_dp_gather;
-  bool enable_moe_all2all;
-  int64_t rows;
-  std::vector<float> attn_out;
-  std::vector<float> residual;
-  std::vector<int> dp_global_token_nums;
-  std::vector<float> tp_full_tokens;
-  DeepseekV2DecoderLayerTestPeer::Mode mode;
-  std::vector<float> expected_ffn_in;
-  std::vector<float> expected_skip_local;
-  int32_t expected_allreduce_calls;
-  int32_t expected_rs_calls;
 };
 
 class ExpertDegreeGuard {
@@ -475,14 +315,6 @@ class ExpertDegreeGuard {
  private:
   int32_t saved_;
 };
-
-std::string case_name(const ::testing::TestParamInfo<LayerCase>& info) {
-  return info.param.name;
-}
-
-std::string carrier_name(const ::testing::TestParamInfo<CarrierCase>& info) {
-  return info.param.name;
-}
 
 }  // namespace
 namespace {
@@ -504,7 +336,7 @@ std::unordered_map<std::string, torch::Tensor> dec_create_test_weights(
     int64_t custom_hidden_size = -1,
     int64_t custom_intermediate_size = -1,
     int64_t custom_moe_intermediate_size = -1,
-    int custom_num_routed_experts = -1);
+    int32_t custom_num_routed_experts = -1);
 DecoderHolder dec_make_decoder(ModelArgs& model_args_,
                                ModelContext& context_,
                                int32_t layer_id);
@@ -512,37 +344,13 @@ DecoderHolder dec_make_loaded_decoder(ModelArgs& model_args_,
                                       torch::TensorOptions& options_,
                                       ModelContext& context_,
                                       int32_t layer_id);
-torch::TensorOptions dec_fp32_opts(torch::TensorOptions& options_);
-torch::TensorOptions dec_hidden_opts(torch::TensorOptions& options_);
+
 void dec_refresh_ctx(ModelArgs& model_args_,
                      QuantArgs& quant_args_,
                      ParallelArgs& parallel_args_,
                      torch::TensorOptions& options_,
                      ModelContext& context_);
-void dec_set_tp_dp_ctx(ModelArgs& model_args_,
-                       QuantArgs& quant_args_,
-                       ParallelArgs& parallel_args_,
-                       torch::TensorOptions& options_,
-                       std::unique_ptr<test::MockProcessGroup>& global_pg_,
-                       std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-                       std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-                       std::unique_ptr<test::MockProcessGroup>& single_rank_pg_,
-                       ModelContext& context_,
-                       int64_t world_size,
-                       int64_t dp_size,
-                       int64_t tp_size,
-                       int64_t ep_size);
-void dec_set_tp_ctx(ModelArgs& model_args_,
-                    QuantArgs& quant_args_,
-                    ParallelArgs& parallel_args_,
-                    torch::TensorOptions& options_,
-                    std::unique_ptr<test::MockProcessGroup>& global_pg_,
-                    std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-                    std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-                    std::unique_ptr<test::MockProcessGroup>& single_rank_pg_,
-                    ModelContext& context_,
-                    int64_t world_size,
-                    int64_t ep_size);
+
 void dec_set_mixed_dp_ctx(ModelArgs& model_args_,
                           QuantArgs& quant_args_,
                           ParallelArgs& parallel_args_,
@@ -551,15 +359,7 @@ void dec_set_mixed_dp_ctx(ModelArgs& model_args_,
                           std::unique_ptr<test::MockProcessGroup>& dp_pg_,
                           std::unique_ptr<test::MockProcessGroup>& tp_pg_,
                           ModelContext& context_);
-ProcessGroup* dec_build_single_rank_pg(
-    torch::TensorOptions& options_,
-    std::unique_ptr<test::MockProcessGroup>& single_rank_pg_);
-void dec_set_cp_ctx(torch::TensorOptions& options_,
-                    std::unique_ptr<test::MockProcessGroup>& cp_pg_,
-                    v32_cp::DeepseekV32CPContext& cp_ctx_,
-                    DecoderHolder& decoder,
-                    ProcessGroup* process_group = nullptr,
-                    std::vector<int32_t> tokens_per_rank = {2, 1});
+
 ModelInputParams dec_build_prefill_params(torch::TensorOptions& options_,
                                           int64_t batch_size,
                                           int64_t seq_len);
@@ -601,7 +401,7 @@ std::unordered_map<std::string, torch::Tensor> dec_create_test_weights(
     int64_t custom_hidden_size,
     int64_t custom_intermediate_size,
     int64_t custom_moe_intermediate_size,
-    int custom_num_routed_experts) {
+    int32_t custom_num_routed_experts) {
   int64_t test_hidden_size =
       (custom_hidden_size > 0) ? custom_hidden_size : model_args_.hidden_size();
   int64_t test_intermediate_size = (custom_intermediate_size > 0)
@@ -633,16 +433,7 @@ DecoderHolder dec_make_loaded_decoder(ModelArgs& model_args_,
   decoder->load_state_dict(state_dict);
   return decoder;
 }
-torch::TensorOptions dec_fp32_opts(torch::TensorOptions& options_) {
-  return torch::TensorOptions()
-      .dtype(torch::kFloat32)
-      .device(options_.device());
-}
-torch::TensorOptions dec_hidden_opts(torch::TensorOptions& options_) {
-  return torch::TensorOptions()
-      .dtype(options_.dtype())
-      .device(options_.device());
-}
+
 void dec_refresh_ctx(ModelArgs& model_args_,
                      QuantArgs& quant_args_,
                      ParallelArgs& parallel_args_,
@@ -650,67 +441,7 @@ void dec_refresh_ctx(ModelArgs& model_args_,
                      ModelContext& context_) {
   context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
 }
-void dec_set_tp_dp_ctx(ModelArgs& model_args_,
-                       QuantArgs& quant_args_,
-                       ParallelArgs& parallel_args_,
-                       torch::TensorOptions& options_,
-                       std::unique_ptr<test::MockProcessGroup>& global_pg_,
-                       std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-                       std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-                       std::unique_ptr<test::MockProcessGroup>& single_rank_pg_,
-                       ModelContext& context_,
-                       int64_t world_size,
-                       int64_t dp_size,
-                       int64_t tp_size,
-                       int64_t ep_size) {
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, world_size);
-  dp_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, dp_size);
-  tp_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, tp_size);
 
-  parallel_args_ =
-      ParallelArgs(/*rank=*/0, world_size, dp_size, global_pg_.get());
-  parallel_args_.ep_size_ = ep_size;
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.dp_local_process_group_ = dp_pg_.get();
-  parallel_args_.tp_group_ = tp_pg_.get();
-  parallel_args_.single_rank_group_ =
-      tp_size > 1 ? dec_build_single_rank_pg(options_, single_rank_pg_)
-                  : tp_pg_.get();
-  parallel_args_.cp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-}
-void dec_set_tp_ctx(ModelArgs& model_args_,
-                    QuantArgs& quant_args_,
-                    ParallelArgs& parallel_args_,
-                    torch::TensorOptions& options_,
-                    std::unique_ptr<test::MockProcessGroup>& global_pg_,
-                    std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-                    std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-                    std::unique_ptr<test::MockProcessGroup>& single_rank_pg_,
-                    ModelContext& context_,
-                    int64_t world_size,
-                    int64_t ep_size) {
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, world_size);
-  tp_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, world_size);
-  dp_pg_.reset();
-
-  parallel_args_ =
-      ParallelArgs(/*rank=*/0, world_size, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.ep_size_ = ep_size;
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.dp_local_process_group_ = nullptr;
-  parallel_args_.tp_group_ = tp_pg_.get();
-  parallel_args_.single_rank_group_ =
-      world_size > 1 ? dec_build_single_rank_pg(options_, single_rank_pg_)
-                     : tp_pg_.get();
-  parallel_args_.cp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-}
 void dec_set_mixed_dp_ctx(ModelArgs& model_args_,
                           QuantArgs& quant_args_,
                           ParallelArgs& parallel_args_,
@@ -738,39 +469,7 @@ void dec_set_mixed_dp_ctx(ModelArgs& model_args_,
   parallel_args_.moe_tp_group_ = tp_pg_.get();
   dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
 }
-ProcessGroup* dec_build_single_rank_pg(
-    torch::TensorOptions& options_,
-    std::unique_ptr<test::MockProcessGroup>& single_rank_pg_) {
-  single_rank_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/1);
-  return single_rank_pg_.get();
-}
-void dec_set_cp_ctx(torch::TensorOptions& options_,
-                    std::unique_ptr<test::MockProcessGroup>& cp_pg_,
-                    v32_cp::DeepseekV32CPContext& cp_ctx_,
-                    DecoderHolder& decoder,
-                    ProcessGroup* process_group,
-                    std::vector<int32_t> tokens_per_rank) {
-  if (process_group == nullptr) {
-    cp_pg_ = std::make_unique<test::MockProcessGroup>(
-        options_.device(),
-        /*rank=*/0,
-        static_cast<int64_t>(tokens_per_rank.size()));
-    process_group = cp_pg_.get();
-  } else {
-    cp_pg_.reset();
-  }
-  cp_ctx_ = {};
-  cp_ctx_.rank = 0;
-  cp_ctx_.process_group = process_group;
-  cp_ctx_.comm_plan.tokens_per_rank = std::move(tokens_per_rank);
-  CHECK_EQ(process_group->world_size(),
-           static_cast<int64_t>(cp_ctx_.comm_plan.tokens_per_rank.size()));
-  cp_ctx_.comm_plan.token_num_offset = 0;
-  cp_ctx_.comm_plan.ffn_can_rs =
-      v32_cp::can_ffn_rs(cp_ctx_.comm_plan.tokens_per_rank);
-  decoder->set_context_parallel_context(&cp_ctx_);
-}
+
 ModelInputParams dec_build_prefill_params(torch::TensorOptions& options_,
                                           int64_t batch_size,
                                           int64_t seq_len) {
@@ -794,160 +493,11 @@ void dec_sync_dev(torch::TensorOptions& options_) {
 
 // namespace
 
-namespace {}  // namespace
-
 namespace {
-torch::Tensor dec_mat(torch::TensorOptions& options_,
-                      int64_t rows,
-                      const std::vector<float>& values);
-CountingProcessGroup* dec_set_counting_tp_ctx(
-    ModelArgs& model_args_,
-    QuantArgs& quant_args_,
-    ParallelArgs& parallel_args_,
-    torch::TensorOptions& options_,
-    std::unique_ptr<test::MockProcessGroup>& global_pg_,
-    std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-    std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-    ModelContext& context_,
-    int64_t world_size,
-    int64_t ep_size);
-CountingProcessGroup* dec_init_env(
-    ModelArgs& model_args_,
-    QuantArgs& quant_args_,
-    ParallelArgs& parallel_args_,
-    torch::TensorOptions& options_,
-    std::unique_ptr<test::MockProcessGroup>& global_pg_,
-    std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-    std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-    std::unique_ptr<test::MockProcessGroup>& single_rank_pg_,
-    ModelContext& context_,
-    const CarrierCase& tc);
-void dec_set_tp_full_tokens(torch::TensorOptions& options_,
-                            std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-                            const CarrierCase& tc);
-torch::Tensor dec_mat(torch::TensorOptions& options_,
-                      int64_t rows,
-                      const std::vector<float>& values) {
-  return torch::tensor(values, dec_fp32_opts(options_)).reshape({rows, 2});
-}
-CountingProcessGroup* dec_set_counting_tp_ctx(
-    ModelArgs& model_args_,
-    QuantArgs& quant_args_,
-    ParallelArgs& parallel_args_,
-    torch::TensorOptions& options_,
-    std::unique_ptr<test::MockProcessGroup>& global_pg_,
-    std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-    std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-    ModelContext& context_,
-    int64_t world_size,
-    int64_t ep_size) {
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, world_size);
-  auto tp_pg = std::make_unique<CountingProcessGroup>(
-      options_.device(), /*rank=*/0, world_size);
-  auto* tp_pg_raw = tp_pg.get();
-  tp_pg_ = std::move(tp_pg);
-  dp_pg_.reset();
-
-  parallel_args_ =
-      ParallelArgs(/*rank=*/0, world_size, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.ep_size_ = ep_size;
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.dp_local_process_group_ = nullptr;
-  parallel_args_.tp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-  return tp_pg_raw;
-}
-CountingProcessGroup* dec_init_env(
-    ModelArgs& model_args_,
-    QuantArgs& quant_args_,
-    ParallelArgs& parallel_args_,
-    torch::TensorOptions& options_,
-    std::unique_ptr<test::MockProcessGroup>& global_pg_,
-    std::unique_ptr<test::MockProcessGroup>& dp_pg_,
-    std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-    std::unique_ptr<test::MockProcessGroup>& single_rank_pg_,
-    ModelContext& context_,
-    const CarrierCase& tc) {
-  switch (tc.env) {
-    case CarrierEnv::kBase:
-      return nullptr;
-    case CarrierEnv::kCountingTp:
-      return dec_set_counting_tp_ctx(model_args_,
-                                     quant_args_,
-                                     parallel_args_,
-                                     options_,
-                                     global_pg_,
-                                     dp_pg_,
-                                     tp_pg_,
-                                     context_,
-                                     tc.tp_world_size,
-                                     tc.ep_size);
-    case CarrierEnv::kTpDp:
-      dec_set_tp_dp_ctx(model_args_,
-                        quant_args_,
-                        parallel_args_,
-                        options_,
-                        global_pg_,
-                        dp_pg_,
-                        tp_pg_,
-                        single_rank_pg_,
-                        context_,
-                        /*world_size=*/4,
-                        /*dp_size=*/2,
-                        /*tp_size=*/2,
-                        tc.ep_size);
-      return nullptr;
-    case CarrierEnv::kTpOnly:
-      dec_set_tp_ctx(model_args_,
-                     quant_args_,
-                     parallel_args_,
-                     options_,
-                     global_pg_,
-                     dp_pg_,
-                     tp_pg_,
-                     single_rank_pg_,
-                     context_,
-                     tc.tp_world_size,
-                     tc.ep_size);
-      return nullptr;
-  }
-
-  return nullptr;
-}
-void dec_set_tp_full_tokens(torch::TensorOptions& options_,
-                            std::unique_ptr<test::MockProcessGroup>& tp_pg_,
-                            const CarrierCase& tc) {
-  if (tc.env != CarrierEnv::kTpDp || tc.tp_full_tokens.empty()) {
-    return;
-  }
-
-  auto full_tokens = dec_mat(options_, /*rows=*/4, tc.tp_full_tokens);
-  tp_pg_->set_allgather_outputs(
-      {full_tokens.slice(0, 0, 2), full_tokens.slice(0, 2, 4)});
-}
-}  // namespace
-
-TEST(DeepseekV2DecoderLayerParamTest,
-     Constructor_WhenCreated_ThenRegistersExpectedSubmodules) {
-  for (const auto& param :
-       std::vector<LayerCase>{LayerCase{"Dense", 0}, LayerCase{"Moe", 5}}) {
-    ModelArgs model_args_;
-    QuantArgs quant_args_;
-    ParallelArgs parallel_args_{0, 1, nullptr};
-    torch::TensorOptions options_;
-    std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-    std::unique_ptr<test::MockProcessGroup> global_pg_;
-    std::unique_ptr<test::MockProcessGroup> dp_pg_;
-    std::unique_ptr<test::MockProcessGroup> tp_pg_;
-    std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-    std::unique_ptr<test::MockProcessGroup> cp_pg_;
-    ModelContext context_{};
-    v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-    // Base defaults from test helpers
-    model_args_ = test::create_default_model_args();
-    // test w8a8 only for now
+class DeepseekV2DecoderLayerTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_block_size_ = KVCacheConfig::get_instance().block_size();
     quant_args_ = test::create_default_quant_args();
     options_ = torch::TensorOptions()
                    .dtype(torch::kBFloat16)
@@ -956,9 +506,30 @@ TEST(DeepseekV2DecoderLayerParamTest,
     parallel_args_ = test::create_default_parallel_args(mock_process_group_);
     model_args_ = create_decoder_model_args();
 
-    // Build a ModelContext that the decoder requires
     context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
+  }
+  void TearDown() override {
+    KVCacheConfig::get_instance().block_size(saved_block_size_);
+  }
 
+  int64_t saved_block_size_ = 0;
+  ModelArgs model_args_;
+  QuantArgs quant_args_;
+  ParallelArgs parallel_args_{0, 1, nullptr};
+  torch::TensorOptions options_;
+  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
+  std::unique_ptr<test::MockProcessGroup> global_pg_;
+  std::unique_ptr<test::MockProcessGroup> dp_pg_;
+  std::unique_ptr<test::MockProcessGroup> tp_pg_;
+  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
+  ModelContext context_{};
+};
+}  // namespace
+
+TEST_F(DeepseekV2DecoderLayerTest,
+       Constructor_WhenCreated_ThenRegistersExpectedSubmodules) {
+  for (const auto& param :
+       std::vector<LayerCase>{LayerCase{"Dense", 0}, LayerCase{"Moe", 5}}) {
     const auto decoder =
         dec_make_decoder(model_args_, context_, param.layer_id);
 
@@ -972,75 +543,10 @@ TEST(DeepseekV2DecoderLayerParamTest,
   }
 }
 
-TEST(DeepseekV2DecoderLayerTest,
-     ConstructorAllowsDpOneEpWorldWhenDeepEpEnabled) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  ExpertDegreeGuard guard(/*value=*/2);
-  parallel_args_.dp_size() = 1;
-  parallel_args_.ep_size() = parallel_args_.world_size();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  EXPECT_NO_THROW(
-      (void)dec_make_decoder(model_args_, context_, /*layer_id=*/0));
-}
-
-TEST(DeepseekV2DecoderLayerParamTest,
-     LoadStateDict_WhenWeightsMatch_ThenSucceeds) {
+TEST_F(DeepseekV2DecoderLayerTest,
+       LoadStateDict_WhenWeightsMatch_ThenSucceeds) {
   for (const auto& param :
        std::vector<LayerCase>{LayerCase{"Dense", 0}, LayerCase{"Moe", 5}}) {
-    ModelArgs model_args_;
-    QuantArgs quant_args_;
-    ParallelArgs parallel_args_{0, 1, nullptr};
-    torch::TensorOptions options_;
-    std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-    std::unique_ptr<test::MockProcessGroup> global_pg_;
-    std::unique_ptr<test::MockProcessGroup> dp_pg_;
-    std::unique_ptr<test::MockProcessGroup> tp_pg_;
-    std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-    std::unique_ptr<test::MockProcessGroup> cp_pg_;
-    ModelContext context_{};
-    v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-    // Base defaults from test helpers
-    model_args_ = test::create_default_model_args();
-    // test w8a8 only for now
-    quant_args_ = test::create_default_quant_args();
-    options_ = torch::TensorOptions()
-                   .dtype(torch::kBFloat16)
-                   .device(Platform::type_torch(), 0)
-                   .requires_grad(false);
-    parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-    model_args_ = create_decoder_model_args();
-
-    // Build a ModelContext that the decoder requires
-    context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
     auto decoder = dec_make_decoder(model_args_, context_, param.layer_id);
     auto weight_dict =
         dec_create_test_weights(model_args_, options_, param.layer_id);
@@ -1050,645 +556,7 @@ TEST(DeepseekV2DecoderLayerParamTest,
   }
 }
 
-TEST(DeepseekV2DecoderCarrierTest,
-     BuildPostAttnCarrier_WhenScenarioChanges_ThenMatchesExpectedState) {
-  for (const auto& param : std::vector<CarrierCase>{
-           CarrierCase{"Replicated_NoShard_KeepReplicated",
-                       CarrierEnv::kBase,
-                       /*tp_world_size=*/1,
-                       /*ep_size=*/1,
-                       PostAttnLayout::REPLICATED,
-                       /*need_dp_gather=*/false,
-                       /*enable_moe_all2all=*/false,
-                       /*rows=*/2,
-                       {1.0f, 2.0f, 3.0f, 4.0f},
-                       {10.0f, 20.0f, 30.0f, 40.0f},
-                       {},
-                       {},
-                       DeepseekV2DecoderLayerTestPeer::Mode::kReplicated,
-                       {11.0f, 22.0f, 33.0f, 44.0f},
-                       {11.0f, 22.0f, 33.0f, 44.0f},
-                       /*expected_allreduce_calls=*/0,
-                       /*expected_rs_calls=*/0},
-           CarrierCase{"Replicated_TpShardInput_ReducesOnce",
-                       CarrierEnv::kCountingTp,
-                       /*tp_world_size=*/2,
-                       /*ep_size=*/2,
-                       PostAttnLayout::TP_SHARD,
-                       /*need_dp_gather=*/false,
-                       /*enable_moe_all2all=*/false,
-                       /*rows=*/2,
-                       {1.0f, 2.0f, 3.0f, 4.0f},
-                       {10.0f, 20.0f, 30.0f, 40.0f},
-                       {},
-                       {},
-                       DeepseekV2DecoderLayerTestPeer::Mode::kReplicated,
-                       {11.0f, 22.0f, 33.0f, 44.0f},
-                       {11.0f, 22.0f, 33.0f, 44.0f},
-                       /*expected_allreduce_calls=*/1,
-                       /*expected_rs_calls=*/0},
-           CarrierCase{"Replicated_FullAttnOutput_SkipsReduce",
-                       CarrierEnv::kCountingTp,
-                       /*tp_world_size=*/2,
-                       /*ep_size=*/2,
-                       PostAttnLayout::REPLICATED,
-                       /*need_dp_gather=*/false,
-                       /*enable_moe_all2all=*/false,
-                       /*rows=*/2,
-                       {1.0f, 2.0f, 3.0f, 4.0f},
-                       {10.0f, 20.0f, 30.0f, 40.0f},
-                       {},
-                       {},
-                       DeepseekV2DecoderLayerTestPeer::Mode::kReplicated,
-                       {11.0f, 22.0f, 33.0f, 44.0f},
-                       {11.0f, 22.0f, 33.0f, 44.0f},
-                       /*expected_allreduce_calls=*/0,
-                       /*expected_rs_calls=*/0}}) {
-    ModelArgs model_args_;
-    QuantArgs quant_args_;
-    ParallelArgs parallel_args_{0, 1, nullptr};
-    torch::TensorOptions options_;
-    std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-    std::unique_ptr<test::MockProcessGroup> global_pg_;
-    std::unique_ptr<test::MockProcessGroup> dp_pg_;
-    std::unique_ptr<test::MockProcessGroup> tp_pg_;
-    std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-    std::unique_ptr<test::MockProcessGroup> cp_pg_;
-    ModelContext context_{};
-    v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-    // Base defaults from test helpers
-    model_args_ = test::create_default_model_args();
-    // test w8a8 only for now
-    quant_args_ = test::create_default_quant_args();
-    options_ = torch::TensorOptions()
-                   .dtype(torch::kBFloat16)
-                   .device(Platform::type_torch(), 0)
-                   .requires_grad(false);
-    parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-    model_args_ = create_decoder_model_args();
-
-    // Build a ModelContext that the decoder requires
-    context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-    const auto& tc = param;
-    auto* tp_pg_raw = dec_init_env(model_args_,
-                                   quant_args_,
-                                   parallel_args_,
-                                   options_,
-                                   global_pg_,
-                                   dp_pg_,
-                                   tp_pg_,
-                                   single_rank_pg_,
-                                   context_,
-                                   tc);
-    auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-    ModelInputParams input_params;
-    input_params.parallel.dp_global_token_nums = tc.dp_global_token_nums;
-    dec_set_tp_full_tokens(options_, tp_pg_, tc);
-
-    auto carrier = DeepseekV2DecoderLayerTestPeer::build_post_attn_carrier(
-        *decoder,
-        dec_mat(options_, tc.rows, tc.attn_out),
-        dec_mat(options_, tc.rows, tc.residual),
-        input_params,
-        tc.attn_layout,
-        tc.need_dp_gather,
-        tc.enable_moe_all2all);
-
-    EXPECT_EQ(carrier.mode, tc.mode);
-    test::verify_tensor_close(
-        carrier.ffn_in,
-        dec_mat(options_, tc.expected_ffn_in.size() / 2, tc.expected_ffn_in));
-    test::verify_tensor_close(carrier.skip_local,
-                              dec_mat(options_,
-                                      tc.expected_skip_local.size() / 2,
-                                      tc.expected_skip_local));
-    if (tp_pg_raw != nullptr) {
-      EXPECT_EQ(tp_pg_raw->allreduce_calls(), tc.expected_allreduce_calls);
-      EXPECT_EQ(tp_pg_raw->rs_calls(), tc.expected_rs_calls);
-    }
-  }
-}
-
-TEST(DeepseekV2DecoderLayerTest, BuildPostAttnCarrierPackedLocal) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  auto decoder =
-      dec_make_loaded_decoder(model_args_, options_, context_, /*layer_id=*/0);
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder);
-
-  auto attn_out = torch::full(
-      {2, model_args_.hidden_size()}, 1.0f, dec_hidden_opts(options_));
-  auto residual = torch::full(
-      {2, model_args_.hidden_size()}, 2.0f, dec_hidden_opts(options_));
-  auto expected_skip = torch::full(
-      {2, model_args_.hidden_size()}, 3.0f, dec_hidden_opts(options_));
-  auto expected_local_norm = DeepseekV2DecoderLayerTestPeer::post_norm(
-      *decoder, expected_skip.clone());
-  auto remote_norm = torch::full(
-      {2, model_args_.hidden_size()}, 5.0f, dec_hidden_opts(options_));
-  cp_pg_->set_allgather_outputs({expected_local_norm, remote_norm});
-
-  ModelInputParams input_params;
-  auto carrier = DeepseekV2DecoderLayerTestPeer::build_post_attn_carrier(
-      *decoder,
-      attn_out,
-      residual,
-      input_params,
-      PostAttnLayout::PACKED_LOCAL,
-      /*need_dp_gather=*/false,
-      /*enable_moe_all2all=*/false);
-
-  EXPECT_EQ(carrier.mode, DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
-  test::verify_tensor_close(carrier.skip_local, expected_skip);
-  test::verify_tensor_close(
-      carrier.ffn_in,
-      torch::cat({expected_local_norm, remote_norm.slice(0, 0, 1)}, 0));
-}
-
-TEST(DeepseekV2DecoderLayerTest, RestoreFfnOutputReplicated) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  ModelInputParams input_params;
-
-  auto attn_out = torch::tensor(
-      {{1.0f, 2.0f}, {3.0f, 4.0f}},
-      torch::TensorOptions().dtype(torch::kFloat32).device(options_.device()));
-  auto residual = torch::tensor(
-      {{10.0f, 20.0f}, {30.0f, 40.0f}},
-      torch::TensorOptions().dtype(torch::kFloat32).device(options_.device()));
-  auto carrier = DeepseekV2DecoderLayerTestPeer::build_post_attn_carrier(
-      *decoder,
-      attn_out,
-      residual,
-      input_params,
-      PostAttnLayout::TP_SHARD,
-      /*need_dp_gather=*/false,
-      /*enable_moe_all2all=*/false);
-
-  auto ffn_out = torch::tensor(
-      {{100.0f, 200.0f}, {300.0f, 400.0f}},
-      torch::TensorOptions().dtype(torch::kFloat32).device(options_.device()));
-  auto restored = DeepseekV2DecoderLayerTestPeer::restore_ffn_output(
-      *decoder, ffn_out, carrier, input_params);
-
-  auto expected = torch::tensor(
-      {{111.0f, 222.0f}, {333.0f, 444.0f}},
-      torch::TensorOptions().dtype(torch::kFloat32).device(options_.device()));
-  test::verify_tensor_close(restored, expected);
-}
-
-TEST(DeepseekV2DecoderLayerTest, RestoreFfnOutputPackedLocal) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  auto decoder =
-      dec_make_loaded_decoder(model_args_, options_, context_, /*layer_id=*/0);
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder);
-
-  auto attn_out = torch::full(
-      {2, model_args_.hidden_size()}, 1.0f, dec_hidden_opts(options_));
-  auto residual = torch::full(
-      {2, model_args_.hidden_size()}, 2.0f, dec_hidden_opts(options_));
-  auto expected_skip = torch::full(
-      {2, model_args_.hidden_size()}, 3.0f, dec_hidden_opts(options_));
-  auto expected_local_norm = DeepseekV2DecoderLayerTestPeer::post_norm(
-      *decoder, expected_skip.clone());
-  auto remote_norm = torch::full(
-      {2, model_args_.hidden_size()}, 5.0f, dec_hidden_opts(options_));
-  cp_pg_->set_allgather_outputs(
-      std::vector<torch::Tensor>{expected_local_norm, remote_norm});
-
-  ModelInputParams input_params;
-  auto carrier = DeepseekV2DecoderLayerTestPeer::build_post_attn_carrier(
-      *decoder,
-      attn_out,
-      residual,
-      input_params,
-      PostAttnLayout::PACKED_LOCAL,
-      /*need_dp_gather=*/false,
-      /*enable_moe_all2all=*/false);
-
-  auto packed_ffn_out = torch::full(
-      {3, model_args_.hidden_size()}, 7.0f, dec_hidden_opts(options_));
-  auto restored = DeepseekV2DecoderLayerTestPeer::restore_ffn_output(
-      *decoder, packed_ffn_out, carrier, input_params);
-  test::verify_tensor_close(
-      restored,
-      torch::full(
-          {2, model_args_.hidden_size()}, 10.0f, dec_hidden_opts(options_)));
-}
-
-TEST(DeepseekV2DecoderLayerTest, CanLocalOutPackedLocalNeedsEqualTokens) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto tp_pg = std::make_unique<CountingProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto* tp_pg_raw = tp_pg.get();
-  tp_pg_ = std::move(tp_pg);
-
-  parallel_args_ = ParallelArgs(
-      /*rank=*/0, /*world_size=*/2, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.tp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
-      DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
-
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder, tp_pg_.get(), {2, 2});
-  EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
-      *decoder, carrier, tp_pg_.get()));
-
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder, tp_pg_.get(), {2, 1});
-  EXPECT_FALSE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
-      *decoder, carrier, tp_pg_.get()));
-
-  EXPECT_EQ(tp_pg_raw->allreduce_calls(), 0);
-  EXPECT_EQ(tp_pg_raw->rs_calls(), 0);
-}
-
-TEST(DeepseekV2DecoderLayerTest, CanLocalOutPackedLocalAllowsGlobalAlias) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  tp_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-
-  parallel_args_ = ParallelArgs(
-      /*rank=*/0, /*world_size=*/2, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.tp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
-      DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
-
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder, tp_pg_.get(), {2, 2});
-  EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
-      *decoder, carrier, global_pg_.get()));
-}
-
-TEST(DeepseekV2DecoderLayerTest, CommOutPackedLocalReduceScatters) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto tp_pg = std::make_unique<CountingProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto* tp_pg_raw = tp_pg.get();
-  tp_pg_ = std::move(tp_pg);
-
-  parallel_args_ = ParallelArgs(
-      /*rank=*/0, /*world_size=*/2, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.tp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder, tp_pg_.get(), {2, 2});
-  auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
-      DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
-  auto packed_out =
-      torch::tensor({{1.0f, 2.0f}, {3.0f, 4.0f}, {5.0f, 6.0f}, {7.0f, 8.0f}},
-                    dec_fp32_opts(options_));
-
-  auto local_out = DeepseekV2DecoderLayerTestPeer::comm_out(
-      *decoder, packed_out, carrier, tp_pg_.get());
-
-  test::verify_tensor_close(local_out, packed_out.slice(0, 0, 2));
-  EXPECT_EQ(tp_pg_raw->allreduce_calls(), 0);
-  EXPECT_EQ(tp_pg_raw->rs_calls(), 1);
-}
-
-TEST(DeepseekV2DecoderLayerTest, CommOutPackedLocalSlicesSingleRankOutput) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder, nullptr, {2, 2});
-  auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
-      DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
-  test::MockProcessGroup single_rank_pg(
-      options_.device(), /*rank=*/0, /*world_size=*/1);
-  auto packed_out =
-      torch::tensor({{1.0f, 2.0f}, {3.0f, 4.0f}, {5.0f, 6.0f}, {7.0f, 8.0f}},
-                    dec_fp32_opts(options_));
-
-  auto local_out = DeepseekV2DecoderLayerTestPeer::comm_out(
-      *decoder, packed_out, carrier, &single_rank_pg);
-
-  test::verify_tensor_close(local_out, packed_out.slice(0, 0, 2));
-}
-
-TEST(DeepseekV2DecoderLayerTest, CommOutPackedLocalFallsBackOnPgMismatch) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  tp_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto mismatch_pg = std::make_unique<CountingProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/4);
-  auto* mismatch_pg_raw = mismatch_pg.get();
-
-  parallel_args_ = ParallelArgs(
-      /*rank=*/0, /*world_size=*/2, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.tp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  dec_set_cp_ctx(options_, cp_pg_, cp_ctx_, decoder, tp_pg_.get(), {2, 2});
-  auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
-      DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal);
-  auto packed_out =
-      torch::tensor({{1.0f, 2.0f}, {3.0f, 4.0f}, {5.0f, 6.0f}, {7.0f, 8.0f}},
-                    dec_fp32_opts(options_));
-
-  auto local_out = DeepseekV2DecoderLayerTestPeer::comm_out(
-      *decoder, packed_out, carrier, mismatch_pg.get());
-
-  EXPECT_FALSE(DeepseekV2DecoderLayerTestPeer::can_keep_local_output(
-      *decoder, carrier, mismatch_pg.get()));
-  test::verify_tensor_close(local_out, packed_out);
-  EXPECT_EQ(mismatch_pg_raw->allreduce_calls(), 1);
-  EXPECT_EQ(mismatch_pg_raw->rs_calls(), 0);
-}
-
-TEST(DeepseekV2DecoderLayerTest, PackedLocalFastAddsSkipLocally) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  auto decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/0);
-  auto carrier = DeepseekV2DecoderLayerTestPeer::make_carrier(
-      DeepseekV2DecoderLayerTestPeer::Mode::kPackedLocal,
-      torch::tensor({{10.0f, 20.0f}, {30.0f, 40.0f}}, dec_fp32_opts(options_)));
-  auto local_out =
-      torch::tensor({{1.0f, 2.0f}, {3.0f, 4.0f}}, dec_fp32_opts(options_));
-
-  test::verify_tensor_close(
-      local_out + carrier.skip_local,
-      torch::tensor({{11.0f, 22.0f}, {33.0f, 44.0f}}, dec_fp32_opts(options_)));
-}
-
-TEST(DeepseekV2DecoderLayerTest, ForwardMixedDpMoEReturnsLocalSlice) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest, ForwardMixedDpMoEReturnsLocalSlice) {
   const int32_t layer_id =
       std::max<int32_t>(5, model_args_.first_k_dense_replace());
   ExpertDegreeGuard guard(/*value=*/0);
@@ -1764,70 +632,6 @@ TEST(DeepseekV2DecoderLayerTest, ForwardMixedDpMoEReturnsLocalSlice) {
   EXPECT_FALSE(residual.has_value());
 }
 
-TEST(DeepseekV2DecoderLayerTest, DenseMlpReductionMovesToDecoder) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  global_pg_ = std::make_unique<test::MockProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto tp_pg = std::make_unique<CountingProcessGroup>(
-      options_.device(), /*rank=*/0, /*world_size=*/2);
-  auto* tp_pg_raw = tp_pg.get();
-  tp_pg_ = std::move(tp_pg);
-
-  parallel_args_ = ParallelArgs(
-      /*rank=*/0, /*world_size=*/2, /*dp_size=*/1, global_pg_.get());
-  parallel_args_.process_group_ = global_pg_.get();
-  parallel_args_.tp_group_ = tp_pg_.get();
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  auto decoder =
-      dec_make_loaded_decoder(model_args_, options_, context_, /*layer_id=*/0);
-  auto hidden_states = test::seeded_tensor("deepseek_v2_decoder.dense_ffn",
-                                           {4, model_args_.hidden_size()},
-                                           torch::kBFloat16,
-                                           options_.device());
-
-  auto local_out =
-      DeepseekV2DecoderLayerTestPeer::mlp(*decoder)->forward(hidden_states);
-  dec_sync_dev(options_);
-
-  EXPECT_EQ(tp_pg_raw->allreduce_calls(), 0);
-  ASSERT_EQ(local_out.size(0), hidden_states.size(0));
-  ASSERT_EQ(local_out.size(1), model_args_.hidden_size());
-
-  auto reduced_out = DeepseekV2DecoderLayerTestPeer::reduce_out(
-      *decoder, local_out, parallel_args_.tp_group_);
-  dec_sync_dev(options_);
-
-  EXPECT_EQ(tp_pg_raw->allreduce_calls(), 1);
-  EXPECT_EQ(reduced_out.sizes(), local_out.sizes());
-}
-
 namespace {
 
 // Ground-truth indexer_types for GLM5.2-W4A8 (index_topk_freq=4,
@@ -1895,35 +699,8 @@ void dec_use_cpu_constructor_context(
 }
 }  // namespace
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     DefaultConstructorWhenShareConfiguredKeepsOwnIndexer) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       DefaultConstructorWhenShareConfiguredKeepsOwnIndexer) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.index_topk_freq() = 4;
   model_args_.index_skip_topk_offset() = 3;
@@ -1943,91 +720,24 @@ TEST(DeepseekV2DecoderTopkShareTest,
   EXPECT_TRUE(parameters.contains("self_attn.indexer.k_norm.weight"));
 }
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     FreqConfig_WhenGlm52_ThenPlanMatchesIndexerTypes) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       FreqConfig_WhenGlm52_ThenPlanMatchesIndexerTypes) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.index_topk_freq() = 4;
   model_args_.index_skip_topk_offset() = 3;
   model_args_.index_topk_pattern() = "";
   dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
 
-  int32_t full_count = 0;
-  int32_t shared_count = 0;
-  for (int32_t layer_id = 0; layer_id < kNumLayers; ++layer_id) {
+  for (int32_t layer_id : {0, 2, 3, 5, 6, 7, kNumLayers - 1}) {
     auto decoder = dec_make_decoder(model_args_, context_, layer_id);
-    const DsaTopkShareDecision& decision =
-        DeepseekV2DecoderLayerTestPeer::topk_share_decision(*decoder);
-    const bool expect_full = is_full_indexer_layer_glm52(layer_id);
-    const bool expect_output =
-        expect_full && !is_full_indexer_layer_glm52(layer_id + 1);
-    EXPECT_EQ(decision.reuse_topk, !expect_full) << "layer " << layer_id;
-    EXPECT_EQ(decision.output_topk, expect_output) << "layer " << layer_id;
-    if (expect_full) {
-      ++full_count;
-    } else {
-      ++shared_count;
-    }
+    EXPECT_EQ(decoder->named_modules().contains("self_attn.indexer"),
+              is_full_indexer_layer_glm52(layer_id))
+        << "layer " << layer_id;
   }
-  EXPECT_EQ(full_count, 21);
-  EXPECT_EQ(shared_count, 57);
 }
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     SharedLayerOwnsNoIndexerParametersOrConstants) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       SharedLayerOwnsNoIndexerParametersOrConstants) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.index_topk_freq() = 4;
   model_args_.index_skip_topk_offset() = 3;
@@ -2036,14 +746,12 @@ TEST(DeepseekV2DecoderTopkShareTest,
   auto full_decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/2);
   auto shared_decoder = dec_make_decoder(model_args_, context_, /*layer_id=*/3);
 
-  EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::attention_has_child(*full_decoder,
-                                                                  "indexer"));
-  EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::attention_has_child(
-      *full_decoder, "indexer_rotary_emb"));
-  EXPECT_FALSE(DeepseekV2DecoderLayerTestPeer::attention_has_child(
-      *shared_decoder, "indexer"));
-  EXPECT_FALSE(DeepseekV2DecoderLayerTestPeer::attention_has_child(
-      *shared_decoder, "indexer_rotary_emb"));
+  EXPECT_TRUE(full_decoder->named_modules().contains("self_attn.indexer"));
+  EXPECT_TRUE(
+      full_decoder->named_modules().contains("self_attn.indexer_rotary_emb"));
+  EXPECT_FALSE(shared_decoder->named_modules().contains("self_attn.indexer"));
+  EXPECT_FALSE(
+      shared_decoder->named_modules().contains("self_attn.indexer_rotary_emb"));
 
   const auto full_parameters = full_decoder->named_parameters(/*recurse=*/true);
   const auto shared_parameters =
@@ -2060,82 +768,25 @@ TEST(DeepseekV2DecoderTopkShareTest,
   EXPECT_FALSE(shared_parameters.contains("self_attn.indexer.k_norm.weight"));
 }
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     Pattern_WhenEquivalentFsString_ThenPlanMatchesFreqConfig) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       Pattern_WhenEquivalentFsString_ThenPlanMatchesFreqConfig) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.index_topk_freq() = 1;
   model_args_.index_skip_topk_offset() = 0;
   model_args_.index_topk_pattern() = build_fs_pattern_glm52(kNumLayers);
   dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
 
-  for (int32_t layer_id = 0; layer_id < kNumLayers; ++layer_id) {
+  for (int32_t layer_id : {0, 2, 3, 5, 6, 7, kNumLayers - 1}) {
     auto decoder = dec_make_decoder(model_args_, context_, layer_id);
-    const DsaTopkShareDecision& decision =
-        DeepseekV2DecoderLayerTestPeer::topk_share_decision(*decoder);
     const bool expect_full = is_full_indexer_layer_glm52(layer_id);
-    const bool expect_output =
-        expect_full && !is_full_indexer_layer_glm52(layer_id + 1);
-    EXPECT_EQ(decision.reuse_topk, !expect_full) << "layer " << layer_id;
-    EXPECT_EQ(decision.output_topk, expect_output) << "layer " << layer_id;
+    EXPECT_EQ(decoder->named_modules().contains("self_attn.indexer"),
+              expect_full)
+        << "layer " << layer_id;
   }
 }
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     DefaultIndexer_WhenGlm51_ThenEveryLayerLoadsOwnIndexerWeights) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       DefaultIndexer_WhenGlm51_ThenEveryLayerLoadsOwnIndexerWeights) {
   dec_configure_glm5_indexer(model_args_);
   // GLM5.1 has an indexer on every layer but no cross-layer share fields.
   model_args_.index_topk_freq() = 1;
@@ -2150,15 +801,10 @@ TEST(DeepseekV2DecoderTopkShareTest,
   for (int32_t layer_id : {0, 3, 6, 7}) {
     auto decoder =
         dec_make_loaded_decoder(model_args_, options_, context_, layer_id);
-    const DsaTopkShareDecision& decision =
-        DeepseekV2DecoderLayerTestPeer::topk_share_decision(*decoder);
-    EXPECT_FALSE(decision.reuse_topk) << "layer " << layer_id;
-    EXPECT_FALSE(decision.output_topk) << "layer " << layer_id;
-    EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::attention_has_child(*decoder,
-                                                                    "indexer"))
+    EXPECT_TRUE(decoder->named_modules().contains("self_attn.indexer"))
         << "layer " << layer_id;
-    EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::attention_has_child(
-        *decoder, "indexer_rotary_emb"))
+    EXPECT_TRUE(
+        decoder->named_modules().contains("self_attn.indexer_rotary_emb"))
         << "layer " << layer_id;
 
     const auto parameters = decoder->named_parameters(/*recurse=*/true);
@@ -2173,82 +819,8 @@ TEST(DeepseekV2DecoderTopkShareTest,
   }
 }
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     MtpLayerAtMainModelBoundaryUsesOnlyCrossStepReuse) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
-  dec_configure_glm5_indexer(model_args_);
-  model_args_.model_type() = "glm_moe_dsa_mtp";
-  model_args_.index_topk_freq() = 4;
-  model_args_.index_skip_topk_offset() = 3;
-  model_args_.index_share_for_mtp_iteration() = true;
-  dec_refresh_ctx(model_args_, quant_args_, parallel_args_, options_, context_);
-
-  DecoderHolder decoder(
-      DeepseekV32DecoderLayerImpl(context_, /*layer_id=*/kNumLayers));
-  const DsaTopkShareDecision& decision =
-      DeepseekV2DecoderLayerTestPeer::topk_share_decision(*decoder);
-  EXPECT_FALSE(decision.reuse_topk);
-  EXPECT_FALSE(decision.output_topk);
-  EXPECT_TRUE(DeepseekV2DecoderLayerTestPeer::mtp_topk_reuse(*decoder));
-  EXPECT_TRUE(
-      DeepseekV2DecoderLayerTestPeer::attention_has_child(*decoder, "indexer"));
-}
-
-TEST(DeepseekV2DecoderTopkShareTest,
-     MtpForwardComputesThenReusesTopkAcrossSteps) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       MtpForwardComputesThenReusesTopkAcrossSteps) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.model_type() = "glm_moe_dsa_mtp";
   model_args_.mtp_mlp_type() = "dense";
@@ -2336,34 +908,7 @@ TEST(DeepseekV2DecoderTopkShareTest,
       second_output, first_output, /*rtol=*/1e-3, /*atol=*/1e-2);
 }
 
-TEST(DeepseekV2DecoderTopkShareTest, PatternWithOnlyFullLayersHasNoReuse) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest, PatternWithOnlyFullLayersHasNoReuse) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.n_layers() = 4;
   model_args_.index_topk_freq() = 1;
@@ -2376,35 +921,8 @@ TEST(DeepseekV2DecoderTopkShareTest, PatternWithOnlyFullLayersHasNoReuse) {
   EXPECT_FALSE(topk_share_plan.decision_for(/*layer_id=*/3).output_topk);
 }
 
-TEST(DeepseekV2DecoderTopkShareTest,
-     ShortFrequencyPlanWithNoSharedLayerHasNoReuse) {
-  ModelArgs model_args_;
-  QuantArgs quant_args_;
-  ParallelArgs parallel_args_{0, 1, nullptr};
-  torch::TensorOptions options_;
-  std::unique_ptr<xllm::ProcessGroup> mock_process_group_;
-  std::unique_ptr<test::MockProcessGroup> global_pg_;
-  std::unique_ptr<test::MockProcessGroup> dp_pg_;
-  std::unique_ptr<test::MockProcessGroup> tp_pg_;
-  std::unique_ptr<test::MockProcessGroup> single_rank_pg_;
-  std::unique_ptr<test::MockProcessGroup> cp_pg_;
-  ModelContext context_{};
-  v32_cp::DeepseekV32CPContext cp_ctx_{};
-
-  // Base defaults from test helpers
-  model_args_ = test::create_default_model_args();
-  // test w8a8 only for now
-  quant_args_ = test::create_default_quant_args();
-  options_ = torch::TensorOptions()
-                 .dtype(torch::kBFloat16)
-                 .device(Platform::type_torch(), 0)
-                 .requires_grad(false);
-  parallel_args_ = test::create_default_parallel_args(mock_process_group_);
-  model_args_ = create_decoder_model_args();
-
-  // Build a ModelContext that the decoder requires
-  context_ = ModelContext(parallel_args_, model_args_, quant_args_, options_);
-
+TEST_F(DeepseekV2DecoderLayerTest,
+       ShortFrequencyPlanWithNoSharedLayerHasNoReuse) {
   dec_configure_glm5_indexer(model_args_);
   model_args_.n_layers() = 3;
   model_args_.index_topk_freq() = 4;

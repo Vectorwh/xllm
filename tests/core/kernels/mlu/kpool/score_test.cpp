@@ -1114,8 +1114,26 @@ TEST(KPoolKernelTest, BudgetedPrefillScoresMatchIndependentTorch) {
   }
 }
 
-TEST(KPoolKernelTest, DecodeVerifyScoresCoverEveryBatchThrough128) {
-  for (int64_t batch = 1; batch <= 128; ++batch) {
+TEST(KPoolKernelTest, DecodeVerifyScoresCoverDispatchBoundaryBatches) {
+  for (const int64_t batch : {1,
+                              2,
+                              3,
+                              4,
+                              5,
+                              8,
+                              9,
+                              15,
+                              16,
+                              17,
+                              31,
+                              32,
+                              33,
+                              63,
+                              64,
+                              65,
+                              127,
+                              128,
+                              129}) {
     for (const int64_t query : {1, 4}) {
       SCOPED_TRACE(::testing::Message() << batch << ":" << query);
       std::vector<int64_t> histories;

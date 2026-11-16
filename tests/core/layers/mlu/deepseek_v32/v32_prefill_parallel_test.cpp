@@ -57,6 +57,22 @@ limitations under the License.
 #include "platform/device.h"
 #include "platform/platform.h"
 
+namespace xllm::layer {
+
+class DeepseekV32DecoderLayerTestPeer final {
+ public:
+  static torch::Tensor comm_out_packed_local(
+      DeepseekV32DecoderLayerImpl& decoder,
+      torch::Tensor x,
+      ProcessGroup* process_group) {
+    DeepseekV32DecoderLayerImpl::PostAttnCarrier carrier;
+    carrier.mode = DeepseekV32DecoderLayerImpl::PostAttnMode::kPackedLocal;
+    return decoder.comm_out(std::move(x), carrier, process_group);
+  }
+};
+
+}  // namespace xllm::layer
+
 namespace xllm::layer::test {
 namespace {
 bool child_failed(int32_t initial_parts) {
@@ -140,6 +156,32 @@ struct CpTpTestGroups {
   std::unique_ptr<ProcessGroup> tp;
   std::unique_ptr<ProcessGroup> cp;
   std::unique_ptr<ParallelArgs> parallel_args;
+};
+
+class CountingProcessGroup final : public MockProcessGroup {
+ public:
+  CountingProcessGroup(const torch::Device& device,
+                       int32_t rank,
+                       int32_t world_size)
+      : MockProcessGroup(device, rank, world_size) {}
+
+  void allreduce(torch::Tensor& input) override {
+    ++allreduce_calls_;
+    MockProcessGroup::allreduce(input);
+  }
+
+  void reduce_scatter(const torch::Tensor& input,
+                      torch::Tensor& output) override {
+    ++reduce_scatter_calls_;
+    MockProcessGroup::reduce_scatter(input, output);
+  }
+
+  int32_t allreduce_calls() const { return allreduce_calls_; }
+  int32_t reduce_scatter_calls() const { return reduce_scatter_calls_; }
+
+ private:
+  int32_t allreduce_calls_ = 0;
+  int32_t reduce_scatter_calls_ = 0;
 };
 int32_t parallel_base_port(int32_t world_size, int32_t cp_size) {
   CHECK_GT(cp_size, 0);
@@ -651,6 +693,9 @@ void expect_close(const torch::Tensor& actual,
   const torch::Tensor value = actual.cpu().to(torch::kFloat32);
   ASSERT_GT(ref.abs().max().item<float>(), atol)
       << label << " reference is too small for a meaningful absolute tolerance";
+  const double scale = torch::norm(ref).item<double>();
+  ASSERT_GT(scale, 0.0);
+  EXPECT_LE(torch::norm(value - ref).item<double>() / scale, rtol);
   EXPECT_TRUE(torch::allclose(value, ref, rtol, atol))
       << label << " max error " << (value - ref).abs().max().item<float>();
 }
@@ -890,64 +935,90 @@ struct PrefillCase {
   return ::testing::AssertionSuccess();
 }
 
-TEST(AttentionReferenceContractTest, OutputRejectsCoherentDrift) {
-  const torch::Tensor reference = torch::ones({1, 256}, torch::kBFloat16);
-  EXPECT_FALSE(bf16_output_close(reference + 0.015625, reference));
+TEST(AttentionReferenceContractTest,
+     OutputContractSeparatesRealErrorsFromRounding) {
+  {
+    SCOPED_TRACE("OutputRejectsCoherentDrift");
+
+    const torch::Tensor reference = torch::ones({1, 256}, torch::kBFloat16);
+    EXPECT_FALSE(bf16_output_close(reference + 0.015625, reference));
+  }
+  {
+    SCOPED_TRACE("single_outlier");
+
+    const torch::Tensor reference = torch::ones({1, 256}, torch::kBFloat16);
+    torch::Tensor actual = reference.clone();
+    actual[0][0] = 1.03125;
+    EXPECT_FALSE(bf16_output_close(actual, reference));
+  }
+  {
+    SCOPED_TRACE("cancellation_floor");
+
+    torch::Tensor reference = torch::ones({1, 256}, torch::kBFloat16);
+    reference[0][0] = 0;
+    torch::Tensor actual = reference.clone();
+    actual[0][0] = std::ldexp(/*arg=*/1.0, /*exp=*/-10);
+    EXPECT_TRUE(bf16_output_close(actual, reference));
+  }
+  {
+    SCOPED_TRACE("zero_row_exact");
+
+    const torch::Tensor reference = torch::zeros({1, 256}, torch::kBFloat16);
+    EXPECT_TRUE(bf16_output_close(reference, reference));
+    EXPECT_FALSE(bf16_output_close(reference + 0.00001, reference));
+  }
+  {
+    SCOPED_TRACE("nonfinite_operands");
+
+    const torch::Tensor nonfinite = torch::full(
+        {1, 1}, std::numeric_limits<double>::infinity(), torch::kBFloat16);
+    EXPECT_FALSE(bf16_output_close(nonfinite, nonfinite));
+    EXPECT_FALSE(score_selection_legal(nonfinite,
+                                       torch::ones({1}, torch::kBFloat16),
+                                       torch::ones({1, 1}, torch::kBFloat16),
+                                       torch::tensor({96}),
+                                       torch::tensor({96}),
+                                       /*topk=*/1));
+  }
 }
 
-TEST(AttentionReferenceContractTest, OutputRejectsSingleOutlier) {
-  const torch::Tensor reference = torch::ones({1, 256}, torch::kBFloat16);
-  torch::Tensor actual = reference.clone();
-  actual[0][0] = 1.03125;
-  EXPECT_FALSE(bf16_output_close(actual, reference));
-}
+TEST(AttentionReferenceContractTest,
+     SelectionContractSeparatesCutoffRoundingFromWrongScores) {
+  {
+    SCOPED_TRACE("SelectionAcceptsCutoffRounding");
 
-TEST(AttentionReferenceContractTest, OutputAcceptsCancellationFloor) {
-  torch::Tensor reference = torch::ones({1, 256}, torch::kBFloat16);
-  reference[0][0] = 0;
-  torch::Tensor actual = reference.clone();
-  actual[0][0] = std::ldexp(/*arg=*/1.0, /*exp=*/-10);
-  EXPECT_TRUE(bf16_output_close(actual, reference));
-}
+    const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+    EXPECT_TRUE(
+        score_selection_legal(torch::ones({1, 1}, bf16),
+                              torch::ones({1}, bf16),
+                              torch::tensor({{1.0}, {0.99609375}, {0.5}}, bf16),
+                              torch::tensor({96, 97, 98}),
+                              torch::tensor({97}),
+                              /*topk=*/1));
+  }
+  {
+    SCOPED_TRACE("wrong_cutoff_swap");
 
-TEST(AttentionReferenceContractTest, ZeroReferenceRowsRequireExactOutput) {
-  const torch::Tensor reference = torch::zeros({1, 256}, torch::kBFloat16);
-  EXPECT_TRUE(bf16_output_close(reference, reference));
-  EXPECT_FALSE(bf16_output_close(reference + 0.00001, reference));
-}
+    const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+    EXPECT_FALSE(
+        score_selection_legal(torch::ones({1, 1}, bf16),
+                              torch::ones({1}, bf16),
+                              torch::tensor({{1.0}, {0.99609375}, {0.5}}, bf16),
+                              torch::tensor({96, 97, 98}),
+                              torch::tensor({98}),
+                              /*topk=*/1));
+  }
+  {
+    SCOPED_TRACE("complete_causal_set");
 
-TEST(AttentionReferenceContractTest, NonfiniteValuesAreRejected) {
-  const torch::Tensor nonfinite = torch::full(
-      {1, 1}, std::numeric_limits<double>::infinity(), torch::kBFloat16);
-  EXPECT_FALSE(bf16_output_close(nonfinite, nonfinite));
-  EXPECT_FALSE(score_selection_legal(nonfinite,
-                                     torch::ones({1}, torch::kBFloat16),
-                                     torch::ones({1, 1}, torch::kBFloat16),
-                                     torch::tensor({96}),
-                                     torch::tensor({96}),
-                                     /*topk=*/1));
-}
-
-TEST(AttentionReferenceContractTest, SelectionAcceptsCutoffRounding) {
-  const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
-  EXPECT_TRUE(
-      score_selection_legal(torch::ones({1, 1}, bf16),
-                            torch::ones({1}, bf16),
-                            torch::tensor({{1.0}, {0.99609375}, {0.5}}, bf16),
-                            torch::tensor({96, 97, 98}),
-                            torch::tensor({97}),
-                            /*topk=*/1));
-}
-
-TEST(AttentionReferenceContractTest, SelectionRejectsWorstSwap) {
-  const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
-  EXPECT_FALSE(
-      score_selection_legal(torch::ones({1, 1}, bf16),
-                            torch::ones({1}, bf16),
-                            torch::tensor({{1.0}, {0.99609375}, {0.5}}, bf16),
-                            torch::tensor({96, 97, 98}),
-                            torch::tensor({98}),
-                            /*topk=*/1));
+    const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
+    EXPECT_TRUE(score_selection_legal(torch::ones({1, 1}, bf16),
+                                      torch::ones({1}, bf16),
+                                      torch::ones({3, 1}, bf16),
+                                      torch::tensor({96, 97, 98}),
+                                      torch::tensor({98, 96, 97}),
+                                      /*topk=*/8));
+  }
 }
 
 TEST(AttentionReferenceContractTest, SelectionRejectsInvalidStructure) {
@@ -962,16 +1033,6 @@ TEST(AttentionReferenceContractTest, SelectionRejectsInvalidStructure) {
       query, weights, keys, slots, torch::tensor({96, 99}), /*topk=*/2));
   EXPECT_FALSE(score_selection_legal(
       query, weights, keys, slots, torch::tensor({96}), /*topk=*/2));
-}
-
-TEST(AttentionReferenceContractTest, SelectionAcceptsCompleteCausalSet) {
-  const auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16);
-  EXPECT_TRUE(score_selection_legal(torch::ones({1, 1}, bf16),
-                                    torch::ones({1}, bf16),
-                                    torch::ones({3, 1}, bf16),
-                                    torch::tensor({96, 97, 98}),
-                                    torch::tensor({98, 96, 97}),
-                                    /*topk=*/8));
 }
 
 ModelArgs prefill_args(DsaModelVariant variant) {
@@ -1627,13 +1688,6 @@ void run_prefill_case(const PrefillCase& config,
                 shard_rank,
                 "index cache",
                 dcp_size);
-    const std::string phase = "prefix" + std::to_string(prefix);
-
-    const torch::Tensor reference_written_index =
-        reference_cache.get_index_cache()
-            .cpu()
-            .reshape({-1, args.index_head_dim()})
-            .index_select(/*dim=*/0, torch::tensor(slots, torch::kInt64));
 
     prefix += count;
   }
@@ -1734,10 +1788,12 @@ void check_packed_values(const torch::Tensor& actual,
   const torch::Tensor av = a.masked_select(finite);
   const torch::Tensor bv = b.masked_select(finite);
   ASSERT_TRUE(torch::allclose(av, bv, /*rtol=*/1e-2, /*atol=*/1e-3)) << label;
-  const float error =
-      av.numel() > 0 ? (av - bv).abs().max().item<float>() : 0.0f;
-  LOG(INFO) << label << " bitwise_equal=" << torch::equal(a, b)
-            << " max_abs_error=" << error;
+  const double scale = torch::norm(bv).item<double>();
+  if (scale == 0.0) {
+    EXPECT_TRUE(torch::equal(av, bv)) << label;
+  } else {
+    EXPECT_LE(torch::norm(av - bv).item<double>() / scale, 0.01) << label;
+  }
 }
 
 std::pair<torch::Tensor, torch::Tensor> packed_local_attention(
@@ -1952,7 +2008,9 @@ TEST(PackedAttentionParallelTest, EightRanksMatchGlobalOrderAndFp64Reference) {
   }
   bool skipped = false;
   ASSERT_TRUE(wait_ranks(pids, std::chrono::milliseconds{300000}, skipped));
-  ASSERT_FALSE(skipped) << "Eight physical MLU devices are required";
+  if (skipped) {
+    GTEST_SKIP() << "Eight physical MLU devices are required";
+  }
 }
 
 TEST(PackedAttentionParallelTest, FullAndSharedHistoryMatchSingleRank) {
@@ -2253,6 +2311,54 @@ void run_cp_decoder(int32_t rank,
               "decoder KV");
 }
 
+TEST(DecoderCpParallelTest,
+     CommOutPackedLocalFallsBackOnMismatchedProcessGroup) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
+  KVCacheConfig::get_instance().block_size(kBlock);
+
+  MockProcessGroup global_group(device.unwrap(), /*rank=*/0, /*world_size=*/2);
+  MockProcessGroup cp_group(device.unwrap(), /*rank=*/0, /*world_size=*/2);
+  MockProcessGroup single_rank_group(
+      device.unwrap(), /*rank=*/0, /*world_size=*/1);
+  CountingProcessGroup mismatched_group(
+      device.unwrap(), /*rank=*/0, /*world_size=*/4);
+  ParallelArgs parallel(/*rank=*/0,
+                        /*world_size=*/2,
+                        /*dp_size=*/1,
+                        &global_group);
+  parallel.tp_size() = 1;
+  parallel.cp_size() = 2;
+  parallel.tp_group_ = &single_rank_group;
+  parallel.cp_group_ = &cp_group;
+
+  ModelArgs args = prefill_args(DsaModelVariant::GLM5);
+  args.index_topk() = 64;
+  DeepseekV32DecoderLayer decoder(
+      ModelContext(parallel, args, QuantArgs(), options), /*layer_id=*/0);
+  v32_cp::DeepseekV32CPContext cp_context;
+  cp_context.rank = 0;
+  cp_context.process_group = &cp_group;
+  cp_context.comm_plan.tokens_per_rank = {2, 2};
+  cp_context.comm_plan.ffn_can_rs =
+      v32_cp::can_ffn_rs(cp_context.comm_plan.tokens_per_rank);
+  ASSERT_TRUE(cp_context.comm_plan.ffn_can_rs);
+  decoder->set_context_parallel_context(&cp_context);
+
+  const auto fp32_options = options.dtype(torch::kFloat32);
+  const torch::Tensor packed_output = torch::tensor(
+      {{1.0f, 2.0f}, {3.0f, 4.0f}, {5.0f, 6.0f}, {7.0f, 8.0f}}, fp32_options);
+  const torch::Tensor output =
+      DeepseekV32DecoderLayerTestPeer::comm_out_packed_local(
+          *decoder, packed_output, &mismatched_group);
+
+  expect_close(output, packed_output, /*rtol=*/0.0, /*atol=*/0.0);
+  EXPECT_EQ(mismatched_group.allreduce_calls(), 1);
+  EXPECT_EQ(mismatched_group.reduce_scatter_calls(), 0);
+}
+
 struct DecoderCpCase {
   bool moe;
   int32_t count;
@@ -2261,15 +2367,21 @@ struct DecoderCpCase {
 };
 
 TEST(DecoderCpParallelTest, MatchesSingleRank) {
-  for (const auto& param :
-       std::vector<DecoderCpCase>{DecoderCpCase{.moe = false,
-                                                .count = 16,
-                                                .can_rs = true,
-                                                .name = "DenseBalanced"},
-                                  DecoderCpCase{.moe = true,
-                                                .count = 15,
-                                                .can_rs = false,
-                                                .name = "MoeUnbalanced"}}) {
+  for (const auto& param : std::vector<DecoderCpCase>{
+           DecoderCpCase{.moe = false,
+                         .count = 16,
+                         .can_rs = true,
+                         .name = "DenseBalanced"},
+           DecoderCpCase{.moe = false,
+                         .count = 15,
+                         .can_rs = false,
+                         .name = "DenseUnbalanced"},
+           DecoderCpCase{
+               .moe = true, .count = 16, .can_rs = true, .name = "MoeBalanced"},
+           DecoderCpCase{.moe = true,
+                         .count = 15,
+                         .can_rs = false,
+                         .name = "MoeUnbalanced"}}) {
     // Two physical cards, including equal and unequal token counts per CP rank.
     const DecoderCpCase config = param;
     const int32_t port = parallel_base_port(/*world_size=*/2, /*cp_size=*/2);
@@ -2643,7 +2755,6 @@ void run_cp_relay(int32_t rank, int32_t port) {
       EXPECT_FALSE(torch::equal(selected, first_selection))
           << "Full layer must refresh a sensitive sparse fixture";
     }
-    const std::string tag = "layer" + std::to_string(layer_id);
   }
   // Dummy shared layers skip relay preparation even with an empty relay.
   DeepseekV32DecoderLayer dummy(

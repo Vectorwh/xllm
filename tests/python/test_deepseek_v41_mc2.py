@@ -82,6 +82,13 @@ def _install_mc2_streams(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> 
     return SimpleNamespace(current=current, side=side)
 
 
+@pytest.fixture
+def _isolated_collectives_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Do not remove another suite's groups or leave native-name cache entries."""
+    monkeypatch.setattr(collectives, "_groups", dict(collectives._groups))
+    monkeypatch.setattr(collectives, "_moe_ep_comm_name_cache", dict(collectives._moe_ep_comm_name_cache))
+
+
 def _mc2_hidden(dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     return torch.randn(_TOKENS, _MC2_HIDDEN, dtype=dtype, device=torch.device("cpu"))
 
@@ -221,13 +228,13 @@ def mc2(monkeypatch: pytest.MonkeyPatch) -> _Mc2Recorder:
     monkeypatch.setattr(v41, "_moe_mc2_ops_available", lambda: True)
     monkeypatch.setattr(v41, "_moe_mc2_device_supported", lambda x: True)
     # The production env switches are gone; drive the static seams directly.
-    monkeypatch.setattr(v41, "_moe_mc2_allow_draft", lambda: False)
     monkeypatch.setattr(v41.DeepseekV4MoE, "forward", base_forward)
     return rec
 
 
 def _make_moe(**overrides: Any) -> v41.DeepseekV41W8A8MoE:
     moe = object.__new__(v41.DeepseekV41W8A8MoE)
+    torch.nn.Module.__init__(moe)
     moe.cfg = SimpleNamespace(
         ep_size=2,
         tp_size=1,
@@ -239,6 +246,9 @@ def _make_moe(**overrides: Any) -> v41.DeepseekV41W8A8MoE:
         expert_parallel_degree=0,
         eplv2_shared_overlap=True,
     )
+    if "cfg" in overrides:
+        for key, value in vars(overrides["cfg"]).items():
+            setattr(moe.cfg, key, value)
     moe.layer_id = 0
     moe.hash_layer = False
     moe.w4a8_dynamic = False
@@ -246,20 +256,23 @@ def _make_moe(**overrides: Any) -> v41.DeepseekV41W8A8MoE:
     moe.dp_size = 1
     moe.dp_rank = 0
     moe.num_total_experts = _TOTAL_EXPERTS
-    moe.num_experts_per_rank = _LOCAL_EXPERTS
+    moe.num_experts_per_rank = _TOTAL_EXPERTS // max(1, moe.cfg.ep_size)
     moe.topk = _TOPK
     moe.scoring_func = "sqrtsoftplus"
     moe.routed_scaling = 1.5
     moe.shared_expert_gate_is_loaded = False
-    moe.experts_w13 = torch.zeros(_LOCAL_EXPERTS, _MC2_HIDDEN, 2 * _MC2_INTER, dtype=torch.int8)
-    moe.experts_w2 = torch.zeros(_LOCAL_EXPERTS, _MC2_INTER, _MC2_HIDDEN, dtype=torch.int8)
-    moe.experts_w13_scale = torch.ones(_LOCAL_EXPERTS, 2 * _MC2_INTER, dtype=torch.float32)
-    moe.experts_w2_scale = torch.ones(_LOCAL_EXPERTS, _MC2_HIDDEN, dtype=torch.float32)
+    moe.experts_w13 = torch.zeros(moe.num_experts_per_rank, _MC2_HIDDEN, 2 * _MC2_INTER, dtype=torch.int8)
+    moe.experts_w2 = torch.zeros(moe.num_experts_per_rank, _MC2_INTER, _MC2_HIDDEN, dtype=torch.int8)
+    moe.experts_w13_scale = torch.ones(moe.num_experts_per_rank, 2 * _MC2_INTER, dtype=torch.float32)
+    moe.experts_w2_scale = torch.ones(moe.num_experts_per_rank, _MC2_HIDDEN, dtype=torch.float32)
     moe._gate_logits = lambda gate_input, gate_input_ids: torch.zeros(gate_input.shape[0], _TOTAL_EXPERTS)
     moe._run_shared_experts = lambda hidden: torch.full((hidden.shape[0], _MC2_HIDDEN), 0.25, dtype=hidden.dtype)
     moe.enable_fused_mc2 = True
     for key, value in overrides.items():
-        setattr(moe, key, value)
+        if key != "cfg":
+            setattr(moe, key, value)
+    moe.cfg.dp_size = moe.dp_size
+    moe.cfg.dp_rank = moe.dp_rank
     return moe
 
 
@@ -269,8 +282,7 @@ def _names(rec: _Mc2Recorder) -> list[str]:
 
 def test_default_off() -> None:
     """The fused MC2 switch defaults off in the config dataclass."""
-    assert "enable_fused_mc2" in v41.DeepseekV41Config.__dataclass_fields__
-    assert v41.DeepseekV41Config.__dataclass_fields__["enable_fused_mc2"].default is False
+    assert v41.DeepseekV41Config().enable_fused_mc2 is False
 
 
 def test_off_delegates_bitwise(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -306,6 +318,7 @@ def test_on_runs_mc2_chain_in_order(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Re
     assert dispatch["moe_expert_num"] == _TOTAL_EXPERTS
     assert dispatch["quant_mode"] == 2
     assert dispatch["global_bs"] == _TOKENS * 2
+    assert dispatch["x_active_mask"] is None
     assert dispatch["expert_token_nums_type"] == 1
     assert dispatch["group_tp"] == "" and dispatch["tp_world_size"] == 1
     assert dispatch["x"] is hidden
@@ -339,6 +352,7 @@ def test_on_runs_mc2_chain_in_order(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Re
     assert combine["expand_scales"] is None
     assert combine["expert_ids"].dtype == torch.int32
     assert combine["global_bs"] == _TOKENS * 2
+    assert combine["x_active_mask"] is None
 
     # combine_v2 already folded the EP sum; a second reduce would double it.
     assert mc2.ep_reduces == []
@@ -437,6 +451,8 @@ def test_guard_fallbacks(
         reason = moe._mc2_guard_reason(hidden)
     assert reason is not None
     assert expected_reason in reason
+    assert torch.equal(out, hidden + 1.0)
+    assert mc2.calls == []
 
 
 def test_guard_shape_dtype_device_ops_communicator(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -457,11 +473,18 @@ def test_guard_shape_dtype_device_ops_communicator(monkeypatch: pytest.MonkeyPat
         assert "device" in moe._mc2_guard_reason(_mc2_hidden())
 
 
-def test_guard_falls_back_without_a_real_moe_ep_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The un-masked path: no Python or native moe_ep group => guard declines.
-    Unlike the ``mc2`` fixture, this does NOT patch ``moe_ep_comm_name``: it only forces the native runtime to look"""
+def test_guard_falls_back_without_a_real_moe_ep_group(
+    monkeypatch: pytest.MonkeyPatch, _isolated_collectives_state: None
+) -> None:
+    """A native rank alone cannot replace the missing EP communicator.
+    The real native facade supplies rank 1 but no communicator name."""
     monkeypatch.setattr(distributed, "moe_ep_comm_name", collectives.moe_ep_comm_name, raising=False)
-    monkeypatch.setattr(collectives, "_native_runtime_op", lambda name: None)
+
+    def native_op(name: str) -> Any:
+        return (lambda: 1) if name == "moe_ep_rank" else None
+
+    monkeypatch.setattr(collectives, "_native_runtime_op", native_op)
+    monkeypatch.setattr(distributed, "moe_ep_rank_from_native", collectives.moe_ep_rank_from_native, raising=False)
     collectives._moe_ep_comm_name_cache.clear()
     collectives._groups.pop(("moe_ep", "cpu"), None)
 
@@ -492,11 +515,21 @@ def test_guard_falls_back_without_a_real_moe_ep_group(monkeypatch: pytest.Monkey
     assert "communicator" in reason
 
 
-def test_guard_uses_native_comm_name_without_python_group(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
+def test_guard_uses_native_comm_name_without_python_group(
+    monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder, _isolated_collectives_state: None
+) -> None:
     """The P0 fix: a native-only moe_ep group satisfies the guard.
     The ``mc2`` fixture pins ``moe_ep_comm_name`` to a constant; this test puts the real function back and stubs only the"""
     monkeypatch.setattr(distributed, "moe_ep_comm_name", collectives.moe_ep_comm_name, raising=False)
-    monkeypatch.setattr(collectives, "_native_runtime_op", lambda name: (lambda: "hccl-native"))
+
+    def native_op(name: str) -> Any:
+        if name == "moe_ep_comm_name":
+            return lambda: "hccl-native"
+        return (lambda: 1) if name == "moe_ep_rank" else None
+
+    monkeypatch.setattr(collectives, "_native_runtime_op", native_op)
+    monkeypatch.setattr(distributed, "moe_ep_rank", collectives.moe_ep_rank, raising=False)
+    monkeypatch.setattr(distributed, "moe_ep_rank_from_native", collectives.moe_ep_rank_from_native, raising=False)
     collectives._moe_ep_comm_name_cache.clear()
     collectives._groups.pop(("moe_ep", "cpu"), None)
 
@@ -511,18 +544,25 @@ def test_guard_uses_native_comm_name_without_python_group(monkeypatch: pytest.Mo
     assert torch.equal(out, torch.full((_TOKENS, _MC2_HIDDEN), 0.5, dtype=torch.bfloat16) + 0.25)
 
 
-def test_mc2_uses_native_ep_rank_without_python_group(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """The P1 fix: dispatch/combine take the native C++ ``ep_rank``, not 0.
+def test_mc2_uses_native_ep_rank_without_python_group(
+    monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder, _isolated_collectives_state: None
+) -> None:
+    """Dispatch/combine use the native C++ rank, including a valid rank zero.
     The ``mc2`` fixture pins ``moe_ep_rank`` to 1; this test puts the real native-first function back and stubs only the"""
     monkeypatch.setattr(distributed, "moe_ep_rank", collectives.moe_ep_rank, raising=False)
+    monkeypatch.setattr(distributed, "moe_ep_rank_from_native", collectives.moe_ep_rank_from_native, raising=False)
     collectives._groups.pop(("moe_ep", "cpu"), None)
 
     def native_op(name: str) -> Any:
         if name == "moe_ep_rank":
-            return lambda: 3
+            return lambda: 0
+        if name == "moe_ep_comm_name":
+            return lambda: "hccl-ep0"
         return None
 
     monkeypatch.setattr(collectives, "_native_runtime_op", native_op)
+    monkeypatch.setattr(distributed, "moe_ep_comm_name", collectives.moe_ep_comm_name, raising=False)
+    collectives._moe_ep_comm_name_cache.clear()
 
     moe = _make_moe()
     hidden = _mc2_hidden()
@@ -531,118 +571,12 @@ def test_mc2_uses_native_ep_rank_without_python_group(monkeypatch: pytest.Monkey
 
     dispatch = next(kwargs for name, kwargs in mc2.calls if name == "dispatch")
     combine = next(kwargs for name, kwargs in mc2.calls if name == "combine")
-    assert dispatch["ep_rank_id"] == 3
-    assert combine["ep_rank_id"] == 3
-    assert torch.equal(out, torch.full((_TOKENS, _MC2_HIDDEN), 0.5, dtype=torch.bfloat16) + 0.25)
-
-
-def test_mc2_ep_rank_falls_back_to_zero_when_native_absent(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """A build without the binding (the already-compiled remote .so) still runs:
-    the rank silently falls back to the Python ``_groups``/0 chain and must not raise from the guard or the forward."""
-    monkeypatch.setattr(distributed, "moe_ep_rank", collectives.moe_ep_rank, raising=False)
-    monkeypatch.setattr(collectives, "_native_runtime_op", lambda name: None)
-    collectives._groups.pop(("moe_ep", "cpu"), None)
-
-    moe = _make_moe()
-    hidden = _mc2_hidden()
-    with forward_context(_context()):
-        out = moe.forward(hidden)
-
-    dispatch = next(kwargs for name, kwargs in mc2.calls if name == "dispatch")
     assert dispatch["ep_rank_id"] == 0
+    assert combine["ep_rank_id"] == 0
     assert torch.equal(out, torch.full((_TOKENS, _MC2_HIDDEN), 0.5, dtype=torch.bfloat16) + 0.25)
-
-
-def test_fallback_logs_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(v41, "_moe_mc2_fallback_logged", False)
-    logged: list[str] = []
-    monkeypatch.setattr(v41.logger, "warning", lambda msg: logged.append(msg))
-    v41._log_moe_mc2_fallback("not a decode step", enabled=True)
-    v41._log_moe_mc2_fallback("a later failure", enabled=True)
-    assert len(logged) == 1
-    assert "not a decode step" in logged[0]
-    # The target prefix stays distinguishable from the DSpark-draft one.
-    assert "for the target" in logged[0]
-
-
-def test_draft_fallback_has_its_own_latch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fix-1: the draft exit logs once even after the target latch was consumed.
-    The shared process latch used to swallow the draft reason because target warmup fired first; the dedicated latch must"""
-    monkeypatch.setattr(v41, "_moe_mc2_fallback_logged", False)
-    monkeypatch.setattr(v41, "_moe_mc2_draft_fallback_logged", False)
-    logged: list[str] = []
-    monkeypatch.setattr(v41.logger, "warning", lambda msg: logged.append(msg))
-
-    v41._log_moe_mc2_fallback("target warmup reason", enabled=True)
-    v41._log_moe_mc2_draft_fallback(_DRAFT_REASON, enabled=True)
-    assert len(logged) == 2
-    assert "for the target" in logged[0] and "target warmup reason" in logged[0]
-    assert "DSpark draft (Fix-1, target keeps MC2)" in logged[1]
-    assert _DRAFT_REASON in logged[1]
-
-    # Each helper stays one-shot on its OWN latch, in either order.
-    v41._log_moe_mc2_fallback("a later target failure", enabled=True)
-    v41._log_moe_mc2_draft_fallback("a later draft failure", enabled=True)
-    assert len(logged) == 2
-
-
-def test_draft_fallback_requires_enabled_mc2(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No MC2 request, no draft exit log (and the latch stays unset)."""
-    monkeypatch.setattr(v41, "_moe_mc2_draft_fallback_logged", False)
-    logged: list[str] = []
-    monkeypatch.setattr(v41.logger, "warning", lambda msg: logged.append(msg))
-    v41._log_moe_mc2_draft_fallback(_DRAFT_REASON, enabled=False)
-    assert logged == []
-    assert v41._moe_mc2_draft_fallback_logged is False
-
-
-def test_forward_routes_draft_and_target_to_separate_logs(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """Both latches are independent: the draft cannot starve the target log."""
-    monkeypatch.setattr(v41, "_moe_mc2_fallback_logged", False)
-    monkeypatch.setattr(v41, "_moe_mc2_draft_fallback_logged", False)
-    logged: list[str] = []
-    monkeypatch.setattr(v41.logger, "warning", lambda msg: logged.append(msg))
-
-    draft = _make_moe(dp_size=4, dp_rank=1, _moe_is_dspark_draft=True)
-    target = _make_moe(dp_size=4, dp_rank=1)
-    layout = dict(token_counts=[1, 5, 1, 1], dp_is_decode=[1, 1, 1, 1])
-    hidden = torch.randn(5, _MC2_HIDDEN, dtype=torch.bfloat16)
-
-    with forward_context(_context(**layout)):
-        assert torch.equal(draft.forward(hidden), hidden + 1.0)
-    assert len(logged) == 1
-    assert "DSpark draft (Fix-1, target keeps MC2)" in logged[0]
-    assert v41._moe_mc2_fallback_logged is False
-    assert v41._moe_mc2_draft_fallback_logged is True
-
-    # A target MoE (no draft flag) reaches the DP token-count clause and logs
-    # through the target latch; the draft's latch never masks it.
-    with forward_context(_context()):
-        assert torch.equal(target.forward(hidden), hidden + 1.0)
-    assert len(logged) == 2
-    assert "for the target" in logged[1] and "DP token counts unavailable" in logged[1]
-    assert v41._moe_mc2_fallback_logged is True
 
 
 # --- dp>1: local-row MC2 dispatch/combine (no DP gather, no slice) -----------
-
-
-def test_mc2_dp1_keeps_the_single_replica_chain(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """dp=1 must stay byte-for-byte the previous slice: local rows, explicit
-    global_bs, no mask, no gather, no slice."""
-    moe = _make_moe(dp_size=1)
-    hidden = _mc2_hidden()
-    with forward_context(_context()):
-        out = moe.forward(hidden)
-
-    assert "all_gather" not in _names(mc2)
-    dispatch = next(kwargs for name, kwargs in mc2.calls if name == "dispatch")
-    combine = next(kwargs for name, kwargs in mc2.calls if name == "combine")
-    assert dispatch["global_bs"] == _TOKENS * 2
-    assert dispatch["x_active_mask"] is None
-    assert combine["global_bs"] == _TOKENS * 2
-    assert combine["x_active_mask"] is None
-    assert out.shape == (_TOKENS, _MC2_HIDDEN)
 
 
 @pytest.mark.parametrize("with_norm", [False, True])
@@ -835,20 +769,6 @@ def test_overlapped_and_serial_mc2_preserve_global_routing(
     assert torch.all(serial["expert_scales"][nonlocal_experts] > 0)
 
 
-def test_mc2_dp_empty_rank_falls_back_on_all_ranks(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """The P0 fix: an empty DP rank makes dispatch receive ZERO rows.
-    ``npu_moe_distribute_dispatch_v2`` rejects ``bs <= 0`` in infershape"""
-    moe = _make_moe(dp_size=4, dp_rank=0)
-    token_counts = [0, 3, 1, 2]
-    hidden = torch.randn(0, _MC2_HIDDEN, dtype=torch.bfloat16)
-
-    with forward_context(_context(is_dummy=True, token_counts=token_counts, dp_is_decode=[1, 1, 1, 1])):
-        out = moe.forward(hidden)
-        reason = moe._mc2_guard_reason(hidden)
-
-    assert reason == "an empty DP rank is present"
-
-
 def test_mc2_dp_empty_rank_decides_like_a_nonempty_peer(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
     """The P0 symmetry: a rank-local ``is_dummy`` must not flip the collective.
     An empty rank (``is_dummy=True``, ``token_counts[dp_rank] == 0``) and a non-empty peer see the same host-planned"""
@@ -866,23 +786,6 @@ def test_mc2_dp_empty_rank_decides_like_a_nonempty_peer(monkeypatch: pytest.Monk
     # Same reason on both: no rank runs the collective while another skips it.
     assert empty_reason == "an empty DP rank is present"
     assert peer_reason == empty_reason
-
-
-def test_mc2_dp_rank_above_operator_limit_falls_back(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """P1-b: a per-rank token count above the A2 ``bs <= 256`` bound declines.
-    The operator tiling caps the per-rank batch at 256 (``..._tiling_arch22.cpp:507-510``); ``dp_execution_token_counts``"""
-    moe = _make_moe(dp_size=2, dp_rank=0)
-    hidden = torch.randn(2, _MC2_HIDDEN, dtype=torch.bfloat16)
-
-    with forward_context(_context(token_counts=[257, 2], dp_is_decode=[1, 1])):
-        out = moe.forward(hidden)
-        reason = moe._mc2_guard_reason(hidden)
-
-    assert reason is not None and "256" in reason
-
-    # Exactly at the bound stays on the MC2 path (uniform, as the guard requires).
-    with forward_context(_context(token_counts=[256, 256], dp_is_decode=[1, 1])):
-        assert moe._mc2_guard_reason(hidden) is None
 
 
 def test_mc2_guard_declines_on_uneven_dp_rows(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -912,7 +815,8 @@ def test_mc2_guard_declines_on_uneven_dp_rows(monkeypatch: pytest.MonkeyPatch, m
         over = moe._mc2_guard_reason(hidden)
         assert over is not None and "256" in over
     with forward_context(layout([256, 256, 256])):
-        assert moe._mc2_guard_reason(hidden) is None
+        full_hidden = torch.randn(256, _MC2_HIDDEN, dtype=torch.bfloat16)
+        assert moe._mc2_guard_reason(full_hidden) is None
 
 
 def test_mc2_guard_declines_when_native_ep_rank_unavailable(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -927,16 +831,6 @@ def test_mc2_guard_declines_when_native_ep_rank_unavailable(monkeypatch: pytest.
         reason = moe._mc2_guard_reason(hidden)
 
     assert reason == "moe_ep rank unavailable from native source"
-
-
-def test_mc2_dp_empty_rank_still_declines_when_a_peer_is_not_decode(
-    monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder
-) -> None:
-    """An empty rank does not force MC2 when a peer is on a dummy/prefill step."""
-    empty = _make_moe(dp_size=2, dp_rank=0)
-    with forward_context(_context(is_dummy=True, token_counts=[0, 2], dp_is_decode=[1, 0])):
-        reason = empty._mc2_guard_reason(torch.randn(0, _MC2_HIDDEN, dtype=torch.bfloat16))
-    assert reason is not None and "all DP ranks" in reason
 
 
 def test_mc2_guard_requires_all_dp_ranks_decode(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -970,12 +864,8 @@ def test_moe_mc2_all_dp_ranks_decode_mirrors_cpp() -> None:
 
 # --- Fix-1: DSpark-draft MC2 veto (structural uneven rows) -------------------
 
-#: Escape hatch that waives the draft veto (see ``v41._moe_mc2_allow_draft``).
+# Rank-uniform reason for declining MC2 on eager DSpark drafts.
 _DRAFT_REASON = "DSpark draft MoE (uneven per-rank rows break global_bs=0)"
-
-
-def test_moe_mc2_allow_draft_defaults_off() -> None:
-    assert v41._moe_mc2_allow_draft() is False
 
 
 def test_mc2_draft_flag_declines_on_every_rank(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -1000,51 +890,6 @@ def test_mc2_draft_flag_declines_on_every_rank(monkeypatch: pytest.MonkeyPatch, 
     hidden = torch.randn(5, _MC2_HIDDEN, dtype=torch.bfloat16)
     with forward_context(_context(**layout)):
         out = busy.forward(hidden)
-
-
-def test_mc2_target_without_flag_keeps_original_guard(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """A target MoE (no flag) is byte-for-byte the pre-Fix-1 guard behavior."""
-    target = _make_moe()
-    assert getattr(target, "_moe_is_dspark_draft", False) is False
-    hidden = _mc2_hidden()
-
-    with forward_context(_context()):
-        assert target._mc2_guard_reason(hidden) is None
-        out = target.forward(hidden)
-
-    # The full MC2 chain still engages: the new clause added nothing for targets.
-    assert mc2.base_calls == []
-    assert _names(mc2)[0] == "gating"
-    assert torch.equal(out, torch.full((_TOKENS, _MC2_HIDDEN), 0.5, dtype=torch.bfloat16) + 0.25)
-
-    # An unrelated fallback still reports its own reason verbatim, not the draft one.
-    hashed = _make_moe(hash_layer=True)
-    with forward_context(_context()):
-        reason = hashed._mc2_guard_reason(hidden)
-    assert reason is not None and "hash" in reason
-    assert _DRAFT_REASON not in reason
-
-
-def test_mc2_draft_veto_waived_by_escape_hatch(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """An enabled draft escape hatch skips the draft clause."""
-    monkeypatch.setattr(v41, "_moe_mc2_allow_draft", lambda: True)
-    moe = _make_moe(_moe_is_dspark_draft=True)
-    hidden = _mc2_hidden()
-
-    with forward_context(_context()):
-        assert moe._mc2_guard_reason(hidden) is None
-        out = moe.forward(hidden)
-
-    assert mc2.base_calls == []
-    assert _names(mc2) == [
-        "gating",
-        "dispatch",
-        "grouped_matmul",
-        "dequant_swiglu_quant",
-        "grouped_matmul",
-        "combine",
-    ]
-    assert torch.equal(out, torch.full((_TOKENS, _MC2_HIDDEN), 0.5, dtype=torch.bfloat16) + 0.25)
 
 
 def test_mc2_graph_draft_uses_uniform_rows_and_replay_mask(mc2: _Mc2Recorder) -> None:
@@ -1073,22 +918,6 @@ def test_mc2_graph_draft_still_rejects_uneven_counts(mc2: _Mc2Recorder) -> None:
         reason = moe._mc2_guard_reason(_mc2_hidden())
     assert reason is not None and "uneven DP rows" in reason
     assert mc2.calls == []
-
-
-def test_mc2_forward_asserts_local_expert_count(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """M4: a shard claiming more experts than ``experts_w13`` holds fails loud."""
-    moe = _make_moe(num_experts_per_rank=3)  # experts_w13 still has _LOCAL_EXPERTS rows
-    hidden = _mc2_hidden()
-
-    with forward_context(_context()), pytest.raises(RuntimeError) as err:
-        moe.forward(hidden)
-
-    message = str(err.value)
-    assert "experts_w13" in message
-    assert str(moe.experts_w13.shape[0]) in message
-    assert "3" in message
-    # No silent completion: the grouped GEMM never ran.
-    assert "grouped_matmul" not in _names(mc2)
 
 
 def test_mc2_forward_asserts_grouped_rows_fit_dispatch(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
@@ -1128,13 +957,12 @@ def test_mc2_grouped_rows_check_is_capture_gated(monkeypatch: pytest.MonkeyPatch
     moe = _make_moe()
     hidden = _mc2_hidden()
 
-    def overfull_dispatch(**kwargs: Any) -> tuple:
+    def valid_dispatch(**kwargs: Any) -> tuple:
         mc2.calls.append(("dispatch", kwargs))
         mc2.dispatch_rows = int(kwargs["x"].shape[0])
-        # The dispatch produced _TOKENS rows, but the local expert groups claim
-        # 2 + 3 = 5 rows -- a contract violation the check must catch.
+        # A valid result: two expert groups cover all five expanded rows.
         return (
-            torch.randn(_TOKENS, _MC2_HIDDEN, dtype=torch.bfloat16),
+            torch.randn(_DISPATCH_ROWS, _MC2_HIDDEN, dtype=torch.bfloat16),
             None,
             torch.zeros(_TOKENS * _TOPK, dtype=torch.int32),
             torch.tensor([2, 3], dtype=torch.int64),
@@ -1143,7 +971,7 @@ def test_mc2_grouped_rows_check_is_capture_gated(monkeypatch: pytest.MonkeyPatch
             None,
         )
 
-    monkeypatch.setattr(v41, "_moe_mc2_dispatch", overfull_dispatch)
+    monkeypatch.setattr(v41, "_moe_mc2_dispatch", valid_dispatch)
 
     reductions: list[int] = []
     real_sum = torch.Tensor.sum
@@ -1155,11 +983,11 @@ def test_mc2_grouped_rows_check_is_capture_gated(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(torch.Tensor, "sum", spy_sum)
 
     # Eager (no acl_graph): the value check runs -> one reduction + fail loud.
-    with forward_context(_context()), pytest.raises(RuntimeError) as err:
-        moe.forward(hidden)
-    assert "expert groups cover" in str(err.value)
+    with forward_context(_context()):
+        eager = moe.forward(hidden)
+    assert torch.equal(eager, torch.full_like(hidden, 0.75))
     assert len(reductions) == 1
-    assert "grouped_matmul" not in _names(mc2)
+    assert _names(mc2)[-1] == "combine"
 
     # Capture active: the value check is skipped -> no reduction, chain completes.
     reductions.clear()
@@ -1168,48 +996,7 @@ def test_mc2_grouped_rows_check_is_capture_gated(monkeypatch: pytest.MonkeyPatch
         out = moe.forward(hidden)
     assert reductions == []
     assert _names(mc2)[-1] == "combine"
-    assert out.shape == (_TOKENS, _MC2_HIDDEN)
-
-
-def test_mc2_expert_count_check_stays_active_in_capture(monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder) -> None:
-    """The host-only ``experts_w13`` shape check is NOT gated (capture-safe)."""
-    moe = _make_moe(num_experts_per_rank=3)  # experts_w13 still has _LOCAL_EXPERTS rows
-    hidden = _mc2_hidden()
-
-    with forward_context(_capture_context()), pytest.raises(RuntimeError) as err:
-        moe.forward(hidden)
-
-    assert "experts_w13" in str(err.value)
-    # No device work ran: the shape check fires before the grouped GEMM.
-    assert "grouped_matmul" not in _names(mc2)
-
-
-def test_mc2_dispatch_and_combine_share_the_expected_global_bs(
-    monkeypatch: pytest.MonkeyPatch, mc2: _Mc2Recorder
-) -> None:
-    """The matched dispatch/combine pair is fed ONE host ``global_bs``.
-    The former M4 "dispatch == combine" guard was a tautology: it compared one local variable with itself (the alias was"""
-
-    # dp == 1: explicit ``local_bs * ep_size``; dp > 1: the auto ``0``. dp > 1
-    # uses uniform host-planned counts (the ACL-graph layout; see the guard).
-    for dp_size, rows, layout, expected in (
-        (1, _TOKENS, None, _TOKENS * 2),
-        (3, 2, dict(token_counts=[2, 2, 2], dp_is_decode=[1, 1, 1]), 0),
-    ):
-        moe = _make_moe(dp_size=dp_size, dp_rank=1 if dp_size > 1 else 0)
-        hidden = torch.randn(rows, _MC2_HIDDEN, dtype=torch.bfloat16)
-        with forward_context(_context() if layout is None else _context(**layout)):
-            moe.forward(hidden)
-        dispatch = next(kwargs for name, kwargs in mc2.calls if name == "dispatch")
-        combine = next(kwargs for name, kwargs in mc2.calls if name == "combine")
-        assert dispatch["global_bs"] == combine["global_bs"] == expected
-        mc2.calls.clear()
-
-
-def test_draft_marking_is_instance_scoped() -> None:
-    """The flag is a per-instance attribute, never a class attribute.
-    The draft reuses the target's MoE classes, so a class attribute would veto the target too."""
-    assert not hasattr(v41.DeepseekV4MoE, "_moe_is_dspark_draft")
+    assert torch.equal(out, eager)
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])

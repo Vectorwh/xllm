@@ -733,7 +733,7 @@ def test_mla_cp_projects_global_rows_and_reshards_output() -> None:
             torch.tensor([[True, False]]),
         )
 
-    # Merge to global rows, then reshard: identical for either switch value.
+    # Merge to global rows, then reshard to CP-local layout.
     assert merge.call_count == 2
     assert indexer.select_qli.call_args.args[0].shape == (1, 3, 3)
     torch.testing.assert_close(indexer.select_qli.call_args.args[0], global_hidden)
@@ -744,7 +744,7 @@ def test_mla_cp_projects_global_rows_and_reshards_output() -> None:
     assert attention.o_proj.input_shape == (2, 6)
 
 
-def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk(monkeypatch) -> None:
+def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk() -> None:
     indexer = MagicMock()
     global_topk = torch.tensor([[[10]], [[20]], [[30]]], dtype=torch.int32)
     indexer.select_qli.return_value = global_topk
@@ -780,7 +780,7 @@ def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk(m
     torch.testing.assert_close(topk, torch.tensor([[[10]], [[0]]], dtype=torch.int32))
 
 
-def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank(monkeypatch) -> None:
+def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank() -> None:
     """MLA/DSA counterpart of the KDA rank-invariance test.
 
     Under CP the model merges every rank up to the complete logical stream
@@ -839,7 +839,7 @@ def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank(monkeypatc
     )
 
 
-def test_dsa_cp_full_indexer_uses_global_rows_and_reshards_topk(monkeypatch) -> None:
+def test_dsa_cp_full_indexer_uses_global_rows_and_reshards_topk() -> None:
     """A full-indexer DSA layer under CP merges to global rows first: the
     indexer sees the complete logical stream, the MLA backend sees global
     q/kv/topk (so its projections keep ``M = T_global``), and the returned
@@ -896,7 +896,7 @@ def test_dsa_cp_full_indexer_uses_global_rows_and_reshards_topk(monkeypatch) -> 
     torch.testing.assert_close(topk, global_topk.index_select(0, torch.tensor([0, 3])))
 
 
-def test_dsa_cp_shared_indexer_merges_local_topk_back_to_global(monkeypatch) -> None:
+def test_dsa_cp_shared_indexer_merges_local_topk_back_to_global() -> None:
     """A shared-indexer DSA layer receives the preceding layer's CP-local top-k,
     merges it (with hidden and positions) back to global rows, and hands the
     global tensor to the backend. The returned top-k is resharded again for the
@@ -1007,7 +1007,7 @@ def _index_context_recording(cp_context, recorded: dict[str, torch.Tensor]) -> S
     )
 
 
-def test_dsa_cp_indexer_writes_global_key_and_selects_global_query_rows(monkeypatch) -> None:
+def test_dsa_cp_indexer_writes_global_key_and_selects_global_query_rows() -> None:
     """The real ``Glm5NextIndexer.select_qli`` receives global rows under CP
     (the owning MLA layer merged them), so it must:
     (a) write the index cache in **global** token order with no extra gather,
@@ -1047,7 +1047,7 @@ def test_dsa_cp_indexer_writes_global_key_and_selects_global_query_rows(monkeypa
     assert topk.dtype == torch.int32
 
 
-def test_dsa_indexer_packs_global_rows_per_request_for_varlen_batch(monkeypatch) -> None:
+def test_dsa_indexer_packs_global_rows_per_request_for_varlen_batch() -> None:
     """The per-request query packing (``is_varlen`` branch of ``select_qli``)
     maps each request's **global** query rows to the right padded window slot,
     masks the pad rows, and gathers the surviving top-k rows back to the flat

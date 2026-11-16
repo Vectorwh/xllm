@@ -22,15 +22,13 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <unordered_set>
 #include <vector>
 
 #include "core/platform/numa_utils.h"
 
 namespace {
-
-// =============================================================================
-// Test environment
-// =============================================================================
 
 class NumaUtilsTestEnvironment final : public ::testing::Environment {
  public:
@@ -44,10 +42,6 @@ class NumaUtilsTestEnvironment final : public ::testing::Environment {
 
 ::testing::Environment* const test_env =
     ::testing::AddGlobalTestEnvironment(new NumaUtilsTestEnvironment);
-
-// =============================================================================
-// File-local helpers
-// =============================================================================
 
 bool SaveCurrentThreadAffinity(cpu_set_t* cpu_set) {
   if (cpu_set == nullptr) {
@@ -72,12 +66,19 @@ bool HasHipDevice() {
   return hipGetDeviceCount(&count) == hipSuccess && count > 0;
 }
 
-// =============================================================================
-// Tests
-// =============================================================================
-
 // xllm::numa APIs under test: is_numa_available, get_num_numa_nodes
-TEST(NumaUtilsTest, AvailabilityAndNodeCountAreConsistent) {
+class NumaUtilsTest : public ::testing::Test {
+ protected:
+  void SetUp() override { ASSERT_TRUE(SaveCurrentThreadAffinity(&saved_)); }
+  void TearDown() override {
+    EXPECT_TRUE(RestoreCurrentThreadAffinity(saved_));
+  }
+
+ private:
+  cpu_set_t saved_;
+};
+
+TEST_F(NumaUtilsTest, AvailabilityAndNodeCountAreConsistent) {
   const bool available = xllm::numa::is_numa_available();
   const int32_t num_nodes = xllm::numa::get_num_numa_nodes();
 
@@ -90,7 +91,7 @@ TEST(NumaUtilsTest, AvailabilityAndNodeCountAreConsistent) {
 
 // xllm::numa APIs under test: is_numa_available, get_current_numa_node,
 // get_num_numa_nodes
-TEST(NumaUtilsTest, CurrentNumaNodeMatchesAvailability) {
+TEST_F(NumaUtilsTest, CurrentNumaNodeMatchesAvailability) {
   const bool available = xllm::numa::is_numa_available();
   const int32_t current_node = xllm::numa::get_current_numa_node();
 
@@ -104,7 +105,7 @@ TEST(NumaUtilsTest, CurrentNumaNodeMatchesAvailability) {
 
 // xllm::numa APIs under test: get_numa_node_cpus,
 // bind_thread_to_numa_node,bind_process_to_numa_node
-TEST(NumaUtilsTest, InvalidNodeQueriesReturnEmptyOrError) {
+TEST_F(NumaUtilsTest, InvalidNodeQueriesReturnEmptyOrError) {
   const bool available = xllm::numa::is_numa_available();
 
   if (!available) {
@@ -126,66 +127,25 @@ TEST(NumaUtilsTest, InvalidNodeQueriesReturnEmptyOrError) {
 }
 
 // xllm::numa APIs under test: get_numa_node_cpus, bind_thread_to_numa_node
-TEST(NumaUtilsTest, ValidNodeCpuListLooksReasonable) {
-  const bool available = xllm::numa::is_numa_available();
-
-  if (!available) {
-    GTEST_SKIP() << "NUMA is not available on this system";
+TEST_F(NumaUtilsTest, ValidNodeCpuListLooksReasonable) {
+  if (!xllm::numa::is_numa_available()) {
+    GTEST_SKIP() << "NUMA is unavailable";
   }
-
-  const int32_t num_nodes = xllm::numa::get_num_numa_nodes();
-  ASSERT_GT(num_nodes, 0);
-
-  for (int32_t node = 0; node < num_nodes; ++node) {
-    std::vector<int32_t> cpus = xllm::numa::get_numa_node_cpus(node);
-
-    // May be empty under restrictive container affinity; if non-empty, entries
-    // must be valid CPU ids with no duplicates.
-    for (size_t i = 0; i < cpus.size(); ++i) {
-      EXPECT_GE(cpus[i], 0);
-      for (size_t j = i + 1; j < cpus.size(); ++j) {
-        EXPECT_NE(cpus[i], cpus[j]);
-      }
+  cpu_set_t allowed;
+  ASSERT_TRUE(SaveCurrentThreadAffinity(&allowed));
+  for (int32_t node = 0; node < xllm::numa::get_num_numa_nodes(); ++node) {
+    const auto cpus = xllm::numa::get_numa_node_cpus(node);
+    const std::unordered_set<int32_t> unique(cpus.begin(), cpus.end());
+    EXPECT_EQ(unique.size(), cpus.size());
+    for (int32_t cpu : cpus) {
+      ASSERT_GE(cpu, 0);
+      ASSERT_LT(cpu, CPU_SETSIZE);
+      EXPECT_TRUE(CPU_ISSET(cpu, &allowed));
     }
   }
-
-  // Verify thread is actually scheduled on a CPU belonging to the bound node.
-  const int32_t current_node = xllm::numa::get_current_numa_node();
-  if (current_node < 0) {
-    GTEST_SKIP() << "Unable to determine current NUMA node";
-  }
-
-  const std::vector<int32_t> current_cpus =
-      xllm::numa::get_numa_node_cpus(current_node);
-  if (current_cpus.empty()) {
-    GTEST_SKIP() << "No CPUs available on current NUMA node under current "
-                    "affinity constraints";
-  }
-
-  cpu_set_t saved_affinity;
-  ASSERT_TRUE(SaveCurrentThreadAffinity(&saved_affinity));
-
-  const int32_t bind_ret = xllm::numa::bind_thread_to_numa_node(current_node);
-  EXPECT_EQ(bind_ret, 0);
-
-  // Verify the thread affinity mask directly rather than relying on
-  // sched_getcpu(), which may return a stale CPU before the scheduler
-  // has migrated the thread.
-  cpu_set_t thread_affinity;
-  ASSERT_EQ(pthread_getaffinity_np(
-                pthread_self(), sizeof(cpu_set_t), &thread_affinity),
-            0);
-  for (int32_t cpu : current_cpus) {
-    EXPECT_TRUE(CPU_ISSET(cpu, &thread_affinity))
-        << "Thread affinity should include CPU " << cpu << " of node "
-        << current_node;
-  }
-
-  EXPECT_TRUE(RestoreCurrentThreadAffinity(saved_affinity));
 }
 
-// xllm::numa APIs under test: get_numa_node_cpus, bind_thread_to_numa_node
-TEST(NumaUtilsTest, BuildCpuSetRespectsProcessAffinityConstraints) {
+TEST_F(NumaUtilsTest, BuildCpuSetRespectsProcessAffinityConstraints) {
   const bool available = xllm::numa::is_numa_available();
 
   if (!available) {
@@ -229,137 +189,68 @@ TEST(NumaUtilsTest, BuildCpuSetRespectsProcessAffinityConstraints) {
 //
 // NOTE: bind_process_to_numa_node also calls numa_set_membind / numa_set_strict
 // which are process-global memory policy settings with no standard undo API.
-TEST(NumaUtilsTest, BindProcessToValidNodeSucceeds) {
-  const bool available = xllm::numa::is_numa_available();
-
-  if (!available) {
-    GTEST_SKIP() << "NUMA is not available on this system";
+TEST_F(NumaUtilsTest, BindProcessToValidNodeSucceeds) {
+  if (!xllm::numa::is_numa_available()) {
+    GTEST_SKIP() << "NUMA is unavailable";
   }
-
-  const int32_t num_nodes = xllm::numa::get_num_numa_nodes();
-  ASSERT_GT(num_nodes, 0);
-
-  // Capture initial state before any binding.
-  const int32_t initial_node = xllm::numa::get_current_numa_node();
-
-  // Pick a target node different from the initial one.
-  int32_t target_node = (initial_node + 1) % num_nodes;
-
-  cpu_set_t saved_affinity;
-  CPU_ZERO(&saved_affinity);
-  ASSERT_EQ(sched_getaffinity(getpid(), sizeof(cpu_set_t), &saved_affinity), 0);
-
-  // Verify the initial CPU mask matches the initial node's CPU list.
-  std::vector<int32_t> initial_cpus =
-      xllm::numa::get_numa_node_cpus(initial_node);
-  if (!initial_cpus.empty()) {
-    cpu_set_t current_affinity;
-    ASSERT_EQ(sched_getaffinity(getpid(), sizeof(cpu_set_t), &current_affinity),
-              0);
-    for (int32_t cpu : initial_cpus) {
-      EXPECT_TRUE(CPU_ISSET(cpu, &current_affinity))
-          << "CPU " << cpu << " should be set before binding to node "
-          << initial_node;
+  int32_t target = -1;
+  std::vector<int32_t> expected;
+  for (int32_t node = 0; node < xllm::numa::get_num_numa_nodes(); ++node) {
+    auto cpus = xllm::numa::get_numa_node_cpus(node);
+    if (!cpus.empty()) {
+      target = node;
+      expected = std::move(cpus);
+      break;
     }
   }
+  if (target < 0) {
+    GTEST_SKIP() << "No allowed NUMA CPUs";
+  }
+  // NUMA memory policy has no portable undo; isolate it from later cases.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_EXIT(
+      {
+        auto bind = [&] {
+          ASSERT_EQ(xllm::numa::bind_process_to_numa_node(target), 0);
+          cpu_set_t actual;
+          ASSERT_TRUE(SaveCurrentThreadAffinity(&actual));
+          for (int32_t cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            EXPECT_EQ(CPU_ISSET(cpu, &actual) != 0, CpuInList(cpu, expected));
+          }
+        };
+        bind();
+        std::exit(::testing::Test::HasFailure() ? EXIT_FAILURE : EXIT_SUCCESS);
+      },
+      ::testing::ExitedWithCode(EXIT_SUCCESS),
+      "");
+}
 
-  // Bind to target node.
-  const int32_t bind_ret = xllm::numa::bind_process_to_numa_node(target_node);
-  EXPECT_EQ(bind_ret, 0);
-
-  // Yield to ensure the thread is migrated to a CPU within the new affinity
-  // mask before querying the current NUMA node.
-  sched_yield();
-
-  const int32_t reported_node = xllm::numa::get_current_numa_node();
-  EXPECT_EQ(reported_node, target_node);
-
-  // Verify the process CPU mask matches the target node's CPU list.
-  std::vector<int32_t> target_cpus =
-      xllm::numa::get_numa_node_cpus(target_node);
-  if (!target_cpus.empty()) {
-    cpu_set_t current_affinity;
-    ASSERT_EQ(sched_getaffinity(getpid(), sizeof(cpu_set_t), &current_affinity),
-              0);
-    for (int32_t cpu : target_cpus) {
-      EXPECT_TRUE(CPU_ISSET(cpu, &current_affinity))
-          << "CPU " << cpu << " should be set after binding to node "
-          << target_node;
+TEST_F(NumaUtilsTest, BindThreadToNumaNodeSucceeds) {
+  if (!xllm::numa::is_numa_available()) {
+    GTEST_SKIP() << "NUMA is unavailable";
+  }
+  int32_t target = -1;
+  std::vector<int32_t> expected;
+  for (int32_t node = 0; node < xllm::numa::get_num_numa_nodes(); ++node) {
+    auto cpus = xllm::numa::get_numa_node_cpus(node);
+    if (!cpus.empty()) {
+      target = node;
+      expected = std::move(cpus);
+      break;
     }
   }
-
-  // Rebind to initial node and verify the transition works both ways.
-  // Note: bind_process_to_numa_node modifies process CPU affinity, so restore
-  // the saved affinity first so that build_cpu_set_for_numa_node can find
-  // the CPUs of the initial node (they would otherwise be filtered out).
-  if (initial_node != target_node) {
-    ASSERT_EQ(sched_setaffinity(getpid(), sizeof(cpu_set_t), &saved_affinity),
-              0);
-    const int32_t rebind_ret =
-        xllm::numa::bind_process_to_numa_node(initial_node);
-    EXPECT_EQ(rebind_ret, 0);
-
-    sched_yield();
-
-    const int32_t restored_node = xllm::numa::get_current_numa_node();
-    EXPECT_EQ(restored_node, initial_node);
+  if (target < 0) {
+    GTEST_SKIP() << "No allowed NUMA CPUs";
   }
-
-  ASSERT_EQ(sched_setaffinity(getpid(), sizeof(cpu_set_t), &saved_affinity), 0);
+  ASSERT_EQ(xllm::numa::bind_thread_to_numa_node(target), 0);
+  cpu_set_t actual;
+  ASSERT_TRUE(SaveCurrentThreadAffinity(&actual));
+  for (int32_t cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    EXPECT_EQ(CPU_ISSET(cpu, &actual) != 0, CpuInList(cpu, expected));
+  }
 }
 
-// xllm::numa APIs under test: bind_thread_to_numa_node,
-// get_current_numa_node, get_numa_node_cpus, is_numa_available
-TEST(NumaUtilsTest, BindThreadToNumaNodeSucceeds) {
-  const bool available = xllm::numa::is_numa_available();
-
-  if (!available) {
-    GTEST_SKIP() << "NUMA is not available on this system";
-  }
-
-  const int32_t num_nodes = xllm::numa::get_num_numa_nodes();
-  ASSERT_GT(num_nodes, 0);
-
-  const int32_t initial_node = xllm::numa::get_current_numa_node();
-
-  const int32_t target_node = (initial_node + 2) % num_nodes;
-
-  // Save process affinity so we can restore it before rebinding (thread
-  // affinity changes affect sched_getaffinity(0, ...) in
-  // build_cpu_set_for_numa_node).
-  cpu_set_t saved_affinity;
-  CPU_ZERO(&saved_affinity);
-  ASSERT_EQ(sched_getaffinity(getpid(), sizeof(cpu_set_t), &saved_affinity), 0);
-
-  // Bind the thread to target node.
-  const int32_t bind_ret = xllm::numa::bind_thread_to_numa_node(target_node);
-  EXPECT_EQ(bind_ret, 0);
-
-  sched_yield();
-
-  const int32_t reported_node = xllm::numa::get_current_numa_node();
-  EXPECT_EQ(reported_node, target_node);
-
-  // Bind back to initial node.
-  if (initial_node != target_node) {
-    ASSERT_EQ(sched_setaffinity(getpid(), sizeof(cpu_set_t), &saved_affinity),
-              0);
-    const int32_t rebind_ret =
-        xllm::numa::bind_thread_to_numa_node(initial_node);
-    EXPECT_EQ(rebind_ret, 0);
-
-    sched_yield();
-
-    const int32_t restored_node = xllm::numa::get_current_numa_node();
-    EXPECT_EQ(restored_node, initial_node);
-  }
-
-  ASSERT_EQ(sched_setaffinity(getpid(), sizeof(cpu_set_t), &saved_affinity), 0);
-}
-
-// xllm::numa APIs under test: get_device_numa_node, is_numa_available,
-// get_num_numa_nodes, device_count
-TEST(NumaUtilsTest, GetDeviceNumaNodeReturnsValidNodeOrMinusOneForHipDevice) {
+TEST_F(NumaUtilsTest, GetDeviceNumaNodeReturnsValidNodeOrMinusOneForHipDevice) {
   if (!HasHipDevice()) {
     GTEST_SKIP() << "No HIP/DCU device available";
   }

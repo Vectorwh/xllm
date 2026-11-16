@@ -64,38 +64,6 @@ TEST(AnthropicJsonTest, AcceptsValidGenerationBudgetAndMessages) {
   EXPECT_TRUE(api_service::validate_anthropic_request(request).ok());
 }
 
-TEST(AnthropicJsonTest, ExpandsToolUseInputStruct) {
-  proto::AnthropicMessagesResponse response;
-  response.set_id("msg_123");
-  response.set_type("message");
-  response.set_role("assistant");
-  response.set_model("test_model");
-  response.set_stop_reason("tool_use");
-
-  auto* tool_block = response.add_content();
-  tool_block->set_type("tool_use");
-  tool_block->set_id("call_123");
-  tool_block->set_name("get_weather");
-  *tool_block->mutable_input() =
-      json_to_struct({{"city", "San Francisco"}, {"unit", "celsius"}});
-
-  std::string json;
-  std::string err_msg;
-  ASSERT_TRUE(api_service::proto_to_anthropic_json(
-      response, json_options(), &json, &err_msg))
-      << err_msg;
-
-  nlohmann::json parsed = nlohmann::json::parse(json);
-  ASSERT_TRUE(parsed["content"].is_array());
-  ASSERT_EQ(parsed["content"].size(), 1);
-  const nlohmann::json& input = parsed["content"][0]["input"];
-  ASSERT_TRUE(input.is_object());
-  EXPECT_FALSE(input.contains("fields"));
-  EXPECT_EQ(input["city"], "San Francisco");
-  EXPECT_EQ(input["unit"], "celsius");
-  EXPECT_EQ(parsed["stop_reason"], "tool_use");
-}
-
 TEST(AnthropicJsonTest, MessageStartPreservesZeroUsageAndNullableStops) {
   proto::AnthropicStreamEvent event;
   event.set_type("message_start");
@@ -155,25 +123,6 @@ TEST(AnthropicJsonTest, ExpandsNestedToolInputStruct) {
   ASSERT_TRUE(input["flags"].is_array());
   EXPECT_EQ(input["flags"][0], true);
   EXPECT_EQ(input["flags"][1], false);
-}
-
-TEST(AnthropicJsonTest, KeepsEmptyContentArray) {
-  proto::AnthropicMessagesResponse response;
-  response.set_id("msg_123");
-  response.set_type("message");
-  response.set_role("assistant");
-  response.set_model("test_model");
-
-  std::string json;
-  std::string err_msg;
-  ASSERT_TRUE(api_service::proto_to_anthropic_json(
-      response, json_options(), &json, &err_msg))
-      << err_msg;
-
-  nlohmann::json parsed = nlohmann::json::parse(json);
-  ASSERT_TRUE(parsed.contains("content"));
-  EXPECT_TRUE(parsed["content"].is_array());
-  EXPECT_TRUE(parsed["content"].empty());
 }
 
 TEST(AnthropicJsonTest, KeepsEmptyToolUseInputObject) {

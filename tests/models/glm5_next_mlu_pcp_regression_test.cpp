@@ -13,38 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Model-level regression test for GLM-5.3-Flash prefill context parallelism.
-//
-// Eight ranks (cp_size=8, kv_split_size=1, TP=1, EP=8) run the first eight
-// decoder layers through consecutive chunked-prefill segments, decode steps
-// and a second turn that reuses the caches, and compare the outputs, the
-// captured intermediate hidden states and the caches with a frozen baseline.
-//
-// Kept at production values: hidden size, mHC, the KDA/DSA and dense/MoE layer
-// pattern of layers 0-7, every KDA, MLA and KPool indexer dimension, weight
-// dtypes, the compressed-tensors W8A8/W4A8 formats with their scales, and the
-// MTP cache layout (num_speculative_tokens=3).
-//
-// Reduced to bound the cost, and therefore not covered:
-//   - intermediate_size 12288 -> 512 and moe_intermediate_size 2048 -> 256;
-//   - n_routed_experts 288 -> 16, so each EP rank owns 2 experts instead of 36;
-//   - vocab_size 154880 -> 512 and 45 layers -> 8;
-//   - sequences shorter than index_topk, so sparse selection keeps every block;
-//   - no speculative verification, MTP draft, graph replay, lm_head or
-//     scheduler; ranks share one host.
-// The packed INT4 expert bytes are arbitrary fixed bytes rather than a
-// quantization of meaningful weights.
-//
-// Environment:
-//   XLLM_GLM5_NEXT_PCP_BASELINE_DIR   directory holding the frozen baseline.
-//   XLLM_GLM5_NEXT_PCP_BASELINE_MODE  "verify" (default) or "record". Record
-//                                     creates a baseline and never overwrites.
-//   XLLM_GLM5_NEXT_PCP_STRICT_BITS    "1" requires bit-identical tensors.
+// CP8 hybrid KDA/DSA and quantized MoE regression across chunked prefill,
+// decode and a second turn. Verification requires an independently frozen
+// baseline in XLLM_GLM5_NEXT_PCP_BASELINE_DIR; this test never records one.
+// Channels are production-sized; FFN/expert/vocabulary/layer counts are
+// reduced. Graph replay, speculative verification and long-context sparse
+// selection are not covered. XLLM_GLM5_NEXT_PCP_STRICT_BITS=1 requires exact
+// tensors.
 
-#include <fcntl.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <torch/torch.h>
 #include <unistd.h>
@@ -136,11 +114,8 @@ constexpr char kTensorMagic[8] = {'X', 'L', 'T', 'E', 'N', 'S', '0', '1'};
 
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
-enum class BaselineMode : int8_t { VERIFY = 0, RECORD = 1 };
-
 struct BaselineOptions {
   std::string directory;
-  BaselineMode mode = BaselineMode::VERIFY;
   bool strict_bits = false;
 };
 
@@ -793,45 +768,6 @@ std::string tensor_path(const std::string& directory, const std::string& name) {
   return directory + "/" + name + ".tensor";
 }
 
-// Stores one tensor in its original dtype: magic, dtype, rank, shape, bytes.
-// O_EXCL keeps record mode from ever replacing an existing baseline file.
-bool write_tensor_exclusive(const std::string& path,
-                            const torch::Tensor& tensor) {
-  const torch::Tensor cpu = tensor.cpu().contiguous();
-  const int32_t descriptor =
-      ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, /*mode=*/0644);
-  if (descriptor < 0) {
-    LOG(ERROR) << "Cannot create baseline file " << path << ": "
-               << std::strerror(errno);
-    return false;
-  }
-  std::string header(kTensorMagic, sizeof(kTensorMagic));
-  const int32_t dtype = static_cast<int32_t>(cpu.scalar_type());
-  const int32_t rank = static_cast<int32_t>(cpu.dim());
-  header.append(reinterpret_cast<const char*>(&dtype), sizeof(dtype));
-  header.append(reinterpret_cast<const char*>(&rank), sizeof(rank));
-  for (const int64_t size : cpu.sizes()) {
-    header.append(reinterpret_cast<const char*>(&size), sizeof(size));
-  }
-  const auto write_all = [descriptor](const char* data, size_t bytes) {
-    while (bytes > 0) {
-      const ssize_t written = ::write(descriptor, data, bytes);
-      if (written <= 0) {
-        return false;
-      }
-      data += written;
-      bytes -= static_cast<size_t>(written);
-    }
-    return true;
-  };
-  const bool written =
-      write_all(header.data(), header.size()) &&
-      write_all(static_cast<const char*>(cpu.data_ptr()), cpu.nbytes());
-  const bool closed = ::close(descriptor) == 0;
-  LOG_IF(ERROR, !(written && closed)) << "Failed writing " << path;
-  return written && closed;
-}
-
 std::optional<torch::Tensor> read_tensor(const std::string& path) {
   std::ifstream file(path, std::ios::binary);
   if (!file) {
@@ -860,7 +796,7 @@ std::optional<torch::Tensor> read_tensor(const std::string& path) {
   return tensor;
 }
 
-// Records tensors into a new baseline, or compares them with a frozen one.
+// Compares tensors with an independently frozen baseline.
 // A verification never derives its expectation from the current run.
 class BaselineSession final {
  public:
@@ -869,9 +805,6 @@ class BaselineSession final {
 
   // Returns false when a required baseline is absent.
   bool open() {
-    if (options_.mode == BaselineMode::RECORD) {
-      return true;
-    }
     std::ifstream manifest(options_.directory + "/" + kManifestName);
     if (!manifest) {
       return false;
@@ -893,14 +826,7 @@ class BaselineSession final {
       fail(name, "contains non-finite values");
       return;
     }
-    if (options_.mode == BaselineMode::RECORD) {
-      // Rank 0 owns the files; the other ranks only run the model.
-      if (rank_ == 0 && !write_tensor_exclusive(
-                            tensor_path(options_.directory, name), actual)) {
-        fail(name, "could not be recorded");
-      }
-      return;
-    }
+
     if (!expected_.contains(name)) {
       fail(name, "is missing from the baseline manifest");
       return;
@@ -952,28 +878,6 @@ class BaselineSession final {
 
   // Returns true when the whole session succeeded.
   bool finish() {
-    if (options_.mode == BaselineMode::RECORD) {
-      if (rank_ == 0 && failures_ == 0) {
-        std::string manifest;
-        for (const std::string& name : names_) {
-          manifest += name + "\n";
-        }
-        const std::string path = options_.directory + "/" + kManifestName;
-        const int32_t descriptor =
-            ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, /*mode=*/0644);
-        const bool written =
-            descriptor >= 0 &&
-            ::write(descriptor, manifest.data(), manifest.size()) ==
-                static_cast<ssize_t>(manifest.size()) &&
-            ::close(descriptor) == 0;
-        if (!written) {
-          fail(kManifestName, "could not be recorded");
-        }
-        LOG(INFO) << "[baseline] recorded " << names_.size() << " tensors in "
-                  << options_.directory;
-      }
-      return failures_ == 0;
-    }
     const std::unordered_set<std::string> produced(names_.begin(),
                                                    names_.end());
     for (const std::string& name : expected_) {
@@ -1206,10 +1110,9 @@ std::optional<BaselineOptions> read_baseline_options(std::string& error) {
   options.directory = directory;
   const char* mode = std::getenv(kBaselineModeEnv);
   const std::string mode_name = mode == nullptr ? "verify" : mode;
-  if (mode_name == "record") {
-    options.mode = BaselineMode::RECORD;
-  } else if (mode_name != "verify") {
-    error = std::string(kBaselineModeEnv) + " must be verify or record";
+  if (mode_name != "verify") {
+    error = std::string(kBaselineModeEnv) +
+            " must be verify; recording is not a test";
     return std::nullopt;
   }
   const char* strict = std::getenv(kStrictBitsEnv);
@@ -1223,25 +1126,13 @@ TEST(Glm5NextMluPcpRegressionTest, EightRanksMatchFrozenBaseline) {
   const char* baseline_directory = std::getenv(kBaselineDirEnv);
   if (baseline_directory == nullptr || baseline_directory[0] == '\0') {
     GTEST_SKIP() << "Set " << kBaselineDirEnv
-                 << " to a frozen baseline, or create one explicitly with "
-                 << kBaselineModeEnv << "=record.";
+                 << " to an independently frozen baseline.";
   }
   std::string error;
   const std::optional<BaselineOptions> baseline = read_baseline_options(error);
-  ASSERT_TRUE(baseline.has_value())
-      << error << ". Point " << kBaselineDirEnv
-      << " at a frozen baseline, or create one explicitly with "
-      << kBaselineModeEnv << "=record.";
+  ASSERT_TRUE(baseline.has_value()) << error << ". Point " << kBaselineDirEnv
+                                    << " at an independently frozen baseline.";
   const std::string manifest = baseline->directory + "/" + kManifestName;
-  if (baseline->mode == BaselineMode::RECORD) {
-    std::error_code status;
-    std::filesystem::create_directories(baseline->directory, status);
-    ASSERT_FALSE(status) << "Cannot create " << baseline->directory;
-    ASSERT_TRUE(std::filesystem::is_empty(baseline->directory, status))
-        << "Record mode never overwrites: " << baseline->directory
-        << " already holds files.";
-  }
-
   const int32_t cp_port = net::get_local_free_port();
   const int32_t ep_port = net::get_local_free_port();
   ASSERT_GT(cp_port, 0);
@@ -1289,9 +1180,8 @@ TEST(Glm5NextMluPcpRegressionTest, EightRanksMatchFrozenBaseline) {
   if (skipped == kWorldSize) {
     GTEST_SKIP() << "Requires " << kWorldSize << " MLU devices.";
   }
-  ASSERT_EQ(missing_baseline, 0)
-      << "No baseline manifest at " << manifest << ". Record one with "
-      << kBaselineModeEnv << "=record; verification never creates it.";
+  ASSERT_EQ(missing_baseline, 0) << "No baseline manifest at " << manifest
+                                 << "; verification never creates it.";
   ASSERT_EQ(skipped, 0);
   ASSERT_EQ(failed, 0);
 }

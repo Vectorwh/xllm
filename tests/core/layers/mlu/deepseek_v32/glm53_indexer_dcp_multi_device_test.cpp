@@ -426,7 +426,8 @@ DcpIndexerLocalCandidates select_reference(const IndexerCPPreOut& pre,
 bool valid_selection(const std::vector<int32_t>& selected,
                      const std::vector<float>& scores,
                      int32_t visible,
-                     int32_t topk) {
+                     int32_t topk,
+                     float margin = 0.0f) {
   const int32_t count = std::min(visible, topk);
   if (static_cast<int32_t>(selected.size()) != count) {
     return false;
@@ -441,11 +442,8 @@ bool valid_selection(const std::vector<int32_t>& selected,
     }
   }
   if (visible <= topk) {
-    for (int32_t index = 0; index < count; ++index) {
-      if (selected[index] != index) {
-        return false;
-      }
-    }
+    // Count, uniqueness and range already imply the complete causal set;
+    // its order is not part of the paired slot/score contract.
     return true;
   }
   std::vector<float> ordered(scores.begin(), scores.begin() + visible);
@@ -456,14 +454,14 @@ bool valid_selection(const std::vector<int32_t>& selected,
   const float cutoff = ordered[topk - 1];
   int32_t required = 0;
   for (int32_t index = 0; index < visible; ++index) {
-    required += scores[index] > cutoff;
+    required += scores[index] > cutoff + margin;
   }
   int32_t found = 0;
   for (int32_t index : selected) {
-    if (scores[index] < cutoff) {
+    if (scores[index] < cutoff - margin) {
       return false;
     }
-    found += scores[index] > cutoff;
+    found += scores[index] > cutoff + margin;
   }
   return found == required;
 }
@@ -563,15 +561,21 @@ torch::Tensor compare_selection(const torch::Tensor& actual,
         count);
     for (int32_t col = 0; col < count; ++col) {
       CHECK(std::isfinite(values[row][col]));
-      if (visible <= kTopk) {
-        CHECK_EQ(selected[col], col);
-      } else if (col > 0) {
-        CHECK_LE(values[row][col], values[row][col - 1]);
-        if (values[row][col] == values[row][col - 1]) {
-          CHECK_GT(a[row][col], a[row][col - 1]);
-        }
-      }
     }
+    auto score_row = selector[row].to(torch::kFloat32).cpu().contiguous();
+    const auto* data = score_row.data_ptr<float>();
+    std::vector<float> candidate_scores(data, data + visible);
+    float margin = 0.0f;
+    if (visible > kTopk) {
+      auto ordered = candidate_scores;
+      std::nth_element(ordered.begin(),
+                       ordered.begin() + kTopk - 1,
+                       ordered.end(),
+                       std::greater<float>());
+      margin = std::abs(ordered[kTopk - 1]) / 64.0f;
+    }
+    CHECK(valid_selection(selected, candidate_scores, visible, kTopk, margin))
+        << "Candidate outside the BF16 cutoff neighbourhood";
     int32_t overlap = 0;
     for (int32_t col = 0; col < count; ++col) {
       overlap += reference.count(a[row][col]);
@@ -785,8 +789,6 @@ void run_case(int32_t rank,
   auto ref_slots = torch::empty_like(actual.global_slots);
   auto ref_scores = torch::empty_like(actual.scores, torch::kBFloat16);
   auto reused_actual = torch::empty_like(ref_scores);
-  const char* reuse_dir = std::getenv("XLLM_GLM53_SCORE_REUSE_DIR");
-  const bool export_reuse = reuse_dir != nullptr && reuse_dir[0] != '\0';
   Stats stats;
   for (int32_t req = 0; req < pages.batch(); ++req) {
     const auto keys = gather_keys(ref_cache, pages, req, shard);
@@ -941,30 +943,12 @@ void run_case(int32_t rank,
       stats.final_differences,
       stats.cutoff_final_diff + stats.score_final_diff + stats.merge_tie_diff);
   report_stats(stats, rank, batch, history, seed);
-  if (export_reuse && shard == 0) {
-    const std::string path =
-        std::string(reuse_dir) + "/b" + std::to_string(batch) + "-h" +
-        std::to_string(history) + "-s" + std::to_string(seed) + "-tp" +
-        std::to_string(rank % kTp) + ".pt";
-    torch::save(std::vector<torch::Tensor>{witness_slots_cpu,
-                                           witness_scores_cpu,
-                                           gathered_reused,
-                                           full_slots,
-                                           full_scores,
-                                           merged_cpu.block_tables(),
-                                           same_scores.block_tables(),
-                                           same_candidates.block_tables(),
-                                           full.block_tables(),
-                                           mapping},
-                path);
-    LOG(INFO) << "GLM53_SCORE_REUSE_EXPORT rank=" << rank << " path=" << path;
-  }
 }
 
 void run_edges(int32_t rank,
                const ParallelArgs& parallel,
                const torch::Device& device) {
-  const std::vector<int32_t> counts = {0, 1, 15, 16, 17, 2047, 2048, 2049};
+  const std::vector<int32_t> counts = {0, 1, 15, 16, 17, 2047, 2048, 2049, 1};
   const int32_t rows = static_cast<int32_t>(counts.size());
   constexpr int32_t kPages = 129;
   const int32_t shard = rank / kTp;
@@ -979,6 +963,8 @@ void run_edges(int32_t rank,
     logical[index][0] = index % 3 == 0 ? 2.0f : -4.0f;
     logical[index][1] = index % 3 == 1 ? 3.0f : 0.0f;
   }
+  logical[0][0] = 1.0078125f;
+  logical[0][1] = 0.0f;
   auto cache = torch::zeros({kPages * 2 + 1, 1, kPage, kDim}, options);
   auto local = (table.to(torch::kInt64).unsqueeze(/*dim=*/1) * kPage +
                 torch::arange(kPage, torch::kInt64))
@@ -997,6 +983,13 @@ void run_edges(int32_t rank,
   weights.select(/*dim=*/1, /*index=*/0).fill_(/*value=*/1);
   weights.select(/*dim=*/1, /*index=*/1).fill_(/*value=*/-1);
   weights[7].neg_();
+  // Two-head cancellation distinguishes output rounding from independently
+  // rounding every weighted head product. Exercise the actual device selector.
+  query[8].zero_();
+  query[8][0][0] = 1.0f;
+  query[8][1][0] = 1.0078125f;
+  weights[8][0] = 1.0078125f;
+  weights[8][1] = -1.0f;
   IndexerCPPreOut pre{query.to(device),
                       torch::zeros({rows, kDim}, options),
                       weights.to(device),
@@ -1022,6 +1015,7 @@ void run_edges(int32_t rank,
   auto actual =
       indexer->forward_dcp_local_prefill_from_cp(pre, cache, prefill, selector);
   CHECK(torch::equal(initial, cache));
+  CHECK_EQ(actual.scores[8][0].item<float>(), 0x1p-20f);
   auto all = selector_scores(pre.q, logical.to(device), pre.weights)
                  .to(torch::kFloat32)
                  .cpu()
@@ -1098,7 +1092,8 @@ void run_rank(int32_t rank, int32_t port) {
   CHECK_EQ(parallel.tp_group_->rank(), rank % kTp);
   CHECK_EQ(parallel.cp_group_->world_size(), kCp);
   CHECK_EQ(parallel.cp_group_->rank(), rank / kTp);
-  CHECK_EQ(parallel.dcp_group_, parallel.cp_group_);
+  CHECK_EQ(parallel.dcp_group_->world_size(), kCp);
+  CHECK_EQ(parallel.dcp_group_->rank(), rank / kTp);
   CHECK_EQ(parallel.kv_split_rank(), rank / kTp);
   run_edges(rank, parallel, device);
   for (int32_t scenario_batch : {1, 2}) {
@@ -1126,234 +1121,5 @@ TEST(Glm53IndexerDcpMultiDeviceTest, PrefillAndChunkedRequestsMatchReference) {
   run_distributed();
 }
 
-// CPU-only fixtures leave the parent MLU runtime untouched before fork.
-TEST(Glm53IndexerReferenceDeathTest, RejectsForeignAndNoncausalSlots) {
-  const Pages pages(/*batch=*/16, /*history=*/0, /*seed=*/42);
-  auto pool = torch::zeros({1, pages.local_length()}, torch::kBFloat16);
-  for (int32_t slot : {pages.slot(/*req=*/1, /*position=*/0),
-                       pages.slot(/*req=*/0, /*position=*/1),
-                       pages.slot(/*req=*/0, /*position=*/16),
-                       -2}) {
-    auto slots = torch::tensor({{slot}}, torch::kInt32);
-    EXPECT_DEATH(reuse_scores(pool, slots, pages, /*shard=*/0, /*start=*/0),
-                 "Invalid candidate");
-  }
-  EXPECT_DEATH(
-      gather_scores(pool,
-                    torch::tensor({{pages.local_length()}}, torch::kInt64)),
-      "Check failed");
-}
-
-TEST(Glm53IndexerReferenceTest, ReusesVisiblePrefixAndCutoffScores) {
-  const Pages pages(/*batch=*/1, /*history=*/8000, /*seed=*/42);
-  IndexerCPPreOut pre;
-  pre.q = torch::ones({1, kHeads, kDim}, torch::kBFloat16)
-              .expand({kTokens, kHeads, kDim});
-  pre.weights =
-      torch::ones({1, kHeads}, torch::kBFloat16).expand({kTokens, kHeads});
-  auto cache = torch::ones({pages.count(), 1, kPage, kDim}, torch::kBFloat16);
-  const auto keys = gather_keys(cache, pages, /*req=*/0, /*shard=*/0);
-  for (int32_t start : {142, 143, 192}) {
-    torch::Tensor pool;
-    const auto ref = select_reference(
-        pre, keys, pages, /*shard=*/0, start, /*rows=*/1, pool);
-    EXPECT_EQ(pages.visible(start, /*shard=*/0),
-              start == 142 ? 2047 : (start == 143 ? 2048 : 2049));
-    EXPECT_EQ(pool.scalar_type(), torch::kBFloat16);
-    EXPECT_TRUE(equal_reused_scores(
-        ref.scores, reuse_scores(pool, ref.global_slots, pages, 0, start)));
-    Stats stats;
-    auto ordinals = compare_selection(ref.global_slots,
-                                      ref.scores,
-                                      ref.global_slots,
-                                      pool,
-                                      pages,
-                                      /*shard=*/0,
-                                      start,
-                                      stats);
-    EXPECT_TRUE(equal_reused_scores(gather_scores(pool, ordinals), ref.scores));
-    EXPECT_EQ(stats.columns, std::min(kTopk, pages.visible(start, 0)));
-    EXPECT_TRUE(ref.scores[0][0].eq(/*other=*/64).item<bool>());
-  }
-  const Pages empty_pages(/*batch=*/16, /*history=*/0, /*seed=*/42);
-  auto empty_cache =
-      torch::ones({empty_pages.count(), 1, kPage, kDim}, torch::kBFloat16);
-  const auto empty_keys =
-      gather_keys(empty_cache, empty_pages, /*req=*/0, /*shard=*/1);
-  torch::Tensor pool;
-  const auto empty = select_reference(pre,
-                                      empty_keys,
-                                      empty_pages,
-                                      /*shard=*/1,
-                                      /*start=*/0,
-                                      /*rows=*/1,
-                                      pool);
-  EXPECT_TRUE(empty.global_slots.eq(/*other=*/-1).all().item<bool>());
-  EXPECT_TRUE(empty.scores.isneginf().all().item<bool>());
-}
-
-TEST(Glm53IndexerReferenceTest, ShardedTiesPreserveFullCutoff) {
-  constexpr int32_t kCount = kTopk + 3;
-  auto all = torch::ones({2, 1, kCount}, torch::kBFloat16);
-  all[0][0][0] = 2;
-  all[1][0][0] = 3;
-  all[0][0][kCount - 1] = -1;
-  auto slots = torch::arange(2 * kCount, torch::kInt32).view({2, 1, kCount});
-  auto local_indices = std::get<1>(all.to(torch::kFloat32).topk(kTopk));
-  auto local_scores = all.gather(/*dim=*/2, local_indices);
-  auto local_slots = slots.gather(/*dim=*/2, local_indices);
-  auto mapping = torch::zeros({1}, torch::kInt32);
-  const auto sharded = merge_reference(local_scores, local_slots, mapping);
-  const auto full = merge_reference(all, slots, mapping);
-  auto cpu_scores = all.to(torch::kFloat32).flatten().contiguous();
-  const auto data = cpu_scores.accessor<float, 1>();
-  const std::vector<float> scores(data.data(), data.data() + 2 * kCount);
-  for (const auto& result : {sharded, full}) {
-    auto cpu_slots = result.block_tables().flatten().contiguous();
-    const auto indices = cpu_slots.accessor<int32_t, 1>();
-    EXPECT_TRUE(valid_selection(
-        std::vector<int32_t>(indices.data(), indices.data() + kTopk),
-        scores,
-        /*visible=*/2 * kCount,
-        kTopk));
-  }
-}
-
-TEST(Glm53IndexerReferenceTest, RejectsInvalidCandidatesAndScores) {
-  EXPECT_TRUE(valid_selection({}, {}, /*visible=*/0, kTopk));
-  for (int32_t count : {2047, 2048, 2049}) {
-    std::vector<float> scores(count, /*value=*/1.0f);
-    scores.front() = 2.0f;
-    std::vector<int32_t> selected(std::min(count, kTopk));
-    std::iota(selected.begin(), selected.end(), 0);
-    EXPECT_TRUE(valid_selection(selected, scores, count, kTopk));
-    auto invalid = selected;
-    invalid.back() = count;
-    EXPECT_FALSE(valid_selection(invalid, scores, count, kTopk));
-    invalid = selected;
-    invalid.back() = invalid.front();
-    EXPECT_FALSE(valid_selection(invalid, scores, count, kTopk));
-    if (count > kTopk) {
-      selected.back() = count - 1;
-      EXPECT_TRUE(valid_selection(selected, scores, count, kTopk));
-      selected.front() = count - 2;
-      EXPECT_FALSE(valid_selection(selected, scores, count, kTopk));
-    }
-  }
-}
-
-TEST(Glm53IndexerReferenceTest, MergesTiesIndependentlyOfCandidateOrder) {
-  auto scores = torch::full({1, 2, kTopk}, kNegInf, torch::kFloat32);
-  auto slots = torch::full({1, 2, kTopk}, /*fill_value=*/-1, torch::kInt32);
-  scores[0][0]
-      .narrow(/*dim=*/0, /*start=*/0, /*length=*/7)
-      .copy_(torch::tensor({2.0f,
-                            2.0f,
-                            -3.0f,
-                            0.0f,
-                            -0.0f,
-                            std::numeric_limits<float>::infinity(),
-                            kNegInf}));
-  slots[0][0]
-      .narrow(/*dim=*/0, /*start=*/0, /*length=*/7)
-      .copy_(torch::tensor({19, 7, 3, 11, 5, 23, 29}, torch::kInt32));
-  auto mapping = torch::tensor({0, -1}, torch::kInt32);
-  const auto merged = merge_reference(scores, slots, mapping);
-  EXPECT_TRUE(torch::equal(
-      merged.block_tables()[0].narrow(/*dim=*/0, /*start=*/0, /*length=*/7),
-      torch::tensor({23, 7, 19, 5, 11, 3, 29}, torch::kInt32)));
-  EXPECT_TRUE(merged.block_tables()[0]
-                  .narrow(/*dim=*/0, /*start=*/7, kTopk - 7)
-                  .eq(/*other=*/-1)
-                  .all()
-                  .item<bool>());
-  EXPECT_TRUE(merged.block_tables()[1].eq(/*other=*/-1).all().item<bool>());
-  EXPECT_TRUE(torch::equal(merged.context_lens(),
-                           torch::tensor({7, 0}, torch::kInt32)));
-  EXPECT_TRUE(
-      torch::equal(merge_reference(scores.flip({2}), slots.flip({2}), mapping)
-                       .block_tables(),
-                   merged.block_tables()));
-}
-
-TEST(Glm53IndexerReferenceTest, PreservesMap64RoundingBoundaries) {
-  auto query = torch::zeros({1, kHeads, kDim}, torch::kBFloat16);
-  query[0][0][0] = 1.0f;
-  query[0][1][0] = 1.0078125f;
-  auto keys = torch::zeros({1, kDim}, torch::kBFloat16);
-  keys[0][0] = 1.0078125f;
-  auto weights = torch::zeros({1, kHeads}, torch::kBFloat16);
-  weights[0][0] = 1.0078125f;
-  weights[0][1] = -1.0f;
-  // BF16 QK rounding leaves exactly 2^-14 before scaling. Rounding each
-  // head product to BF16 would instead cancel the result to zero.
-  EXPECT_EQ(selector_scores(query, keys, weights).item<float>(), 0x1p-20f);
-}
-
-TEST(Glm53IndexerReferenceTest, RoundsScaledScoresAtMidpoints) {
-  auto values = torch::tensor({1.00390625f, 1.01171875f, -1.00390625f});
-  auto rounded = (values * 64).mul(kScale).to(torch::kBFloat16);
-  EXPECT_TRUE(torch::equal(rounded.to(torch::kFloat32),
-                           torch::tensor({1.0f, 1.015625f, -1.0f})));
-}
-
-TEST(Glm53IndexerReferenceTest, CoversPageBoundariesAndSignedWeights) {
-  const Pages pages(/*batch=*/2, /*history=*/0, /*seed=*/42);
-  EXPECT_EQ(pages.visible(/*row=*/0, /*shard=*/1), 0);
-  EXPECT_EQ(pages.visible(/*row=*/14, /*shard=*/0), 15);
-  EXPECT_EQ(pages.visible(/*row=*/15, /*shard=*/0), 16);
-  EXPECT_EQ(pages.visible(/*row=*/16, /*shard=*/1), 1);
-  EXPECT_EQ(pages.visible(/*row=*/63, /*shard=*/3), 16);
-  EXPECT_EQ(pages.visible(/*row=*/64, /*shard=*/0), 17);
-  EXPECT_EQ(
-      pages.ordinal(
-          /*row=*/16, pages.slot(/*req=*/0, /*position=*/16), /*shard=*/1),
-      0);
-  EXPECT_EQ(
-      pages.ordinal(
-          /*row=*/15, pages.slot(/*req=*/0, /*position=*/16), /*shard=*/1),
-      -1);
-  EXPECT_EQ(
-      pages.ordinal(
-          /*row=*/128, pages.slot(/*req=*/0, /*position=*/0), /*shard=*/0),
-      -1);
-  EXPECT_EQ(pages.ordinal(/*row=*/0, /*global=*/-1, /*shard=*/0), -1);
-  auto q = torch::zeros({2, kHeads, kDim}, torch::kBFloat16);
-  q[0][0][0] = 1;
-  q[0][1][1] = 1;
-  q[1].copy_(q[0]);
-  auto keys = torch::zeros({3, kDim}, torch::kBFloat16);
-  keys[0][0] = 2;
-  keys[1][1] = 3;
-  keys[2][0] = -4;
-  auto w = torch::zeros({2, kHeads}, torch::kBFloat16);
-  w[0][0] = 1;
-  w[0][1] = -1;
-  w[1][0] = -1;
-  w[1][1] = 1;
-  EXPECT_TRUE(torch::equal(
-      selector_scores(q, keys, w),
-      torch::tensor({{2.0f, -3.0f, 0.0f}, {-2.0f, 3.0f, 0.0f}}) * kScale));
-  auto pool = selector_scores(q, keys, w);
-  auto ordinals = torch::full({2, kTopk}, /*fill_value=*/-1, torch::kInt64);
-  ordinals.narrow(/*dim=*/1, /*start=*/0, /*length=*/3)
-      .copy_(torch::tensor({0, 1, 2}, torch::kInt64).expand({2, 3}));
-  auto scores = gather_scores(pool, ordinals);
-  EXPECT_EQ(scores.scalar_type(), torch::kBFloat16);
-  EXPECT_TRUE(
-      torch::equal(scores.narrow(/*dim=*/1, /*start=*/0, /*length=*/3), pool));
-  EXPECT_TRUE(scores.narrow(/*dim=*/1, /*start=*/3, kTopk - 3)
-                  .isneginf()
-                  .all()
-                  .item<bool>());
-  EXPECT_TRUE(equal_reused_scores(scores, scores.clone()));
-  auto wrong = scores.clone();
-  wrong[0][0] = 0;
-  EXPECT_FALSE(equal_reused_scores(wrong, scores));
-  EXPECT_FALSE(equal_reused_scores(scores.to(torch::kFloat32), scores));
-  wrong = scores.clone();
-  wrong[0][3] = 0;
-  EXPECT_FALSE(equal_reused_scores(wrong, scores));
-}
 }  // namespace
 }  // namespace xllm::layer

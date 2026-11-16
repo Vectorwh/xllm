@@ -69,9 +69,25 @@ class V41PrefixMetadataTest(unittest.TestCase):
                 specs = [layer.copy() for layer in backend.caches_info]
                 layer_caches = [LayerCache(key=None, value=None, swa=torch.zeros(12, 128, 8)) for _ in range(3)]
                 backend.bind_kv_caches(layer_caches)
-                self.assertIs(backend._kv_caches, layer_caches)
-                self.assertIs(backend._builder.group_infos, backend.group_infos)
-                self.assertIs(backend._builder.caches_info, backend.caches_info)
+
+                def _check_builder_slots(backend: Csa2AttentionBackend, width: int) -> None:
+                    dsa = backend._builder.build(
+                        multi_block_tables=[
+                            torch.tensor([[9, 10, 11]], dtype=torch.int32),
+                            torch.tensor([[20, 21]], dtype=torch.int32),
+                            torch.tensor([[30, 31, 32]], dtype=torch.int32),
+                        ],
+                        kv_seq_lens=[129],
+                        q_seq_lens=[1],
+                        positions=torch.tensor([128]),
+                        dsa_cos_sin=None,
+                        is_prefill=False,
+                        is_chunked_prefill=True,
+                    )
+                    expected = (9 + 128 // width) * width + 128 % width
+                    self.assertEqual(dsa.slot_mappings[0][0].tolist(), [expected])
+
+                _check_builder_slots(backend, 128)
                 self.assertEqual(backend.window_size, window)
                 self.assertEqual(backend._swa_ring_blocks, window // 128)
                 for original, bound in zip(groups, backend.group_infos, strict=True):
@@ -79,9 +95,8 @@ class V41PrefixMetadataTest(unittest.TestCase):
                     self.assertEqual(bound.cache_type, original.cache_type)
                     self.assertEqual(bound.ratio, original.ratio)
                     if original.cache_type != DSA_CACHE_SLIDING_WINDOW or window == 128:
-                        self.assertIs(bound, original)
+                        self.assertEqual(bound, original)
                     else:
-                        self.assertIsNot(bound, original)
                         self.assertEqual(original.block_size, window)
                 for original_layer, bound_layer in zip(specs, backend.caches_info, strict=True):
                     for original, bound in zip(original_layer, bound_layer, strict=True):
@@ -90,13 +105,13 @@ class V41PrefixMetadataTest(unittest.TestCase):
                         self.assertEqual(bound.cache_type, original.cache_type)
                         self.assertEqual(bound.ratio, original.ratio)
                         if original.cache_type != DSA_CACHE_SLIDING_WINDOW or window == 128:
-                            self.assertIs(bound, original)
+                            self.assertEqual(bound, original)
                         else:
-                            self.assertIsNot(bound, original)
                             self.assertEqual(original.block_size, window)
 
                 # Rebinding must derive the page width again, not hardcode 128.
                 backend.bind_kv_caches([LayerCache(key=None, value=None, swa=torch.zeros(12, 64, 8))])
+                _check_builder_slots(backend, 64)
                 self.assertEqual(backend._swa_ring_blocks, window // 64)
                 for group in backend.group_infos:
                     self.assertEqual(group.block_size, 64 if group.cache_type == DSA_CACHE_SLIDING_WINDOW else 128)
@@ -105,7 +120,7 @@ class V41PrefixMetadataTest(unittest.TestCase):
                         if original.cache_type == DSA_CACHE_SLIDING_WINDOW:
                             self.assertEqual(bound.block_size, 64)
                         else:
-                            self.assertIs(bound, original)
+                            self.assertEqual(bound, original)
 
     def test_unbound_swa_keeps_metadata_descriptors(self) -> None:
         backend = self._backend(512)
@@ -114,10 +129,10 @@ class V41PrefixMetadataTest(unittest.TestCase):
         for caches in ([], [LayerCache(key=None, value=None)]):
             backend.bind_kv_caches(caches)
             for original, bound in zip(groups, backend.group_infos, strict=True):
-                self.assertIs(bound, original)
+                self.assertEqual(bound, original)
             for original_layer, bound_layer in zip(specs, backend.caches_info, strict=True):
                 for original, bound in zip(original_layer, bound_layer, strict=True):
-                    self.assertIs(bound, original)
+                    self.assertEqual(bound, original)
 
     def test_bound_swa_suffix_slots_and_history_use_physical_pages(self) -> None:
         for window in (128, 256, 512):
@@ -272,9 +287,10 @@ class V41PrefixMetadataTest(unittest.TestCase):
         self.assertEqual(dsa.slot_mappings[2][0].tolist(), [32 * 128, 32 * 128 + 1])
         self.assertEqual(dsa.slot_mappings[1][2].tolist(), [10 * 128, 10 * 128 + 1])
         for idx in (2, 3, 4):
-            self.assertEqual(dsa.block_tables[1][idx].data_ptr(), dsa.block_tables[0][0].data_ptr())
-        self.assertEqual(dsa.block_tables[1][0].data_ptr(), dsa.block_tables[1][1].data_ptr())
-        self.assertNotEqual(dsa.block_tables[1][0].data_ptr(), dsa.block_tables[2][0].data_ptr())
+            torch.testing.assert_close(dsa.block_tables[1][idx], tables[0], rtol=0, atol=0)
+        for idx in (0, 1):
+            torch.testing.assert_close(dsa.block_tables[1][idx], tables[1], rtol=0, atol=0)
+        torch.testing.assert_close(dsa.block_tables[2][0], tables[2], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

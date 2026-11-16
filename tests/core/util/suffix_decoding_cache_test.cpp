@@ -32,7 +32,7 @@ TEST(SuffixDecodingCacheTest, StartStopAndActiveSet) {
   EXPECT_TRUE(cache.has_cached_request("req_a"));
 
   auto active = cache.active_requests();
-  EXPECT_EQ(active.size(), 1);
+  ASSERT_EQ(active.size(), 1);
   EXPECT_EQ(active[0], "req_a");
 
   cache.stop_request("req_a");
@@ -58,7 +58,7 @@ TEST(SuffixDecodingCacheTest, AddResponseAndSpeculate) {
                                               /*min_token_prob=*/0.01f,
                                               /*use_tree_spec=*/false);
 
-  EXPECT_FALSE(draft.token_ids.empty());
+  ASSERT_FALSE(draft.token_ids.empty());
   EXPECT_EQ(draft.token_ids[0], 5);
 }
 
@@ -123,7 +123,7 @@ TEST(SuffixDecodingCacheTest, GlobalCacheSpeculateAcrossRequests) {
                                /*min_token_prob=*/0.01f,
                                /*use_tree_spec=*/false);
 
-  EXPECT_FALSE(draft.token_ids.empty());
+  ASSERT_FALSE(draft.token_ids.empty());
   EXPECT_EQ(draft.token_ids[0], 50);
 }
 

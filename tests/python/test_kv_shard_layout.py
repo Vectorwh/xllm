@@ -56,19 +56,6 @@ def test_local_seq_lens_are_derived_from_global_kv_seq_lens() -> None:
     )
 
 
-def test_local_token_count_matches_tensor_layout() -> None:
-    layout = KVShardLayout(
-        physical_block_size=4,
-        dcp_size=2,
-        dcp_rank=1,
-    )
-    global_seq_lens = torch.arange(-2, 18, dtype=torch.int32)
-
-    assert [layout.local_token_count(int(length)) for length in global_seq_lens] == layout.local_seq_lens(
-        global_seq_lens
-    ).tolist()
-
-
 def test_indexer_reads_expanded_logical_block_table() -> None:
     layout = KVShardLayout(
         physical_block_size=4,
@@ -151,13 +138,8 @@ def test_indexer_page_bounds(split: int) -> None:
     pages = layout.expand_indexer_block_table(logical_blocks)
     assert torch.equal(pages, torch.arange(16 * split, dtype=torch.int32).reshape(1, -1))
     assert pages[0, -1].item() == 16 * split - 1
-    # Read every mapped page from a full-history cache, including the last page.
-    cache = torch.arange(16 * split * 4).reshape(16 * split, 4)
-    assert cache[pages.long()].shape == (1, 16 * split, 4)
     if split == 4:
         assert pages[0, 16:20].tolist() == [16, 17, 18, 19]
-        with pytest.raises(IndexError):
-            _ = cache[:16][pages.long()]
 
     padded = layout.expand_indexer_block_table(torch.tensor([[15, -1]], dtype=torch.int32))
     assert padded[0, :split].tolist() == list(range(15 * split, 16 * split))

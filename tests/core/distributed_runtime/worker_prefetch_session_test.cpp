@@ -317,7 +317,7 @@ TEST(WorkerPrefetchSessionTest, FailureWhileWaitingReportsOnceWithoutProbe) {
             bytes_before + 400);
 }
 
-TEST(WorkerPrefetchSessionTest, ShutdownWaitsForGetAndDrainsStatistics) {
+TEST(WorkerPrefetchSessionTest, ShutdownDuringGetDrainsStatistics) {
   std::promise<void> entered;
   std::promise<void> release;
   const std::shared_future<void> released = release.get_future().share();

@@ -172,13 +172,11 @@ class NpuCpPlan final {
   // through prepare(); tests and direct builders use this instead.
   void set_process_group(ProcessGroup* process_group);
 
-  // Rewrites the model attention metadata to the per-rank local-padded view.
-  // Called from prepare(); public for unit tests that build a plan directly.
-  void apply_attention_meta(ModelInputParams& params) const;
-
  private:
   friend class npu::GraphPersistentParam;
   friend struct ParallelInput;
+
+  void apply_attention_meta(ModelInputParams& params) const;
 
   NpuCpPlan to(const torch::Device& device) const;
 

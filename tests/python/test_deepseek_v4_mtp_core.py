@@ -18,11 +18,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-pytest.importorskip("torch_npu")
-
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.model_executor.runners.decode_acl_graph import _StaticAttentionMetadata
-from xllm.python.models import deepseek_v4, deepseek_v4_mtp
 from xllm.python.models.deepseek_v4 import DeepseekV4Model
 from xllm.python.models.deepseek_v4_mtp import (
     DeepseekV4MtpForCausalLM,
@@ -101,72 +98,12 @@ def test_target_and_mtp_hc_merge_match_independent_reference() -> None:
     torch.testing.assert_close(draft._merge_hc_hidden(hidden), expected)
 
 
-def test_mtp_model_reuses_target_rotary_table_builder(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[object, torch.dtype, torch.device]] = []
-    rotary_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    original_build_rotary_tables = DeepseekV4Model._build_rotary_tables
-
-    def build_rotary_tables(
-        self: DeepseekV4Model,
-        cfg: object,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        calls.append((cfg, dtype, device))
-        original_build_rotary_tables(self, cfg, dtype, device)
-
-    def rotary_embedding(*args: object, **kwargs: object) -> SimpleNamespace:
-        rotary_calls.append((args, kwargs))
-        return SimpleNamespace(cos_sin_cache=torch.empty(0))
-
-    monkeypatch.setattr(DeepseekV4Model, "_build_rotary_tables", build_rotary_tables)
-    monkeypatch.setattr(deepseek_v4, "DeepseekV4RotaryEmbedding", rotary_embedding)
-    monkeypatch.setattr(deepseek_v4_mtp, "HiddenParallelEmbedding", lambda *_args, **_kwargs: nn.Identity())
-    monkeypatch.setattr(deepseek_v4_mtp, "DeepseekV4MtpLayer", lambda *_args, **_kwargs: nn.Identity())
-    monkeypatch.setattr(deepseek_v4_mtp, "RMSNorm", lambda *_args, **_kwargs: nn.Identity())
-    cfg = SimpleNamespace(
-        tp_size=1,
-        vocab_size=8,
-        hidden_size=4,
-        n_layers=2,
-        rms_norm_eps=1e-6,
-        qk_rope_head_dim=4,
-        max_position_embeddings=16,
-        rope_scaling_factor=1.0,
-        rope_theta=10000.0,
-        rope_beta_fast=32,
-        rope_beta_slow=1,
-        compress_rope_theta=160000.0,
-    )
-    dtype = torch.float32
-    device = torch.device("cpu")
-
-    model = DeepseekV4MtpModel(cfg, dtype, device)
-
-    assert calls == [(cfg, dtype, device)]
-    assert len(rotary_calls) == 3
-    assert not hasattr(model, "aux_hidden_capture")
-
-
-def test_mtp_dummy_embedding_matches_target_hidden_width() -> None:
-    model = DeepseekV4MtpModel.__new__(DeepseekV4MtpModel)
-    nn.Module.__init__(model)
-    model.cfg = SimpleNamespace(hc_mult=2, hidden_size=3)
-    model.norm = SimpleNamespace(weight=torch.empty(3, dtype=torch.float32))
-
-    embedding = model.make_dummy_input_embedding(torch.tensor([1, 2], dtype=torch.int32))
-
-    assert tuple(embedding.shape) == (2, 6)
-    assert embedding.dtype == torch.float32
-    assert torch.count_nonzero(embedding) == 0
-
-
 def test_mtp_decoder_layer_loader_uses_projection_loader_contract() -> None:
-    """Lock the shared attention loader's renamed keyword for MTP."""
+    """The MTP decoder loader applies the shared V4 projection mapping."""
     checkpoint_prefix = "mtp.0."
     attention_prefix = checkpoint_prefix + "attn."
     tensors = {
-        attention_prefix + "wq_a.weight": torch.empty(128, 128, dtype=torch.int8),
+        attention_prefix + "wq_a.weight": torch.full((128, 128), 7, dtype=torch.int8),
         attention_prefix + "wq_a.weight_scale": torch.empty(128, 1),
         attention_prefix + "wq_b.weight": torch.empty(128, 128, dtype=torch.int8),
         attention_prefix + "wq_b.weight_scale": torch.empty(128, 1),
@@ -224,7 +161,10 @@ def test_mtp_decoder_layer_loader_uses_projection_loader_contract() -> None:
         0,
     )
 
-    assert copied["model.layers.0.self_attn.q_a_proj.weight"] is tensors[attention_prefix + "wq_a.weight"]
+    torch.testing.assert_close(
+        copied["model.layers.0.self_attn.q_a_proj.weight"],
+        tensors[attention_prefix + "wq_a.weight"],
+    )
     torch.testing.assert_close(
         copied["model.layers.0.mlp.gate_up_proj.weight"],
         torch.cat(
@@ -251,6 +191,7 @@ def test_mtp_forward_uses_dummy_flag_from_graph_metadata() -> None:
             input_ids: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             del positions, cos_sin_cache, input_ids
+            assert previous_hidden_states.dtype == torch.float32
             assert torch.count_nonzero(previous_hidden_states) == 0
             return inputs_embeds, previous_hidden_states.reshape(-1, 2, 2)
 

@@ -13,15 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// M0 acceptance test for the xllm_ops torch-op library.
-//
-// Verifies two things end to end:
-//   1. The TORCH_LIBRARY(xllm_ops) registrations survive linking (via the
-//      ensure_xllm_ops_registered anchor) and are callable through the torch
-//      dispatcher, producing results that match a plain-torch reference.
-//   2. An *embedded* CPython interpreter running in this same process (sharing
-//      this binary's libtorch) can see and call torch.ops.xllm_ops.* — this is
-//      exactly the path PyCausalLM uses at runtime.
+// Exercise native torch dispatch and the embedded Python bindings used by
+// Python models, with numerical references rather than registration metadata.
 
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <gtest/gtest.h>
@@ -77,6 +70,9 @@ class XllmOpsTest : public ::testing::Test {
       GTEST_SKIP() << "CUDA not available; skipping xllm_ops CUDA test.";
     }
     Platform::init_capabilities(Platform::current_device());
+    if (!Py_IsInitialized()) {
+      Py_InitializeEx(0);
+    }
   }
 };
 
@@ -106,9 +102,6 @@ TEST_F(XllmOpsTest, DispatcherRmsNormMatchesReference) {
 // (2) Call through an embedded interpreter's torch.ops.xllm_ops.* — proves the
 // Python-side graph will see the ops with no extra registration.
 TEST_F(XllmOpsTest, EmbeddedInterpreterSeesOps) {
-  if (!Py_IsInitialized()) {
-    Py_InitializeEx(0);
-  }
   py::gil_scoped_acquire gil;
 
   auto opts =
@@ -131,9 +124,6 @@ TEST_F(XllmOpsTest, EmbeddedInterpreterSeesOps) {
 }
 
 TEST_F(XllmOpsTest, EmbeddedInterpreterMoeOpsMatchTorchReference) {
-  if (!Py_IsInitialized()) {
-    Py_InitializeEx(0);
-  }
   py::gil_scoped_acquire gil;
 
   py::exec(R"PY(
@@ -190,9 +180,6 @@ torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 }
 
 TEST_F(XllmOpsTest, EmbeddedPythonCollectivesUseTorchDistributed) {
-  if (!Py_IsInitialized()) {
-    Py_InitializeEx(0);
-  }
   py::gil_scoped_acquire gil;
   prepend_python_model_path();
 
@@ -208,11 +195,12 @@ TEST_F(XllmOpsTest, EmbeddedPythonCollectivesUseTorchDistributed) {
   auto input = torch::ones({2, 3}, options);
 
   py::object all_reduce = collectives.attr("all_reduce_");
-  const std::string all_reduce_schema =
-      py::str(all_reduce.attr("_opoverload").attr("_schema"))
-          .cast<std::string>();
-  EXPECT_NE(all_reduce_schema.find("Tensor(a0!) x"), std::string::npos);
-  EXPECT_NE(all_reduce_schema.find("str group_name=\"tp\""), std::string::npos);
+  py::object schema = all_reduce.attr("_opoverload").attr("_schema");
+  py::list schema_arguments = schema.attr("arguments");
+  EXPECT_TRUE(
+      schema_arguments[0].attr("alias_info").attr("is_write").cast<bool>());
+  EXPECT_EQ(schema_arguments[1].attr("default_value").cast<std::string>(),
+            "tp");
   EXPECT_TRUE(all_reduce(input).is_none());
   EXPECT_TRUE(all_reduce(input, "moe_ep").is_none());
   EXPECT_TRUE(torch::equal(input, torch::ones_like(input)));
@@ -227,9 +215,6 @@ TEST_F(XllmOpsTest, EmbeddedPythonCollectivesUseTorchDistributed) {
 }
 
 TEST_F(XllmOpsTest, DecodeGraphSharesMaximumBlockTableBufferAcrossBuckets) {
-  if (!Py_IsInitialized()) {
-    Py_InitializeEx(0);
-  }
   py::gil_scoped_acquire gil;
   prepend_python_model_path();
 
@@ -279,9 +264,6 @@ assert (
 }
 
 TEST_F(XllmOpsTest, ModelExecutorUsesExplicitRuntimeBatchLimit) {
-  if (!Py_IsInitialized()) {
-    Py_InitializeEx(0);
-  }
   py::gil_scoped_acquire gil;
   prepend_python_model_path();
 
@@ -338,9 +320,6 @@ with patch.object(executor_module, "_create_attention_backend", return_value=Fak
 }
 
 TEST_F(XllmOpsTest, DecodeGraphMetadataKernelMatchesReferenceAcrossShapes) {
-  if (!Py_IsInitialized()) {
-    Py_InitializeEx(0);
-  }
   py::gil_scoped_acquire gil;
   prepend_python_model_path();
 

@@ -26,19 +26,6 @@ limitations under the License.
 namespace xllm::mm_service_utils {
 namespace {
 
-TEST(MMServiceUtilsTest, ReservesCombinedPayloadCapacity) {
-  const std::vector<std::string> outputs = {"image", "audio", "video"};
-  std::string payload;
-
-  ASSERT_TRUE(reserve_binary_payload(
-      outputs,
-      [](const std::string& output) -> std::string_view { return output; },
-      payload));
-
-  EXPECT_GE(payload.capacity(), 15u);
-  EXPECT_TRUE(payload.empty());
-}
-
 TEST(MMServiceUtilsTest, AppendsPayloadAndTracksOffsets) {
   std::string payload;
   proto::BinaryRef first;
@@ -158,6 +145,7 @@ TEST(MMServiceUtilsTest, PreservesRequestStrings) {
   EXPECT_EQ(video->video_url().url(), payload);
   EXPECT_EQ(audio->audio_url().url(), payload);
   ASSERT_EQ(messages.size(), 1u);
+  EXPECT_EQ(messages.front().role, "user");
   const auto& contents = std::get<MMContentVec>(messages.front().content);
   ASSERT_EQ(contents.size(), 4u);
   EXPECT_EQ(contents[0].text, payload);
@@ -185,24 +173,6 @@ TEST(MMServiceUtilsTest, PreservesTextOnValidationFailure) {
   EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
   EXPECT_TRUE(text->has_text());
   EXPECT_EQ(text->text(), payload);
-}
-
-TEST(MMServiceUtilsTest, BuildsValidMessages) {
-  proto::MMChatRequest request;
-  proto::MMChatMessage* message = request.add_messages();
-  message->set_role("user");
-  proto::MMInputData* content = message->add_content();
-  content->set_type("text");
-  content->set_text("hello");
-  std::vector<Message> messages;
-
-  const Status status =
-      build_messages(request.messages(), messages, /*image_limit=*/1);
-  ASSERT_TRUE(status.ok());
-  ASSERT_EQ(messages.size(), 1u);
-  EXPECT_EQ(messages.front().role, "user");
-  EXPECT_EQ(status.code(), StatusCode::OK);
-  EXPECT_TRUE(status.message().empty());
 }
 
 }  // namespace

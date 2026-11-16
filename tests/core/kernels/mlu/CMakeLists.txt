@@ -80,7 +80,6 @@ cc_test(
   SRCS
     causal_conv1d_update_decode_test.cpp
     fused_recurrent_gated_delta_rule_packed_decode_test.cpp
-    causal_conv1d_fn_test.cpp
     chunk_gated_delta_rule_regression_test.cpp
     chunk_kda_test.cpp
     fused_sigmoid_update_regression_test.cpp

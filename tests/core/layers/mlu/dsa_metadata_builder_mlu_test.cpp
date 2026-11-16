@@ -83,27 +83,6 @@ AttentionMetadata build_metadata(ModelInputParams params,
   return DSAMetadataBuilderMlu::build(params, positions, {}, {}, window_size);
 }
 
-TEST(DSAMetadataBuilderMluTest, BuildsCanonicalSeqMetadataFromCuLens) {
-  ModelInputParams params =
-      make_params(BatchForwardType::PREFILL, {0, 2, 3}, {0, 5, 9});
-  torch::Tensor positions = torch::tensor({3, 4, 8}, torch::kInt32);
-  AttentionMetadata metadata = build_metadata(params, positions);
-
-  ASSERT_NE(metadata.dsa_metadata, nullptr);
-  const DSAMetadata& dsa = *metadata.dsa_metadata;
-  EXPECT_EQ(tensor_vec(metadata.q_cu_seq_lens),
-            std::vector<int64_t>({0, 2, 3}));
-  EXPECT_EQ(tensor_vec(metadata.kv_cu_seq_lens),
-            std::vector<int64_t>({0, 5, 9}));
-  EXPECT_EQ(tensor_vec(metadata.q_seq_lens), std::vector<int64_t>({2, 1}));
-  EXPECT_EQ(tensor_vec(metadata.kv_seq_lens), std::vector<int64_t>({5, 4}));
-  EXPECT_EQ(tensor_vec(dsa.q_seq_lens), std::vector<int64_t>({2, 1}));
-  EXPECT_EQ(tensor_vec(dsa.kv_seq_lens), std::vector<int64_t>({5, 4}));
-  EXPECT_EQ(dsa.query_start_offsets, std::vector<int64_t>({0, 2, 3}));
-  EXPECT_EQ(dsa.start_pos_vec, std::vector<int64_t>({3, 3}));
-  EXPECT_TRUE(torch::equal(dsa.seq_lens, dsa.kv_seq_lens));
-}
-
 TEST(DSAMetadataBuilderMluTest, EmptyDpRankParamsBuildOneTokenDsaMetadata) {
   ModelInputParams params;
   params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -149,8 +128,8 @@ TEST(DSAMetadataBuilderMluTest, EmptyDpRankParamsBuildOneTokenDsaMetadata) {
 TEST(DSAMetadataBuilderMluTest, UsesAttentionMetadataSeqLens) {
   ModelInputParams params =
       make_params(BatchForwardType::PREFILL, {0, 2, 3}, {0, 5, 9});
-  params.attention.host.q_cu_seq_lens.clear();
-  params.attention.host.kv_cu_seq_lens.clear();
+  params.attention.host.q_cu_seq_lens = {99, 100};
+  params.attention.host.kv_cu_seq_lens = {88, 89};
   params.attention.host.q_seq_lens = {99};
   params.attention.host.kv_seq_lens = {199};
 
@@ -164,6 +143,10 @@ TEST(DSAMetadataBuilderMluTest, UsesAttentionMetadataSeqLens) {
             std::vector<int64_t>({0, 5, 9}));
   EXPECT_EQ(tensor_vec(metadata.q_seq_lens), std::vector<int64_t>({2, 1}));
   EXPECT_EQ(tensor_vec(metadata.kv_seq_lens), std::vector<int64_t>({5, 4}));
+  const auto& dsa = *metadata.dsa_metadata;
+  EXPECT_EQ(dsa.query_start_offsets, std::vector<int64_t>({0, 2, 3}));
+  EXPECT_EQ(dsa.start_pos_vec, std::vector<int64_t>({3, 3}));
+  EXPECT_TRUE(torch::equal(dsa.seq_lens, dsa.kv_seq_lens));
 }
 
 TEST(DSAMetadataBuilderMluTest, PreservesAttentionFlags) {
@@ -373,26 +356,6 @@ TEST(DSAMetadataBuilderMluTest, BuildsDecodeCompressedSlotMapping) {
                                    group_infos,
                                    /*window_size=*/0);
   EXPECT_FALSE(prefill_metadata.dsa_metadata->cmp_slots_dict.contains(4));
-}
-
-TEST(DSAMetadataBuilderMluTest, IgnoresLegacyCuLensFields) {
-  ModelInputParams params =
-      make_params(BatchForwardType::PREFILL, {0, 2, 3}, {0, 5, 9});
-  params.attention.host.q_cu_seq_lens = {99, 100};
-  params.attention.host.kv_cu_seq_lens = {88, 89};
-
-  AttentionMetadata metadata =
-      build_metadata(params, torch::tensor({3, 4, 8}, torch::kInt32));
-
-  ASSERT_NE(metadata.dsa_metadata, nullptr);
-  EXPECT_EQ(tensor_vec(metadata.q_cu_seq_lens),
-            std::vector<int64_t>({0, 2, 3}));
-  EXPECT_EQ(tensor_vec(metadata.kv_cu_seq_lens),
-            std::vector<int64_t>({0, 5, 9}));
-  EXPECT_EQ(tensor_vec(metadata.dsa_metadata->q_seq_lens),
-            std::vector<int64_t>({2, 1}));
-  EXPECT_EQ(tensor_vec(metadata.dsa_metadata->kv_seq_lens),
-            std::vector<int64_t>({5, 4}));
 }
 
 }  // namespace

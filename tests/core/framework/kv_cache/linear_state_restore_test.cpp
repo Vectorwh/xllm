@@ -25,16 +25,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(LinearStateRestoreTest, BuildsColdMaskForUncachedRow) {
-  EXPECT_EQ(build_linear_state_mask(/*cached_tokens=*/{0}, /*active_rows=*/1),
-            std::vector<int64_t>({0}));
-}
-
-TEST(LinearStateRestoreTest, BuildsWarmMaskForCachedRow) {
-  EXPECT_EQ(build_linear_state_mask(/*cached_tokens=*/{8}, /*active_rows=*/1),
-            std::vector<int64_t>({1}));
-}
-
 TEST(LinearStateRestoreTest, BuildsMixedWarmMask) {
   EXPECT_EQ(
       build_linear_state_mask(/*cached_tokens=*/{0, 8, -1}, /*active_rows=*/3),

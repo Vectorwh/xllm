@@ -156,8 +156,6 @@ class CompositeBlockManager : public BlockManager {
   size_t num_sub_managers() const { return leaves_.size(); }
 
  private:
-  friend class BlockManagerPoolTestPeer;
-
   BlockManager* leaf_of(BlockType type) const;
 
   static LeafCombination classify_leaf_combination(const LeafMap& leaves);

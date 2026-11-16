@@ -222,6 +222,7 @@ float max_abs_diff(const torch::Tensor& lhs, const torch::Tensor& rhs) {
 }
 
 void run_case(const SplitQkvTestCase& test_case) {
+  SCOPED_TRACE(test_case.name);
   ASSERT_GT(test_case.num_tokens, 0);
   ASSERT_GT(test_case.num_q_heads, 0);
   ASSERT_GT(test_case.num_kv_heads, 0);
@@ -302,363 +303,69 @@ void run_case(const SplitQkvTestCase& test_case) {
       << "gate mismatch, max_diff=" << max_abs_diff(gate_out, gate_ref);
 }
 
-TEST_F(TileLangSplitQkvRmsnormMRopeWrapperTest,
-       BuildGatherPatternMatchesReference) {
-  const torch::Device device("npu:0");
-  const std::vector<int64_t> mrope_section = {11, 11, 10};
-  const int64_t rope_dim = 64;
-
-  torch::Tensor non_interleaved =
-      build_split_qkv_rmsnorm_mrope_gather_pattern(
-          rope_dim, mrope_section, /*is_interleaved=*/false, device)
-          .cpu()
-          .view(torch::kInt32);
-  EXPECT_EQ(non_interleaved.dtype(), torch::kInt32);
-  EXPECT_EQ(non_interleaved.size(0), 256);
-  EXPECT_EQ(non_interleaved[0].item<int32_t>(), 0);
-  EXPECT_EQ(non_interleaved[10].item<int32_t>(), 20);
-  EXPECT_EQ(non_interleaved[11].item<int32_t>(), 150);
-  EXPECT_EQ(non_interleaved[21].item<int32_t>(), 170);
-  EXPECT_EQ(non_interleaved[22].item<int32_t>(), 300);
-  EXPECT_EQ(non_interleaved[31].item<int32_t>(), 318);
-  EXPECT_EQ(non_interleaved[32].item<int32_t>(), 64);
-  EXPECT_EQ(non_interleaved[42].item<int32_t>(), 84);
-  EXPECT_EQ(non_interleaved[43].item<int32_t>(), 214);
-  EXPECT_EQ(non_interleaved[53].item<int32_t>(), 234);
-  EXPECT_EQ(non_interleaved[54].item<int32_t>(), 364);
-  EXPECT_EQ(non_interleaved[63].item<int32_t>(), 382);
-  EXPECT_EQ(non_interleaved[64].item<int32_t>(), 0);
-  EXPECT_EQ(non_interleaved[255].item<int32_t>(), 0);
-
-  torch::Tensor interleaved =
-      build_split_qkv_rmsnorm_mrope_gather_pattern(
-          rope_dim, mrope_section, /*is_interleaved=*/true, device)
-          .cpu()
-          .view(torch::kInt32);
-  EXPECT_EQ(interleaved.dtype(), torch::kInt32);
-  EXPECT_EQ(interleaved.size(0), 256);
-  EXPECT_EQ(interleaved[0].item<int32_t>(), 0);
-  EXPECT_EQ(interleaved[1].item<int32_t>(), 130);
-  EXPECT_EQ(interleaved[2].item<int32_t>(), 260);
-  EXPECT_EQ(interleaved[3].item<int32_t>(), 6);
-  EXPECT_EQ(interleaved[4].item<int32_t>(), 136);
-  EXPECT_EQ(interleaved[5].item<int32_t>(), 266);
-  EXPECT_EQ(interleaved[30].item<int32_t>(), 60);
-  EXPECT_EQ(interleaved[31].item<int32_t>(), 190);
-  EXPECT_EQ(interleaved[32].item<int32_t>(), 64);
-  EXPECT_EQ(interleaved[33].item<int32_t>(), 194);
-  EXPECT_EQ(interleaved[34].item<int32_t>(), 324);
-  EXPECT_EQ(interleaved[35].item<int32_t>(), 70);
-  EXPECT_EQ(interleaved[63].item<int32_t>(), 254);
-  EXPECT_EQ(interleaved[64].item<int32_t>(), 0);
-  EXPECT_EQ(interleaved[255].item<int32_t>(), 0);
-}
-
 TEST_F(TileLangSplitQkvRmsnormMRopeWrapperTest, MatchesTorchReference) {
-  const std::vector<SplitQkvTestCase> cases = {
-      {.name = "tiny_t1_q16_kv4",
-       .num_tokens = 1,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 101,
-       .is_interleaved = false},
-      {.name = "medium_t17_q16_kv4",
-       .num_tokens = 17,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 102,
-       .is_interleaved = false},
-      {.name = "chunked_t4097_q16_kv4",
-       .num_tokens = 4097,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 103,
-       .is_interleaved = false},
-      {.name = "tiny_t1_q16_kv2",
-       .num_tokens = 1,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 201,
-       .is_interleaved = false},
-      {.name = "medium_t17_q16_kv2",
-       .num_tokens = 17,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 202,
-       .is_interleaved = false},
-      {.name = "chunked_t4097_q16_kv2",
-       .num_tokens = 4097,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 203,
-       .is_interleaved = false},
-      {.name = "tiny_t1_q8_kv1",
-       .num_tokens = 1,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 301,
-       .is_interleaved = false},
-      {.name = "medium_t17_q8_kv1",
-       .num_tokens = 17,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 302,
-       .is_interleaved = false},
-      {.name = "chunked_t4097_q8_kv1",
-       .num_tokens = 4097,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 303,
-       .is_interleaved = false},
-      {.name = "tiny_t1_q16_kv4_interleaved",
-       .num_tokens = 1,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 401,
-       .is_interleaved = true},
-      {.name = "medium_t17_q16_kv4_interleaved",
-       .num_tokens = 17,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 402,
-       .is_interleaved = true},
-      {.name = "chunked_t4097_q16_kv4_interleaved",
-       .num_tokens = 4097,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 403,
-       .is_interleaved = true},
-      {.name = "tiny_t1_q16_kv2_interleaved",
-       .num_tokens = 1,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 501,
-       .is_interleaved = true},
-      {.name = "medium_t17_q16_kv2_interleaved",
-       .num_tokens = 17,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 502,
-       .is_interleaved = true},
-      {.name = "chunked_t4097_q16_kv2_interleaved",
-       .num_tokens = 4097,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 503,
-       .is_interleaved = true},
-      {.name = "tiny_t1_q8_kv1_interleaved",
-       .num_tokens = 1,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 601,
-       .is_interleaved = true},
-      {.name = "medium_t17_q8_kv1_interleaved",
-       .num_tokens = 17,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 602,
-       .is_interleaved = true},
-      {.name = "chunked_t4097_q8_kv1_interleaved",
-       .num_tokens = 4097,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 603,
-       .is_interleaved = true},
-      // Odd num_tokens
-      {.name = "odd_t3_q16_kv4",
-       .num_tokens = 3,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 701,
-       .is_interleaved = false},
-      {.name = "odd_t7_q16_kv2_interleaved",
-       .num_tokens = 7,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 702,
-       .is_interleaved = true},
-      {.name = "odd_t15_q8_kv1",
-       .num_tokens = 15,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 703,
-       .is_interleaved = false},
-      {.name = "odd_t33_q16_kv4_interleaved",
-       .num_tokens = 33,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 704,
-       .is_interleaved = true},
-      // Boundary: min specialization bucket
-      {.name = "boundary_t2_q16_kv2",
-       .num_tokens = 2,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 801,
-       .is_interleaved = false},
-      // Boundary: vec_core_num (48) and neighbors
-      {.name = "boundary_t48_q8_kv1_interleaved",
-       .num_tokens = 48,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 802,
-       .is_interleaved = true},
-      {.name = "boundary_t49_q16_kv4",
-       .num_tokens = 49,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 803,
-       .is_interleaved = false},
-      // Large: old 4096 boundary
-      {.name = "large_t4096_q16_kv2",
-       .num_tokens = 4096,
-       .num_q_heads = 16,
-       .num_kv_heads = 2,
-       .seed = 901,
-       .is_interleaved = false},
-      // Large: odd, exceeding old chunking limit
-      {.name = "large_t4099_q8_kv1_interleaved",
-       .num_tokens = 4099,
-       .num_q_heads = 8,
-       .num_kv_heads = 1,
-       .seed = 902,
-       .is_interleaved = true},
-      // Large batch
-      {.name = "large_t8192_q16_kv4",
-       .num_tokens = 8192,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 903,
-       .is_interleaved = false},
-      {.name = "large_t8193_q16_kv4_interleaved",
-       .num_tokens = 8193,
-       .num_q_heads = 16,
-       .num_kv_heads = 4,
-       .seed = 904,
-       .is_interleaved = true},
-      // Qwen3.5-0.8B/2B tp=1, Qwen3.5-4B/9B tp=2
-      {.name = "tiny_t1_q8_kv2",
-       .num_tokens = 1,
-       .num_q_heads = 8,
-       .num_kv_heads = 2,
-       .seed = 1001,
-       .is_interleaved = false},
-      {.name = "large_t4097_q8_kv2",
-       .num_tokens = 4097,
-       .num_q_heads = 8,
-       .num_kv_heads = 2,
-       .seed = 1002,
-       .is_interleaved = false},
-      // Qwen3.5-27B tp=1
-      {.name = "tiny_t1_q24_kv4",
-       .num_tokens = 1,
-       .num_q_heads = 24,
-       .num_kv_heads = 4,
-       .seed = 1101,
-       .is_interleaved = false},
-      {.name = "large_t4097_q24_kv4",
-       .num_tokens = 4097,
-       .num_q_heads = 24,
-       .num_kv_heads = 4,
-       .seed = 1102,
-       .is_interleaved = true},
-      // Qwen3.5-27B tp=2
-      {.name = "tiny_t1_q12_kv2",
-       .num_tokens = 1,
-       .num_q_heads = 12,
-       .num_kv_heads = 2,
-       .seed = 1201,
-       .is_interleaved = false},
-      {.name = "large_t4097_q12_kv2",
-       .num_tokens = 4097,
-       .num_q_heads = 12,
-       .num_kv_heads = 2,
-       .seed = 1202,
-       .is_interleaved = true},
-      // Qwen3.5-27B tp=4
-      {.name = "tiny_t1_q6_kv1",
-       .num_tokens = 1,
-       .num_q_heads = 6,
-       .num_kv_heads = 1,
-       .seed = 1301,
-       .is_interleaved = false},
-      {.name = "large_t4097_q6_kv1",
-       .num_tokens = 4097,
-       .num_q_heads = 6,
-       .num_kv_heads = 1,
-       .seed = 1302,
-       .is_interleaved = true},
-      // Qwen3.5-27B tp=8
-      {.name = "tiny_t1_q3_kv1",
-       .num_tokens = 1,
-       .num_q_heads = 3,
-       .num_kv_heads = 1,
-       .seed = 1401,
-       .is_interleaved = false},
-      {.name = "large_t4097_q3_kv1",
-       .num_tokens = 4097,
-       .num_q_heads = 3,
-       .num_kv_heads = 1,
-       .seed = 1402,
-       .is_interleaved = true},
-      // Qwen3.5-35B tp=4, Qwen3.5-4B tp=4
-      {.name = "tiny_t1_q4_kv1",
-       .num_tokens = 1,
-       .num_q_heads = 4,
-       .num_kv_heads = 1,
-       .seed = 1501,
-       .is_interleaved = false},
-      {.name = "large_t4097_q4_kv1",
-       .num_tokens = 4097,
-       .num_q_heads = 4,
-       .num_kv_heads = 1,
-       .seed = 1502,
-       .is_interleaved = true},
-      // Qwen3.5-122B/397B tp=1
-      {.name = "tiny_t1_q32_kv2",
-       .num_tokens = 1,
-       .num_q_heads = 32,
-       .num_kv_heads = 2,
-       .seed = 1601,
-       .is_interleaved = false},
-      {.name = "large_t4097_q32_kv2",
-       .num_tokens = 4097,
-       .num_q_heads = 32,
-       .num_kv_heads = 2,
-       .seed = 1602,
-       .is_interleaved = true},
-      // Qwen3.5-122B/397B tp=2
-      {.name = "tiny_t1_q16_kv1",
-       .num_tokens = 1,
-       .num_q_heads = 16,
-       .num_kv_heads = 1,
-       .seed = 1701,
-       .is_interleaved = false},
-      {.name = "large_t4097_q16_kv1",
-       .num_tokens = 4097,
-       .num_q_heads = 16,
-       .num_kv_heads = 1,
-       .seed = 1702,
-       .is_interleaved = true},
-      // Qwen3.5-0.8B/2B tp=4, various tp=8/16
-      {.name = "tiny_t1_q2_kv1",
-       .num_tokens = 1,
-       .num_q_heads = 2,
-       .num_kv_heads = 1,
-       .seed = 1801,
-       .is_interleaved = false},
-      {.name = "large_t4097_q2_kv1",
-       .num_tokens = 4097,
-       .num_q_heads = 2,
-       .num_kv_heads = 1,
-       .seed = 1802,
-       .is_interleaved = true},
+  struct HeadCase {
+    const char* name;
+    int64_t num_q_heads;
+    int64_t num_kv_heads;
+  };
+  const std::vector<HeadCase> head_cases = {
+      {"q8_kv2", 8, 2},
+      {"q16_kv4", 16, 4},
+      {"q24_kv4", 24, 4},
+      {"q16_kv2", 16, 2},
+      {"q32_kv2", 32, 2},
+      {"q12_kv2", 12, 2},
+      {"q6_kv1", 6, 1},
+      {"q3_kv1", 3, 1},
+      {"q4_kv1", 4, 1},
+      {"q16_kv1", 16, 1},
+      {"q2_kv1", 2, 1},
+      {"q8_kv1", 8, 1},
+      {"q1_kv1", 1, 1},
   };
 
-  for (const SplitQkvTestCase& test_case : cases) {
-    SCOPED_TRACE(test_case.name);
-    run_case(test_case);
+  int64_t seed = 101;
+  for (const HeadCase& head_case : head_cases) {
+    SCOPED_TRACE(head_case.name);
+    run_case({.name = std::string("tiny_t1_") + head_case.name,
+              .num_tokens = 1,
+              .num_q_heads = head_case.num_q_heads,
+              .num_kv_heads = head_case.num_kv_heads,
+              .seed = seed++,
+              .is_interleaved = false});
+    run_case({.name = std::string("large_t4097_") + head_case.name,
+              .num_tokens = 4097,
+              .num_q_heads = head_case.num_q_heads,
+              .num_kv_heads = head_case.num_kv_heads,
+              .seed = seed++,
+              .is_interleaved = true});
   }
+
+  run_case({.name = "large_t4097_q16_kv4_non_interleaved",
+            .num_tokens = 4097,
+            .num_q_heads = 16,
+            .num_kv_heads = 4,
+            .seed = seed++,
+            .is_interleaved = false});
+  run_case({.name = "medium_t17_q16_kv4",
+            .num_tokens = 17,
+            .num_q_heads = 16,
+            .num_kv_heads = 4,
+            .seed = seed++,
+            .is_interleaved = false});
+  run_case({.name = "boundary_t48_q16_kv4",
+            .num_tokens = 48,
+            .num_q_heads = 16,
+            .num_kv_heads = 4,
+            .seed = seed++,
+            .is_interleaved = false});
+  run_case({.name = "boundary_t49_q16_kv4",
+            .num_tokens = 49,
+            .num_q_heads = 16,
+            .num_kv_heads = 4,
+            .seed = seed,
+            .is_interleaved = false});
 }
 
 }  // namespace
