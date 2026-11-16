@@ -770,7 +770,7 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
     CHECK(mm_batch.foreach (output_scatter) && output_scatter.finish())
         << "MiniMax-H3 encoder output scattering failed";
     EncoderEmbeddingGatherVisitor embedding_gather(
-        params.attention.host.kv_seq_lens, params.attention.host.q_seq_lens);
+        /*num_computed_tokens=*/{0}, /*num_scheduled_tokens=*/{length});
     CHECK(mm_batch.foreach (embedding_gather) &&
           embedding_gather.finish(mm_batch))
         << "MiniMax-H3 encoder embedding gathering failed";

@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -87,14 +88,8 @@ TEST(MMDataEncoderHandoffTest, RestoresIndependentModalityMasksInChunk) {
   EncoderOutputScatterVisitor scatter(encoded);
   ASSERT_TRUE(batch.foreach (scatter));
   ASSERT_TRUE(scatter.finish());
-#if defined(USE_NPU) || defined(USE_MUSA)
-  const std::vector<int32_t> kv_lens{5};
-  const std::vector<int32_t> q_lens{3};
-#else
-  const std::vector<int32_t> kv_lens{0, 5};
-  const std::vector<int32_t> q_lens{0, 3};
-#endif
-  EncoderEmbeddingGatherVisitor gather(kv_lens, q_lens);
+  EncoderEmbeddingGatherVisitor gather(
+      /*num_computed_tokens=*/{2}, /*num_scheduled_tokens=*/{3});
   ASSERT_TRUE(batch.foreach (gather));
   ASSERT_TRUE(gather.finish(batch));
   EXPECT_TRUE(torch::equal(batch.get<torch::Tensor>("video|embedding").value(),
@@ -105,6 +100,40 @@ TEST(MMDataEncoderHandoffTest, RestoresIndependentModalityMasksInChunk) {
                            torch::tensor({false, true, false}, torch::kBool)));
   EXPECT_TRUE(torch::equal(batch.get<torch::Tensor>("image|mask").value(),
                            torch::tensor({false, false, true}, torch::kBool)));
+}
+
+TEST(MMDataEncoderHandoffTest, GathersImagesAcrossSequenceWindows) {
+  MMDataItem first(MMType::IMAGE);
+  auto& first_state = first.mutable_state();
+  first_state.mutable_token_pos() = {2, 2};
+  first_state.mutable_mm_token_num() = 1;
+  first_state.mutable_mm_token_mask() =
+      torch::tensor({true, false}, torch::kBool);
+  first_state.mutable_seq_index() = 0;
+  first_state.mutable_schedule_data().end_pos = 2;
+  ASSERT_TRUE(first.add("image|embedding", torch::tensor({{10.0, 11.0}})));
+
+  MMDataItem second = first;
+  auto& second_state = second.mutable_state();
+  second_state.mutable_token_pos() = {4, 2};
+  second_state.mutable_mm_token_mask() =
+      torch::tensor({false, true}, torch::kBool);
+  second_state.mutable_seq_index() = 1;
+  second.mutable_data()["image|embedding"] = torch::tensor({{20.0, 21.0}});
+
+  MMBatchData batch(
+      std::vector<MMData>{MMData(MMType::IMAGE, MMItemVec{first}),
+                          MMData(MMType::IMAGE, MMItemVec{second})});
+  EncoderEmbeddingGatherVisitor gather(
+      /*num_computed_tokens=*/{2, 3}, /*num_scheduled_tokens=*/{3, 4});
+  ASSERT_TRUE(batch.foreach (gather));
+  ASSERT_TRUE(gather.finish(batch));
+  EXPECT_TRUE(torch::equal(batch.get<torch::Tensor>("image|embedding").value(),
+                           torch::tensor({{10.0, 11.0}, {20.0, 21.0}})));
+  EXPECT_TRUE(torch::equal(
+      batch.get<torch::Tensor>("image|mask").value(),
+      torch::tensor({true, false, false, false, false, true, false},
+                    torch::kBool)));
 }
 
 MMData make_codec_media() {

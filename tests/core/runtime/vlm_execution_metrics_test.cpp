@@ -183,6 +183,12 @@ ForwardInput make_mm_input(const torch::Device& device,
   EXPECT_TRUE(data.foreach (visitor));
   input.input_params.multimodal.mm_data =
       MMBatchData({MMData(visitor.scheduled_type_, visitor.mm_data_items_)});
+  input.input_params.execution_batch.num_reqs = 1;
+  input.input_params.execution_batch.num_tokens = 1;
+  input.input_params.execution_batch.num_scheduled_tokens = {1};
+  input.input_params.execution_batch.num_computed_tokens = {0};
+  input.input_params.execution_batch.query_start_loc = {0, 1};
+  input.input_params.execution_batch.is_prefilling = {1};
   return input;
 }
 

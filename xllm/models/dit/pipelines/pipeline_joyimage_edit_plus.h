@@ -600,7 +600,8 @@ class JoyImageEditPlusPipelineImpl : public torch::nn::Module,
         << "JoyImageEditPlus failed to scatter Qwen3-VL embeddings";
 
     EncoderEmbeddingGatherVisitor embedding_gather(
-        params.attention.host.kv_seq_lens, params.attention.host.q_seq_lens);
+        /*num_computed_tokens=*/{0},
+        /*num_scheduled_tokens=*/{sequence_length});
     CHECK(mm_batch.foreach (embedding_gather));
     CHECK(embedding_gather.finish(mm_batch))
         << "JoyImageEditPlus failed to gather Qwen3-VL embeddings";

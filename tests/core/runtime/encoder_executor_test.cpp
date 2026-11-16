@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "core/common/metrics.h"
@@ -27,14 +28,6 @@ limitations under the License.
 
 namespace xllm {
 namespace {
-
-std::vector<int32_t> sequence_lengths(int32_t length) {
-#if defined(USE_NPU) || defined(USE_MUSA)
-  return {length};
-#else
-  return {0, length};
-#endif
-}
 
 MMDataItem make_item(MMType modality,
                      int32_t offset,
@@ -55,8 +48,12 @@ ModelInputParams schedule(MMData data, int32_t computed, int32_t query_length) {
   ModelInputParams params;
   params.multimodal.mm_data =
       MMBatchData({MMData(visitor.scheduled_type_, visitor.mm_data_items_)});
-  params.attention.host.kv_seq_lens = sequence_lengths(computed + query_length);
-  params.attention.host.q_seq_lens = sequence_lengths(query_length);
+  params.execution_batch.num_reqs = 1;
+  params.execution_batch.num_tokens = query_length;
+  params.execution_batch.num_scheduled_tokens = {query_length};
+  params.execution_batch.num_computed_tokens = {computed};
+  params.execution_batch.query_start_loc = {0, query_length};
+  params.execution_batch.is_prefilling = {1};
   return params;
 }
 
@@ -290,21 +287,26 @@ TEST(EncoderExecutorTest, MissingMultimodalDataSkipsEncode) {
   EXPECT_EQ(calls, 0);
 }
 
-TEST(EncoderExecutorTest, EncodesGatheredItemsWithCurrentExecutionContext) {
-  MMDataItem first = make_item(MMType::IMAGE, 0, torch::tensor({true}), 11);
-  MMDataItem second = make_item(MMType::IMAGE, 1, torch::tensor({true}), 12);
+TEST(EncoderExecutorTest, UsesLogicalWindowsInsteadOfAttentionLayout) {
+  MMDataItem first = make_item(MMType::IMAGE, 2, torch::tensor({true}), 11);
+  MMDataItem second = make_item(MMType::IMAGE, 3, torch::tensor({true}), 12);
   first.add("pixel_values", torch::tensor({{1.0f, 2.0f}}));
   second.add("pixel_values", torch::tensor({{3.0f, 4.0f}}));
-  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{first, second}), 0, 2);
-  params.meta.num_sequences = 1;
+  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{first, second}), 2, 2);
+  // Attention rows can describe padding/expansion instead of logical requests.
+  params.meta.num_sequences = 64;
+  params.attention.host.kv_seq_lens = {0, 4};
+  params.attention.host.q_seq_lens = {0, 4};
   EncoderExecutor executor(0);
   int32_t encoder_calls = 0;
   executor.prepare(
       params, [&encoder_calls](const ModelInputParams& inputs) -> MMDict {
         ++encoder_calls;
-        EXPECT_EQ(inputs.meta.num_sequences, 1);
-        EXPECT_EQ(inputs.attention.host.kv_seq_lens, sequence_lengths(2));
-        EXPECT_EQ(inputs.attention.host.q_seq_lens, sequence_lengths(2));
+        EXPECT_EQ(inputs.execution_batch.num_reqs, 1);
+        EXPECT_EQ(inputs.execution_batch.num_scheduled_tokens,
+                  (std::vector<int32_t>{2}));
+        EXPECT_EQ(inputs.execution_batch.num_computed_tokens,
+                  (std::vector<int32_t>{2}));
         const torch::Tensor pixels =
             inputs.multimodal.mm_data.get<torch::Tensor>("pixel_values")
                 .value();
@@ -316,12 +318,50 @@ TEST(EncoderExecutorTest, EncodesGatheredItemsWithCurrentExecutionContext) {
   EXPECT_TRUE(torch::equal(
       params.multimodal.mm_data.get<torch::Tensor>("image|embedding").value(),
       torch::tensor({{10.0f, 20.0f}, {30.0f, 40.0f}})));
+  EXPECT_TRUE(torch::equal(
+      params.multimodal.mm_data.get<torch::Tensor>("image|mask").value(),
+      torch::tensor({true, true})));
 }
 
 class EncoderExecutorDeathTest : public ::testing::Test {
  protected:
   void SetUp() override { GTEST_FLAG_SET(death_test_style, "threadsafe"); }
 };
+
+TEST_F(EncoderExecutorDeathTest, RejectsMissingExecutionCounts) {
+  MMDataItem item = make_item(MMType::IMAGE, 0, torch::tensor({true}), 18);
+  auto params = schedule(MMData(MMType::IMAGE, MMItemVec{item}), 0, 1);
+  EncoderExecutor executor(0);
+  params.execution_batch = {};
+  EXPECT_DEATH(
+      executor.prepare(params,
+                       [](const ModelInputParams&) -> MMDict { return {}; }),
+      "multimodal encoder prepare requires execution_batch");
+
+  params = schedule(MMData(MMType::IMAGE, MMItemVec{item}), 0, 1);
+  params.execution_batch.num_computed_tokens.clear();
+  EXPECT_DEATH(
+      executor.prepare(params,
+                       [](const ModelInputParams&) -> MMDict { return {}; }),
+      "computed token counts do not match logical request count");
+}
+
+TEST_F(EncoderExecutorDeathTest, RejectsInvalidWindowCounts) {
+  EXPECT_DEATH(EncoderEmbeddingGatherVisitor(/*num_computed_tokens=*/{-1},
+                                             /*num_scheduled_tokens=*/{2}),
+               "negative computed token count");
+  EXPECT_DEATH(EncoderEmbeddingGatherVisitor(/*num_computed_tokens=*/{0},
+                                             /*num_scheduled_tokens=*/{-1}),
+               "negative scheduled token count");
+  EXPECT_DEATH(EncoderEmbeddingGatherVisitor(/*num_computed_tokens=*/{0},
+                                             /*num_scheduled_tokens=*/{}),
+               "computed and scheduled token counts do not match");
+  EXPECT_DEATH(
+      EncoderEmbeddingGatherVisitor(
+          /*num_computed_tokens=*/{0, 0},
+          /*num_scheduled_tokens=*/{std::numeric_limits<int32_t>::max(), 1}),
+      "scheduled token count exceeds multimodal mask capacity");
+}
 
 TEST_F(EncoderExecutorDeathTest, RejectsPrecomputedEmbeddingWithMissingRows) {
   MMDataItem item =

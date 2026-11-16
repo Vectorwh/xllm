@@ -13,17 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mm_visitor.h"
+#include "core/framework/multimodal/mm_visitor.h"
 
 #include <absl/strings/match.h>
 #include <glog/logging.h>
 
-#include <numeric>
+#include <limits>
 #include <optional>
 #include <utility>
 
-#include "common/metrics.h"
-#include "framework/encoder_cache/encoder_cache.h"
+#include "core/common/metrics.h"
+#include "core/framework/encoder_cache/encoder_cache.h"
 #include "processors/processor_cache.h"
 
 namespace xllm {
@@ -55,20 +55,6 @@ std::pair<int32_t, int32_t> compute_emb_range(int32_t start_pos,
   return {upto_start_pos, upto_end_pos};
 }
 
-std::vector<int32_t> normalize_to_per_seq_lens(
-    const std::vector<int32_t>& seq_lens) {
-#if defined(USE_NPU) || defined(USE_MUSA)
-  return seq_lens;
-#else
-  // Other backends pass cumulative sequence lengths.
-  std::vector<int32_t> per_seq_lens;
-  per_seq_lens.reserve(seq_lens.empty() ? 0 : seq_lens.size() - 1);
-  for (size_t i = 1; i < seq_lens.size(); ++i) {
-    per_seq_lens.push_back(seq_lens[i] - seq_lens[i - 1]);
-  }
-  return per_seq_lens;
-#endif
-}
 }  // namespace
 
 bool MMInputGatherVisitor::visit(const MMInputItem& item) {
@@ -295,26 +281,24 @@ bool EncoderOutputScatterVisitor::finish() const {
 }
 
 EncoderEmbeddingGatherVisitor::EncoderEmbeddingGatherVisitor(
-    const std::vector<int32_t>& seq_lens,
-    const std::vector<int32_t>& scheduled_seq_lens)
-    : per_seq_context_lens_(normalize_to_per_seq_lens(seq_lens)),
-      per_seq_scheduled_lens_(normalize_to_per_seq_lens(scheduled_seq_lens)),
-      per_seq_scheduled_offsets_(per_seq_scheduled_lens_.size(), 0),
-      total_scheduled_tokens_(std::accumulate(per_seq_scheduled_lens_.begin(),
-                                              per_seq_scheduled_lens_.end(),
-                                              0)) {
-  CHECK_EQ(per_seq_context_lens_.size(), per_seq_scheduled_lens_.size())
-      << "sequence length counts do not match";
-  for (size_t seq_index = 0; seq_index < per_seq_context_lens_.size();
+    std::vector<int32_t> num_computed_tokens,
+    const std::vector<int32_t>& num_scheduled_tokens)
+    : num_computed_tokens_(std::move(num_computed_tokens)) {
+  CHECK_EQ(num_computed_tokens_.size(), num_scheduled_tokens.size())
+      << "computed and scheduled token counts do not match";
+  per_seq_scheduled_offsets_.reserve(num_scheduled_tokens.size() + 1);
+  per_seq_scheduled_offsets_.emplace_back(0);
+  for (size_t seq_index = 0; seq_index < num_scheduled_tokens.size();
        ++seq_index) {
-    CHECK_GE(per_seq_context_lens_[seq_index],
-             per_seq_scheduled_lens_[seq_index])
-        << "kv length below q length for seq " << seq_index;
-  }
-  if (per_seq_scheduled_lens_.size() > 1) {
-    std::partial_sum(per_seq_scheduled_lens_.begin(),
-                     per_seq_scheduled_lens_.end() - 1,
-                     per_seq_scheduled_offsets_.begin() + 1);
+    CHECK_GE(num_computed_tokens_[seq_index], 0)
+        << "negative computed token count";
+    const int32_t scheduled_tokens = num_scheduled_tokens[seq_index];
+    CHECK_GE(scheduled_tokens, 0) << "negative scheduled token count";
+    CHECK_LE(scheduled_tokens,
+             std::numeric_limits<int32_t>::max() - total_scheduled_tokens_)
+        << "scheduled token count exceeds multimodal mask capacity";
+    total_scheduled_tokens_ += scheduled_tokens;
+    per_seq_scheduled_offsets_.emplace_back(total_scheduled_tokens_);
   }
 }
 
@@ -323,7 +307,7 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
 
   int32_t seq_index = state.seq_index();
   CHECK_GE(seq_index, 0);
-  CHECK_LT(static_cast<size_t>(seq_index), per_seq_scheduled_lens_.size())
+  CHECK_LT(static_cast<size_t>(seq_index), num_computed_tokens_.size())
       << "item sequence index outside scheduled batch";
 
   auto token_pos = item.state().token_pos();
@@ -335,18 +319,15 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
   // positions when slicing multimodal embeddings.
   auto [emb_start, emb_end] =
       compute_emb_range(start_pos, end_pos, state.mm_token_mask());
-  int32_t schedule_tokens_num = per_seq_scheduled_lens_[seq_index];
-  int32_t context_tokens_num = per_seq_context_lens_[seq_index];
-
-  int32_t computed_tokens_num = context_tokens_num - schedule_tokens_num;
-  int32_t req_start_idx_ = per_seq_scheduled_offsets_[seq_index];
-  int32_t req_start_pos =
-      req_start_idx_ + token_pos.offset - computed_tokens_num + start_pos;
-  int32_t req_end_pos =
-      req_start_idx_ + token_pos.offset - computed_tokens_num + end_pos;
-  CHECK_GE(req_start_pos, req_start_idx_)
+  int32_t computed_tokens_num = num_computed_tokens_[seq_index];
+  int32_t req_start_idx = per_seq_scheduled_offsets_[seq_index];
+  int64_t req_start_pos = static_cast<int64_t>(req_start_idx) +
+                          token_pos.offset - computed_tokens_num + start_pos;
+  int64_t req_end_pos = static_cast<int64_t>(req_start_idx) + token_pos.offset -
+                        computed_tokens_num + end_pos;
+  CHECK_GE(req_start_pos, req_start_idx)
       << "scatter range starts before its sequence window";
-  CHECK_LE(req_end_pos, req_start_idx_ + schedule_tokens_num)
+  CHECK_LE(req_end_pos, per_seq_scheduled_offsets_[seq_index + 1])
       << "scatter range ends past its sequence window";
 
   const std::string key = get_embedding_key(item.type());

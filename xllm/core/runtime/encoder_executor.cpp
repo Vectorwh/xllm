@@ -33,6 +33,18 @@ void EncoderExecutor::prepare(const ModelInputParams& params,
   if (!data.valid()) {
     return;
   }
+  const auto& batch = params.execution_batch;
+  CHECK_GT(batch.num_reqs, 0)
+      << "multimodal encoder prepare requires execution_batch with logical "
+         "requests";
+  CHECK_EQ(batch.num_scheduled_tokens.size(),
+           static_cast<size_t>(batch.num_reqs))
+      << "scheduled token counts do not match logical request count";
+  CHECK_EQ(batch.num_computed_tokens.size(),
+           static_cast<size_t>(batch.num_reqs))
+      << "computed token counts do not match logical request count";
+  EncoderEmbeddingGatherVisitor gather(batch.num_computed_tokens,
+                                       batch.num_scheduled_tokens);
   if (cache_) {
     EncoderCacheLookupVisitor lookup(cache_.get());
     CHECK(data.foreach (lookup));
@@ -50,8 +62,6 @@ void EncoderExecutor::prepare(const ModelInputParams& params,
     EncoderCacheInsertVisitor insert(cache_.get());
     CHECK(data.foreach (insert));
   }
-  EncoderEmbeddingGatherVisitor gather(params.attention.host.kv_seq_lens,
-                                       params.attention.host.q_seq_lens);
   CHECK(data.foreach (gather));
   CHECK(gather.finish(data));
 }

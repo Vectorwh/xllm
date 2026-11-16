@@ -18,14 +18,15 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include "mm_batch_data.h"
-#include "mm_data.h"
-#include "mm_input.h"
+#include "core/framework/multimodal/mm_batch_data.h"
+#include "core/framework/multimodal/mm_data.h"
+#include "core/framework/multimodal/mm_input.h"
 
 namespace xllm {
 
@@ -120,6 +121,7 @@ class EncoderOutputScatterVisitor : public MMDataItem::IVisitor {
 
   bool visit(MMDataItem& data) override;
   bool finish() const;
+
  public:
   const MMDict& data_;
   int32_t image_idx = 0;
@@ -129,14 +131,16 @@ class EncoderOutputScatterVisitor : public MMDataItem::IVisitor {
 
 class EncoderEmbeddingGatherVisitor final : public MMDataItem::IVisitor {
  public:
-  EncoderEmbeddingGatherVisitor(const std::vector<int32_t>& seq_lens,
-                                const std::vector<int32_t>& scheduled_seq_lens);
+  // Per-logical-request counts, independent of attention layouts or padding.
+  // Retain computed counts by value; scheduled counts become owned offsets.
+  EncoderEmbeddingGatherVisitor(
+      std::vector<int32_t> num_computed_tokens,
+      const std::vector<int32_t>& num_scheduled_tokens);
   bool visit(MMDataItem& data) override;
   bool finish(MMBatchData& mm_data);
 
- public:
-  std::vector<int32_t> per_seq_context_lens_;
-  std::vector<int32_t> per_seq_scheduled_lens_;
+ private:
+  std::vector<int32_t> num_computed_tokens_;
   std::vector<int32_t> per_seq_scheduled_offsets_;
   int32_t total_scheduled_tokens_ = 0;
   torch::Tensor image_mask_;
@@ -221,7 +225,7 @@ class MMSideOutputCacheVisitor final : public MMData::IVisitor,
 
 // Collects CTC tensors by sequence index, preserving full-batch empty slots.
 class MMSideOutputCollectVisitor final : public MMData::IVisitor,
-                          public MMDataItem::IVisitor {
+                                         public MMDataItem::IVisitor {
  public:
   explicit MMSideOutputCollectVisitor(int32_t num_sequences);
   bool visit(MMData& data) override;
