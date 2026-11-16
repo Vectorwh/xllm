@@ -43,14 +43,7 @@ class Qwen3DSparkConfig(DFlashQwen3Config):
         if nested is not None and not isinstance(nested, dict):
             raise ValueError("dflash_config must be a dict when present")
         nested = nested or {}
-        values = dict(d)
-        for name, alias, default in (
-            ("use_sliding_window", "use_swa", False),
-            ("sliding_window", "swa_window_size", -1),
-        ):
-            if values.get(name) is None:
-                values[name] = nested.get(alias) if nested.get(alias) is not None else default
-        base = DFlashQwen3Config.from_dict(values)
+        base = DFlashQwen3Config.from_dict(cls._apply_swa_aliases(d, nested))
         non_causal = d.get("sliding_window_non_causal")
         if non_causal is None:
             non_causal = not bool(nested.get("causal", True)) if nested.get("causal") is not None else False
@@ -91,8 +84,8 @@ class Qwen3DSparkConfig(DFlashQwen3Config):
 class Qwen3DSparkModel(DFlashQwen3Model):
     """DFlash draft backbone used with DSpark-specific output heads."""
 
-    def __init__(self, cfg: Qwen3DSparkConfig, dtype: torch.dtype, device: torch.device) -> None:
-        super().__init__(cfg, dtype, device)
+    def _configure_sliding_attention(self, cfg: Qwen3DSparkConfig) -> None:
+        # DSpark owns anchor windows rather than DFlash's per-query windows.
         if cfg.use_sliding_window:
             for layer in self.layers:
                 layer.self_attn.attn.causal = not cfg.sliding_window_non_causal

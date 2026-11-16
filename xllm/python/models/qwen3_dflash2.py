@@ -55,7 +55,6 @@ class DFlash2Qwen3Config(DFlashQwen3Config):
 
     @classmethod
     def from_dict(cls, d: dict) -> DFlash2Qwen3Config:
-        base = DFlashQwen3Config.from_dict(d)
         # Community DFlash2 checkpoints (incoai/GLM-5.3-DFlash2 and the
         # GLM-5.3-Flash pairing) nest the geometry under "dflash_config"
         # (block_size, conv_group_size, ...); our own exports use flat
@@ -65,6 +64,8 @@ class DFlash2Qwen3Config(DFlashQwen3Config):
         nested = d.get("dflash_config") or {}
         if not isinstance(nested, dict):
             raise ValueError(f"dflash_config must be a dict when present, got {type(nested).__name__}")
+
+        base = DFlashQwen3Config.from_dict(cls._apply_swa_aliases(d, nested))
 
         def pick(flat_key: str, nested_key: str) -> int:
             if flat_key in d:
@@ -80,8 +81,15 @@ class DFlash2Qwen3Config(DFlashQwen3Config):
             dflash2_selector_top_k=pick("dflash2_selector_top_k", "selector_top_k"),
         )
 
+    def _requires_explicit_sliding_layer_types(self) -> bool:
+        return False
+
     def validate(self) -> None:
         super().validate()
+        if self.layer_types and self.layer_types != ("sliding_attention",) * self.n_layers:
+            raise ValueError(
+                "DFlash2 applies the block window to every layer; layer_types must be all sliding or empty"
+            )
         if self.sliding_window <= 0:
             raise ValueError("DFlash2 requires sliding_window > 0")
         if self.dflash2_block_size <= 0:
@@ -305,6 +313,10 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             device,
         )
 
+    def _configure_sliding_attention(self, cfg: DFlashQwen3Config) -> None:
+        # DFlash2DecoderLayer owns the non-causal block window.
+        pass
+
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> ScopedWeightLoader:
         all_weights = super().load_weights(state_dicts, tp_rank, tp_size)
         # Replicated selector codebooks + projection; loaded from the model root.
@@ -318,6 +330,20 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     config_cls = DFlash2Qwen3Config
     model_cls = DFlash2Qwen3Model
+
+    def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
+        window = (self.cfg.sliding_window - 1, self.draft_query_width - 1)
+        return (
+            type(self) is DFlash2Qwen3ForCausalLM
+            and self.draft_query_width == self.cfg.dflash2_block_size
+            and self._supports_device_only_decode_geometry(kv_page_size)
+            and all(
+                not layer.self_attn.attn.causal
+                and layer.self_attn.attn.attention_window == window
+                and layer.self_attn.attn.sliding_window == self.cfg.sliding_window
+                for layer in self.model.layers
+            )
+        )
 
     def create_execution_pipeline(
         self,

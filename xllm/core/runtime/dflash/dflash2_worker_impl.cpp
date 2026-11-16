@@ -58,7 +58,7 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   ForwardInput query;
   prepare_query_inputs(input, query);
   query.input_params.use_dflash_proposal_attention =
-      proposal_xfia_enabled_ && !input.input_params.meta.is_graph_warmup;
+      proposal_attention_enabled_ && !input.input_params.meta.is_graph_warmup;
   const int32_t batch_size = input.input_params.meta.num_sequences;
   CHECK_GT(batch_size, 0);
   CHECK(input.token_ids_host.defined());

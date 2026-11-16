@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -184,9 +186,9 @@ def test_context_projection_writes_each_layer_cache(
     monkeypatch.setattr(
         kernels,
         "rms_norm",
-        lambda hidden, weight, eps: hidden
-        * torch.rsqrt(hidden.float().pow(2).mean(dim=-1, keepdim=True) + eps)
-        * weight,
+        lambda hidden, weight, eps: (
+            hidden * torch.rsqrt(hidden.float().pow(2).mean(dim=-1, keepdim=True) + eps) * weight
+        ),
         raising=False,
     )
     reshape_paged_cache = Mock()
@@ -336,8 +338,10 @@ def test_dflash2_nested_dflash_config_geometry_is_parsed() -> None:
         use_sliding_window=True,
         hidden_size=16,
     )
-    nested = dict(base, dflash_config=dict(geometry))
-    flat = dict(base, **{f"dflash2_{k}": v for k, v in geometry.items()})
+    base.pop("sliding_window")
+    base.pop("use_sliding_window")
+    nested = dict(base, dflash_config=dict(geometry, use_swa=True, swa_window_size=2048))
+    flat = dict(base, sliding_window=2048, use_sliding_window=True, **{f"dflash2_{k}": v for k, v in geometry.items()})
 
     nested_cfg = DFlash2Qwen3Config.from_dict(nested)
     flat_cfg = DFlash2Qwen3Config.from_dict(flat)
@@ -354,6 +358,8 @@ def test_dflash2_nested_dflash_config_geometry_is_parsed() -> None:
     assert nested_cfg.dflash2_conv_kernel_size == 2
     assert nested_cfg.dflash2_selector_rank == 256
     assert nested_cfg.dflash2_selector_top_k == 16
+    assert nested_cfg.sliding_window == flat_cfg.sliding_window == 2048
+    assert nested_cfg.use_sliding_window == flat_cfg.use_sliding_window is True
 
 
 def test_dflash2_flat_keys_take_precedence_over_nested_geometry() -> None:
@@ -372,9 +378,13 @@ def test_dflash2_flat_keys_take_precedence_over_nested_geometry() -> None:
         },
         dflash2_block_size=4,
     )
+    cfg_dict["use_sliding_window"] = False
+    cfg_dict["dflash_config"].update(use_swa=True, swa_window_size=1024)
     cfg = DFlash2Qwen3Config.from_dict(cfg_dict)
     assert cfg.dflash2_block_size == 4
     assert cfg.dflash2_selector_rank == 256
+    assert cfg.sliding_window == 2048
+    assert not cfg.use_sliding_window
 
 
 def test_dflash2_non_dict_dflash_config_raises() -> None:
@@ -390,3 +400,103 @@ def test_dflash2_non_dict_dflash_config_raises() -> None:
     cfg_dict = dict(base, dflash_config="not-a-dict")
     with pytest.raises(ValueError, match="dflash_config must be a dict"):
         DFlash2Qwen3Config.from_dict(cfg_dict)
+
+
+def test_dflash_mixed_windows_preserve_dflash2_block_attention() -> None:
+    from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3Config, DFlash2Qwen3Model
+
+    values = _config_dict(
+        num_hidden_layers=2,
+        sliding_window=8,
+        use_sliding_window=True,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+    cfg = DFlashQwen3Config.from_dict(values)
+    cfg.validate()
+    model = DFlashQwen3Model(cfg, torch.float32, torch.device("cpu"))
+    sliding, full = (layer.self_attn.attn for layer in model.layers)
+    assert sliding.causal and sliding.attention_window == (7, 0)
+    assert not full.causal and full.attention_window is None
+
+    values.update(
+        num_hidden_layers=1,
+        layer_types=["sliding_attention"],
+        dflash_config=dict(block_size=3, conv_group_size=2, conv_kernel_size=2, selector_rank=2, selector_top_k=2),
+    )
+    cfg2 = DFlash2Qwen3Config.from_dict(values)
+    cfg2.validate()
+    model2 = DFlash2Qwen3Model(cfg2, torch.float32, torch.device("cpu"))
+    attention2 = model2.layers[0].self_attn.attn
+    assert not attention2.causal and attention2.attention_window == (7, 2)
+
+    values.update(num_hidden_layers=2, layer_types=["sliding_attention", "full_attention"])
+    with pytest.raises(ValueError, match="DFlash2 applies the block window to every layer"):
+        DFlash2Qwen3Config.from_dict(values).validate()
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({}, "use_sliding_window=true"),
+        ({"use_sliding_window": False}, "use_sliding_window=true"),
+        ({"use_sliding_window": True, "cp_size": 2}, "cp_size=1"),
+    ],
+)
+def test_dflash_sliding_rejects_disabled_or_sharded_configuration(overrides: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _config(layer_types=["sliding_attention"], sliding_window=8, **overrides)
+
+
+@pytest.mark.parametrize(
+    "variant,expected",
+    [
+        ("full", True),
+        ("scalar-window", False),
+        ("causal", False),
+        ("mixed", False),
+        ("dflash2", True),
+        ("dflash2-width", False),
+    ],
+)
+def test_device_only_decode_admits_only_matching_attention(
+    monkeypatch: pytest.MonkeyPatch, variant: str, expected: bool
+) -> None:
+    from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
+
+    runtime = SimpleNamespace(is_ascend_a3=lambda: True)
+    monkeypatch.setitem(sys.modules, "xllm_runtime", runtime)
+    config = _config_dict(
+        hidden_size=256,
+        head_dim=128,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        draft_query_width=4,
+    )
+    model_cls = DFlashQwen3ForCausalLM
+    if variant.startswith("dflash2"):
+        model_cls = DFlash2Qwen3ForCausalLM
+        config.update(
+            sliding_window=8,
+            use_sliding_window=True,
+            dflash2_block_size=4,
+            dflash2_conv_group_size=16,
+            dflash2_conv_kernel_size=2,
+            dflash2_selector_rank=4,
+            dflash2_selector_top_k=4,
+        )
+    elif variant == "scalar-window":
+        config["sliding_window"] = 8
+    elif variant in ("causal", "mixed"):
+        config.update(
+            sliding_window=8,
+            use_sliding_window=True,
+            layer_types=["sliding_attention", "sliding_attention" if variant == "causal" else "full_attention"],
+        )
+    model = model_cls(config)
+    if variant == "dflash2-width":
+        model.draft_query_width = 3
+    assert model.supports_device_only_decode_inputs(128) is expected
+    assert not model.supports_device_only_decode_inputs(64)
+    runtime.is_ascend_a3 = lambda: False
+    assert not model.supports_device_only_decode_inputs(128)

@@ -485,10 +485,11 @@ TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
 #endif
 }
 
-TEST(ModelConfigValidationTest, Qwen35PythonDFlash2FollowsBackendSupport) {
+TEST(ModelConfigValidationTest, Qwen35PythonDFlashFollowsBackendSupport) {
   for (const std::string& model_type : {"qwen3_5_text", "qwen3_5_moe_text"}) {
     for (const std::string& model_impl : {"python", "py"}) {
-      for (const std::string& algorithm : {"DFlash2", "dflash2", "DFLASH2"}) {
+      for (const std::string& algorithm :
+           {"DFlash", "DFlash2", "dflash2", "DFLASH2", "dspark", "mtp"}) {
         const std::optional<std::string> error =
             ModelConfig::validate_python_speculative_decode(
                 model_impl,
@@ -501,9 +502,6 @@ TEST(ModelConfigValidationTest, Qwen35PythonDFlash2FollowsBackendSupport) {
         EXPECT_TRUE(error.has_value());
 #endif
       }
-      EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
-                      model_impl, model_type, "DFlash", 7)
-                      .has_value());
     }
   }
 }

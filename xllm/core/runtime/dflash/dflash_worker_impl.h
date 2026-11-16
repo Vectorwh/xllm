@@ -212,6 +212,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
 
   bool async_output_enabled_ = false;
   bool proposal_xfia_enabled_ = false;
+  bool proposal_attention_enabled_ = false;
   bool draft_prelaunch_enabled_for_init_ = false;
   std::optional<PendingContext> pending_context_;
   // One idle step's inputs; retired only after the following step is queued.

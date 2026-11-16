@@ -65,12 +65,24 @@ class DFlashQwen3Config(Qwen3Config):
     draft_vocab_size: int = 0
     world_size: int = 1
     use_sliding_window: bool = False
+    layer_types: tuple[str, ...] = ()
     # Context parallelism is a target-model concern: the draft does not shard
     # the sequence, but it is constructed on the same rank set as the target,
     # so the reflected ``world_size`` still includes the CP dimension. Track it
     # so ``validate`` can accept ``tp * dp * cp == world_size`` instead of
     # rejecting the configuration outright.
     cp_size: int = 1
+
+    @staticmethod
+    def _apply_swa_aliases(d: dict, nested: dict) -> dict:
+        values = dict(d)
+        for name, alias, default in (
+            ("use_sliding_window", "use_swa", False),
+            ("sliding_window", "swa_window_size", -1),
+        ):
+            if values.get(name) is None:
+                values[name] = nested.get(alias) if nested.get(alias) is not None else default
+        return values
 
     @classmethod
     def from_dict(cls, d: dict) -> DFlashQwen3Config:
@@ -87,6 +99,7 @@ class DFlashQwen3Config(Qwen3Config):
             draft_vocab_size=draft_vocab_size,
             world_size=int(d.get("world_size", base.tp_size * base.dp_size * cp_size)),
             use_sliding_window=bool(d.get("use_sliding_window", False)),
+            layer_types=tuple(d.get("layer_types") or ()),
             cp_size=cp_size,
         )
 
@@ -119,7 +132,24 @@ class DFlashQwen3Config(Qwen3Config):
                 raise ValueError("draft_vocab_size must be positive and divisible by tp_size")
         if self.layers_to_capture:
             raise ValueError("DFlash draft model does not support layers_to_capture")
+        if self._requires_explicit_sliding_layer_types() and self.use_sliding_window and not self.layer_types:
+            raise ValueError("DFlash sliding attention requires explicit layer_types")
+        if self.layer_types:
+            if len(self.layer_types) != self.n_layers:
+                raise ValueError("DFlash layer_types must contain one entry per hidden layer")
+            if any(layer_type not in ("sliding_attention", "full_attention") for layer_type in self.layer_types):
+                raise ValueError("DFlash layer_types must use sliding_attention or full_attention")
+            if "sliding_attention" in self.layer_types:
+                if self._requires_explicit_sliding_layer_types() and not self.use_sliding_window:
+                    raise ValueError("sliding_attention layers require use_sliding_window=true")
+                if self.sliding_window <= 0:
+                    raise ValueError("DFlash sliding attention requires sliding_window > 0")
+                if self.cp_size != 1:
+                    raise ValueError("sliding-window draft attention requires cp_size=1")
         self.head_split()
+
+    def _requires_explicit_sliding_layer_types(self) -> bool:
+        return True
 
     def _allows_reduced_vocab(self) -> bool:
         """Whether a draft vocabulary smaller than the target's is supported.
@@ -204,6 +234,7 @@ class DFlashQwen3Model(Qwen3Model):
             decoder_layer_cls=decoder_layer_cls,
         )
         self.cfg = cfg
+        self._configure_sliding_attention(cfg)
         self.dtype = dtype
         self.device = device
         self.fc = DFlashContextProjection(
@@ -221,6 +252,14 @@ class DFlashQwen3Model(Qwen3Model):
         self.register_buffer("_fused_kv_weight", None, persistent=False)
         self.register_buffer("_fused_kv_bias", None, persistent=False)
         self.register_buffer("_k_norm_weights", None, persistent=False)
+
+    def _configure_sliding_attention(self, cfg: DFlashQwen3Config) -> None:
+        # Legacy checkpoints omit layer_types and keep non-causal full attention.
+        for layer, layer_type in zip(self.layers, cfg.layer_types):
+            if layer_type == "sliding_attention":
+                attention = layer.self_attn.attn
+                attention.causal = True
+                attention.attention_window = (cfg.sliding_window - 1, 0)
 
     def _build_context_kv_buffers(self) -> None:
         kv_weights: list[torch.Tensor] = []
@@ -344,6 +383,7 @@ class DFlashQwen3Model(Qwen3Model):
 
 
 class DFlashQwen3ForCausalLM(PyModelBase):
+    uses_block_query_graph_metadata: bool = True
     model: DFlashQwen3Model
     # Subclasses override these to reuse this ctor with their own config/model
     # types (e.g. DFlash2) instead of duplicating the body.
@@ -372,6 +412,30 @@ class DFlashQwen3ForCausalLM(PyModelBase):
 
         return DFlashExecutionPipeline(
             self, builders, runner_config, attention_backend=attention_backend, restore_history=restore_history
+        )
+
+    def _supports_device_only_decode_geometry(self, kv_page_size: int) -> bool:
+        import xllm_runtime
+
+        return (
+            self.cfg.cp_size == 1
+            and self.cfg.n_heads % self.cfg.tp_size == 0
+            and self.cfg.n_kv_heads % self.cfg.tp_size == 0
+            and self.cfg.head_dim == 128
+            and kv_page_size == 128
+            and xllm_runtime.is_ascend_a3()
+        )
+
+    def supports_device_only_decode_inputs(self, kv_page_size: int) -> bool:
+        return (
+            type(self) is DFlashQwen3ForCausalLM
+            and self._supports_device_only_decode_geometry(kv_page_size)
+            and all(
+                not layer.self_attn.attn.causal
+                and layer.self_attn.attn.attention_window is None
+                and layer.self_attn.attn.sliding_window <= 0
+                for layer in self.model.layers
+            )
         )
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:

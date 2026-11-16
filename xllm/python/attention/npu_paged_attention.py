@@ -295,10 +295,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self.draft_query_width = draft_query_width
         self._draft_has_full_attention = draft_graph_window_size is None
         self.graph_capturable = graph_capturable
-        self.graph_token_capacity_ceiling = (
-            draft_graph_window_size + draft_query_width
-            if draft_query_width and draft_graph_window_size is not None and not use_xfia_decode
-            else 0
+        draft_window_history = draft_graph_window_size
+        if draft_window_history is None and sliding_window > 0:
+            draft_window_history = sliding_window - 1
+        self._draft_graph_token_capacity_ceiling = (
+            draft_window_history + draft_query_width if draft_query_width and draft_window_history is not None else 0
         )
         self._use_xfia_decode = use_xfia_decode
         self._device_only_decode_inputs = False
@@ -437,6 +438,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     @property
     def is_mla(self) -> bool:
         return self._is_mla
+
+    @property
+    def graph_token_capacity_ceiling(self) -> int:
+        return 0 if self._use_xfia_decode else self._draft_graph_token_capacity_ceiling
 
     @property
     def supports_anchor_context_window(self) -> bool:
@@ -941,7 +946,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             and not self._use_xfia_decode
             and _use_dflash_proposal_attention(metadata)
         )
-        if draft_graph or isinstance(attention_window, int):
+        # FIA BAND requires a compressed mask; its causal mask cannot express
+        # a non-causal proposal window. Reuse the explicit window path in eager.
+        draft_window = isinstance(attention_window, int) or (
+            attention_window is not None
+            and (draft_graph or (self.draft_query_width and not self._use_xfia_decode and not layer.causal))
+        )
+        xfia_proposal = self._use_xfia_decode and self.draft_query_width and _use_dflash_proposal_attention(metadata)
+        if draft_graph or draft_window or xfia_proposal:
             context = get_forward_context()
             if context.cp_context is not None or metadata.kv_split_size != 1:
                 raise NotImplementedError("draft proposal attention requires an unsharded KV pool")
@@ -952,14 +964,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 raise NotImplementedError("paged draft graph attention requires non-causal full layers")
             if attention_window is not None and metadata.dsa_graph_token_capacity <= 0:
                 raise ValueError("windowed draft graph attention requires a positive token capacity")
-        elif isinstance(attention_window, int) and (
-            not metadata.is_chunked_prefill
+        elif attention_window is not None and (
+            (not metadata.is_chunked_prefill and not (xfia_proposal and self._prepared_in_graph_mode))
             or metadata.is_prefill
             or metadata.is_mixed
-            or metadata.is_spec_verify
+            # Draft Graph also marks its expanded proposal rows as spec-verify.
+            or (metadata.is_spec_verify and not xfia_proposal)
             or self._use_expanded_decode
         ):
-            raise ValueError("anchor-window attention requires a chunked proposal batch")
+            raise ValueError("windowed draft attention requires a chunked proposal batch")
 
         # Context-Parallel prefill: q/k/v are this rank's sequence shard while
         # the slot_mapping/metadata still describe the full global sequence
@@ -980,7 +993,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
         if self._device_only_decode_inputs and _use_dflash_proposal_attention(metadata):
             return self._xfia_decode(q_3d, k_cache, v_cache, layer_id)
-        if isinstance(attention_window, int):
+        if draft_window:
             return self._draft_window_attention(q_3d, k_cache, v_cache, metadata, layer.causal, attention_window)
         if draft_graph:
             return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens, layer_id)
@@ -2370,16 +2383,17 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         v_cache: torch.Tensor,
         metadata: AttentionMetadata,
         causal: bool,
-        window: int,
+        window: int | tuple[int, int],
     ) -> torch.Tensor:
-        """Use the same fixed-anchor window for eager and captured proposals."""
+        """Apply anchor or per-query windows to captured proposal blocks."""
         context = get_forward_context()
         width = self.draft_query_width
         rows = query.shape[0]
         groups = rows // width
+        history = window[0] if isinstance(window, tuple) else window
         capacity = min(
             metadata.dsa_graph_token_capacity if self._prepared_in_graph_mode else max(self._actual_seq_kv),
-            window + width,
+            history + width,
         )
         cache_key = (_DraftGraphAttentionMetadata, capacity, width)
         plan = context.layer_shared_cache.get(cache_key)
@@ -2420,10 +2434,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         values.masked_fill_(~valid, 0)
         query = query.view(groups, width, self.num_heads, self.head_dim)
         visible = plan.visible[:, None, :].expand(groups, width, capacity)
-        if causal:
+        if causal or isinstance(window, tuple):
             query_positions = capacity - width + torch.arange(width, device=query.device)
             key_positions = torch.arange(capacity, device=query.device)
-            visible = visible & (key_positions[None, :] <= query_positions[:, None])[None, :, :]
+            if isinstance(window, tuple):
+                preceding, following = window
+                visible = visible & (key_positions[None, :] >= query_positions[:, None] - preceding)[None, :, :]
+                visible = visible & (key_positions[None, :] <= query_positions[:, None] + following)[None, :, :]
+            if causal:
+                visible = visible & (key_positions[None, :] <= query_positions[:, None])[None, :, :]
         output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query,
             keys,

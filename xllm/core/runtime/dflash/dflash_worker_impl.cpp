@@ -486,6 +486,11 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                           !options.enable_adaptive_speculative_decode();
   proposal_xfia_enabled_ =
       enable_dflash_proposal_xfia(parallel_args, device, options);
+  // Python block-query graphs need proposal metadata on non-XFIA NPUs too.
+  proposal_attention_enabled_ =
+      proposal_xfia_enabled_ ||
+      (Platform::is_npu() && ModelConfig::is_python_model_impl(
+                                 ModelConfig::get_instance().model_impl()));
   draft_prelaunch_enabled_for_init_ =
       async_output_enabled_ && proposal_xfia_enabled_ &&
       parallel_args.kv_split_size_effective() == 1;
@@ -531,12 +536,11 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
         model_weights_path, random_seed, master_status);
   } else {
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
-    // Draft config's use_sliding_window / sliding_window is intentionally
-    // ignored: xLLM NPU FIA hard-codes pre_tokens=INT_MAX, next_tokens=0
-    // and never plumbs sliding_window into the aclnn call. Attended kv_len
-    // on the draft path is bounded by the target sequence length, not by
-    // block_size, so enforcing a block_size-vs-window relationship here
-    // would compare the wrong quantities.
+    // Native draft attention ignores use_sliding_window / sliding_window:
+    // its NPU FIA uses pre_tokens=INT_MAX, next_tokens=0. Python draft
+    // attention consumes the window in npu_paged_attention.py. Neither path
+    // compares block_size with the window here: attended KV length also
+    // includes target context, rather than only the proposal block.
     result = draft_impl_->WorkerImpl::init_model(
         model_weights_path, random_seed, master_status);
   }
@@ -548,6 +552,18 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
   }
 
   if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    if (proposal_attention_enabled_ &&
+        (options_.speculative_algorithm() == "DFlash" ||
+         SpeculativeConfig::is_dflash2_algorithm(
+             options_.speculative_algorithm()))) {
+      draft_prelaunch_enabled_for_init_ =
+          draft_prelaunch_enabled_for_init_ &&
+          draft_impl_->supports_device_only_decode_inputs();
+      proposal_xfia_enabled_ = draft_prelaunch_enabled_for_init_;
+      draft_impl_->set_device_only_decode_inputs(proposal_xfia_enabled_);
+      LOG(INFO) << "DFlash device-only/prelaunch enabled="
+                << draft_prelaunch_enabled_for_init_;
+    }
     const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
     // DeepSeek-V4 DSpark checkpoints carry trained mtp.0.embed /
     // mtp.<last>.head tensors (with the draft-side QuaRot transform); replacing
@@ -703,7 +719,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   dflash_detail::reset_draft_model_metadata(query_input.input_params);
   query_input.input_params.use_dflash_proposal_attention =
       input.input_params.use_dflash_proposal_attention ||
-      (proposal_xfia_enabled_ && !input.input_params.meta.is_graph_warmup);
+      (proposal_attention_enabled_ && !input.input_params.meta.is_graph_warmup);
   query_input.input_params.meta.batch_forward_type = draft_batch_forward_type();
   if (draft_impl_->context_.get_model_args().dummy_token_count() == 1) {
     // The metadata builder uses zero query length to materialize a dummy row.
@@ -1118,6 +1134,9 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
   DraftBlock draft_block;
   if (!pending_rows.empty()) {
     draft_block = run_decode_draft_from_pending(input, pending_rows);
+    VLOG(1) << "DFlash draft prelaunch submitted: batch_id="
+            << input.input_params.meta.batch_id
+            << ", sequences=" << pending_rows.size();
     commit_pending_context();
     prepare_decode_input(input);
     prepare_validate_inputs(input, validate_input);
@@ -1325,7 +1344,7 @@ DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::run_decode_draft(
   ForwardInput query_input;
   prepare_query_inputs(input, query_input);
   query_input.input_params.use_dflash_proposal_attention =
-      proposal_xfia_enabled_ && !input.input_params.meta.is_graph_warmup;
+      proposal_attention_enabled_ && !input.input_params.meta.is_graph_warmup;
   DraftBlock draft_block =
       execute_greedy_draft_query(std::move(query_input), false);
   // Overlap validate input preparation with the async draft forward: the draft

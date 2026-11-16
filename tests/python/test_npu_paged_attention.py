@@ -372,7 +372,7 @@ def test_xfia_single_token_decode_uses_actual_window(
 @pytest.mark.parametrize("proposal_width", [8, 15])
 @pytest.mark.parametrize("expanded_graph", [False, True])
 def test_xfia_dflash2_chunked_query_keeps_band_window(
-    sliding_window: int, proposal_width: int, expanded_graph: bool
+    monkeypatch: pytest.MonkeyPatch, sliding_window: int, proposal_width: int, expanded_graph: bool
 ) -> None:
     backend = NpuPagedAttentionBackend(
         num_heads=4,
@@ -385,6 +385,7 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(
         dtype=torch.bfloat16,
         use_xfia_decode=True,
         xfia_query_width=proposal_width,
+        draft_query_width=proposal_width,
     )
     cache = torch.empty(40, 128, 1, 128, dtype=torch.bfloat16)
     backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
@@ -392,7 +393,9 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(
     metadata = SimpleNamespace(
         is_prefill=False,
         is_chunked_prefill=True,
-        is_spec_verify=False,
+        is_spec_verify=expanded_graph,
+        is_mixed=False,
+        kv_split_size=1,
         use_dflash_proposal_attention=True,
         block_table=table,
         kv_seq_lens=torch.tensor([2055, 2305], dtype=torch.int32),
@@ -400,7 +403,6 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(
     )
     if expanded_graph:
         metadata.is_chunked_prefill = False
-        metadata.is_spec_verify = True
         metadata.block_table = table.repeat_interleave(proposal_width, dim=0)
         metadata.kv_seq_lens = metadata.kv_seq_lens.repeat_interleave(proposal_width)
     context = ForwardContext(
@@ -410,8 +412,26 @@ def test_xfia_dflash2_chunked_query_keeps_band_window(
         layer_caches=[LayerCache(key=cache, value=cache)],
         execution_state=AclGraphExecutionState(persistent_buffers={}) if expanded_graph else None,
     )
+    monkeypatch.setattr(
+        sys.modules[NpuPagedAttentionBackend.__module__].kernels,
+        "reshape_paged_cache",
+        lambda *args: None,
+        raising=False,
+    )
+    monkeypatch.setattr(backend, "_xfia_decode", lambda query, *args: query.flatten(1))
+    query = torch.randn(2 * proposal_width, 4, 128)
+    key = torch.randn(2 * proposal_width, 1, 128)
+    layer = SimpleNamespace(
+        layer_id=0, causal=False, attention_window=(sliding_window - 1, proposal_width - 1) if sliding_window else None
+    )
     with forward_context(context):
         backend.prepare(metadata, graph_mode=expanded_graph)
+        torch.testing.assert_close(backend.execute(query, key, key, layer), query.flatten(1))
+        if sliding_window:
+            metadata.is_spec_verify = True
+            metadata.use_dflash_proposal_attention = False
+            with pytest.raises(ValueError, match="chunked proposal batch"):
+                backend.execute(query, key, key, layer)
     assert backend._xfia_query_ends.tolist() == list(range(1, 2 * proposal_width + 1))
     assert backend._xfia_kv_lengths.tolist() == [2055] * proposal_width + [2305] * proposal_width
     expected_starts = [
@@ -613,3 +633,124 @@ def test_xfia_matching_prompt_chunk_keeps_causal_prefill(
     layer = SimpleNamespace(layer_id=0, causal=True, attention_window=None)
     output = backend.execute(query, key, key, layer)
     torch.testing.assert_close(output, query.flatten(1))
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("graph_mode,capacity", [(True, 0), (False, 0), (True, 4)])
+def test_captured_draft_windows_move_with_each_query(
+    monkeypatch: pytest.MonkeyPatch, causal: bool, graph_mode: bool, capacity: int
+) -> None:
+    def _scatter(
+        slots: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+    ) -> None:
+        key_cache.flatten(0, 1).index_copy_(0, slots, key)
+        value_cache.flatten(0, 1).index_copy_(0, slots, value)
+
+    def _fia(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: object
+    ) -> tuple[torch.Tensor, None]:
+        if kwargs["input_layout"] == "TND":
+            table = kwargs["block_table"]
+            lengths = kwargs.get("actual_seq_kvlen", kwargs.get("actual_seq_lengths_kv"))
+            outputs = []
+            for row, length in enumerate(lengths):
+                positions = torch.arange(length)
+                slots = table[row, positions // 4].long() * 4 + positions % 4
+                q = query[row * 3 : (row + 1) * 3].transpose(0, 1)
+                k = key.flatten(0, 1)[slots].view(-1, 1, 1).permute(1, 2, 0)
+                v = value.flatten(0, 1)[slots].view(-1, 1, 1).transpose(0, 1)
+                scores = q @ k
+                if kwargs.get("sparse_mode") == 4:
+                    query_positions = length - 3 + torch.arange(3)
+                    visible = (positions[None, :] >= query_positions[:, None] - kwargs["pre_tokens"]) & (
+                        positions[None, :] <= query_positions[:, None] + kwargs["next_tokens"]
+                    )
+                    if kwargs.get("atten_mask") is not None:
+                        visible &= positions[None, :] <= query_positions[:, None]
+                    scores.masked_fill_(~visible, -torch.inf)
+                outputs.append((scores.softmax(-1) @ v).transpose(0, 1))
+            return torch.cat(outputs), None
+        assert kwargs["input_layout"] == "BSND"
+        scores = query.transpose(1, 2) @ key.permute(0, 2, 3, 1)
+        scores.masked_fill_(kwargs["atten_mask"], -torch.inf)
+        return (scores.softmax(-1) @ value.transpose(1, 2)).transpose(1, 2).contiguous(), None
+
+    monkeypatch.setattr(sys.modules["xllm.python.kernels"], "reshape_paged_cache", _scatter, raising=False)
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", _fia, raising=False)
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score_v2", _fia, raising=False)
+    table = torch.tensor([[2, 0, 1], [6, 7, 4]], dtype=torch.int32)
+    cache = LayerCache(torch.full((8, 4, 1, 1), float("nan")), torch.full((8, 4, 1, 1), float("nan")))
+    for row, anchor in enumerate((3, 8)):
+        positions = torch.arange(anchor)
+        physical = table[row, positions // 4].long() * 4 + positions % 4
+        cache.key.flatten(0, 1).index_fill_(0, physical, 0)
+        cache.value.flatten(0, 1)[physical] = (positions + 100 * row).float().view(-1, 1, 1)
+    metadata = SimpleNamespace(
+        block_table=table.repeat_interleave(3, dim=0),
+        kv_seq_lens=torch.tensor([6] * 3 + [11] * 3, dtype=torch.int32),
+        kv_seq_lens_host_values=[6] * 3 + [11] * 3,
+        slot_mapping=torch.tensor([11, 0, 1, 16, 17, 18]),
+        q_cu_seq_lens=None,
+        q_cu_seq_lens_host_values=list(range(1, 7)),
+        is_prefill=False,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        use_dflash_proposal_attention=True,
+        kv_split_size=1,
+        dsa_graph_token_capacity=8,
+    )
+    backend = NpuPagedAttentionBackend(1, 1, 1, 1.0, 4, False, torch.device("cpu"), torch.float32, draft_query_width=3)
+    metadata.dsa_graph_token_capacity = capacity or backend.graph_token_capacity_ceiling
+    if not graph_mode:
+        metadata.block_table = table
+        metadata.kv_seq_lens = torch.tensor([6, 11], dtype=torch.int32)
+        metadata.kv_seq_lens_host_values = [6, 11]
+        metadata.q_cu_seq_lens = torch.tensor([0, 3, 6], dtype=torch.int32)
+        metadata.q_cu_seq_lens_host_values = [0, 3, 6]
+        metadata.is_chunked_prefill = True
+    # CPU reference operators need no NPU workspace.
+    backend._draft_graph_workspaces[6] = torch.empty(0)
+    backend.bind_kv_caches([cache])
+    layer = SimpleNamespace(layer_id=0, causal=causal, attention_window=(3, 0 if causal else 2))
+    context = ForwardContext(backend, torch.device("cpu"), metadata, [cache])
+    query = key = torch.zeros(6, 1, 1)
+    value = torch.tensor([3, 4, 5, 108, 109, 110], dtype=torch.float32).view(6, 1, 1)
+    with forward_context(context):
+        backend.prepare(metadata, graph_mode=graph_mode)
+        output = backend.execute(query, key, value, layer)
+        # A full layer shares this proposal's paging and execution context.
+        full = backend.execute(query, key, value, SimpleNamespace(layer_id=0, causal=False, attention_window=None))
+    expected = [1.5, 2.5, 3.5, 106.5, 107.5, 108.5] if causal else [2.5, 3, 3.5, 107.5, 108, 108.5]
+    if capacity:
+        expected = [2.5, 3, 3.5, 107.5, 108, 108.5] if causal else [3.5] * 3 + [108.5] * 3
+    torch.testing.assert_close(output.flatten(), torch.tensor(expected))
+    torch.testing.assert_close(full.flatten(), torch.tensor([2.5] * 3 + [105.0] * 3))
+    with forward_context(context):
+        if graph_mode:
+            metadata.dsa_graph_token_capacity = 0
+            backend.prepare(metadata, graph_mode=True)
+            with pytest.raises(ValueError, match="positive token capacity"):
+                backend.execute(query, key, value, layer)
+        else:
+            metadata.is_chunked_prefill = False
+            backend.prepare(metadata)
+            with pytest.raises(ValueError, match="chunked proposal batch"):
+                backend.execute(query, key, value, layer)
+
+
+def test_device_only_mode_keeps_graph_capacity_consistent() -> None:
+    backend = NpuPagedAttentionBackend(
+        2, 1, 128, 0.125, 8, False, torch.device("cpu"), torch.float32, draft_query_width=4
+    )
+    assert backend.graph_token_capacity_ceiling == 11
+    backend.set_device_only_decode_inputs(True, 4)
+    assert backend.graph_token_capacity_ceiling == 0
+    assert not backend.requires_host_kv_lengths
+    backend.set_device_only_decode_inputs(False, 4)
+    assert backend.graph_token_capacity_ceiling == 11
+    assert backend.requires_host_kv_lengths

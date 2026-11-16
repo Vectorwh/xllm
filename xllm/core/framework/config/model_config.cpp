@@ -163,12 +163,12 @@ std::optional<std::string> ModelConfig::validate_python_speculative_decode(
     return std::nullopt;
   }
 #if defined(USE_NPU)
-  if (speculative_algorithm == "DSpark" || speculative_algorithm == "MTP" ||
-      SpeculativeConfig::is_dflash2_algorithm(speculative_algorithm)) {
+  if (SpeculativeConfig::is_mtp_algorithm(speculative_algorithm) ||
+      SpeculativeConfig::is_block_diffusion_algorithm(speculative_algorithm)) {
     return std::nullopt;
   }
   return "Qwen3.5 Python model executor does not support speculative decoding; "
-         "use speculative_algorithm=DSpark, MTP, or DFlash2, set "
+         "use speculative_algorithm=DSpark, MTP, DFlash, or DFlash2, set "
          "num_speculative_tokens=0, or "
          "use the native model executor";
 #else

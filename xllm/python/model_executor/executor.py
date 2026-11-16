@@ -219,12 +219,13 @@ def _create_attention_backend(
         if dflash_xfia_enabled:
             proposal_width = int(config.get("draft_query_width", proposal_width))
         use_xfia_decode = False
-        if proposal_width > 0 and dflash_xfia_enabled:
+        if proposal_width > 0 and dflash_xfia_enabled and not block_query_graph_metadata:
             import xllm_runtime
 
             # C++ enable_dflash_proposal_xfia already applied the prelaunch gate.
             # Confirm the device here so a stale config cannot enable XFIA off A3.
             use_xfia_decode = xllm_runtime.is_ascend_a3()
+        # Block-query models finalize device-only mode after loading, before KV binding.
         draft_graph_options = {}
         if block_query_graph_metadata:
             window = first_attention.attention_window

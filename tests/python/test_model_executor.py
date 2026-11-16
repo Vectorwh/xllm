@@ -651,10 +651,12 @@ class TestCreateAttentionBackend:
 
     @pytest.mark.parametrize("is_ascend_a3", [False, True])
     @pytest.mark.parametrize("dflash_xfia_enabled", [False, True])
+    @pytest.mark.parametrize("block_query_graph_metadata", [False, True])
     def test_dspark_xfia_uses_generic_proposal_width(
         self,
         is_ascend_a3: bool,
         dflash_xfia_enabled: bool,
+        block_query_graph_metadata: bool,
     ) -> None:
         native_query = MagicMock(return_value=is_ascend_a3)
         runtime = types.ModuleType("xllm_runtime")
@@ -674,10 +676,13 @@ class TestCreateAttentionBackend:
                     "dflash2_block_size": 0,
                     "dflash_xfia_enabled": dflash_xfia_enabled,
                 },
+                block_query_graph_metadata=block_query_graph_metadata,
             )
-        assert backend.init_kwargs["use_xfia_decode"] == (is_ascend_a3 and dflash_xfia_enabled)
+        assert backend.init_kwargs["use_xfia_decode"] == (
+            is_ascend_a3 and dflash_xfia_enabled and not block_query_graph_metadata
+        )
         assert backend.init_kwargs["xfia_query_width"] == (15 if dflash_xfia_enabled else 1)
-        if dflash_xfia_enabled:
+        if dflash_xfia_enabled and not block_query_graph_metadata:
             native_query.assert_called_once_with()
         else:
             native_query.assert_not_called()
