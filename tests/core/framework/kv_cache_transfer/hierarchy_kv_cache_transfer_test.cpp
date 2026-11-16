@@ -392,11 +392,22 @@ TEST(HierarchyKVCacheTransferTest,
                                     create_options);
 
   GTEST_FLAG_SET(death_test_style, "threadsafe");
+  // A missing handle fails the batch by throwing (the former process abort
+  // was degraded so one lost registration cannot restart the whole group);
+  // assert the throw and its message instead of a death.
+  auto expect_missing_handle_failure = [&transfer](ModelInputParams& params) {
+    try {
+      transfer.set_layer_synchronizer(params);
+      FAIL() << "expected the missing-handle batch failure";
+    } catch (const std::runtime_error& error) {
+      EXPECT_NE(std::string(error.what()).find("Host restore handle missing"),
+                std::string::npos);
+    }
+  };
   ModelInputParams missing;
   missing.meta.batch_id = kBatchId;
   missing.meta.requires_host_restore = true;
-  EXPECT_DEATH(transfer.set_layer_synchronizer(missing),
-               "Missing Host restore handle");
+  expect_missing_handle_failure(missing);
 
   BlockTransferInfo offload_info(kSourceBlockId, /*dst_block_id=*/0);
   offload_info.block_type = BlockType::KV;
@@ -409,8 +420,7 @@ TEST(HierarchyKVCacheTransferTest,
   EXPECT_EQ(transfer.transfer_kv_blocks(kBatchId, {load_info}), 1U);
 
   missing.meta.batch_id = kBatchId + 1;
-  EXPECT_DEATH(transfer.set_layer_synchronizer(missing),
-               "Missing Host restore handle");
+  expect_missing_handle_failure(missing);
 
   ModelInputParams input_params;
   input_params.meta.batch_id = kBatchId;
@@ -418,13 +428,26 @@ TEST(HierarchyKVCacheTransferTest,
   transfer.set_layer_synchronizer(input_params);
   ASSERT_NE(input_params.parallel.layer_wise_load_synchronizer, nullptr);
   EXPECT_FALSE(input_params.meta.requires_host_restore);
+  EXPECT_EQ(input_params.parallel.layer_wise_load_batch_id, kBatchId);
   const auto synchronizer = input_params.parallel.layer_wise_load_synchronizer;
   transfer.set_layer_synchronizer(input_params);
   EXPECT_EQ(input_params.parallel.layer_wise_load_synchronizer, synchronizer);
   EXPECT_FALSE(input_params.meta.requires_host_restore);
+  // A stale flag that carries a synchronizer installed for ANOTHER batch
+  // must not silently reuse it: the layer events belong to that batch, not
+  // this one. The batch-id stamp fails the batch instead.
+  ModelInputParams foreign = input_params;
+  foreign.meta.batch_id = kBatchId + 5;
+  foreign.meta.requires_host_restore = true;
+  try {
+    transfer.set_layer_synchronizer(foreign);
+    FAIL() << "expected the foreign-synchronizer batch failure";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find("belongs to another batch"),
+              std::string::npos);
+  }
   missing.meta.batch_id = kBatchId;
-  EXPECT_DEATH(transfer.set_layer_synchronizer(missing),
-               "Missing Host restore handle");
+  expect_missing_handle_failure(missing);
   ModelInputParams next;
   next.meta.batch_id = kBatchId + 1;
   transfer.set_layer_synchronizer(next);

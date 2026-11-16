@@ -502,12 +502,16 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
     const_cast<ModelInputParams*>(&(input.input_params))
         ->parallel.layer_synchronizer = layer_synchronizer;
 
+    // Cancel hook: aborting the layer synchronizer unblocks a push thread
+    // spinning in synchronize_layer, so it stops reading source KV blocks,
+    // reports its keys as failed, and completes.
     kv_transfers.add(runtime_.worker.kv_cache_transfer_->push_kv_blocks_async(
                          input.transfer_kv_infos,
                          runtime_.context->get_parallel_args(),
                          layer_synchronizer,
                          runtime_.worker.is_spec_draft_),
-                     unique_transfer_request_ids(input.transfer_kv_infos));
+                     unique_transfer_request_ids(input.transfer_kv_infos),
+                     [layer_synchronizer] { layer_synchronizer->abort(); });
 #endif
   }
 

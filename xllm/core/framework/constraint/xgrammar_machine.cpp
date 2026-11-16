@@ -97,6 +97,12 @@ bool XGrammarConstraintMachine::is_complete(
   return s.is_valid() && s.is_completed();
 }
 
+bool XGrammarConstraintMachine::is_terminated(
+    const ConstraintState& state) const {
+  const XGrammarState& s = cast(state);
+  return s.is_valid() && s.is_terminated();
+}
+
 bool XGrammarConstraintMachine::advance(ConstraintState& state,
                                         int32_t token_id,
                                         HaltPolicy halt) const {

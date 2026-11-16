@@ -18,6 +18,7 @@ limitations under the License.
 #include <folly/futures/Future.h>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -57,17 +58,30 @@ class KVTransferCompletion final {
   KVTransferCompletion& operator=(KVTransferCompletion&&) = delete;
 
   void add(folly::SemiFuture<std::vector<KVTransferTaskResult>> future,
-           std::vector<std::string> fallback_request_ids);
+           std::vector<std::string> fallback_request_ids,
+           std::function<void()> cancel = {});
 
   // Waits until all owned transfers finish and returns the failed request IDs.
   std::unordered_set<std::string> wait();
 
  private:
+  // Aggregates the pending futures into one completion bounded by
+  // collect_timeout. Returns the aggregated Try: hasValue means every transfer
+  // finished; an empty Try means the collection timed out. Callers that only
+  // need termination may discard the value.
+  folly::Try<std::vector<folly::Try<std::vector<KVTransferTaskResult>>>>
+  collect_pending(std::chrono::milliseconds collect_timeout);
+
   std::chrono::milliseconds wait_timeout_;
   std::unique_ptr<KVTransferTracker> tracker_;
   struct PendingTransfer {
     folly::SemiFuture<std::vector<KVTransferTaskResult>> future;
     std::vector<std::string> fallback_request_ids;
+    // Unblocks a stuck transfer (e.g. aborts the layer synchronizer) so the
+    // push thread stops reading source KV blocks, reports its keys as
+    // failed, and completes its future. Empty when the transfer cannot be
+    // cancelled; the destruction path then keeps its fail-safe.
+    std::function<void()> cancel;
   };
   std::vector<PendingTransfer> futures_;
   std::unordered_set<std::string> failed_request_ids_;
@@ -121,8 +135,16 @@ class KVTransferTracker final {
 
   std::shared_ptr<Completion> track();
   bool has_pending() const;
+  // Number of tracked transfers whose completion token is still held, i.e.
+  // transfers whose push thread has not finished. Read before abandon():
+  // abandon itself clears the count.
+  size_t pending_count() const;
   void wait();
   bool wait_for(std::chrono::milliseconds timeout);
+  // Clears the pending count so wait()/~KVTransferTracker() return without
+  // waiting for transfers that will never finish. Late completions are
+  // logged and ignored.
+  void abandon();
 
  private:
   std::shared_ptr<State> state_;

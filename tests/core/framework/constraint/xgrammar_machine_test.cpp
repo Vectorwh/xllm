@@ -79,6 +79,17 @@ TEST(XGrammarMachineTest, StopTokenIsAcceptedOnlyAtATerminalState) {
     ASSERT_TRUE(machine->advance(matched, token, HaltPolicy::RESPECT));
   }
   EXPECT_TRUE(machine->advance(matched, kStopTokenId, HaltPolicy::RESPECT));
+  EXPECT_TRUE(machine->is_complete(matched));
+  EXPECT_TRUE(machine->is_terminated(matched));
+  // Schedule overlap must observe the terminal state instead of advancing a
+  // matcher that has already consumed its stop token.
+  EXPECT_FALSE(machine->can_accept(matched, 0));
+  EXPECT_FALSE(machine->advance(matched, 0, HaltPolicy::IGNORE));
+  const auto terminated_mask = machine->allowed_bitmask(matched);
+  ASSERT_FALSE(terminated_mask.empty());
+  for (const uint32_t word : terminated_mask) {
+    EXPECT_EQ(word, 0u);
+  }
 }
 
 TEST(XGrammarMachineTest, AdvanceCommitsTokensAndDetectsCompletion) {

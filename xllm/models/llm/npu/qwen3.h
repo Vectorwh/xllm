@@ -495,13 +495,27 @@ REGISTER_MODEL_ARGS_WITH_VARNAME(qwen3_atb, qwen3_atb, [&] {
   LOAD_ARG_OR(intermediate_size, "intermediate_size", 18944);
   LOAD_ARG_OR(max_position_embeddings, "max_position_embeddings", 32768);
   LOAD_ARG_OR(rms_norm_eps, "rms_norm_eps", 1e-6);
-  LOAD_ARG_OR(eos_token_id, "eos_token_id", 151643);
+  // qwen3-family checkpoints (e.g. DFlash2 drafts) may publish multiple end
+  // tokens as an array; accept both shapes like the llm/qwen3.h loader.
+  std::vector<int32_t> eos_token_ids =
+      json.value_int_or_array("eos_token_id")
+          .value_or(std::vector<int32_t>{151643});
+  SET_ARG(eos_token_id_vec, eos_token_ids);
+  args->eos_token_id() = args->eos_token_id_vec().front();
   LOAD_ARG_OR(rope_theta, "rope_theta", 1000000.0f);
 
   // For qwen3/2.5 model < 7B,  tie_word_embeddings = true
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);
 
-  LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
+  LOAD_ARG_OR(use_sliding_window,
+              "use_sliding_window",
+              json.value_or<bool>("dflash_config.use_swa", false));
+  LOAD_ARG_OR(sliding_window_non_causal,
+              "sliding_window_non_causal",
+              !json.value_or<bool>("dflash_config.causal", true));
+  LOAD_ARG_OR(sliding_window,
+              "sliding_window",
+              json.value_or<int32_t>("dflash_config.swa_window_size", -1));
   LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
 
   // DSpark: low-rank dim of the Markov head (top-level config key, like vLLM's
@@ -511,11 +525,24 @@ REGISTER_MODEL_ARGS_WITH_VARNAME(qwen3_atb, qwen3_atb, [&] {
   LOAD_ARG_OR(
       confidence_head_with_markov, "confidence_head_with_markov", false);
 
+  // DFlash2 draft configs publish their kernel geometry under
+  // dflash_config; the npu loader previously missed these fields so any
+  // qwen3-family DFlash2 draft failed the block-size check.
+  LOAD_ARG_OR(dflash2_block_size, "dflash_config.block_size", 0);
+  LOAD_ARG_OR(dflash2_conv_group_size, "dflash_config.conv_group_size", 0);
+  LOAD_ARG_OR(dflash2_conv_kernel_size, "dflash_config.conv_kernel_size", 0);
+  LOAD_ARG_OR(dflash2_selector_rank, "dflash_config.selector_rank", 0);
+  LOAD_ARG_OR(dflash2_selector_top_k, "dflash_config.selector_top_k", 0);
+  SET_ARG(dflash2_target_layer_ids,
+          AuxHiddenCapture::read_capture_layer_ids(json));
+
   LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
     return args->hidden_size() / args->n_heads();
   });
 
-  SET_ARG(stop_token_ids, std::unordered_set<int32_t>({args->eos_token_id()}));
+  SET_ARG(stop_token_ids,
+          std::unordered_set<int32_t>(args->eos_token_id_vec().begin(),
+                                      args->eos_token_id_vec().end()));
 });
 
 }  // namespace xllm::npu::model

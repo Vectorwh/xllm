@@ -22,10 +22,12 @@ limitations under the License.
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "common/metrics.h"
 #include "core/common/types.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/parallel_state/process_group.h"
@@ -242,15 +244,98 @@ TEST(KVTransferCompletionTest, DrainsPendingTransferAfterTimeout) {
   EXPECT_EQ(result.get(), (std::unordered_set<std::string>{"request-timeout"}));
 }
 
-TEST(KVTransferCompletionTest, RejectsPendingTransferAtDestruction) {
-  EXPECT_DEATH(
-      {
-        folly::Promise<std::vector<KVTransferTaskResult>> promise;
-        KVTransferCompletion completion;
-        completion.add(promise.getSemiFuture(), {"request-pending"});
-      },
-      "pending KV transfers");
+TEST(KVTransferCompletionTest, DrainsPendingTransferAtDestruction) {
+  // An exception unwinding the worker step skips wait(); the destructor must
+  // drain the pending transfer instead of aborting the process. The transfer
+  // completes while the destructor is draining, mirroring an in-flight push
+  // that finishes after the step already failed.
+  folly::Promise<std::vector<KVTransferTaskResult>> promise;
+  auto setter = std::async(std::launch::async, [&promise]() {
+    std::this_thread::sleep_for(50ms);
+    promise.setValue(std::vector<KVTransferTaskResult>{});
+  });
+  {
+    KVTransferCompletion completion;
+    completion.add(promise.getSemiFuture(), {"request-pending"});
+  }
+  setter.get();
+  SUCCEED();
 }
+
+TEST(KVTransferCompletionTest, DrainsCompletedTransferAtDestruction) {
+  folly::Promise<std::vector<KVTransferTaskResult>> promise;
+  {
+    KVTransferCompletion completion;
+    completion.add(promise.getSemiFuture(), {"request-pending"});
+    promise.setValue(std::vector<KVTransferTaskResult>{
+        KVTransferTaskResult{{"request-pending"}, KVTransferErrorCode::NONE}});
+  }
+  SUCCEED();
+}
+
+TEST(KVTransferCompletionTest, PropagatesExceptionAfterDestructionDrain) {
+  // The unwinding exception must survive the destructor's drain: the drain
+  // itself never throws, so the original failure reaches the handler.
+  try {
+    folly::Promise<std::vector<KVTransferTaskResult>> promise;
+    KVTransferCompletion completion;
+    completion.add(promise.getSemiFuture(), {"request-pending"});
+    promise.setValue(std::vector<KVTransferTaskResult>{});
+    throw std::runtime_error("forward failed");
+  } catch (const std::runtime_error& error) {
+    EXPECT_STREQ(error.what(), "forward failed");
+  }
+}
+
+// A cancel hook that ignores abort is the extreme tail: the destructor
+// cancels, drains the bounded window, then releases the leaked tracker
+// token with abandon() instead of hanging the destroying thread.
+TEST(KVTransferCompletionTest, AbandonsStuckTransferAtDestruction) {
+  // Both counters are process-global and monotonic, so assert the delta of
+  // this test's own completion rather than absolute values: --gtest_repeat
+  // or a second abandon case in the same binary would otherwise fail.
+  const double pending_before =
+      COUNTER_VALUE(kv_transfer_destruction_pending_total);
+  const double abandoned_before =
+      COUNTER_VALUE(kv_transfer_destruction_abandoned_total);
+  folly::Promise<std::vector<KVTransferTaskResult>> promise;
+  {
+    KVTransferCompletion completion(1ms);
+    completion.add(promise.getSemiFuture(),
+                   {"request-stuck"},
+                   /*cancel=*/[] {});  // abort that unblocks nothing.
+  }
+  SUCCEED();  // Destructor cancels, drains 1s, abandons, and returns.
+  // The accepted-risk abandon is counted, not just logged.
+  EXPECT_GE(COUNTER_VALUE(kv_transfer_destruction_pending_total),
+            pending_before + 1.0);
+  EXPECT_EQ(COUNTER_VALUE(kv_transfer_destruction_abandoned_total),
+            abandoned_before + 1.0);
+}
+
+// The cancel hook mirrors the layer-synchronizer abort contract: it unblocks
+// the stuck push so the transfer completes during the bounded drain and no
+// failure path is needed at all.
+TEST(KVTransferCompletionTest, CancelUnblocksStuckTransferAtDestruction) {
+  folly::Promise<std::vector<KVTransferTaskResult>> promise;
+  auto* promise_ptr = &promise;
+  {
+    KVTransferCompletion completion(1ms);
+    completion.add(promise.getSemiFuture(), {"request-stuck"}, [promise_ptr] {
+      // Simulate abort() making the push thread report
+      // failure and complete.
+      promise_ptr->setValue(
+          std::vector<KVTransferTaskResult>{KVTransferTaskResult{
+              {"request-stuck"}, KVTransferErrorCode::FAILED}});
+    });
+  }
+  SUCCEED();  // Destructor cancels, drain converges immediately.
+}
+
+// An uncancellable stuck transfer keeps the original fail-safe: the
+// destructor would hit LOG(FATAL) after the bounded drain. This path is not
+// death-tested here because folly's HeapTimekeeper thread does not survive
+// the fork used by EXPECT_DEATH, so within() can never fire in the child.
 
 TEST(KVTransferTrackerTest, WaitsForEveryTrackedTransfer) {
   KVTransferTracker tracker;

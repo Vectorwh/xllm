@@ -58,6 +58,13 @@ bool DenyConstraintMachine::is_complete(
   return false;
 }
 
+bool DenyConstraintMachine::is_terminated(
+    const ConstraintState& /*state*/) const {
+  // A deny state never completes and never terminates; every token is
+  // rejected through the normal error channel instead.
+  return false;
+}
+
 bool DenyConstraintMachine::advance(ConstraintState& /*state*/,
                                     int32_t /*token_id*/,
                                     HaltPolicy /*halt*/) const {

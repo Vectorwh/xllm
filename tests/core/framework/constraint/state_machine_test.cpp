@@ -52,14 +52,22 @@ TEST(ConstraintStateMachineTest, InitialStateAcceptsDocumentPrefix) {
 TEST(ConstraintStateMachineTest, AdvanceCommitsTokensAndDetectsCompletion) {
   std::shared_ptr<BuiltinJsonConstraintMachine> machine = make_machine();
   ConstraintState state = machine->initial_state(false);
+  EXPECT_FALSE(machine->is_terminated(state));
   for (const int32_t token : kDocTokens) {
     EXPECT_TRUE(machine->advance(state, token, HaltPolicy::RESPECT));
   }
   EXPECT_TRUE(machine->is_complete(state));
+  // The builtin grammar has no separate stop-token state: completing the
+  // root leaves no legal advance (a token past it is a positional
+  // rejection), so completion is termination. Contrast with XGrammar, whose
+  // root can complete before the stop token is consumed.
+  EXPECT_TRUE(machine->is_terminated(state));
+  EXPECT_TRUE(state.is_terminated());
 
   ConstraintState bad = machine->initial_state(false);
   EXPECT_FALSE(machine->advance(bad, 1, HaltPolicy::IGNORE));  // "}" first
   EXPECT_FALSE(machine->is_valid(bad));
+  EXPECT_FALSE(machine->is_terminated(bad));
 }
 
 TEST(ConstraintStateMachineTest, RespectHaltFreezesPositionalRejections) {
@@ -126,6 +134,7 @@ TEST(ConstraintStateMachineTest, DenyMachineRejectsEverything) {
   EXPECT_TRUE(state.initialized());
   EXPECT_FALSE(machine->is_valid(state));
   EXPECT_FALSE(machine->is_complete(state));
+  EXPECT_FALSE(machine->is_terminated(state));
   EXPECT_FALSE(machine->can_accept(state, 0));
   EXPECT_EQ(machine->bitmask_num_words(), 2u);
   EXPECT_EQ(machine->allowed_bitmask(state), std::vector<uint32_t>({0, 0}));

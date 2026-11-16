@@ -60,6 +60,9 @@ class DenyConstraintMachine final
                   int32_t token_id) const override;
   bool is_valid(const ConstraintState& state) const override;
   bool is_complete(const ConstraintState& state) const override;
+  // A deny state never completes and never terminates: every token is
+  // rejected through the normal error channel instead.
+  bool is_terminated(const ConstraintState& state) const override;
   bool advance(ConstraintState& state,
                int32_t token_id,
                HaltPolicy halt) const override;

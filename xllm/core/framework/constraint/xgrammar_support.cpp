@@ -78,16 +78,14 @@ std::vector<std::string> xgrammar_unsupported_features(
   if (inputs.enable_pd_ooc) {
     unsupported.emplace_back("pd_ooc");
   }
-  if (inputs.enable_service_routing) {
-    // Service routing may migrate a request between workers; constraint-state
-    // consistency across that migration is unverified.
-    unsupported.emplace_back("service_routing");
-  }
-  if (inputs.enable_prefix_cache) {
-    // A prefix-cache hit must leave the matcher aligned with the cached token
-    // prefix (the matcher state that prefix implies) - unverified.
-    unsupported.emplace_back("prefix_cache");
-  }
+  // Service routing uses the same serialized constraint snapshots as regular
+  // disagg PD. XGrammar snapshots carry the grammar identity and committed
+  // token history, so a receiving worker rebuilds the exact machine before
+  // applying the next mask instead of dropping or resetting the constraint.
+  //
+  // Prefix caching only reuses prompt KV. The response grammar starts at the
+  // first generated token, after prefill, so a cached prompt prefix does not
+  // advance or otherwise change the response matcher.
   return unsupported;
 }
 

@@ -140,6 +140,12 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::execute_draft_query(
   sampling.parameters.return_probs = true;
   sampling.gumbel_noise = gumbel_noise;
   processed_input.input_params.sampling = std::move(sampling);
+  // The draft input derives from the target input that step_async's guarded
+  // set_hierarchy_layer_synchronizer already processed, so
+  // requires_host_restore is cleared (or the promise failed before this
+  // query was built): the missing-handle throw cannot fire here. The call
+  // still installs the draft's own host-restore synchronizer when one was
+  // registered for the draft transfer.
   draft_impl_->set_hierarchy_layer_synchronizer(processed_input.input_params);
   if (!input.sampling_params.all_greedy_sample &&
       sampling_process_group_ != nullptr &&

@@ -35,6 +35,12 @@ limitations under the License.
 #endif
 
 namespace {
+
+// Upper bound for the c10d TCPStore rendezvous; cold-start HCCL unique-id
+// exchange and first kernel compiles on many ranks exceed the 300s c10d
+// default.
+constexpr std::chrono::minutes kRendezvousStoreTimeout{15};
+
 std::pair<int, std::vector<uint64_t>> get_trans_group_rank(int world_size,
                                                            int global_rank,
                                                            int split_size) {
@@ -211,6 +217,7 @@ c10::intrusive_ptr<c10d::Store> create_tcp_store(const std::string& host,
   tcp_options.isServer = (rank == 0);
   tcp_options.port = port;
   tcp_options.multiTenant = true;
+  tcp_options.timeout = kRendezvousStoreTimeout;
   return c10::make_intrusive<c10d::TCPStore>(host, tcp_options);
 }
 

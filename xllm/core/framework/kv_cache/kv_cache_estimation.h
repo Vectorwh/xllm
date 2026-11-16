@@ -112,4 +112,25 @@ SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
                                   KVCacheCapacity draft_cap,
                                   const ModelArgs& draft_args);
 
+// Per-block full-attention KV cost of a speculative target+draft pair.
+struct SpeculativeFullAttentionBlockCost {
+  int64_t target_full_attention_block_size_in_bytes = 0;
+  int64_t draft_full_attention_block_size_in_bytes = 0;
+};
+
+// Shared draft-slot sizing for SpeculativeEngine::calculate_kv_cache, the
+// only production caller. `draft_body_uses_tp1` marks an MTP draft body
+// running TP1; `draft_manages_own_kv_shape` mirrors
+// SpeculativeConfig::draft_manages_own_kv_shape. Both draft flavors are
+// sized by the draft's own slot geometry; only workers that reuse the
+// target KVCacheShape require the draft slot to fit within the target's.
+// The caller owns the kv_split replicated-draft-page multiplier and the
+// block-count division, so this helper deliberately returns costs only.
+SpeculativeFullAttentionBlockCost
+estimate_speculative_full_attention_block_cost(
+    const KVCacheCapacity& target_kv_cache_cap,
+    const KVCacheCapacity& draft_kv_cache_cap,
+    bool draft_body_uses_tp1,
+    bool draft_manages_own_kv_shape);
+
 }  // namespace xllm

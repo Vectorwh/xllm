@@ -442,17 +442,29 @@ void validate_config(const std::string& model_type) {
         << "xgrammar_cache_max_memory_bytes must be >= 0 or -1 (unlimited)";
     const DistributedConfig& distributed_config =
         DistributedConfig::get_instance();
-    CHECK(model_config.backend() == "llm" &&
-          model_config.task() == "generate" &&
-          model_config.model_impl() == "native")
-        << "XGrammar requires backend=llm, task=generate and model_impl=native";
-    CHECK(distributed_config.nnodes() == 1 &&
-          distributed_config.node_rank() == 0 &&
-          parallel_config.dp_size() == 1 && parallel_config.cp_size() == 1 &&
-          parallel_config.tp_size() <= 1 &&
-          DeviceNameUtils::parse_devices("auto").size() == 1)
-        << "XGrammar requires one visible NPU, nnodes=1, node_rank=0, "
-           "dp_size=1, cp_size=1 and tp_size<=1";
+    CHECK(model_config.backend() == "llm" && model_config.task() == "generate")
+        << "XGrammar requires backend=llm and task=generate";
+    CHECK(model_config.model_impl() == "native" ||
+          ModelConfig::is_python_model_impl(model_config.model_impl()))
+        << "XGrammar requires model_impl=native or python";
+    if (model_config.model_impl() == "native") {
+      // The native NPU lm_head uses column-parallel vocab shards and does not
+      // gather full-vocabulary logits before the framework sampler. Keep the
+      // native single-device guard until that gather exists. Python executors
+      // return full-vocabulary logits to the sampler, so their DP/CP/TP and
+      // multi-node topologies remain allowed.
+      CHECK(distributed_config.nnodes() == 1 &&
+            distributed_config.node_rank() == 0 &&
+            parallel_config.dp_size() == 1 && parallel_config.cp_size() == 1 &&
+            parallel_config.tp_size() <= 1 &&
+            DeviceNameUtils::parse_devices("auto").size() == 1)
+          << "Native XGrammar requires one visible NPU, nnodes=1, node_rank=0, "
+             "dp_size=1, cp_size=1 and tp_size<=1";
+    }
+    // The sampler enforces an explicit mask-vs-logits width check. Python
+    // model executors return full-vocabulary logits to that sampler, so their
+    // data, expert, context and tensor parallelism as well as multi-node
+    // topologies are allowed; the width guard remains the correctness net.
     XGrammarSupportInputs support_inputs;
     support_inputs.enable_pd_ooc = disagg_pd_config.enable_pd_ooc();
     support_inputs.num_speculative_tokens =

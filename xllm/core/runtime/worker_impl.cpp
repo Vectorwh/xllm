@@ -1087,6 +1087,12 @@ void WorkerImpl::advance_json_object_states(ForwardInput& input) {
     CHECK(has_prior_output);
     CHECK_GE(output_idx, 0);
     CHECK_LT(output_idx, next_tokens.size(0));
+    // Schedule overlap may prepare the next step after the previous row has
+    // already consumed its stop token. Keep the terminated matcher intact and
+    // never advance it into XGrammar's fatal post-stop state.
+    if (state.is_terminated()) {
+      continue;
+    }
     if (next_tokens.dim() == 1) {
       const int32_t token_id =
           static_cast<int32_t>(next_tokens[output_idx].item<int64_t>());
@@ -1111,6 +1117,9 @@ void WorkerImpl::advance_json_object_states(ForwardInput& input) {
 
     const torch::Tensor output_row = next_tokens[output_idx];
     for (int64_t token_idx = 0; token_idx < output_row.numel(); ++token_idx) {
+      if (state.is_terminated()) {
+        break;
+      }
       const int32_t token_id =
           static_cast<int32_t>(output_row[token_idx].item<int64_t>());
       if (token_id < 0) {
@@ -1366,7 +1375,9 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
                     [](const JsonObjectGrammarSnapshot& snapshot) {
                       return snapshot.enabled;
                     });
-    if (has_enabled_snapshot || input.json_object_states.empty()) {
+    if (options_.is_draft_engine() || has_enabled_snapshot ||
+        expanded_speculative_validation(input) ||
+        input.json_object_states.empty()) {
       ForwardInput restored_input = input;
       restore_json_object_states(restored_input);
       prepare_work_before_execute_on_stream(restored_input,
@@ -1577,8 +1588,42 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
   }
 }
 
+bool WorkerImpl::expanded_speculative_validation(
+    const ForwardInput& input) const {
+  // A block-diffusion target verification input carries per-position states
+  // already expanded to batch x (num_speculative_tokens + 1) rows; both the
+  // prepare entry and the restore entry must judge the same ForwardInput
+  // with this single predicate, so an algorithm or arity change cannot make
+  // one side accept what the other rejects.
+  return SpeculativeConfig::is_block_diffusion_algorithm(
+             options_.speculative_algorithm()) &&
+         input.json_object_states.size() ==
+             input.json_object_state_snapshots.size() *
+                 static_cast<size_t>(options_.num_speculative_tokens() + 1);
+}
+
 void WorkerImpl::restore_json_object_states(ForwardInput& input) {
   if (input.json_object_state_snapshots.empty()) {
+    return;
+  }
+  // DFlash2/DSpark draft workers intentionally have no tokenizer: drafts
+  // propose unconstrained candidates and target verify rows enforce grammar.
+  // Consume, but do not restore, snapshots on draft workers.
+  if (options_.is_draft_engine()) {
+    input.json_object_state_snapshots.clear();
+    return;
+  }
+  // DFlash2/DSpark target verification expands each sequence-level snapshot
+  // into anchor + num_speculative_tokens per-position states before calling
+  // the target worker. Those states are already restored and replayed by
+  // prepare_json_validation_states; do not reject the intentional row-count
+  // difference or restore the sequence snapshot over the expanded states.
+  // The predicate is shared with prepare_work_before_execute_on_stream: the
+  // prepare side decides whether this input takes the restore path, this
+  // side decides whether the already-expanded rows skip sequence restore -
+  // both entries must judge the same ForwardInput identically.
+  if (expanded_speculative_validation(input)) {
+    input.json_object_state_snapshots.clear();
     return;
   }
   CHECK(tokenizer_ != nullptr)
@@ -1624,13 +1669,12 @@ void WorkerImpl::restore_json_object_states(ForwardInput& input) {
     };
     if (!snapshot.enabled) {
       // An empty snapshot means either a genuinely unconstrained row or a
-      // backend whose spec snapshot is not yet implemented (xgrammar). Only
-      // keep the builder's state for the latter: a non-builtin (xgrammar) row
-      // has no spec snapshot, so its live constraint must be preserved. A
-      // builtin empty snapshot means genuinely unconstrained. The predicate
-      // is the backend-neutral spec-snapshot support: a backend whose
-      // snapshots round-trip the matcher restores from them, one without
-      // keeps its live state instead of being reset to unconstrained.
+      // row from a backend that does not serialize spec snapshots.
+      // Backends whose snapshots round-trip the matcher (builtin's matcher
+      // snapshots, xgrammar's per-request grammar_spec restored below)
+      // never take this branch with a live constraint. For a backend
+      // without spec-snapshot support, keep the builder's live state: the
+      // row arrives with the machine already installed.
       // initialized() implies a machine (the ConstraintState constructor
       // rejects a payload without one), so the dereference below is safe.
       const bool non_builtin_initialized =
@@ -1643,12 +1687,11 @@ void WorkerImpl::restore_json_object_states(ForwardInput& input) {
         // arrival, where states do not transport), decoding the row
         // unconstrained would silently drop the constraint. Fail THIS request
         // through the error channel rather than terminating the worker: the
-        // condition is reachable from ordinary request traffic (xgrammar +
-        // PD/transport) until the backend-neutral spec transport (G9) lands.
+        // condition is reachable from ordinary request traffic whenever a
+        // backend without spec-snapshot support meets PD/transport.
         fail_row(
             "constrained row arrived without a serializable snapshot or a "
-            "live state (the backend's spec transport is not implemented "
-            "until G9)");
+            "live state (the backend does not support spec snapshots)");
         continue;
       }
       if (non_builtin_initialized) {
@@ -1899,7 +1942,21 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
   threadpool_.schedule([this,
                         input = std::move(input_on_device),
                         promise = std::move(promise)]() mutable {
-    set_hierarchy_layer_synchronizer(input.input_params);
+    try {
+      // The only set_hierarchy_layer_synchronizer site that can observe the
+      // missing-handle throw from HierarchyKVCacheTransfer. Later
+      // target/draft re-entries (SpeculativeWorkerImpl::step,
+      // DFlash2WorkerImpl::execute_draft_query) receive this same input
+      // after the handle was consumed and requires_host_restore cleared,
+      // so they cannot re-arm the failure.
+      set_hierarchy_layer_synchronizer(input.input_params);
+    } catch (const std::exception& e) {
+      // A missing Host restore handle fails this batch through the future
+      // instead of terminating the worker thread.
+      LOG(ERROR) << "Host restore setup failed: " << e.what();
+      promise.setException(folly::exception_wrapper(std::current_exception()));
+      return;
+    }
 
     // run the model on the given input in working thread
     if (!enable_schedule_overlap()) {

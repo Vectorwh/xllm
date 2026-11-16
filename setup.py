@@ -543,7 +543,8 @@ class ExtBuild(build_ext):
             cmake_args += ["-DUSE_CCACHE=ON"]
 
         if self.device == "npu":
-            cmake_args += ["-DUSE_NPU=ON"]
+            # Build the XGrammar constraint backend for NPU targets.
+            cmake_args += ["-DUSE_NPU=ON", "-DUSE_XGRAMMAR=ON"]
             set_npu_envs()
             _maybe_compile_tilelang_kernels(self.device, self.tilelang_jobs)
         elif self.device == "mlu":

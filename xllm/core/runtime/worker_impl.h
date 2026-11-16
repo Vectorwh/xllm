@@ -125,6 +125,10 @@ class WorkerImpl {
   virtual void prepare_work_before_execute(const ForwardInput& inputs,
                                            ForwardInput& processed_inputs);
   virtual void restore_json_object_states(ForwardInput& input);
+  // Whether this input's constraint rows are a block-diffusion target
+  // verification already expanded to per-position states. Shared by the
+  // prepare and restore entries so both judge the same input identically.
+  bool expanded_speculative_validation(const ForwardInput& input) const;
   // Speculative metadata staging precedes the scheduler's next slot assignment.
   // It must defer request-state restoration until the actual execution input.
   void prepare_work_before_execute_on_stream(const ForwardInput& input,

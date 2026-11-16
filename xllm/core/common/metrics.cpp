@@ -264,6 +264,15 @@ DEFINE_COUNTER(mooncake_transfer_bytes_total_write,
                "Total bytes completed by MoonCake WRITE transfers");
 DEFINE_COUNTER(mooncake_transfer_failed_total,
                "Total number of failed MoonCake transfers");
+DEFINE_COUNTER(
+    kv_transfer_destruction_pending_total,
+    "Total KV transfers a worker step left pending at KVTransferCompletion "
+    "destruction without calling wait()");
+DEFINE_COUNTER(
+    kv_transfer_destruction_abandoned_total,
+    "Total KV transfers abandoned at KVTransferCompletion destruction after "
+    "cancel and drain; their push threads ignored abort and may still read "
+    "source KV blocks");
 DEFINE_HISTOGRAM(mooncake_transfer_latency_microseconds_read,
                  "MoonCake READ transfer latency in microseconds");
 DEFINE_HISTOGRAM(mooncake_transfer_latency_microseconds_write,

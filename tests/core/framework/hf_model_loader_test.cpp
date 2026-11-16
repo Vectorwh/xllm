@@ -1037,6 +1037,51 @@ TEST(HFModelLoaderTest, DeepseekV41ModelArgsFromConfig) {
 }
 #endif
 
+#if defined(USE_NPU)
+TEST(HFModelLoaderTest, NpuQwen3UsesEveryEosAndDflashWindowFallback) {
+  auto loader = ModelRegistry::get_model_args_loader("qwen3_atb");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "qwen3",
+      "eos_token_id": [154820, 154827, 154829],
+      "dflash_config": {
+        "use_swa": true,
+        "causal": false,
+        "swa_window_size": 4096
+      }
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.eos_token_id_vec(),
+            std::vector<int32_t>({154820, 154827, 154829}));
+  EXPECT_EQ(args.eos_token_id(), 154820);
+  EXPECT_EQ(args.stop_token_ids(),
+            std::unordered_set<int32_t>({154820, 154827, 154829}));
+  EXPECT_TRUE(args.use_sliding_window());
+  EXPECT_TRUE(args.sliding_window_non_causal());
+  EXPECT_EQ(args.sliding_window(), 4096);
+}
+
+TEST(HFModelLoaderTest, NpuQwen3EmptyEosFallsBackToDefault) {
+  auto loader = ModelRegistry::get_model_args_loader("qwen3_atb");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {"model_type": "qwen3", "eos_token_id": []}
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.eos_token_id_vec(), std::vector<int32_t>({151643}));
+  EXPECT_EQ(args.eos_token_id(), 151643);
+  EXPECT_EQ(args.stop_token_ids(), std::unordered_set<int32_t>({151643}));
+}
+#endif
+
 TEST(HFModelLoaderTest, Qwen3DFlash2DraftModelArgsFromOrnithConfig) {
   auto loader = ModelRegistry::get_model_args_loader("qwen3");
   ASSERT_NE(loader, nullptr);

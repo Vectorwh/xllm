@@ -138,6 +138,9 @@ XGrammarState XGrammarState::fork() const {
 }
 
 bool XGrammarState::accept_token(int32_t token_id) {
+  if (matcher_->IsTerminated()) {
+    return false;
+  }
   const bool accepted = matcher_->AcceptToken(token_id);
   if (accepted) {
     accepted_tokens_.push_back(token_id);
@@ -146,6 +149,9 @@ bool XGrammarState::accept_token(int32_t token_id) {
 }
 
 bool XGrammarState::can_accept(int32_t token_id) {
+  if (matcher_->IsTerminated()) {
+    return false;
+  }
   if (token_id < 0 || token_id >= vocab_size_) {
     return false;
   }
@@ -165,11 +171,13 @@ bool XGrammarState::can_accept(int32_t token_id) {
 
 bool XGrammarState::is_completed() const { return matcher_->IsCompleted(); }
 
+bool XGrammarState::is_terminated() const { return matcher_->IsTerminated(); }
+
 std::vector<uint32_t> XGrammarState::allowed_bitmask() const {
   const size_t num_words = static_cast<size_t>((vocab_size_ + 31) / 32);
   // A frozen matcher rejects everything: the all-deny mask matches
   // can_accept instead of the live fill.
-  if (!is_valid()) {
+  if (!is_valid() || matcher_->IsTerminated()) {
     return std::vector<uint32_t>(num_words, 0);
   }
   // Logically read-only: the fill may refresh matcher caches, like the
@@ -204,8 +212,9 @@ bool XGrammarState::fill_allowed_bitmask_row(int32_t* row,
   if (row == nullptr || num_words == 0) {
     return false;
   }
-  if (!is_valid()) {
-    // A frozen matcher rejects everything; the caller needs no fill call.
+  if (!is_valid() || matcher_->IsTerminated()) {
+    // Frozen or terminated matchers reject everything; the caller needs no
+    // backend fill (which itself rejects post-stop calls).
     std::fill_n(row, num_words, 0);
     return true;
   }
@@ -256,6 +265,7 @@ uint64_t XGrammarState::fingerprint() const { return 0; }
 bool XGrammarState::accept_token(int32_t) { return false; }
 bool XGrammarState::can_accept(int32_t) { return false; }
 bool XGrammarState::is_completed() const { return false; }
+bool XGrammarState::is_terminated() const { return false; }
 bool XGrammarState::fill_next_token_bitmask(std::span<int32_t>) const {
   LOG(FATAL) << "Cannot construct a bitmask without XGrammar support";
 }

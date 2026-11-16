@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/model/model_args.h"
@@ -1306,6 +1307,106 @@ TEST(KVCacheEstimationTest, DeepSeekV41RejectsBudgetWithoutTokenCacheUnit) {
       estimate_kv_cache_capacity(model_args, options),
       "minimum DSV4 SWA cache leaves insufficient memory for one compressed "
       "cache unit");
+}
+
+TEST(KVCacheEstimationTest, SpeculativeDecodeUsesDraftShapeForDFlash2) {
+  // A DFlash2 draft whose per-slot KV is wider than the target's (a hybrid
+  // target with narrow full-attention layers) must skip the draft-slot<=
+  // target-slot guard and be sized by the draft's own geometry, matching
+  // DFlash2WorkerImpl::draft_kv_cache_shape allocations. Asserted through
+  // the cost estimator the engine calls; the block count is the engine's
+  // own division of the same numbers (cache - linear) / combined cost.
+  KVCacheCapacity target_capacity;
+  target_capacity.cache_size_in_bytes(100000)
+      .block_size(10)
+      .slot_size(2)
+      .scale_slot_size(1)
+      .index_cache_sizes(3, 30)
+      .num_full_attention_layers(2)
+      .num_indexer_layers(1);
+  KVCacheCapacity draft_capacity;
+  draft_capacity.cache_size_in_bytes(100000)
+      .block_size(10)
+      .slot_size(4)
+      .scale_slot_size(1)
+      .index_cache_sizes(2, 20)
+      .num_indexer_layers(1)
+      .n_layers(2);
+
+  const SpeculativeFullAttentionBlockCost dflash2_cost =
+      estimate_speculative_full_attention_block_cost(
+          target_capacity,
+          draft_capacity,
+          /*draft_body_uses_tp1=*/false,
+          /*draft_manages_own_kv_shape=*/true);
+  const SpeculativeFullAttentionBlockCost tp1_cost =
+      estimate_speculative_full_attention_block_cost(
+          target_capacity,
+          draft_capacity,
+          /*draft_body_uses_tp1=*/true,
+          /*draft_manages_own_kv_shape=*/false);
+  EXPECT_EQ(dflash2_cost.draft_full_attention_block_size_in_bytes,
+            tp1_cost.draft_full_attention_block_size_in_bytes);
+  const int64_t blocks =
+      (target_capacity.cache_size_in_bytes() -
+       target_capacity.linear_cache_size_in_bytes()) /
+      (dflash2_cost.target_full_attention_block_size_in_bytes +
+       dflash2_cost.draft_full_attention_block_size_in_bytes);
+  EXPECT_EQ(blocks, 476);
+}
+
+TEST(KVCacheEstimationTest, SpeculativeDecodeSizesIndexCacheByBlockBytes) {
+  // The index term of the shared speculative block cost must use
+  // index_block_size() (block units), matching
+  // standard_full_cache_block_size_in_bytes and the pre-extraction engine
+  // formula. Folding it into block_size * index_slot_size() overestimates
+  // compressed-tail layouts, where the block value is
+  // block_size/kpool*pool_bytes (floor) while the slot value is
+  // ceil(pool_bytes/kpool): here index_block_size()=25 differs from
+  // block_size * index_slot_size()=30, and the slot-folded form would
+  // report 90 instead of 85 bytes per target block.
+  KVCacheCapacity target_capacity;
+  target_capacity.cache_size_in_bytes(100000)
+      .block_size(10)
+      .slot_size(2)
+      .scale_slot_size(1)
+      .index_cache_sizes(3, 25)
+      .num_full_attention_layers(2)
+      .num_indexer_layers(1);
+  KVCacheCapacity draft_capacity;
+  draft_capacity.cache_size_in_bytes(100000)
+      .block_size(10)
+      .slot_size(4)
+      .scale_slot_size(1)
+      .index_cache_sizes(2, 20)
+      .num_indexer_layers(1)
+      .n_layers(2);
+
+  const SpeculativeFullAttentionBlockCost cost =
+      estimate_speculative_full_attention_block_cost(
+          target_capacity,
+          draft_capacity,
+          /*draft_body_uses_tp1=*/true,
+          /*draft_manages_own_kv_shape=*/false);
+  EXPECT_EQ(cost.target_full_attention_block_size_in_bytes,
+            10 * 2 * (2 + 1) + 1 * 25);
+  EXPECT_EQ(cost.draft_full_attention_block_size_in_bytes,
+            10 * 2 * (4 + 1) + 1 * 20);
+}
+
+TEST(KVCacheEstimationTest, DraftOwnShapeCoversBlockDiffusionWorkers) {
+  // The own-shape predicate must match the worker dispatch: DFlash, DFlash2,
+  // and DSpark all inherit DraftModelSpecWorkerImpl and build the draft pool
+  // through build_draft_kv_cache_shape, so a full-attention draft on a
+  // narrow-slot target must neither trip the estimator's draft-slot CHECK
+  // nor be sized by the target slot. Workers that reuse the target
+  // KVCacheShape (MTP, Eagle3) must stay excluded so the CHECK still guards
+  // them.
+  EXPECT_TRUE(SpeculativeConfig::draft_manages_own_kv_shape("DFlash"));
+  EXPECT_TRUE(SpeculativeConfig::draft_manages_own_kv_shape("DFlash2"));
+  EXPECT_TRUE(SpeculativeConfig::draft_manages_own_kv_shape("DSpark"));
+  EXPECT_FALSE(SpeculativeConfig::draft_manages_own_kv_shape("MTP"));
+  EXPECT_FALSE(SpeculativeConfig::draft_manages_own_kv_shape("Eagle3"));
 }
 
 }  // namespace xllm

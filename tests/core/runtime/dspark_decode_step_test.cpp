@@ -196,18 +196,35 @@ fixture = module._create_fixture()
     for (int32_t token = 0; token < 64; ++token) {
       vocabulary[std::to_string(token)] = token;
     }
+    // XGrammar constraint-vocabulary rebuilds require a ByteLevel decoder
+    // (see FastTokenizer's get_constraint_vocab); the digit strings keep the
+    // CrossProcessGrammarRestoresCommittedHistory regex assertions intact.
     nlohmann::json tokenizer = {{"version", "1.0"},
                                 {"added_tokens", nlohmann::json::array()},
                                 {"normalizer", nullptr},
-                                {"pre_tokenizer", nullptr},
+                                {"pre_tokenizer",
+                                 {{"type", "ByteLevel"},
+                                  {"add_prefix_space", false},
+                                  {"trim_offsets", true},
+                                  {"use_regex", false}}},
                                 {"post_processor", nullptr},
-                                {"decoder", nullptr},
+                                {"decoder",
+                                 {{"type", "ByteLevel"},
+                                  {"add_prefix_space", true},
+                                  {"trim_offsets", true},
+                                  {"use_regex", true}}},
                                 {"truncation", nullptr},
                                 {"padding", nullptr},
                                 {"model",
-                                 {{"type", "WordLevel"},
+                                 {{"type", "BPE"},
+                                  {"dropout", nullptr},
+                                  {"unk_token", nullptr},
+                                  {"continuing_subword_prefix", nullptr},
+                                  {"end_of_word_suffix", nullptr},
+                                  {"fuse_unk", false},
+                                  {"byte_fallback", false},
                                   {"vocab", std::move(vocabulary)},
-                                  {"unk_token", "0"}}}};
+                                  {"merges", nlohmann::json::array()}}}};
     std::ofstream(model_path_ / "tokenizer.json") << tokenizer;
   }
 
@@ -363,6 +380,23 @@ TEST_F(BlockDiffusionDecodeTest, MissingConstraintSnapshotFailsClosed) {
   EXPECT_FALSE(input.json_object_states.front().is_valid());
   const torch::Tensor mask = build_filter_bitmask(input.json_object_states);
   EXPECT_TRUE(torch::equal(mask, torch::zeros_like(mask)));
+}
+
+TEST_F(BlockDiffusionDecodeTest, ExpandedValidationStatesSkipSequenceRestore) {
+  // Target verification expands each sequence-level snapshot into
+  // num_speculative_tokens + 1 per-position states; those rows are already
+  // restored, so the sequence snapshot must be skipped instead of replayed
+  // over them.
+  auto worker = make_worker("DSpark");
+  ForwardInput input;
+  input.sample_sequence_ids = {"expanded-validation"};
+  input.json_object_state_snapshots.resize(1);
+  input.json_object_states.resize(3);  // 1 snapshot x (2 speculative + 1).
+  worker->restore_json_object_states(input);
+
+  EXPECT_TRUE(input.json_object_state_snapshots.empty());
+  EXPECT_EQ(input.json_object_states.size(), 3u);
+  EXPECT_TRUE(input.json_object_errors.empty());
 }
 
 TEST_F(BlockDiffusionDecodeTest, AsyncOutputDoesNotRequireDraftPrelaunch) {

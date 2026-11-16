@@ -946,6 +946,11 @@ struct ParallelInput {
 #endif
   uint32_t layers_per_event = std::numeric_limits<uint32_t>::max();
   std::shared_ptr<LayerSynchronizer> layer_wise_load_synchronizer = nullptr;
+  // The batch that installed layer_wise_load_synchronizer. The stale-flag
+  // path in HierarchyKVCacheTransfer::set_layer_synchronizer verifies it
+  // before reusing an installed synchronizer, so a synchronizer from a
+  // different batch is never silently trusted.
+  uint64_t layer_wise_load_batch_id = std::numeric_limits<uint64_t>::max();
   std::optional<uint32_t> draft_load_event_index;
 #if defined(USE_NPU) || defined(USE_MUSA)
   std::vector<int64_t> query_start_loc;
@@ -966,6 +971,7 @@ struct ParallelInput {
 #endif
     out.layers_per_event = layers_per_event;
     out.layer_wise_load_synchronizer = layer_wise_load_synchronizer;
+    out.layer_wise_load_batch_id = layer_wise_load_batch_id;
     out.draft_load_event_index = draft_load_event_index;
 #if defined(USE_NPU) || defined(USE_MUSA)
     out.query_start_loc = query_start_loc;

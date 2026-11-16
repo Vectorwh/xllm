@@ -19,6 +19,7 @@ limitations under the License.
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -680,8 +681,39 @@ void HierarchyKVCacheTransfer::set_layer_synchronizer(
     ModelInputParams& params) {
   std::optional<HostKVLoadHandle> handle =
       take_load_handle(params.meta.batch_id);
-  CHECK(!params.meta.requires_host_restore || handle.has_value())
-      << "Missing Host restore handle at batch_id=" << params.meta.batch_id;
+  if (params.meta.requires_host_restore && !handle.has_value()) {
+    if (params.parallel.layer_wise_load_synchronizer != nullptr) {
+      if (params.parallel.layer_wise_load_batch_id == params.meta.batch_id) {
+        // A derived target/draft input re-entered with a stale
+        // requires_host_restore flag: the first consumer already took the
+        // handle and installed the synchronizer, and this copy retained it,
+        // so no second take is needed.
+        LOG(WARNING) << "Stale Host restore flag at batch_id="
+                     << params.meta.batch_id
+                     << "; retaining installed synchronizer";
+        params.meta.requires_host_restore = false;
+        return;
+      }
+      // The installed synchronizer belongs to a different batch: reusing it
+      // would synchronize this batch's layers against another batch's
+      // events. Fail this batch instead of silently trusting foreign state.
+      LOG(ERROR) << "Installed Host restore synchronizer at batch_id="
+                 << params.meta.batch_id << " belongs to batch_id="
+                 << params.parallel.layer_wise_load_batch_id
+                 << "; failing the batch";
+      throw std::runtime_error(
+          "Host restore synchronizer belongs to another batch at batch_id=" +
+          std::to_string(params.meta.batch_id));
+    }
+    // The restore bookkeeping lost this batch handle before any synchronizer
+    // was installed (e.g. a lost per-rank registration). Aborting here
+    // amplifies one degraded batch into a full-group restart (worker loss ->
+    // master exit); fail this batch instead.
+    LOG(ERROR) << "Missing Host restore handle at batch_id="
+               << params.meta.batch_id << "; failing the batch";
+    throw std::runtime_error("Host restore handle missing at batch_id=" +
+                             std::to_string(params.meta.batch_id));
+  }
   if (!handle.has_value()) {
     return;
   }
@@ -699,6 +731,7 @@ void HierarchyKVCacheTransfer::set_layer_synchronizer(
         << params.meta.batch_id;
   }
   params.parallel.layer_wise_load_synchronizer = handle->synchronizer;
+  params.parallel.layer_wise_load_batch_id = params.meta.batch_id;
   params.parallel.layers_per_event = handle->layers_per_event;
   params.parallel.draft_load_event_index = handle->draft_event_index;
   // Derived target/draft inputs retain the synchronizer, not a second request

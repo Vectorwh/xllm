@@ -276,6 +276,10 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
     const ForwardInput& input) {
   ModelInputParams& mutable_params =
       const_cast<ModelInputParams&>(input.input_params);
+  // Cannot observe the missing-host-restore-handle throw: the step_async
+  // lambda consumed this batch's handle (and cleared requires_host_restore)
+  // before dispatching here, or it failed the promise and this step never
+  // ran. Kept so a direct step() caller still installs the synchronizer.
   set_hierarchy_layer_synchronizer(mutable_params);
   const bool run_speculative_decode =
       should_run_speculative_decode(input.input_params);

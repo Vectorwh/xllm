@@ -59,6 +59,16 @@ class ConstraintStateMachine {
                           int32_t token_id) const = 0;
   virtual bool is_valid(const ConstraintState& state) const = 0;
   virtual bool is_complete(const ConstraintState& state) const = 0;
+  // Whether the matcher has consumed its terminal stop and must not advance
+  // again. Pure virtual on purpose: completion (root rule matched) and
+  // termination (terminal stop consumed) are distinct states, and how they
+  // relate is a per-backend contract. A backend whose completion implies no
+  // further legal advance (builtin: a token past a completed root is a
+  // positional rejection) declares is_terminated == is_complete; XGrammar
+  // keeps them apart because its root can complete before the stop token.
+  // A silent default would re-introduce the post-stop fatal path the
+  // XGrammar override was added to avoid, so every backend must declare.
+  virtual bool is_terminated(const ConstraintState& state) const = 0;
 
   // Returns false when the token is rejected; under HaltPolicy::RESPECT the
   // state is also invalidated (frozen), so halt-aware callers see a sticky
@@ -163,6 +173,10 @@ class ConstraintState final {
   bool is_complete() const {
     CHECK(initialized());
     return machine_->is_complete(*this);
+  }
+  bool is_terminated() const {
+    CHECK(initialized());
+    return machine_->is_terminated(*this);
   }
   bool can_accept(int32_t token_id) const {
     CHECK(initialized());

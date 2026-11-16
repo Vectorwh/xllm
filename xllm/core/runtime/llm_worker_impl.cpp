@@ -272,12 +272,25 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const_cast<ModelInputParams*>(&(input.input_params))
         ->parallel.layer_synchronizer = layer_synchronizer;
 
+#if defined(USE_NPU) || defined(USE_MLU)
+    // Cancel hook: aborting the layer synchronizer unblocks a push thread
+    // spinning in synchronize_layer, so it stops reading source KV blocks,
+    // reports its keys as failed, and completes. DCU has no abort().
+    kv_transfers.add(
+        kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
+                                                 context_.get_parallel_args(),
+                                                 layer_synchronizer,
+                                                 is_spec_draft_),
+        canonical_request_ids,
+        [layer_synchronizer] { layer_synchronizer->abort(); });
+#else
     kv_transfers.add(
         kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
                                                  context_.get_parallel_args(),
                                                  layer_synchronizer,
                                                  is_spec_draft_),
         canonical_request_ids);
+#endif
 #endif
   }
   auto wait_kv_push = [&]() {

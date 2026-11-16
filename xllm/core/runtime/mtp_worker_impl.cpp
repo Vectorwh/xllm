@@ -864,8 +864,13 @@ bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
       if (!python_weights_shared) {
         const bool share_lm_head = share_target_lm_head_with_draft();
 #if defined(USE_NPU)
-        if (::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
-            "TORCH") {
+        // ATB models expose npu_* modules; torch-only models expose the plain
+        // torch modules. The DFlash2-specific exception lives in
+        // dflash_worker_impl.cpp, which is where that algorithm is dispatched.
+        const bool use_npu_surface =
+            ::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
+            "TORCH";
+        if (use_npu_surface) {
           if (share_lm_head) {
             auto head = impl_->get_npu_lm_head();
             draft_impl_->set_npu_lm_head(head);

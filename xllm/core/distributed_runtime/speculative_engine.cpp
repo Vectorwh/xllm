@@ -256,9 +256,6 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
   CHECK_EQ(target_kv_cache_cap.block_size(), draft_kv_cache_cap.block_size())
       << "target and draft kv cache block size must be the same";
 
-  const int64_t block_size = target_kv_cache_cap.block_size();
-  CHECK_GT(block_size, 0) << "kv cache block size must be greater than 0";
-
   const int64_t cache_size_in_bytes =
       std::min(target_kv_cache_cap.cache_size_in_bytes(),
                draft_kv_cache_cap.cache_size_in_bytes());
@@ -270,45 +267,24 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
       << cache_size_in_bytes
       << ", linear_cache_size: " << linear_cache_size_in_bytes;
 
-  const int64_t target_full_attention_slot_size =
-      target_kv_cache_cap.slot_size() + target_kv_cache_cap.index_slot_size() +
-      target_kv_cache_cap.scale_slot_size();
-  const int64_t draft_full_attention_slot_size =
-      draft_kv_cache_cap.slot_size() + draft_kv_cache_cap.index_slot_size() +
-      draft_kv_cache_cap.scale_slot_size();
-  CHECK_GT(target_full_attention_slot_size, 0)
-      << "target full-attention kv cache slot size must be greater than 0";
-  CHECK_GT(draft_full_attention_slot_size, 0)
-      << "draft full-attention kv cache slot size must be greater than 0";
-
-  const int64_t target_full_attention_layers =
-      std::max<int64_t>(target_kv_cache_cap.num_full_attention_layers(), 1);
-  // Draft model has no linear-attention layers in the current MTP/Eagle path.
-  const int64_t draft_full_attention_layers = draft_kv_cache_cap.n_layers();
-  const int64_t target_full_attention_block_size_in_bytes =
-      block_size * (target_full_attention_layers *
-                    (target_kv_cache_cap.slot_size() +
-                     target_kv_cache_cap.scale_slot_size())) +
-      target_kv_cache_cap.num_indexer_layers() *
-          target_kv_cache_cap.index_block_size();
-  // The draft KV cache is allocated from the draft's own KVCacheShape, so its
-  // per-block cost uses the draft's own slot size, which may exceed the
-  // target's (e.g. a full-attention draft against an MLA target). A standalone
-  // drafter replicates the whole context on every kv_split rank, so one logical
-  // draft block costs that many physical pages. Kept in lockstep with
-  // DraftModelSpecWorkerImpl::draft_replicated_block_pages() through the same
-  // SpeculativeConfig predicate.
+  const SpeculativeFullAttentionBlockCost cost =
+      estimate_speculative_full_attention_block_cost(
+          target_kv_cache_cap,
+          draft_kv_cache_cap,
+          /*draft_body_uses_tp1=*/options_.enable_mtp_draft_body_tp1(),
+          SpeculativeConfig::draft_manages_own_kv_shape(
+              options_.speculative_algorithm()));
+  // A standalone drafter replicates the whole context on every kv_split rank,
+  // so one logical draft block costs that many physical pages. Kept in
+  // lockstep with DraftModelSpecWorkerImpl::draft_replicated_block_pages()
+  // through the same SpeculativeConfig predicate.
   const int32_t replicated_block_pages =
       SpeculativeConfig::draft_replicated_block_pages(
           options_.speculative_algorithm(),
           ParallelConfig::get_instance().kv_split_size_effective());
   const int64_t draft_full_attention_block_size_in_bytes =
       replicated_block_pages *
-      (block_size * (draft_full_attention_layers *
-                     (draft_kv_cache_cap.slot_size() +
-                      draft_kv_cache_cap.scale_slot_size())) +
-       draft_kv_cache_cap.num_indexer_layers() *
-           draft_kv_cache_cap.index_block_size());
+      cost.draft_full_attention_block_size_in_bytes;
   const int32_t layerwise_split_size =
       options_.is_draft_engine()
           ? 1
@@ -322,7 +298,7 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
         draft_full_attention_block_size_in_bytes);
   }
   const int64_t full_attention_block_size_in_bytes =
-      target_full_attention_block_size_in_bytes +
+      cost.target_full_attention_block_size_in_bytes +
       draft_full_attention_block_size_in_bytes;
   CHECK_GT(full_attention_block_size_in_bytes, 0)
       << "speculative kv cache block size in bytes must be greater than 0";

@@ -91,6 +91,8 @@ class XGrammarState final {
   // The root rule is fully matched by the accepted input (stop token not
   // required).
   bool is_completed() const;
+  // Root completion plus the terminal stop token: no further advance is legal.
+  bool is_terminated() const;
   // A frozen matcher rejects everything; used for halt semantics.
   bool is_valid() const { return !invalid_; }
   void set_invalid() { invalid_ = true; }

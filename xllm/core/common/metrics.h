@@ -437,6 +437,8 @@ DECLARE_COUNTER(mooncake_transfer_completed_total_write);
 DECLARE_COUNTER(mooncake_transfer_bytes_total_read);
 DECLARE_COUNTER(mooncake_transfer_bytes_total_write);
 DECLARE_COUNTER(mooncake_transfer_failed_total);
+DECLARE_COUNTER(kv_transfer_destruction_pending_total);
+DECLARE_COUNTER(kv_transfer_destruction_abandoned_total);
 DECLARE_HISTOGRAM(mooncake_transfer_latency_microseconds_read);
 DECLARE_HISTOGRAM(mooncake_transfer_latency_microseconds_write);
 

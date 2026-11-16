@@ -72,8 +72,8 @@ DEFINE_string(
     structured_output_backend,
     "builtin",
     "Structured output backend: builtin (json_object only) or xgrammar "
-    "(json_object, json_schema and regex; requires USE_XGRAMMAR and a single "
-    "NPU with native eager generation and performance switches disabled).");
+    "(json_object, json_schema and regex; requires USE_XGRAMMAR, NPU, and "
+    "the native or Python model implementation).");
 
 DEFINE_int64(xgrammar_cache_max_memory_bytes,
              64 * 1024 * 1024,

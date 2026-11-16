@@ -72,6 +72,10 @@ class BuiltinJsonConstraintMachine final
                   int32_t token_id) const override;
   bool is_valid(const ConstraintState& state) const override;
   bool is_complete(const ConstraintState& state) const override;
+  // The builtin grammar has no separate stop-token state: a token past a
+  // completed root is a positional rejection that freezes the state under
+  // HaltPolicy::RESPECT, so root completion is termination here.
+  bool is_terminated(const ConstraintState& state) const override;
 
   bool advance(ConstraintState& state,
                int32_t token_id,

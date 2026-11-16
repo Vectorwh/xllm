@@ -79,6 +79,14 @@ bool BuiltinJsonConstraintMachine::is_complete(
   return cast(state).is_complete();
 }
 
+bool BuiltinJsonConstraintMachine::is_terminated(
+    const ConstraintState& state) const {
+  // The builtin grammar has no separate stop-token state: a token past a
+  // completed root is a positional rejection that freezes the state under
+  // HaltPolicy::RESPECT (see advance), so root completion is termination.
+  return cast(state).is_complete();
+}
+
 bool BuiltinJsonConstraintMachine::advance(ConstraintState& state,
                                            int32_t token_id,
                                            HaltPolicy halt) const {

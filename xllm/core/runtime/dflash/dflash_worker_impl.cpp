@@ -598,20 +598,42 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
           draft_impl_->WorkerImpl::share_weights_from(*impl_);
       if (!python_weights_shared) {
 #if defined(USE_NPU)
-        if (!SpeculativeConfig::is_dflash2_algorithm(
-                options_.speculative_algorithm())) {
+        const bool dflash2 = SpeculativeConfig::is_dflash2_algorithm(
+            options_.speculative_algorithm());
+        // Torch-only models use the plain torch surface. DFlash2 retains the
+        // fused NPU projection under either kernel backend; DFlash v1 keeps
+        // its target embedding sharing on ATB models.
+        const bool use_npu_surface =
+            ::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
+                "TORCH" ||
+            dflash2;
+        if (use_npu_surface) {
           auto head = impl_->get_npu_lm_head();
           draft_impl_->set_npu_lm_head(head);
-          auto word_embedding = impl_->get_npu_word_embedding();
-          draft_impl_->set_npu_word_embedding(word_embedding);
-        } else
-#endif
+          if (dflash2) {
+            // The DFlash2 draft backbone deliberately does not register a
+            // local embed_tokens module; bind the target's torch embedding
+            // after both workers load, independently of the fused NPU head.
+            auto word_embedding = impl_->get_word_embedding();
+            draft_impl_->set_word_embedding(word_embedding);
+          } else {
+            auto word_embedding = impl_->get_npu_word_embedding();
+            draft_impl_->set_npu_word_embedding(word_embedding);
+          }
+        } else {
+          auto head = impl_->get_lm_head();
+          draft_impl_->set_lm_head(head);
+          auto word_embedding = impl_->get_word_embedding();
+          draft_impl_->set_word_embedding(word_embedding);
+        }
+#else
         {
           auto head = impl_->get_lm_head();
           draft_impl_->set_lm_head(head);
           auto word_embedding = impl_->get_word_embedding();
           draft_impl_->set_word_embedding(word_embedding);
         }
+#endif
       }
     }
 
@@ -2265,12 +2287,16 @@ std::vector<std::string> DFlashWorkerImpl::write_context_kv(
             draft_impl_->context_.get_model_args().n_layers());
     draft_input_params.parallel.layer_synchronizer = layer_synchronizer;
 #endif
+    // Cancel hook: aborting the layer synchronizer unblocks a push thread
+    // spinning in synchronize_layer, so it stops reading source KV blocks,
+    // reports its keys as failed, and completes.
     kv_transfers.add(kv_cache_transfer_->push_kv_blocks_async(
                          input.transfer_kv_infos,
                          draft_impl_->context_.get_parallel_args(),
                          layer_synchronizer,
                          /*is_spec_draft=*/true),
-                     unique_transfer_request_ids(input.transfer_kv_infos));
+                     unique_transfer_request_ids(input.transfer_kv_infos),
+                     [layer_synchronizer] { layer_synchronizer->abort(); });
   }
 #endif
 

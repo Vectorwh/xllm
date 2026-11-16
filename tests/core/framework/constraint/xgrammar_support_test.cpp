@@ -74,27 +74,27 @@ TEST(XGrammarSupportTest, DisaggPdIsSupportedAfterCrossInstanceVerification) {
   EXPECT_TRUE(contains(xgrammar_unsupported_features(inputs), "pd_ooc"));
 }
 
-TEST(XGrammarSupportTest, ServiceRoutingStaysGated) {
+TEST(XGrammarSupportTest, ServiceRoutingUsesSerializedConstraintStates) {
   XGrammarSupportInputs inputs;
   inputs.enable_service_routing = true;
-  EXPECT_TRUE(
-      contains(xgrammar_unsupported_features(inputs), "service_routing"));
+  EXPECT_TRUE(xgrammar_unsupported_features(inputs).empty());
 }
 
-TEST(XGrammarSupportTest, PrefixCacheStaysGated) {
+TEST(XGrammarSupportTest, PromptPrefixCacheDoesNotAdvanceResponseGrammar) {
   XGrammarSupportInputs inputs;
   inputs.enable_prefix_cache = true;
-  EXPECT_TRUE(contains(xgrammar_unsupported_features(inputs), "prefix_cache"));
+  EXPECT_TRUE(xgrammar_unsupported_features(inputs).empty());
 }
 
 TEST(XGrammarSupportTest, OnlyTheGatedFeaturesAreReported) {
-  // Graph flags no longer participate. With PD disabled, routing alone
-  // contributes an unsupported feature.
+  // Graph, service routing, and prompt prefix caching no longer participate.
   XGrammarSupportInputs inputs;
   inputs.enable_service_routing = true;
+  inputs.enable_prefix_cache = true;
+  inputs.enable_pd_ooc = true;
   const auto unsupported = xgrammar_unsupported_features(inputs);
   EXPECT_EQ(unsupported.size(), 1u);
-  EXPECT_TRUE(contains(unsupported, "service_routing"));
+  EXPECT_TRUE(contains(unsupported, "pd_ooc"));
 }
 
 TEST(XGrammarSupportTest, ChunkedPrefillStaysSupportedWithSpeculation) {
@@ -120,12 +120,16 @@ TEST(XGrammarSupportTest, ChunkedPrefillStaysSupportedWithSpeculation) {
   }
 }
 
-TEST(XGrammarSupportTest, AllGatedFeaturesAreListedTogether) {
+TEST(XGrammarSupportTest, RoutingCacheAndDFlash2StaySupportedTogether) {
   XGrammarSupportInputs inputs;
-  inputs.enable_pd_ooc = true;
   inputs.enable_service_routing = true;
   inputs.enable_prefix_cache = true;
-  EXPECT_EQ(xgrammar_unsupported_features(inputs).size(), 3u);
+  inputs.num_speculative_tokens = 7;
+  inputs.speculative_algorithm = "DFlash2";
+  EXPECT_TRUE(xgrammar_unsupported_features(inputs).empty());
+  inputs.enable_pd_ooc = true;
+  EXPECT_EQ(xgrammar_unsupported_features(inputs).size(), 1u);
+  EXPECT_TRUE(contains(xgrammar_unsupported_features(inputs), "pd_ooc"));
 }
 
 class CacheTestTokenizer final : public Tokenizer {
