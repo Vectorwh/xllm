@@ -8,6 +8,7 @@ cc_library(
     ../utils.h
   SRCS
     replace_token.cpp
+    dsa_kv_offloading.cpp
     laser_attention.cpp
     mtp_prepare_next_draft.cpp
     top_k_top_p.cpp

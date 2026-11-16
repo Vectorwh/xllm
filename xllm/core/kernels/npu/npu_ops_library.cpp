@@ -807,6 +807,41 @@ void ensure_xllm_ops_registered() {
 // Schema declarations (device-agnostic). Identical to cuda_ops_library.cpp —
 // compiled only under USE_NPU (mutually exclusive with USE_CUDA).
 TORCH_LIBRARY(xllm_ops, m) {
+  // NPU-only: the stable resident KV offloading schemas below have no CUDA
+  // counterpart, so they are exempt from the "identical to CUDA" rule.
+  m.def(
+      "dsa_kv_offloading_update_nope_out(Tensor(a!) host, Tensor block_table, "
+      "Tensor "
+      "descriptor, "
+      "Tensor current_map, Tensor topk, Tensor append_slots, Tensor current, "
+      "Tensor(b!) selection, Tensor(c!) indices, Tensor(d!) lengths, "
+      "Tensor(e!) selection_table, "
+      "Tensor(f!) resident, Tensor(g!) slots, Tensor(h!) count, Tensor(i!) "
+      "compact_indices) -> "
+      "(Tensor(b!), Tensor(i!), Tensor(d!), Tensor(e!))");
+  m.def(
+      "dsa_kv_offloading_update_rope_with_plan_out(Tensor(a!) host, Tensor "
+      "block_table, "
+      "Tensor descriptor, "
+      "Tensor current_map, Tensor topk, Tensor append_slots, Tensor current, "
+      "Tensor(b!) selection, Tensor(c!) indices, Tensor(d!) lengths, "
+      "Tensor(e!) selection_table, "
+      "Tensor(f!) resident, Tensor(g!) slots, Tensor(h!) count, Tensor(i!) "
+      "host_rope, "
+      "Tensor current_rope, Tensor(j!) selection_rope, Tensor(k!) plan_tokens, "
+      "Tensor(l!) plan_slots) -> ()");
+  m.def(
+      "dsa_kv_offloading_serve_rope_planned_out(Tensor(a!) host, Tensor(b!) "
+      "host_rope, "
+      "Tensor "
+      "block_table, "
+      "Tensor descriptor, Tensor current_map, Tensor plan_tokens, Tensor "
+      "plan_slots, "
+      "Tensor append_slots, Tensor current, Tensor current_rope, Tensor(c!) "
+      "selection, "
+      "Tensor(d!) selection_rope) -> ()");
+  m.def("dsa_kv_offloading_selection_capacity() -> int");
+
   m.def(
       "smla_va_metadata(int num_heads_q, int num_heads_kv, int head_dim, *, "
       "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_ori_kv=None, Tensor? "
@@ -1162,6 +1197,14 @@ TORCH_LIBRARY(xllm_ops, m) {
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
+  m.impl("dsa_kv_offloading_update_nope_out",
+         TORCH_FN(xllm::kernel::npu::dsa_kv_offloading_update_nope_out));
+  m.impl(
+      "dsa_kv_offloading_update_rope_with_plan_out",
+      TORCH_FN(xllm::kernel::npu::dsa_kv_offloading_update_rope_with_plan_out));
+  m.impl("dsa_kv_offloading_serve_rope_planned_out",
+         TORCH_FN(xllm::kernel::npu::dsa_kv_offloading_serve_rope_planned_out));
+
   m.impl("smla_va", TORCH_FN(xllm::kernel::npu::smla_va));
   m.impl("rms_norm", TORCH_FN(xllm::rms_norm_npu));
   m.impl("rms_norm_gated", TORCH_FN(xllm::rms_norm_gated_npu));
@@ -1243,6 +1286,9 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
 // runs only on the eager prefill path, so it needs no fake/meta registration;
 // decode graph capture is phase-disjoint.
 TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
+  m.impl("dsa_kv_offloading_selection_capacity",
+         TORCH_FN(xllm::kernel::npu::dsa_kv_offloading_selection_capacity));
+
   m.impl("has_dispatch_ffn_combine",
          TORCH_FN(xllm::kernel::npu::has_dispatch_ffn_combine));
   m.impl("build_cp_context", TORCH_FN(xllm::build_cp_context_npu));

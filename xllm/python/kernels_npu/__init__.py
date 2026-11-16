@@ -135,6 +135,11 @@ _EXPORTS = {
         "sparse_flash_attention",
         "sparse_flash_attention_out",
         "sparse_flash_attention_lse",
+        "dsa_kv_offloading_update_nope_out",
+        "dsa_kv_offloading_update_rope_with_plan_out",
+        "dsa_kv_offloading_serve_rope_planned_out",
+        "has_stable_resident_slots",
+        "has_stable_rope_resident_slots",
     ),
     "dsa": (
         "compressor",
@@ -249,6 +254,11 @@ __all__ = [
     "prepare_weight_mxfp4",
     "quant_matmul_mx",
     "rms_norm_dynamic_mx_quant",
+    "dsa_kv_offloading_update_nope_out",
+    "dsa_kv_offloading_update_rope_with_plan_out",
+    "dsa_kv_offloading_serve_rope_planned_out",
+    "has_stable_resident_slots",
+    "has_stable_rope_resident_slots",
 ]
 _runtime_initialized = False
 

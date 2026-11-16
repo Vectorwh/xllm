@@ -42,6 +42,85 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
+TEST(DsaKvOffloadingSetupTest, RejectsCpuCurrentBeforeHostSetup) {
+  torch::Tensor unused;
+  const torch::Tensor current =
+      torch::zeros({1, 1, 512}, torch::TensorOptions().dtype(torch::kBFloat16));
+  const auto expect_rejection = [](const auto& invoke) {
+    try {
+      invoke();
+      ADD_FAILURE() << "Expected invalid resident current device to fail.";
+    } catch (const c10::Error& error) {
+      EXPECT_NE(std::string(error.what())
+                    .find("Resident current KV must be an NPU tensor"),
+                std::string::npos);
+    }
+  };
+  expect_rejection([&] {
+    kernel::npu::dsa_kv_offloading_update_nope_out(unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   current,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused,
+                                                   unused);
+  });
+  expect_rejection([&] {
+    kernel::npu::dsa_kv_offloading_update_rope_with_plan_out(unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             current,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             unused,
+                                                             current,
+                                                             unused,
+                                                             unused,
+                                                             unused);
+  });
+  expect_rejection([&] {
+    kernel::npu::dsa_kv_offloading_serve_rope_planned_out(unused,
+                                                          unused,
+                                                          unused,
+                                                          unused,
+                                                          unused,
+                                                          unused,
+                                                          unused,
+                                                          unused,
+                                                          current,
+                                                          current,
+                                                          unused,
+                                                          unused);
+  });
+}
+
+TEST(DsaKvOffloadingCapacityTest, MatchesVendorProbe) {
+  if (kernel::npu::aclnn::detail::get_op_api_func_addr(
+          "aclnnDsaKvOffloadingSelectionCapacity") == nullptr) {
+    GTEST_SKIP() << "The optional DSA KV offloading vendor is not available.";
+  }
+  // The probe is compared against this constant by the Python layer; keep the
+  // acceptance test on the same contract so a vendor/build skew is visible.
+  EXPECT_EQ(kernel::npu::dsa_kv_offloading_selection_capacity(),
+            kernel::npu::kDsaKvOffloadingSelectionCapacity);
+}
+
 torch::Tensor rms_norm_reference(const torch::Tensor& input,
                                  const torch::Tensor& weight,
                                  double eps) {

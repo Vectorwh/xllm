@@ -18,6 +18,13 @@ from __future__ import annotations
 
 import torch
 
+# Geometry of the existing xllm_ops stable-resident tensor contract.
+RESIDENT_PAGE_SIZE = 128
+RESIDENT_HEAD_DIM = 512
+RESIDENT_ROPE_DIM = 64
+SELECTION_CAPACITY = 2176
+SELECTION_BLOCKS = SELECTION_CAPACITY // RESIDENT_PAGE_SIZE
+
 
 def pool_key_indexer(
     query: torch.Tensor,
@@ -706,6 +713,176 @@ def kv_quant_sparse_flash_attention(
     )
 
 
+def _current_row_map(name: str, current_map: torch.Tensor, rows: int) -> torch.Tensor:
+    """Take a square active-row view from a possibly wider caller buffer."""
+    if current_map.ndim != 2 or current_map.shape[0] != rows or current_map.shape[1] < rows:
+        raise RuntimeError(
+            f"{name}: current row map must have shape ({rows}, >= {rows}); got {tuple(current_map.shape)}."
+        )
+    return current_map[:, :rows].contiguous()
+
+
+def _require_selection_layout(name: str, padded: torch.Tensor, selection: torch.Tensor) -> int:
+    """Validate the query layout and return the complete resident capacity."""
+    row_elements = SELECTION_CAPACITY * RESIDENT_HEAD_DIM
+    elements = selection.numel()
+    if elements % row_elements != 0:
+        raise RuntimeError(
+            f"{name}: selection payload must contain whole resident rows; "
+            f"got {elements} elements, expected a multiple of {row_elements}."
+        )
+    capacity = elements // row_elements
+    rows = padded.shape[0]
+    if capacity < rows:
+        raise RuntimeError(f"{name}: stable resident capacity {capacity} is smaller than {rows} active query rows.")
+    if padded.shape[1:] != (1, SELECTION_CAPACITY):
+        raise RuntimeError(f"{name}: requires [query, 1, {SELECTION_CAPACITY}] padded top-k.")
+    return capacity
+
+
+def dsa_kv_offloading_update_nope_out(
+    full_kv_cache: torch.Tensor,
+    full_block_table: torch.Tensor,
+    query_row_descriptor: torch.Tensor,
+    current_row_map: torch.Tensor,
+    topk_indices: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    current_kv: torch.Tensor,
+    selection_kv_cache: torch.Tensor,
+    selection_sparse_indices: torch.Tensor,
+    selection_actual_seq: torch.Tensor,
+    selection_block_table: torch.Tensor,
+    resident_token_ids: torch.Tensor,
+    selection_slot_indices: torch.Tensor,
+    selection_valid_count: torch.Tensor,
+    compact_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Canonical zero-copy views for the stable-resident NoPE vendor entry."""
+    rows = topk_indices.shape[0]
+    capacity = _require_selection_layout("NoPE", topk_indices, selection_kv_cache)
+    if selection_valid_count.numel() != capacity:
+        raise RuntimeError(
+            f"NoPE: selection_valid_count has {selection_valid_count.numel()} rows but resident capacity is {capacity}."
+        )
+    torch.ops.xllm_ops.dsa_kv_offloading_update_nope_out(
+        full_kv_cache,
+        full_block_table,
+        query_row_descriptor,
+        _current_row_map("NoPE", current_row_map, rows),
+        topk_indices,
+        slot_mapping.view(rows),
+        current_kv.view(rows, 1, RESIDENT_HEAD_DIM),
+        selection_kv_cache.view(capacity * SELECTION_BLOCKS, RESIDENT_PAGE_SIZE, 1, RESIDENT_HEAD_DIM),
+        selection_sparse_indices.view(rows, 1, SELECTION_CAPACITY),
+        selection_actual_seq.view(rows),
+        selection_block_table.view(rows, SELECTION_BLOCKS),
+        resident_token_ids.view(capacity, 1, SELECTION_CAPACITY),
+        selection_slot_indices.view(capacity, 1, SELECTION_CAPACITY),
+        selection_valid_count.view(capacity),
+        compact_indices.view(rows, 1, SELECTION_CAPACITY),
+    )
+    return (selection_kv_cache, compact_indices, selection_actual_seq, selection_block_table)
+
+
+def dsa_kv_offloading_update_rope_with_plan_out(
+    host: torch.Tensor,
+    block_table: torch.Tensor,
+    descriptor: torch.Tensor,
+    current_map: torch.Tensor,
+    topk: torch.Tensor,
+    append: torch.Tensor,
+    current: torch.Tensor,
+    selection: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    table: torch.Tensor,
+    resident: torch.Tensor,
+    slots: torch.Tensor,
+    count: torch.Tensor,
+    host_rope: torch.Tensor,
+    current_rope: torch.Tensor,
+    selection_rope: torch.Tensor,
+    plan_tokens: torch.Tensor,
+    plan_slots: torch.Tensor,
+) -> None:
+    rows = topk.shape[0]
+    capacity = _require_selection_layout("RoPE plan/update", topk, selection)
+    torch.ops.xllm_ops.dsa_kv_offloading_update_rope_with_plan_out(
+        host,
+        block_table,
+        descriptor,
+        _current_row_map("RoPE plan/update", current_map, rows),
+        topk,
+        append.view(rows),
+        current.view(rows, 1, RESIDENT_HEAD_DIM),
+        selection.view(capacity * SELECTION_BLOCKS, RESIDENT_PAGE_SIZE, 1, RESIDENT_HEAD_DIM),
+        indices.view(rows, 1, SELECTION_CAPACITY),
+        lengths.view(rows),
+        table.view(rows, SELECTION_BLOCKS),
+        resident.view(capacity, 1, SELECTION_CAPACITY),
+        slots.view(capacity, 1, SELECTION_CAPACITY),
+        count.view(capacity),
+        host_rope,
+        current_rope.view(rows, 1, RESIDENT_ROPE_DIM),
+        selection_rope.view(capacity * SELECTION_BLOCKS, RESIDENT_PAGE_SIZE, 1, RESIDENT_ROPE_DIM),
+        plan_tokens.view(rows, 1, SELECTION_CAPACITY),
+        plan_slots.view(rows, 1, SELECTION_CAPACITY),
+    )
+
+
+def dsa_kv_offloading_serve_rope_planned_out(
+    host: torch.Tensor,
+    host_rope: torch.Tensor,
+    block_table: torch.Tensor,
+    descriptor: torch.Tensor,
+    current_map: torch.Tensor,
+    plan_tokens: torch.Tensor,
+    plan_slots: torch.Tensor,
+    append: torch.Tensor,
+    current: torch.Tensor,
+    current_rope: torch.Tensor,
+    selection: torch.Tensor,
+    selection_rope: torch.Tensor,
+) -> None:
+    rows = plan_tokens.shape[0]
+    capacity = _require_selection_layout("RoPE serve", plan_tokens, selection)
+    torch.ops.xllm_ops.dsa_kv_offloading_serve_rope_planned_out(
+        host,
+        host_rope,
+        block_table,
+        descriptor,
+        _current_row_map("RoPE serve", current_map, rows),
+        plan_tokens,
+        plan_slots,
+        append.view(rows),
+        current.view(rows, 1, RESIDENT_HEAD_DIM),
+        current_rope.view(rows, 1, RESIDENT_ROPE_DIM),
+        selection.view(capacity * SELECTION_BLOCKS, RESIDENT_PAGE_SIZE, 1, RESIDENT_HEAD_DIM),
+        selection_rope.view(capacity * SELECTION_BLOCKS, RESIDENT_PAGE_SIZE, 1, RESIDENT_ROPE_DIM),
+    )
+
+
+def has_stable_resident_slots() -> bool:
+    """Choose the stable resident ABI before any execution or state update."""
+    ops = torch.ops.xllm_ops
+    return (
+        hasattr(ops, "dsa_kv_offloading_update_nope_out")
+        and hasattr(ops, "dsa_kv_offloading_selection_capacity")
+        and ops.dsa_kv_offloading_selection_capacity() == SELECTION_CAPACITY
+    )
+
+
+def has_stable_rope_resident_slots() -> bool:
+    """Select both stable owner and shared contracts before state mutation."""
+    ops = torch.ops.xllm_ops
+    return (
+        hasattr(ops, "dsa_kv_offloading_update_rope_with_plan_out")
+        and hasattr(ops, "dsa_kv_offloading_serve_rope_planned_out")
+        and hasattr(ops, "dsa_kv_offloading_selection_capacity")
+        and ops.dsa_kv_offloading_selection_capacity() == SELECTION_CAPACITY
+    )
+
+
 __all__ = [
     "dynamic_block_quant",
     "kv_quant_sparse_flash_attention",
@@ -718,4 +895,9 @@ __all__ = [
     "sparse_flash_attention",
     "sparse_flash_attention_out",
     "sparse_flash_attention_lse",
+    "dsa_kv_offloading_update_nope_out",
+    "dsa_kv_offloading_update_rope_with_plan_out",
+    "dsa_kv_offloading_serve_rope_planned_out",
+    "has_stable_resident_slots",
+    "has_stable_rope_resident_slots",
 ]

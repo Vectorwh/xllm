@@ -1489,3 +1489,71 @@ register_fake("xllm_ops::sparse_flash_attention_lse", _sparse_flash_attention_ls
 register_fake("xllm_ops::sfa_dcp_remap_out", _sfa_dcp_remap_out_fake)
 
 register_fake("xllm_ops::x_flash_attention_decode_out", _x_flash_attention_decode_out_fake)
+
+
+def _dsa_kv_offloading_update_nope_out_fake(
+    host: torch.Tensor,
+    block_table: torch.Tensor,
+    descriptor: torch.Tensor,
+    current_map: torch.Tensor,
+    topk: torch.Tensor,
+    append_slots: torch.Tensor,
+    current: torch.Tensor,
+    selection: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    selection_table: torch.Tensor,
+    resident: torch.Tensor,
+    slots: torch.Tensor,
+    count: torch.Tensor,
+    compact_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return selection, compact_indices, lengths, selection_table
+
+
+def _dsa_kv_offloading_update_rope_with_plan_out_fake(
+    host: torch.Tensor,
+    block_table: torch.Tensor,
+    descriptor: torch.Tensor,
+    current_map: torch.Tensor,
+    topk: torch.Tensor,
+    append: torch.Tensor,
+    current: torch.Tensor,
+    selection: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    table: torch.Tensor,
+    resident: torch.Tensor,
+    slots: torch.Tensor,
+    count: torch.Tensor,
+    host_rope: torch.Tensor,
+    current_rope: torch.Tensor,
+    selection_rope: torch.Tensor,
+    plan_tokens: torch.Tensor,
+    plan_slots: torch.Tensor,
+) -> None:
+    return None
+
+
+def _dsa_kv_offloading_serve_rope_planned_out_fake(
+    host: torch.Tensor,
+    host_rope: torch.Tensor,
+    block_table: torch.Tensor,
+    descriptor: torch.Tensor,
+    current_map: torch.Tensor,
+    plan_tokens: torch.Tensor,
+    plan_slots: torch.Tensor,
+    append: torch.Tensor,
+    current: torch.Tensor,
+    current_rope: torch.Tensor,
+    selection: torch.Tensor,
+    selection_rope: torch.Tensor,
+) -> None:
+    return None
+
+
+register_fake("xllm_ops::dsa_kv_offloading_update_nope_out", _dsa_kv_offloading_update_nope_out_fake)
+register_fake(
+    "xllm_ops::dsa_kv_offloading_update_rope_with_plan_out", _dsa_kv_offloading_update_rope_with_plan_out_fake
+)
+register_fake("xllm_ops::dsa_kv_offloading_serve_rope_planned_out", _dsa_kv_offloading_serve_rope_planned_out_fake)

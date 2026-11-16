@@ -766,4 +766,64 @@ std::tuple<torch::Tensor, torch::Tensor> smla_va(
     c10::string_view layout_kv,
     int64_t topk_value_mode,
     bool return_softmax_lse);
+
+// Stable resident sparse KV offloading. The selection payload is
+// (capacity * 17, 128, 1, head_dim). The capacity probe returns the installed
+// vendor value, or -1 when the vendor package does not export the capacity
+// symbol. The operator entries below are linked against the vendor, so a
+// package without this family fails at load; treat the probe as a capacity
+// check, not as a load-time feature gate.
+inline constexpr int64_t kDsaKvOffloadingSelectionCapacity = 2176;
+
+int64_t dsa_kv_offloading_selection_capacity();
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+dsa_kv_offloading_update_nope_out(torch::Tensor& host,
+                                  const torch::Tensor& block_table,
+                                  const torch::Tensor& descriptor,
+                                  const torch::Tensor& current_map,
+                                  const torch::Tensor& topk,
+                                  const torch::Tensor& append_slots,
+                                  const torch::Tensor& current,
+                                  torch::Tensor& selection,
+                                  torch::Tensor& indices,
+                                  torch::Tensor& lengths,
+                                  torch::Tensor& selection_table,
+                                  torch::Tensor& resident,
+                                  torch::Tensor& slots,
+                                  torch::Tensor& count,
+                                  torch::Tensor& compact_indices);
+void dsa_kv_offloading_update_rope_with_plan_out(
+    torch::Tensor& host,
+    const torch::Tensor& block_table,
+    const torch::Tensor& descriptor,
+    const torch::Tensor& current_map,
+    const torch::Tensor& topk,
+    const torch::Tensor& append_slots,
+    const torch::Tensor& current,
+    torch::Tensor& selection,
+    torch::Tensor& indices,
+    torch::Tensor& lengths,
+    torch::Tensor& selection_table,
+    torch::Tensor& resident,
+    torch::Tensor& slots,
+    torch::Tensor& count,
+    torch::Tensor& host_rope,
+    const torch::Tensor& current_rope,
+    torch::Tensor& selection_rope,
+    torch::Tensor& plan_tokens,
+    torch::Tensor& plan_slots);
+void dsa_kv_offloading_serve_rope_planned_out(torch::Tensor& host,
+                                              torch::Tensor& host_rope,
+                                              const torch::Tensor& block_table,
+                                              const torch::Tensor& descriptor,
+                                              const torch::Tensor& current_map,
+                                              const torch::Tensor& plan_tokens,
+                                              const torch::Tensor& plan_slots,
+                                              const torch::Tensor& append_slots,
+                                              const torch::Tensor& current,
+                                              const torch::Tensor& current_rope,
+                                              torch::Tensor& selection,
+                                              torch::Tensor& selection_rope);
+
 }  // namespace xllm::kernel::npu
