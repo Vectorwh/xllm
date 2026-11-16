@@ -58,7 +58,7 @@ limitations under the License.
 #include "framework/sampling/sampling_params.h"
 #include "runtime/xservice_client.h"
 #include "scheduler/disagg_pd_scheduler.h"
-#include "tests/core/framework/kv_cache_transfer/scoped_environment_variable.h"
+#include "tests/core/common/scoped_environment_variable.h"
 #include "xservice.pb.h"
 
 namespace xllm {

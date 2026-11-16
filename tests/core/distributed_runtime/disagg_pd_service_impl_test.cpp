@@ -22,7 +22,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/common/etcd_client.h"
 #include "core/common/macros.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/service_config.h"
@@ -31,6 +30,7 @@ limitations under the License.
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
+#include "tests/core/common/etcd_registry_fixture.h"
 
 namespace xllm {
 namespace {
@@ -170,54 +170,38 @@ class ScopedConfigValue final {
 
 }  // namespace
 
-// Replace only registry I/O in this isolated executable, the same boundary
-// pattern as xservice_client_test.cpp: DisaggPDServiceImpl's constructor
-// requires an initialized XServiceClient, whose init() otherwise blocks on a
-// reachable etcd master entry. These definitions satisfy EtcdClient's public
-// boundary without pulling its production object, and no watch, registration
-// or lookup performs any I/O.
-EtcdClient::EtcdClient(const std::string& address, const std::string& space)
-    : client_(address), etcd_addr_(address), etcd_namespace_prefix_(space) {}
-EtcdClient::EtcdClient(const std::string& address,
-                       const std::string&,
-                       const std::string&,
-                       const std::string& space)
-    : EtcdClient(address, space) {}
-EtcdClient::~EtcdClient() = default;
-void EtcdClient::add_watch(const std::string&, Callback, bool) {}
-void EtcdClient::remove_watch(const std::string&) {}
-void EtcdClient::stop_watch() {}
-bool EtcdClient::get_master_service(const std::string&, std::string* address) {
-  *address = "127.0.0.1:9";
-  return true;
-}
-bool EtcdClient::get_all_xservices(const std::string&,
-                                   std::vector<std::string>*) {
-  return false;
-}
-bool EtcdClient::register_instance(const std::string&,
-                                   const std::string&,
-                                   const int) {
-  return true;
-}
-RegistrationLookupState EtcdClient::lookup_registration(const std::string&) {
-  return RegistrationLookupState::kPresent;
-}
-bool EtcdClient::withdraw_registration(const std::string&) { return true; }
-
 namespace {
+
+// The fixture outlives the process-global client, so it serves the registry
+// RPCs that init() makes without an external etcd.
+test::FakeRegistry& registry_fixture() {
+  static test::FakeRegistry registry;
+  return registry;
+}
 
 class DisaggPDServiceImplTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Construct the fixture in its own statement. In C++17 a call's postfix
+    // expression is sequenced before its arguments, so passing
+    // registry_fixture().address() directly would build the process-global
+    // client first and tear the server down under the client's open streams.
+    test::FakeRegistry& registry = registry_fixture();
     // Initialize the process-global client once: the constructor of the
-    // service under test LOG(FATAL)s without it. The stubbed EtcdClient
-    // boundary above makes init() succeed without a real registry, and the
-    // admission failures under test never exercise the client further.
+    // service under test LOG(FATAL)s without it. The registry fixture serves
+    // the real client's RPCs, and the admission failures under test never
+    // exercise the client further.
     static const bool xservice_initialized =
-        XServiceClient::get_instance()->init("http://127.0.0.1:9",
+        XServiceClient::get_instance()->init(registry.address(),
                                              "disagg-pd-admission-test");
     ASSERT_TRUE(xservice_initialized);
+  }
+
+  static void TearDownTestSuite() {
+    // Stop the client's watch and background threads while the registry
+    // fixture is still serving; leaving that to static destruction tears the
+    // server down under the client.
+    XServiceClient::get_instance()->shutdown();
   }
 };
 

@@ -510,6 +510,13 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/npu_layers.links" "${{links}}")
                 scheduler_source = source / "xllm/core/scheduler" / relative_source
                 scheduler_source.parent.mkdir(parents=True, exist_ok=True)
                 scheduler_source.touch()
+            for relative_source in (
+                "models/dit/utils/lanczos_resample.cpp",
+                "core/layers/common/attention_mask.cpp",
+            ):
+                production_source = source / "xllm" / relative_source
+                production_source.parent.mkdir(parents=True, exist_ok=True)
+                production_source.touch()
             (source / "CMakeLists.txt").write_text(
                 f"""cmake_minimum_required(VERSION 3.24)
 project(host_metadata_test_contract LANGUAGES CXX)

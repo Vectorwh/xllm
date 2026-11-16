@@ -18,7 +18,7 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <gtest/gtest.h>
 
-#include "tests/core/framework/kv_cache_transfer/scoped_environment_variable.h"
+#include "tests/core/common/scoped_environment_variable.h"
 #include "tests/scoped_port_range.h"
 
 #if defined(USE_NPU)

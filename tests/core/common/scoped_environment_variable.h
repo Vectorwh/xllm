@@ -3,15 +3,16 @@
 // (the child's fatal failure never runs a destructor; the parent re-enters
 // the scope after the fork and restores there).
 //
-// Shared by the transfer-engine test TUs that pin an environment-variable
-// driven behavior (XLLM_CP_INDEX_WRITE_MODE, MC_TCP_PROTO, ...). A plain
+// Lives in the shared test layer because transfer-engine tests and the etcd
+// registry fixture both pin an environment-variable driven behavior
+// (XLLM_CP_INDEX_WRITE_MODE, MC_TCP_PROTO, no_grpc_proxy, ...). A plain
 // setenv/unsetenv pair would wipe a value an exported test shell relied on,
 // and per-TU copies of this guard drift (the death-test fork visibility fix
 // once had to be applied per copy). The pre-existing ScopedEnvVar helpers in
 // kv_cache_store_test.cpp / mapping_npu_test.cpp / mlu_graph_executor_test.cpp
 // predate this header and can converge onto it incrementally.
-#ifndef XLLM_TESTS_KV_CACHE_TRANSFER_SCOPED_ENVIRONMENT_VARIABLE_H_
-#define XLLM_TESTS_KV_CACHE_TRANSFER_SCOPED_ENVIRONMENT_VARIABLE_H_
+#ifndef XLLM_TESTS_COMMON_SCOPED_ENVIRONMENT_VARIABLE_H_
+#define XLLM_TESTS_COMMON_SCOPED_ENVIRONMENT_VARIABLE_H_
 
 #include <cstdlib>
 #include <optional>
@@ -47,4 +48,4 @@ class ScopedEnvironmentVariable final {
 
 }  // namespace xllm::tests
 
-#endif  // XLLM_TESTS_KV_CACHE_TRANSFER_SCOPED_ENVIRONMENT_VARIABLE_H_
+#endif  // XLLM_TESTS_COMMON_SCOPED_ENVIRONMENT_VARIABLE_H_

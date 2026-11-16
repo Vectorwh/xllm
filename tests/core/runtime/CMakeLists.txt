@@ -32,7 +32,7 @@ cc_test(
   NAME xservice_client_test
   CPU_ONLY
   SRCS xservice_client_test.cpp
-  DEPS :runtime :config GTest::gtest_main
+  DEPS :runtime :config etcd_registry_fixture GTest::gtest_main
 )
 target_link_libraries(xservice_client_test PRIVATE
   Python::Python

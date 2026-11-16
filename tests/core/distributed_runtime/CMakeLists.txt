@@ -59,14 +59,14 @@ target_link_libraries(llm_engine_host_transfer_test PRIVATE
 
 # Pins the decode admission failure status: only a structured-output
 # constraint rebuild failure reports the permanent 422, every other nullptr
-# path stays a generic 500. CPU_ONLY: no device or NPU runtime is needed;
-# the EtcdClient boundary is stubbed in the source so the process-global
-# XServiceClient can initialize without a registry.
+# path stays a generic 500. CPU_ONLY: no device or NPU runtime is needed; the
+# shared registry fixture serves the etcd RPC boundary so the process-global
+# XServiceClient can initialize without an external registry.
 cc_test(
   NAME disagg_pd_service_impl_test
   CPU_ONLY
   SRCS disagg_pd_service_impl_test.cpp
   DEPS :distributed_runtime :scheduler :xllm_server :block :config
-       GTest::gtest_main
+       etcd_registry_fixture GTest::gtest_main
 )
 target_link_libraries(disagg_pd_service_impl_test PRIVATE Python::Python)
