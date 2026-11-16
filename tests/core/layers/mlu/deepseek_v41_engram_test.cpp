@@ -116,6 +116,25 @@ TEST_F(DeepseekV41EngramTest, DefaultHostMatchesDeviceAndSelectedRows) {
       expected.index_select(0, indices).cpu()));
 }
 
+TEST_F(DeepseekV41EngramTest, ImageAndPaddingRowsPassThroughIncludingCpShards) {
+  torch::InferenceMode inference;
+  torch::DeviceGuard guard(options_.device());
+  auto layer = create("{}");
+  torch::Tensor tokens = torch::tensor({129264, 5, 129265, 7}, torch::kInt64)
+                             .to(options_.device());
+  torch::Tensor hidden =
+      torch::linspace(-1, 1, 4 * 2 * 8).reshape({4, 2, 8}).to(options_);
+  torch::Tensor actual = layer->forward(hidden, tokens, input_);
+  EXPECT_TRUE(torch::equal(actual[0], hidden[0]));
+  EXPECT_TRUE(torch::equal(actual[2], hidden[2]));
+  EXPECT_FALSE(torch::equal(actual[1], hidden[1]));
+  torch::Tensor indices =
+      torch::tensor({2, 1, 0}, torch::kInt64).to(options_.device());
+  torch::Tensor local = layer->forward(
+      hidden.index_select(0, indices), tokens, input_, nullptr, indices);
+  EXPECT_TRUE(torch::equal(local, actual.index_select(0, indices)));
+}
+
 TEST_F(DeepseekV41EngramTest, SharedHostMatchesDeviceWithStridedFp8Checkpoint) {
   torch::InferenceMode inference;
   torch::DeviceGuard guard(options_.device());

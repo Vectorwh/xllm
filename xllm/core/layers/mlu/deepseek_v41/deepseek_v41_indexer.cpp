@@ -157,11 +157,11 @@ void DeepseekV41IndexerImpl::select_candidate_indices(
       safe.remainder(kDeepseekV41MluKVBlockSize);
   auto keys = cache.index_select(0, physical).to(torch::kFloat32);
   auto scores = (torch::matmul(iq, keys.t()).relu() * iw.unsqueeze(1)).sum(0);
-  scores.masked_fill_((logical < 0) | (logical >= length),
-                      -std::numeric_limits<double>::infinity());
+  const double neg_inf = -std::numeric_limits<double>::infinity();
+  scores.masked_fill_((logical < 0) | (logical >= length), neg_inf);
   auto [values, selected] = scores.topk(std::min<int64_t>(k, logical.numel()));
-  auto indices = logical.index_select(0, selected);
-  indices.masked_fill_(values == -std::numeric_limits<double>::infinity(), -1);
+  torch::Tensor indices = logical.index_select(0, selected);
+  indices.masked_fill_(values == neg_inf, -1);
   shared.topk.at(seq) = indices.view({1, -1});
 }
 

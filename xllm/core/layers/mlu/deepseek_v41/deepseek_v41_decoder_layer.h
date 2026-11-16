@@ -64,6 +64,7 @@ class DeepseekV41DecoderLayerImpl final : public torch::nn::Module {
   torch::Tensor forward_unfused(
       torch::Tensor hidden,
       torch::Tensor& pre_mix,
+      const torch::Tensor& tokens,
       const torch::Tensor& positions,
       const torch::Tensor& rope,
       std::vector<KVCache>& caches,
@@ -71,6 +72,7 @@ class DeepseekV41DecoderLayerImpl final : public torch::nn::Module {
       Csa2Context& shared,
       const mlu_v4_cp::DeepseekV4CpContext* cp_context);
   torch::Tensor forward_moe(torch::Tensor x,
+                            const torch::Tensor& tokens,
                             const ModelInputParams& input,
                             const mlu_v4_cp::DeepseekV4CpContext* cp_context);
 

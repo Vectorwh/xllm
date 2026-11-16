@@ -20,12 +20,12 @@ limitations under the License.
 
 #include <vector>
 
-#include "causal_lm.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/model/model_args.h"
+#include "core/framework/model/model_input_params.h"
 #include "core/framework/quant_args.h"
 #include "core/framework/state_dict/state_dict.h"
-#include "model_args.h"
-#include "model_input_params.h"
 
 namespace xllm {
 
@@ -59,6 +59,30 @@ class CausalVLMImpl : public CausalVLM {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& parameters) override {
     return model_->forward(tokens, positions, kv_caches, parameters);
+  }
+
+  bool requires_graph_forward_metadata() override {
+    if constexpr (detail::has_requires_graph_forward_metadata<Model>::value) {
+      return model_->requires_graph_forward_metadata();
+    }
+    return CausalLM::requires_graph_forward_metadata();
+  }
+
+  std::unique_ptr<ModelGraphMetadataState> create_graph_forward_metadata_state()
+      override {
+    if constexpr (detail::has_create_graph_forward_metadata_state<
+                      Model>::value) {
+      return model_->create_graph_forward_metadata_state();
+    }
+    return CausalLM::create_graph_forward_metadata_state();
+  }
+
+  void prepare_graph_forward_metadata(ModelGraphMetadataState* state,
+                                      const torch::Tensor& positions,
+                                      ModelInputParams& parameters) override {
+    if constexpr (detail::has_prepare_graph_forward_metadata<Model>::value) {
+      model_->prepare_graph_forward_metadata(state, positions, parameters);
+    }
   }
 
   bool is_hybrid_linear_attention() override {

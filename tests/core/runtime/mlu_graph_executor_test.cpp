@@ -3145,6 +3145,7 @@ void MluGraphExecutorTest::
   MtpModelCapabilities capabilities;
   capabilities.graph_block_table_extra_columns = 0;
   capabilities.enable_piecewise_graph = true;
+  capabilities.graph_requires_cache_slots = false;
   ModelRegistry::register_mtp_capabilities("test_piecewise_history",
                                            capabilities);
   model_args_.model_type("test_piecewise_history")
@@ -3159,6 +3160,13 @@ void MluGraphExecutorTest::
     auto input = prepare_inputs(batches[i], 300 + i);
     auto& params = input.input_params;
     params.meta.kv_max_seq_len = histories[i];
+    // Slot input presence may vary; this model owns its cache addressing.
+    if (i % 2 == 0) {
+      params.attention.device.new_cache_slots = torch::Tensor();
+    } else {
+      params.attention.device.new_cache_slots =
+          torch::empty({0}, input.token_ids.options());
+    }
     auto expected = (params.embedding.input_embedding.to(torch::kFloat32) * 2 +
                      histories[i]) *
                     3;

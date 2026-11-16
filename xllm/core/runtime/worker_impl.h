@@ -358,6 +358,11 @@ class WorkerImpl {
     KVCacheCreateOptions create_options;
   };
 
+  // Make rank-local overlap replacements use the same sampled tokens.
+  void synchronize_sampled_tokens_for_schedule_overlap(
+      torch::Tensor& tokens,
+      const SamplingParameters& sampling_params);
+
   void update_last_step_output(
       const std::optional<ForwardOutput>& output,
       const std::vector<std::string>& request_ids,

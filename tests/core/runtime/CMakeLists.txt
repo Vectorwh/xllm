@@ -336,6 +336,17 @@ if(USE_NPU OR USE_MLU)
 endif()
 
 if(USE_MLU)
+  # Fork before device initialization to test sampling on orthogonal TP/CP groups.
+  cc_test(
+    NAME vlm_worker_sampling_test
+    SRCS vlm_worker_sampling_test.cpp
+    DEPS :runtime :model_loader :platform :util :parallel_state
+         GTest::gtest_main torch_mlu glog::glog
+  )
+  set_tests_properties(
+    VlmWorkerSamplingTest.OverlapTokensAgreeAcrossTpAndCpAfterRngDiverges
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+
   # Fork ranks before device initialization to exercise real TP/DP/EP groups.
   cc_test(
     NAME
@@ -353,6 +364,12 @@ if(USE_MLU)
       glog::glog
   )
 
+  cc_test(
+    NAME deepseek_v41_vlm_graph_test
+    SRCS deepseek_v41_vlm_graph_test.cpp
+    DEPS :runtime :model_loader :tests_utils :platform
+         GTest::gtest_main torch_mlu
+  )
   cc_test(
     NAME
       deepseek_v41_dspark_graph_test

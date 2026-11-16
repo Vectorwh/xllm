@@ -34,13 +34,19 @@ class MOESoftPlusTopKImpl final : public torch::nn::Module {
                       float route_scale,
                       int64_t vocab_size,
                       bool use_hash,
-                      const torch::TensorOptions& options);
+                      const torch::TensorOptions& options,
+                      bool use_visual_bias = false,
+                      int64_t image_token_id = -1);
 
   std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& scores,
       const std::optional<torch::Tensor>& input_ids = std::nullopt);
 
   void load_state_dict(const StateDict& state_dict);
+  // Non-hash checkpoints require bias; visual routing additionally requires
+  // bias_vl. Missing required weights fail verification instead of routing with
+  // uninitialized storage or silently substituting the text bias.
+  void verify_loaded_weights() const;
 
  private:
   int64_t n_routed_experts_ = 0;
@@ -48,9 +54,12 @@ class MOESoftPlusTopKImpl final : public torch::nn::Module {
   float route_scale_ = 1.0f;
   int64_t vocab_size_ = 0;
   bool use_hash_ = false;
+  bool use_visual_bias_ = false;
+  int64_t image_token_id_ = -1;
 
   DEFINE_WEIGHT(tid2eid);
   DEFINE_WEIGHT(bias);
+  DEFINE_WEIGHT(bias_vl);
 
   // Cached optional wrappers to avoid creating new objects on each forward
   std::optional<torch::Tensor> tid2eid_opt_;

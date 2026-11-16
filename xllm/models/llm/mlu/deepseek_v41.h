@@ -235,9 +235,15 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
       local_tokens = layer::mlu_v4_cp::shard_rows(tokens, *cp_context);
       positions = cp_context->local_positions;
     }
-    torch::Tensor hidden = embed_tokens_(local_tokens)
-                               .unsqueeze(1)
-                               .repeat({1, model_args_.hc_mult(), 1});
+    torch::Tensor inputs_embeds = input.embedding.input_embedding;
+    if (inputs_embeds.defined() && cp_context) {
+      inputs_embeds = layer::mlu_v4_cp::shard_rows(inputs_embeds, *cp_context);
+    }
+    if (!inputs_embeds.defined()) {
+      inputs_embeds = embed_tokens_(local_tokens);
+    }
+    torch::Tensor hidden =
+        inputs_embeds.unsqueeze(1).repeat({1, model_args_.hc_mult(), 1});
     torch::Tensor pre =
         torch::zeros({local_tokens.numel(), model_args_.hc_mult()},
                      hidden.options().dtype(torch::kFloat32));
@@ -381,9 +387,11 @@ class DeepseekV41ForCausalLMImpl final
   }
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
-    model_->load_hash_state(layer::build_deepseek_v41_hash_state(
-        loader->model_args(),
-        loader->model_weights_path() + "/tokenizer.json"));
+    if (!loader->model_args().engram_layer_ids().empty()) {
+      model_->load_hash_state(layer::build_deepseek_v41_hash_state(
+          loader->model_args(),
+          loader->model_weights_path() + "/tokenizer.json"));
+    }
     for (const auto& state : loader->get_state_dicts()) {
       // Both released checkpoints and HF exports are supported by stripping
       // their optional model. prefix without altering layer parameter names.
@@ -429,6 +437,7 @@ const bool deepseek_v41_graph_capabilities_registered = []() {
   capabilities.enable_piecewise_graph = true;
   capabilities.supports_grouped_mtp_graph = true;
   capabilities.graph_dynamic_multi_block_tables = true;
+  capabilities.graph_requires_cache_slots = false;
   ModelRegistry::register_mtp_capabilities("deepseek_v41", capabilities);
   return true;
 }();

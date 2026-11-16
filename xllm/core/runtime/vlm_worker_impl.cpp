@@ -337,6 +337,8 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   if (sampling_params.selected_token_idxes.defined()) {
     if (!input.skip_sampling_for_logits_only) {
       output.sample_output = sampler_->forward(logits, sampling_params);
+      synchronize_sampled_tokens_for_schedule_overlap(
+          output.sample_output.next_tokens, sampling_params);
       output.filter_bitmask_applied_to_logits =
           sampling_params.filter_bitmask.defined();
       output.filter_mask_applied_to_logits =

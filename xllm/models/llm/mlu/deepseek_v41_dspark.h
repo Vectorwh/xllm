@@ -229,6 +229,7 @@ const bool kDeepseekV41DSparkGraphCapabilitiesRegistered = []() {
   capabilities.enable_piecewise_graph = true;
   capabilities.supports_grouped_mtp_graph = true;
   capabilities.graph_dynamic_multi_block_tables = true;
+  capabilities.graph_requires_cache_slots = false;
   ModelRegistry::register_mtp_capabilities("deepseek_v41_dspark", capabilities);
   return true;
 }();

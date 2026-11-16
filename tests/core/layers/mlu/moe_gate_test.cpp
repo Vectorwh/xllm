@@ -34,6 +34,43 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
+TEST(MoEGateWeightLoadingTest, RejectsMissingRoutingBias) {
+  torch::InferenceMode inference;
+  const auto options = torch::TensorOptions().dtype(torch::kFloat32);
+  MOESoftPlusTopK text_gate(/*n_routed_experts=*/4,
+                            /*n_activated_experts=*/2,
+                            /*route_scale=*/1.0f,
+                            /*vocab_size=*/8,
+                            /*use_hash=*/false,
+                            options);
+  EXPECT_DEATH(text_gate->verify_loaded_weights(),
+               "sqrtsoftplus routing requires bias");
+  MOESoftPlusTopK visual_gate(/*n_routed_experts=*/4,
+                              /*n_activated_experts=*/2,
+                              /*route_scale=*/1.0f,
+                              /*vocab_size=*/8,
+                              /*use_hash=*/false,
+                              options,
+                              /*use_visual_bias=*/true,
+                              /*image_token_id=*/7);
+  visual_gate->load_state_dict(StateDict({{"bias", torch::zeros({4})}}));
+  EXPECT_DEATH(visual_gate->verify_loaded_weights(),
+               "Missing visual router bias_vl");
+  visual_gate->load_state_dict(StateDict({{"bias_vl", torch::zeros({4})}}));
+  visual_gate->verify_loaded_weights();
+  text_gate->load_state_dict(StateDict({{"bias", torch::zeros({4})}}));
+  text_gate->verify_loaded_weights();
+  MOESoftPlusTopK hash_gate(/*n_routed_experts=*/4,
+                            /*n_activated_experts=*/2,
+                            /*route_scale=*/1.0f,
+                            /*vocab_size=*/8,
+                            /*use_hash=*/true,
+                            options);
+  hash_gate->load_state_dict(
+      StateDict({{"tid2eid", torch::zeros({8, 2}, torch::kInt32)}}));
+  hash_gate->verify_loaded_weights();
+}
+
 class MoEGateTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -327,6 +364,45 @@ TEST_F(MoEGateTest, SqrtSoftplusHashRoutingPreservesTokenExpertMapping) {
                               torch::full({3, kTopk}, 1.5f / kTopk),
                               1e-6,
                               1e-6));
+}
+
+TEST_F(MoEGateTest, VisualBiasRespectsCapabilityAndTokenType) {
+  torch::InferenceMode inference;
+  set_moe_gate_params(4, 2, 1, 1, 1.5, 4, true, "sqrtsoftplus", "noaux_tc");
+  for (const std::string& model_type :
+       {"deepseek_v41", "deepseek_v41_dspark"}) {
+    SCOPED_TRACE(model_type);
+    for (const int32_t vision_layers : {0, 1}) {
+      SCOPED_TRACE(vision_layers);
+      model_args_.model_type(model_type)
+          .image_token_id(129264)
+          .mm_num_hidden_layers(vision_layers);
+      MoEGate gate(model_args_, quant_args_, options_);
+      gate->load_state_dict(StateDict(
+          {{"weight", torch::eye(4, torch::kBFloat16)},
+           {"bias", torch::tensor({20.0f, 10.0f, 0.0f, -10.0f})},
+           {"bias_vl", torch::tensor({-10.0f, 0.0f, 10.0f, 20.0f})}}));
+      gate->verify_loaded_weights();
+      torch::Tensor logits = torch::tensor({{-4.0f, -1.0f, 1.0f, 3.0f},
+                                            {-4.0f, -1.0f, 1.0f, 3.0f},
+                                            {-4.0f, -1.0f, 1.0f, 3.0f}},
+                                           options_);
+      torch::Tensor tokens =
+          torch::tensor({7, 129264, 129265}, options_.dtype(torch::kInt32));
+      auto [weights, indices] = gate->forward(logits, tokens);
+      torch::Tensor expected_ids =
+          torch::tensor({{0, 1},
+                         {vision_layers > 0 ? 3 : 0, vision_layers > 0 ? 2 : 1},
+                         {0, 1}},
+                        torch::kInt64);
+      EXPECT_TRUE(torch::equal(indices.cpu().to(torch::kLong), expected_ids));
+      torch::Tensor scores =
+          torch::softplus(logits.cpu().to(torch::kFloat32)).sqrt();
+      torch::Tensor expected = scores.gather(1, expected_ids);
+      expected = expected / expected.sum(-1, true) * 1.5;
+      EXPECT_TRUE(torch::allclose(weights.cpu(), expected, 1e-6, 1e-6));
+    }
+  }
 }
 
 }  // namespace layer

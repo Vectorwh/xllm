@@ -427,6 +427,11 @@ torch::Tensor DeepseekV41EngramImpl::forward(const torch::Tensor& hidden,
          std::sqrt(width);
   torch::Tensor gate = torch::sigmoid(torch::where(dot < 0, -1.0, 1.0) *
                                       dot.abs().clamp_min(1e-6).sqrt());
+  torch::Tensor local_tokens =
+      row_indices.defined() ? tokens.index_select(0, row_indices) : tokens;
+  torch::Tensor text_mask = local_tokens.ne(kEngramImageSentinelBaseId) &
+                            local_tokens.ne(kEngramImagePadId);
+  gate = torch::where(text_mask.unsqueeze(-1), gate, torch::zeros_like(gate));
   return (h + gate.unsqueeze(-1) * value.unsqueeze(1)).to(hidden.scalar_type());
 }
 

@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 
+#include <cstdint>
 #include <memory>
 
 #include "common/macros.h"
@@ -127,7 +128,9 @@ class VLMEngine : public Engine {
 
   // common frequently used args
   uint32_t dp_size_;
+  uint32_t cp_size_;
   uint32_t worker_clients_num_;
+  uint32_t dp_local_size_;
   uint32_t dp_local_tp_size_;
 
   bool layer_forward_interrupted_ = false;

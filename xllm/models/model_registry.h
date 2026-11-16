@@ -76,6 +76,9 @@ struct MtpModelCapabilities {
   bool supports_grouped_mtp_graph = false;
   int64_t graph_block_table_extra_columns = 1;
   int64_t graph_cache_pad_slot = 0;
+  // Models that derive cache addresses from their own grouped block tables
+  // do not consume the generic per-token slot mapping.
+  bool graph_requires_cache_slots = true;
   bool enable_piecewise_graph = false;
   // Grouped page tables are consumed only by piecewise eager callbacks.
   // Their widths do not specialize captured kernels or own captured storage.

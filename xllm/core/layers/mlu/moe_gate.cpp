@@ -13,8 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "moe_gate.h"
+#include "core/layers/mlu/moe_gate.h"
 
+#include "core/util/utils.h"
 #include "kernels/ops_api.h"
 
 namespace xllm {
@@ -41,6 +42,9 @@ MoEGateImpl::MoEGateImpl(const ModelArgs& model_args,
   }
 
   if (scoring_func_ == "sqrtsoftplus") {
+    const bool use_visual_bias =
+        util::is_deepseek_v41_family_model_type(model_args.model_type()) &&
+        model_args.mm_num_hidden_layers() > 0;
     moe_softplus_topk_ =
         register_module("moe_softplus_topk",
                         MOESoftPlusTopK(model_args.n_routed_experts(),
@@ -48,7 +52,9 @@ MoEGateImpl::MoEGateImpl(const ModelArgs& model_args,
                                         model_args.routed_scaling_factor(),
                                         model_args.vocab_size(),
                                         use_hash,
-                                        options));
+                                        options,
+                                        use_visual_bias,
+                                        model_args.image_token_id()));
   }
 
   gate_ = register_module("gate_proj",
@@ -97,6 +103,12 @@ void MoEGateImpl::load_state_dict(const StateDict& state_dict) {
   }
   if (moe_softplus_topk_) {
     moe_softplus_topk_->load_state_dict(state_dict);
+  }
+}
+
+void MoEGateImpl::verify_loaded_weights() const {
+  if (moe_softplus_topk_) {
+    moe_softplus_topk_->verify_loaded_weights();
   }
 }
 

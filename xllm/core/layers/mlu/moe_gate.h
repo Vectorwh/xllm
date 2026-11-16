@@ -50,6 +50,7 @@ class MoEGateImpl : public torch::nn::Module {
 
   // Load state dict. Gate and e_score_correction_bias
   void load_state_dict(const StateDict& state_dict);
+  void verify_loaded_weights() const;
 
  private:
   int64_t num_experts_;

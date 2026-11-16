@@ -204,8 +204,9 @@ GraphPersistentParam::GraphPersistentParam(const torch::Tensor& tokens,
                                            ModelInputParams params,
                                            const GraphLayout& layout,
                                            int64_t main_block_table_columns,
-                                           bool dynamic_multi_block_tables)
-    : params_(std::move(params)) {
+                                           bool dynamic_multi_block_tables,
+                                           bool cache_slots_required)
+    : params_(std::move(params)), cache_slots_required_(cache_slots_required) {
   const torch::Tensor& input_embedding = params_.embedding.input_embedding;
   if (input_embedding.defined()) {
     CHECK_EQ(input_embedding.dim(), 2)
@@ -253,8 +254,13 @@ GraphPersistentParam::GraphPersistentParam(const torch::Tensor& tokens,
   attention.q_cu_seq_lens = attention.q_seq_lens;
   attention.kv_seq_lens = allocate_rows(
       attention.kv_seq_lens, attention.kv_seq_lens.numel() + extra_rows);
-  attention.new_cache_slots =
-      allocate_rows(attention.new_cache_slots, graph_tokens);
+  if (cache_slots_required_) {
+    attention.new_cache_slots =
+        allocate_rows(attention.new_cache_slots, graph_tokens);
+  } else {
+    attention.new_cache_slots = torch::Tensor();
+    params_.attention.host.new_cache_slots.clear();
+  }
   if (attention.block_tables.defined()) {
     attention.block_tables = torch::empty(
         {attention.block_tables.size(0) + extra_rows, main_block_table_columns},
@@ -309,8 +315,10 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
   const auto& buffer = params_.attention.device;
   check_graph_tensor(buffer.q_seq_lens, source.q_seq_lens, "q_seq_lens");
   check_graph_tensor(buffer.kv_seq_lens, source.kv_seq_lens, "kv_seq_lens");
-  check_graph_tensor(
-      buffer.new_cache_slots, source.new_cache_slots, "new_cache_slots");
+  if (cache_slots_required_) {
+    check_graph_tensor(
+        buffer.new_cache_slots, source.new_cache_slots, "new_cache_slots");
+  }
   if (source.block_tables.defined()) {
     CHECK(buffer.block_tables.defined());
     CHECK_EQ(source.block_tables.dim(), 2);
@@ -406,6 +414,9 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
       static_cast<int32_t>(tokens.size(0)));
   positions_.narrow(dim, 0, positions.size(dim)).copy_(positions);
   params_.attention.host = params.attention.host;
+  if (!cache_slots_required_) {
+    params_.attention.host.new_cache_slots.clear();
+  }
   extend_offsets(params_.attention.host.q_seq_lens);
   extend_offsets(params_.attention.host.kv_seq_lens);
   params_.attention.host.q_cu_seq_lens = params_.attention.host.q_seq_lens;
@@ -433,12 +444,14 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
     }
     copy_host(attention.kv_seq_lens.narrow(0, kv_rows, extra_rows), tail);
   }
-  const int64_t slot_rows = params.attention.device.new_cache_slots.size(0);
-  if (padded_reqs || slot_rows < attention.new_cache_slots.size(0)) {
-    attention.new_cache_slots.fill_(layout.cache_pad_slot);
+  if (cache_slots_required_) {
+    const int64_t slot_rows = params.attention.device.new_cache_slots.size(0);
+    if (padded_reqs || slot_rows < attention.new_cache_slots.size(0)) {
+      attention.new_cache_slots.fill_(layout.cache_pad_slot);
+    }
+    attention.new_cache_slots.narrow(0, 0, slot_rows)
+        .copy_(params.attention.device.new_cache_slots);
   }
-  attention.new_cache_slots.narrow(0, 0, slot_rows)
-      .copy_(params.attention.device.new_cache_slots);
   if (attention.block_tables.defined()) {
     const int64_t block_rows = params.attention.device.block_tables.size(0);
     const int64_t copy_width = params.attention.device.block_tables.size(1);
@@ -900,7 +913,8 @@ ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
         std::move(graph_params),
         layout,
         main_block_table_columns_,
-        mtp_capabilities_.graph_dynamic_multi_block_tables);
+        mtp_capabilities_.graph_dynamic_multi_block_tables,
+        mtp_capabilities_.graph_requires_cache_slots);
     auto graph = std::make_unique<MluGraph>(
         std::move(buffers), mtp_capabilities_.enable_piecewise_graph);
     active_graph = graph.get();

@@ -72,6 +72,31 @@ TEST(MluCpCapabilityTest, AcceptsOrthogonalDeepseekV4TargetAndSuffix) {
           .has_value());
 }
 
+TEST(MluCpCapabilityTest, ValidatesNativeDeepseekV41VlmCp) {
+  constexpr int32_t kWorldSize = 8;
+  Options options = make_cp_options(kWorldSize);
+  options.backend("vlm")
+      .model_impl("native")
+      .cp_size(4)
+      .instance_role(InstanceRole::DEFAULT)
+      .speculative_algorithm("DSpark");
+  for (const EngineType type : {EngineType::VLM, EngineType::VLMSSM}) {
+    SCOPED_TRACE(type.to_string());
+    EXPECT_FALSE(validate_model_cp(options, type, "deepseek_v41", kWorldSize)
+                     .has_value());
+    EXPECT_TRUE(
+        validate_model_cp(options, type, "qwen3_vl", kWorldSize).has_value());
+    options.model_impl("python");
+    EXPECT_TRUE(validate_model_cp(options, type, "deepseek_v41", kWorldSize)
+                    .has_value());
+    options.model_impl("native");
+  }
+  options.ep_size(4);
+  EXPECT_TRUE(
+      validate_model_cp(options, EngineType::VLM, "deepseek_v41", kWorldSize)
+          .has_value());
+}
+
 TEST(MluCpCapabilityTest, SupportsGlmPcpDcpAndRejectsLegacyDraftTargets) {
   constexpr int32_t kWorldSize = 8;
   const Options options = make_cp_options(kWorldSize);

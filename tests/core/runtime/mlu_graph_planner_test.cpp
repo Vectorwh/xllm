@@ -72,6 +72,34 @@ ModelInputParams grouped_input(int64_t rows = 3) {
   return params;
 }
 
+TEST(MluGraphPlannerTest, ModelManagedCacheGraphDoesNotRequireSlots) {
+  GraphPlannerConfig config = qwen_config();
+  config.capabilities.supports_grouped_mtp_graph = true;
+  config.capabilities.graph_requires_cache_slots = false;
+  config.state_required = true;
+  ModelInputParams params = grouped_input();
+  params.multi_block_tables = {params.attention.device.block_tables};
+  params.attention.device.block_tables = torch::Tensor();
+  params.attention.device.new_cache_slots = torch::Tensor();
+  const MluGraphPlanner planner(config);
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, params})));
+
+  config.capabilities.graph_requires_cache_slots = true;
+  auto decision = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<EagerReason>(decision));
+  EXPECT_EQ(std::get<EagerReason>(decision), EagerReason::UNSUPPORTED_INPUT);
+  params.attention.device.new_cache_slots = torch::empty({0}, torch::kInt32);
+  decision = MluGraphPlanner(config).plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<EagerReason>(decision));
+  EXPECT_EQ(std::get<EagerReason>(decision), EagerReason::INVALID_LAYOUT);
+  EXPECT_TRUE(std::holds_alternative<GraphPlan>(planner.plan({3, params})));
+
+  params.multi_block_tables[0] = params.multi_block_tables[0].slice(0, 0, 2);
+  decision = planner.plan({3, params});
+  ASSERT_TRUE(std::holds_alternative<EagerReason>(decision));
+  EXPECT_EQ(std::get<EagerReason>(decision), EagerReason::INVALID_LAYOUT);
+}
+
 void expect_eager(const MluGraphPlanner& planner,
                   int64_t tokens,
                   const ModelInputParams& params,

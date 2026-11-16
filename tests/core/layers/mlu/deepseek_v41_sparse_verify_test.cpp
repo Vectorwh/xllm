@@ -32,6 +32,38 @@ limitations under the License.
 namespace xllm::layer {
 namespace {
 
+torch::Tensor select_candidates(const std::vector<int64_t>& blocks,
+                                int64_t length,
+                                int64_t topk) {
+  ModelArgs args;
+  args.compress_ratios({1}).index_topk(topk).candidate_block_size(8);
+  ParallelArgs parallel(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  const auto options = torch::TensorOptions().dtype(torch::kFloat32);
+  DeepseekV41Indexer indexer(ModelContext(parallel, args, QuantArgs(), options),
+                             /*layer_id=*/0);
+  Csa2Context shared;
+  shared.topk.resize(1);
+  shared.candidates = {torch::tensor(blocks, torch::kInt64).view({1, -1})};
+  const torch::Tensor cache = torch::arange(128, options).view({128, 1});
+  indexer->select_candidate_indices(torch::ones({1, 1}, options),
+                                    torch::ones({1}, options),
+                                    cache,
+                                    torch::tensor({0}, torch::kInt32),
+                                    length,
+                                    /*seq=*/0,
+                                    shared);
+  return shared.topk[0];
+}
+
+TEST(DeepseekV41CandidateTest, BoundsTopkAndMasksPartialCandidateBlock) {
+  const torch::Tensor selected =
+      select_candidates({1}, /*length=*/9, /*topk=*/16);
+  EXPECT_TRUE(torch::equal(
+      selected,
+      torch::tensor({{8, -1, -1, -1, -1, -1, -1, -1}}, torch::kInt64)));
+}
+
 TEST(DeepseekV41GraphTest, SparseVerificationIgnoresCausallyMaskedSelections) {
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);

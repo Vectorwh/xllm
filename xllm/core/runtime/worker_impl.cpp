@@ -104,6 +104,7 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "models/py_model_helper.h"
 #include "runtime/forward_params.h"
+#include "runtime/speculative_worker_utils.h"
 #if defined(USE_NPU)
 #include "layers/npu/loader/rolling_weight_buffer.h"
 #endif
@@ -803,6 +804,33 @@ WorkerImpl::estimate_kv_cache_capacity_async() {
     promise.setValue(output);
   });
   return future;
+}
+
+void WorkerImpl::synchronize_sampled_tokens_for_schedule_overlap(
+    torch::Tensor& tokens,
+    const SamplingParameters& sampling_params) {
+  if (!enable_schedule_overlap() || options_.cp_size() <= 1 ||
+      options_.enable_speculative_decode() ||
+      sampling_params.all_greedy_sample) {
+    return;
+  }
+
+  // Each rank replaces the next step's placeholders using its own sample.
+  // Stochastic samples use rank-local RNG state, so reach consensus before
+  // storing last_step_output_. Only overlap guarantees that every rank samples.
+  CHECK(parallel_args_.tp_group_ != nullptr ||
+        parallel_args_.cp_group_ != nullptr)
+      << "cp_size=" << options_.cp_size()
+      << " but no tp/cp broadcast group is available for the "
+         "schedule-overlap token consensus";
+  // TP then CP selects the cohort's dp_driver output. NPU ATB publishes only
+  // the CP group; other backends may alias the two groups.
+  speculative_worker::broadcast_tokens_in_group(tokens,
+                                                parallel_args_.tp_group_);
+  if (parallel_args_.cp_group_ != parallel_args_.tp_group_) {
+    speculative_worker::broadcast_tokens_in_group(tokens,
+                                                  parallel_args_.cp_group_);
+  }
 }
 
 void WorkerImpl::update_last_step_output(

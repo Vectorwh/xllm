@@ -179,6 +179,7 @@ torch::Tensor DeepseekV41DecoderLayerImpl::forward(
         << "Unfused MHC layers cannot take or defer a pending post";
     return forward_unfused(std::move(hidden),
                            pre_mix,
+                           tokens,
                            positions,
                            rope,
                            caches,
@@ -206,7 +207,7 @@ torch::Tensor DeepseekV41DecoderLayerImpl::forward(
   MHCPreOutput ffn;
   std::tie(x, hidden, ffn.pre, ffn.post, ffn.comb) = ffn_hc_->fused_delayed_pre(
       x, hidden, attn.post, attn.comb, attn.pre, ffn_norm_->weight());
-  x = forward_moe(x, input, cp_context);
+  x = forward_moe(x, tokens, input, cp_context);
   pre_mix = ffn.pre;
   if (defer_post) {
     pending.emplace(PendingMHC{x, hidden, ffn.post, ffn.comb});
@@ -218,6 +219,7 @@ torch::Tensor DeepseekV41DecoderLayerImpl::forward(
 torch::Tensor DeepseekV41DecoderLayerImpl::forward_unfused(
     torch::Tensor hidden,
     torch::Tensor& pre_mix,
+    const torch::Tensor& tokens,
     const torch::Tensor& positions,
     const torch::Tensor& rope,
     std::vector<KVCache>& caches,
@@ -231,22 +233,27 @@ torch::Tensor DeepseekV41DecoderLayerImpl::forward_unfused(
   hidden = std::get<0>(post_->forward(x, hidden, attn.post, attn.comb));
   auto ffn = ffn_hc_->forward(hidden, std::nullopt, attn.pre);
   x = std::get<0>(ffn_norm_(ffn.output, std::nullopt));
-  x = forward_moe(x, input, cp_context);
+  x = forward_moe(x, tokens, input, cp_context);
   pre_mix = ffn.pre;
   return std::get<0>(post_->forward(x, hidden, ffn.post, ffn.comb));
 }
 
 torch::Tensor DeepseekV41DecoderLayerImpl::forward_moe(
     torch::Tensor x,
+    const torch::Tensor& tokens,
     const ModelInputParams& input,
     const mlu_v4_cp::DeepseekV4CpContext* cp_context) {
+  torch::Tensor route_tokens =
+      cp_context != nullptr
+          ? tokens.index_select(0, cp_context->local_row_indices)
+          : tokens;
   if (cp_context != nullptr) {
     return moe_->forward_cp(x,
-                            std::nullopt,
+                            route_tokens,
                             cp_context->geometry.tokens_per_rank,
                             cp_context->cp_group);
   }
-  const auto route = moe_->prep_route(x);
+  const auto route = moe_->prep_route(x, route_tokens);
   return moe_->forward_selected(x, route.reduce_weight, route.expert_id, input);
 }
 

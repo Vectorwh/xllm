@@ -437,3 +437,10 @@ cc_test(
   ENVIRONMENT
     "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
 )
+
+cc_test(
+  NAME deepseek_v41_vision_test
+  SRCS deepseek_v41_vision_test.cpp
+  DEPS :mlu_layers :model_context :state_dict :parallel_state
+       torch glog::glog GTest::gtest_main
+)

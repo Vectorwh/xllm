@@ -789,6 +789,7 @@ void FusedMoEImpl::load_experts(const StateDict& state_dict) {
 }
 
 void FusedMoEImpl::verify_loaded_weights() const {
+  gate_->verify_loaded_weights();
   if (!use_a8_quant_) {
     return;
   }

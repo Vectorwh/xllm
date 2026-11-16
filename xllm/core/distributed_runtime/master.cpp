@@ -140,8 +140,15 @@ std::optional<std::string> validate_model_cp(const Options& options,
   }
 
   if (Platform::is_mlu()) {
-    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
-      return "MLU CP supports only LLM text generation";
+    const bool is_vlm =
+        engine_type == EngineType::VLM || engine_type == EngineType::VLMSSM;
+    if (is_vlm && (!util::is_deepseek_v41_model_type(model_type) ||
+                   ModelConfig::is_python_model_impl(options.model_impl()))) {
+      return "MLU VLM CP supports only native DeepSeek-V4.1";
+    }
+    if (!is_vlm && engine_type != EngineType::LLM &&
+        engine_type != EngineType::SSM) {
+      return "MLU CP supports only LLM or native DeepSeek-V4.1 VLM generation";
     }
     if (options.task_type() != "generate") {
       return "MLU CP supports only the generate task";

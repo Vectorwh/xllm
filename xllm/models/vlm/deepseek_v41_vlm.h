@@ -14,11 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 
-// Multimodal-processor registration for DeepSeek-V4.1-Flash served as a VLM
-// via --backend=vlm --model_impl=python (PyCausalLM +
-// xllm.python.models.deepseek_v41.DeepseekV41ForCausalLM). The vision tower
-// and language model both live in Python, so the framework only needs a
-// processor to satisfy VLMMaster's create_multimodal_processor CHECK:
+// Shared processors for the Python and native MLU DeepSeek-V4.1-Flash VLM:
 //   * DeepseekV41ImageProcessor — DeepSeek resize/patchify -> pixel_values +
 //     spatial image_grid_thw (see the reference load_image).
 //   * DeepseekV41PromptProcessor — expands the `<｜deepseek_image｜>` /
