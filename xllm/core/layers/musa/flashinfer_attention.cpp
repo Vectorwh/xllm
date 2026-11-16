@@ -208,11 +208,11 @@ FlashInferAttentionImpl::forward(const AttentionMetadata& attn_metadata,
            "sizes require LSU operators not built by this profile";
   }
   if (is_decode || has_cached_prefix) {
-    CHECK(attn_metadata.q_cu_seq_lens.defined());
-    CHECK_LE(attn_metadata.q_cu_seq_lens.numel() - 1,
-             xllm::kernel::musa::kFa3MaxBatchSize)
-        << "MUSA FA3 metadata supports at most 31 sequences, including graph "
-           "padding; larger batches require multi-warp metadata operators";
+    CHECK(attn_metadata.q_cu_seq_lens.defined())
+        << "MUSA FA3 decode or paged prefill requires query sequence "
+           "boundaries";
+    CHECK_GT(attn_metadata.q_cu_seq_lens.numel(), 1)
+        << "MUSA FA3 decode or paged prefill requires at least one sequence";
   }
 
   // Only reshape and store to cache if k_cache is properly initialized

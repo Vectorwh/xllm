@@ -38,10 +38,7 @@ constexpr int64_t kFa3PrefillNumSplits = 1;
 const char* fa3_metadata_uri(int64_t gqa_ratio) {
   CHECK(gqa_ratio == 3 || gqa_ratio == 6 || gqa_ratio == 8)
       << "MUSA FA3 requires GQA ratio 3, 6 or 8";
-  if (gqa_ratio == 3) {
-    return aot::kFa3MetadataUriGqa3;
-  }
-  return gqa_ratio == 6 ? aot::kFa3MetadataUriGqa6 : aot::kFa3MetadataUriGqa8;
+  return aot::kFa3MetadataUri;
 }
 
 std::string fa3_fwd_uri(int64_t gqa_ratio) {

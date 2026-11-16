@@ -94,14 +94,14 @@ TEST(MusaAttentionTest, DispatchHonorsCompiledContractAndOverrides) {
   // These fail before allocating workspace or loading any operator URI.
   for (const bool prefill : {false, true}) {
     EXPECT_DEATH(([&] {
-                   const torch::Tensor cu_q = torch::arange(33, torch::kInt32);
+                   const torch::Tensor cu_q = torch::arange(1, torch::kInt32);
                    const torch::Tensor kv_lens =
-                       torch::ones({32}, torch::kInt32);
+                       torch::ones({0}, torch::kInt32);
                    const auto get_metadata =
                        prefill ? kernel::musa::fa3_prefill_scheduler_metadata
                                : kernel::musa::fa3_decode_scheduler_metadata;
                    get_metadata(torch::Device(torch::kCPU),
-                                32,
+                                0,
                                 12,
                                 2,
                                 256,
@@ -113,7 +113,7 @@ TEST(MusaAttentionTest, DispatchHonorsCompiledContractAndOverrides) {
                                 cu_q,
                                 kv_lens);
                  }()),
-                 "MUSA FA3 metadata supports at most 31 sequences");
+                 "batch_size > 0");
   }
   EXPECT_DEATH(
       ([] {

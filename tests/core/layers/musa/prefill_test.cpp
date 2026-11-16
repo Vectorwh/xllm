@@ -23,10 +23,13 @@ limitations under the License.
 
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/state_dict/state_dict.h"
+#include "core/kernels/musa/musa_ops_api.h"
 #include "core/layers/musa/flashinfer_attention.h"
 #include "core/layers/musa/qwen3_next_attention.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
+#include "torch_musa/csrc/aten/musa/MUSAGraph.h"
+#include "torch_musa/csrc/core/MUSAGuard.h"
 
 namespace xllm::layer {
 namespace {
@@ -223,6 +226,8 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
   device.set_device();
   device.init_device_context();
   torch::manual_seed(758);
+  const c10::musa::MUSAStream stream = c10::musa::getStreamFromPool();
+  const c10::musa::MUSAStreamGuard stream_guard(stream);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
   for (const int64_t ratio : {3, 6, 8}) {
@@ -300,6 +305,92 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
             /*atol=*/0.015));
         query_offset += q_len;
         kv_offset += kv_len;
+      }
+    }
+    // Reuse the checked two-sequence result for decode warp boundaries and
+    // paged prefill beyond the 32-warp single-CTA capacity.
+    const bool decode = ratio != 8;
+    const std::vector<int64_t> batch_sizes =
+        decode ? std::vector<int64_t>{32, 62, 64} : std::vector<int64_t>{994};
+    for (const int64_t batch_size : batch_sizes) {
+      SCOPED_TRACE(batch_size);
+      const int64_t copies = batch_size / 2;
+      const int64_t query_length = decode ? 1 : 3;
+      const torch::Tensor rows = torch::tensor({1, 4}, int_options);
+      torch::Tensor batched_query =
+          (decode ? device_query.index_select(0, rows) : device_query)
+              .repeat({copies, 1, 1});
+      torch::Tensor expected = output.view_as(device_query);
+      expected = (decode ? expected.index_select(0, rows) : expected)
+                     .repeat({copies, 1, 1});
+      const torch::Tensor cu_query =
+          decode ? torch::arange(batch_size + 1, int_options)
+                 : torch::cat({torch::zeros({1}, int_options),
+                               torch::tensor({2, 3}, int_options)
+                                   .repeat({copies})
+                                   .cumsum(0, torch::kInt32)});
+      torch::Tensor lengths = metadata.kv_seq_lens.repeat({copies});
+      const torch::Tensor pages = metadata.block_table.repeat({copies, 1});
+      torch::Tensor batched_output = torch::empty_like(batched_query);
+      torch::Tensor lse = torch::empty({heads, batched_query.size(0)},
+                                       options.dtype(torch::kFloat32));
+      const auto make_metadata = [&]() {
+        const auto scheduler =
+            decode ? kernel::musa::fa3_decode_scheduler_metadata
+                   : kernel::musa::fa3_prefill_scheduler_metadata;
+        return scheduler(device.unwrap(),
+                         batch_size,
+                         heads,
+                         /*num_heads_kv=*/2,
+                         /*head_dim_qk=*/256,
+                         /*head_dim_vo=*/256,
+                         query_length,
+                         /*max_seq_len=*/8,
+                         /*window_size_left=*/-1,
+                         /*window_size_right=*/0,
+                         cu_query,
+                         lengths);
+      };
+      torch::Tensor scheduler_metadata = make_metadata();
+      const auto forward = [&]() {
+        const auto run_attention =
+            decode ? kernel::musa::fa3_decode : kernel::musa::fa3_prefill_paged;
+        run_attention(batched_query,
+                      k_cache,
+                      v_cache,
+                      cu_query,
+                      lengths,
+                      pages,
+                      scheduler_metadata,
+                      query_length,
+                      /*window_left=*/-1,
+                      /*window_right=*/0,
+                      /*sm_scale=*/0.0625,
+                      batched_output,
+                      lse);
+      };
+      forward();
+      EXPECT_TRUE(torch::allclose(batched_output.to(torch::kFloat32),
+                                  expected.to(torch::kFloat32),
+                                  /*rtol=*/0.015,
+                                  /*atol=*/0.003));
+      if (decode && batch_size == 32) {
+        ASSERT_EQ(musaDeviceSynchronize(), musaSuccess);
+        at::musa::MUSAGraph graph;
+        graph.capture_begin();
+        forward();
+        graph.capture_end();
+        lengths.sub_(1);
+        batched_query.mul_(0.5);
+        scheduler_metadata.copy_(make_metadata());
+        forward();
+        expected = batched_output.clone();
+        batched_output.fill_(std::numeric_limits<float>::quiet_NaN());
+        graph.replay();
+        EXPECT_TRUE(torch::allclose(batched_output.to(torch::kFloat32),
+                                    expected.to(torch::kFloat32),
+                                    /*rtol=*/0.015,
+                                    /*atol=*/0.003));
       }
     }
   }

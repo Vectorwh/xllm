@@ -18,8 +18,13 @@ from __future__ import annotations
 
 from typing import Any
 
-PROFILE = "bf16_attention_h256_gqa3_6_8_gdn_h128_hq16_hv32_48_fp8_bmm_moe_decode_aot"
+PROFILE = "bf16_attention_h256_gqa3_6_8_metadata_shared32warps_gdn_h128_hq16_hv32_48_fp8_bmm_moe_decode_aot"
 SCHEMA_VERSION = 6
+# MATE 0.2.7: jit/attention/fmha/fmha_get_metadata.py::_fmha_get_metadata
+# selects min(ceil(batch / 31), 32). data/include/mate/attention/fmha/metadata.hpp
+# reserves the boundary lane; metadata_kern.j2 launches another CTA per 992 rows.
+FA3_METADATA_BATCH_PER_WARP = 31
+FA3_METADATA_MAX_WARPS = 32
 PINNED_VERSIONS = {
     "mate": "0.2.7",
     "mate-mubin": "0.2.7",
@@ -179,30 +184,30 @@ def _operator_recipes() -> list[dict[str, Any]]:
                     "arity": 38,
                 }
             )
-        recipes.append(
-            {
-                "name": f"xllm_mate_fmha_metadata_decode_bf16_gqa{ratio}_v1",
-                "constant": f"kFa3MetadataUriGqa{ratio}",
-                "kind": "metadata",
-                "config": {
-                    "has_cu_seqlens_q": True,
-                    "has_cu_seqlens_k": False,
-                    "has_seqused_q": False,
-                    "has_seqused_k": True,
-                    "has_cu_seqlens_k_new": False,
-                    "has_leftpad_k": False,
-                    "is_causal": True,
-                    "is_local": False,
-                    "is_packgqa": True,
-                    "head_ratio": ratio,
-                    "element": "mutlass::bfloat16_t",
-                    "element_size": 2,
-                    "sort": True,
-                    "num_warps": 1,
-                },
-                "arity": 21,
-            }
-        )
+    recipes.append(
+        {
+            "name": "xllm_mate_fmha_metadata_decode_bf16_v2",
+            "constant": "kFa3MetadataUri",
+            "kind": "metadata",
+            "config": {
+                "has_cu_seqlens_q": True,
+                "has_cu_seqlens_k": False,
+                "has_seqused_q": False,
+                "has_seqused_k": True,
+                "has_cu_seqlens_k_new": False,
+                "has_leftpad_k": False,
+                "is_causal": True,
+                "is_local": False,
+                "is_packgqa": True,
+                "head_ratios": [3, 6, 8],
+                "element": "mutlass::bfloat16_t",
+                "element_size": 2,
+                "sort": True,
+                "num_warps": list(range(1, FA3_METADATA_MAX_WARPS + 1)),
+            },
+            "arity": 21,
+        }
+    )
     for splits in (16, 32, 64, 128):
         recipes.append(
             {
@@ -332,6 +337,13 @@ def header_content(
         f'inline constexpr const char* kBundleId = "{bundle_id}";',
     ]
     lines.extend(f'inline constexpr const char* {r["constant"]} = "{r["name"]}";' for r in OPERATOR_RECIPES)
+    metadata = [r for r in OPERATOR_RECIPES if r["kind"] == "metadata"]
+    if (
+        len(metadata) != 1
+        or metadata[0]["config"]["head_ratios"] != [3, 6, 8]
+        or metadata[0]["config"]["num_warps"] != list(range(1, FA3_METADATA_MAX_WARPS + 1))
+    ):
+        raise ValueError("MUSA FA3 shared metadata requires GQA3/6/8 and every warp tier in order")
     lines.append(f"inline constexpr std::array<const char*, {len(OPERATOR_RECIPES)}> kOperatorUris = {{")
     lines.extend(f"  {r['constant']}," for r in OPERATOR_RECIPES)
     lines.append("};")

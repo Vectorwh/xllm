@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from scripts.logger import logger
 from xllm.core.kernels.musa import aot_bundle
 from xllm.core.kernels.musa.aot_config import (
+    FA3_METADATA_BATCH_PER_WARP,
     FFI_SIGNATURES,
     FUSED_MOE_RECIPES,
     OPERATOR_RECIPES,
@@ -359,24 +360,83 @@ def _build_gdn_operator(recipe: dict[str, Any], library: Path) -> dict[str, Any]
     return schema
 
 
+def _metadata_spec(recipe: dict[str, Any]) -> Any:
+    """Link parallel-built warp variants with one runtime-GQA metadata entry."""
+    from mate.jit import env as jit_env
+    from mate.jit.attention.fmha.fmha_get_metadata import gen_fmha_metadata_spec
+    from mate.jit.utils import EXPORT_FUNC, TVM_HEADER
+
+    name = recipe["name"]
+    warps = recipe["config"]["num_warps"]
+    helper = f"{name}_warps{warps[0]}"
+    config = {**recipe["config"], "head_ratio": 1, "num_warps": warps[0], "func_name": helper}
+    original = gen_fmha_metadata_spec(config)
+    source = next(iter(original.generated_sources.values()))
+    # MATE passes HeadRatio as a kernel argument, not a template parameter.
+    # Keep its scheduling algorithm while sharing the device code across GQA.
+    replacements = {
+        "constexpr int HeadRatio = 1;": "const int32_t HeadRatio = num_heads_q / num_heads_kv;",
+        f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({helper}, {helper});": "",
+    }
+    for before, after in replacements.items():
+        if source.count(before) != 1:
+            raise RuntimeError("Pinned MATE metadata source no longer matches the shared export adapter")
+        source = source.replace(before, after)
+    signature = re.search(rf"void {helper}\s*\((.*?)\)\s*\{{", source, re.DOTALL)
+    if signature is None:
+        raise RuntimeError("Pinned MATE metadata function declaration is missing")
+    parameters = signature[1]
+    arguments = ", ".join(parameter.split()[-1] for parameter in parameters.split(","))
+    if len(parameters.split(",")) != recipe["arity"]:
+        raise RuntimeError("Pinned MATE metadata argument count changed")
+    sources = {}
+    declarations = []
+    cases = []
+    warp_declaration = f"constexpr int NumWarps = {warps[0]};"
+    if source.count(warp_declaration) != 1:
+        raise RuntimeError("Pinned MATE metadata warp declaration changed")
+    for count in warps:
+        function = f"{name}_warps{count}"
+        path = jit_env.MATE_GEN_SRC_DIR / f"{function}.mu"
+        sources[path] = source.replace(helper, function).replace(warp_declaration, f"constexpr int NumWarps = {count};")
+        declarations.append(f"void {function}({parameters});")
+        cases.append(f"    case {count}: {function}({arguments}); return;")
+    dispatcher = jit_env.MATE_GEN_SRC_DIR / f"{name}.cpp"
+    batch_per_warp = FA3_METADATA_BATCH_PER_WARP
+    sources[dispatcher] = (
+        "#include <algorithm>\n#include <cstdint>\n"
+        + TVM_HEADER
+        + "using namespace tvm;\n"
+        + "\n".join(declarations)
+        + f"\nvoid {name}({parameters}) {{\n"
+        + "  const int64_t num_warps = std::min<int64_t>(\n"
+        + f"      (static_cast<int64_t>(batch_size) + {batch_per_warp - 1}) / {batch_per_warp}, {warps[-1]});\n"
+        + "  switch (num_warps) {\n"
+        + "\n".join(cases)
+        + '\n    default: TVM_FFI_THROW(ValueError) << "Invalid MUSA metadata warp count";\n  }\n}\n'
+        + EXPORT_FUNC.render(func_name=name)
+    )
+    return dataclasses.replace(original, sources=list(sources), generated_sources=sources)
+
+
 def _build_mate_operators(workspace: Path, jobs: int) -> tuple[dict[str, Path], dict[str, dict[str, Path]]]:
     from mate.jit import build_jit_specs
     from mate.jit import env as jit_env
     from mate.jit.attention.fmha.fmha_combine import gen_fmha_fwd_combine_spec
     from mate.jit.attention.fmha.fmha_fwd import gen_fmha_fwd_spec
-    from mate.jit.attention.fmha.fmha_get_metadata import gen_fmha_metadata_spec
     from mate.jit.gemm_ops import gen_gemm_ops_spec
 
     jit_env.MATE_GEN_SRC_DIR = workspace / "generated"
     jit_env.MATE_JIT_DIR = workspace / "compiled"
     generators = {
         "forward": gen_fmha_fwd_spec,
-        "metadata": gen_fmha_metadata_spec,
         "combine": gen_fmha_fwd_combine_spec,
     }
     specs = []
     assets = {}
-    mate_recipes = [recipe for recipe in OPERATOR_RECIPES if recipe["kind"] in (*generators, "bmm", "moe_gemm")]
+    mate_recipes = [
+        recipe for recipe in OPERATOR_RECIPES if recipe["kind"] in (*generators, "metadata", "bmm", "moe_gemm")
+    ]
     for recipe in mate_recipes:
         config = {**recipe["config"], "func_name": recipe["name"]}
         if recipe["kind"] == "moe_gemm":
@@ -384,6 +444,8 @@ def _build_mate_operators(workspace: Path, jobs: int) -> tuple[dict[str, Path], 
             assets[recipe["name"]] = {"kernel.o": kernel}
         elif recipe["kind"] == "bmm":
             original = gen_gemm_ops_spec()
+        elif recipe["kind"] == "metadata":
+            original = _metadata_spec(recipe)
         else:
             original = generators[recipe["kind"]](config)
         specs.append(
