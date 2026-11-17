@@ -181,6 +181,7 @@ def test_attention_passes_full_cp_layout_to_replicated_indexer() -> None:
     attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
     nn.Module.__init__(attention)
     attention.layer_id = 0
+    attention._prolog_ready = False
     attention.cfg = SimpleNamespace(tp_size=1, layerwise_split_size=1, layerwise_split_rank=0)
     attention.num_heads_local = 1
     attention.qk_nope_head_dim = 1

@@ -22,12 +22,18 @@ import torch_npu
 
 from .attention import batch_matmul_transpose
 from .constants import FRACTAL_NZ_FORMAT
+from .mla_cache import mla_cache_mode as _mla_cache_mode
+from .mla_cache import mla_prolog_cache_check
 from .normalization import rms_norm
 from .quantization import quant_matmul, quantize_per_tensor
 
 _KROPE_CTKV_CACHE_MODE = 1
 _NZ_CACHE_MODE = 3
 _PER_TENSOR_QUANT_ASYMM_MODE = 0
+# ``mla_prolog_v3`` mode encodings: 2 quantizes the weights per channel with
+# their dequant scales, 0 leaves the cache and the query unquantized.
+_PROLOG_WEIGHT_QUANT_PER_CHANNEL = 2
+_PROLOG_QUANT_DISABLED = 0
 _INT8_NZ_ROW_BLOCK_SIZE = 16
 _INT8_NZ_COLUMN_BLOCK_SIZE = 32
 _KV_RMSNORM_ROPE_CACHE = getattr(
@@ -40,6 +46,84 @@ _KV_RMSNORM_ROPE_CACHE = getattr(
 def has_mla_preprocess_v2() -> bool:
     """Return whether the xLLM MLAPO v2 operator is registered."""
     return hasattr(torch.ops.xllm_ops, "mla_preprocess_v2")
+
+
+def mla_prolog_v3(
+    token_x: torch.Tensor,
+    token_scale: torch.Tensor,
+    weight_dq: torch.Tensor,
+    weight_uq_qr: torch.Tensor,
+    weight_uk: torch.Tensor,
+    weight_dkv_kr: torch.Tensor,
+    scale_dq: torch.Tensor,
+    scale_uq_qr: torch.Tensor,
+    scale_dkv_kr: torch.Tensor,
+    gamma_cq: torch.Tensor,
+    gamma_ckv: torch.Tensor,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kr_cache: torch.Tensor,
+    cache_index: torch.Tensor,
+    epsilon_cq: float,
+    epsilon_ckv: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the fused W8A8 dynamic MLA prologue and write the paged KV cache.
+
+    Returns ``(query, query_rope, q_c, q_c_scale)``, reordered from the
+    operator's ``(query, query_rope, dequant_scale_q_nope, query_norm,
+    dequant_scale_q_norm)``: ``query_norm`` and its dequant scale are the
+    already quantized ``c^Q`` that ``query_norm_flag`` asks for, returned as
+    ``q_c``/``q_c_scale`` so the indexer reuses them instead of quantizing the
+    same values again. The NoPE dequant scale is dropped because
+    ``query_quant_mode=_PROLOG_QUANT_DISABLED`` leaves ``query`` unquantized,
+    so nothing applies it. ``qc_qr_scale``/``kc_scale`` keep the operator
+    default 1.0: this path applies no extra scaling to q_c or k_c.
+
+    ``cache_index`` must be nonnegative: the kernel writes it without checking
+    the ``-1`` padding sentinel.
+
+    Dispatches through ``cann_ops_transformer.mla_prolog`` (the ops-transformer
+    vendor operator, which accepts ``q_lora_rank=2048``), not
+    ``torch_npu.npu_mla_prolog_v3``: the CANN in-box aclnn of that name resolves
+    ahead of the vendor one and rejects every ``Hcq`` above 1536.
+
+    The vendor package is imported here rather than at module scope: importing
+    it registers ``torch.ops.cann_ops_transformer``, and only this fusion needs
+    that, while ``_initialize_runtime`` imports this module for every NPU model.
+    GLM initializes and validates these bindings during weight loading, before
+    graph capture; direct callers initialize them here.
+    """
+    import cann_ops_transformer  # noqa: F401  registers torch.ops.cann_ops_transformer
+
+    query, query_rope, _scale_q_nope, q_c, q_c_scale = torch.ops.cann_ops_transformer.mla_prolog(
+        token_x,
+        weight_dq,
+        weight_uq_qr,
+        weight_uk,
+        weight_dkv_kr,
+        gamma_cq,
+        gamma_ckv,
+        kv_cache,
+        kr_cache,
+        rope_sin=rope_sin,
+        rope_cos=rope_cos,
+        cache_index=cache_index,
+        dequant_scale_x=token_scale,
+        dequant_scale_w_dq=scale_dq,
+        dequant_scale_w_uq_qr=scale_uq_qr,
+        dequant_scale_w_dkv_kr=scale_dkv_kr,
+        rmsnorm_epsilon_cq=epsilon_cq,
+        rmsnorm_epsilon_ckv=epsilon_ckv,
+        cache_mode="PA_BSND",
+        query_norm_flag=True,
+        weight_quant_mode=_PROLOG_WEIGHT_QUANT_PER_CHANNEL,
+        kv_cache_quant_mode=_PROLOG_QUANT_DISABLED,
+        query_quant_mode=_PROLOG_QUANT_DISABLED,
+        qc_qr_scale=1.0,
+        kc_scale=1.0,
+    )
+    return query, query_rope, q_c, q_c_scale
 
 
 def _reorder_rope_axis(
@@ -207,14 +291,6 @@ def deepseek_mla_preprocess_decode_v2(
         True,
     )
     return q_c, q_latent, q_pe
-
-
-def _mla_cache_mode(kv_cache: torch.Tensor) -> str:
-    """Return the cache layout name expected by the fused KV operator."""
-    get_npu_format = getattr(torch_npu, "get_npu_format", None)
-    if get_npu_format is not None and get_npu_format(kv_cache) == FRACTAL_NZ_FORMAT:
-        return "PA_NZ"
-    return "PA"
 
 
 def _write_mla_kv_cache(
@@ -431,6 +507,8 @@ __all__ = [
     "deepseek_mla_preprocess_decode",
     "deepseek_mla_preprocess_decode_v2",
     "has_mla_preprocess_v2",
+    "mla_prolog_cache_check",
+    "mla_prolog_v3",
     "prepare_mla_preprocess_v2_q_b",
     "prepare_mla_preprocess_v2_qkv",
 ]

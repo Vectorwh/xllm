@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.distributed import ProcessGroup
 
-from xllm.python.attention.backend import AttentionMetadata, LayerCache, MlaIndexContext
+from xllm.python.attention.backend import AttentionMetadata, LayerCache, MlaIndexContext, MlaPreprocessContext
 from xllm.python.attention.kv_shard_layout import KVShardLayout, has_rope_dim
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend, write_mla_paged_cache
 from xllm.python.layers.sfa_dcp import (
@@ -201,6 +201,16 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             attn_metadata.dcp_context.block_table = self._block_table_i32[:num_reqs]
         self._sfa_metadata = attn_metadata
 
+    def mla_preprocess_context(self, layer: Attention) -> MlaPreprocessContext | None:
+        context = super().mla_preprocess_context(layer)
+        if context is None:
+            return None
+        if self._local_slot_mapping is None:
+            raise RuntimeError("SFA DCP MLA preprocessing requires prepare()")
+        # Prolog writes the sharded cache directly, so it needs this rank's
+        # local slots rather than the global logical ones.
+        return replace(context, cache_slot_mapping=self._local_slot_mapping)
+
     def indexer_block_table_or_none(self) -> torch.Tensor | None:
         if self._expanded_indexer_block_table is not None:
             return self._expanded_indexer_block_table
@@ -228,6 +238,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         k_pe_3d: torch.Tensor | None,
         layer: Attention,
         topk: torch.Tensor | None = None,
+        cache_is_preprocessed: bool = False,
     ) -> torch.Tensor:
         if topk is None:
             raise NotImplementedError("dense MLA (topk=None) is not supported on SfaDcpAttentionBackend")
@@ -243,7 +254,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         nope_cache, rope_cache = layer_cache.key, layer_cache.value
         if nope_cache is None:
             raise RuntimeError(f"MLA latent cache is missing for layer {layer.layer_id}")
-        if k_latent_3d is None:
+        if k_latent_3d is None and not cache_is_preprocessed:
             raise RuntimeError(f"SFA DCP execute_mla requires k_latent_3d for layer {layer.layer_id}")
         # Validate the rope story before touching any cache: query and KV decide
         # "NoPE?" independently, so a mixed state must not reach the SFA kernel.
@@ -255,15 +266,22 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             )
 
         attn_metadata.dcp_context.gather_context = None
-        write_mla_paged_cache(
-            attn_metadata.dcp_context.slot_mapping,
-            k_latent_3d,
-            k_pe_3d,
-            nope_cache,
-            rope_cache,
-        )
+        if not cache_is_preprocessed:
+            write_mla_paged_cache(
+                attn_metadata.dcp_context.slot_mapping,
+                k_latent_3d,
+                k_pe_3d,
+                nope_cache,
+                rope_cache,
+            )
         kv_cache = (nope_cache, rope_cache)
-        self._impl._store_parallel_kv(k_pe_3d, k_latent_3d, None, kv_cache, attn_metadata)
+        self._impl._store_parallel_kv(
+            None if cache_is_preprocessed else k_pe_3d,
+            None if cache_is_preprocessed else k_latent_3d,
+            None,
+            kv_cache,
+            attn_metadata,
+        )
         self._impl._record_query_gather_context(q_latent, q_pe, attn_metadata)
         return self._impl._execute_sparse_flash_attention_process(
             q_latent,

@@ -38,8 +38,9 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
+from scripts.logger import logger
 from xllm.python import distributed, kernels
-from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.attention.backend import AttentionBackend, MlaIndexContext, MlaPreprocessContext
 
 # The AICPU tiling of ``aclnnQuantLightningIndexer`` requires
 # ``num_heads_q / num_heads_k == 64``. GLM-5.2 uses ``index_n_heads=32`` and
@@ -121,6 +122,22 @@ _QLI_NO_WINDOW_LIMIT = 9223372036854775807
 # index, so its output stays bit-exact; see research/s0-probe-results.md, task
 # 10-19-glm52-indexer-cp).
 #
+
+# The fused prolog path is a decode-only fast path; keep the switch so it can
+# be a/b tested and rolled back without a rebuild.
+_MLA_PROLOG = os.environ.get("G53_MLA_PROLOG", "1") == "1"
+
+# One-shot diagnostics for the fused MLA prolog path: which gate declined it.
+_PROLOG_LOG = logger
+_PROLOG_DECLINED: set[str] = set()
+_PROLOG_LOGGED_ACTIVE = False
+
+
+def _log_prolog_declined(reason: str) -> None:
+    if reason in _PROLOG_DECLINED:
+        return
+    _PROLOG_DECLINED.add(reason)
+    _PROLOG_LOG.info("MLA prolog path declined: %s", reason)
 
 
 @dataclass
@@ -473,6 +490,9 @@ class Glm52MLAAttention(Attention):
         self.indexer = None
         if not self.is_shared:
             self.indexer = Glm52Indexer(cfg, dtype, device)
+        # The fused prolog path needs the packed projections that
+        # ``process_weights_after_loading`` snapshots below.
+        self._prolog_ready = False
 
     def process_weights_after_loading(self) -> None:
         self.q_a_proj.process_weights_after_loading()
@@ -490,6 +510,163 @@ class Glm52MLAAttention(Attention):
         self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
         if self.indexer is not None:
             self.indexer.process_weights_after_loading()
+        self._prepare_prolog_weights()
+
+    def _prepare_prolog_weights(self) -> None:
+        """Keep the packed NZ projections prolog reads, when they are dynamic.
+
+        ``QLinear`` resolves static versus dynamic at load time. Prolog only
+        accepts dynamic per-channel weights, so a static checkpoint stays on
+        the split path. The indexer's ``wq_b`` is part of the same decision:
+        prolog hands c^Q over already quantized, and only the dynamic linear
+        takes an activation scale.
+        """
+        self._prolog_ready = False
+        projections = (self.q_a_proj, self.kv_a_proj_with_mqa, self.q_b_proj)
+        modules = [projection._w8a8 for projection in projections]
+        if self.indexer is not None:
+            modules.append(self.indexer.wq_b._w8a8)
+        if any(module is None for module in modules):
+            return
+        if any(not hasattr(module, "weight_scale") for module in modules):
+            return
+        if _MLA_PROLOG and self.cfg.layerwise_split_size == 1:
+            # Initialize vendor bindings while loading, not during graph capture.
+            # Other models and configurations that cannot use prolog need no import.
+            import cann_ops_transformer  # noqa: F401  registers vendor operators
+
+            if not hasattr(torch.ops.cann_ops_transformer, "mla_prolog"):
+                raise RuntimeError(
+                    "MLA prolog requires an ops-transformer runtime that registers "
+                    "torch.ops.cann_ops_transformer.mla_prolog; install the "
+                    "ops-transformer torch extension for this vendor build"
+                )
+        query, kv, query_b = modules[:3]
+        # Plain attributes, not registered parameters or buffers: these alias
+        # the packed W8A8 tensors, and assigning them normally would duplicate
+        # the parameters in ``state_dict`` and shadow the canonical names of
+        # the ``_w8a8`` submodules.
+        references = {
+            "_prolog_weight_dq": query.weight,
+            "_prolog_weight_dkv": kv.weight,
+            "_prolog_weight_uq": query_b.weight,
+            "_prolog_scale_dq": query.weight_scale.view(1, -1),
+            "_prolog_scale_dkv": kv.weight_scale.view(1, -1),
+            "_prolog_scale_uq": query_b.weight_scale.view(1, -1),
+        }
+        for name, value in references.items():
+            object.__setattr__(self, name, value)
+        self._prolog_ready = True
+
+    def _prolog_context(self, backend: AttentionBackend) -> MlaPreprocessContext | None:
+        """Return the preprocess context when the fused path may run, else None.
+
+        The cheap, stable decisions come first so a rejected path never pays for
+        the context: the backend builds one per layer and per step.
+        """
+        if not _MLA_PROLOG:
+            _log_prolog_declined("G53_MLA_PROLOG=0")
+            return None
+        if not self._prolog_ready:
+            _log_prolog_declined("prolog weights are not ready")
+            return None
+        forward_ctx = get_forward_context()
+        if forward_ctx.cp_context is not None:
+            _log_prolog_declined("cp_context is set")
+            return None
+        if self.cfg.layerwise_split_size > 1:
+            _log_prolog_declined(f"layerwise_split_size={self.cfg.layerwise_split_size}")
+            return None
+        context = backend.mla_preprocess_context(self)
+        if context is None:
+            _log_prolog_declined("preprocess context is None")
+            return None
+        rejection = kernels.mla_prolog_cache_check(context.kv_cache, context.rope_cache)
+        if rejection is not None:
+            _log_prolog_declined(rejection)
+            return None
+        return context
+
+    def _prolog_decode(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        context: MlaPreprocessContext,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project, normalize, rotate and write the paged KV cache in one op."""
+        cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        slot_source = context.slot_mapping
+        if context.cache_slot_mapping is not None:
+            slot_source = context.cache_slot_mapping
+        # Block 0 is reserved for padding, so unowned ``-1`` slots alias it.
+        cache_index = slot_source[: hidden.shape[0]].clamp_min(0).to(torch.int64)
+        token_x, token_scale = kernels.dynamic_quant(hidden)
+        query, query_rope, q_c, q_c_scale = kernels.mla_prolog_v3(
+            token_x,
+            token_scale.view(-1, 1),
+            self._prolog_weight_dq,
+            self._prolog_weight_uq,
+            self.W_UK,
+            self._prolog_weight_dkv,
+            self._prolog_scale_dq,
+            self._prolog_scale_uq,
+            self._prolog_scale_dkv,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            cos.reshape(hidden.shape[0], -1),
+            sin.reshape(hidden.shape[0], -1),
+            context.kv_cache,
+            context.rope_cache,
+            cache_index,
+            self.q_a_layernorm.eps,
+            self.kv_a_layernorm.eps,
+        )
+        return q_c, q_c_scale, query, query_rope
+
+    def _select_topk(
+        self,
+        hidden: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        prev_topk_indices: torch.Tensor | None,
+        backend: AttentionBackend,
+        layerwise: bool,
+        layer_owner: int,
+    ) -> torch.Tensor:
+        if self.indexer is not None:
+            ctx = backend.mla_index_context(self)
+            if layerwise:
+                if self.cfg.layerwise_split_rank == layer_owner:
+                    topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
+                else:
+                    topk = torch.empty(
+                        (hidden.shape[0], ctx.index_cache.size(2), self.cfg.index_topk),
+                        dtype=torch.int32,
+                        device=hidden.device,
+                    )
+                distributed.broadcast_(topk, layer_owner, "layerwise")
+            else:
+                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
+            return topk
+        if prev_topk_indices is None:
+            raise ValueError(
+                "Shared DSA layers require top-k indices from a previous "
+                "full indexer layer (prev_topk_indices is None)."
+            )
+        return prev_topk_indices
+
+    def _project_output(self, attn_out: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
+        v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
+        output = self.o_proj(v_full)
+        if self.cfg.tp_size > 1:
+            output_dtype = output.dtype
+            output = output.to(torch.float32)
+            distributed.all_reduce_(output)
+            output = output.to(output_dtype)
+        return output
 
     def forward(
         self,
@@ -500,40 +677,48 @@ class Glm52MLAAttention(Attention):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         wait_for_layer_load(self.layer_id)
         num_tokens = hidden.shape[0]
-        q_a = self.q_a_proj(hidden)
-        q_c = self.q_a_layernorm(q_a)
         forward_ctx = get_forward_context()
         backend = forward_ctx.attention_backend
         layerwise = self.cfg.layerwise_split_size > 1 and not (
             forward_ctx.metadata.is_prefill or forward_ctx.metadata.is_chunked_prefill
         )
         layer_owner = self.layer_id % self.cfg.layerwise_split_size
+        preprocess = self._prolog_context(backend)
+        if preprocess is not None:
+            global _PROLOG_LOGGED_ACTIVE
+            if not _PROLOG_LOGGED_ACTIVE:
+                _PROLOG_LOGGED_ACTIVE = True
+                _PROLOG_LOG.info("MLA prolog path active")
+            q_c, q_c_scale, q_latent, q_pe = self._prolog_decode(hidden, positions, cos_sin_cache, preprocess)
+            topk = self._select_topk(
+                hidden,
+                (q_c, q_c_scale),
+                positions,
+                cos_sin_cache,
+                prev_topk_indices,
+                backend,
+                layerwise,
+                layer_owner,
+            )
+            attn_out = backend.execute_mla(q_latent, q_pe, None, None, self, topk=topk, cache_is_preprocessed=True)
+            return self._project_output(attn_out, num_tokens), topk
+        q_a = self.q_a_proj(hidden)
+        q_c = self.q_a_layernorm(q_a)
         owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
-        if self.indexer is not None:
-            ctx = backend.mla_index_context(self)
-            if layerwise:
-                if owns_layer_cache:
-                    topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
-                else:
-                    topk = torch.empty(
-                        (num_tokens, ctx.index_cache.size(2), self.cfg.index_topk),
-                        dtype=torch.int32,
-                        device=hidden.device,
-                    )
-                distributed.broadcast_(topk, layer_owner, "layerwise")
-            else:
-                # The replicated indexer gathers Q/K/weights in global order.
-                # Keep the complete padded CP-local layout here: real-query
-                # packing has unequal row counts on ragged zigzag shards and
-                # violates cp_gather_kv's all-gather/restore-index contract.
-                topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
-        else:
-            if prev_topk_indices is None:
-                raise ValueError(
-                    "Shared DSA layers require top-k indices from a previous "
-                    "full indexer layer (prev_topk_indices is None)."
-                )
-            topk = prev_topk_indices
+        # The replicated indexer gathers Q/K/weights in global order. Keep the
+        # complete padded CP-local layout here: real-query packing has unequal
+        # row counts on ragged zigzag shards and violates cp_gather_kv's
+        # all-gather/restore-index contract.
+        topk = self._select_topk(
+            hidden,
+            q_c,
+            positions,
+            cos_sin_cache,
+            prev_topk_indices,
+            backend,
+            layerwise,
+            layer_owner,
+        )
         q = self.q_b_proj(q_c)
         q = q.view(
             num_tokens,
@@ -578,15 +763,7 @@ class Glm52MLAAttention(Attention):
             attn_out = gathered_attn_out.narrow(1, head_offset, self.num_heads_local)
         else:
             attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
-        v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
-        v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
-        o = self.o_proj(v_full)
-        if self.cfg.tp_size > 1:
-            output_dtype = o.dtype
-            o = o.to(torch.float32)
-            distributed.all_reduce_(o)
-            o = o.to(output_dtype)
-        return o, topk
+        return self._project_output(attn_out, num_tokens), topk
 
 
 class Glm52Indexer(nn.Module):
@@ -838,10 +1015,23 @@ class Glm52Indexer(nn.Module):
         topk.index_copy_(0, rows, topk_rows)
         return topk
 
+    def _project_query(self, qr: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Apply ``wq_b``, reusing prolog's already quantized c^Q when given.
+
+        Prolog quantizes c^Q for its own projection, so the indexer takes the
+        int8 tensor and its scale instead of dequantizing and quantizing the
+        same values again. The gate only enables this after establishing that
+        ``wq_b`` is a dynamic linear, which is the only kind that accepts an
+        activation scale.
+        """
+        if isinstance(qr, tuple):
+            return self.wq_b._w8a8.forward_quantized(*qr)
+        return self.wq_b(qr)
+
     def select_qli(
         self,
         hidden: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         positions: torch.Tensor,
         ctx: MlaIndexContext,
         cos_sin_cache: torch.Tensor,
@@ -850,7 +1040,7 @@ class Glm52Indexer(nn.Module):
     ) -> torch.Tensor:
         actual_seq_q = ctx.actual_seq_q
         actual_seq_kv = ctx.actual_seq_kv
-        q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
+        q = self._project_query(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         cache_hidden = hidden if cache_hidden is None else cache_hidden
         cache_positions = positions if cache_positions is None else cache_positions

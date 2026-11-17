@@ -308,6 +308,9 @@ class MlaPreprocessContext:
     kv_cache: torch.Tensor
     rope_cache: torch.Tensor
     slot_mapping: torch.Tensor
+    # Slots into the cache tensors above. A DCP rank's cache is local, so this
+    # differs from the logical slot_mapping when KV is sharded.
+    cache_slot_mapping: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
