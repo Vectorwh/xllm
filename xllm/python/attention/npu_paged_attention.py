@@ -40,6 +40,8 @@ from xllm.python.attention.backend import (
     linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
 )
+from xllm.python.attention.dsa_kv_offload import DsaKvOffloadMixin
+from xllm.python.attention.dsa_kv_offload_state import DsaKvOffloadState
 from xllm.python.attention.kv_shard_layout import (
     has_rope_dim,
     localize_index_write_slots,
@@ -264,7 +266,7 @@ def write_mla_paged_cache(
     )
 
 
-class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
+class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, AttentionBackend):
     """NPU attention backend dispatching to npu_fused_infer_attention_score."""
 
     def __init__(
@@ -284,7 +286,20 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         draft_query_width: int = 0,
         draft_graph_window_size: int | None = None,
         graph_capturable: bool = True,
+        offload_topk_width: int = 0,
+        max_offload_query_rows: int = 0,
     ) -> None:
+        """Configure optional Host KV selection storage, allocated when caches bind.
+
+        Each max_offload_query_rows row costs 2.125 MiB per NoPE layer or
+        2.391 MiB per RoPE layer in BF16 payload, plus resident metadata.
+        """
+        if (
+            offload_topk_width < 0
+            or max_offload_query_rows < 0
+            or bool(offload_topk_width) != bool(max_offload_query_rows)
+        ):
+            raise ValueError("KV offloading top-k width and query capacity must both be positive or both be zero.")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -317,6 +332,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._prepared_ssm_state_indices: torch.Tensor | None = None
 
         self._kv_caches: list[LayerCache] = []
+        self._offload_topk_width = offload_topk_width
+        self._offload_state = DsaKvOffloadState(device, max_offload_query_rows) if offload_topk_width else None
         self._kpool_cache_triton_compatible: tuple[bool, ...] = ()
         self._num_kv_blocks: int | None = None
         self._page_size: int | None = None
@@ -465,6 +482,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if len(num_kv_blocks) != 1:
             raise RuntimeError("full-attention layers use inconsistent KV block counts")
 
+        if self._offload_state is not None:
+            self._bind_kv_offload_caches(kv_caches)
         self._kv_caches = kv_caches
         self._kpool_cache_triton_compatible = tuple(_is_compact_kpool_cache_compatible(cache) for cache in kv_caches)
         self._page_size = page_sizes.pop()
@@ -565,6 +584,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         *,
         graph_mode: bool = False,
     ) -> None:
+        if self.uses_host_main_kv:
+            self._prepare_kv_offload_step(metadata, graph_mode=graph_mode)
         if self._prefix_bidir_enabled and (metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_mixed):
             self._validate_prefix_bidir(metadata)
         self._metadata = metadata
@@ -1033,7 +1054,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         cache_is_preprocessed: bool = False,
         unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
     ) -> torch.Tensor:
-        """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
+        """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV.
+
+        cache_is_preprocessed means the caller has already written this layer's
+        current KV to the bound main cache. For Host KV offloading, that write
+        must be complete before execution; attention skips the Host append but
+        still requires k_latent_3d and k_pe_3d (for RoPE) on the query device to
+        build the current-window selection. Fused preprocess calls that omit
+        current KV are not supported by the Host path. Dummy steps never append.
+        """
         metadata = self._metadata
         assert metadata is not None, "execute_mla called before prepare()"
         layer_id = layer.layer_id
@@ -1049,6 +1078,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             raise RuntimeError("MLA requires a block table")
         if self._mla_actual_seq_q is None or self._mla_actual_seq_kv is None:
             raise RuntimeError("MLA requires query and KV sequence lengths")
+
+        if self.uses_host_main_kv:
+            return self._execute_kv_offload(q_latent, q_pe, k_latent_3d, k_pe_3d, layer, topk, cache_is_preprocessed)
 
         # SFA C8 routes on both dtype and packed head-dim: a future int8 KV
         # path (for example a plain scale-slab quant) would still have head
