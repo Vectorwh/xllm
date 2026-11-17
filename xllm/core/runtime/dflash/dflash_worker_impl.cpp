@@ -237,6 +237,24 @@ void build_dflash_expanded_spec_verify_graph_input(
 }
 #endif
 
+// Rebuilds the [B] plain-RoPE decode base positions (kv_len - 1) shared by the
+// synchronous and asynchronous decode paths. MRoPE axis rows carry a request
+// delta, so the KV lengths are the only authoritative source.
+std::vector<int32_t> rebuild_decode_base_positions(
+    const ModelInputParams& input_params) {
+  const int32_t num_sequences = input_params.meta.num_sequences;
+  std::vector<int32_t> positions;
+  positions.reserve(static_cast<size_t>(num_sequences));
+  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+    const int32_t kv_len = specBuilder::calc_kv_len(
+        input_params.attention.host.kv_seq_lens, seq_id, /*offset=*/0);
+    CHECK_GT(kv_len, 0) << "DFlash decode KV length must be positive, seq="
+                        << seq_id;
+    positions.emplace_back(kv_len - 1);
+  }
+  return positions;
+}
+
 void normalize_draft_decode_positions(ForwardInput& input) {
   const int32_t num_sequences = input.input_params.meta.num_sequences;
   if (!dflash_detail::is_mrope_context_positions(input.positions_host,
@@ -244,16 +262,10 @@ void normalize_draft_decode_positions(ForwardInput& input) {
     return;
   }
 
-  std::vector<int32_t> positions;
-  positions.reserve(static_cast<size_t>(num_sequences));
-  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    const int32_t kv_len = specBuilder::calc_kv_len(
-        input.input_params.attention.host.kv_seq_lens, seq_id, /*offset=*/0);
-    positions.emplace_back(kv_len - 1);
-  }
   // Only this draft-local copy is rewritten. The shared target input retains
   // its original MRoPE coordinates for verification.
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions);
+  input.positions_host = specBuilder::make_cpu_int_tensor(
+      rebuild_decode_base_positions(input.input_params));
 }
 
 void build_query_rows(const ForwardInput& input,
@@ -1041,10 +1053,37 @@ void DFlashWorkerImpl::commit_pending_context() {
 void DFlashWorkerImpl::prepare_validate_output_async(
     const ForwardInput& input) {
   c10::StreamGuard prepare_guard = prepare_stream_->set_stream_guard();
-  torch::Tensor host_base_positions = torch::empty(
-      input.positions_host.sizes(),
-      input.positions_host.options().dtype(torch::kLong).pinned_memory(true));
-  host_base_positions.copy_(input.positions_host);
+  // The async accepted-context path consumes base_positions as one
+  // plain-RoPE position per sequence (kv_len - 1) to locate draft cache
+  // slots. MRoPE targets carry [3, B] axis coordinates instead, whose
+  // axis-0 row includes a request-specific delta and must not be used as
+  // the logical position. Rebuild from kv_seq_lens, mirroring the
+  // synchronous path's normalize_draft_decode_positions; the shared target
+  // input keeps its MRoPE coordinates for verification. The rebuilt values
+  // are written element-wise straight into the final kLong pinned buffer
+  // (data_ptr<int64_t>), keeping this step at one pinned allocation + one
+  // H2D copy as before the fix.
+  const int32_t num_sequences = input.input_params.meta.num_sequences;
+  const bool is_mrope_positions = dflash_detail::is_mrope_context_positions(
+      input.positions_host, num_sequences);
+  torch::Tensor host_base_positions =
+      torch::empty({static_cast<int64_t>(num_sequences)},
+                   torch::TensorOptions()
+                       .dtype(torch::kLong)
+                       .device(torch::kCPU)
+                       .pinned_memory(true));
+  if (is_mrope_positions) {
+    const std::vector<int32_t> base_positions =
+        rebuild_decode_base_positions(input.input_params);
+    CHECK_EQ(static_cast<int64_t>(base_positions.size()),
+             host_base_positions.numel());
+    int64_t* base_positions_data = host_base_positions.data_ptr<int64_t>();
+    for (size_t seq = 0; seq < base_positions.size(); ++seq) {
+      base_positions_data[seq] = static_cast<int64_t>(base_positions[seq]);
+    }
+  } else {
+    host_base_positions.copy_(input.positions_host);
+  }
   prepared_base_positions_ = host_base_positions.to(device_, true);
   std::optional<ModelInputParams> expanded_draft_params;
   if (draft_replicated_block_pages() > 1) {

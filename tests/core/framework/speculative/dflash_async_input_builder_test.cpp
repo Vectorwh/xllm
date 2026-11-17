@@ -520,5 +520,29 @@ TEST(DFlashAsyncInputBuilderTest, SingleTableKeepsLinearAddressing) {
   EXPECT_EQ(context.slots[0].item<int32_t>(), 44);
 }
 
+// Regression guard for the schedule-overlap MRoPE crash: DSpark/DFlash2 async
+// decode must normalize MRoPE [3, B] axis coordinates to one logical position
+// per sequence before calling this builder (see
+// DFlashWorkerImpl::prepare_validate_output_async). The one-dimension
+// requirement below must stay a hard failure so a missed normalization can
+// never silently reinterpret an axis row (which includes a request-specific
+// delta) as the KV-slot position.
+TEST(DFlashAsyncInputBuilderTest, RejectsMropeBasePositionsRank) {
+  const torch::Tensor accepted = torch::tensor({{42, -1}}, torch::kLong);
+  const torch::Tensor mrope_bases =
+      torch::tensor({{5, 7}, {5, 7}, {5, 7}}, torch::kLong);
+  const torch::Tensor tables = torch::tensor({{7, 2}}, torch::kInt32);
+
+  EXPECT_DEATH(prepare_context_kv(accepted, mrope_bases, tables, 128),
+               "base_positions.dim\\(\\) == 1");
+  EXPECT_DEATH(prepare_next_draft(accepted,
+                                  mrope_bases,
+                                  tables,
+                                  /*mask_token_id=*/999,
+                                  /*block_size=*/128,
+                                  /*query_width=*/15),
+               "base_positions.dim\\(\\) == 1");
+}
+
 }  // namespace
 }  // namespace xllm::dflash_async
