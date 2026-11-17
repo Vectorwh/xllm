@@ -15,9 +15,13 @@ limitations under the License.
 
 #include "core/distributed_runtime/disagg_pd_service_impl.h"
 
+#include <brpc/closure_guard.h>
+#include <brpc/server.h>
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +35,7 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "tests/core/common/etcd_registry_fixture.h"
+#include "xservice.pb.h"
 
 namespace xllm {
 namespace {
@@ -149,6 +154,28 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
  public:
   TestDisaggPDScheduler(Engine* engine, const Options& options)
       : DisaggPDScheduler(engine, options, /*start_services=*/false) {}
+};
+
+class TestDisaggPDServiceImpl final : public DisaggPDServiceImpl {
+ public:
+  using DisaggPDServiceImpl::DisaggPDServiceImpl;
+  using DisaggPDServiceImpl::generate_request;
+};
+
+class GenerationReceiver final : public xllm_service::proto::XllmRpcService {
+ public:
+  void Generations(google::protobuf::RpcController* /*unused*/,
+                   const proto::DisaggStreamGenerations* request,
+                   proto::StatusSet* response,
+                   google::protobuf::Closure* done) override {
+    brpc::ClosureGuard guard(done);
+    received = *request;
+    for (int32_t index = 0; index < request->gens_size(); ++index) {
+      response->add_all_status()->set_ok(true);
+    }
+  }
+
+  proto::DisaggStreamGenerations received;
 };
 
 // Restores a process-global config field on scope exit, so one test's
@@ -285,6 +312,64 @@ TEST_F(DisaggPDServiceImplTest, AdmissionFailureStatusMatchesFailureClass) {
     EXPECT_EQ(responses.resps(0).req_id(), req->req_id());
     EXPECT_EQ(responses.resps(0).status_code(), c.expected_status);
   }
+}
+
+TEST_F(DisaggPDServiceImplTest, RequestOutputCallbacksOutliveService) {
+  GenerationReceiver receiver;
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&receiver, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  const std::string address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  DisaggPDScheduler::Options options;
+  options.enable_disagg_pd(true)
+      .enable_schedule_overlap(false)
+      .instance_role(InstanceRole::DECODE)
+      .max_tokens_per_batch(32)
+      .max_seqs_per_batch(4)
+      .max_tokens_per_chunk_for_prefill(32)
+      .dp_size(1);
+  TestDisaggPDScheduler scheduler(&engine, options);
+  std::optional<TestDisaggPDServiceImpl> service(
+      std::in_place, &scheduler, &engine);
+
+  proto::DisaggRequest wire_request;
+  wire_request.set_req_id("retained-decode-output");
+  wire_request.set_service_req_id("owning-service-request");
+  wire_request.set_source_xservice_addr(address);
+  wire_request.set_prompt("prompt");
+  wire_request.add_prompt_tokens(1);
+  wire_request.set_n(1);
+  wire_request.set_best_of(1);
+  wire_request.set_max_tokens(16);
+  wire_request.set_max_context_len(64);
+  wire_request.set_seq_capacity(64);
+  auto request = service->generate_request(wire_request);
+  ASSERT_NE(request, nullptr);
+
+  // Registry teardown retires the RPC service before queued responses drain.
+  // Overwrite its retired storage so this regression cannot pass merely
+  // because the allocator left the old client pointer intact.
+  void* retired_storage = &service.value();
+  service.reset();
+  std::memset(retired_storage, 0, sizeof(TestDisaggPDServiceImpl));
+
+  RequestOutput output;
+  output.request_id = request->request_id();
+  output.service_request_id = request->service_request_id();
+  output.target_xservice_addr = request->source_xservice_addr();
+  EXPECT_TRUE(request->state().output_func(output));
+  ASSERT_EQ(receiver.received.gens_size(), 1);
+  EXPECT_EQ(receiver.received.gens(0).req_id(), output.request_id);
+  EXPECT_EQ(request->state().outputs_func({output, output}),
+            std::vector<bool>({true, true}));
+  ASSERT_EQ(receiver.received.gens_size(), 2);
+  EXPECT_EQ(receiver.received.gens(1).service_req_id(),
+            output.service_request_id);
+  server.Stop(0);
+  server.Join();
 }
 
 }  // namespace

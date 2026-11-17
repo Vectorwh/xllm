@@ -131,25 +131,28 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
                                    std::move(stop_tokens),
                                    std::move(stop_sequences));
 
-  auto output_callback = [this](const RequestOutput& output) -> bool {
+  // Requests can outlive the registry-owned RPC service during shutdown.
+  // The master keeps the client and its channels alive until responses drain.
+  auto output_callback = [xservice_client = xservice_client_](
+                             const RequestOutput& output) -> bool {
     // response to xllm service to avoid the redirect cost.
-    if (xservice_client_ == nullptr) {
+    if (xservice_client == nullptr) {
       return false;
     }
-    auto return_status = xservice_client_->generations({output});
+    auto return_status = xservice_client->generations({output});
     CHECK_EQ(return_status.size(), 1)
         << "return size of generations is not equal to 1";
     return return_status[0];
   };
 
-  auto batch_output_callback =
-      [this](const std::vector<RequestOutput>& outputs) {
-        // response to xllm service to avoid the redirect cost.
-        if (xservice_client_ == nullptr) {
-          return std::vector<bool>(outputs.size(), false);
-        }
-        return xservice_client_->generations(outputs);
-      };
+  auto batch_output_callback = [xservice_client = xservice_client_](
+                                   const std::vector<RequestOutput>& outputs) {
+    // response to xllm service to avoid the redirect cost.
+    if (xservice_client == nullptr) {
+      return std::vector<bool>(outputs.size(), false);
+    }
+    return xservice_client->generations(outputs);
+  };
 
   RequestState req_state(std::move(prompt),
                          std::move(prompt_tokens),
