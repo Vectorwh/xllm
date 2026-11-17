@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/platform/platform.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/options.h"
@@ -29,6 +30,33 @@ limitations under the License.
 #include "framework/block/block_utils.h"
 
 namespace xllm {
+
+runtime::Options build_draft_engine_options(const runtime::Options& options,
+                                            int64_t world_size) {
+  runtime::Options draft_options = options;
+  draft_options.model_path(options.draft_model_path().value_or(""))
+      .devices(options.draft_devices())
+      .backend("llm")
+      .num_decoding_tokens(1)
+      .enable_speculative_decode(/*enable_speculative_decode=*/false)
+      .enable_graph(/*enable_graph=*/false)
+      .is_draft_engine(true);
+  // Only the controller owns worker clients and plans cache capacity.
+  if (options.node_rank() == 0 && options.cp_size() > 1 &&
+      Platform::uses_cp_independent_tp_for_block_diffusion_draft() &&
+      SpeculativeConfig::is_block_diffusion_algorithm(
+          options.speculative_algorithm())) {
+    CHECK_GT(world_size, 0);
+    CHECK_LE(world_size, std::numeric_limits<int32_t>::max());
+    CHECK_GT(options.dp_size(), 0);
+    CHECK_EQ(world_size % options.dp_size(), 0);
+    // Cache estimation and allocation must use the draft worker's TP domain.
+    draft_options.world_size(static_cast<int32_t>(world_size))
+        .cp_size(1)
+        .tp_size(static_cast<int32_t>(world_size / options.dp_size()));
+  }
+  return draft_options;
+}
 
 runtime::DecodeGraphWarmupConfig build_decode_graph_warmup_config(
     const runtime::Options& options) {

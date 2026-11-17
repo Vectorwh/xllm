@@ -23,6 +23,7 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "core/distributed_runtime/engine_utils.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
@@ -64,14 +65,9 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
     // draft engine
     // In vlm mtp case, we'd like to use llm backend instead of vlm backend for
     // draft engine.
-    runtime::Options draft_engine_options = options_;
-    draft_engine_options.model_path(options_.draft_model_path().value_or(""))
-        .devices(options.draft_devices())
-        .backend("llm")
-        .num_decoding_tokens(1)
-        .enable_speculative_decode(/*enable_speculative_decode=*/false)
-        .enable_graph(/*enable_graph=*/false)
-        .is_draft_engine(true);
+    runtime::Options draft_engine_options = build_draft_engine_options(
+        options_,
+        static_cast<int64_t>(dist_manager_->get_worker_clients().size()));
     draft_engine_ =
         std::make_unique<LLMEngine>(draft_engine_options, dist_manager_);
 

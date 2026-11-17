@@ -28,6 +28,14 @@ struct Options;
 struct DecodeGraphWarmupConfig;
 }  // namespace runtime
 
+// Builds draft options from the target options. On the controller
+// (node_rank == 0), MLU block-diffusion drafts with CP > 1 merge CP into TP,
+// preserving DP: cp_size = 1 and tp_size = world_size / dp_size. Here,
+// world_size is the actual worker client count, so cache sizing follows the
+// draft worker layout.
+runtime::Options build_draft_engine_options(const runtime::Options& options,
+                                            int64_t world_size);
+
 // Shared by text and multimodal engines so synthetic warmup uses the same
 // NPU decode token shapes as the executor. Other backends keep their policy.
 runtime::DecodeGraphWarmupConfig build_decode_graph_warmup_config(

@@ -623,7 +623,8 @@ endif()
 if(USE_MLU)
   add_definitions(-DUSE_MLU)
   set(CMAKE_VERBOSE_MAKEFILE ON)
-  include_directories(
+  # Keep PyTorch's bundled fmt behind the shared vcpkg dependency headers.
+  include_directories(SYSTEM
       $ENV{PYTHON_INCLUDE_PATH}
       $ENV{PYTORCH_INSTALL_PATH}/include
       $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/api/include

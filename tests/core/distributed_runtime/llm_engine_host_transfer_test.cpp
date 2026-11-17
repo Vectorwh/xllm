@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -25,7 +26,10 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/distributed_runtime/engine_utils.h"
 #include "core/distributed_runtime/llm_engine.h"
+#include "core/framework/kv_cache/kv_cache_estimation.h"
+#include "core/platform/platform.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/config/execution_config.h"
@@ -34,6 +38,91 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+TEST(DraftEngineCacheTest, WorkerRanksBuildWithoutControllerClients) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_EXIT(
+      {
+        runtime::Options target;
+        target.node_rank(1)
+            .dp_size(1)
+            .cp_size(8)
+            .tp_size(1)
+            .speculative_algorithm("DFlash2");
+        const runtime::Options draft =
+            build_draft_engine_options(target, /*world_size=*/0);
+        std::_Exit(draft.node_rank() == 1 && draft.cp_size() == 8 &&
+                           draft.is_draft_engine()
+                       ? 0
+                       : 1);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
+}
+
+TEST(DraftEngineCacheTest, CpPrefillBudgetMatchesDraftTensorParallelCache) {
+  if (!Platform::uses_cp_independent_tp_for_block_diffusion_draft()) {
+    GTEST_SKIP() << "Requires CP-independent draft tensor parallelism";
+  }
+  runtime::Options target;
+  target.dp_size(1).cp_size(8).tp_size(1).speculative_algorithm("DFlash2");
+  const runtime::Options draft =
+      build_draft_engine_options(target, /*world_size=*/8);
+  ModelArgs args;
+  args.model_type("qwen3").n_layers(5).n_heads(32).n_kv_heads(8).head_dim(128);
+  KVCacheEstimateOptions estimate;
+  estimate.dtype = torch::kBFloat16;
+  estimate.cache_size_in_bytes = 409600;
+  estimate.block_size = 16;
+  estimate.world_size = draft.world_size() / draft.dp_size() / draft.cp_size();
+  estimate.n_local_kv_heads =
+      std::max<int64_t>(1, args.n_kv_heads().value() / estimate.world_size);
+  estimate.is_draft_engine = draft.is_draft_engine();
+  const KVCacheCapacity capacity = estimate_kv_cache_capacity(args, estimate);
+
+  // Five BF16 layers, K+V, 16 tokens and one local 128-wide KV head:
+  // each TP8 rank pays 40,960 bytes per block, so this budget fits ten.
+  EXPECT_EQ(capacity.slot_size(), 512);
+  EXPECT_EQ(capacity.n_blocks(), 10);
+  const KVCacheShape worker_shape(capacity, args, /*world_size=*/8);
+  EXPECT_EQ(worker_shape.key_cache_shape(),
+            (std::vector<int64_t>{10, 1, 16, 128}));
+  EXPECT_EQ(worker_shape.value_cache_shape(),
+            (std::vector<int64_t>{10, 1, 16, 128}));
+  EXPECT_EQ(target.cp_size(), 8);
+  EXPECT_EQ(target.tp_size(), 1);
+}
+
+TEST(DraftEngineCacheTest, CpDraftRetainsDataParallelOwnership) {
+  if (!Platform::uses_cp_independent_tp_for_block_diffusion_draft()) {
+    GTEST_SKIP() << "Requires CP-independent draft tensor parallelism";
+  }
+  runtime::Options target;
+  target.world_size(16).dp_size(2).cp_size(4).tp_size(2).speculative_algorithm(
+      "DFlash2");
+  const runtime::Options draft =
+      build_draft_engine_options(target, /*world_size=*/16);
+  EXPECT_EQ(draft.world_size(), 16);
+  EXPECT_EQ(draft.dp_size(), 2);
+  EXPECT_EQ(draft.cp_size(), 1);
+  EXPECT_EQ(draft.tp_size(), 8);
+}
+
+TEST(DraftEngineCacheTest, PreservesDecodeAndNonBlockDiffusionLayouts) {
+  runtime::Options target;
+  target.world_size(8).dp_size(1).cp_size(1).tp_size(8).speculative_algorithm(
+      "DFlash2");
+  const runtime::Options decode =
+      build_draft_engine_options(target, /*world_size=*/8);
+  EXPECT_EQ(decode.cp_size(), 1);
+  EXPECT_EQ(decode.tp_size(), 8);
+
+  target.cp_size(8).tp_size(1).speculative_algorithm("MTP");
+  const runtime::Options mtp =
+      build_draft_engine_options(target, /*world_size=*/8);
+  EXPECT_EQ(mtp.cp_size(), 8);
+  EXPECT_EQ(mtp.tp_size(), 1);
+}
 
 class RecordingWorker final : public WorkerClient {
  public:
