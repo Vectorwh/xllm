@@ -30,9 +30,13 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
   const auto& options = context.get_tensor_options();
-  CHECK(model_args.n_routed_experts() == 0 ||
-        model_args.model_type() == "qwen3_5_moe_text")
-      << "MUSA hybrid MoE currently supports qwen3_5_moe_text only";
+  const std::string& model_type = model_args.model_type();
+  const bool is_qwen35_moe = model_type == "qwen3_5_moe" ||
+                             model_type == "qwen3_5_moe_text" ||
+                             model_type == "qwen3_5_moe_mtp";
+  CHECK(model_args.n_routed_experts() == 0 || is_qwen35_moe)
+      << "MUSA hybrid MoE currently supports qwen3_5_moe, "
+      << "qwen3_5_moe_text and qwen3_5_moe_mtp only";
   const bool use_full_attention = is_full_attention_layer(model_args, layer_id);
 
   // Initialize attention layers
@@ -58,7 +62,9 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
           model_args.hidden_size(), model_args.rms_norm_eps(), options));
 
   // Initialize the feed-forward block. Qwen3.5 uses a routed block; select the
-  // MUSA MoE path only for qwen3_5_moe_text (generic Qwen3-Next MoE differs).
+  // MUSA MoE path for Qwen3.5 MoE target and MTP draft models.
+  // Non-Qwen3.5 MoE model types are rejected by the CHECK above and never
+  // reach this selection.
   CHECK_GT(model_args.decoder_sparse_step(), 0);
   auto mlp_only_layers = model_args.mlp_only_layers();
   const bool is_moe_layer =
@@ -66,8 +72,7 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
           0 &&
       model_args.n_routed_experts() > 0 &&
       (layer_id + 1) % model_args.decoder_sparse_step() == 0;
-  const bool use_qwen35_moe =
-      is_moe_layer && model_args.model_type() == "qwen3_5_moe_text";
+  const bool use_qwen35_moe = is_moe_layer && is_qwen35_moe;
   if (use_qwen35_moe) {
     moe_mlp_ = register_module("mlp",
                                Qwen3_5FusedMoE(model_args,
