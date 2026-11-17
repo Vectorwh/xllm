@@ -142,12 +142,10 @@ torch::Tensor DeepseekV32SparseMoEBlockImpl::merge_out(
 
   if (prep.need_tp_pad && parallel_args_.tp_group_ &&
       parallel_args_.tp_group_->world_size() > 1) {
+    // Both tensors use the same token shard, so add before communicating.
+    x = x + prep.skip_local;
     x = parallel_state::gather(x, parallel_args_.tp_group_, 0);
-    x = unpad_tokens(x, prep.pad_info);
-    auto skip_local =
-        parallel_state::gather(prep.skip_local, parallel_args_.tp_group_, 0);
-    skip_local = unpad_tokens(skip_local, prep.pad_info);
-    return x + skip_local;
+    return unpad_tokens(x, prep.pad_info);
   }
 
   return x + prep.skip_local;

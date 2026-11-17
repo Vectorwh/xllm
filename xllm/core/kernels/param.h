@@ -620,6 +620,10 @@ struct MoeExpandInputParams {
   torch::Tensor combine_idx;
   // topk for moe
   int topk;
+  // ========== Torch MLU related parameters ==========
+  // Optional preallocated output for the MLU backend.
+  // Shape: [expand_token_num, hidden_size], with the same dtype as input.
+  std::optional<torch::Tensor> output = std::nullopt;
 };
 
 struct MoeCombineResultParams {

@@ -767,8 +767,11 @@ torch::Tensor moe_expand_input(MoeExpandInputParams& params) {
                                params.gather_index,
                                params.cusum_token_count,
                                params.start_expert_id,
-                               params.expert_size);
+                               params.expert_size,
+                               params.output);
 #elif defined(USE_ILU)
+  CHECK(!params.output.has_value())
+      << "ILU MoE expand does not support output buffers";
   return ilu::moe_expand_input(
       params.input, params.gather_index, params.combine_idx, params.topk);
 #else

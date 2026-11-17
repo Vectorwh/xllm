@@ -43,6 +43,24 @@ namespace layer {
 namespace {
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
+class MergeOutputProcessGroup final : public test::MockProcessGroup {
+ public:
+  explicit MergeOutputProcessGroup(const torch::Device& device)
+      : test::MockProcessGroup(device, /*rank=*/0, /*world_size=*/2) {}
+
+  c10::intrusive_ptr<c10d::Work> allgather_base_async(
+      const torch::Tensor& input,
+      torch::Tensor& output) override {
+    inputs_.emplace_back(input.clone());
+    return test::MockProcessGroup::allgather_base_async(input, output);
+  }
+
+  const std::vector<torch::Tensor>& inputs() const { return inputs_; }
+
+ private:
+  std::vector<torch::Tensor> inputs_;
+};
+
 Weights create_moe_bf16_weights(const ModelArgs& model_args,
                                 const torch::TensorOptions& options,
                                 int64_t n_shared_experts);
@@ -527,6 +545,8 @@ TEST_F(DeepseekV2SparseMoEBlockTest, MergeOutTpPadGathersAndUnpads) {
                  single_rank_pg_,
                  /*world_size=*/2,
                  /*ep_size=*/2);
+  auto merge_pg = std::make_unique<MergeOutputProcessGroup>(options_.device());
+  parallel_args_.tp_group_ = merge_pg.get();
   auto block = moe_create_block(
       model_args_, quant_args_, parallel_args_, options_, stream_registry_);
 
@@ -536,14 +556,20 @@ TEST_F(DeepseekV2SparseMoEBlockTest, MergeOutTpPadGathersAndUnpads) {
   prep.pad_info = {.original_tokens = 3, .padded_tokens = 4, .active = true};
   auto shard0 = moe_mat(options_, /*rows=*/2, {1.0f, 2.0f, 3.0f, 4.0f});
   auto shard1 = moe_mat(options_, /*rows=*/2, {5.0f, 6.0f, 0.0f, 0.0f});
-  prep.skip_local = shard0;
-  tp_pg_->set_allgather_outputs({shard0, shard1});
+  prep.skip_local = moe_mat(options_, /*rows=*/2, {10.0f, 20.0f, 30.0f, 40.0f});
+  auto peer_skip = moe_mat(options_, /*rows=*/2, {50.0f, 60.0f, 90.0f, 90.0f});
+  merge_pg->set_allgather_outputs(
+      {shard0 + prep.skip_local, shard1 + peer_skip});
 
   auto merged = block->merge_out(shard0, prep, input_params);
 
+  ASSERT_EQ(merge_pg->inputs().size(), 1U);
+  test::verify_tensor_close(merge_pg->inputs().front(),
+                            shard0 + prep.skip_local);
   test::verify_tensor_close(
       merged,
-      moe_mat(options_, /*rows=*/3, {2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f}));
+      moe_mat(
+          options_, /*rows=*/3, {11.0f, 22.0f, 33.0f, 44.0f, 55.0f, 66.0f}));
 }
 
 TEST_F(DeepseekV2SparseMoEBlockTest, MergeOutDpGatherSlicesLocalTokens) {

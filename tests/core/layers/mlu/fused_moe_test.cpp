@@ -31,6 +31,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
+#include "kernels/ops_api.h"
 #include "layers/mlu/tests_utils.h"
 #include "platform/device.h"
 #include "platform/model_stream_registry.h"
@@ -50,6 +51,32 @@ class CountingReduceProcessGroup : public test::MockProcessGroup {
   }
   int32_t calls = 0;
 };
+
+TEST(FusedMoEBufferTest, ExpandWritesOnlyRequestedOutputSlice) {
+  auto options = torch::TensorOptions()
+                     .device(Platform::type_torch(), 0)
+                     .dtype(torch::kBFloat16);
+  auto input = torch::arange(8 * 256, options).view({8, 256});
+  auto indices = torch::tensor({7, 0, 3, 3, 1, 5, 2, 6}, torch::kInt32)
+                     .to(options.device());
+  auto storage = torch::full({10, 256}, -1.0, options);
+  auto output = storage.narrow(0, 1, 8);
+  kernel::MoeExpandInputParams params;
+  params.input = input;
+  params.gather_index = indices;
+  params.cusum_token_count = std::nullopt;
+  params.start_expert_id = 0;
+  params.expert_size = 256;
+  auto reference = kernel::moe_expand_input(params);
+  params.output = output;
+  auto actual = kernel::moe_expand_input(params);
+  EXPECT_EQ(actual.data_ptr(), output.data_ptr());
+  test::verify_tensor_close(actual, reference);
+  test::verify_tensor_close(actual,
+                            input.index_select(0, indices.to(torch::kLong)));
+  EXPECT_TRUE(storage[0].eq(-1).all().item<bool>());
+  EXPECT_TRUE(storage[9].eq(-1).all().item<bool>());
+}
 
 class FusedMoETest : public ::testing::Test {
  protected:

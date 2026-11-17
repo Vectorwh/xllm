@@ -233,6 +233,12 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
       const DsaTopkState& global_topk,
       const DsaTopkTransfer* topk_transfer) const;
 
+  torch::Tensor forward_unabsorbed_prefill(
+      const torch::Tensor& positions,
+      const torch::Tensor& hidden_states,
+      const AttentionMetadata& attn_metadata,
+      KVCache& kv_cache);
+
   torch::Tensor project_output(const torch::Tensor& attn_output, int64_t heads);
 
   bool can_use_cp(const DsaTopkTransfer* topk_transfer) const {
@@ -282,6 +288,7 @@ class DeepseekV32AttentionImpl : public torch::nn::Module {
   RowParallelLinear o_proj_{nullptr};
 
   Attention attn_{nullptr};
+  Attention unabsorbed_prefill_attn_{nullptr};
   std::shared_ptr<RotaryEmbeddingBase> rotary_emb_;
   std::shared_ptr<RotaryEmbeddingBase> indexer_rotary_emb_;
   DeepseekV32Indexer indexer_{nullptr};

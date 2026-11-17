@@ -15,7 +15,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
-#include "mlu_ops_api.h"
+#include "kernels/mlu/mlu_ops_api.h"
 
 namespace xllm::kernel::mlu {
 
@@ -96,7 +96,17 @@ torch::Tensor moe_expand_input(
     const torch::Tensor& gather_index,
     const std::optional<torch::Tensor>& cusum_token_count,
     int64_t start_expert_id,
-    int64_t expert_size) {
+    int64_t expert_size,
+    const std::optional<torch::Tensor>& output) {
+  if (output.has_value()) {
+    tmo::torch_api::moe_expand_input_inplace(input,
+                                             gather_index,
+                                             cusum_token_count,
+                                             start_expert_id,
+                                             expert_size,
+                                             output.value());
+    return output.value();
+  }
   return tmo::torch_api::moe_expand_input(
       input, gather_index, cusum_token_count, start_expert_id, expert_size);
 }

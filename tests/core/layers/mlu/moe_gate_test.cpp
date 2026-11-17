@@ -236,16 +236,25 @@ TEST_F(MoEGateTest, SqrtSoftplusHashRoutingPreservesTokenExpertMapping) {
 
 TEST_F(MoEGateTest, VisualBiasRespectsCapabilityAndTokenType) {
   torch::InferenceMode inference;
-  set_moe_gate_params(4, 2, 1, 1, 1.5, 4, true, "sqrtsoftplus", "noaux_tc");
+  ModelArgs args;
+  args.n_routed_experts() = 4;
+  args.num_experts_per_tok() = 2;
+  args.n_group() = 1;
+  args.topk_group() = 1;
+  args.routed_scaling_factor() = 1.5;
+  args.hidden_size() = 4;
+  args.norm_topk_prob() = true;
+  args.scoring_func() = "sqrtsoftplus";
+  args.topk_method() = "noaux_tc";
   for (const std::string& model_type :
        {"deepseek_v41", "deepseek_v41_dspark"}) {
     SCOPED_TRACE(model_type);
     for (const int32_t vision_layers : {0, 1}) {
       SCOPED_TRACE(vision_layers);
-      model_args_.model_type(model_type)
+      args.model_type(model_type)
           .image_token_id(129264)
           .mm_num_hidden_layers(vision_layers);
-      MoEGate gate(model_args_, quant_args_, options_);
+      MoEGate gate(args, QuantArgs(), options_);
       gate->load_state_dict(StateDict(
           {{"weight", torch::eye(4, torch::kBFloat16)},
            {"bias", torch::tensor({20.0f, 10.0f, 0.0f, -10.0f})},

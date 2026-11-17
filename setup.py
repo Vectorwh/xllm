@@ -995,6 +995,7 @@ class TestUT(Command):
         "BroadcastMultiDeviceTest",
         "DeepEPMultiDeviceTest",
         "AttentionMultiDeviceTest",
+        "MluMlaPrefillTpTest",
         "Glm5AttentionDcpTest",
         "DecoderDpParallelTest",
         "V32DecoderParallelTest",

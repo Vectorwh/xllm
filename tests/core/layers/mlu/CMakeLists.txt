@@ -127,6 +127,7 @@ cc_test(
   SRCS
     dense_mlp_test.cpp
     mla_decode_lse_test.cpp
+    mla_prefill_dispatch_test.cpp
     deepseek_v32/dcp_indexer_candidate_test.cpp
     deepseek_v32/dcp_decode_context_test.cpp
     deepseek_v32/deepseek_v32_cp_utils_test.cpp
@@ -154,6 +155,10 @@ cc_test(
   ENVIRONMENT
     "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH}"
 )
+
+# Keep the TP prefill case isolated when CTest is invoked directly as well.
+set_tests_properties(MluMlaPrefillTpTest.MatchesSingleRankAbsorbedAttention
+  PROPERTIES RUN_SERIAL TRUE)
 
 cc_test(
   NAME

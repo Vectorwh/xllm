@@ -220,6 +220,21 @@ DeepseekV32AttentionImpl::DeepseekV32AttentionImpl(
                                     use_fused_mla_qkv_,
                                     enable_lighting_indexer_,
                                     args.enable_mla()));
+  if (!enable_lighting_indexer_ && args.enable_mla() &&
+      quant_args.quant_method().empty() &&
+      options.dtype().toScalarType() == torch::kBFloat16) {
+    unabsorbed_prefill_attn_ =
+        register_module("unabsorbed_prefill_attn",
+                        Attention(local_heads(),
+                                  qk_head_dim_,
+                                  local_heads(),
+                                  v_head_dim_,
+                                  args.sliding_window(),
+                                  scaling,
+                                  /*use_fused_mla_qkv=*/false,
+                                  /*enable_lighting_indexer=*/false,
+                                  /*enable_mla=*/true));
+  }
   if (dcp_spans_tp_) {
     dcp_full_head_attn_ =
         register_module("dcp_full_head_attn",
@@ -579,6 +594,92 @@ DeepseekV32AttentionImpl::ForwardResult DeepseekV32AttentionImpl::forward(
   };
 }
 
+torch::Tensor DeepseekV32AttentionImpl::forward_unabsorbed_prefill(
+    const torch::Tensor& positions,
+    const torch::Tensor& hidden_states,
+    const AttentionMetadata& attn_metadata,
+    KVCache& kv_cache) {
+  const bool has_cached_prefix =
+      attn_metadata.total_kv_len > hidden_states.size(0);
+  if (has_cached_prefix) {
+    // Gathering the paged latent cache requires one block-table row per
+    // sequence. Validate the metadata before updating the cache.
+    CHECK(attn_metadata.kv_seq_lens.defined());
+    CHECK_EQ(attn_metadata.kv_seq_lens.dim(), 1);
+    CHECK(attn_metadata.block_table.defined());
+    CHECK_EQ(attn_metadata.block_table.dim(), 2);
+    CHECK_EQ(attn_metadata.block_table.size(0),
+             attn_metadata.kv_seq_lens.size(0));
+  }
+
+  const int64_t heads = local_heads();
+  auto query_prep = prep_query(hidden_states, heads);
+  torch::Tensor query = query_prep.q;
+  if (qk_rope_head_dim_ > 0) {
+    auto query_rope = query.slice(-1, qk_nope_head_dim_);
+    rotary_emb_->forward(query_rope,
+                         positions,
+                         attn_metadata.q_cu_seq_lens,
+                         attn_metadata.max_query_len,
+                         attn_metadata.is_prefill);
+  }
+
+  torch::Tensor latent_cache;
+  torch::Tensor k_cache = kv_cache.get_k_cache();
+  auto k_cache_scale = kv_cache.get_k_cache_scale();
+  prepare_mla_latent_side(latent_cache,
+                          k_cache,
+                          k_cache_scale,
+                          hidden_states,
+                          positions,
+                          attn_metadata,
+                          /*enable_fused_qkv=*/false,
+                          /*use_prompt_rope=*/attn_metadata.is_prefill);
+  update_mla_k_cache(latent_cache,
+                     attn_metadata,
+                     kv_cache,
+                     k_cache_scale,
+                     /*is_prefill_phase=*/true);
+
+  // Keep the persistent cache in latent form. Cached prefill needs the full
+  // per-sequence history, including the new tokens just written above.
+  if (has_cached_prefix) {
+    LOG_FIRST_N(INFO, 1) << "Using unabsorbed MLA cached prefill: query_tokens="
+                         << hidden_states.size(0)
+                         << ", kv_tokens=" << attn_metadata.total_kv_len;
+    latent_cache = torch::empty(
+        {attn_metadata.total_kv_len, kv_lora_rank_ + qk_rope_head_dim_},
+        hidden_states.options());
+    kernel::ReshapeFromCacheParams gather_params;
+    gather_params.key = latent_cache.unsqueeze(1);
+    gather_params.key_cache = k_cache;
+    gather_params.context_lengths = attn_metadata.kv_seq_lens;
+    gather_params.max_context_len = attn_metadata.max_seq_len;
+    gather_params.block_tables = attn_metadata.block_table;
+    kernel::reshape_from_cache(gather_params);
+  }
+
+  // Expand only the active context so attention uses QK=192/V=128 instead
+  // of QK=576/V=512. Historical keys already contain their absolute RoPE.
+  auto latent = latent_cache.slice(-1, 0, kv_lora_rank_)
+                    .unsqueeze(0)
+                    .expand({heads, -1, -1});
+  auto key_nope = torch::bmm(latent, w_kc_.transpose(1, 2)).transpose(0, 1);
+  auto key_rope = latent_cache.slice(-1, kv_lora_rank_)
+                      .unsqueeze(1)
+                      .expand({-1, heads, -1});
+  auto key = torch::cat({key_nope, key_rope}, /*dim=*/-1);
+  auto value = torch::bmm(latent, w_vc_).transpose(0, 1).contiguous();
+  AttentionMetadata explicit_kv_metadata = attn_metadata;
+  // The K/V tensors now contain the complete context. Select the explicit-KV
+  // kernel while preserving unequal Q/KV lengths and bottom-right causality.
+  explicit_kv_metadata.is_prefill = true;
+  explicit_kv_metadata.is_chunked_prefill = false;
+  auto output = std::get<0>(unabsorbed_prefill_attn_->forward(
+      explicit_kv_metadata, query, key, value, kv_cache, /*return_lse=*/false));
+  return o_proj_->forward(output);
+}
+
 torch::Tensor DeepseekV32AttentionImpl::forward_normal_tp(
     const torch::Tensor& positions,
     const torch::Tensor& hidden_states,
@@ -593,6 +694,17 @@ torch::Tensor DeepseekV32AttentionImpl::forward_normal_tp(
                        kv_cache,
                        is_prefill_or_chunked_prefill,
                        topk_transfer);
+  }
+
+  constexpr int64_t kMinUnabsorbedPrefillTokens = 1024;
+  if (unabsorbed_prefill_attn_ && is_prefill_or_chunked_prefill &&
+      !attn_metadata.is_mixed && !attn_metadata.is_dummy &&
+      !attn_metadata.enable_cuda_graph && topk_transfer == nullptr &&
+      !kv_cache.get_k_cache_scale().has_value() &&
+      attn_metadata.total_kv_len >= hidden_states.size(0) &&
+      attn_metadata.max_query_len >= kMinUnabsorbedPrefillTokens) {
+    return forward_unabsorbed_prefill(
+        positions, hidden_states, attn_metadata, kv_cache);
   }
 
   const int64_t heads = local_heads();
