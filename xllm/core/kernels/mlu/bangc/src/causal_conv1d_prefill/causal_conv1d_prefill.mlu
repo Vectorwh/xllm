@@ -1,0 +1,601 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cstdint>
+#include <type_traits>
+
+#include "kernels/mlu/bangc/src/causal_conv1d_prefill/launch.h"
+
+namespace xllm::kernel::mlu::bangc {
+namespace {
+constexpr int32_t kDefaultChannels = 256;
+constexpr int32_t kTokens = 64;
+constexpr int32_t kRows = kTokens + 4;
+
+// DMA strides are bytes; segnum counts segments after the first.
+template <typename T>
+__mlu_func__ void load_row(T* dst,
+                           const T* src,
+                           int32_t count,
+                           int64_t stride) {
+  if (stride == 1) {
+    __memcpy_async(dst, src, count * sizeof(T), GDRAM2NRAM);
+  } else {
+    __memcpy_async(dst,
+                   src,
+                   sizeof(T),
+                   GDRAM2NRAM,
+                   sizeof(T),
+                   stride * sizeof(T),
+                   count - 1);
+  }
+}
+
+template <typename T>
+__mlu_func__ void store_row(T* dst,
+                            const T* src,
+                            int32_t count,
+                            int64_t stride) {
+  if (stride == 1) {
+    __memcpy_async(dst, src, count * sizeof(T), NRAM2GDRAM);
+  } else {
+    __memcpy_async(dst,
+                   src,
+                   sizeof(T),
+                   NRAM2GDRAM,
+                   stride * sizeof(T),
+                   sizeof(T),
+                   count - 1);
+  }
+}
+
+template <typename T>
+__mlu_func__ void to_float(float* dst, const T* src, int32_t count) {
+  if constexpr (std::is_same_v<T, float>) {
+    __memcpy(dst, src, count * sizeof(float), NRAM2NRAM);
+  } else if constexpr (std::is_same_v<T, half>) {
+    __bang_half2float(dst, src, count);
+  } else {
+    __bang_bfloat162float(dst, src, count);
+  }
+}
+
+template <typename T>
+__mlu_func__ void from_float(T* dst, const float* src, int32_t count) {
+  if constexpr (std::is_same_v<T, float>) {
+    __memcpy(dst, src, count * sizeof(float), NRAM2NRAM);
+  } else if constexpr (std::is_same_v<T, half>) {
+    __bang_float2half_rn(dst, src, count);
+  } else {
+    __bang_float2bfloat16_rn(dst, src, count);
+  }
+}
+
+template <typename T, int32_t kChannels = kDefaultChannels>
+__mlu_global__ void prefill_tile_kernel(PrefillParams p) {
+  if (__is_mpu()) return;
+  __nram__ T raw[kRows * kChannels];
+  __nram__ T raw_weights[6 * kChannels];
+  __nram__ T packed_weights[8 * kChannels];
+  __nram__ T transposed_weights[8 * kChannels];
+  __nram__ T final_state[4 * kChannels];
+  __nram__ float values[kRows * kChannels];
+  __nram__ float weights[6 * kChannels];
+  __nram__ float acc[kTokens * kChannels];
+  __nram__ float product[kTokens * kChannels];
+  __nram__ float denominator[kTokens * kChannels];
+  const auto* x = static_cast<const T*>(p.x);
+  const auto* w = static_cast<const T*>(p.weight);
+  auto* state = static_cast<T*>(p.state);
+  auto* output = static_cast<T*>(p.output);
+  const int32_t history = p.width - 1;
+  const int64_t channel_tiles = (p.dim + kChannels - 1) / kChannels;
+  for (int64_t tile = taskId; tile < p.nt * channel_tiles; tile += taskDim) {
+    const int64_t work = tile / channel_tiles;
+    const int32_t request = p.batch[work];
+    if (request < 0) continue;
+    const int32_t destination = p.indices[request * p.index_stride];
+    if (destination == 0) continue;
+    const int32_t source = p.read_indices
+                               ? p.read_indices[request * p.read_index_stride]
+                               : destination;
+    const bool has_history = p.initial[request] && source != 0;
+    const int32_t begin = p.query[request];
+    const int32_t length = p.query[request + 1] - begin;
+    const int32_t offset = p.chunks[work] * kTokens;
+    if (offset >= length) continue;
+    const int32_t tokens =
+        length - offset < kTokens ? length - offset : kTokens;
+    const int64_t channel = (tile % channel_tiles) * kChannels;
+    const int32_t channels =
+        p.dim - channel < kChannels ? p.dim - channel : kChannels;
+    const int32_t rows = tokens + history;
+    const bool packed_weight_layout = p.weight_width_stride == 1 &&
+                                      p.weight_channel_stride >= p.width &&
+                                      p.weight_channel_stride <= 8;
+    if (channels != kChannels || (offset == 0 && !has_history)) {
+      __bang_write_value(raw, rows * kChannels, static_cast<T>(0));
+    }
+    __bang_write_value(raw_weights, 6 * kChannels, static_cast<T>(0));
+    if (packed_weight_layout)
+      __bang_write_value(packed_weights, 8 * kChannels, static_cast<T>(0));
+    __sync();
+    if (offset == 0) {
+      if (has_history) {
+        for (int32_t j = 0; j < history; ++j) {
+          load_row(raw + j * kChannels,
+                   state + static_cast<int64_t>(source) * p.state_slot_stride +
+                       channel * p.state_channel_stride +
+                       j * p.state_history_stride,
+                   channels,
+                   p.state_channel_stride);
+        }
+      }
+    } else if (p.x_channel_stride != 1) {
+      for (int32_t j = 0; j < history; ++j) {
+        load_row(raw + j * kChannels,
+                 x + channel * p.x_channel_stride +
+                     (begin + offset - history + j) * p.x_token_stride,
+                 channels,
+                 p.x_channel_stride);
+      }
+    }
+    if (p.x_channel_stride == 1) {
+      const bool include_halo = offset != 0;
+      const int32_t input_rows = include_halo ? rows : tokens;
+      const int32_t input_begin = begin + offset - (include_halo ? history : 0);
+      __memcpy_async(include_halo ? raw : raw + history * kChannels,
+                     x + channel + input_begin * p.x_token_stride,
+                     channels * sizeof(T),
+                     GDRAM2NRAM,
+                     kChannels * sizeof(T),
+                     p.x_token_stride * sizeof(T),
+                     input_rows - 1);
+    } else {
+      for (int32_t j = 0; j < tokens; ++j) {
+        load_row(raw + (history + j) * kChannels,
+                 x + channel * p.x_channel_stride +
+                     (begin + offset + j) * p.x_token_stride,
+                 channels,
+                 p.x_channel_stride);
+      }
+    }
+    if (packed_weight_layout) {
+      const int64_t span = (channels - 1) * p.weight_channel_stride + p.width;
+      __memcpy_async(packed_weights,
+                     w + channel * p.weight_channel_stride,
+                     span * sizeof(T),
+                     GDRAM2NRAM);
+    } else {
+      for (int32_t j = 0; j < p.width; ++j) {
+        load_row(
+            raw_weights + j * kChannels,
+            w + channel * p.weight_channel_stride + j * p.weight_width_stride,
+            channels,
+            p.weight_channel_stride);
+      }
+    }
+    if (p.bias) {
+      load_row(raw_weights + 5 * kChannels,
+               static_cast<const T*>(p.bias) + channel * p.bias_stride,
+               channels,
+               p.bias_stride);
+    }
+    __sync();
+    if (packed_weight_layout) {
+      __bang_transpose(transposed_weights,
+                       packed_weights,
+                       kChannels,
+                       p.weight_channel_stride);
+      for (int32_t j = 0; j < p.width; ++j)
+        __memcpy(raw_weights + j * kChannels,
+                 transposed_weights + j * kChannels,
+                 kChannels * sizeof(T),
+                 NRAM2NRAM);
+    }
+    to_float(values, raw, rows * kChannels);
+    to_float(weights, raw_weights, 6 * kChannels);
+    const int32_t count = tokens * kChannels;
+    int32_t first_tap = 0;
+    if (p.bias) {
+      __bang_write_value(acc, count, 0.0f);
+      __bang_cycle_add(acc, acc, weights + 5 * kChannels, count, kChannels);
+    } else {
+      __bang_cycle_mul(acc, values, weights, count, kChannels);
+      first_tap = 1;
+    }
+    for (int32_t j = first_tap; j < p.width; ++j) {
+      __bang_cycle_mul(product,
+                       values + j * kChannels,
+                       weights + j * kChannels,
+                       count,
+                       kChannels);
+      __bang_add(acc, acc, product, count);
+    }
+    __bang_mul_scalar(denominator, acc, -1.4426950408889634f, count);
+    __bang_pow2(denominator, denominator, count);
+    __bang_add_scalar(denominator, denominator, 1.0f, count);
+    __bang_recip(denominator, denominator, count);
+    __bang_mul(acc, acc, denominator, count);
+    __sync();
+    // Only chunk zero mutates state, after its old history has been consumed.
+    if (offset == 0) {
+      for (int32_t j = 0; j < history; ++j) {
+        if (length >= history) {
+          load_row(final_state + j * kChannels,
+                   x + channel * p.x_channel_stride +
+                       (begin + length - history + j) * p.x_token_stride,
+                   channels,
+                   p.x_channel_stride);
+        } else {
+          __memcpy(final_state + j * kChannels,
+                   raw + (length + j) * kChannels,
+                   channels * sizeof(T),
+                   NRAM2NRAM);
+        }
+      }
+      __sync();
+      for (int32_t j = 0; j < history; ++j) {
+        store_row(
+            state + static_cast<int64_t>(destination) * p.state_slot_stride +
+                channel * p.state_channel_stride + j * p.state_history_stride,
+            final_state + j * kChannels,
+            channels,
+            p.state_channel_stride);
+      }
+      __sync();
+    }
+    from_float(raw, acc, count);
+    const T* result = raw;
+    __sync();
+    if (p.output_channel_stride == 1) {
+      __memcpy_async(
+          output + channel + (begin + offset) * p.output_token_stride,
+          result,
+          channels * sizeof(T),
+          NRAM2GDRAM,
+          p.output_token_stride * sizeof(T),
+          kChannels * sizeof(T),
+          tokens - 1);
+    } else {
+      for (int32_t j = 0; j < tokens; ++j) {
+        store_row(output + channel * p.output_channel_stride +
+                      (begin + offset + j) * p.output_token_stride,
+                  result + j * kChannels,
+                  channels,
+                  p.output_channel_stride);
+      }
+    }
+    __sync();
+  }
+}
+struct RequestMetadata {
+  int32_t request;
+  int32_t destination;
+  int32_t source;
+  bool has_history;
+  int32_t begin;
+  int32_t length;
+};
+
+struct TileMetadata {
+  int32_t destination;
+  int32_t begin;
+  int32_t length;
+  int32_t offset;
+  int32_t tokens;
+  int64_t channel;
+  int32_t channels;
+};
+
+template <int32_t kChannels>
+__mlu_func__ int64_t load_prefill_tile(PrefillParams p,
+                                       int64_t first,
+                                       bfloat16_t* raw,
+                                       bfloat16_t* raw_weights,
+                                       bfloat16_t* packed_weights,
+                                       TileMetadata& metadata,
+                                       RequestMetadata& cache) {
+  using T = bfloat16_t;
+  const auto* x = static_cast<const T*>(p.x);
+  const auto* w = static_cast<const T*>(p.weight);
+  const auto* state = static_cast<const T*>(p.state);
+  const int32_t history = p.width - 1;
+  const int64_t channel_tiles = (p.dim + kChannels - 1) / kChannels;
+  const int64_t end = p.nt * channel_tiles;
+  for (int64_t tile = first; tile < end; tile += taskDim) {
+    const int64_t work = tile / channel_tiles;
+    const int32_t request = p.batch[work];
+    if (request < 0) continue;
+    if (request != cache.request) {
+      cache.request = request;
+      cache.destination = p.indices[request * p.index_stride];
+      if (cache.destination != 0) {
+        cache.source = p.read_indices
+                           ? p.read_indices[request * p.read_index_stride]
+                           : cache.destination;
+        cache.has_history = p.initial[request] && cache.source != 0;
+        cache.begin = p.query[request];
+        cache.length = p.query[request + 1] - cache.begin;
+      }
+    }
+    const int32_t destination = cache.destination;
+    if (destination == 0) continue;
+    const int32_t source = cache.source;
+    const bool has_history = cache.has_history;
+    const int32_t begin = cache.begin;
+    const int32_t length = cache.length;
+    const int32_t offset = p.chunks[work] * kTokens;
+    if (offset >= length) continue;
+    const int32_t tokens =
+        length - offset < kTokens ? length - offset : kTokens;
+    const int64_t channel = (tile % channel_tiles) * kChannels;
+    const int32_t channels =
+        p.dim - channel < kChannels ? p.dim - channel : kChannels;
+    const int32_t rows = tokens + history;
+    const bool packed_weight_layout = p.weight_width_stride == 1 &&
+                                      p.weight_channel_stride >= p.width &&
+                                      p.weight_channel_stride <= 8;
+    if (channels != kChannels || (offset == 0 && !has_history)) {
+      __bang_write_value(raw, rows * kChannels, static_cast<T>(0));
+    }
+    __bang_write_value(raw_weights, 6 * kChannels, static_cast<T>(0));
+    if (packed_weight_layout)
+      __bang_write_value(packed_weights, 8 * kChannels, static_cast<T>(0));
+    __sync_compute();
+    if (offset == 0) {
+      if (has_history) {
+        for (int32_t j = 0; j < history; ++j) {
+          load_row(raw + j * kChannels,
+                   state + static_cast<int64_t>(source) * p.state_slot_stride +
+                       channel * p.state_channel_stride +
+                       j * p.state_history_stride,
+                   channels,
+                   p.state_channel_stride);
+        }
+      }
+    } else if (p.x_channel_stride != 1) {
+      for (int32_t j = 0; j < history; ++j) {
+        load_row(raw + j * kChannels,
+                 x + channel * p.x_channel_stride +
+                     (begin + offset - history + j) * p.x_token_stride,
+                 channels,
+                 p.x_channel_stride);
+      }
+    }
+    if (p.x_channel_stride == 1) {
+      const bool include_halo = offset != 0;
+      const int32_t input_rows = include_halo ? rows : tokens;
+      const int32_t input_begin = begin + offset - (include_halo ? history : 0);
+      __memcpy_async(include_halo ? raw : raw + history * kChannels,
+                     x + channel + input_begin * p.x_token_stride,
+                     channels * sizeof(T),
+                     GDRAM2NRAM,
+                     kChannels * sizeof(T),
+                     p.x_token_stride * sizeof(T),
+                     input_rows - 1);
+    } else {
+      for (int32_t j = 0; j < tokens; ++j) {
+        load_row(raw + (history + j) * kChannels,
+                 x + channel * p.x_channel_stride +
+                     (begin + offset + j) * p.x_token_stride,
+                 channels,
+                 p.x_channel_stride);
+      }
+    }
+    if (packed_weight_layout) {
+      const int64_t span = (channels - 1) * p.weight_channel_stride + p.width;
+      __memcpy_async(packed_weights,
+                     w + channel * p.weight_channel_stride,
+                     span * sizeof(T),
+                     GDRAM2NRAM);
+    } else {
+      for (int32_t j = 0; j < p.width; ++j) {
+        load_row(
+            raw_weights + j * kChannels,
+            w + channel * p.weight_channel_stride + j * p.weight_width_stride,
+            channels,
+            p.weight_channel_stride);
+      }
+    }
+    if (p.bias) {
+      load_row(raw_weights + 5 * kChannels,
+               static_cast<const T*>(p.bias) + channel * p.bias_stride,
+               channels,
+               p.bias_stride);
+    }
+    metadata = {destination, begin, length, offset, tokens, channel, channels};
+    return tile;
+  }
+  return end;
+}
+
+template <int32_t kChannels>
+__mlu_global__ void prefill_pipeline_kernel(PrefillParams p) {
+  if (__is_mpu()) return;
+  using T = bfloat16_t;
+  __nram__ T raw_storage[2 * kRows * kChannels];
+  T* raw = raw_storage;
+  __nram__ T raw_weights_storage[2 * 6 * kChannels];
+  T* raw_weights = raw_weights_storage;
+  __nram__ T packed_storage[2 * 8 * kChannels];
+  T* packed_weights = packed_storage;
+  __nram__ T transposed_weights[8 * kChannels];
+  __nram__ T final_state[4 * kChannels];
+  __nram__ float values[kRows * kChannels];
+  __nram__ float weights[6 * kChannels];
+  __nram__ float acc[kTokens * kChannels];
+  __nram__ float product[kTokens * kChannels];
+  __nram__ float denominator[kTokens * kChannels];
+  const auto* x = static_cast<const T*>(p.x);
+  const auto* w = static_cast<const T*>(p.weight);
+  auto* state = static_cast<T*>(p.state);
+  auto* output = static_cast<T*>(p.output);
+  const int32_t history = p.width - 1;
+  const int64_t channel_tiles = (p.dim + kChannels - 1) / kChannels;
+  int32_t slot = 0;
+  TileMetadata metadata;
+  TileMetadata next_metadata;
+  RequestMetadata cache;
+  cache.request = -1;
+  int64_t tile = load_prefill_tile<kChannels>(
+      p, taskId, raw, raw_weights, packed_weights, metadata, cache);
+  __sync();
+  while (tile < p.nt * channel_tiles) {
+    const int32_t destination = metadata.destination;
+    const int32_t begin = metadata.begin;
+    const int32_t length = metadata.length;
+    const int32_t offset = metadata.offset;
+    const int32_t tokens = metadata.tokens;
+    const int64_t channel = metadata.channel;
+    const int32_t channels = metadata.channels;
+    const int32_t rows = tokens + history;
+    const bool packed_weight_layout = p.weight_width_stride == 1 &&
+                                      p.weight_channel_stride >= p.width &&
+                                      p.weight_channel_stride <= 8;
+    const int64_t next = load_prefill_tile<kChannels>(
+        p,
+        tile + taskDim,
+        raw_storage + (1 - slot) * kRows * kChannels,
+        raw_weights_storage + (1 - slot) * 6 * kChannels,
+        packed_storage + (1 - slot) * 8 * kChannels,
+        next_metadata,
+        cache);
+    if (packed_weight_layout) {
+      __bang_transpose(transposed_weights,
+                       packed_weights,
+                       kChannels,
+                       p.weight_channel_stride);
+      for (int32_t j = 0; j < p.width; ++j)
+        __memcpy(raw_weights + j * kChannels,
+                 transposed_weights + j * kChannels,
+                 kChannels * sizeof(T),
+                 NRAM2NRAM);
+    }
+    to_float(values, raw, rows * kChannels);
+    to_float(weights, raw_weights, 6 * kChannels);
+    const int32_t count = tokens * kChannels;
+    int32_t first_tap = 0;
+    if (p.bias) {
+      __bang_write_value(acc, count, 0.0f);
+      __bang_cycle_add(acc, acc, weights + 5 * kChannels, count, kChannels);
+    } else {
+      __bang_cycle_mul(acc, values, weights, count, kChannels);
+      first_tap = 1;
+    }
+    for (int32_t j = first_tap; j < p.width; ++j) {
+      __bang_cycle_mul(product,
+                       values + j * kChannels,
+                       weights + j * kChannels,
+                       count,
+                       kChannels);
+      __bang_add(acc, acc, product, count);
+    }
+    __bang_mul_scalar(denominator, acc, -1.4426950408889634f, count);
+    __bang_pow2(denominator, denominator, count);
+    __bang_add_scalar(denominator, denominator, 1.0f, count);
+    __bang_recip(denominator, denominator, count);
+    __bang_mul(acc, acc, denominator, count);
+    __sync();
+    // Only chunk zero mutates state, after its old history has been consumed.
+    if (offset == 0) {
+      for (int32_t j = 0; j < history; ++j) {
+        if (length >= history) {
+          load_row(final_state + j * kChannels,
+                   x + channel * p.x_channel_stride +
+                       (begin + length - history + j) * p.x_token_stride,
+                   channels,
+                   p.x_channel_stride);
+        } else {
+          __memcpy(final_state + j * kChannels,
+                   raw + (length + j) * kChannels,
+                   channels * sizeof(T),
+                   NRAM2NRAM);
+        }
+      }
+      __sync();
+      for (int32_t j = 0; j < history; ++j) {
+        store_row(
+            state + static_cast<int64_t>(destination) * p.state_slot_stride +
+                channel * p.state_channel_stride + j * p.state_history_stride,
+            final_state + j * kChannels,
+            channels,
+            p.state_channel_stride);
+      }
+      __sync();
+    }
+    from_float(raw, acc, count);
+    const T* result = raw;
+    __sync();
+    if (p.output_channel_stride == 1) {
+      __memcpy_async(
+          output + channel + (begin + offset) * p.output_token_stride,
+          result,
+          channels * sizeof(T),
+          NRAM2GDRAM,
+          p.output_token_stride * sizeof(T),
+          kChannels * sizeof(T),
+          tokens - 1);
+    } else {
+      for (int32_t j = 0; j < tokens; ++j) {
+        store_row(output + channel * p.output_channel_stride +
+                      (begin + offset + j) * p.output_token_stride,
+                  result + j * kChannels,
+                  channels,
+                  p.output_channel_stride);
+      }
+    }
+    __sync();
+    slot = 1 - slot;
+    raw = raw_storage + slot * kRows * kChannels;
+    raw_weights = raw_weights_storage + slot * 6 * kChannels;
+    packed_weights = packed_storage + slot * 8 * kChannels;
+    tile = next;
+    if (tile < p.nt * channel_tiles) {
+      metadata = next_metadata;
+    }
+  }
+}
+}  // namespace
+
+cnrtRet_t launch_prefill(PrefillParams p, int32_t dtype, cnrtQueue_t queue) {
+  if (p.nt == 0 || p.dim == 0) return cnrtSuccess;
+  int32_t device = 0;
+  int32_t clusters = 0;
+  cnrtRet_t status = cnrtGetDevice(&device);
+  if (status != cnrtSuccess) return status;
+  status = cnrtDeviceGetAttribute(&clusters, cnrtAttrClusterCount, device);
+  if (status != cnrtSuccess) return status;
+  if (clusters <= 0) return cnrtErrorNoDevice;
+  const int64_t work =
+      p.nt * ((p.dim + kDefaultChannels - 1) / kDefaultChannels);
+  const int32_t cores = work < clusters * 4 ? work : clusters * 4;
+  const cnrtDim3_t grid = {static_cast<uint32_t>(cores), 1, 1};
+  if (dtype == kPrefillFloat32) {
+    prefill_tile_kernel<float><<<grid, cnrtFuncTypeBlock, queue>>>(p);
+  } else if (dtype == kPrefillFloat16) {
+    prefill_tile_kernel<half><<<grid, cnrtFuncTypeBlock, queue>>>(p);
+  } else if (dtype == kPrefillBFloat16 && work >= clusters * 8) {
+    prefill_pipeline_kernel<kDefaultChannels>
+        <<<grid, cnrtFuncTypeBlock, queue>>>(p);
+  } else {
+    prefill_tile_kernel<bfloat16_t><<<grid, cnrtFuncTypeBlock, queue>>>(p);
+  }
+  return cnrtGetLastError();
+}
+}  // namespace xllm::kernel::mlu::bangc

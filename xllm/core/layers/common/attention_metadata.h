@@ -150,6 +150,11 @@ struct AttentionMetadata {
   // Optional source slots prepared by models supporting distinct state I/O.
   // Undefined means the caller consumes the destination slots.
   torch::Tensor linear_state_read_indices;
+  // Physical cache rows derived from linear_state_indices ("logical slot x
+  // checkpoint_stride", rebased to 2D for spec-verify). The model derives it
+  // once per forward and every recurrent-state layer consumes the same tensor;
+  // undefined means a layer derives it locally for that call.
+  torch::Tensor derived_linear_state_indices;
   std::vector<int32_t> kpool_query_lens;
   std::shared_ptr<const KPoolBatchMetadata> kpool_batch_metadata;
   // Cache-shard derivations are immutable batch data shared by all layers.

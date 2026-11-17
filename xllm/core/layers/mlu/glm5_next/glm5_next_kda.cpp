@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/common/constants.h"
 #include "framework/state_dict/utils.h"
 #include "kernels/mlu/bangc/include/bangc_kda_norm_gate_api.h"
+#include "kernels/mlu/bangc/include/kda.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
 #include "layers/mlu/qwen3_5/qwen3_5_gated_delta_net.h"
@@ -466,7 +467,7 @@ void Glm5NextKDAImpl::verify_loaded_weights(const std::string& prefix) const {
 
 torch::Tensor Glm5NextKDAImpl::get_linear_state_indices(
     const ModelInputParams& input_params,
-    const torch::Device& device) const {
+    const torch::Device& device) {
   CHECK(!input_params.embedding.linear_state_ids.empty())
       << "linear_state_ids must be populated for GLM5-Next KDA";
   if (input_params.embedding.linear_state_indices.defined()) {
@@ -474,7 +475,7 @@ torch::Tensor Glm5NextKDAImpl::get_linear_state_indices(
   }
   return torch::tensor(
       input_params.embedding.linear_state_ids,
-      torch::TensorOptions().dtype(torch::kInt).device(device));
+      torch::TensorOptions().dtype(torch::kInt32).device(device));
 }
 
 std::optional<torch::Tensor> Glm5NextKDAImpl::get_prefill_read_indices(
@@ -495,9 +496,48 @@ std::optional<torch::Tensor> Glm5NextKDAImpl::get_prefill_read_indices(
   return std::nullopt;
 }
 
-int64_t Glm5NextKDAImpl::get_checkpoint_stride(const KVCache& kv_cache) const {
-  torch::Tensor conv_cache = kv_cache.get_conv_cache();
-  torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
+torch::Tensor Glm5NextKDAImpl::derive_state_indices(
+    const AttentionMetadata& attn_metadata,
+    const ModelInputParams& input_params,
+    const KVCache& kv_cache) {
+  const int64_t checkpoint_stride = get_checkpoint_stride(kv_cache);
+  // An idle DP shard executes one padding token but shares the target's full
+  // speculative cache layout, so its rebase width stays at the physical stride.
+  const int64_t verify_width =
+      input_params.is_spec_verify
+          ? (attn_metadata.is_dummy ? checkpoint_stride
+                                    : attn_metadata.max_query_len)
+          : 0;
+
+  const torch::Tensor logical_state_indices =
+      get_linear_state_indices(input_params, kv_cache.get_ssm_cache().device());
+  CHECK_EQ(input_params.embedding.linear_state_ids.size(),
+           static_cast<size_t>(logical_state_indices.numel()))
+      << "GLM5-Next KDA linear state ids and indices disagree";
+
+  if (input_params.is_spec_verify) {
+    torch::Tensor state_indices = build_rebased_ssm_state_indices(
+        logical_state_indices, checkpoint_stride, verify_width);
+    state_indices.masked_fill_(
+        logical_state_indices.eq(kPaddingLinearStateId).unsqueeze(1), 0);
+    CHECK_EQ(state_indices.size(1), verify_width);
+    return state_indices;
+  }
+  return build_linear_state_base_indices(logical_state_indices,
+                                         checkpoint_stride);
+}
+
+void Glm5NextKDAImpl::prepare_state_indices(
+    AttentionMetadata& metadata,
+    const ModelInputParams& input_params,
+    const KVCache& kv_cache) {
+  metadata.derived_linear_state_indices =
+      derive_state_indices(metadata, input_params, kv_cache);
+}
+
+int64_t Glm5NextKDAImpl::get_checkpoint_stride(const KVCache& kv_cache) {
+  const torch::Tensor conv_cache = kv_cache.get_conv_cache();
+  const torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
   CHECK_GT(conv_cache.size(0), 0) << "GLM5-Next KDA conv cache must have rows";
   CHECK_EQ(ssm_cache.size(0) % conv_cache.size(0), 0)
       << "GLM5-Next KDA SSM checkpoint layout mismatch";
@@ -547,11 +587,21 @@ torch::Tensor Glm5NextKDAImpl::forward(
   torch::Tensor conv_cache = kv_cache.get_conv_cache().transpose(-1, -2);
   torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
   const int64_t checkpoint_stride = get_checkpoint_stride(kv_cache);
-  // An idle DP shard executes one padding token but shares the target's full
-  // speculative cache layout. Keep that physical stride for the kernels;
-  // q_cu_seq_lens still bounds the dummy query to one token.
+  // The model derives the shared slot indices once per forward; fall back to a
+  // local derivation for direct callers (e.g. unit tests).
+  std::optional<torch::Tensor> local_state;
+  const torch::Tensor* state_indices =
+      &attn_metadata.derived_linear_state_indices;
+  if (!state_indices->defined()) {
+    local_state = derive_state_indices(attn_metadata, input_params, kv_cache);
+    state_indices = &*local_state;
+  }
+  // The spec-verify indices are 2D and already encode the rebase width (an idle
+  // DP shard rebases to the physical stride). Read it back from the tensor so
+  // the conv-state checks and the kernel argument cannot drift from the index
+  // construction.
   const int64_t verify_width =
-      attn_metadata.is_dummy ? checkpoint_stride : attn_metadata.max_query_len;
+      input_params.is_spec_verify ? state_indices->size(1) : 0;
   if (input_params.is_spec_verify) {
     CHECK_EQ(checkpoint_stride, verify_width)
         << "GLM5-Next KDA Spec Verify checkpoint stride mismatch";
@@ -566,8 +616,10 @@ torch::Tensor Glm5NextKDAImpl::forward(
       /*dim=*/0);
   torch::Tensor logical_state_indices =
       get_linear_state_indices(input_params, mixed_qkv.device());
-  torch::Tensor state_base_indices =
-      build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+  torch::Tensor state_base_indices;
+  if (!input_params.is_spec_verify) {
+    state_base_indices = *state_indices;
+  }
   torch::Tensor core_output;
 
   if (input_params.is_spec_verify) {
@@ -584,11 +636,6 @@ torch::Tensor Glm5NextKDAImpl::forward(
         input_params.num_accepted_tokens);
     std::tie(q, k, v) = split_mixed_qkv(mixed_qkv);
 
-    torch::Tensor state_indices = build_rebased_ssm_state_indices(
-        logical_state_indices, checkpoint_stride, verify_width);
-    // Slot zero is reserved; every checkpoint of a virtual request skips state.
-    state_indices.masked_fill_(
-        logical_state_indices.eq(kPaddingLinearStateId).unsqueeze(1), 0);
     xllm::kernel::FusedSigmoidGatingDeltaRuleUpdateParams params;
     params.A_log = A_log_;
     params.a = raw_gate.view({num_tokens, local_projection_size_});
@@ -598,7 +645,7 @@ torch::Tensor Glm5NextKDAImpl::forward(
     params.v = v;
     params.b = beta;
     params.initial_state_source = ssm_cache;
-    params.initial_state_indices = state_indices;
+    params.initial_state_indices = *state_indices;
     params.cu_seqlens = attn_metadata.q_cu_seq_lens;
     params.scale =
         static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim_)));
@@ -659,8 +706,8 @@ torch::Tensor Glm5NextKDAImpl::forward(
                                      /*output_final_state=*/true,
                                      /*use_qk_l2norm=*/true);
     core_output = core_output.squeeze(/*dim=*/0).contiguous();
-    ssm_cache.index_put_({state_base_indices},
-                         final_state.to(ssm_cache.scalar_type()));
+    kernel::mlu::bangc::kda_state_writeback(
+        final_state, ssm_cache, state_base_indices);
   } else {
     mixed_qkv = xllm::kernel::mlu::causal_conv1d_update_decode(
         mixed_qkv,

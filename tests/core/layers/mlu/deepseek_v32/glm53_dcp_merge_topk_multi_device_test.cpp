@@ -118,7 +118,7 @@ std::vector<MergeCase> history_cases(Deployment deployment, int32_t batch) {
           batch,
           kQueries / batch,
           history});
-      continue;
+      return cases;
     }
     // Global batch is split equally between the two DP replicas.
     // K=3 verifies the current plus three draft tokens.

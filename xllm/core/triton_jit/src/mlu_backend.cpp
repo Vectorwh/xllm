@@ -146,6 +146,9 @@ void MluCompiledKernel::launch(void* stream, Grid g, const void* const* args) {
   uint32_t gx = g.x * static_cast<uint32_t>(meta_.num_warps);
   uint32_t gy = g.y;
   uint32_t gz = g.z;
+  if (gx == 0 || gy == 0 || gz == 0) {
+    return;
+  }
   uint64_t total = static_cast<uint64_t>(gx) * gy * gz;
 
   uint64_t func_type = static_cast<uint64_t>(meta_.num_warps);

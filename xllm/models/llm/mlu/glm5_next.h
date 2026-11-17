@@ -203,6 +203,16 @@ class Glm5NextModelImpl final
         modified_input_params.parallel.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
     prepare_attention_metadata(modified_input_params);
+    // Derive the KDA slot indices once per forward and let every KDA layer
+    // share the result. This runs inside graph capture, so replay recomputes
+    // the derivation from the executor-refreshed linear_state_indices.
+    for (const auto& cache : kv_caches) {
+      if (cache.get_ssm_cache().defined()) {
+        layer::Glm5NextKDAImpl::prepare_state_indices(
+            *modified_input_params.attn_metadata, modified_input_params, cache);
+        break;
+      }
+    }
     const layer::AttentionMetadata& attn_metadata =
         *modified_input_params.attn_metadata;
 

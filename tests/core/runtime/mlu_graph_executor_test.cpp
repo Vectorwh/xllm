@@ -1384,10 +1384,10 @@ void MluGraphExecutorTest::
   spec_input.input_params.num_accepted_tokens =
       torch::ones({batch_size}, tensor_options_.dtype(torch::kInt32));
 
-  const auto expected_spec = base_impl_->run(forward_input.token_ids,
-                                             forward_input.positions,
+  const auto expected_spec = base_impl_->run(spec_input.token_ids,
+                                             spec_input.positions,
                                              kv_caches_,
-                                             forward_input.input_params);
+                                             spec_input.input_params);
   const int32_t start_cnt = model_->forward_cnt();
   auto first_spec_output = impl_
                                ->run({spec_input.token_ids},

@@ -22,6 +22,7 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 
+#include "kernels/mlu/bangc/include/causal_conv1d_prefill.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "triton_jit/include/jit_kernel.h"
 
@@ -77,6 +78,29 @@ torch::Tensor causal_conv1d_fn(
   }
   torch::Tensor out = torch::zeros_like(x);
   CHECK_GT(nt, 0);
+
+  // Prefer the BangC prefill kernel when the frozen prefill state contract
+  // matches. It returns false without enqueuing device work or mutating the
+  // output for unsupported inputs, so the Triton kernel below remains the
+  // pre-selected path for those cases.
+  if (bangc_causal_conv1d_prefill(x,
+                                  weight,
+                                  conv_states,
+                                  query_start_loc,
+                                  batch,
+                                  token_block_offset,
+                                  nt,
+                                  bias_opt,
+                                  cache_indices_opt,
+                                  has_initial_state_opt,
+                                  initial_state_idx_opt,
+                                  num_accepted_tokens_opt,
+                                  read_cache_indices_opt,
+                                  inplace_final_state,
+                                  out)) {
+    return out;
+  }
+
   int32_t dim = static_cast<int32_t>(x.size(0));
   int32_t width = static_cast<int32_t>(weight.size(1));
   int32_t state_len = width - 1;

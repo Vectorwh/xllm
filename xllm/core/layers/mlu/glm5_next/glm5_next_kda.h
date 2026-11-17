@@ -104,6 +104,12 @@ class Glm5NextKDAImpl final : public torch::nn::Module {
                         const ModelInputParams& input_params,
                         const glm5_next_pcp::Context* pcp_context = nullptr);
 
+  // Derives the batch-shaped SSM state-slot indices once per model forward and
+  // stores them in the shared metadata for all KDA layers of that forward.
+  static void prepare_state_indices(AttentionMetadata& metadata,
+                                    const ModelInputParams& input_params,
+                                    const KVCache& kv_cache);
+
   torch::Tensor forward_pcp(const torch::Tensor& hidden_states,
                             const AttentionMetadata& attn_metadata,
                             KVCache& kv_cache,
@@ -111,12 +117,17 @@ class Glm5NextKDAImpl final : public torch::nn::Module {
                             const glm5_next_pcp::Context& context);
 
  private:
-  torch::Tensor get_linear_state_indices(const ModelInputParams& input_params,
-                                         const torch::Device& device) const;
+  static torch::Tensor derive_state_indices(
+      const AttentionMetadata& attn_metadata,
+      const ModelInputParams& input_params,
+      const KVCache& kv_cache);
+  static torch::Tensor get_linear_state_indices(
+      const ModelInputParams& input_params,
+      const torch::Device& device);
   std::optional<torch::Tensor> get_prefill_read_indices(
       const ModelInputParams& input_params,
       const AttentionMetadata& attn_metadata) const;
-  int64_t get_checkpoint_stride(const KVCache& kv_cache) const;
+  static int64_t get_checkpoint_stride(const KVCache& kv_cache);
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> split_mixed_qkv(
       const torch::Tensor& mixed_qkv) const;
 

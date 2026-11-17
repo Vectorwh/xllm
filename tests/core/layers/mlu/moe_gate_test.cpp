@@ -83,6 +83,28 @@ class MoEGateTest : public ::testing::Test {
                    .requires_grad(false);
   }
 
+  // Set MoE gate related fields on model_args_. Call before constructing
+  // MoEGateImpl in each test.
+  void set_moe_gate_params(int64_t num_experts,
+                           int64_t top_k,
+                           int64_t num_expert_group,
+                           int64_t topk_group,
+                           double route_scale,
+                           int64_t hidden_size,
+                           bool renormalize,
+                           const std::string& scoring_func,
+                           const std::string& topk_method) {
+    model_args_.n_routed_experts() = static_cast<int32_t>(num_experts);
+    model_args_.num_experts_per_tok() = static_cast<int32_t>(top_k);
+    model_args_.n_group() = static_cast<int32_t>(num_expert_group);
+    model_args_.topk_group() = static_cast<int32_t>(topk_group);
+    model_args_.routed_scaling_factor() = static_cast<float>(route_scale);
+    model_args_.hidden_size() = hidden_size;
+    model_args_.norm_topk_prob() = renormalize;
+    model_args_.scoring_func() = scoring_func;
+    model_args_.topk_method() = topk_method;
+  }
+
   void verify_routes(const std::string& scoring,
                      bool corrected,
                      bool grouped) const {
@@ -141,6 +163,8 @@ class MoEGateTest : public ::testing::Test {
   }
 
   torch::TensorOptions options_;
+  ModelArgs model_args_;
+  QuantArgs quant_args_;
 };
 
 TEST_F(MoEGateTest, Sigmoid) {

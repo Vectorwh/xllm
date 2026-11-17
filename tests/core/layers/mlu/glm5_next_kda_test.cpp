@@ -25,6 +25,8 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -33,6 +35,7 @@ limitations under the License.
 #include <vector>
 
 #include "kernels/mlu/bangc/include/bangc_kda_norm_gate_api.h"
+#include "kernels/mlu/bangc/include/kda.h"
 #include "kernels/mlu/chunk_kda.h"
 #include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
@@ -216,6 +219,216 @@ std::tuple<torch::Tensor, torch::Tensor> packed_eager_kda(
     begin = end;
   }
   return {torch::cat(outputs, /*dim=*/0), torch::stack(states, /*dim=*/0)};
+}
+
+bool writeback_bytes_equal(const torch::Tensor& actual,
+                           const torch::Tensor& expected) {
+  const torch::Tensor actual_cpu = actual.cpu().contiguous();
+  const torch::Tensor expected_cpu = expected.cpu().contiguous();
+  return actual_cpu.sizes() == expected_cpu.sizes() &&
+         actual_cpu.scalar_type() == expected_cpu.scalar_type() &&
+         (actual_cpu.numel() == 0 ||
+          std::memcmp(actual_cpu.const_data_ptr(),
+                      expected_cpu.const_data_ptr(),
+                      actual_cpu.numel() * actual_cpu.element_size()) == 0);
+}
+
+torch::Tensor make_writeback_source(int64_t rows,
+                                    int64_t width,
+                                    torch::ScalarType dtype,
+                                    bool special_values) {
+  torch::Tensor source =
+      torch::randn({rows, width}, torch::TensorOptions().dtype(dtype));
+  if (!special_values) {
+    return source;
+  }
+  constexpr std::array<uint32_t, 12> kFp32Bits = {0x00000000,
+                                                  0x80000000,
+                                                  0x00000001,
+                                                  0x80000001,
+                                                  0x007fffff,
+                                                  0x00800000,
+                                                  0x7f7fffff,
+                                                  0xff7fffff,
+                                                  0x7f800000,
+                                                  0xff800000,
+                                                  0x7fc12345,
+                                                  0x7f812345};
+  constexpr std::array<uint16_t, 12> kBf16Bits = {0x0000,
+                                                  0x8000,
+                                                  0x0001,
+                                                  0x8001,
+                                                  0x007f,
+                                                  0x0080,
+                                                  0x7f7f,
+                                                  0xff7f,
+                                                  0x7f80,
+                                                  0xff80,
+                                                  0x7fc1,
+                                                  0x7f81};
+  auto* bytes = static_cast<uint8_t*>(source.mutable_data_ptr());
+  for (int64_t element = 0; element < source.numel(); ++element) {
+    const size_t pattern = static_cast<size_t>(element) % kFp32Bits.size();
+    if (dtype == torch::kFloat32) {
+      std::memcpy(bytes + element * sizeof(uint32_t),
+                  &kFp32Bits[pattern],
+                  sizeof(uint32_t));
+    } else {
+      std::memcpy(bytes + element * sizeof(uint16_t),
+                  &kBf16Bits[pattern],
+                  sizeof(uint16_t));
+    }
+  }
+  return source;
+}
+
+TEST(Glm5NextKDAWritebackTest, MatchesTorchCastAndPreservesStorageBytes) {
+  const torch::InferenceMode inference_guard;
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  const torch::DeviceGuard device_guard(device);
+  torch::manual_seed(/*seed=*/20261112);
+  constexpr int64_t kRows = 7;
+  constexpr int64_t kSlots = 17;
+  const std::array<int64_t, 18> widths = {0,
+                                          1,
+                                          31,
+                                          4095,
+                                          4096,
+                                          4097,
+                                          8191,
+                                          8192,
+                                          8193,
+                                          16383,
+                                          16384,
+                                          16385,
+                                          32767,
+                                          32768,
+                                          32769,
+                                          65536,
+                                          262144,
+                                          1048576};
+  for (const torch::ScalarType source_dtype :
+       {torch::kFloat32, torch::kBFloat16}) {
+    for (const torch::ScalarType cache_dtype :
+         {torch::kFloat32, torch::kBFloat16}) {
+      for (const int64_t width : widths) {
+        SCOPED_TRACE(static_cast<int32_t>(source_dtype));
+        SCOPED_TRACE(static_cast<int32_t>(cache_dtype));
+        SCOPED_TRACE(width);
+        const auto source_options =
+            torch::TensorOptions().device(device).dtype(source_dtype);
+        const auto cache_options = source_options.dtype(cache_dtype);
+        torch::Tensor source_storage =
+            torch::full({kRows + 2, width + 37}, -91.0, source_options);
+        torch::Tensor source =
+            source_storage.narrow(/*dim=*/0, /*start=*/1, kRows)
+                .narrow(/*dim=*/1, /*start=*/0, width);
+        torch::Tensor actual_storage =
+            torch::full({kSlots + 2, width + 53}, -123.0, cache_options);
+        torch::Tensor expected_storage = actual_storage.clone();
+        torch::Tensor actual =
+            actual_storage.narrow(/*dim=*/0, /*start=*/1, kSlots)
+                .narrow(/*dim=*/1, /*start=*/0, width);
+        torch::Tensor expected =
+            expected_storage.narrow(/*dim=*/0, /*start=*/1, kSlots)
+                .narrow(/*dim=*/1, /*start=*/0, width);
+        for (const bool skipped_slots : {false, true}) {
+          SCOPED_TRACE(skipped_slots);
+          const torch::Tensor indices_cpu =
+              skipped_slots
+                  ? torch::tensor({0, -1, 17, 19, 8, 3, 16}, torch::kInt32)
+                  : torch::tensor({1, 5, 7, 12, 8, 3, 16}, torch::kInt32);
+          const torch::Tensor indices = indices_cpu.to(device);
+          const torch::Tensor valid =
+              (indices_cpu > 0) & (indices_cpu < kSlots);
+          const torch::Tensor valid_rows =
+              torch::nonzero(valid).flatten().to(device);
+          const torch::Tensor valid_indices =
+              indices_cpu.index({valid}).to(device);
+          for (const bool special_values : {false, true}) {
+            SCOPED_TRACE(special_values);
+            const torch::Tensor values = make_writeback_source(
+                kRows, width, source_dtype, special_values);
+            source.copy_(values.to(device));
+            const torch::Tensor source_before = source_storage.cpu();
+            torch::Tensor golden_storage = expected_storage.cpu();
+            torch::Tensor golden =
+                golden_storage.narrow(/*dim=*/0, /*start=*/1, kSlots)
+                    .narrow(/*dim=*/1, /*start=*/0, width);
+            golden.index_put_({valid_indices.cpu()},
+                              values.index_select(/*dim=*/0, valid_rows.cpu())
+                                  .to(cache_dtype));
+            expected.index_put_(
+                {valid_indices},
+                source.index_select(/*dim=*/0, valid_rows).to(cache_dtype));
+            kernel::mlu::bangc::kda_state_writeback(source, actual, indices);
+            // MLU casts canonicalize NaNs differently from CPU casts.
+            if (source_dtype == cache_dtype || !special_values) {
+              EXPECT_TRUE(
+                  writeback_bytes_equal(actual_storage, golden_storage));
+            }
+            EXPECT_TRUE(
+                writeback_bytes_equal(actual_storage, expected_storage));
+            EXPECT_TRUE(writeback_bytes_equal(source_storage, source_before));
+            EXPECT_TRUE(writeback_bytes_equal(indices, indices_cpu));
+          }
+        }
+        const torch::Tensor empty_indices =
+            torch::empty({0}, source_options.dtype(torch::kInt32));
+        const torch::Tensor cache_before = actual_storage.cpu();
+        kernel::mlu::bangc::kda_state_writeback(
+            source.narrow(/*dim=*/0, /*start=*/0, /*length=*/0),
+            actual,
+            empty_indices);
+        EXPECT_TRUE(writeback_bytes_equal(actual_storage, cache_before));
+      }
+    }
+  }
+}
+
+TEST(Glm5NextKDAWritebackTest, ChangedInputsReplayOnCurrentStream) {
+  const torch::InferenceMode inference_guard;
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  const torch::DeviceGuard device_guard(device);
+  for (const torch::ScalarType source_dtype :
+       {torch::kFloat32, torch::kBFloat16}) {
+    for (const torch::ScalarType cache_dtype :
+         {torch::kFloat32, torch::kBFloat16}) {
+      SCOPED_TRACE(static_cast<int32_t>(source_dtype));
+      SCOPED_TRACE(static_cast<int32_t>(cache_dtype));
+      const auto options =
+          torch::TensorOptions().device(device).dtype(source_dtype);
+      const auto ints = options.dtype(torch::kInt32);
+      for (const auto& [rows, width] :
+           std::array<std::pair<int64_t, int64_t>, 4>{
+               {{1, 16385}, {2, 131073}, {16, 16385}, {33, 16385}}}) {
+        SCOPED_TRACE(rows);
+        SCOPED_TRACE(width);
+        torch_mlu::mlu::MLUStreamGuard stream(torch_mlu::getStreamFromPool(
+            /*isHighPriority=*/false, /*device=*/0));
+        torch::Tensor source = torch::randn({rows, width}, options);
+        torch::Tensor actual =
+            torch::full({rows + 5, width}, -123.0, options.dtype(cache_dtype));
+        torch::Tensor expected = actual.clone();
+        torch::Tensor indices = torch::arange(1, rows + 1, ints);
+        kernel::mlu::bangc::kda_state_writeback(source, actual, indices);
+        expected.index_put_({indices}, source.to(cache_dtype));
+        EXPECT_TRUE(writeback_bytes_equal(actual, expected));
+        torch_mlu::MLUGraph graph;
+        graph.capture_begin();
+        kernel::mlu::bangc::kda_state_writeback(source, actual, indices);
+        graph.capture_end();
+        for (int32_t round = 0; round < 4; ++round) {
+          source.normal_();
+          indices.copy_(torch::arange(1, rows + 1, ints) + round);
+          expected.index_put_({indices}, source.to(cache_dtype));
+          graph.replay();
+          const torch::Tensor consumer = actual.clone();
+          EXPECT_TRUE(writeback_bytes_equal(consumer, expected));
+        }
+      }
+    }
+  }
 }
 
 TEST(Glm5NextKDATest, DistinctPrefillStatesMatchRestoreCopyAndContinueDecode) {
@@ -1710,6 +1923,149 @@ TEST(Glm5NextKDATest, NonInplaceDecodeReturnsEveryStateAcrossTokenWindows) {
       actual_output, expected_output, /*rtol=*/3e-2, /*atol=*/2e-2));
   EXPECT_TRUE(test::scaled_close(
       actual_states, expected_states, /*rtol=*/3e-2, /*atol=*/2e-2));
+}
+
+// Graph capture runs an eager warmup and then the captured forward against the
+// same AttentionMetadata object. The slot derivation must therefore happen
+// inside every forward (never be carried over from a previous one), so replay
+// follows the executor's in-place refresh of linear_state_indices instead of
+// warmup-time slots.
+TEST(Glm5NextKDATest, GraphReplayFollowsRefreshedStateSlots) {
+  torch::InferenceMode guard;
+  torch::manual_seed(/*seed=*/20261112);
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  const torch::DeviceGuard device_guard(device);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto ints = options.dtype(torch::kInt32);
+  test::MockProcessGroup group(device);
+  ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &group);
+  parallel.tp_group_ = &group;
+  ModelArgs args;
+  args.hidden_size(128)
+      .linear_num_key_heads(8)
+      .linear_num_value_heads(8)
+      .linear_key_head_dim(128)
+      .linear_value_head_dim(128)
+      .linear_conv_kernel_dim(4)
+      .rms_norm_eps(1e-6);
+  Glm5NextKDA layer(args, QuantArgs(), parallel, options);
+  for (auto& parameter : layer->named_parameters()) {
+    parameter.value().normal_(0.0, 0.03);
+  }
+
+  const int64_t checkpoint_stride = 4;
+  const int64_t slots = 4;
+  const torch::Tensor conv_init =
+      torch::randn({slots, checkpoint_stride + 2, 3 * 8 * 128}, options);
+  const torch::Tensor ssm_init =
+      torch::randn({slots * checkpoint_stride, 8, 128, 128},
+                   options.dtype(torch::kFloat32)) *
+      0.03f;
+  KVCache graph_cache(
+      LinearAttentionKVCacheTensors{conv_init.clone(), ssm_init.clone()});
+  KVCache eager_cache(
+      LinearAttentionKVCacheTensors{conv_init.clone(), ssm_init.clone()});
+  auto reset_caches = [&]() {
+    graph_cache.get_conv_cache().copy_(conv_init);
+    graph_cache.get_ssm_cache().copy_(ssm_init);
+    eager_cache.get_conv_cache().copy_(conv_init);
+    eager_cache.get_ssm_cache().copy_(ssm_init);
+  };
+
+  // Graph-owned metadata keeps the captured derivation alive; eager references
+  // use their own metadata so they never free a tensor the graph still reads.
+  auto metadata = std::make_shared<AttentionMetadata>();
+  metadata->q_cu_seq_lens = torch::tensor({0, 1, 2}, ints);
+  AttentionMetadata eager_metadata{};
+  eager_metadata.q_cu_seq_lens = torch::tensor({0, 1, 2}, ints);
+
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.embedding.linear_state_ids = {1, 2};
+  params.embedding.linear_state_indices = torch::tensor({1, 2}, ints);
+  params.attn_metadata = metadata;
+  const torch::Tensor hidden = torch::randn({2, 128}, options);
+
+  // The model derives the shared slot indices once per forward, before the KDA
+  // layers run.
+  Glm5NextKDAImpl::prepare_state_indices(*metadata, params, graph_cache);
+  layer->forward(hidden, *metadata, graph_cache, params);
+
+  reset_caches();
+  torch_mlu::synchronize();
+  torch_mlu::MLUGraph graph;
+  torch::Tensor graph_output;
+  {
+    torch_mlu::mlu::MLUStreamGuard stream(
+        torch_mlu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0));
+    graph.capture_begin();
+    Glm5NextKDAImpl::prepare_state_indices(*metadata, params, graph_cache);
+    graph_output = layer->forward(hidden, *metadata, graph_cache, params);
+    graph.capture_end();
+  }
+  torch_mlu::synchronize();
+
+  // Capture runs the recorded work, but its outputs are only read back after a
+  // replay; replay the captured batch from the same starting state.
+  reset_caches();
+  graph.replay();
+  torch_mlu::synchronize();
+  const torch::Tensor expected_a =
+      layer->forward(hidden, eager_metadata, eager_cache, params);
+  EXPECT_TRUE(torch::allclose(graph_output, expected_a, 0.02, 0.002));
+  EXPECT_TRUE(torch::allclose(
+      graph_cache.get_ssm_cache(), eager_cache.get_ssm_cache(), 0.001, 0.0001));
+
+  // The executor refreshes the persistent slot buffer in place before replay.
+  torch_mlu::synchronize();
+  params.embedding.linear_state_indices.copy_(torch::tensor({2, 1}, ints));
+  params.embedding.linear_state_ids = {2, 1};
+  reset_caches();
+  const torch::Tensor expected_b =
+      layer->forward(hidden, eager_metadata, eager_cache, params);
+  torch_mlu::synchronize();
+  graph.replay();
+  torch_mlu::synchronize();
+  EXPECT_TRUE(torch::allclose(graph_output, expected_b, 0.02, 0.002));
+  EXPECT_TRUE(torch::allclose(
+      graph_cache.get_ssm_cache(), eager_cache.get_ssm_cache(), 0.001, 0.0001));
+  EXPECT_TRUE(torch::allclose(
+      graph_cache.get_conv_cache(), eager_cache.get_conv_cache(), 0.01, 0.001));
+}
+
+TEST(Glm5NextKDATest, PrepareStateIndicesDerivesSlotsPerForward) {
+  torch::InferenceMode guard;
+  const torch::Device device(torch::kPrivateUse1, /*index=*/0);
+  const torch::DeviceGuard device_guard(device);
+  const auto options =
+      torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  const auto ints = options.dtype(torch::kInt32);
+
+  const int64_t checkpoint_stride = 4;
+  const int64_t slots = 4;
+  KVCache cache(LinearAttentionKVCacheTensors{
+      torch::randn({slots, checkpoint_stride + 2, 3 * 8 * 128}, options),
+      torch::randn({slots * checkpoint_stride, 8, 128, 128},
+                   options.dtype(torch::kFloat32))});
+
+  AttentionMetadata metadata{};
+  metadata.q_cu_seq_lens = torch::tensor({0, 1, 2}, ints);
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.embedding.linear_state_ids = {1, 2};
+  params.embedding.linear_state_indices = torch::tensor({1, 2}, ints);
+
+  Glm5NextKDAImpl::prepare_state_indices(metadata, params, cache);
+  EXPECT_TRUE(torch::equal(metadata.derived_linear_state_indices,
+                           torch::tensor({4, 8}, ints)));
+
+  // A later forward rewrites the shared field instead of reusing old slots.
+  params.embedding.linear_state_indices.copy_(torch::tensor({2, 1}, ints));
+  params.embedding.linear_state_ids = {2, 1};
+  Glm5NextKDAImpl::prepare_state_indices(metadata, params, cache);
+  EXPECT_TRUE(torch::equal(metadata.derived_linear_state_indices,
+                           torch::tensor({8, 4}, ints)));
 }
 
 }  // namespace
