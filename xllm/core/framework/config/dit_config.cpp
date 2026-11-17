@@ -93,6 +93,11 @@ DEFINE_int64(
     "tail. 0 = disable (full sequence); >0 trades compute for lower peak "
     "activation memory.");
 
+DEFINE_int64(dit_h3_vae_max_window_clips,
+             8,
+             "MiniMax-H3 video VAE: maximum clips per global tile window; "
+             "must be positive.");
+
 DEFINE_bool(dit_enable_text_encoder,
             true,
             "JoyOV2/MiniMax-H3/Qwen-Image-2.1/QwenImageEditPlus: load the "
@@ -164,6 +169,7 @@ void DiTConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_vae_tiling);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_tail_chunk_frames);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_h3_vae_max_window_clips);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_text_encoder);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_sparse_attention_enabled);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_sparse_attention_sparsity);
@@ -194,6 +200,7 @@ void DiTConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_vae_tiling);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_tail_chunk_frames);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_h3_vae_max_window_clips);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_text_encoder);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_sparse_attention_enabled);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_sparse_attention_sparsity);
@@ -244,6 +251,8 @@ void DiTConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, dit_enable_vae_tiling);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_vae_tail_chunk_frames);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_h3_vae_max_window_clips);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_enable_text_encoder);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

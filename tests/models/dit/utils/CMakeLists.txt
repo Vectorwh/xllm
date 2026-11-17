@@ -19,3 +19,10 @@ cc_test(
     torch
     GTest::gtest_main
 )
+
+cc_test(
+  NAME minimax_h3_vae_tile_window_test
+  CPU_ONLY
+  SRCS minimax_h3_vae_tile_window_test.cpp
+  DEPS torch glog::glog GTest::gtest_main
+)

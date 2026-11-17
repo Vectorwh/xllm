@@ -60,6 +60,7 @@ class DiTConfig final {
          "dit_vae_dtype",
          "dit_enable_vae_tiling",
          "dit_vae_tail_chunk_frames",
+         "dit_h3_vae_max_window_clips",
          "dit_enable_text_encoder",
          "dit_sparse_attention_enabled",
          "dit_sparse_attention_sparsity",
@@ -108,6 +109,8 @@ class DiTConfig final {
   PROPERTY(bool, dit_enable_vae_tiling) = false;
 
   PROPERTY(int64_t, dit_vae_tail_chunk_frames) = 0;
+
+  PROPERTY(int64_t, dit_h3_vae_max_window_clips) = 8;
 
   PROPERTY(bool, dit_enable_text_encoder) = true;
 
