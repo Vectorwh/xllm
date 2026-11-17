@@ -28,11 +28,13 @@ limitations under the License.
 #endif
 
 #include <algorithm>
+#include <array>
 #include <barrier>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1593,6 +1595,92 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
+     RegistersAliasedLayerBuffersOnceWithLogicalLayerMappings) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP()
+        << "An accelerator is required to initialize the transfer engine.";
+  }
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0,
+      torch::Device(Platform::type_torch(), /*device_index=*/0));
+  RecordingMooncakeTransferEngine* observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(
+      0,
+      0,
+      torch::Device(Platform::type_torch(), /*device_index=*/0),
+      "glm_moe_dsa",
+      std::move(engine));
+  transfer.initialize(/*device_id=*/0);
+  ModelArgs args;
+  args.model_type("glm_moe_dsa")
+      .n_layers(5)
+      .n_heads(1)
+      .n_kv_heads(1)
+      .head_dim(4);
+  transfer.configure_cache_layout(make_args(0, 1, 1), args, 2, false);
+  std::vector<KVCache> caches;
+#if defined(USE_MLU) || defined(USE_ILU)
+  const std::vector<int64_t> slot_shape = {4, 1, 2, 4};
+#else
+  const std::vector<int64_t> slot_shape = {4, 2, 1, 4};
+#endif
+  const std::vector<KVCacheTensors> slots{
+      {torch::zeros(slot_shape), torch::zeros(slot_shape)},
+      {torch::zeros(slot_shape), torch::zeros(slot_shape)}};
+  for (int64_t layer = 0; layer < 5; ++layer) {
+    caches.emplace_back(slots[static_cast<size_t>(layer % 2)]);
+  }
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+  ASSERT_EQ(observer->registered_addrs.size(), 1U);
+  ASSERT_EQ(observer->registered_addrs[0].size(), 4U);
+  const WorkerCacheLayoutManifest source = published_layout();
+  ASSERT_EQ(source.tensors.size(), 10U);
+  for (int64_t layer = 0; layer < 5; ++layer) {
+    for (int64_t role = 0; role < 2; ++role) {
+      const CacheTensorManifest& tensor =
+          source.tensors[static_cast<size_t>(2 * layer + role)];
+      EXPECT_EQ(tensor.layer_id, layer);
+      EXPECT_EQ(tensor.mooncake_buffer_id, 2 * (layer % 2) + role);
+      EXPECT_EQ(observer->registered_addrs[0][static_cast<size_t>(
+                    tensor.mooncake_buffer_id)],
+                role == 0 ? caches[layer].get_k_cache().data_ptr()
+                          : caches[layer].get_v_cache().data_ptr());
+    }
+  }
+  WorkerCacheLayoutManifest destination = source;
+  destination.addr = "decode-independent-layers";
+  destination.incarnation_id += "-decode";
+  ++destination.cluster_id;
+  for (size_t index = 0; index < destination.tensors.size(); ++index) {
+    destination.tensors[index].mooncake_buffer_id = static_cast<int64_t>(index);
+  }
+  ReshardPlanTemplate plan;
+  ASSERT_TRUE(
+      ReshardPlanner().build_outgoing_plan(source, destination, &plan).ok());
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.local_ids = {1};
+  mapping.remote_ids = {2};
+  for (int64_t layer = 0; layer < 5; ++layer) {
+    std::vector<ByteRegion> regions;
+    ASSERT_TRUE(
+        RequestRegionBinder()
+            .bind(plan, {mapping}, CacheNamespace::MAIN, layer, &regions)
+            .ok());
+    std::array<uint64_t, 2> bytes{};
+    for (const ByteRegion& region : regions) {
+      const uint64_t role = region.remote_buffer_id - 2 * layer;
+      ASSERT_LT(role, 2U);
+      EXPECT_EQ(region.local_buffer_id, 2 * (layer % 2) + role);
+      EXPECT_EQ(region.remote_offset - region.local_offset, 32U);
+      bytes[role] += region.length;
+    }
+    EXPECT_EQ(bytes[0], 32U);
+    EXPECT_EQ(bytes[1], 32U);
+  }
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
      RegistersCheckpointedSsmAsLogicalSequenceSlots) {
   if (Platform::device_count() < 1) {
     GTEST_SKIP()
@@ -2740,11 +2828,18 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                                /*world_size=*/1,
                                                /*dp_size=*/1);
   std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
+  std::promise<bool> completion;
+  transfer.set_push_completion_callback(
+      [&completion](std::optional<int64_t> layer, bool success) {
+        EXPECT_FALSE(layer.has_value());
+        completion.set_value(success);
+      });
 
   folly::SemiFuture<std::vector<KVTransferTaskResult>> future =
       transfer.push_kv_blocks_async(
           {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
   EXPECT_FALSE(std::move(future).get().empty());
+  EXPECT_TRUE(completion.get_future().get());
   EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 

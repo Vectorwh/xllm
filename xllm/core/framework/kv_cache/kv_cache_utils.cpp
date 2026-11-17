@@ -493,9 +493,7 @@ HostPageAlignedRegion::HostPageAlignedRegion(size_t bytes) {
   base_ptr = mlu_region_->data();
   total_bytes = mlu_region_->size();
 #else
-  const int64_t system_page_size = sysconf(_SC_PAGESIZE);
-  CHECK_GT(system_page_size, 0) << "Failed to query system page size.";
-  const size_t page_size = static_cast<size_t>(system_page_size);
+  const size_t page_size = static_cast<size_t>(host_page_size());
   CHECK_LE(bytes, std::numeric_limits<size_t>::max() - (page_size - 1))
       << "Host region byte count overflows page rounding: bytes=" << bytes
       << ", page_size=" << page_size;

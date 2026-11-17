@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 #include <torch/torch.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -174,6 +175,13 @@ struct KVCacheTensor {
 
 using BlockTypeTensorMap = std::map<KVCacheTensorRole::Value, torch::Tensor>;
 
+// Page size used to round HostPageAlignedRegion allocations.
+inline int64_t host_page_size() {
+  const int64_t page_size = sysconf(_SC_PAGESIZE);
+  CHECK_GT(page_size, 0) << "Failed to query system page size.";
+  return page_size;
+}
+
 struct HostPageAlignedRegion {
   void* base_ptr = nullptr;
   size_t total_bytes = 0;
@@ -215,6 +223,33 @@ bool is_linear_attention_layer(
 
 // Whether NPU KV cache should use FRACTAL_NZ layout for a model type.
 bool use_npu_nz_kv_cache_layout(const std::string& model_type);
+
+// Per-physical-slot index-cache requirement for a round-robin pool shared by
+// `layers` logical layers. A slot owns index tensors when any layer mapped to
+// it does; both the capacity estimate and the worker allocation must derive
+// this union from the same rule.
+inline std::vector<char> index_slots_for_round_robin_buffers(
+    int64_t layers,
+    int32_t buffers,
+    bool has_index_cache,
+    const std::vector<bool>& indexer_layer_mask) {
+  CHECK_GT(layers, 0);
+  CHECK_GT(buffers, 0);
+  CHECK_LE(buffers, layers);
+  CHECK(indexer_layer_mask.empty() ||
+        indexer_layer_mask.size() == static_cast<size_t>(layers));
+  std::vector<char> slots(static_cast<size_t>(buffers), 0);
+  if (!has_index_cache) {
+    return slots;
+  }
+  for (int64_t layer = 0; layer < layers; ++layer) {
+    if (indexer_layer_mask.empty() ||
+        indexer_layer_mask[static_cast<size_t>(layer)]) {
+      slots[static_cast<size_t>(layer % buffers)] = 1;
+    }
+  }
+  return slots;
+}
 
 KVCacheTensors create_kv_cache_tensors(
     const KVCacheShape& kv_cache_shape,

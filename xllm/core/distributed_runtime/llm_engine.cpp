@@ -488,6 +488,40 @@ int64_t LLMEngine::get_effective_xtensor_weight_size(
 }
 
 KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
+  const KVCacheConfig& cache_config = KVCacheConfig::get_instance();
+  const int32_t prefill_buffers = cache_config.prefill_layerwise_num_buffers();
+  cache_config.validate_prefill_layerwise_worker_mode(options_.backend(),
+                                                      options_.task_type());
+  if (prefill_buffers > 0) {
+    CHECK(Platform::is_npu()) << "Prefill layerwise offload requires NPU.";
+    CHECK_EQ(options_.npu_kernel_backend(), "TORCH")
+        << "Prefill layerwise offload currently supports only the TORCH "
+           "kernel backend; ATB has no model TP group to prepare KV over.";
+    CHECK(options_.enable_disagg_pd() &&
+          options_.instance_role() == InstanceRole::PREFILL)
+        << "Prefill layerwise offload requires a disaggregated PREFILL "
+           "instance.";
+    CHECK_EQ(options_.kv_cache_transfer_mode(), "PUSH")
+        << "Prefill layerwise offload currently requires PD PUSH.";
+    CHECK(!options_.enable_graph())
+        << "Prefill layerwise offload requires eager execution.";
+    CHECK_EQ(options_.cp_size(), 1);
+    CHECK_EQ(ParallelConfig::get_instance().layerwise_split_size(), 1);
+    CHECK_LE(ParallelConfig::get_instance().kv_split_size(), 1);
+    CHECK(!options_.enable_speculative_decode());
+    CHECK(!options_.is_draft_engine());
+    CHECK(!options_.enable_sleep_mode());
+    CHECK(!options_.enable_pd_ooc());
+    CHECK(!cache_config.enable_xtensor());
+    CHECK(!options_.enable_kvcache_store() &&
+          options_.host_blocks_factor() <= 1.0)
+        << "Prefill layerwise offload owns its Host data; Host/Store hierarchy "
+           "cannot be combined.";
+    CHECK_EQ(options_.kv_cache_dtype(), "auto");
+    CHECK_EQ(args_.model_type(), "glm_moe_dsa")
+        << "Prefill layerwise offload currently supports glm_moe_dsa only.";
+    CHECK_LE(prefill_buffers, args_.n_layers());
+  }
   const int64_t max_cache_size = options_.max_cache_size();
   const double max_memory_utilization = options_.max_memory_utilization();
 
@@ -572,6 +606,9 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   estimate_options.enable_prefix_cache = options_.enable_prefix_cache();
   estimate_options.enable_disagg_pd = options_.enable_disagg_pd();
   estimate_options.instance_role = options_.instance_role();
+  estimate_options.prefill_layerwise_num_buffers = prefill_buffers;
+  estimate_options.prefill_layerwise_host_memory_bytes =
+      cache_config.prefill_layerwise_host_memory_bytes();
   estimate_options.dp_size = options_.dp_size();
   estimate_options.enable_dp_fair_token_budget =
       ::xllm::SchedulerConfig::get_instance().enable_dp_fair_token_budget();

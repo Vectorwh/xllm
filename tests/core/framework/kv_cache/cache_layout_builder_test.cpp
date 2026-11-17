@@ -17,16 +17,287 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <future>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_shard_layout.h"
+#include "framework/kv_cache/prefill_layerwise_kv_cache.h"
+#include "framework/model/model_input_params.h"
+#include "framework/parallel_state/process_group.h"
 #include "layers/common/kv_shard_batch_metadata.h"
 
 namespace xllm {
 
 namespace {
+
+class PreparationProcessGroup final : public ProcessGroup {
+ public:
+  PreparationProcessGroup(int32_t rank, bool peer_prepared)
+      : ProcessGroup(rank, /*world_size=*/2, torch::Device(torch::kCPU)),
+        peer_prepared_(peer_prepared) {}
+
+  torch::Tensor allgather_base_sync(const torch::Tensor& input) override {
+    ++allgather_count_;
+    const torch::Tensor peer =
+        torch::full_like(input, static_cast<int64_t>(peer_prepared_));
+    return rank() == 0 ? torch::cat({input, peer}) : torch::cat({peer, input});
+  }
+
+  void peer_prepared(bool value) { peer_prepared_ = value; }
+  int32_t allgather_count() const { return allgather_count_; }
+
+ private:
+  bool peer_prepared_;
+  int32_t allgather_count_ = 0;
+};
+
+TEST(CacheLayoutBuilderTest,
+     PrefillPreparationRejectsEveryRankAndPreservesHostHistory) {
+  proto::KVCacheShape proto_shape;
+  for (int64_t dim : {4, 2, 1, 8}) {
+    proto_shape.add_key_cache_shape(dim);
+  }
+  const KVCacheShape shape = KVCacheShape::from_proto(proto_shape);
+  KVCacheCreateOptions options;
+  options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kFloat32)
+      .num_layers(2);
+  std::array<std::vector<KVCache>, 2> caches;
+  std::array<std::unique_ptr<PrefillLayerwiseKVCache>, 2> owners;
+  for (int32_t rank = 0; rank < 2; ++rank) {
+    owners[rank] =
+        std::make_unique<PrefillLayerwiseKVCache>(shape,
+                                                  options,
+                                                  /*num_buffers=*/1,
+                                                  /*host_memory_bytes=*/4096,
+                                                  caches[rank]);
+    for (int32_t layer = 0; layer < 2; ++layer) {
+      owners[rank]->host_caches()[layer].get_k_cache().fill_(rank * 10 + layer);
+    }
+  }
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  params.attention.host.block_tables = torch::tensor({{1}}, torch::kInt32);
+  params.attention.host.kv_seq_lens = {2};
+  params.attention.host.q_seq_lens = {1};
+  ModelInputParams invalid = params;
+  invalid.attention.host.block_tables = torch::tensor({{-1}}, torch::kInt32);
+  PreparationProcessGroup rank0_group(/*rank=*/0, /*peer_prepared=*/true);
+  PreparationProcessGroup rank1_group(/*rank=*/1, /*peer_prepared=*/false);
+  std::array<PreparationProcessGroup*, 2> groups{&rank0_group, &rank1_group};
+
+  ASSERT_FALSE(owners[0]->begin(invalid,
+                                /*block_size=*/2,
+                                /*compute_stream=*/nullptr,
+                                /*expect_push=*/true,
+                                groups[0]));
+  ASSERT_FALSE(owners[1]->begin(params,
+                                /*block_size=*/2,
+                                /*compute_stream=*/nullptr,
+                                /*expect_push=*/true,
+                                groups[1]));
+  for (int32_t rank = 0; rank < 2; ++rank) {
+    EXPECT_EQ(groups[rank]->allgather_count(), 1);
+    for (int32_t layer = 0; layer < 2; ++layer) {
+      EXPECT_TRUE(owners[rank]
+                      ->host_caches()[layer]
+                      .get_k_cache()
+                      .eq(rank * 10 + layer)
+                      .all()
+                      .item<bool>());
+    }
+    groups[rank]->peer_prepared(true);
+    ASSERT_TRUE(owners[rank]->begin(params,
+                                    /*block_size=*/2,
+                                    /*compute_stream=*/nullptr,
+                                    /*expect_push=*/false,
+                                    groups[rank]));
+    EXPECT_EQ(groups[rank]->allgather_count(), 2);
+    for (int32_t layer = 0; layer < 2; ++layer) {
+      ASSERT_TRUE(owners[rank]->synchronize_layer(layer));
+      EXPECT_TRUE(caches[rank][layer]
+                      .get_k_cache()[1]
+                      .eq(rank * 10 + layer)
+                      .all()
+                      .item<bool>());
+    }
+    ASSERT_TRUE(owners[rank]->finish());
+  }
+}
+
+TEST(CacheLayoutBuilderTest,
+     PrefillLayerwiseBuffersPreservePrefixAndChunkHistory) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  // Exercise the production cache owner on CPU. B=1, B=2 and B=N cover a
+  // serial reusable slot, pipelined slots and the independent-buffer control.
+  for (int32_t buffers : {1, 2, 5}) {
+    proto::KVCacheShape proto_shape;
+    for (int64_t dim : {6, 4, 1, 8}) {
+      proto_shape.add_key_cache_shape(dim);
+      proto_shape.add_value_cache_shape(dim);
+    }
+    for (int64_t dim : {6, 4, 1, 4}) {
+      proto_shape.add_index_cache_shape(dim);
+    }
+    for (int64_t dim : {6, 4, 1, 1}) {
+      proto_shape.add_index_cache_scale_shape(dim);
+    }
+    const KVCacheShape shape = KVCacheShape::from_proto(proto_shape);
+    KVCacheCreateOptions options;
+    options.device(torch::Device(torch::kCPU))
+        .dtype(torch::kFloat32)
+        .num_layers(5)
+        .enable_lighting_indexer(true)
+        .enable_indexer_cache_quant(true);
+    std::vector<KVCache> caches;
+    PrefillLayerwiseKVCache offload(shape,
+                                    options,
+                                    buffers,
+                                    /*host_memory_bytes=*/1024 * 1024,
+                                    caches);
+    ASSERT_EQ(caches.size(), 5);
+    EXPECT_EQ(offload.device_bytes() * 5, offload.host_bytes() * buffers);
+    if (buffers < 5) {
+      EXPECT_EQ(caches[0].get_k_cache().data_ptr(),
+                caches[buffers].get_k_cache().data_ptr());
+      EXPECT_EQ(caches[0].get_index_cache().data_ptr(),
+                caches[buffers].get_index_cache().data_ptr());
+      EXPECT_NE(offload.host_caches()[0].get_k_cache().data_ptr(),
+                offload.host_caches()[buffers].get_k_cache().data_ptr());
+    }
+    const std::vector<int64_t> blocks{1, 3};
+    ModelInputParams params;
+    params.meta.batch_forward_type = BatchForwardType::PREFILL;
+    params.attention.host.block_tables = torch::tensor({{1, 3}}, torch::kInt32);
+    params.attention.host.kv_seq_lens = {6};
+    params.attention.host.q_seq_lens = {6};
+    for (int64_t layer = 0; layer < 5; ++layer) {
+      offload.host_caches()[layer].get_k_cache()[1].fill_(7);
+    }
+    ASSERT_TRUE(
+        offload.begin(params, /*block_size=*/4, /*compute_stream=*/nullptr));
+    // A fresh sequence has no prefix rows, so its whole read set is skipped
+    // even though every block is a write block.
+    for (int64_t layer = 0; layer < 5; ++layer) {
+      EXPECT_TRUE(caches[layer].get_k_cache()[1].eq(0).all().item<bool>());
+    }
+    for (int64_t layer = 0; layer < 5; ++layer) {
+      ASSERT_TRUE(offload.synchronize_layer(layer));
+      for (const KVCacheTensor& tensor : caches[layer].get_cache_tensors()) {
+        tensor.tensor[1].fill_(layer + 1);
+        tensor.tensor[3].fill_(layer + 11);
+      }
+    }
+    ASSERT_TRUE(offload.finish());
+    // A prefix hit needs every layer reloaded even though the scheduler still
+    // calls these Device-tier blocks. The second chunk writes only block 3;
+    // the old boundary-page entries and full block 1 must survive.
+    params.attention.host.kv_seq_lens = {8};
+    params.attention.host.q_seq_lens = {2};
+    ASSERT_TRUE(
+        offload.begin(params, /*block_size=*/4, /*compute_stream=*/nullptr));
+    for (int64_t layer = 0; layer < 5; ++layer) {
+      ASSERT_TRUE(offload.synchronize_layer(layer));
+      for (const KVCacheTensor& tensor : caches[layer].get_cache_tensors()) {
+        EXPECT_TRUE(tensor.tensor[1].eq(layer + 1).all().item<bool>());
+        EXPECT_TRUE(tensor.tensor[3].eq(layer + 11).all().item<bool>());
+        tensor.tensor[3].slice(/*dim=*/0, /*start=*/2).fill_(layer + 21);
+      }
+    }
+    ASSERT_TRUE(offload.finish());
+    for (int64_t layer = 0; layer < 5; ++layer) {
+      for (const KVCacheTensor& tensor :
+           offload.host_caches()[layer].get_cache_tensors()) {
+        EXPECT_TRUE(tensor.tensor[1].eq(layer + 1).all().item<bool>());
+        EXPECT_TRUE(
+            tensor.tensor[3].slice(0, 0, 2).eq(layer + 11).all().item<bool>());
+        EXPECT_TRUE(
+            tensor.tensor[3].slice(0, 2).eq(layer + 21).all().item<bool>());
+        EXPECT_TRUE(tensor.tensor[5].eq(0).all().item<bool>());
+      }
+    }
+    // Invalid ids fail before any DMA or cache-state mutation. A following
+    // valid batch can still run and read the previous chunks intact.
+    EXPECT_FALSE(offload.begin({6}, {6}, /*compute_stream=*/nullptr));
+    EXPECT_FALSE(offload.begin({1}, {-1}, /*compute_stream=*/nullptr));
+    params.block_copy.swap_blocks.emplace_back(1, 3);
+    EXPECT_FALSE(
+        offload.begin(params, /*block_size=*/4, /*compute_stream=*/nullptr));
+    params.block_copy.swap_blocks.clear();
+    params.attention.host.kv_seq_lens = {9};
+    EXPECT_FALSE(
+        offload.begin(params, /*block_size=*/4, /*compute_stream=*/nullptr));
+    params.attention.host.kv_seq_lens = {8};
+    ASSERT_TRUE(offload.begin(blocks, {}, /*compute_stream=*/nullptr));
+    for (int64_t layer = 0; layer < 5; ++layer) {
+      ASSERT_TRUE(offload.synchronize_layer(layer));
+      EXPECT_TRUE(caches[layer]
+                      .get_k_cache()[3]
+                      .slice(0, 2)
+                      .eq(layer + 21)
+                      .all()
+                      .item<bool>());
+    }
+    ASSERT_TRUE(offload.finish());
+    // A PUSH reader keeps old slots alive. Already-loaded layers must still
+    // advance; only the layer that needs an occupied slot waits for its send.
+    ASSERT_TRUE(offload.begin(blocks,
+                              {},
+                              /*compute_stream=*/nullptr,
+                              /*expect_push=*/true));
+    for (int64_t layer = 0; layer < buffers; ++layer) {
+      ASSERT_TRUE(offload.synchronize_layer(layer));
+    }
+    if (buffers < 5) {
+      auto next_layer = std::async(std::launch::async, [&]() {
+        return offload.synchronize_layer(buffers);
+      });
+      EXPECT_EQ(next_layer.wait_for(std::chrono::milliseconds(100)),
+                std::future_status::timeout);
+      EXPECT_TRUE(caches[0].get_k_cache()[1].eq(1).all().item<bool>());
+      offload.notify_push_completion(0, true);
+      ASSERT_TRUE(next_layer.get());
+      EXPECT_TRUE(
+          caches[buffers].get_k_cache()[1].eq(buffers + 1).all().item<bool>());
+      for (int64_t layer = buffers + 1; layer < 5; ++layer) {
+        offload.notify_push_completion(layer - buffers, true);
+        ASSERT_TRUE(offload.synchronize_layer(layer));
+      }
+    }
+    auto pushed =
+        std::async(std::launch::async, [&]() { return offload.finish(); });
+    EXPECT_EQ(pushed.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    offload.notify_push_completion(std::nullopt, true);
+    ASSERT_TRUE(pushed.get());
+
+    // Sender failure must release the waiter without allowing any slot reuse
+    // or another batch on this owner, even if local D2H has already completed.
+    ASSERT_TRUE(offload.begin(blocks,
+                              {},
+                              /*compute_stream=*/nullptr,
+                              /*expect_push=*/true));
+    for (int64_t layer = 0; layer < buffers; ++layer) {
+      ASSERT_TRUE(offload.synchronize_layer(layer));
+    }
+    auto failed_push = std::async(std::launch::async, [&]() {
+      return buffers < 5 ? offload.synchronize_layer(buffers)
+                         : offload.finish();
+    });
+    EXPECT_EQ(failed_push.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    offload.notify_push_completion(std::nullopt, false);
+    EXPECT_FALSE(failed_push.get());
+    EXPECT_DEATH(offload.begin(blocks, {}, /*compute_stream=*/nullptr),
+                 "failed and cannot be reused");
+  }
+}
 
 TEST(CacheLayoutBuilderTest, DescribesTokenMajorGqaHeads) {
   CacheTensorLayoutContext context;

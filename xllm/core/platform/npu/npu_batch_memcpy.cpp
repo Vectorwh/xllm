@@ -46,19 +46,29 @@ void NPUBatchMemcpy::init(int32_t device_id) {
 bool NPUBatchMemcpy::submit_h2d(const std::vector<torch::Tensor>& src_tensors,
                                 const std::vector<torch::Tensor>& dst_tensors,
                                 Stream* stream) {
-  return copy(src_tensors, dst_tensors, h2d_attr_, stream);
+  return copy(
+      src_tensors, dst_tensors, h2d_attr_, stream, submit_asynchronously_);
 }
 
 bool NPUBatchMemcpy::copy_d2h(const std::vector<torch::Tensor>& src_tensors,
                               const std::vector<torch::Tensor>& dst_tensors,
                               Stream* stream) {
-  return copy(src_tensors, dst_tensors, d2h_attr_, stream);
+  return copy(
+      src_tensors, dst_tensors, d2h_attr_, stream, /*asynchronous=*/false);
+}
+
+bool NPUBatchMemcpy::submit_d2h(const std::vector<torch::Tensor>& src_tensors,
+                                const std::vector<torch::Tensor>& dst_tensors,
+                                Stream* stream) {
+  return copy(
+      src_tensors, dst_tensors, d2h_attr_, stream, submit_asynchronously_);
 }
 
 bool NPUBatchMemcpy::copy(const std::vector<torch::Tensor>& src_tensors,
                           const std::vector<torch::Tensor>& dst_tensors,
                           const aclrtMemcpyBatchAttr& attr,
-                          Stream* stream) {
+                          Stream* stream,
+                          bool asynchronous) {
   CHECK(initialized_) << "NPUBatchMemcpy not initialized.";
   CHECK(stream != nullptr) << "Stream must not be null.";
   CHECK_EQ(src_tensors.size(), dst_tensors.size())
@@ -77,8 +87,8 @@ bool NPUBatchMemcpy::copy(const std::vector<torch::Tensor>& src_tensors,
 
   // aclrtMemcpyBatch caps a single call at kMaxBatchCopyCount descriptors, so a
   // large transfer (e.g. a many-block prefix reload) is split into fixed-size
-  // chunks issued onto the same stream in order. The stream is synchronized
-  // once after all chunks are enqueued rather than per chunk.
+  // chunks issued onto the same stream in order. Synchronous copies drain once
+  // at the end; submit-only callers own the completion/lifetime fence.
   std::vector<void*> srcs;
   std::vector<void*> dsts;
   std::vector<size_t> sizes;
@@ -98,26 +108,49 @@ bool NPUBatchMemcpy::copy(const std::vector<torch::Tensor>& src_tensors,
     }
 
     size_t fail_index = SIZE_MAX;
-    aclError ret = aclrtMemcpyBatch(dsts.data(),
-                                    sizes.data(),
-                                    srcs.data(),
-                                    sizes.data(),
-                                    chunk,
-                                    attrs,
-                                    attrs_indexes,
-                                    /*attrsCount=*/1,
-                                    &fail_index);
+    const auto submit = [&](bool async) {
+      if (async) {
+        return aclrtMemcpyBatchAsync(dsts.data(),
+                                     sizes.data(),
+                                     srcs.data(),
+                                     sizes.data(),
+                                     chunk,
+                                     attrs,
+                                     attrs_indexes,
+                                     /*attrsCount=*/1,
+                                     &fail_index,
+                                     stream->get_stream()->stream());
+      }
+      return aclrtMemcpyBatch(dsts.data(),
+                              sizes.data(),
+                              srcs.data(),
+                              sizes.data(),
+                              chunk,
+                              attrs,
+                              attrs_indexes,
+                              /*attrsCount=*/1,
+                              &fail_index);
+    };
+    const aclError ret = submit(asynchronous);
     if (ret != ACL_SUCCESS || fail_index != SIZE_MAX) {
       // fail_index is chunk-local; report the position within the full batch.
       LOG(ERROR) << "aclrtMemcpyBatch failed: ret=" << ret << ", fail_index="
                  << (fail_index == SIZE_MAX ? fail_index : offset + fail_index);
+      // An earlier chunk may already be in flight. Returning false without
+      // draining it would let callers free or reuse live DMA buffers.
+      CHECK_EQ(stream->synchronize(), 0)
+          << "Cannot drain a failed NPU batch copy; DMA lifetime is unknown.";
       return false;
     }
   }
 
-  if (stream->synchronize() != 0) {
-    LOG(ERROR) << "BatchMemcpy stream synchronize timeout.";
-    return false;
+  if (!asynchronous) {
+    // A synchronous caller returns its source/destination buffers to normal
+    // ownership immediately. If completion cannot be established, an in-flight
+    // DMA may still touch them, so this cannot be reported as a request error.
+    CHECK_EQ(stream->synchronize(), 0)
+        << "Cannot establish synchronous NPU copy completion; DMA lifetime is "
+           "unknown.";
   }
 
   return true;

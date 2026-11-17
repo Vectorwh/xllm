@@ -39,6 +39,9 @@ class KVCacheConfig final {
   void append_config_json(nlohmann::ordered_json& config_json) const;
   void initialize();
   void validate() const;
+  // Called after the backend is resolved, before estimating or allocating KV.
+  void validate_prefill_layerwise_worker_mode(const std::string& backend,
+                                              const std::string& task) const;
 
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {
@@ -50,6 +53,8 @@ class KVCacheConfig final {
          "indexer_cache_dtype",
          "enable_prefix_cache",
          "enable_in_batch_prefix_cache",
+         "prefill_layerwise_num_buffers",
+         "prefill_layerwise_host_memory_gb",
          "max_linear_state_cache_slots",
          "xxh3_128bits_seed",
          "enable_xtensor",
@@ -74,6 +79,16 @@ class KVCacheConfig final {
   PROPERTY(bool, enable_prefix_cache) = true;
 
   PROPERTY(bool, enable_in_batch_prefix_cache) = false;
+
+  // Zero preserves the ordinary per-layer Device cache allocation.
+  PROPERTY(int32_t, prefill_layerwise_num_buffers) = 0;
+
+  PROPERTY(double, prefill_layerwise_host_memory_gb) = 8.0;
+
+  [[nodiscard]] int64_t prefill_layerwise_host_memory_bytes() const {
+    return static_cast<int64_t>(prefill_layerwise_host_memory_gb() * 1024 *
+                                1024 * 1024);
+  }
 
   PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 

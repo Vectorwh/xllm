@@ -33,6 +33,7 @@ limitations under the License.
 #endif
 #include "framework/eplb/eplb_executor.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache/prefill_layerwise_kv_cache.h"
 #include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
 #include "framework/kv_cache_transfer/kv_cache_store.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
@@ -494,6 +495,9 @@ class WorkerImpl {
 
   // kv caches
   std::vector<xllm::KVCache> kv_caches_;
+  // Declared before the PD transfer owner: its consumers must stop before the
+  // cache owner and registered Device slots are released.
+  std::shared_ptr<PrefillLayerwiseKVCache> prefill_layerwise_kv_cache_;
 
   // causal LM model
   std::unique_ptr<CausalLM> model_;

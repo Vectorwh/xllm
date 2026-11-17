@@ -45,6 +45,7 @@ cc_library(
     kv_cache_utils.h
     layerwise_split_layout.h
     linear_attention_kv_cache_impl.h
+    prefill_layerwise_kv_cache.h
     quantized_kv_cache_impl.h
   SRCS
     cache_layout_builder.cpp
@@ -57,12 +58,14 @@ cc_library(
     kv_cache_tensor_allocator.cpp
     kv_cache_utils.cpp
     linear_attention_kv_cache_impl.cpp
+    prefill_layerwise_kv_cache.cpp
     quantized_kv_cache_impl.cpp
   DEPS
     :block_utils
     :common
     :deepseek_v4_cache_policy
     :kv_cache_estimation
+    :platform
     :xtensor
     glog::glog
     torch

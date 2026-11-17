@@ -31,6 +31,7 @@ limitations under the License.
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
 #include "util/pretty_print.h"
 #include "util/tensor_helper.h"
@@ -902,7 +903,36 @@ void init_standard_counts(const ModelArgs& model_args,
   CHECK_GT(available_full_cache_size_in_bytes, 0)
       << "no memory left for full-attention kv cache after reserving linear "
          "state cache";
-  if (options.layerwise_split_size > 1) {
+  if (options.prefill_layerwise_num_buffers > 0) {
+    CHECK_EQ(options.dp_size, 1)
+        << "Prefill layerwise offload requires DP=1; empty DP shards are not "
+           "supported.";
+    CHECK_EQ(kv_cache_cap->num_linear_attention_layers(), 0);
+    CHECK_EQ(kv_cache_cap->kpool_tail_slot_size(), 0);
+    const int64_t layers = kv_cache_cap->n_layers();
+    const int32_t buffers = options.prefill_layerwise_num_buffers;
+    CHECK_LE(buffers, layers);
+    const std::vector<bool> index_mask =
+        resolve_indexer_cache_enabled_layers(model_args, layers);
+    const std::vector<char> index_slots = index_slots_for_round_robin_buffers(
+        layers, buffers, kv_cache_cap->index_slot_size() > 0, index_mask);
+    const int64_t physical_index_buffers =
+        std::count(index_slots.begin(), index_slots.end(), 1);
+    const int64_t device_block_bytes =
+        buffers * kv_cache_cap->block_size() * kv_cache_cap->slot_size() +
+        physical_index_buffers * kv_cache_cap->index_block_size();
+    CHECK_GT(device_block_bytes, 0)
+        << "Prefill layerwise Device slot bytes must be positive.";
+    // Host allocations are page-aligned per role/layer. Reserve one rounding
+    // unit for K, V, INDEX and INDEX_SCALE each.
+    const int64_t alignment_headroom_per_layer = 4 * host_page_size();
+    const int64_t host_budget = options.prefill_layerwise_host_memory_bytes -
+                                layers * alignment_headroom_per_layer;
+    CHECK_GT(host_budget, 0) << "Prefill Host budget is too small.";
+    kv_cache_cap->n_blocks(
+        std::min(available_full_cache_size_in_bytes / device_block_bytes,
+                 host_budget / full_cache_block_size_in_bytes));
+  } else if (options.layerwise_split_size > 1) {
     kv_cache_cap->n_blocks(
         layerwise_split_block_count(model_args,
                                     options.layerwise_split_size,

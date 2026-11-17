@@ -609,6 +609,19 @@ TEST(ExecutionConfigTest, EnableGraphWithoutRemovedBackendDoesNotWarn) {
   EXPECT_TRUE(warning.empty());
 }
 
+TEST(KVCacheConfigValidationTest, PrefillOffloadRejectsEmbeddingWorker) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  KVCacheConfig config;
+  config.prefill_layerwise_num_buffers(1);
+  EXPECT_DEATH(config.validate_prefill_layerwise_worker_mode("llm", "embed"),
+               "requires task=generate");
+  EXPECT_NO_FATAL_FAILURE(
+      config.validate_prefill_layerwise_worker_mode("llm", "generate"));
+  config.prefill_layerwise_num_buffers(0);
+  EXPECT_NO_FATAL_FAILURE(
+      config.validate_prefill_layerwise_worker_mode("llm", "embed"));
+}
+
 TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {
   KVCacheConfig config;
 

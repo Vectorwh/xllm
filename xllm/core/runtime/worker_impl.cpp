@@ -595,8 +595,28 @@ bool WorkerImpl::allocate_kv_cache_storage(
   // RL sleep mode: when enable_sleep_mode is set, allocate_kv_caches builds the
   // KV cache over a VMM-backed SleepableAllocator region (see kv_cache.cpp), so
   // sleep()/wake_up() can release / re-acquire it.
-  allocate_kv_caches(kv_caches_, kv_cache_shape, create_options);
-  init_hierarchy_kv_cache_transfer(kv_cache_shape, create_options);
+  const KVCacheConfig& cache_config = KVCacheConfig::get_instance();
+  cache_config.validate_prefill_layerwise_worker_mode(options_.backend(),
+                                                      options_.task_type());
+  if (cache_config.prefill_layerwise_num_buffers() > 0) {
+    // Only LLMWorkerImpl drives the layer synchronizer and saves each layer
+    // back to Host. Other worker lifecycles would reuse the round-robin slots
+    // without ever persisting their KV, so reject the flag here rather than
+    // silently corrupting their prefill cache.
+    CHECK(Platform::is_npu()) << "Prefill layerwise KV offload requires NPU.";
+    CHECK(parallel_args_.world_size() == 1 ||
+          parallel_args_.tp_group_ != nullptr)
+        << "Prefill layerwise KV preparation requires a TP process group.";
+    prefill_layerwise_kv_cache_ = std::make_shared<PrefillLayerwiseKVCache>(
+        kv_cache_shape,
+        create_options,
+        cache_config.prefill_layerwise_num_buffers(),
+        cache_config.prefill_layerwise_host_memory_bytes(),
+        kv_caches_);
+  } else {
+    allocate_kv_caches(kv_caches_, kv_cache_shape, create_options);
+    init_hierarchy_kv_cache_transfer(kv_cache_shape, create_options);
+  }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_DCU)
   refresh_cuda_block_copy_runtime_state();
@@ -645,6 +665,13 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
                                              /*is_spec_draft=*/false,
                                              linear_attention_policy_);
   kv_cache_transfer_->register_kv_cache(kv_caches_, kv_cache_shape, dtype_);
+  if (prefill_layerwise_kv_cache_ != nullptr) {
+    kv_cache_transfer_->set_push_completion_callback(
+        [cache = prefill_layerwise_kv_cache_](std::optional<int64_t> layer,
+                                              bool safe_to_reuse) {
+          cache->notify_push_completion(layer, safe_to_reuse);
+        });
+  }
 
   status_ = Status::READY;
   return true;

@@ -31,7 +31,10 @@ namespace npu {
 
 class NPUBatchMemcpy final : public BatchMemcpy {
  public:
-  NPUBatchMemcpy() = default;
+  // Ordinary Host transfers retain their synchronous completion semantics.
+  // Persistent-buffer owners may opt in and fence completion themselves.
+  explicit NPUBatchMemcpy(bool submit_asynchronously = false)
+      : submit_asynchronously_(submit_asynchronously) {}
   ~NPUBatchMemcpy() override = default;
 
   void init(int32_t device_id) override;
@@ -44,6 +47,10 @@ class NPUBatchMemcpy final : public BatchMemcpy {
                 const std::vector<torch::Tensor>& dst_tensors,
                 Stream* stream) override;
 
+  bool submit_d2h(const std::vector<torch::Tensor>& src_tensors,
+                  const std::vector<torch::Tensor>& dst_tensors,
+                  Stream* stream) override;
+
  private:
   static constexpr size_t kMaxBatchCopyCount = 4096;
 
@@ -52,9 +59,11 @@ class NPUBatchMemcpy final : public BatchMemcpy {
   bool copy(const std::vector<torch::Tensor>& src_tensors,
             const std::vector<torch::Tensor>& dst_tensors,
             const aclrtMemcpyBatchAttr& attr,
-            Stream* stream);
+            Stream* stream,
+            bool asynchronous);
 
   bool initialized_ = false;
+  bool submit_asynchronously_ = false;
   int32_t device_id_ = -1;
   aclrtMemcpyBatchAttr h2d_attr_{};
   aclrtMemcpyBatchAttr d2h_attr_{};

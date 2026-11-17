@@ -408,6 +408,10 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
     layout.offset = main_layout_.offset + main_layout_.total_buf_cnt;
   }
   std::vector<CacheTensorManifest> tensor_manifests;
+  // Logical layers may alias a physical prefill slot. Assign one SDK buffer
+  // id per allocation while preserving every logical layer's manifest entry.
+  std::unordered_map<void*, std::pair<RegisteredBufferDesc, uint64_t>>
+      physical_buffers;
   for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
     const std::vector<KVCacheTensor> transfer_tensors =
         get_mooncake_tensors(kv_caches[static_cast<size_t>(layer_id)]);
@@ -439,6 +443,17 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
           cache_tensor.role,
           cache_tensor.group_id,
           logical_bytes / static_cast<uint64_t>(resource_count)};
+      const auto [physical, inserted] = physical_buffers.emplace(
+          tensor.data_ptr(), std::make_pair(desc, logical_bytes));
+      CHECK_EQ(physical->second.second, logical_bytes)
+          << "Aliased KV buffers must have equal allocation sizes.";
+      CHECK_EQ(physical->second.first.block_bytes, desc.block_bytes)
+          << "Aliased KV buffers must have equal resource geometry.";
+      desc.buf_id = physical->second.first.buf_id;
+      if (inserted) {
+        ++layout.total_buf_cnt;
+      }
+      const int64_t buffer_id = desc.buf_id;
       layer_buffers.emplace_back(std::move(desc));
       layout.group_ids.emplace(cache_tensor.group_id);
       if (pending_registration_context_.has_value()) {
@@ -459,8 +474,7 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
         tensor_manifest.role = static_cast<int32_t>(
             static_cast<KVCacheTensorRole::Value>(cache_tensor.role));
         tensor_manifest.group_id = cache_tensor.group_id;
-        tensor_manifest.mooncake_buffer_id =
-            layout.offset + layout.total_buf_cnt;
+        tensor_manifest.mooncake_buffer_id = buffer_id;
         tensor_manifest.scalar_type =
             static_cast<int32_t>(tensor.scalar_type());
         tensor_manifest.element_bytes = tensor.element_size();
@@ -485,7 +499,6 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
             std::move(described_tensor.shard_descriptor.value());
         tensor_manifests.emplace_back(std::move(tensor_manifest));
       }
-      ++layout.total_buf_cnt;
     }
     CHECK(!layer_buffers.empty())
         << "No Mooncake cache tensor registered at layer " << layer_id;
@@ -690,11 +703,15 @@ void MooncakeKVCacheTransferDefault::register_kv_cache_impl(
   addrs.reserve(kv_caches.size() * 4);
   lens.reserve(kv_caches.size() * 4);
   buf_bytes.reserve(kv_caches.size() * 4);
+  std::unordered_set<void*> physical_buffers;
 
   for (const KVCache& cache : kv_caches) {
     const std::vector<KVCacheTensor> transfer_tensors =
         get_mooncake_tensors(cache);
     for (const KVCacheTensor& cache_tensor : transfer_tensors) {
+      if (!physical_buffers.emplace(cache_tensor.tensor.data_ptr()).second) {
+        continue;
+      }
       add_buf(cache_tensor.tensor,
               addrs,
               lens,
@@ -823,8 +840,10 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
     if (!layer_synchronizer->synchronize_layer(layer_index)) {
       LOG(ERROR) << "Synchronize KV cache layer failed, layer=" << layer_index;
       failed_keys.insert(keys.begin(), keys.end());
+      notify_push_completion(layer_index, false);
       continue;
     }
+    bool layer_safe = true;
     for (const std::string& key : keys) {
       if (failed_keys.find(key) != failed_keys.end()) {
         continue;
@@ -853,8 +872,10 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
         LOG(ERROR) << "Push KV byte regions failed, layer=" << layer_index
                    << ", destination=" << kv_info.dst_addr;
         failed_keys.insert(key);
+        layer_safe = false;
       }
     }
+    notify_push_completion(layer_index, layer_safe);
   }
   std::vector<KVTransferTaskResult> results;
   results.reserve(failed_keys.size());
@@ -1139,9 +1160,11 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
       LOG(ERROR) << "Synchronize XTensor KV cache layer failed, layer="
                  << layer_index;
       failed_keys.insert(keys.begin(), keys.end());
+      notify_push_completion(layer_index, false);
       continue;
     }
 
+    bool layer_safe = true;
     for (const std::string& key : keys) {
       if (failed_keys.find(key) != failed_keys.end()) {
         continue;
@@ -1275,8 +1298,10 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
       if (!ret) {
         LOG(ERROR) << "push_kv_blocks_impl failed at layer " << layer_index;
         failed_keys.insert(key);
+        layer_safe = false;
       }
     }
+    notify_push_completion(layer_index, layer_safe);
   }
 
   std::vector<KVTransferTaskResult> results;

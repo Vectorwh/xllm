@@ -17,9 +17,12 @@ limitations under the License.
 
 #include <folly/futures/Future.h>
 
+#include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/types.h"
@@ -234,6 +237,16 @@ class KVCacheTransfer {
       const std::string& src_addr,
       const std::vector<KVTransferMapping>& mappings);
 
+  // Installed during worker initialization. A layer notification follows all
+  // of its writes; nullopt closes the batch, including validation/no-work
+  // paths.
+  // The boolean means source memory is safe to reuse. Request failure results
+  // remain separate; rejected requests with no submitted DMA release the fence.
+  void set_push_completion_callback(
+      std::function<void(std::optional<int64_t>, bool)> callback) {
+    push_completion_callback_ = std::move(callback);
+  }
+
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   virtual folly::SemiFuture<std::vector<KVTransferTaskResult>>
   push_kv_blocks_async(
@@ -258,6 +271,13 @@ class KVCacheTransfer {
 #endif
 
  protected:
+  void notify_push_completion(std::optional<int64_t> layer,
+                              bool safe_to_reuse) {
+    if (push_completion_callback_) {
+      push_completion_callback_(layer, safe_to_reuse);
+    }
+  }
+
   // Drafts may register only a subset of the target's cache groups. Prepare
   // their request mappings before validating them in the draft's KV topology.
   virtual bool prepare_draft_transfer_infos(
@@ -289,6 +309,11 @@ class KVCacheTransfer {
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       int32_t src_kv_split_size);
 
+ private:
+  // Outlives the pool so queued notifications cannot access a destroyed hook.
+  std::function<void(std::optional<int64_t>, bool)> push_completion_callback_;
+
+ protected:
   // working thread
   ThreadPool threadpool_{/*num_threads=*/1,
                          /*cpu_binding=*/false,

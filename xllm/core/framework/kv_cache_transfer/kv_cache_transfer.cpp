@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 
+#include <folly/ScopeGuard.h>
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -495,7 +496,14 @@ KVCacheTransfer::push_kv_blocks_async(
                         layer_synchronizer,
                         is_spec_draft,
                         promise = std::move(promise)]() mutable {
+    bool push_safe = false;
+    auto completion = folly::makeGuard([this, &push_safe]() {
+      notify_push_completion(std::nullopt, push_safe);
+    });
     if (is_spec_draft && !prepare_draft_transfer_infos(transfer_kv_infos)) {
+      // Structured request failure: no source consumer remains for these
+      // mappings, so shared prefill slots do not need to stay quarantined.
+      push_safe = true;
       promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
       return;
     }
@@ -514,10 +522,12 @@ KVCacheTransfer::push_kv_blocks_async(
     // declares width 1", and reading it as a width refused every push to a
     // destination that declares kv_split_size > 1.
     if (!validate_kv_split_width_plan(*kv_infos, kv_split_size)) {
+      push_safe = true;
       promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
       return;
     }
     if (!validate_transfer_mappings(*kv_infos, kv_split_size)) {
+      push_safe = true;
       promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
       return;
     }
@@ -526,6 +536,7 @@ KVCacheTransfer::push_kv_blocks_async(
           parallel_args.kv_split_rank(), kv_split_size, *kv_infos);
       kv_infos = &filtered_kv_infos;
       if (kv_infos->empty()) {
+        push_safe = true;
         promise.setValue(std::vector<KVTransferTaskResult>{});
         return;
       }
@@ -533,6 +544,7 @@ KVCacheTransfer::push_kv_blocks_async(
     // Post-filter identity: every rank's local_ids and remote_ids must line up
     // 1:1. The literal 1 below is that expectation, not a declared width.
     if (!validate_transfer_mappings(*kv_infos, /*kv_split_size=*/1)) {
+      push_safe = true;
       promise.setValue(failed_tasks_for_requests(transfer_kv_infos));
       return;
     }
@@ -545,6 +557,9 @@ KVCacheTransfer::push_kv_blocks_async(
                                      parallel_args.kv_split_rank(),
                                      parallel_args.kv_split_size_effective());
     }
+    // Unsafe layer completions were already reported by the sender. Structured
+    // request failures (e.g. rejected bindings) leave no live source consumers.
+    push_safe = true;
     promise.setValue(std::move(results));
   });
   return future;

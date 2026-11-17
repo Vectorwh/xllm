@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/deepseek_v4_cache_policy.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
 
 namespace xllm {
@@ -95,6 +96,47 @@ TEST(KVCacheEstimationTest, EstimatesStandardAttentionBlocks) {
   EXPECT_EQ(capacity.num_full_attention_layers(), 4);
   EXPECT_EQ(capacity.num_linear_attention_layers(), 0);
   EXPECT_EQ(capacity.n_blocks(), 128);
+}
+
+TEST(KVCacheEstimationTest,
+     PrefillLayerwiseCapacityUsesBothDeviceAndHostBudgets) {
+  const ModelArgs args = make_standard_args();
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.prefill_layerwise_num_buffers = 2;
+  options.prefill_layerwise_host_memory_bytes = 64 * 1024 * 1024;
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 256);
+  options.prefill_layerwise_num_buffers = 1;
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 512);
+  options.prefill_layerwise_host_memory_bytes =
+      4 * host_page_size() * args.n_layers() + 512 * 1024;
+  const KVCacheCapacity host_limited =
+      estimate_kv_cache_capacity(args, options);
+  EXPECT_EQ(host_limited.n_blocks(), 64);
+  options.prefill_layerwise_num_buffers = 0;
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 128);
+  options.dp_size = 2;
+  options.world_size = 2;
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 128);
+  options.prefill_layerwise_num_buffers = 1;
+  EXPECT_DEATH(estimate_kv_cache_capacity(args, options), "requires DP=1");
+}
+
+TEST(KVCacheEstimationTest, PrefillLayerwiseCapacityCountsPhysicalIndexSlots) {
+  const ModelArgs no_index_args = make_standard_args();
+  ModelArgs index_args = no_index_args;
+  index_args.index_n_heads(1).index_head_dim(16);
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.prefill_layerwise_num_buffers = 2;
+  options.prefill_layerwise_host_memory_bytes = 64 * 1024 * 1024;
+
+  const KVCacheCapacity without_index =
+      estimate_kv_cache_capacity(no_index_args, options);
+  const KVCacheCapacity with_index =
+      estimate_kv_cache_capacity(index_args, options);
+
+  EXPECT_EQ(without_index.index_slot_size(), 0);
+  EXPECT_GT(with_index.index_slot_size(), 0);
+  EXPECT_GT(without_index.n_blocks(), with_index.n_blocks());
 }
 
 TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {

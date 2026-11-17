@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cmath>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
@@ -65,6 +67,17 @@ DEFINE_int64(
     "for Decode with prefix cache, otherwise derives capacity from the "
     "available KV cache budget.");
 
+DEFINE_int32(prefill_layerwise_num_buffers,
+             0,
+             "Reusable prefill KV layer buffers. 0 disables offload; positive "
+             "values require task=generate, NPU eager PREFILL/PUSH on "
+             "glm_moe_dsa with DP=1, CP=1.");
+
+DEFINE_double(prefill_layerwise_host_memory_gb,
+              8.0,
+              "Maximum pinned Host KV memory per prefill worker in GiB when "
+              "prefill_layerwise_num_buffers is positive.");
+
 DEFINE_uint32(xxh3_128bits_seed, 1024, "Default XXH3 128-bits hash seed.");
 
 DEFINE_bool(
@@ -88,6 +101,8 @@ void KVCacheConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(indexer_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_in_batch_prefix_cache);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(prefill_layerwise_num_buffers);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(prefill_layerwise_host_memory_gb);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(xxh3_128bits_seed);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_xtensor);
@@ -102,6 +117,8 @@ void KVCacheConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(indexer_cache_dtype);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefix_cache);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_in_batch_prefix_cache);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(prefill_layerwise_num_buffers);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(prefill_layerwise_host_memory_gb);
   XLLM_CONFIG_ASSIGN_FROM_JSON(max_linear_state_cache_slots);
   XLLM_CONFIG_ASSIGN_FROM_JSON(xxh3_128bits_seed);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_xtensor);
@@ -126,6 +143,10 @@ void KVCacheConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_in_batch_prefix_cache);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, prefill_layerwise_num_buffers);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, prefill_layerwise_host_memory_gb);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, max_linear_state_cache_slots);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, xxh3_128bits_seed);
@@ -149,10 +170,28 @@ void KVCacheConfig::initialize() {
 }
 
 void KVCacheConfig::validate() const {
+  CHECK_GE(prefill_layerwise_num_buffers_, 0);
+  CHECK(std::isfinite(prefill_layerwise_host_memory_gb_));
+  CHECK_GT(prefill_layerwise_host_memory_gb_, 0.0);
+  CHECK_LE(prefill_layerwise_host_memory_gb_, 1048576.0)
+      << "Prefill Host budget must fit in an int64 byte count.";
   if (indexer_cache_dtype_ != "auto" && indexer_cache_dtype_ != "int8") {
     LOG(FATAL) << "Invalid indexer_cache_dtype=\"" << indexer_cache_dtype_
                << "\". Supported values are exactly \"auto\" and \"int8\".";
   }
+}
+
+void KVCacheConfig::validate_prefill_layerwise_worker_mode(
+    const std::string& backend,
+    const std::string& task) const {
+  if (prefill_layerwise_num_buffers_ <= 0) {
+    return;
+  }
+  CHECK_EQ(backend, "llm")
+      << "Prefill layerwise offload requires the LLM worker lifecycle.";
+  CHECK_EQ(task, "generate")
+      << "Prefill layerwise offload requires task=generate; embedding workers "
+         "do not drive the layerwise KV lifecycle.";
 }
 
 }  // namespace xllm

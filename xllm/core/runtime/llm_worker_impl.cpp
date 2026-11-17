@@ -16,6 +16,7 @@ limitations under the License.
 #include "llm_worker_impl.h"
 
 #include <c10/core/DeviceGuard.h>
+#include <folly/ScopeGuard.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
@@ -252,30 +253,77 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       canonical_transfer_request_ids(input.transfer_kv_infos);
   std::vector<std::string> failed_request_ids;
   bool kv_push_waited = false;
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  std::shared_ptr<KVPushSynchronizerImpl> layer_synchronizer;
+#endif
 
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
 #if defined(USE_NPU)
-    std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer =
-        std::make_shared<NPULayerSynchronizerImpl>(
-            context_.get_model_args().n_layers());
+    layer_synchronizer = std::make_shared<NPULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
 #elif defined(USE_MLU)
-    std::shared_ptr<MLULayerSynchronizerImpl> layer_synchronizer =
-        std::make_shared<MLULayerSynchronizerImpl>(
-            context_.get_model_args().n_layers());
+    layer_synchronizer = std::make_shared<MLULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
 #elif defined(USE_DCU)
-    std::shared_ptr<DCULayerSynchronizerImpl> layer_synchronizer =
-        std::make_shared<DCULayerSynchronizerImpl>(
-            context_.get_model_args().n_layers());
+    layer_synchronizer = std::make_shared<DCULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
 #endif
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
     const_cast<ModelInputParams*>(&(input.input_params))
         ->parallel.layer_synchronizer = layer_synchronizer;
 
+#endif
+  }
+  // call model executor forward to get hidden states
+  const ModelInputParams* forward_params = &input.input_params;
+  std::optional<ModelInputParams> prefill_params;
+  std::unique_ptr<Stream> prefill_stream;
+  if (prefill_layerwise_kv_cache_ != nullptr) {
+    // One batch-sized copy per prefill step lets the two fields below be
+    // overridden without mutating the caller's params for the duration of the
+    // forward; begin() itself takes the params by const reference.
+    prefill_params.emplace(input.input_params);
+    ModelInputParams& model_params = *prefill_params;
+    prefill_stream = device_.current_stream();
+    // Keep the Stream wrapper alive across model forward; the manager only
+    // borrows it while the current batch runs.
+    if (!prefill_layerwise_kv_cache_->begin(
+            model_params,
+            options_.block_size(),
+            prefill_stream.get(),
+            /*expect_push=*/!input.transfer_kv_infos.empty(),
+            context_.get_parallel_args().tp_group_)) {
+      LOG(ERROR) << "Failed to prepare prefill layerwise KV, batch_id="
+                 << model_params.meta.batch_id;
+      return make_failed_output(model_params.embedding.request_ids);
+    }
+    model_params.parallel.layers_per_event = 1;
+    model_params.parallel.layer_wise_load_synchronizer =
+        prefill_layerwise_kv_cache_;
+    forward_params = &model_params;
+  }
+  auto abort_prefill = folly::makeGuard([&]() {
+    if (prefill_layerwise_kv_cache_ == nullptr) {
+      return;
+    }
 #if defined(USE_NPU) || defined(USE_MLU)
-    // Cancel hook: aborting the layer synchronizer unblocks a push thread
-    // spinning in synchronize_layer, so it stops reading source KV blocks,
-    // reports its keys as failed, and completes. DCU has no abort().
+    if (layer_synchronizer != nullptr) {
+      layer_synchronizer->abort();
+    }
+#endif
+    // Preserve the original exception while cancelling readers waiting for
+    // missing compute events and draining the owner before stack unwinding.
+    prefill_layerwise_kv_cache_->abort();
+  });
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  // Begin the cache batch before any PUSH completion can arrive. In particular,
+  // invalid prefill metadata must fail without leaving a sender waiting for
+  // computation events from a forward that will never execute.
+  if (layer_synchronizer != nullptr) {
+#if defined(USE_NPU) || defined(USE_MLU)
+    // Preserve the cancellation hook that releases senders waiting for a
+    // layer event when the completion object drains after an exception.
     kv_transfers.add(
         kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
                                                  context_.get_parallel_args(),
@@ -291,8 +339,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
                                                  is_spec_draft_),
         canonical_request_ids);
 #endif
-#endif
   }
+#endif
   auto wait_kv_push = [&]() {
     if (kv_push_waited) {
       return;
@@ -309,10 +357,22 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   if (eplb_executor_ != nullptr) {
     eplb_executor_->start_eplb_step(input.input_params.expert.eplb_info);
   }
-
-  // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
-      input.token_ids, input.positions, kv_caches_, input.input_params);
+      input.token_ids, input.positions, kv_caches_, *forward_params);
+  if (prefill_layerwise_kv_cache_ != nullptr) {
+#if defined(USE_NPU) || defined(USE_MLU)
+    if (!model_output.hidden_states.defined() &&
+        !model_output.draft_proposal.has_value() &&
+        layer_synchronizer != nullptr) {
+      layer_synchronizer->abort();
+    }
+#endif
+    CHECK(prefill_layerwise_kv_cache_->finish())
+        << "Prefill layerwise KV execution/save/PUSH failed; shared cache "
+           "buffers cannot be reused, batch_id="
+        << input.input_params.meta.batch_id;
+  }
+  abort_prefill.dismiss();
   if (eplb_executor_ != nullptr) {
     eplb_executor_->finish_eplb_step();
   }
