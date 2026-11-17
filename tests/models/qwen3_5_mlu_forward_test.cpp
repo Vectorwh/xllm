@@ -14,12 +14,14 @@ limitations under the License.
 ==============================================================================*/
 
 #include <framework/core/MLUStream.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +29,7 @@ limitations under the License.
 
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model_context.h"
+#include "framework/model_loader.h"
 #include "framework/parallel_state/process_group.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/vlm/qwen3_5.h"
@@ -36,6 +39,106 @@ namespace xllm {
 namespace {
 
 constexpr int64_t kHiddenSize = 128;
+
+using Weights = std::unordered_map<std::string, torch::Tensor>;
+
+class InMemoryModelLoader final : public ModelLoader {
+ public:
+  explicit InMemoryModelLoader(std::vector<Weights> shards) {
+    states_.reserve(shards.size());
+    for (auto& shard : shards) {
+      states_.emplace_back(std::make_unique<StateDict>(std::move(shard)));
+    }
+  }
+
+  std::unique_ptr<Tokenizer> tokenizer() const override {
+    LOG(FATAL) << "Tokenizer construction is not used by weight loading tests";
+    return nullptr;
+  }
+
+  std::vector<std::unique_ptr<StateDict>>& get_state_dicts() override {
+    return states_;
+  }
+
+  std::string model_weights_path() const override { return "in-memory"; }
+
+ private:
+  std::vector<std::unique_ptr<StateDict>> states_;
+};
+
+class Qwen35MluWeightLoadingTest : public ::testing::Test {
+ protected:
+  ModelContext make_context() {
+    ParallelArgs parallel(/*rank=*/1, /*world_size=*/2, &tp_group_);
+    parallel.tp_group_ = &tp_group_;
+    parallel.lm_head_group_ = &head_group_;
+    ModelArgs args;
+    args.model_type("qwen3_5_text")
+        .n_layers(0)
+        .hidden_size(8)
+        .vocab_size(8)
+        .rms_norm_eps(1e-6)
+        .tie_word_embeddings(true);
+    return ModelContext(parallel, args, QuantArgs(), options_);
+  }
+
+  const torch::TensorOptions options_ =
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  ProcessGroup tp_group_{/*rank=*/1, /*world_size=*/2, torch::kCPU};
+  ProcessGroup head_group_{/*rank=*/2, /*world_size=*/4, torch::kCPU};
+};
+
+TEST_F(Qwen35MluWeightLoadingTest,
+       LoadsTiedHeadFromNestedShardsWithOwnTpLayout) {
+  Qwen3_5ForCausalLMImpl model(make_context());
+  const torch::Tensor embedding = torch::arange(64, options_).reshape({8, 8});
+  std::vector<Weights> shards;
+  shards.reserve(2);
+  shards.emplace_back(Weights{
+      {"model.language_model.norm.weight", torch::ones({8}, options_)}});
+  shards.emplace_back(
+      Weights{{"model.language_model.embed_tokens.weight", embedding},
+              {"embed_tokens.weight", torch::full({8, 8}, -1.0f, options_)}});
+
+  model.load_model(std::make_unique<InMemoryModelLoader>(std::move(shards)));
+
+  ASSERT_TRUE(model.get_lm_head()->is_weight_loaded());
+  EXPECT_TRUE(torch::equal(model.get_lm_head()->weight(),
+                           embedding.slice(/*dim=*/0, /*start=*/4, /*end=*/6)));
+  ASSERT_TRUE(model.get_word_embedding()->is_weight_loaded());
+  EXPECT_TRUE(torch::equal(model.get_word_embedding()->weight(),
+                           embedding.slice(/*dim=*/1, /*start=*/4, /*end=*/8)));
+}
+
+TEST_F(Qwen35MluWeightLoadingTest, PreservesRootEmbeddingFallback) {
+  Qwen3_5ForCausalLMImpl model(make_context());
+  const torch::Tensor embedding = torch::arange(64, options_).reshape({8, 8});
+  std::vector<Weights> shards;
+  shards.reserve(1);
+  shards.emplace_back(
+      Weights{{"model.language_model.norm.weight", torch::ones({8}, options_)},
+              {"embed_tokens.weight", embedding}});
+
+  model.load_model(std::make_unique<InMemoryModelLoader>(std::move(shards)));
+
+  ASSERT_TRUE(model.get_lm_head()->is_weight_loaded());
+  EXPECT_TRUE(torch::equal(model.get_lm_head()->weight(),
+                           embedding.slice(/*dim=*/0, /*start=*/4, /*end=*/6)));
+}
+
+TEST_F(Qwen35MluWeightLoadingTest, RejectsMissingHeadAfterAllShards) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  Qwen3_5ForCausalLMImpl model(make_context());
+  std::vector<Weights> shards;
+  shards.reserve(2);
+  shards.emplace_back(Weights{
+      {"model.language_model.norm.weight", torch::ones({8}, options_)}});
+  shards.emplace_back();
+
+  EXPECT_DEATH(model.load_model(
+                   std::make_unique<InMemoryModelLoader>(std::move(shards))),
+               "lm_head weight was not loaded");
+}
 
 bool has_safe_visible_device() {
   const char* visible = std::getenv("MLU_VISIBLE_DEVICES");

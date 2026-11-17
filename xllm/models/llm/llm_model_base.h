@@ -284,18 +284,23 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
       // The same model_type may come from checkpoints with different top-level
       // weight prefixes. Try these candidate prefixes in order to improve
       // compatibility across such variants.
-      model_->load_state_dict(state_dict->get_dict_with_prefix(
+      auto model_state_dict = state_dict->get_dict_with_prefix(
           std::vector<std::string>{"model.language_model.",
                                    "language_model.model.",
                                    prefix,
                                    "model.",
-                                   ""}));
+                                   ""});
+      model_->load_state_dict(model_state_dict);
 
       if (!embedding_mode_) {
         if (tie_word_embeddings) {
           auto lm_head_state_dict =
-              state_dict->get_dict_with_prefix(std::vector<std::string>{
-                  prefix + "embed_tokens.", "embed_tokens.", "embed."});
+              model_state_dict.get_dict_with_prefix("embed_tokens.");
+          if (lm_head_state_dict.size() == 0) {
+            lm_head_state_dict =
+                state_dict->get_dict_with_prefix(std::vector<std::string>{
+                    prefix + "embed_tokens.", "embed_tokens.", "embed."});
+          }
           lm_head_->load_state_dict(lm_head_state_dict);
         } else {
           auto lm_head_state_dict = state_dict->get_dict_with_prefix(
@@ -309,6 +314,11 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
           lm_head_->load_state_dict(lm_head_state_dict);
         }
       }
+    }
+    if (!embedding_mode_ && !lm_head_.is_empty()) {
+      CHECK(lm_head_->is_weight_loaded())
+          << "lm_head weight was not loaded; model prefix: " << prefix
+          << ", tie_word_embeddings: " << tie_word_embeddings;
     }
   }
 

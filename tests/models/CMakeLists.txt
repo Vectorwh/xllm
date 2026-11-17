@@ -168,6 +168,7 @@ if(USE_MLU)
       :common_layers
       :parallel_state
       :model_context
+      :state_dict
       GTest::gtest_main
       torch_mlu
   )
