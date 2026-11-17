@@ -144,6 +144,24 @@ class SequenceParallelMixin {
     return outputs;
   }
 
+  torch::Tensor scatter_padded_sequence(const torch::Tensor& input,
+                                        int64_t dim) const {
+    if (!input.defined() || input.size(dim) == 0) {
+      return input;
+    }
+    return parallel_state::scatter(
+        input, process_group_, static_cast<int32_t>(dim));
+  }
+
+  torch::Tensor gather_padded_sequence(const torch::Tensor& input,
+                                       int64_t dim) const {
+    if (!sequence_parallel_enabled() || !input.defined()) {
+      return input;
+    }
+    return parallel_state::gather(
+        input.contiguous(), process_group_, static_cast<int32_t>(dim));
+  }
+
  private:
   int32_t world_size() const {
     return process_group_ == nullptr ? 1 : process_group_->world_size();
@@ -158,17 +176,15 @@ class SequenceParallelMixin {
       return input;
     }
 
-    const int64_t sequence_length = input.size(sequence_dim);
-    const int64_t padding_length =
-        (world_size() - sequence_length % world_size()) % world_size();
-    padding_lengths_[tensor_name] = padding_length;
+    const int64_t group_size = world_size();
+    padding_lengths_[tensor_name] =
+        (group_size - input.size(sequence_dim) % group_size) % group_size;
     if (!sequence_parallel_enabled()) {
       return input;
     }
 
     torch::Tensor padded_input = pad_tensor(input, tensor_name, sequence_dim);
-    return parallel_state::scatter(
-        padded_input, process_group_, static_cast<int32_t>(sequence_dim));
+    return scatter_padded_sequence(padded_input, sequence_dim);
   }
 
   torch::Tensor gather_sequence(const torch::Tensor& input,
@@ -178,9 +194,8 @@ class SequenceParallelMixin {
       return input;
     }
 
-    torch::Tensor output = parallel_state::gather(
-        input.contiguous(), process_group_, static_cast<int32_t>(sequence_dim));
-    return unpad_tensor(output, tensor_name, sequence_dim);
+    return unpad_tensor(
+        gather_padded_sequence(input, sequence_dim), tensor_name, sequence_dim);
   }
 
   int64_t normalize_dim(const torch::Tensor& input, int64_t dim) const {
