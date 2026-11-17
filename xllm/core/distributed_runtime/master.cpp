@@ -808,17 +808,21 @@ Master::Master(const Options& options, EngineType type)
     engine_ = std::move(engine);
   } else if (type == EngineType::SSM || type == EngineType::VLMSSM) {
     if (type == EngineType::VLMSSM) {
-      const bool supports_pd = SpeculativeConfig::is_glm5_next_dflash2(
-          util::get_model_type(options_.model_path(), options_.backend()),
-          options_.speculative_algorithm());
+      const std::string vlm_spec_model_type =
+          util::get_model_type(options_.model_path(), options_.backend());
+      const bool supports_pd =
+          SpeculativeConfig::is_glm5_next_dflash2(
+              vlm_spec_model_type, options_.speculative_algorithm()) ||
+          SpeculativeConfig::is_deepseek_v41_dspark(
+              vlm_spec_model_type, options_.speculative_algorithm());
       CHECK(!options_.enable_disagg_pd() || supports_pd)
           << "VLM speculative decoding with disaggregated PD requires "
-             "glm5_next + DFlash2";
+             "glm5_next + DFlash2 or deepseek_v41 + DSpark";
       CHECK(!options_.enable_pd_ooc())
           << "VLM speculative decoding does not support PD OOC";
       CHECK(!options_.enable_service_routing() || supports_pd)
-          << "VLM speculative decoding with service routing requires glm5_next "
-             "+ DFlash2";
+          << "VLM speculative decoding with service routing requires "
+             "glm5_next + DFlash2 or deepseek_v41 + DSpark";
       CHECK(!options_.enable_adaptive_speculative_decode())
           << "VLM speculative decoding does not support adaptive speculative "
              "decode";

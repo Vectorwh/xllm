@@ -84,7 +84,8 @@ runtime::Options target_options(const runtime::Options& options) {
 
 runtime::Options draft_options(const runtime::Options& options,
                                bool enable_dflash_xfia) {
-  const bool sample_from_anchor = options.speculative_algorithm() == "DSpark";
+  const bool sample_from_anchor =
+      SpeculativeConfig::is_dspark_algorithm(options.speculative_algorithm());
   // DFlash-style drafts execute one forward. Their proposal geometry is
   // carried separately from the speculative-token count used by DSpark.
   const int32_t draft_num_speculative_tokens =

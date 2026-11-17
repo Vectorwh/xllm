@@ -49,7 +49,7 @@ class SpeculativeConfig final {
   // classify without an initialized singleton.
   static bool requires_aux_hidden_capture(std::string_view algorithm) {
     return algorithm == "Eagle3" || algorithm == "DFlash" ||
-           is_dflash2_algorithm(algorithm) || algorithm == "DSpark";
+           is_dflash2_algorithm(algorithm) || is_dspark_algorithm(algorithm);
   }
 
   // Whether the speculative worker builds the draft paged cache from the
@@ -101,6 +101,17 @@ class SpeculativeConfig final {
                                      std::string_view model_impl) {
     return model_type == "glm_moe_dsa" && is_dflash2_algorithm(algorithm) &&
            ModelConfig::is_python_model_impl(model_impl);
+  }
+
+  // The deepseek_v41 + DSpark pairing. The drafter is the checkpoint's own
+  // mtp.0/1/2 block, so it inherits the target's kv_split sharding
+  // (owns_replicated_kv_cache() is false) and reuses the DFlash worker's PD
+  // bootstrap-embedding handoff, which makes the pairing usable under
+  // disaggregated PD. Kept next to is_glm5_next_dflash2 so the VLM PD
+  // whitelist in Master::Master reads one place.
+  static bool is_deepseek_v41_dspark(std::string_view model_type,
+                                     std::string_view algorithm) {
+    return model_type == "deepseek_v41" && is_dspark_algorithm(algorithm);
   }
 
   static bool is_mtp_algorithm(std::string_view algorithm) {

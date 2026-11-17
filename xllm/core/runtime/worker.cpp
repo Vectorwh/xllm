@@ -64,7 +64,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
 #endif
       impl_ =
           new DFlash2WorkerImpl(parallel_args, device, options, worker_type);
-    } else if (algorithm == "DSpark") {
+    } else if (SpeculativeConfig::is_dspark_algorithm(algorithm)) {
       impl_ = new DSparkWorkerImpl(parallel_args, device, options, worker_type);
     } else if (algorithm == "Suffix") {
       impl_ = new SuffixWorkerImpl(parallel_args, device, options, worker_type);
