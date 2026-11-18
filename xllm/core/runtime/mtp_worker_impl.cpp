@@ -2063,6 +2063,22 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
   auto& fused_draft_tokens =
       validate_input.input_params.graph.spec_verify_draft_token_sources;
   fused_draft_tokens.clear();
+  // A JSON grammar halt pads the unexecuted draft steps with -1 so greedy
+  // rejection can never match them against a target sample. That sentinel
+  // belongs to the proposal domain only: the validate input is an
+  // embedding-table operand, and every row must stay a valid vocab index.
+  // Map the padded slots to token 0 in the copies handed to the target
+  // forward; the original draft tensors and the invalid-draft flags keep
+  // rejecting those positions after the forward.
+  const auto embedding_safe_draft_tokens =
+      [has_json_states =
+           json_scratch != nullptr](const torch::Tensor& next_tokens) {
+        torch::Tensor flat_tokens = next_tokens.flatten();
+        if (has_json_states) {
+          flat_tokens = torch::clamp_min(flat_tokens, /*min=*/0);
+        }
+        return flat_tokens;
+      };
 #if defined(USE_NPU)
   const bool use_fused_verify_token_update =
       validate_input.input_params.graph.spec_verify_source_addresses_stable &&
@@ -2080,7 +2096,7 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
             next_tokens.is_contiguous())
           << "fused speculative verify input update requires one contiguous "
              "int64 token per sequence and draft step";
-      fused_draft_tokens.emplace_back(next_tokens.flatten());
+      fused_draft_tokens.emplace_back(embedding_safe_draft_tokens(next_tokens));
     }
     validate_input.device_tensors_ready = true;
     return;
@@ -2113,8 +2129,10 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
             draft_outputs[static_cast<size_t>(i)].sample_output.next_tokens;
         CHECK(next_tokens.defined())
             << "draft next_tokens must be defined for validate token fill";
-        draft_token_columns.push_back(safe_to(
-            next_tokens.flatten(), token_options, /*non_blocking=*/true));
+        draft_token_columns.push_back(
+            safe_to(embedding_safe_draft_tokens(next_tokens),
+                    token_options,
+                    /*non_blocking=*/true));
       }
       torch::Tensor packed_drafts =
           torch::stack(draft_token_columns, /*dim=*/1);
@@ -2177,8 +2195,10 @@ void MTPWorkerImpl::fill_validate_input_from_draft_outputs(
             draft_outputs[static_cast<size_t>(step)].sample_output.next_tokens;
         CHECK(next_tokens.defined())
             << "draft next_tokens must be defined for validate token fill";
-        torch::Tensor flat_tokens = safe_to(
-            next_tokens.flatten(), token_options, /*non_blocking=*/true);
+        torch::Tensor flat_tokens =
+            safe_to(embedding_safe_draft_tokens(next_tokens),
+                    token_options,
+                    /*non_blocking=*/true);
 
         torch::Tensor step_mask = step_all.eq(step);
         torch::Tensor step_dst = dst_idx_all.masked_select(step_mask);

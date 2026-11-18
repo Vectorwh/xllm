@@ -55,8 +55,10 @@ namespace {
 
 class DecodeInputMTPWorker final : public MTPWorkerImpl {
  public:
+  using MTPWorkerImpl::fill_validate_input_from_draft_outputs;
   using MTPWorkerImpl::MTPWorkerImpl;
   using MTPWorkerImpl::update_decode_step_input;
+  using WorkerImpl::compute_stream_;
 };
 
 // Exposes inherited protected runtime seams only from the test binary; no
@@ -132,6 +134,62 @@ TEST(MTPDecodeStepTest, CacheCorrectionSurvivesPackedInputMaterialization) {
             scheduler.input_params.embedding.engram_lookback_token_ids);
   EXPECT_EQ(materialized.input_params.execution_batch.num_computed_tokens,
             scheduler.input_params.execution_batch.num_computed_tokens);
+}
+
+// A JSON grammar halt pads the unexecuted draft steps with -1. The validate
+// input is an embedding-table operand, so the fill must map that
+// proposal-domain sentinel to a valid vocab index instead of leaking it into
+// the target forward. The original draft tensors keep -1: greedy rejection
+// relies on the sentinel never matching a target sample.
+TEST(MTPDecodeStepTest, JsonHaltPaddingNeverReachesTheTargetEmbeddingInput) {
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(0, 1, nullptr);
+  runtime::Options options;
+  options.enable_schedule_overlap(false)
+      .enable_graph(false)
+      .speculative_algorithm("mtp")
+      .num_speculative_tokens(2)
+      .block_size(16);
+  DecodeInputMTPWorker worker(
+      parallel_args, device.unwrap(), options, /*worker_type=*/WorkerType::LLM);
+
+  ForwardInput input;
+  input.json_object_states = {ConstraintState(), ConstraintState()};
+
+  ForwardInput validate_input;
+  const torch::TensorOptions token_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device.unwrap());
+  validate_input.token_ids = torch::full({6}, /*fill_value=*/5, token_options);
+
+  std::vector<ForwardOutput> draft_outputs(2);
+  const torch::TensorOptions draft_token_options =
+      torch::TensorOptions().dtype(torch::kInt64).device(device.unwrap());
+  draft_outputs[0].sample_output.next_tokens =
+      torch::tensor({11, 12}, draft_token_options);
+  draft_outputs[1].sample_output.next_tokens =
+      torch::full({2}, /*fill_value=*/-1, draft_token_options);
+
+  detail::JsonDraftValidationScratch json_scratch;
+  json_scratch.states_after = {{ConstraintState(), ConstraintState()},
+                               {ConstraintState(), ConstraintState()}};
+  json_scratch.invalid_draft_step_major = {0, 0, 1, 1};
+
+  worker.fill_validate_input_from_draft_outputs(input,
+                                                draft_outputs,
+                                                validate_input,
+                                                /*per_seq_val_tokens=*/{3, 3},
+                                                &json_scratch,
+                                                *worker.compute_stream_);
+
+  EXPECT_TRUE(torch::equal(validate_input.token_ids.cpu(),
+                           torch::tensor({5, 11, 0, 5, 12, 0}, torch::kInt32)))
+      << "halt-padded draft slots must reach the target as token 0";
+  EXPECT_TRUE(torch::equal(draft_outputs[1].sample_output.next_tokens.cpu(),
+                           torch::full({2}, /*fill_value=*/-1, torch::kInt64)))
+      << "the proposal-domain sentinel must stay in the original draft "
+         "tensors";
 }
 
 class BlockDiffusionDecodeTest : public ::testing::Test {
