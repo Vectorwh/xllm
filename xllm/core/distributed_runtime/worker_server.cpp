@@ -189,11 +189,22 @@ void WorkerServer::create_server(const runtime::Options& options,
         options.text_encoder_tp_size());
     comm = std::move(dit_comm);
   } else {
+    // DP1 layerwise KV preparation must agree across the full TP x CP cohort.
+    // This worker-side condition is a necessary-condition approximation: it
+    // may build the group when the feature will not proceed, but never skips
+    // it for an admitted run. LLMEngine::estimate_kv_cache_capacity remains
+    // the authoritative admission (NPU, TORCH, DP1, eager, PUSH). On ATB the
+    // communicator returns before assigning tp_cp_group_, but that engine
+    // CHECK fires first, so an ATB run never reaches this worker.
+    // Keep the DP check in sync with the DP=1 admission in
+    // kv_cache_estimation.cpp; DP>1 needs a per-DP cohort first.
     const bool needs_tp_cp_group =
-        Platform::uses_cp_independent_tp_for_block_diffusion_draft() &&
-        options.enable_speculative_decode() &&
-        SpeculativeConfig::is_block_diffusion_algorithm(
-            options.speculative_algorithm());
+        (Platform::uses_cp_independent_tp_for_block_diffusion_draft() &&
+         options.enable_speculative_decode() &&
+         SpeculativeConfig::is_block_diffusion_algorithm(
+             options.speculative_algorithm())) ||
+        (Platform::is_npu() && options.dp_size() == 1 &&
+         KVCacheConfig::get_instance().prefill_layerwise_num_buffers() > 0);
     auto common_comm = std::make_unique<CollectiveCommunicator>(
         worker_global_rank,
         world_size,

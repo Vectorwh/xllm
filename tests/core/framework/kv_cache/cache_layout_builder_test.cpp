@@ -38,15 +38,18 @@ namespace {
 
 class PreparationProcessGroup final : public ProcessGroup {
  public:
-  PreparationProcessGroup(int32_t rank, bool peer_prepared)
-      : ProcessGroup(rank, /*world_size=*/2, torch::Device(torch::kCPU)),
+  PreparationProcessGroup(int32_t rank, int32_t world_size, bool peer_prepared)
+      : ProcessGroup(rank, world_size, torch::Device(torch::kCPU)),
         peer_prepared_(peer_prepared) {}
 
   torch::Tensor allgather_base_sync(const torch::Tensor& input) override {
     ++allgather_count_;
-    const torch::Tensor peer =
-        torch::full_like(input, static_cast<int64_t>(peer_prepared_));
-    return rank() == 0 ? torch::cat({input, peer}) : torch::cat({peer, input});
+    torch::Tensor prepared = torch::ones({world_size()}, input.options());
+    if (!peer_prepared_) {
+      prepared[0] = 0;
+    }
+    prepared[rank()] = input[0];
+    return prepared;
   }
 
   void peer_prepared(bool value) { peer_prepared_ = value; }
@@ -68,9 +71,13 @@ TEST(CacheLayoutBuilderTest,
   options.device(torch::Device(torch::kCPU))
       .dtype(torch::kFloat32)
       .num_layers(2);
-  std::array<std::vector<KVCache>, 2> caches;
-  std::array<std::unique_ptr<PrefillLayerwiseKVCache>, 2> owners;
-  for (int32_t rank = 0; rank < 2; ++rank) {
+  // TP=2, CP=2: rank 0 rejects in the first TP cohort. Both ranks in the
+  // other CP cohort must reject too, preserving each worker's Host history.
+  constexpr int32_t kWorldSize = 4;
+  std::array<std::vector<KVCache>, kWorldSize> caches;
+  std::array<std::unique_ptr<PrefillLayerwiseKVCache>, kWorldSize> owners;
+  std::array<std::unique_ptr<PreparationProcessGroup>, kWorldSize> groups;
+  for (int32_t rank = 0; rank < kWorldSize; ++rank) {
     owners[rank] =
         std::make_unique<PrefillLayerwiseKVCache>(shape,
                                                   options,
@@ -80,6 +87,8 @@ TEST(CacheLayoutBuilderTest,
     for (int32_t layer = 0; layer < 2; ++layer) {
       owners[rank]->host_caches()[layer].get_k_cache().fill_(rank * 10 + layer);
     }
+    groups[rank] = std::make_unique<PreparationProcessGroup>(
+        rank, kWorldSize, /*peer_prepared=*/rank == 0);
   }
   ModelInputParams params;
   params.meta.batch_forward_type = BatchForwardType::PREFILL;
@@ -88,21 +97,12 @@ TEST(CacheLayoutBuilderTest,
   params.attention.host.q_seq_lens = {1};
   ModelInputParams invalid = params;
   invalid.attention.host.block_tables = torch::tensor({{-1}}, torch::kInt32);
-  PreparationProcessGroup rank0_group(/*rank=*/0, /*peer_prepared=*/true);
-  PreparationProcessGroup rank1_group(/*rank=*/1, /*peer_prepared=*/false);
-  std::array<PreparationProcessGroup*, 2> groups{&rank0_group, &rank1_group};
-
-  ASSERT_FALSE(owners[0]->begin(invalid,
-                                /*block_size=*/2,
-                                /*compute_stream=*/nullptr,
-                                /*expect_push=*/true,
-                                groups[0]));
-  ASSERT_FALSE(owners[1]->begin(params,
-                                /*block_size=*/2,
-                                /*compute_stream=*/nullptr,
-                                /*expect_push=*/true,
-                                groups[1]));
-  for (int32_t rank = 0; rank < 2; ++rank) {
+  for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+    ASSERT_FALSE(owners[rank]->begin(rank == 0 ? invalid : params,
+                                     /*block_size=*/2,
+                                     /*compute_stream=*/nullptr,
+                                     /*expect_push=*/true,
+                                     groups[rank].get()));
     EXPECT_EQ(groups[rank]->allgather_count(), 1);
     for (int32_t layer = 0; layer < 2; ++layer) {
       EXPECT_TRUE(owners[rank]
@@ -117,7 +117,7 @@ TEST(CacheLayoutBuilderTest,
                                     /*block_size=*/2,
                                     /*compute_stream=*/nullptr,
                                     /*expect_push=*/false,
-                                    groups[rank]));
+                                    groups[rank].get()));
     EXPECT_EQ(groups[rank]->allgather_count(), 2);
     for (int32_t layer = 0; layer < 2; ++layer) {
       ASSERT_TRUE(owners[rank]->synchronize_layer(layer));

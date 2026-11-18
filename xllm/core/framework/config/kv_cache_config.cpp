@@ -70,8 +70,9 @@ DEFINE_int64(
 DEFINE_int32(prefill_layerwise_num_buffers,
              0,
              "Reusable prefill KV layer buffers. 0 disables offload; positive "
-             "values require task=generate, NPU eager PREFILL/PUSH on "
-             "glm_moe_dsa with DP=1, CP=1.");
+             "values require task=generate, NPU TORCH eager PREFILL/PUSH on "
+             "glm_moe_dsa with DP=1. CP>1 additionally requires an explicit "
+             "kv_split_size=1.");
 
 DEFINE_double(prefill_layerwise_host_memory_gb,
               8.0,
@@ -192,6 +193,22 @@ void KVCacheConfig::validate_prefill_layerwise_worker_mode(
   CHECK_EQ(task, "generate")
       << "Prefill layerwise offload requires task=generate; embedding workers "
          "do not drive the layerwise KV lifecycle.";
+}
+
+void KVCacheConfig::validate_prefill_layerwise_parallel_mode(
+    int32_t cp_size,
+    int32_t layerwise_split_size,
+    int32_t kv_split_size_effective) const {
+  if (prefill_layerwise_num_buffers_ <= 0) {
+    return;
+  }
+  CHECK_GT(cp_size, 0) << "Prefill layerwise offload requires CP >= 1.";
+  CHECK_EQ(layerwise_split_size, 1)
+      << "Prefill layerwise offload requires layerwise_split_size=1.";
+  CHECK_LE(kv_split_size_effective, 1)
+      << "Prefill layerwise offload requires effective kv_split_size<=1; "
+         "kv_split_size=0 inherits cp_size, so set kv_split_size=1 explicitly "
+         "when CP>1.";
 }
 
 }  // namespace xllm

@@ -293,7 +293,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
             options_.block_size(),
             prefill_stream.get(),
             /*expect_push=*/!input.transfer_kv_infos.empty(),
-            context_.get_parallel_args().tp_group_)) {
+            context_.get_parallel_args().tp_cp_group_)) {
       LOG(ERROR) << "Failed to prepare prefill layerwise KV, batch_id="
                  << model_params.meta.batch_id;
       return make_failed_output(model_params.embedding.request_ids);

@@ -605,8 +605,8 @@ bool WorkerImpl::allocate_kv_cache_storage(
     // silently corrupting their prefill cache.
     CHECK(Platform::is_npu()) << "Prefill layerwise KV offload requires NPU.";
     CHECK(parallel_args_.world_size() == 1 ||
-          parallel_args_.tp_group_ != nullptr)
-        << "Prefill layerwise KV preparation requires a TP process group.";
+          parallel_args_.tp_cp_group_ != nullptr)
+        << "Prefill layerwise KV preparation requires a TP x CP process group.";
     prefill_layerwise_kv_cache_ = std::make_shared<PrefillLayerwiseKVCache>(
         kv_cache_shape,
         create_options,

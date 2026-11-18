@@ -42,6 +42,12 @@ class KVCacheConfig final {
   // Called after the backend is resolved, before estimating or allocating KV.
   void validate_prefill_layerwise_worker_mode(const std::string& backend,
                                               const std::string& task) const;
+  // Validate the replicated KV layout required by prefill layerwise
+  // offloading (CP1 aliases the model TP group; CP>1 uses the TP x CP cohort).
+  void validate_prefill_layerwise_parallel_mode(
+      int32_t cp_size,
+      int32_t layerwise_split_size,
+      int32_t kv_split_size_effective) const;
 
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {

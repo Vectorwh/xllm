@@ -505,9 +505,10 @@ KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
         << "Prefill layerwise offload currently requires PD PUSH.";
     CHECK(!options_.enable_graph())
         << "Prefill layerwise offload requires eager execution.";
-    CHECK_EQ(options_.cp_size(), 1);
-    CHECK_EQ(ParallelConfig::get_instance().layerwise_split_size(), 1);
-    CHECK_LE(ParallelConfig::get_instance().kv_split_size(), 1);
+    cache_config.validate_prefill_layerwise_parallel_mode(
+        options_.cp_size(),
+        ParallelConfig::get_instance().layerwise_split_size(),
+        ParallelConfig::get_instance().kv_split_size_effective());
     CHECK(!options_.enable_speculative_decode());
     CHECK(!options_.is_draft_engine());
     CHECK(!options_.enable_sleep_mode());

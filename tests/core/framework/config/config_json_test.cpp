@@ -316,15 +316,6 @@ class DumpConfigJsonFlagGuard final {
   std::string old_dump_config_json_file_;
 };
 
-class CpSizeFlagGuard final {
- public:
-  CpSizeFlagGuard() : old_cp_size_(FLAGS_cp_size) {}
-  ~CpSizeFlagGuard() { FLAGS_cp_size = old_cp_size_; }
-
- private:
-  int32_t old_cp_size_;
-};
-
 class ConfigFlagGuard final {
  public:
   ConfigFlagGuard()
@@ -622,6 +613,47 @@ TEST(KVCacheConfigValidationTest, PrefillOffloadRejectsEmbeddingWorker) {
       config.validate_prefill_layerwise_worker_mode("llm", "embed"));
 }
 
+TEST(KVCacheConfigValidationTest, PrefillOffloadAdmitsContextParallel) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  KVCacheConfig config;
+  config.prefill_layerwise_num_buffers(1);
+
+  for (int32_t cp_size : {1, 2, 4}) {
+    EXPECT_NO_FATAL_FAILURE(config.validate_prefill_layerwise_parallel_mode(
+        cp_size,
+        /*layerwise_split_size=*/1,
+        /*kv_split_size_effective=*/1));
+  }
+  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
+                   4,
+                   /*layerwise_split_size=*/2,
+                   /*kv_split_size_effective=*/1),
+               "layerwise_split_size=1");
+  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
+                   4,
+                   /*layerwise_split_size=*/1,
+                   /*kv_split_size_effective=*/2),
+               "effective kv_split_size<=1");
+  // kv_split_size=0 inherits cp_size. CP>1 therefore selects the unsupported
+  // sharded path even though the raw flag itself is not greater than one.
+  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
+                   4,
+                   /*layerwise_split_size=*/1,
+                   /*kv_split_size_effective=*/4),
+               "effective kv_split_size<=1");
+  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
+                   0,
+                   /*layerwise_split_size=*/1,
+                   /*kv_split_size_effective=*/1),
+               "CP >= 1");
+
+  config.prefill_layerwise_num_buffers(0);
+  EXPECT_NO_FATAL_FAILURE(config.validate_prefill_layerwise_parallel_mode(
+      0,
+      /*layerwise_split_size=*/2,
+      /*kv_split_size_effective=*/2));
+}
+
 TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {
   KVCacheConfig config;
 
@@ -657,15 +689,44 @@ TEST(KVCacheConfigValidationTest, RejectsUnsupportedIndexerCacheDtypes) {
 }
 
 TEST(ConfigJsonTest, ParallelConfigHandlesKvSplitSize) {
-  CpSizeFlagGuard flag_guard;
-  const JsonReader json = config::parse_json_string(
-      R"json({"cp_size": 1, "kv_split_size": 2})json");
-  ParallelConfig parallel_config;
-  parallel_config.from_json(json);
+  // from_json writes the resolved value back into FLAGS_kv_split_size, and a
+  // direct FLAGS_ assignment cannot restore gflags' is_default bit. Scope a
+  // FlagSaver around each parse so every case starts with both the value and
+  // the bit restored, and no state leaks to sibling tests.
+  {
+    google::FlagSaver flag_saver;
+    const JsonReader json = config::parse_json_string(
+        R"json({"cp_size": 1, "kv_split_size": 2})json");
+    ParallelConfig parallel_config;
+    parallel_config.from_json(json);
 
-  EXPECT_EQ(parallel_config.cp_size(), 1);
-  EXPECT_EQ(parallel_config.kv_split_size(), 2);
-  EXPECT_EQ(parallel_config.kv_split_size_effective(), 2);
+    EXPECT_EQ(parallel_config.cp_size(), 1);
+    EXPECT_EQ(parallel_config.kv_split_size(), 2);
+    EXPECT_EQ(parallel_config.kv_split_size_effective(), 2);
+  }
+
+  // kv_split_size=0 inherits cp_size. The layerwise admission reads this
+  // effective width, so lock the inherited values that decide whether CP>1 is
+  // rejected as a sharded layout.
+  {
+    google::FlagSaver flag_saver;
+    const JsonReader inherit_json = config::parse_json_string(
+        R"json({"cp_size": 4, "kv_split_size": 0})json");
+    ParallelConfig inherit_config;
+    inherit_config.from_json(inherit_json);
+    EXPECT_EQ(inherit_config.cp_size(), 4);
+    EXPECT_EQ(inherit_config.kv_split_size(), 0);
+    EXPECT_EQ(inherit_config.kv_split_size_effective(), 4);
+  }
+
+  {
+    google::FlagSaver flag_saver;
+    const JsonReader single_json = config::parse_json_string(
+        R"json({"cp_size": 1, "kv_split_size": 0})json");
+    ParallelConfig single_config;
+    single_config.from_json(single_json);
+    EXPECT_EQ(single_config.kv_split_size_effective(), 1);
+  }
 }
 
 TEST(KVCacheStoreConfigTest, ReadsAndExportsRdmaDevices) {
