@@ -369,10 +369,19 @@ void dequant_from_paged_cache(ReshapeFromCacheParams& params) {
 
 void fused_layernorm(FusedLayerNormParams& params) {
 #if defined(USE_MLU)
+  if (!params.output.defined()) {
+    params.output = torch::empty_like(params.input);
+  }
+  if (params.residual.has_value() &&
+      (!params.residual_out.has_value() || !params.residual_out->defined())) {
+    params.residual_out = torch::empty_like(params.residual.value());
+  }
+  const torch::Tensor weight =
+      params.add_gamma_offset ? 1.0 + params.weight : params.weight;
   mlu::fused_layernorm(params.input,
                        params.output,
                        params.residual,
-                       params.weight,
+                       weight,
                        params.beta,
                        params.bias,
                        params.quant_scale,
@@ -418,66 +427,38 @@ void fused_layernorm(FusedLayerNormParams& params) {
     params.output += params.beta.value();
   }
 #elif defined(USE_MUSA)
-  if (params.mode == "layernorm") {
-    CHECK(params.beta.has_value()) << "LayerNorm requires beta";
-    if (params.residual.has_value() && params.residual_out.has_value() &&
-        params.residual_out->defined() && params.output.defined()) {
-      CHECK(!params.output.is_alias_of(params.residual_out.value()))
-          << "LayerNorm output and residual_out must not share storage";
-    }
-    torch::Tensor norm_input = params.input;
-    if (params.residual.has_value()) {
-      norm_input = params.input + params.residual.value();
-      if (params.residual_out.has_value() && params.residual_out->defined()) {
-        CHECK(params.residual_out->sizes() == norm_input.sizes())
-            << "LayerNorm residual_out size mismatch";
-        params.residual_out->copy_(norm_input);
-      } else {
-        params.residual_out = norm_input;
-      }
-    }
-    torch::Tensor norm_output = torch::layer_norm(norm_input,
-                                                  {params.input.size(-1)},
-                                                  params.weight,
-                                                  params.beta.value(),
-                                                  params.eps);
-    if (params.output.defined()) {
-      CHECK(params.output.sizes() == norm_output.sizes())
-          << "LayerNorm output size mismatch";
-      params.output.copy_(norm_output);
-    } else {
-      params.output = norm_output;
-    }
-  } else if (params.residual.has_value()) {
-    gpu_kernels::fused_add_rms_norm(
-        params.input, params.residual.value(), params.weight, params.eps);
-    params.output = params.input;
-    params.residual_out = params.residual;
-  } else {
-    gpu_kernels::rms_norm(
-        params.output, params.input, params.weight, params.eps);
-  }
+  musa::fused_layernorm(params);
 #elif defined(USE_CUDA) || defined(USE_DCU)
+  torch::Tensor weight =
+      params.add_gamma_offset ? 1.0 + params.weight : params.weight;
   if (params.residual.has_value()) {
     gpu_kernels::fused_add_rms_norm(
-        params.input, params.residual.value(), params.weight, params.eps);
+        params.input, params.residual.value(), weight, params.eps);
     params.output = params.input;
     params.residual_out = params.residual;
   } else {
-    gpu_kernels::rms_norm(
-        params.output, params.input, params.weight, params.eps);
+    gpu_kernels::rms_norm(params.output, params.input, weight, params.eps);
   }
 #elif defined(USE_ILU)
+  if (!params.output.defined()) {
+    params.output = torch::empty_like(params.input);
+  }
+  if (params.residual.has_value() &&
+      (!params.residual_out.has_value() || !params.residual_out->defined())) {
+    params.residual_out = torch::empty_like(params.residual.value());
+  }
+  torch::Tensor weight =
+      params.add_gamma_offset ? 1.0 + params.weight : params.weight;
   if (params.residual.has_value()) {
     ilu::residual_layer_norm(params.input,
                              params.output,
                              params.residual,
-                             params.weight,
+                             weight,
                              params.bias,  // residual_bias
                              params.residual_out,
                              params.eps);
   } else {
-    ilu::rms_norm(params.output, params.input, params.weight, params.eps);
+    ilu::rms_norm(params.output, params.input, weight, params.eps);
   }
 #else
   NOT_IMPLEMENTED();

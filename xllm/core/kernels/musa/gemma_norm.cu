@@ -23,6 +23,8 @@ limitations under the License.
 
 #include "core/kernels/musa/musa_ops_api.h"
 #include "core/kernels/musa/musa_tvmffi_stream.h"
+#include "core/kernels/musa/norm_utils.cuh"
+#include "core/kernels/param.h"
 
 namespace xllm::kernel::musa {
 
@@ -56,6 +58,9 @@ class __align__(16) Vec8 final {
   static __device__ __forceinline__ Vec8 load_byp_slc(const T* ptr,
                                                       Offset idx) {
 #if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ == 310)
+    if constexpr (sizeof(T) != 2) {
+      return load(ptr, idx);
+    }
     uint4 raw;
     const T* addr = ptr + idx;
     asm volatile(
@@ -102,17 +107,6 @@ __device__ __forceinline__ T gemma_from_float(float value) {
   } else {
     return static_cast<T>(value);
   }
-}
-
-__device__ __forceinline__ float fast_rsqrt(float value) {
-#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ == 310)
-  const float half_value = 0.5f * value;
-  float y = __frsqrt_rn(value);
-  y = y * (1.5f - half_value * y * y);
-  return y;
-#else
-  return rsqrtf(value);
-#endif
 }
 
 __device__ __forceinline__ void block_sync() {
@@ -521,24 +515,34 @@ inline int cached_vec8_shared_bytes(int hidden,
 }
 
 template <typename T>
-void launch_rmsnorm_gemma(const T* input_ptr,
-                          const T* weight_ptr,
-                          T* out_ptr,
-                          int rows,
-                          int hidden,
-                          int input_outer_dim,
-                          int64_t input_outer_stride,
-                          int64_t input_row_stride,
-                          int64_t out_row_stride,
-                          float inv_hidden,
-                          float eps,
-                          cudaStream_t stream) {
-  if ((hidden % 8) == 0 && hidden <= 32768) {
+bool vec8_aligned(const T* pointer, int64_t row_stride) {
+  return reinterpret_cast<uintptr_t>(pointer) % 16 == 0 &&
+         (row_stride * sizeof(T)) % 16 == 0;
+}
+
+template <typename T, bool GEMMA>
+void launch_rmsnorm(const T* input_ptr,
+                    const T* weight_ptr,
+                    T* out_ptr,
+                    int rows,
+                    int hidden,
+                    int input_outer_dim,
+                    int64_t input_outer_stride,
+                    int64_t input_row_stride,
+                    int64_t out_row_stride,
+                    float inv_hidden,
+                    float eps,
+                    cudaStream_t stream) {
+  const bool aligned = vec8_aligned(input_ptr, input_row_stride) &&
+                       vec8_aligned(input_ptr, input_outer_stride) &&
+                       vec8_aligned(weight_ptr, 0) &&
+                       vec8_aligned(out_ptr, out_row_stride);
+  if (aligned && (hidden % 8) == 0 && hidden <= 32768) {
     if (rows <= 16 && hidden == 1024) {
       constexpr int threads = 128;
       constexpr int smem_bytes = 4 * static_cast<int>(sizeof(float));
       rmsnorm_small_h_one_vec_register_kernel<T,
-                                              /*GEMMA=*/true,
+                                              GEMMA,
                                               /*H=*/1024,
                                               /*WARPS=*/4>
           <<<rows, threads, smem_bytes, stream>>>(input_ptr,
@@ -558,7 +562,7 @@ void launch_rmsnorm_gemma(const T* input_ptr,
       constexpr int threads = 256;
       constexpr int smem_bytes = 8 * static_cast<int>(sizeof(float));
       rmsnorm_small_h_one_vec_register_kernel<T,
-                                              /*GEMMA=*/true,
+                                              GEMMA,
                                               /*H=*/2048,
                                               /*WARPS=*/8>
           <<<rows, threads, smem_bytes, stream>>>(input_ptr,
@@ -577,7 +581,7 @@ void launch_rmsnorm_gemma(const T* input_ptr,
     const int threads = rmsnorm_block_threads(rows, hidden);
     if (hidden <= 8192) {
       const int smem = cached_vec8_shared_bytes(hidden, threads, 8192);
-      rmsnorm_vec8_kernel<T, /*GEMMA=*/true, /*CACHE=*/true>
+      rmsnorm_vec8_kernel<T, GEMMA, /*CACHE=*/true>
           <<<rows, threads, smem, stream>>>(input_ptr,
                                             weight_ptr,
                                             out_ptr,
@@ -591,7 +595,7 @@ void launch_rmsnorm_gemma(const T* input_ptr,
                                             eps);
     } else {
       const int smem = cached_vec8_shared_bytes(hidden, threads, 8192);
-      rmsnorm_vec8_kernel<T, /*GEMMA=*/true, /*CACHE=*/false>
+      rmsnorm_vec8_kernel<T, GEMMA, /*CACHE=*/false>
           <<<rows, threads, smem, stream>>>(input_ptr,
                                             weight_ptr,
                                             out_ptr,
@@ -608,7 +612,7 @@ void launch_rmsnorm_gemma(const T* input_ptr,
     constexpr int threads = 256;
     constexpr int smem =
         ((threads + 31) / 32) * static_cast<int>(sizeof(float));
-    rmsnorm_scalar_kernel<T, /*GEMMA=*/true>
+    rmsnorm_scalar_kernel<T, GEMMA>
         <<<rows, threads, smem, stream>>>(input_ptr,
                                           weight_ptr,
                                           out_ptr,
@@ -623,21 +627,24 @@ void launch_rmsnorm_gemma(const T* input_ptr,
   }
 }
 
-template <typename T>
-void launch_fused_add_rmsnorm_gemma(T* input_ptr,
-                                    T* residual_ptr,
-                                    const T* weight_ptr,
-                                    int rows,
-                                    int hidden,
-                                    int64_t input_row_stride,
-                                    int64_t residual_row_stride,
-                                    float inv_hidden,
-                                    float eps,
-                                    cudaStream_t stream) {
-  if ((hidden % 8) == 0 && hidden <= 32768) {
+template <typename T, bool GEMMA>
+void launch_fused_add_rmsnorm(T* input_ptr,
+                              T* residual_ptr,
+                              const T* weight_ptr,
+                              int rows,
+                              int hidden,
+                              int64_t input_row_stride,
+                              int64_t residual_row_stride,
+                              float inv_hidden,
+                              float eps,
+                              cudaStream_t stream) {
+  const bool aligned = vec8_aligned(input_ptr, input_row_stride) &&
+                       vec8_aligned(residual_ptr, residual_row_stride) &&
+                       vec8_aligned(weight_ptr, 0);
+  if (aligned && (hidden % 8) == 0 && hidden <= 32768) {
     const int threads = fused_block_threads(hidden);
     const int smem = cached_vec8_shared_bytes(hidden, threads, 32768);
-    fused_add_rmsnorm_vec8_kernel<T, /*GEMMA=*/true, /*CACHE=*/true>
+    fused_add_rmsnorm_vec8_kernel<T, GEMMA, /*CACHE=*/true>
         <<<rows, threads, smem, stream>>>(input_ptr,
                                           residual_ptr,
                                           weight_ptr,
@@ -651,7 +658,7 @@ void launch_fused_add_rmsnorm_gemma(T* input_ptr,
     constexpr int threads = 256;
     constexpr int smem =
         ((threads + 31) / 32) * static_cast<int>(sizeof(float));
-    fused_add_rmsnorm_scalar_kernel<T, /*GEMMA=*/true>
+    fused_add_rmsnorm_scalar_kernel<T, GEMMA>
         <<<rows, threads, smem, stream>>>(input_ptr,
                                           residual_ptr,
                                           weight_ptr,
@@ -664,15 +671,21 @@ void launch_fused_add_rmsnorm_gemma(T* input_ptr,
   }
 }
 
-}  // namespace
-
-void gemma_rms_norm(torch::Tensor output,
-                    torch::Tensor input,
-                    torch::Tensor weight,
-                    double eps) {
+template <bool GEMMA>
+void rms_norm_impl(torch::Tensor output,
+                   torch::Tensor input,
+                   torch::Tensor weight,
+                   double eps) {
   CHECK(input.scalar_type() == output.scalar_type());
   CHECK(input.scalar_type() == weight.scalar_type());
-  CHECK(output.is_contiguous());
+  CHECK_EQ(output.sizes(), input.sizes());
+  CHECK_EQ(output.stride(-1), 1);
+  CHECK_GE(output.stride(-2), output.size(-1));
+  // Output rows may be slices of the MTP projection input. The kernel uses
+  // a single row stride, so 3D outputs must retain a packed outer dimension.
+  if (output.dim() == 3) {
+    CHECK_EQ(output.stride(-3), output.size(-2) * output.stride(-2));
+  }
   CHECK(weight.is_contiguous());
   CHECK(input.stride(-1) == 1)
       << "gemma_rms_norm requires the last dim to be contiguous "
@@ -699,7 +712,7 @@ void gemma_rms_norm(torch::Tensor output,
       input.scalar_type(),
       "gemma_rms_norm",
       AT_DISPATCH_CASE(torch::ScalarType::Half, [&] {
-        launch_rmsnorm_gemma<__half>(
+        launch_rmsnorm<__half, GEMMA>(
             reinterpret_cast<const __half*>(input.data_ptr<c10::Half>()),
             reinterpret_cast<const __half*>(weight.data_ptr<c10::Half>()),
             reinterpret_cast<__half*>(output.data_ptr<c10::Half>()),
@@ -713,7 +726,7 @@ void gemma_rms_norm(torch::Tensor output,
             static_cast<float>(eps),
             stream);
       }) AT_DISPATCH_CASE(torch::ScalarType::BFloat16, [&] {
-        launch_rmsnorm_gemma<__nv_bfloat16>(
+        launch_rmsnorm<__nv_bfloat16, GEMMA>(
             reinterpret_cast<const __nv_bfloat16*>(
                 input.data_ptr<c10::BFloat16>()),
             reinterpret_cast<const __nv_bfloat16*>(
@@ -729,34 +742,42 @@ void gemma_rms_norm(torch::Tensor output,
             static_cast<float>(eps),
             stream);
       }) AT_DISPATCH_CASE(torch::ScalarType::Float, [&] {
-        launch_rmsnorm_gemma<float>(input.data_ptr<float>(),
-                                    weight.data_ptr<float>(),
-                                    output.data_ptr<float>(),
-                                    rows,
-                                    hidden,
-                                    input_outer_dim,
-                                    input_outer_stride,
-                                    input_row_stride,
-                                    out_row_stride,
-                                    inv_hidden,
-                                    static_cast<float>(eps),
-                                    stream);
+        launch_rmsnorm<float, GEMMA>(input.data_ptr<float>(),
+                                     weight.data_ptr<float>(),
+                                     output.data_ptr<float>(),
+                                     rows,
+                                     hidden,
+                                     input_outer_dim,
+                                     input_outer_stride,
+                                     input_row_stride,
+                                     out_row_stride,
+                                     inv_hidden,
+                                     static_cast<float>(eps),
+                                     stream);
       }));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void fused_add_gemma_rms_norm(torch::Tensor& input,
-                              torch::Tensor& residual,
-                              torch::Tensor& weight,
-                              double epsilon) {
+template <bool GEMMA>
+void fused_add_rms_norm_impl(torch::Tensor& input,
+                             torch::Tensor& residual,
+                             torch::Tensor& weight,
+                             double epsilon) {
   CHECK(input.scalar_type() == residual.scalar_type());
   CHECK(input.scalar_type() == weight.scalar_type());
   CHECK(residual.is_contiguous());
   CHECK(weight.is_contiguous());
-  CHECK(input.is_contiguous())
-      << "fused_add_gemma_rms_norm requires a contiguous `input` (in-place "
-         "write back). Got strides="
-      << input.strides() << ", sizes=" << input.sizes();
+  if constexpr (GEMMA) {
+    CHECK(input.is_contiguous());
+  } else {
+    CHECK_GE(input.dim(), 2);
+    CHECK_EQ(input.stride(-1), 1);
+    CHECK_GE(input.stride(-2), input.size(-1));
+    for (int64_t dim = input.dim() - 3; dim >= 0; --dim) {
+      CHECK_EQ(input.stride(dim), input.size(dim + 1) * input.stride(dim + 1));
+    }
+  }
+  CHECK_EQ(input.sizes(), residual.sizes());
 
   const int hidden = input.size(-1);
   const int64_t input_row_stride = input.stride(-2);
@@ -771,7 +792,7 @@ void fused_add_gemma_rms_norm(torch::Tensor& input,
       input.scalar_type(),
       "fused_add_gemma_rms_norm",
       AT_DISPATCH_CASE(torch::ScalarType::Half, [&] {
-        launch_fused_add_rmsnorm_gemma<__half>(
+        launch_fused_add_rmsnorm<__half, GEMMA>(
             reinterpret_cast<__half*>(input.data_ptr<c10::Half>()),
             reinterpret_cast<__half*>(residual.data_ptr<c10::Half>()),
             reinterpret_cast<const __half*>(weight.data_ptr<c10::Half>()),
@@ -783,7 +804,7 @@ void fused_add_gemma_rms_norm(torch::Tensor& input,
             static_cast<float>(epsilon),
             stream);
       }) AT_DISPATCH_CASE(torch::ScalarType::BFloat16, [&] {
-        launch_fused_add_rmsnorm_gemma<__nv_bfloat16>(
+        launch_fused_add_rmsnorm<__nv_bfloat16, GEMMA>(
             reinterpret_cast<__nv_bfloat16*>(input.data_ptr<c10::BFloat16>()),
             reinterpret_cast<__nv_bfloat16*>(
                 residual.data_ptr<c10::BFloat16>()),
@@ -797,18 +818,107 @@ void fused_add_gemma_rms_norm(torch::Tensor& input,
             static_cast<float>(epsilon),
             stream);
       }) AT_DISPATCH_CASE(torch::ScalarType::Float, [&] {
-        launch_fused_add_rmsnorm_gemma<float>(input.data_ptr<float>(),
-                                              residual.data_ptr<float>(),
-                                              weight.data_ptr<float>(),
-                                              rows,
-                                              hidden,
-                                              input_row_stride,
-                                              residual_row_stride,
-                                              inv_hidden,
-                                              static_cast<float>(epsilon),
-                                              stream);
+        launch_fused_add_rmsnorm<float, GEMMA>(input.data_ptr<float>(),
+                                               residual.data_ptr<float>(),
+                                               weight.data_ptr<float>(),
+                                               rows,
+                                               hidden,
+                                               input_row_stride,
+                                               residual_row_stride,
+                                               inv_hidden,
+                                               static_cast<float>(epsilon),
+                                               stream);
       }));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+void gemma_rms_norm(torch::Tensor output,
+                    torch::Tensor input,
+                    torch::Tensor weight,
+                    double eps) {
+  rms_norm_impl<true>(output, input, weight, eps);
+}
+
+void fused_add_gemma_rms_norm(torch::Tensor& input,
+                              torch::Tensor& residual,
+                              torch::Tensor& weight,
+                              double eps) {
+  fused_add_rms_norm_impl<true>(input, residual, weight, eps);
+}
+
+void rms_norm(torch::Tensor output,
+              torch::Tensor input,
+              torch::Tensor weight,
+              double eps) {
+  CHECK_EQ(output.sizes(), input.sizes());
+  if (input.dim() > 3) {
+    CHECK(output.is_contiguous());
+    output = output.flatten(/*start_dim=*/0, /*end_dim=*/-2);
+    input = input.flatten(/*start_dim=*/0, /*end_dim=*/-2);
+  }
+  rms_norm_impl<false>(output, input, weight, eps);
+}
+
+void fused_add_rms_norm(torch::Tensor& input,
+                        torch::Tensor& residual,
+                        torch::Tensor& weight,
+                        double eps) {
+  fused_add_rms_norm_impl<false>(input, residual, weight, eps);
+}
+
+void fused_layernorm(FusedLayerNormParams& params) {
+  if (params.mode == "layernorm") {
+    CHECK(params.beta.has_value()) << "LayerNorm requires beta";
+    if (params.residual.has_value() && params.residual_out.has_value() &&
+        params.residual_out->defined() && params.output.defined()) {
+      CHECK(!params.output.is_alias_of(params.residual_out.value()))
+          << "LayerNorm output and residual_out must not share storage";
+    }
+    torch::Tensor norm_input = params.input;
+    if (params.residual.has_value()) {
+      norm_input = params.input + params.residual.value();
+      if (params.residual_out.has_value() && params.residual_out->defined()) {
+        CHECK(params.residual_out->sizes() == norm_input.sizes())
+            << "LayerNorm residual_out size mismatch";
+        params.residual_out->copy_(norm_input);
+      } else {
+        params.residual_out = norm_input;
+      }
+    }
+    torch::Tensor norm_output = torch::layer_norm(norm_input,
+                                                  {params.input.size(-1)},
+                                                  params.weight,
+                                                  params.beta.value(),
+                                                  params.eps);
+    if (params.output.defined()) {
+      CHECK(params.output.sizes() == norm_output.sizes())
+          << "LayerNorm output size mismatch";
+      params.output.copy_(norm_output);
+    } else {
+      params.output = norm_output;
+    }
+  } else if (params.residual.has_value()) {
+    if (params.add_gamma_offset) {
+      fused_add_gemma_rms_norm(
+          params.input, params.residual.value(), params.weight, params.eps);
+    } else {
+      fused_add_rms_norm(
+          params.input, params.residual.value(), params.weight, params.eps);
+    }
+    params.output = params.input;
+    params.residual_out = params.residual;
+  } else {
+    if (!params.output.defined()) {
+      params.output = torch::empty_like(params.input);
+    }
+    if (params.add_gamma_offset) {
+      gemma_rms_norm(params.output, params.input, params.weight, params.eps);
+    } else {
+      rms_norm(params.output, params.input, params.weight, params.eps);
+    }
+  }
 }
 
 }  // namespace xllm::kernel::musa

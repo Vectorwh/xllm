@@ -25,7 +25,13 @@ limitations under the License.
 
 #include "core/kernels/musa/musa_tvmffi_stream.h"
 
+namespace xllm::kernel {
+struct FusedLayerNormParams;
+}
+
 namespace xllm::kernel::musa {
+
+void fused_layernorm(FusedLayerNormParams& params);
 
 // Replaces negative dst entries with indexed values from src.
 void replace_token(torch::Tensor& dst,

@@ -17,12 +17,80 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include "core/kernels/musa/mrope.h"
+#include "core/kernels/musa/musa_ops_api.h"
 #include "core/kernels/ops_api.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 
 namespace xllm::kernel {
 namespace {
+
+TEST(MusaRopeTest, FusedQkNormPreservesStagedRoundingForBothPositionTypes) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "No MUSA device available";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  constexpr int64_t kHeadDim = 256;
+  constexpr int64_t kRotaryDim = 64;
+  constexpr double kEpsilon = 1e-6;
+  const torch::Device target = device.unwrap();
+  const torch::Tensor positions = torch::tensor({1, 0}, torch::kInt64);
+  const torch::Tensor source =
+      (torch::arange(2 * 4 * kHeadDim).remainder(17).to(torch::kFloat32) / 16 -
+       0.5)
+          .view({2, 4 * kHeadDim});
+  for (const torch::ScalarType dtype : {torch::kBFloat16, torch::kFloat16}) {
+    SCOPED_TRACE(dtype);
+    const torch::Tensor input = source.to(dtype).to(target);
+    const torch::Tensor weight =
+        (torch::arange(kHeadDim).remainder(7).to(torch::kFloat32) / 16 - 0.25)
+            .to(dtype)
+            .to(target);
+    torch::Tensor cache =
+        (torch::arange(2 * kRotaryDim).remainder(11).to(torch::kFloat32) / 16)
+            .view({2, kRotaryDim})
+            .to(dtype)
+            .to(target);
+    for (const bool interleaved : {false, true}) {
+      SCOPED_TRACE(interleaved);
+      torch::Tensor expected = input.clone();
+      torch::Tensor query = expected.narrow(1, 0, kHeadDim);
+      torch::Tensor key = expected.narrow(1, 2 * kHeadDim, kHeadDim);
+      musa::gemma_rms_norm(
+          query, input.slice(1, 0, kHeadDim), weight, kEpsilon);
+      musa::gemma_rms_norm(
+          key, input.slice(1, 2 * kHeadDim, 3 * kHeadDim), weight, kEpsilon);
+      torch::Tensor device_positions = positions.to(target);
+      musa::partial_rotary_embedding_inplace(device_positions,
+                                             query,
+                                             key,
+                                             cache,
+                                             kHeadDim,
+                                             kRotaryDim,
+                                             /*is_neox=*/!interleaved);
+      for (const torch::ScalarType position_type :
+           {torch::kInt32, torch::kInt64}) {
+        SCOPED_TRACE(position_type);
+        torch::Tensor actual = input.clone();
+        musa::fused_qk_norm_rope(actual,
+                                 /*num_heads_q=*/1,
+                                 /*num_heads_k=*/1,
+                                 /*num_heads_v=*/1,
+                                 kHeadDim,
+                                 kEpsilon,
+                                 weight,
+                                 weight,
+                                 cache,
+                                 interleaved,
+                                 positions.to(position_type).to(target),
+                                 /*k_head_offset=*/2);
+        EXPECT_TRUE(torch::equal(actual.cpu(), expected.cpu()));
+      }
+    }
+  }
+}
 
 TEST(MusaRopeTest, MatchesReferenceWithAndWithoutKey) {
   if (Platform::device_count() == 0) {
