@@ -168,6 +168,7 @@ ModelArgs moe_model_args() {
   model.n_shared_experts() = 0;
   model.n_group() = 1;
   model.topk_group() = 1;
+  model.routed_scaling_factor() = 1.0f;
   model.scoring_func() = "softmax";
   model.topk_method() = "greedy";
   model.hidden_act() = "silu";

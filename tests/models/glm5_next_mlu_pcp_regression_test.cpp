@@ -13,13 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// CP8 hybrid KDA/DSA and quantized MoE regression across chunked prefill,
-// decode and a second turn. Verification requires an independently frozen
-// baseline in XLLM_GLM5_NEXT_PCP_BASELINE_DIR; this test never records one.
-// Channels are production-sized; FFN/expert/vocabulary/layer counts are
-// reduced. Graph replay, speculative verification and long-context sparse
-// selection are not covered. XLLM_GLM5_NEXT_PCP_STRICT_BITS=1 requires exact
-// tensors.
+// CP8 hybrid KDA/DSA with deterministic checkpoint-format weights.
+// FFN, expert, vocabulary and layer counts are reduced.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -29,16 +24,12 @@ limitations under the License.
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
+#include <initializer_list>
 #include <memory>
-#include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -103,21 +94,9 @@ constexpr double kTolerance = 1e-3;
 
 constexpr int32_t kExitSkip = 77;
 constexpr int32_t kExitMismatch = 1;
-constexpr int32_t kExitMissingBaseline = 3;
 constexpr uint32_t kChildTimeoutSeconds = 1500;
 
-constexpr char kBaselineDirEnv[] = "XLLM_GLM5_NEXT_PCP_BASELINE_DIR";
-constexpr char kBaselineModeEnv[] = "XLLM_GLM5_NEXT_PCP_BASELINE_MODE";
-constexpr char kStrictBitsEnv[] = "XLLM_GLM5_NEXT_PCP_STRICT_BITS";
-constexpr char kManifestName[] = "MANIFEST";
-constexpr char kTensorMagic[8] = {'X', 'L', 'T', 'E', 'N', 'S', '0', '1'};
-
 using Weights = std::unordered_map<std::string, torch::Tensor>;
-
-struct BaselineOptions {
-  std::string directory;
-  bool strict_bits = false;
-};
 
 uint64_t fnv1a64(const std::string& text) {
   uint64_t hash = 0xcbf29ce484222325ULL;
@@ -649,25 +628,84 @@ struct SequenceState {
   int32_t length = 0;
 };
 
+struct HiddenSamples {
+  float values[2][4];
+};
+
+struct CacheSamples {
+  // [sequence][key, compressed index]
+  float dsa[2][2];
+  // [CP rank][sequence][conv, SSM] for the first logical head on each rank.
+  float kda[kWorldSize][2][2];
+};
+
+// CP=8 / EP=8 samples from e414171ef on MLU590-M9DK, using kWeightSeed.
+constexpr HiddenSamples kPrefill = {
+    {{0.330078125f, 1.1015625f, -1.78125f, 0.85546875f},
+     {-0.125f, 1.328125f, 1.328125f, -1.515625f}}};
+constexpr HiddenSamples kChunk2 = {
+    {{1.234375f, -0.80078125f, 0.53515625f, -0.14453125f},
+     {-0.296875f, 0.83984375f, -1.8359375f, 1.3046875f}}};
+constexpr HiddenSamples kDecode2 = {
+    {{0.9609375f, -0.01177978516f, -1.09375f, -1.8046875f},
+     {0.0048828125f, -0.447265625f, 0.6953125f, 0.1206054688f}}};
+constexpr HiddenSamples kTurn2Decode = {
+    {{-0.6015625f, -0.185546875f, -0.703125f, -0.94921875f},
+     {0.359375f, -1.3359375f, -1.1875f, 0.1298828125f}}};
+constexpr CacheSamples kChunk2Caches = {
+    .dsa = {{4.0625f, -0.03247070312f}, {-0.1137695312f, 0.447265625f}},
+    .kda = {
+        {{2.234375f, 0.0001716940023f}, {-0.6640625f, 0.0007297327975f}},
+        {{-0.359375f, 0.007880941033f}, {-0.58203125f, 0.001331661362f}},
+        {{-0.00373840332f, 0.002957318211f}, {0.1416015625f, 0.001119454275f}},
+        {{0.57421875f, 0.002118875273f}, {0.365234375f, 0.001077918801f}},
+        {{1.7734375f, 0.0005943361903f}, {0.2890625f, -0.0008219594019f}},
+        {{-0.01165771484f, -0.004967074841f},
+         {-0.2099609375f, 0.002834114246f}},
+        {{-0.40625f, 0.0007942903903f}, {-0.412109375f, -0.001497511286f}},
+        {{-0.7578125f, -0.002814526903f}, {-0.1245117188f, -0.001458446961f}}}};
+constexpr CacheSamples kDecode2Caches = {
+    .dsa = {{-0.2451171875f, 0.30078125f}, {0.435546875f, 0.3828125f}},
+    .kda = {
+        {{0.45703125f, 0.002365184948f}, {-0.2451171875f, 0.004235941451f}},
+        {{0.8125f, 0.002829528879f}, {-1.5703125f, -0.0009964628844f}},
+        {{0.4609375f, 2.004753333e-05f}, {0.3515625f, -0.002220587106f}},
+        {{-0.416015625f, -0.01119114645f}, {-0.1513671875f, -0.000190579085f}},
+        {{-0.1015625f, -0.001932092477f}, {0.271484375f, -0.00103383814f}},
+        {{0.1030273438f, 0.004069101065f}, {0.0908203125f, -0.0003122166381f}},
+        {{-0.85546875f, -8.80745938e-05f}, {-1.3828125f, 1.320186675e-05f}},
+        {{-0.095703125f, 0.01216405164f}, {0.25390625f, -0.003447745461f}}}};
+constexpr float kTurn2Aux[2][3][2] = {{{-0.443359375f, -0.37890625f},
+                                       {-0.392578125f, -0.4296875f},
+                                       {-0.2470703125f, -0.6015625f}},
+                                      {{-1.203125f, -0.9453125f},
+                                       {-1.203125f, -0.8671875f},
+                                       {-1.1484375f, -0.9296875f}}};
+
 struct Step {
   std::string name;
   BatchForwardType::Value type = BatchForwardType::PREFILL;
   std::vector<int32_t> new_tokens;
-  bool snapshot_caches = false;
+  const HiddenSamples* hidden = nullptr;
+  const CacheSamples* caches = nullptr;
 };
 
 // Every prefill segment gives sequence 0 at least 449 tokens, i.e. eight
 // 64-token KDA chunks, so all eight ranks own tokens and PCP engages.
 std::vector<Step> make_steps() {
   return {
-      {"prefill", BatchForwardType::PREFILL, {512, 200}, false},
-      {"chunk1", BatchForwardType::CHUNKED_PREFILL, {576, 96}, false},
-      {"chunk2", BatchForwardType::CHUNKED_PREFILL, {449, 1}, true},
-      {"decode0", BatchForwardType::DECODE, {1, 1}, false},
-      {"decode1", BatchForwardType::DECODE, {1, 1}, false},
-      {"decode2", BatchForwardType::DECODE, {1, 1}, true},
-      {"turn2_chunk", BatchForwardType::CHUNKED_PREFILL, {512, 130}, false},
-      {"turn2_decode", BatchForwardType::DECODE, {1, 1}, true},
+      {"prefill", BatchForwardType::PREFILL, {512, 200}, &kPrefill},
+      {"chunk1", BatchForwardType::CHUNKED_PREFILL, {576, 96}},
+      {"chunk2",
+       BatchForwardType::CHUNKED_PREFILL,
+       {449, 1},
+       &kChunk2,
+       &kChunk2Caches},
+      {"decode0", BatchForwardType::DECODE, {1, 1}},
+      {"decode1", BatchForwardType::DECODE, {1, 1}},
+      {"decode2", BatchForwardType::DECODE, {1, 1}, &kDecode2, &kDecode2Caches},
+      {"turn2_chunk", BatchForwardType::CHUNKED_PREFILL, {512, 130}},
+      {"turn2_decode", BatchForwardType::DECODE, {1, 1}, &kTurn2Decode},
   };
 }
 
@@ -764,178 +802,112 @@ StepInput make_step_input(const Step& step,
   return input;
 }
 
-std::string tensor_path(const std::string& directory, const std::string& name) {
-  return directory + "/" + name + ".tensor";
+void expect_sample(const torch::Tensor& tensor,
+                   std::initializer_list<int64_t> coordinates,
+                   float expected,
+                   const char* name) {
+  torch::Tensor value = tensor;
+  for (const int64_t index : coordinates) {
+    value = value.select(0, index);
+  }
+  const float actual = value.item<float>();
+  ASSERT_TRUE(std::isfinite(actual))
+      << name << " at " << ::testing::PrintToString(coordinates);
+  EXPECT_NEAR(actual, expected, kTolerance + kTolerance * std::abs(expected))
+      << name << " at " << ::testing::PrintToString(coordinates);
 }
 
-std::optional<torch::Tensor> read_tensor(const std::string& path) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    return std::nullopt;
+void check_hidden(const Step& step,
+                  const torch::Tensor& hidden,
+                  const HiddenSamples& expected) {
+  const int64_t rows = step.new_tokens[0] + step.new_tokens[1];
+  ASSERT_EQ(hidden.sizes(), torch::IntArrayRef({rows, kHiddenSize}));
+  ASSERT_EQ(hidden.scalar_type(), torch::kBFloat16);
+  constexpr int64_t kChannels[] = {0, 127, 1024, kHiddenSize - 1};
+  int64_t row = -1;
+  for (int32_t seq = 0; seq < 2; ++seq) {
+    SCOPED_TRACE(::testing::Message() << "sequence " << seq);
+    row += step.new_tokens[seq];
+    for (int32_t i = 0; i < 4; ++i) {
+      expect_sample(
+          hidden, {row, kChannels[i]}, expected.values[seq][i], "hidden");
+    }
   }
-  char magic[sizeof(kTensorMagic)];
-  int32_t dtype = 0;
-  int32_t rank = 0;
-  file.read(magic, sizeof(magic));
-  file.read(reinterpret_cast<char*>(&dtype), sizeof(dtype));
-  file.read(reinterpret_cast<char*>(&rank), sizeof(rank));
-  if (!file || std::memcmp(magic, kTensorMagic, sizeof(magic)) != 0 ||
-      rank < 0 || rank > 8) {
-    return std::nullopt;
-  }
-  std::vector<int64_t> shape(static_cast<size_t>(rank));
-  file.read(reinterpret_cast<char*>(shape.data()),
-            static_cast<std::streamsize>(shape.size() * sizeof(int64_t)));
-  torch::Tensor tensor =
-      torch::empty(shape, static_cast<torch::ScalarType>(dtype));
-  file.read(static_cast<char*>(tensor.data_ptr()),
-            static_cast<std::streamsize>(tensor.nbytes()));
-  if (!file) {
-    return std::nullopt;
-  }
-  return tensor;
 }
 
-// Compares tensors with an independently frozen baseline.
-// A verification never derives its expectation from the current run.
-class BaselineSession final {
- public:
-  BaselineSession(BaselineOptions options, int32_t rank)
-      : options_(std::move(options)), rank_(rank) {}
-
-  // Returns false when a required baseline is absent.
-  bool open() {
-    std::ifstream manifest(options_.directory + "/" + kManifestName);
-    if (!manifest) {
-      return false;
-    }
-    std::string name;
-    while (std::getline(manifest, name)) {
-      if (!name.empty()) {
-        expected_.emplace(std::move(name));
+void check_aux(const torch::Tensor& aux, const std::vector<int32_t>& layers) {
+  ASSERT_EQ(layers.size(), 3);
+  ASSERT_EQ(aux.sizes(), torch::IntArrayRef({2, 3 * kHiddenSize}));
+  ASSERT_EQ(aux.scalar_type(), torch::kBFloat16);
+  constexpr int64_t kChannels[] = {127, 1024};
+  for (int32_t seq = 0; seq < 2; ++seq) {
+    for (int32_t slot = 0; slot < 3; ++slot) {
+      SCOPED_TRACE(::testing::Message()
+                   << "sequence " << seq << " layer " << layers[slot]);
+      for (int32_t i = 0; i < 2; ++i) {
+        expect_sample(aux,
+                      {seq, slot * kHiddenSize + kChannels[i]},
+                      kTurn2Aux[seq][slot][i],
+                      "aux_hidden");
       }
     }
-    return !expected_.empty();
   }
+}
 
-  void check(const std::string& name, const torch::Tensor& tensor) {
-    const torch::Tensor actual = tensor.cpu().contiguous();
-    names_.emplace_back(name);
-    if (torch::isFloatingType(actual.scalar_type()) &&
-        !torch::isfinite(actual.to(torch::kFloat32)).all().item<bool>()) {
-      fail(name, "contains non-finite values");
-      return;
-    }
-
-    if (!expected_.contains(name)) {
-      fail(name, "is missing from the baseline manifest");
-      return;
-    }
-    const std::optional<torch::Tensor> expected =
-        read_tensor(tensor_path(options_.directory, name));
-    if (!expected.has_value()) {
-      fail(name, "baseline file is missing or unreadable");
-      return;
-    }
-    if (expected->scalar_type() != actual.scalar_type() ||
-        expected->sizes() != actual.sizes()) {
-      fail(name, "dtype or shape differs from the baseline");
-      return;
-    }
-    const bool bit_identical =
-        std::memcmp(expected->data_ptr(), actual.data_ptr(), actual.nbytes()) ==
-        0;
-    const torch::Tensor actual_wide = actual.to(torch::kFloat64);
-    const torch::Tensor expected_wide = expected->to(torch::kFloat64);
-    const double max_error =
-        actual.numel() == 0
-            ? 0.0
-            : (actual_wide - expected_wide).abs().max().item<double>();
-    const bool close = torch::isFloatingType(actual.scalar_type())
-                           ? torch::allclose(actual_wide,
-                                             expected_wide,
-                                             /*rtol=*/kTolerance,
-                                             /*atol=*/kTolerance)
-                           : bit_identical;
-    ++compared_;
-    bit_identical_ += bit_identical ? 1 : 0;
-    max_error_ = std::max(max_error_, max_error);
-    LOG(INFO) << "[baseline] rank=" << rank_ << " " << name
-              << " bit_identical=" << bit_identical
-              << " max_abs_error=" << max_error
-              << " within_tolerance=" << close;
-    if (!close) {
-      fail(name, "exceeds atol=rtol=1e-3");
-    } else if (options_.strict_bits && !bit_identical) {
-      fail(name, "is not bit-identical in strict mode");
-    }
-  }
-
-  void fail(const std::string& name, const std::string& reason) {
-    LOG(ERROR) << "[baseline] rank=" << rank_ << " " << name << " " << reason;
-    ++failures_;
-  }
-
-  // Returns true when the whole session succeeded.
-  bool finish() {
-    const std::unordered_set<std::string> produced(names_.begin(),
-                                                   names_.end());
-    for (const std::string& name : expected_) {
-      if (!produced.contains(name)) {
-        fail(name, "is in the baseline but was not produced");
-      }
-    }
-    LOG(INFO) << "[baseline] rank=" << rank_ << " compared=" << compared_
-              << " bit_identical=" << bit_identical_
-              << " max_abs_error=" << max_error_ << " failures=" << failures_
-              << " strict_bits=" << options_.strict_bits;
-    return failures_ == 0;
-  }
-
- private:
-  BaselineOptions options_;
-  int32_t rank_ = 0;
-  std::unordered_set<std::string> expected_;
-  std::vector<std::string> names_;
-  int64_t compared_ = 0;
-  int64_t bit_identical_ = 0;
-  int64_t failures_ = 0;
-  double max_error_ = 0.0;
-};
-
-// Saves every cache in its own dtype. The SSM snapshot keeps the committed
-// row of each real sequence; its speculative rows are covered by
-// checkpoints_untouched.
-void check_caches(const std::string& prefix,
-                  const std::vector<LayerCacheTensors>& tensors,
-                  BaselineSession& session,
-                  ProcessGroup* head_tp_group) {
-  for (size_t layer_id = 0; layer_id < tensors.size(); ++layer_id) {
-    const LayerCacheTensors& layer = tensors[layer_id];
-    const std::string name = prefix + ".layer" + std::to_string(layer_id);
-    if (layer.conv.defined()) {
-      // Preserve the frozen full-head baseline by materializing logical state.
-      std::vector<torch::Tensor> conv_parts;
-      conv_parts.reserve(3);
-      for (const auto& part : layer.conv.chunk(3, /*dim=*/2)) {
-        conv_parts.emplace_back(parallel_state::gather(
-            part.contiguous(), head_tp_group, /*dim=*/2));
-      }
-      session.check(name + ".conv", torch::cat(conv_parts, /*dim=*/2));
-      session.check(name + ".ssm",
-                    parallel_state::gather(layer.ssm, head_tp_group, /*dim=*/1)
-                        .view({kLinearStateBlocks,
-                               kNumSpeculativeTokens + 1,
-                               kLinearHeads,
-                               kLinearHeadDim,
-                               kLinearHeadDim})
-                        .narrow(/*dim=*/0, /*start=*/1, kLinearStateBlocks - 1)
-                        .select(/*dim=*/1, /*index=*/0));
-      continue;
-    }
-    session.check(name + ".key", layer.key);
-    session.check(name + ".index", layer.index);
-    session.check(name + ".kpool_tail", layer.kpool_tail);
+void check_caches(const std::vector<LayerCacheTensors>& tensors,
+                  const std::vector<SequenceState>& sequences,
+                  const CacheSamples& expected,
+                  int32_t rank) {
+  const LayerCacheTensors& kda = tensors[6];
+  const LayerCacheTensors& dsa = tensors[3];
+  constexpr int64_t kLocalHeads = kLinearHeads / kWorldSize;
+  ASSERT_EQ(kda.conv.sizes(),
+            torch::IntArrayRef({kLinearStateBlocks,
+                                kConvKernel - 1 + kNumSpeculativeTokens,
+                                3 * kLocalHeads * kLinearHeadDim}));
+  ASSERT_EQ(
+      kda.ssm.sizes(),
+      torch::IntArrayRef({kLinearStateBlocks * (1 + kNumSpeculativeTokens),
+                          kLocalHeads,
+                          kLinearHeadDim,
+                          kLinearHeadDim}));
+  ASSERT_EQ(dsa.key.sizes(),
+            torch::IntArrayRef({kKvBlocks, 1, kBlockSize, kKvLoraRank}));
+  ASSERT_EQ(dsa.index.sizes(),
+            torch::IntArrayRef(
+                {kKvBlocks, 1, kBlockSize / kIndexKpool, kIndexHeadDim}));
+  ASSERT_EQ(kda.conv.scalar_type(), torch::kBFloat16);
+  ASSERT_EQ(kda.ssm.scalar_type(), torch::kFloat32);
+  ASSERT_EQ(dsa.key.scalar_type(), torch::kBFloat16);
+  ASSERT_EQ(dsa.index.scalar_type(), torch::kBFloat16);
+  for (int32_t seq = 0; seq < 2; ++seq) {
+    SCOPED_TRACE(::testing::Message() << "sequence " << seq);
+    const auto& state = sequences[seq];
+    // Last committed token and last complete pool of four tokens.
+    const int64_t pos = state.length - 1;
+    const int64_t pool = state.length / kIndexKpool - 1;
+    expect_sample(
+        dsa.key,
+        {state.first_block + pos / kBlockSize, 0, pos % kBlockSize, 127},
+        expected.dsa[seq][0],
+        "layer3.key");
+    const int64_t pools_per_block = kBlockSize / kIndexKpool;
+    expect_sample(dsa.index,
+                  {state.first_block + pool / pools_per_block,
+                   0,
+                   pool % pools_per_block,
+                   63},
+                  expected.dsa[seq][1],
+                  "layer3.index");
+    expect_sample(kda.conv,
+                  {state.linear_state_id, kConvKernel - 2, 17},
+                  expected.kda[rank][seq][0],
+                  "layer6.conv");
+    expect_sample(
+        kda.ssm,
+        {state.linear_state_id * (1 + kNumSpeculativeTokens), 0, 17, 31},
+        expected.kda[rank][seq][1],
+        "layer6.ssm");
   }
 }
 
@@ -946,8 +918,7 @@ bool run_scenario(const std::string& pass,
                   const std::vector<int32_t>& layers_to_capture,
                   const ParallelArgs& parallel_args,
                   const Weights& weights,
-                  Device& device,
-                  BaselineSession& session) {
+                  Device& device) {
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
   const ModelArgs model_args = make_model_args(layers_to_capture);
@@ -1000,12 +971,17 @@ bool run_scenario(const std::string& pass,
           sequences[sequence].num_blocks * static_cast<int32_t>(kBlockSize));
     }
     const std::string name = pass + "." + step.name;
-    session.check(name + ".hidden", output.hidden_states);
-    if (!layers_to_capture.empty()) {
-      session.check(name + ".aux_hidden", output.aux_hidden_states);
+    SCOPED_TRACE(::testing::Message()
+                 << "rank " << parallel_args.rank() << " " << name);
+    if (step.hidden != nullptr && layers_to_capture.empty()) {
+      check_hidden(step, output.hidden_states, *step.hidden);
     }
-    if (step.snapshot_caches && layers_to_capture.empty()) {
-      check_caches(name, cache_tensors, session, parallel_args.process_group_);
+    if (!layers_to_capture.empty() && step.name == "turn2_decode") {
+      check_aux(output.aux_hidden_states, layers_to_capture);
+    }
+    if (step.caches != nullptr && layers_to_capture.empty()) {
+      check_caches(
+          cache_tensors, sequences, *step.caches, parallel_args.rank());
     }
     const bool untouched = checkpoints_untouched(cache_tensors);
     LOG_IF(ERROR, !untouched)
@@ -1033,20 +1009,13 @@ std::unique_ptr<ProcessGroup> create_rank_group(int32_t rank,
   return group;
 }
 
-int32_t run_rank(int32_t rank,
-                 int32_t cp_port,
-                 int32_t ep_port,
-                 const BaselineOptions& baseline) {
+int32_t run_rank(int32_t rank, int32_t cp_port, int32_t ep_port) {
   // Bounds a stuck collective, including a peer that died during setup.
   ::alarm(kChildTimeoutSeconds);
   if (Platform::device_count() < kWorldSize) {
     return kExitSkip;
   }
-  BaselineSession session(baseline, rank);
-  if (!session.open()) {
-    return kExitMissingBaseline;
-  }
-
+  torch::set_num_threads(1);
   torch::InferenceMode inference_mode;
   Device device(rank);
   device.set_device();
@@ -1088,51 +1057,18 @@ int32_t run_rank(int32_t rank,
                                           /*layers_to_capture=*/{},
                                           parallel_args,
                                           weights,
-                                          device,
-                                          session);
+                                          device);
   const bool capture_ok = run_scenario("capture",
                                        /*layers_to_capture=*/{2, 3, 6},
                                        parallel_args,
                                        weights,
-                                       device,
-                                       session);
-  const bool baseline_ok = session.finish();
-  return production_ok && capture_ok && baseline_ok ? 0 : kExitMismatch;
+                                       device);
+  return production_ok && capture_ok && !::testing::Test::HasFailure()
+             ? 0
+             : kExitMismatch;
 }
 
-std::optional<BaselineOptions> read_baseline_options(std::string& error) {
-  BaselineOptions options;
-  const char* directory = std::getenv(kBaselineDirEnv);
-  if (directory == nullptr || directory[0] == '\0') {
-    error = std::string(kBaselineDirEnv) + " is not set";
-    return std::nullopt;
-  }
-  options.directory = directory;
-  const char* mode = std::getenv(kBaselineModeEnv);
-  const std::string mode_name = mode == nullptr ? "verify" : mode;
-  if (mode_name != "verify") {
-    error = std::string(kBaselineModeEnv) +
-            " must be verify; recording is not a test";
-    return std::nullopt;
-  }
-  const char* strict = std::getenv(kStrictBitsEnv);
-  options.strict_bits = strict != nullptr && std::string(strict) == "1";
-  return options;
-}
-
-TEST(Glm5NextMluPcpRegressionTest, EightRanksMatchFrozenBaseline) {
-  // The frozen baseline lives outside the repository, so a default ctest run
-  // has nothing to compare against.
-  const char* baseline_directory = std::getenv(kBaselineDirEnv);
-  if (baseline_directory == nullptr || baseline_directory[0] == '\0') {
-    GTEST_SKIP() << "Set " << kBaselineDirEnv
-                 << " to an independently frozen baseline.";
-  }
-  std::string error;
-  const std::optional<BaselineOptions> baseline = read_baseline_options(error);
-  ASSERT_TRUE(baseline.has_value()) << error << ". Point " << kBaselineDirEnv
-                                    << " at an independently frozen baseline.";
-  const std::string manifest = baseline->directory + "/" + kManifestName;
+TEST(Glm5NextMluPcpRegressionTest, EightRanksMatchOutputSamples) {
   const int32_t cp_port = net::get_local_free_port();
   const int32_t ep_port = net::get_local_free_port();
   ASSERT_GT(cp_port, 0);
@@ -1146,13 +1082,12 @@ TEST(Glm5NextMluPcpRegressionTest, EightRanksMatchFrozenBaseline) {
     const pid_t child = ::fork();
     ASSERT_GE(child, 0) << "fork failed: " << std::strerror(errno);
     if (child == 0) {
-      ::_exit(run_rank(rank, cp_port, ep_port, *baseline));
+      ::_exit(run_rank(rank, cp_port, ep_port));
     }
     children.emplace_back(child);
   }
 
   int32_t skipped = 0;
-  int32_t missing_baseline = 0;
   int32_t failed = 0;
   for (size_t rank = 0; rank < children.size(); ++rank) {
     int32_t status = 0;
@@ -1163,25 +1098,17 @@ TEST(Glm5NextMluPcpRegressionTest, EightRanksMatchFrozenBaseline) {
     ASSERT_EQ(waited, children[rank]);
     const int32_t exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     skipped += exit_code == kExitSkip ? 1 : 0;
-    missing_baseline += exit_code == kExitMissingBaseline ? 1 : 0;
-    failed += exit_code != 0 && exit_code != kExitSkip &&
-                      exit_code != kExitMissingBaseline
-                  ? 1
-                  : 0;
+    failed += exit_code != 0 && exit_code != kExitSkip ? 1 : 0;
     if (!WIFEXITED(status)) {
       ADD_FAILURE() << "Rank " << rank << " terminated by signal "
                     << (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
-    } else if (exit_code != 0 && exit_code != kExitSkip &&
-               exit_code != kExitMissingBaseline) {
-      ADD_FAILURE() << "Rank " << rank << " exited with code " << exit_code
-                    << "; see its [baseline] log lines.";
+    } else if (exit_code != 0 && exit_code != kExitSkip) {
+      ADD_FAILURE() << "Rank " << rank << " exited with code " << exit_code;
     }
   }
   if (skipped == kWorldSize) {
     GTEST_SKIP() << "Requires " << kWorldSize << " MLU devices.";
   }
-  ASSERT_EQ(missing_baseline, 0) << "No baseline manifest at " << manifest
-                                 << "; verification never creates it.";
   ASSERT_EQ(skipped, 0);
   ASSERT_EQ(failed, 0);
 }

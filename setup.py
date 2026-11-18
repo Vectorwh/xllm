@@ -986,19 +986,36 @@ class TestUT(Command):
     description = "Run all testing binary."
     user_options = []
 
-    # Whitelist: tests that must run sequentially (not in parallel with others)
-    # Add test names here if they use fork() or have device initialization conflicts
+    # Multi-device tests must not overlap other tests. Add suites or individual
+    # cases here unless CTest already isolates them with RUN_SERIAL.
     # Use CTest names; selected suites retain per-case results in GTest XML.
     SEQUENTIAL_TESTS = [
         "python_executor_test",
         "ReduceScatterMultiDeviceTest",
         "BroadcastMultiDeviceTest",
+        "AllGatherBaseMultiDeviceTest",
         "DeepEPMultiDeviceTest",
         "AttentionMultiDeviceTest",
+        "PackedAttentionParallelTest",
+        "AttentionPrefillParallelTest",
+        "AttentionCpTpDcpTest",
+        "DcpChunkedParallelTest",
+        "V32AttentionParallelTest",
         "MluMlaPrefillTpTest",
         "Glm5AttentionDcpTest",
+        "DecoderCpParallelTest",
         "DecoderDpParallelTest",
         "V32DecoderParallelTest",
+        "RowParallelLinearTest",
+        "DsaDeepEpDecoderTest",
+        "Glm52MluForwardTest",
+        "Glm5NextMluPcpRegressionTest",
+        "Glm5NextStatePcpTest",
+        "DeepseekV41DpDecodeTest",
+        "VlmWorkerSamplingTest",
+        "MluDFlash2SamplingGuardTest.OtherDeviceInputsAreRejected",
+        "MLUBatchMemcpyTest.RejectsStreamFromAnotherDevice",
+        "MLUBatchMemcpyTest.DeviceStreamPoolUsesRepresentedDevice",
         "FusedMoEAll2AllMultiDeviceTest",
         "SparseMoECollectiveTest",
     ]

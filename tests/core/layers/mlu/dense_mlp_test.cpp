@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "layers/common/dense_mlp.h"
+#include "layers/mlu/dense_mlp.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -100,16 +100,16 @@ class DenseMLPTest : public ::testing::Test {
 
     return weight_dict;
   }
-  DenseMLP create_mlp(int64_t hidden_size, int64_t intermediate_size) {
-    return DenseMLP(DenseMLPImpl(hidden_size,
-                                 intermediate_size,
-                                 /*is_gated=*/true,
-                                 /*has_bias=*/false,
-                                 /*hidden_act=*/"silu",
-                                 /*enable_result_reduction=*/true,
-                                 quant_args_,
-                                 parallel_args_.tp_group_,
-                                 options_));
+  MluDenseMLP create_mlp(int64_t hidden_size, int64_t intermediate_size) {
+    return MluDenseMLP(MluDenseMLPImpl(hidden_size,
+                                       intermediate_size,
+                                       /*is_gated=*/true,
+                                       /*has_bias=*/false,
+                                       /*hidden_act=*/"silu",
+                                       /*enable_result_reduction=*/true,
+                                       quant_args_,
+                                       parallel_args_.tp_group_,
+                                       options_));
   }
 
   QuantArgs quant_args_;
@@ -121,15 +121,15 @@ class DenseMLPTest : public ::testing::Test {
 TEST_F(DenseMLPTest, Bfloat16LoadStateDictTest) {
   constexpr int64_t kHidden = 128;
   constexpr int64_t kIntermediate = 256;
-  DenseMLP mlp(kHidden,
-               kIntermediate,
-               true,
-               false,
-               "silu",
-               true,
-               QuantArgs(),
-               parallel_args_.tp_group_,
-               options_);
+  MluDenseMLP mlp(kHidden,
+                  kIntermediate,
+                  true,
+                  false,
+                  "silu",
+                  true,
+                  QuantArgs(),
+                  parallel_args_.tp_group_,
+                  options_);
   const auto gate = torch::full({kIntermediate, kHidden}, 0.01f, options_);
   const auto up = torch::full({kIntermediate, kHidden}, 0.02f, options_);
   const auto down = torch::full({kHidden, kIntermediate}, 0.03f, options_);
@@ -162,16 +162,16 @@ TEST_F(DenseMLPTest, Fp8IgnoredDownProjLoadsAsUnquantized) {
 
   const int64_t hidden_size = 16;
   const int64_t intermediate_size = 32;
-  auto mlp = DenseMLP(DenseMLPImpl(hidden_size,
-                                   intermediate_size,
-                                   /*is_gated=*/true,
-                                   /*has_bias=*/false,
-                                   /*hidden_act=*/"silu",
-                                   /*enable_result_reduction=*/true,
-                                   fp8_quant_args,
-                                   parallel_args_.tp_group_,
-                                   options_,
-                                   "model.layers.1.mlp"));
+  auto mlp = MluDenseMLP(MluDenseMLPImpl(hidden_size,
+                                         intermediate_size,
+                                         /*is_gated=*/true,
+                                         /*has_bias=*/false,
+                                         /*hidden_act=*/"silu",
+                                         /*enable_result_reduction=*/true,
+                                         fp8_quant_args,
+                                         parallel_args_.tp_group_,
+                                         options_,
+                                         "model.layers.1.mlp"));
 
   std::unordered_map<std::string, torch::Tensor> weight_dict;
   auto fp8_weight_options = options_.dtype(torch::kFloat8_e4m3fn);

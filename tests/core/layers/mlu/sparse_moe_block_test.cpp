@@ -282,7 +282,8 @@ TEST_P(SparseMoEBlockTest, SelectedRouteReducesOverTheRoutedGroup) {
     block->load_state_dict(StateDict(create_fp_weights()));
 
     torch::Tensor hidden_states = make_hidden({2, model_args_.hidden_size()});
-    torch::Tensor topk_weights = torch::ones({2, 2}, options_);
+    torch::Tensor topk_weights =
+        torch::ones({2, 2}, options_.dtype(torch::kFloat32));
     torch::Tensor topk_ids =
         torch::zeros({2, 2}, options_.dtype(torch::kInt64));
     torch::Tensor output = block->forward_selected(
@@ -316,7 +317,8 @@ TEST_P(SparseMoEBlockTest, SelectedRouteGathersAndConvertsRowsOnlyForDpEp) {
     // three model tokens therefore require six gathered rows.
     torch::Tensor hidden_states =
         make_hidden({1, 2, model_args_.hidden_size()});
-    torch::Tensor topk_weights = torch::ones({1, 2, 2}, options_);
+    torch::Tensor topk_weights =
+        torch::ones({1, 2, 2}, options_.dtype(torch::kFloat32));
     torch::Tensor topk_ids =
         torch::zeros({1, 2, 2}, options_.dtype(torch::kInt64));
     ModelInputParams input_params;
@@ -339,7 +341,8 @@ TEST_P(SparseMoEBlockTest, SelectedRouteGathersAndConvertsRowsOnlyForDpEp) {
     block->load_state_dict(StateDict(create_fp_weights()));
 
     torch::Tensor hidden_states = make_hidden({2, model_args_.hidden_size()});
-    torch::Tensor topk_weights = torch::ones({2, 2}, options_);
+    torch::Tensor topk_weights =
+        torch::ones({2, 2}, options_.dtype(torch::kFloat32));
     torch::Tensor topk_ids =
         torch::zeros({2, 2}, options_.dtype(torch::kInt64));
     torch::Tensor output = block->forward_selected(

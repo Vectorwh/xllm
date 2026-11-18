@@ -85,7 +85,7 @@ inline StateDict make_deepseek_v41_dspark_weights(
       {"mtp.0.attn.wo_b.weight", random({hidden_size, groups * o_rank})},
       {"mtp.0.attn.attn_sink", torch::zeros({heads}, options)},
       {"mtp.0.ffn.gate.weight", random({args.n_routed_experts(), hidden_size})},
-      {"mtp.0.ffn.gate.e_score_correction_bias",
+      {"mtp.0.ffn.gate.bias",
        torch::zeros({args.n_routed_experts()},
                     options.dtype(torch::kFloat32))}};
   for (const std::string& name : {"hc_attn_", "hc_ffn_"}) {

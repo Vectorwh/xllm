@@ -2331,6 +2331,8 @@ TEST(DecoderCpParallelTest,
                         &global_group);
   parallel.tp_size() = 1;
   parallel.cp_size() = 2;
+  // This fixture exercises PCP communication without DCP cache sharding.
+  parallel.kv_split_size() = 1;
   parallel.tp_group_ = &single_rank_group;
   parallel.cp_group_ = &cp_group;
 

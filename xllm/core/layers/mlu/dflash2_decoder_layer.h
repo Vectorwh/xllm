@@ -19,9 +19,9 @@ limitations under the License.
 
 #include <optional>
 
-#include "core/layers/common/dense_mlp.h"
 #include "core/layers/common/qwen2_attention.h"
 #include "core/layers/common/rms_norm.h"
+#include "core/layers/mlu/dense_mlp.h"
 #include "core/layers/mlu/dflash2_grouped_conv.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
@@ -50,7 +50,7 @@ class DFlash2DecoderLayerImpl final : public torch::nn::Module {
 
  private:
   Qwen2Attention attention_{nullptr};
-  DenseMLP mlp_{nullptr};
+  MluDenseMLP mlp_{nullptr};
   RMSNorm input_norm_{nullptr};
   RMSNorm post_norm_{nullptr};
   DFlash2GroupedConv attention_conv_{nullptr};

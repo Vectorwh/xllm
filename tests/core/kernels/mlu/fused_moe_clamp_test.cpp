@@ -62,7 +62,7 @@ TEST(FusedMoeClampTest, MatchesReferenceForDtypesWidthsAndSpecials) {
   for (const torch::ScalarType dtype :
        {torch::kBFloat16, torch::kFloat16, torch::kFloat32}) {
     // Minimum width, unaligned patterns, idle cores, and partial/full DMA
-    // pipelines. Both wide rows have their own pattern and tile-size risks.
+    // pipelines, including rows wider than the BangC pattern buffer.
     for (const auto& [rows, width] :
          std::vector<std::pair<int64_t, int64_t>>{{1, 2},
                                                   {9, 14},
@@ -71,7 +71,8 @@ TEST(FusedMoeClampTest, MatchesReferenceForDtypesWidthsAndSpecials) {
                                                   {257, 4096},
                                                   {4096, 4096},
                                                   {257, 6144},
-                                                  {4096, 6144}}) {
+                                                  {4096, 6144},
+                                                  {2, 18432}}) {
       const torch::Tensor input = with_specials(
           torch::randn({rows, width}).mul(/*other=*/12).to(dtype));
       const torch::Tensor expected = reference_clamp(input, /*limit=*/10);

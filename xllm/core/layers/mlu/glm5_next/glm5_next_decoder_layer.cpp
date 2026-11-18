@@ -107,17 +107,17 @@ Glm5NextDecoderLayerImpl::Glm5NextDecoderLayerImpl(const ModelContext& context,
   if (role_.mlp == Glm5NextMlpRole::DENSE) {
     dense_mlp_ =
         register_module("mlp",
-                        DenseMLP(hidden_size,
-                                 args.intermediate_size(),
-                                 /*is_gated=*/true,
-                                 /*has_bias=*/false,
-                                 args.hidden_act(),
-                                 /*enable_result_reduction=*/true,
-                                 quant_args,
-                                 parallel_args.tp_group_,
-                                 options,
-                                 /*module_prefix=*/"",
-                                 static_cast<double>(args.swiglu_limit())));
+                        MluDenseMLP(hidden_size,
+                                    args.intermediate_size(),
+                                    /*is_gated=*/true,
+                                    /*has_bias=*/false,
+                                    args.hidden_act(),
+                                    /*enable_result_reduction=*/true,
+                                    quant_args,
+                                    parallel_args.tp_group_,
+                                    options,
+                                    /*module_prefix=*/"",
+                                    static_cast<double>(args.swiglu_limit())));
   } else {
     const std::shared_ptr<ModelStreamRegistry>& streams =
         context.stream_registry();

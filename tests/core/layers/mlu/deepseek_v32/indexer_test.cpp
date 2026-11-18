@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/kernels/mlu/dcp/dcp_precision_test_utils.h"
 #include "core/layers/mlu/deepseek_v32/dcp_batch_metadata.h"
+#include "core/util/linalg.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
@@ -193,7 +194,8 @@ void populate_chunked_metadata(AttentionMetadata& metadata,
   metadata.max_seq_len = total_len;
   metadata.total_kv_len = batch_size * total_len;
   metadata.compute_dtype = "bfloat16";
-  metadata.is_prefill = true;
+  // Chunked prefill uses absolute positions with discrete RoPE.
+  metadata.is_prefill = false;
   metadata.is_chunked_prefill = true;
 }
 
@@ -505,6 +507,52 @@ void idx_fill_quantized_cache(torch::TensorOptions& options_,
                                   .add(0.01f)
                                   .to(options_.device()));
 }
+
+// The fused decode op retains projection and LayerNorm precision until RoPE
+// writes BF16 values for the Hadamard transform. The eager path also rounds
+// after projection and LayerNorm, so it is not a pointwise fused-op oracle.
+torch::Tensor idx_reference_fused_k(
+    const TestInputs& inputs,
+    const std::shared_ptr<RotaryEmbeddingBase>& rotary_emb) {
+  const torch::Tensor x = inputs.x.cpu().to(torch::kFloat64);
+  const torch::Tensor wk =
+      inputs.weights.at("wk.weight").cpu().to(torch::kFloat64);
+  torch::Tensor key = torch::matmul(x, wk.t());
+  key = key - key.mean(/*dim=*/-1, /*keepdim=*/true);
+  key = key *
+        torch::rsqrt(key.square().mean(/*dim=*/-1, /*keepdim=*/true) + 1e-6);
+  key = key * inputs.weights.at("k_norm.weight").cpu().to(torch::kFloat64) +
+        inputs.weights.at("k_norm.bias").cpu().to(torch::kFloat64);
+
+  const torch::Tensor positions = inputs.positions.cpu().to(torch::kInt64);
+  const torch::Tensor cos = rotary_emb->get_cos_cache()
+                                .cpu()
+                                .index_select(0, positions)
+                                .to(torch::kFloat64);
+  const torch::Tensor sin = rotary_emb->get_sin_cache()
+                                .cpu()
+                                .index_select(0, positions)
+                                .to(torch::kFloat64);
+  const int64_t rotary_dim = cos.size(-1);
+  const torch::Tensor front = key.slice(/*dim=*/1, /*start=*/0, rotary_dim);
+  CHECK(rotary_emb->get_interleaved());
+  const torch::Tensor pairs = front.reshape({key.size(0), rotary_dim / 2, 2});
+  const torch::Tensor swapped =
+      torch::stack({-pairs.select(2, 1), pairs.select(2, 0)}, /*dim=*/2)
+          .reshape_as(front);
+  front.copy_(front * cos + swapped * sin);
+  key = key.to(inputs.x.scalar_type()).to(torch::kFloat64);
+
+  const torch::Tensor hadamard =
+      util::create_hadamard_matrix(key.size(-1),
+                                   torch::kFloat32,
+                                   torch::Device(torch::kCPU),
+                                   /*normalize=*/true)
+          .to(inputs.x.scalar_type())
+          .to(torch::kFloat64);
+  return torch::matmul(key, hadamard.t());
+}
+
 DeepseekV32Indexer idx_create_indexer(
     ParallelArgs& parallel_args_,
     TestConfig& test_config_,
@@ -531,10 +579,16 @@ DeepseekV32Indexer idx_create_indexer(
       inputs.k_cache.scalar_type() == torch::kChar) {
     inputs.initial_cache = inputs.k_cache.cpu().clone();
     inputs.initial_scale = inputs.k_cache_scale->cpu().clone();
-    inputs.expected_k =
-        indexer
-            ->cp_pre(inputs.x, inputs.q_norm, inputs.positions, inputs.metadata)
-            .k_local.cpu();
+    if (inputs.metadata.is_prefill || inputs.metadata.is_chunked_prefill) {
+      inputs.expected_k =
+          indexer
+              ->cp_pre(
+                  inputs.x, inputs.q_norm, inputs.positions, inputs.metadata)
+              .k_local.cpu()
+              .to(torch::kFloat64);
+    } else {
+      inputs.expected_k = idx_reference_fused_k(inputs, rotary_emb_);
+    }
   }
   return indexer;
 }
@@ -705,7 +759,7 @@ void idx_expect_quantized_cache_updated(const TestInputs& inputs) {
   ASSERT_EQ(inputs.k_cache.scalar_type(), torch::kInt8);
   ASSERT_TRUE(inputs.k_cache_scale.has_value());
   ASSERT_EQ(inputs.k_cache_scale->scalar_type(), torch::kFloat32);
-  ASSERT_EQ(inputs.expected_k.scalar_type(), torch::kBFloat16);
+  ASSERT_EQ(inputs.expected_k.scalar_type(), torch::kFloat64);
 
   ASSERT_TRUE(inputs.k_cache_scale.has_value());
   const auto cache =
@@ -1506,7 +1560,9 @@ TEST_F(IndexerTest, CompareFusedVsNonFusedDecode) {
     EXPECT_TRUE(torch::equal(base_lens, fused_lens));
     const auto fused_keys = input.k_cache.reshape({-1, config.index_head_dim})
                                 .index_select(0, slots);
-    test::verify_tensor_close(fused_keys, base_keys, 0.02, 0.002);
+    const torch::Tensor golden_keys = idx_reference_fused_k(input, rope);
+    test::verify_tensor_close(
+        fused_keys.cpu().to(torch::kFloat64), golden_keys, 0.02, 0.002);
     const double scale =
         torch::norm(base_keys.to(torch::kFloat32)).item<double>();
     ASSERT_GT(scale, 0.0);

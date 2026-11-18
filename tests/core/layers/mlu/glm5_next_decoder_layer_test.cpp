@@ -22,6 +22,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "framework/model/aux_hidden_capture.h"
@@ -139,6 +140,8 @@ void run_layer_chain(LayerTestMode mode) {
   constexpr int64_t kProjectionSize = kHeads * kHeadDim;
   constexpr int64_t kConvWidth = 4;
   constexpr int64_t kIntermediateSize = 256;
+  constexpr float kUnusedConvValue = -7.0f;
+  constexpr float kUnusedSsmValue = 11.0f;
   ModelArgs args;
   args.model_type() = "glm5_next";
   args.hidden_size() = kHiddenSize;
@@ -214,11 +217,20 @@ void run_layer_chain(LayerTestMode mode) {
     return;
   }
   const auto make_cache = [&]() {
-    return KVCache(LinearAttentionKVCacheTensors{
-        torch::zeros({2, kConvWidth - 1, 3 * kProjectionSize}, options),
-        torch::zeros({2, kHeads, kHeadDim, kHeadDim}, fp32_options)});
+    torch::Tensor conv_cache =
+        torch::zeros({2, kConvWidth - 1, 3 * kProjectionSize}, options);
+    torch::Tensor ssm_cache =
+        torch::zeros({2, kHeads, kHeadDim, kHeadDim}, fp32_options);
+    // Only slot 1 participates in the layer chain. Nonzero canaries detect
+    // accidental writes to the unused slot, including clearing its state.
+    conv_cache[0].fill_(kUnusedConvValue);
+    ssm_cache[0].fill_(kUnusedSsmValue);
+    return KVCache(LinearAttentionKVCacheTensors{std::move(conv_cache),
+                                                 std::move(ssm_cache)});
   };
   std::array<KVCache, 2> caches = {make_cache(), make_cache()};
+  const torch::Tensor unused_conv = caches[0].get_conv_cache()[0].clone();
+  const torch::Tensor unused_ssm = caches[0].get_ssm_cache()[0].clone();
   std::vector<KVCache> reference_caches;
   reference_caches.reserve(caches.size());
   for (const auto& cache : caches) {
@@ -311,14 +323,26 @@ void run_layer_chain(LayerTestMode mode) {
                   scale,
               0.02);
     for (size_t index = 0; index < caches.size(); ++index) {
-      EXPECT_TRUE(torch::allclose(caches[index].get_conv_cache(),
-                                  reference_caches[index].get_conv_cache(),
-                                  0.02,
-                                  0.002));
+      SCOPED_TRACE(index);
+      // Fused mHC changes BF16 rounding before the QKV projection. Use its
+      // activation tolerance and bound relative L2 on the active slot only;
+      // the inactive canaries must not dilute the numerical error budget.
+      // Exact same-input writes are covered by CausalConv1dPrefillStateTest.
+      EXPECT_TRUE(
+          test::scaled_close(caches[index].get_conv_cache()[1],
+                             reference_caches[index].get_conv_cache()[1],
+                             /*rtol=*/0.02,
+                             /*atol=*/0.02));
       EXPECT_TRUE(torch::allclose(caches[index].get_ssm_cache(),
                                   reference_caches[index].get_ssm_cache(),
                                   0.02,
                                   0.002));
+      EXPECT_TRUE(torch::equal(caches[index].get_conv_cache()[0], unused_conv));
+      EXPECT_TRUE(torch::equal(reference_caches[index].get_conv_cache()[0],
+                               unused_conv));
+      EXPECT_TRUE(torch::equal(caches[index].get_ssm_cache()[0], unused_ssm));
+      EXPECT_TRUE(
+          torch::equal(reference_caches[index].get_ssm_cache()[0], unused_ssm));
     }
     for (const KVCache& cache : caches) {
       ASSERT_TRUE(torch::isfinite(cache.get_ssm_cache()).all().item<bool>());

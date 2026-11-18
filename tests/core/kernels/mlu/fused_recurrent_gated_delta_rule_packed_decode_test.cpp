@@ -83,10 +83,13 @@ TEST_F(FusedRecurrentGdrPackedDecodeJitTest, SupportsNoL2Norm) {
       {value_heads},
       torch::TensorOptions().dtype(torch::kBFloat16).device(device()));
   torch::Tensor ssm_cache = torch::zeros(
-      {batch, value_heads, value_dim, key_dim},
+      {batch + 1, value_heads, value_dim, key_dim},
       torch::TensorOptions().dtype(torch::kFloat32).device(device()));
+  // Slot 0 is reserved for padding; exercise the recurrence on valid slots.
   torch::Tensor ssm_state_indices = torch::arange(
-      0, batch, torch::TensorOptions().dtype(torch::kInt32).device(device()));
+      1,
+      batch + 1,
+      torch::TensorOptions().dtype(torch::kInt32).device(device()));
 
   auto [out, state] =
       fused_recurrent_gated_delta_rule_packed_decode(mixed_qkv,
@@ -99,8 +102,8 @@ TEST_F(FusedRecurrentGdrPackedDecodeJitTest, SupportsNoL2Norm) {
                                                      ssm_state_indices,
                                                      /*l2norm=*/false);
   torch_mlu::synchronize();
-  // With unnormalized q=k=v=1 and beta=0.5, each selected state is0.5
-  // and output is0.5*head_k_dim*scale. Accidental L2 normalization fails.
+  // With unnormalized q=k=v=1 and beta=0.5, each selected state is 0.5
+  // and output is 0.5*head_k_dim*scale. Accidental L2 normalization fails.
   EXPECT_TRUE(torch::allclose(out,
                               torch::full_like(out, 64.0 * scale),
                               /*rtol=*/1e-3,

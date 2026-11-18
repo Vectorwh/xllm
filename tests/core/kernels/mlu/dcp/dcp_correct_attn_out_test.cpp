@@ -298,6 +298,12 @@ TEST_F(DcpCorrectionTest, ConcatenatedAttentionOracle) {
     merged += dst.cpu().to(torch::kFloat32);
   }
   check_close(merged.transpose(0, 1), expected, /*atol=*/5e-3);
+  // Core attention retains a 1% budget independent of INT8 output projections.
+  const torch::Tensor actual = merged.transpose(0, 1).to(torch::kFloat64);
+  const double reference_norm = torch::norm(expected).item<double>();
+  ASSERT_GT(reference_norm, 0.0);
+  EXPECT_LE(torch::norm(actual - expected).item<double>() / reference_norm,
+            0.01);
 }
 
 }  // namespace

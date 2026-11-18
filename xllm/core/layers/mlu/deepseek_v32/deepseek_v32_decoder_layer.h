@@ -32,9 +32,9 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
-#include "layers/common/dense_mlp.h"
 #include "layers/common/dp_utils.h"
 #include "layers/common/rms_norm.h"
+#include "layers/mlu/dense_mlp.h"
 
 namespace xllm {
 namespace layer {
@@ -142,7 +142,7 @@ class DeepseekV32DecoderLayerImpl : public torch::nn::Module {
   bool mtp_topk_reuse_ = false;
 
   DeepseekV32Attention attention_{nullptr};
-  DenseMLP mlp_{nullptr};
+  MluDenseMLP mlp_{nullptr};
   DeepseekV32SparseMoEBlock sparse_moe_{nullptr};
   RMSNorm input_norm_{nullptr};
   RMSNorm post_norm_{nullptr};

@@ -28,8 +28,8 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "framework/state_dict/utils.h"
 #include "layers/common/deep_ep.h"
-#include "layers/common/dense_mlp.h"
 #include "layers/common/fused_moe_base.h"
+#include "layers/mlu/dense_mlp.h"
 #include "layers/mlu/moe_gate.h"
 #include "platform/device.h"
 #include "util/tensor_helper.h"
@@ -42,6 +42,8 @@ namespace layer {
 class FusedMoEImpl : public torch::nn::Module {
  public:
   struct RouteInfo {
+    // FP32 routing weights and INT32/INT64 expert IDs, shaped [rows, topk]
+    // and on the same device as the hidden states.
     torch::Tensor reduce_weight;
     torch::Tensor expert_id;
   };
@@ -165,7 +167,7 @@ class FusedMoEImpl : public torch::nn::Module {
 
   MoEGate gate_{nullptr};
   std::optional<float> swiglu_limit_;
-  DenseMLP shared_experts_{nullptr};
+  MluDenseMLP shared_experts_{nullptr};
   DeepEP deep_ep_{nullptr};
 
   QuantArgs quant_args_;

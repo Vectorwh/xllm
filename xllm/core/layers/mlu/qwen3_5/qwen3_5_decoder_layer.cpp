@@ -109,15 +109,15 @@ Qwen3_5DecoderLayerImpl::Qwen3_5DecoderLayerImpl(const ModelContext& context,
             stream_registry->get(ExecutionStreamRole::AUXILIARY_COMPUTE)));
   } else {
     mlp_ = register_module("mlp",
-                           DenseMLP(model_args.hidden_size(),
-                                    model_args.intermediate_size(),
-                                    true,
-                                    false,
-                                    model_args.hidden_act(),
-                                    /*enable_result_reduction=*/true,
-                                    quant_args,
-                                    parallel_args_.tp_group_,
-                                    options));
+                           MluDenseMLP(model_args.hidden_size(),
+                                       model_args.intermediate_size(),
+                                       true,
+                                       false,
+                                       model_args.hidden_act(),
+                                       /*enable_result_reduction=*/true,
+                                       quant_args,
+                                       parallel_args_.tp_group_,
+                                       options));
   }
 }
 

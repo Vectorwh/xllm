@@ -22,6 +22,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <string>
 
 #include "framework/config/model_config.h"
 #include "layers/mlu/tests_utils.h"
@@ -33,6 +34,8 @@ class DeepseekV41EngramTest : public ::testing::Test {
  protected:
   void SetUp() override {
     saved_config_ = ModelConfig::get_instance().engram_config();
+    saved_death_test_style_ = GTEST_FLAG_GET(death_test_style);
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     if (Platform::device_count() == 0) {
       GTEST_SKIP() << "MLU device is required";
     }
@@ -71,6 +74,7 @@ class DeepseekV41EngramTest : public ::testing::Test {
 
   void TearDown() override {
     ModelConfig::get_instance().engram_config() = saved_config_;
+    GTEST_FLAG_SET(death_test_style, saved_death_test_style_);
   }
 
   DeepseekV41Engram create(const std::string& config) {
@@ -98,6 +102,7 @@ class DeepseekV41EngramTest : public ::testing::Test {
   std::unordered_map<std::string, torch::Tensor> weights_;
   std::unordered_map<std::string, torch::Tensor> hash_weights_;
   std::string saved_config_;
+  std::string saved_death_test_style_;
 };
 
 TEST_F(DeepseekV41EngramTest, DefaultHostMatchesDeviceAndSelectedRows) {

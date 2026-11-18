@@ -27,8 +27,8 @@ limitations under the License.
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "layers/common/attention_metadata.h"
-#include "layers/common/dense_mlp.h"
 #include "layers/common/rms_norm.h"
+#include "layers/mlu/dense_mlp.h"
 #include "layers/mlu/glm5_next/glm5_next_kda.h"
 #include "layers/mlu/glm5_next/glm5_next_pcp_context.h"
 #include "layers/mlu/hyper_connection.h"
@@ -98,7 +98,7 @@ class Glm5NextDecoderLayerImpl final : public torch::nn::Module {
 
   Glm5NextKDA kda_{nullptr};
   DeepseekV32Attention dsa_{nullptr};
-  DenseMLP dense_mlp_{nullptr};
+  MluDenseMLP dense_mlp_{nullptr};
   SparseMoEBlock sparse_moe_{nullptr};
 };
 

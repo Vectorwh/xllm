@@ -41,16 +41,16 @@ DFlash2DecoderLayerImpl::DFlash2DecoderLayerImpl(const ModelContext& context,
 
   // Initialize mlp
   mlp_ = register_module("mlp",
-                         DenseMLP(model_args.hidden_size(),
-                                  model_args.intermediate_size(),
-                                  true,
-                                  false,
-                                  model_args.hidden_act(),
-                                  /*enable_result_reduction=*/true,
-                                  quant_args,
-                                  parallel_args_.tp_group_,
-                                  options,
-                                  mlp_module_prefix));
+                         MluDenseMLP(model_args.hidden_size(),
+                                     model_args.intermediate_size(),
+                                     true,
+                                     false,
+                                     model_args.hidden_act(),
+                                     /*enable_result_reduction=*/true,
+                                     quant_args,
+                                     parallel_args_.tp_group_,
+                                     options,
+                                     mlp_module_prefix));
 
   attention_conv_ =
       register_module("attention_conv",

@@ -24,7 +24,6 @@ limitations under the License.
 #include <unordered_map>
 #include <utility>
 
-#include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -369,25 +368,6 @@ class DeepseekV2SparseMoEBlockTest : public ::testing::Test {
 
 }  // namespace
 
-namespace {
-
-class ScopedExpertParallelDegree final {
- public:
-  explicit ScopedExpertParallelDegree(int32_t value)
-      : config_(xllm::EPLBConfig::get_instance()),
-        original_(config_.expert_parallel_degree()) {
-    config_.expert_parallel_degree(value);
-  }
-
-  ~ScopedExpertParallelDegree() { config_.expert_parallel_degree(original_); }
-
- private:
-  xllm::EPLBConfig& config_;
-  int32_t original_;
-};
-
-}  // namespace
-
 TEST_F(DeepseekV2SparseMoEBlockTest, PrepInDpGatherBuildsLocalSkip) {
   moe_set_tp_dp_ctx(parallel_args_,
                     options_,
@@ -435,7 +415,6 @@ TEST_F(DeepseekV2SparseMoEBlockTest, PrepInDpGatherBuildsLocalSkip) {
 
 TEST_F(DeepseekV2SparseMoEBlockTest,
        PlanExecUsesAll2AllOnlyWhenEveryDpRankDecodes) {
-  ScopedExpertParallelDegree expert_parallel_degree(/*value=*/2);
   moe_set_tp_dp_ctx(parallel_args_,
                     options_,
                     global_pg_,
@@ -447,20 +426,19 @@ TEST_F(DeepseekV2SparseMoEBlockTest,
                     /*tp_size=*/2,
                     /*ep_size=*/4);
   parallel_args_.tp_size(2);
-  auto block = moe_create_block(
-      model_args_, quant_args_, parallel_args_, options_, stream_registry_);
-
   ModelInputParams decode_params;
   decode_params.parallel.dp_global_token_nums = {1, 1};
   decode_params.parallel.dp_is_decode = {1, 1};
-  const auto decode_cfg = block->plan_exec(decode_params);
+  const auto decode_cfg = DeepseekV32SparseMoEBlockImpl::plan_exec(
+      parallel_args_, /*enable_deep_ep=*/true, decode_params);
   EXPECT_TRUE(decode_cfg.enable_all2all);
   EXPECT_FALSE(decode_cfg.need_dp_gather);
 
   ModelInputParams mixed_params;
   mixed_params.parallel.dp_global_token_nums = {2, 1};
   mixed_params.parallel.dp_is_decode = {0, 1};
-  const auto mixed_cfg = block->plan_exec(mixed_params);
+  const auto mixed_cfg = DeepseekV32SparseMoEBlockImpl::plan_exec(
+      parallel_args_, /*enable_deep_ep=*/true, mixed_params);
   EXPECT_FALSE(mixed_cfg.enable_all2all);
   EXPECT_TRUE(mixed_cfg.need_dp_gather);
 }

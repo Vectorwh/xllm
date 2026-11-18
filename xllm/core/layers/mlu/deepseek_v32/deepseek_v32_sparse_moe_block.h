@@ -80,6 +80,10 @@ class DeepseekV32SparseMoEBlockImpl : public torch::nn::Module {
   void verify_loaded_weights() const;
 
   ExecCfg plan_exec(const ModelInputParams& input_params) const;
+  // Compute execution policy without constructing MoE communication resources.
+  static ExecCfg plan_exec(const ParallelArgs& parallel_args,
+                           bool enable_deep_ep,
+                           const ModelInputParams& input_params);
   PrepOut prep_in(torch::Tensor x,
                   const torch::Tensor& residual,
                   const ModelInputParams& input_params,

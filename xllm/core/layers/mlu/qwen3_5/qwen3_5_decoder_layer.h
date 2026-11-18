@@ -26,7 +26,7 @@ limitations under the License.
 #include "framework/model_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/state_dict/state_dict.h"
-#include "layers/common/dense_mlp.h"
+#include "layers/mlu/dense_mlp.h"
 #include "layers/mlu/qwen3_5/qwen3_5_attention.h"
 #include "layers/mlu/qwen3_5/qwen3_5_fused_moe.h"
 #include "layers/mlu/qwen3_5/qwen3_5_gated_delta_net.h"
@@ -63,7 +63,7 @@ class Qwen3_5DecoderLayerImpl final : public Qwen3HybridDecoderLayerModule {
   std::string layer_type_;
   Qwen3_5Attention full_attention_{nullptr};
   Qwen3_5GatedDeltaNet linear_attention_{nullptr};
-  DenseMLP mlp_{nullptr};
+  MluDenseMLP mlp_{nullptr};
   Qwen3_5FusedMoE moe_mlp_{nullptr};
   Qwen3NextRMSNormMlu input_norm_{nullptr};
   Qwen3NextRMSNormMlu post_norm_{nullptr};

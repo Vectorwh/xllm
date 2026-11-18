@@ -61,9 +61,16 @@ void DeepseekV32SparseMoEBlockImpl::verify_loaded_weights() const {
 
 DeepseekV32SparseMoEBlockImpl::ExecCfg DeepseekV32SparseMoEBlockImpl::plan_exec(
     const ModelInputParams& input_params) const {
+  return plan_exec(parallel_args_, enable_deep_ep_, input_params);
+}
+
+DeepseekV32SparseMoEBlockImpl::ExecCfg DeepseekV32SparseMoEBlockImpl::plan_exec(
+    const ParallelArgs& parallel_args,
+    bool enable_deep_ep,
+    const ModelInputParams& input_params) {
   ExecCfg cfg;
-  cfg.enable_all2all = enable_deep_ep_ && all_dp_ranks_are_decode(input_params);
-  cfg.need_dp_gather = need_dp_moe_gather(parallel_args_, cfg.enable_all2all);
+  cfg.enable_all2all = enable_deep_ep && all_dp_ranks_are_decode(input_params);
+  cfg.need_dp_gather = need_dp_moe_gather(parallel_args, cfg.enable_all2all);
   return cfg;
 }
 

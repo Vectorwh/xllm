@@ -39,6 +39,14 @@ void fused_moe_clamp(torch::Tensor& input,
   const int64_t width = input.size(-1);
   CHECK_GT(width, 0);
   CHECK_EQ(width % 2, 0);
+  if (!token_count.has_value() &&
+      width * input.element_size() > kFusedMoeClampMaxRowBytes) {
+    // Wide dense MLP rows exceed the BangC kernel's NRAM pattern buffer.
+    const int64_t half = width / 2;
+    input.narrow(-1, 0, half).clamp_max_(limit);
+    input.narrow(-1, half, half).clamp_(-limit, limit);
+    return;
+  }
   CHECK_LE(width * input.element_size(), kFusedMoeClampMaxRowBytes);
   const int64_t rows = input.numel() / width;
   CHECK_LE(rows, std::numeric_limits<int32_t>::max());

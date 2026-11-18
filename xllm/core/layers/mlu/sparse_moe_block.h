@@ -52,7 +52,8 @@ class SparseMoEBlockImpl final : public torch::nn::Module {
       torch::Tensor& hidden_states,
       const std::optional<torch::Tensor>& input_ids = std::nullopt);
   // Inputs contain the full token set replicated within TP. Internal DP/TP/EP
-  // communication preserves the input shape and row order.
+  // communication preserves the input shape and row order. Routing weights
+  // must be FP32; expert IDs may be INT32 or INT64.
   torch::Tensor forward_selected(const torch::Tensor& hidden_states,
                                  const torch::Tensor& topk_weights,
                                  const torch::Tensor& topk_ids,

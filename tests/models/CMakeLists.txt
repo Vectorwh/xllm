@@ -144,6 +144,7 @@ if(USE_MLU)
   cc_test(
     NAME
       glm5_next_mlu_pcp_regression_test
+    RUN_SERIAL
     SRCS
       glm5_next_mlu_pcp_regression_test.cpp
     DEPS

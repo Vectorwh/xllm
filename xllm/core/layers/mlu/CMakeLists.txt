@@ -4,6 +4,7 @@ cc_library(
   NAME
     mlu_layers
   HDRS
+    dense_mlp.h
     dflash2_grouped_conv.h
     dflash2_decoder_layer.h
     dflash2_context_kv.h
@@ -51,6 +52,7 @@ cc_library(
     qwen3_5/qwen3_next_rms_norm.h
     moe_softplus_topk.h
   SRCS
+    dense_mlp.cpp
     dflash2_grouped_conv.cpp
     dflash2_decoder_layer.cpp
     dflash2_context_kv.cpp

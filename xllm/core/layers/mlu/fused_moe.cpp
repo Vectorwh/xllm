@@ -234,17 +234,17 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     shared_pg_ = parallel_args.single_rank_group_;
     shared_experts_ = register_module(
         "shared_experts",
-        DenseMLP(hidden_size_,
-                 intermediate_size * n_shared_experts_,
-                 is_gated_,
-                 false,
-                 hidden_act_,
-                 enable_result_reduction_,
-                 quant_args,
-                 shared_pg_,
-                 options,
-                 "",
-                 static_cast<double>(swiglu_limit_.value_or(0.0f))));
+        MluDenseMLP(hidden_size_,
+                    intermediate_size * n_shared_experts_,
+                    is_gated_,
+                    false,
+                    hidden_act_,
+                    enable_result_reduction_,
+                    quant_args,
+                    shared_pg_,
+                    options,
+                    "",
+                    static_cast<double>(swiglu_limit_.value_or(0.0f))));
   }
 
   // create weight buffer
@@ -583,6 +583,8 @@ void FusedMoEImpl::check_route(const torch::Tensor& hidden_states_2d,
       << "route_info.reduce_weight topk mismatch";
   CHECK_EQ(route_info.expert_id.size(1), topk_)
       << "route_info.expert_id topk mismatch";
+  CHECK(route_info.reduce_weight.scalar_type() == torch::kFloat32)
+      << "route_info.reduce_weight must be float32";
   CHECK(route_info.reduce_weight.device() == hidden_states_2d.device())
       << "route_info.reduce_weight device mismatch";
   CHECK(route_info.expert_id.device() == hidden_states_2d.device())

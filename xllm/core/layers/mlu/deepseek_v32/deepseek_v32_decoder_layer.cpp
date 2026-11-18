@@ -116,15 +116,15 @@ DeepseekV32DecoderLayerImpl::DeepseekV32DecoderLayerImpl(
             "model.layers." + std::to_string(layer_id) + ".mlp"));
   } else {
     mlp_ = register_module("mlp",
-                           DenseMLP(model_args.hidden_size(),
-                                    model_args.intermediate_size(),
-                                    /*is_gated=*/true,
-                                    /*has_bias=*/false,
-                                    model_args.hidden_act(),
-                                    /*enable_result_reduction=*/false,
-                                    quant_args,
-                                    parallel_args_.tp_group_,
-                                    options));
+                           MluDenseMLP(model_args.hidden_size(),
+                                       model_args.intermediate_size(),
+                                       /*is_gated=*/true,
+                                       /*has_bias=*/false,
+                                       model_args.hidden_act(),
+                                       /*enable_result_reduction=*/false,
+                                       quant_args,
+                                       parallel_args_.tp_group_,
+                                       options));
   }
 }
 
