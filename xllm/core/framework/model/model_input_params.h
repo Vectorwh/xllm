@@ -39,6 +39,9 @@ limitations under the License.
 #if defined(USE_DCU)
 #include "platform/dcu/dcu_layer_synchronizer.h"
 #endif
+#if defined(USE_MUSA)
+#include "platform/musa/musa_layer_synchronizer.h"
+#endif
 
 #include "core/framework/model/model_sampling_input.h"
 #include "core/framework/model/mtp_topk_state.h"
@@ -943,6 +946,8 @@ struct ParallelInput {
   std::shared_ptr<DCULayerSynchronizerImpl> layer_synchronizer = nullptr;
 #elif defined(USE_NPU)
   std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer = nullptr;
+#elif defined(USE_MUSA)
+  std::shared_ptr<MUSALayerSynchronizer> layer_synchronizer = nullptr;
 #endif
   uint32_t layers_per_event = std::numeric_limits<uint32_t>::max();
   std::shared_ptr<LayerSynchronizer> layer_wise_load_synchronizer = nullptr;
@@ -966,7 +971,8 @@ struct ParallelInput {
     out.dp_ep_padding_data = dp_ep_padding_data;
     out.mega_active_mask = mega_active_mask;
     out.cp_plan = cp_plan.to(device);
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
     out.layer_synchronizer = layer_synchronizer;
 #endif
     out.layers_per_event = layers_per_event;
@@ -1265,7 +1271,7 @@ struct ModelInputParams {
   }
 
   bool record_layer(uint32_t layer_idx, const torch::Device& device) const {
-#if defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_MLU) || defined(USE_DCU) || defined(USE_MUSA)
     if (parallel.layer_synchronizer != nullptr) {
       return parallel.layer_synchronizer->record_current(layer_idx,
                                                          device.index());

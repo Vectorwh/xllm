@@ -180,7 +180,8 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     bool record_ready_event) {
   Timer timer;
   KVTransferCompletion kv_transfers;
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
   std::shared_ptr<KVPushSynchronizerImpl> layer_synchronizer;
 #endif
   std::unique_ptr<Stream> push_stream = device_.current_stream();
@@ -197,7 +198,8 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
       return;
     }
     push_aborted = true;
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
     if (layer_synchronizer) {
       CHECK_EQ(push_stream->synchronize(), 0);
       layer_synchronizer->abort();
@@ -226,7 +228,8 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   });
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
 #if defined(USE_NPU)
     layer_synchronizer = std::make_shared<NPULayerSynchronizerImpl>(
         context_.get_model_args().n_layers());
@@ -235,6 +238,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
         context_.get_model_args().n_layers());
 #elif defined(USE_DCU)
     layer_synchronizer = std::make_shared<DCULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
+#elif defined(USE_MUSA)
+    layer_synchronizer = std::make_shared<MUSALayerSynchronizer>(
         context_.get_model_args().n_layers());
 #endif
     CHECK(kv_cache_transfer_ != nullptr);

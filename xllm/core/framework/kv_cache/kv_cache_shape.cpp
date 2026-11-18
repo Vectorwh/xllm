@@ -532,14 +532,9 @@ void KVCacheShape::init_conv_cache_shape(const KVCacheCapacity& kv_cache_cap,
                                      ? kv_cache_cap.linear_conv_state_len()
                                      : model_args.linear_conv_kernel_dim() - 1;
 
-  if constexpr (kConvHistoryAxis == 2) {
-    // Causal-conv kernels consume [num_blocks, dim, state_len].
-    conv_cache_shape_ = std::vector<int64_t>{
-        kv_cache_cap.num_linear_state_blocks(), conv_dim, conv_state_len};
-  } else {
-    conv_cache_shape_ = std::vector<int64_t>{
-        kv_cache_cap.num_linear_state_blocks(), conv_state_len, conv_dim};
-  }
+  // Keep shared cache storage history-major. Backend kernels adapt with views.
+  conv_cache_shape_ = std::vector<int64_t>{
+      kv_cache_cap.num_linear_state_blocks(), conv_state_len, conv_dim};
 }
 
 void KVCacheShape::init_ssm_cache_shape(const KVCacheCapacity& kv_cache_cap,

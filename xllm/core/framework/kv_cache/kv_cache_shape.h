@@ -41,7 +41,7 @@ struct MlaPackedC8Layout {
 
 class KVCacheShape final {
  public:
-  static constexpr int64_t kConvHistoryAxis = Platform::is_musa() ? 2 : 1;
+  static constexpr int64_t kConvHistoryAxis = 1;
 
   KVCacheShape() = default;
 

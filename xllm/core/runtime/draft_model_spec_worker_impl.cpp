@@ -26,7 +26,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/kv_cache/kv_cache_shape.h"
 #include "core/framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA)
 #include "core/framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 #include "core/framework/model/model_args.h"
@@ -379,7 +379,7 @@ bool DraftModelSpecWorkerImpl::allocate_kv_cache(
                         });
 }
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA)
 bool DraftModelSpecWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
   CHECK(impl_ != nullptr);

@@ -156,10 +156,6 @@ TEST(LinearStateRestoreTest, CopiesAcceptedCheckpointAlongHistoryAxis) {
       torch::arange(4 * 8 * 3, torch::kFloat32).reshape({4, 8, 3});
   torch::Tensor expected_conv = conv_cache.clone();
   expected_conv[2].slice(0, 1, 3).copy_(expected_conv[1].slice(0, 1, 3));
-  if constexpr (Platform::is_musa()) {
-    conv_cache = conv_cache.transpose(1, 2).contiguous();
-    expected_conv = expected_conv.transpose(1, 2).contiguous();
-  }
   const torch::Tensor ssm_cache =
       torch::arange(4 * 3 * 2 * 2, torch::kFloat32).reshape({12, 2, 2});
   torch::Tensor expected_ssm = ssm_cache.clone();

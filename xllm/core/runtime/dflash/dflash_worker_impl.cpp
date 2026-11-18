@@ -2284,6 +2284,12 @@ std::vector<std::string> DFlashWorkerImpl::write_context_kv(
     const torch::Tensor& context_hidden,
     const torch::Tensor& positions_device,
     const torch::Tensor& new_cache_slots_device) {
+  if constexpr (Platform::requires_auxiliary_kv_push_rejection()) {
+    CHECK(options_.kv_cache_transfer_mode() != "PUSH" ||
+          input.transfer_kv_infos.empty())
+        << "DFlash draft KV PUSH is not implemented for "
+        << Platform::type_str();
+  }
   CHECK(context_hidden.defined()) << "DFlash context hidden is undefined.";
   CHECK_EQ(context_hidden.dim(), 2) << "DFlash context hidden must be 2D.";
   CHECK_EQ(context_hidden.size(1), expected_context_hidden_size_)

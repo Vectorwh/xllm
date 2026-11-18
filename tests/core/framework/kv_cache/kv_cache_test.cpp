@@ -1571,9 +1571,7 @@ TEST(KVCacheTest, ConvCacheUsesValueHeadDimension) {
   for (const int64_t world_size : {1, 2}) {
     const KVCacheShape shape(capacity, model_args, world_size);
     const int64_t conv_dim = 20 / world_size;
-    const std::vector<int64_t> expected =
-        Platform::is_musa() ? std::vector<int64_t>{4, conv_dim, 3}
-                            : std::vector<int64_t>{4, 3, conv_dim};
+    const std::vector<int64_t> expected = {4, 3, conv_dim};
     EXPECT_EQ(shape.conv_cache_shape(), expected);
   }
 }
@@ -1688,11 +1686,7 @@ TEST(KVCacheTest, HostLinearCacheUsesCommittedCheckpointShape) {
   ASSERT_TRUE(ssm.is_contiguous());
   EXPECT_EQ(conv.size(0), 8);
   EXPECT_EQ(conv.size(1), 2);
-#if defined(USE_MUSA)
-  EXPECT_EQ(conv.size(3), 3);
-#else
   EXPECT_EQ(conv.size(2), 3);
-#endif
   EXPECT_EQ(ssm.size(0), 8);
   EXPECT_EQ(ssm.size(1), 2);
   EXPECT_EQ(ssm.size(2), 1);

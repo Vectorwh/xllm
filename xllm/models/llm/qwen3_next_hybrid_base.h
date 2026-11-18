@@ -241,6 +241,9 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
                          kv_caches[i],
                          input_params,
                          mrope_cos_sin);
+      if (!h.defined()) {
+        return ModelOutput();
+      }
 #if defined(USE_NPU)
       if (input_params.parallel.layer_synchronizer != nullptr &&
           !input_params.parallel.layer_synchronizer->record_event(

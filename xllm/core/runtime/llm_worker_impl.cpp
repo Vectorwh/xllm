@@ -44,6 +44,7 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "runtime/params_utils.h"
 #include "util/env_var.h"
+#include "util/scope_guard.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -253,12 +254,54 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       canonical_transfer_request_ids(input.transfer_kv_infos);
   std::vector<std::string> failed_request_ids;
   bool kv_push_waited = false;
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
   std::shared_ptr<KVPushSynchronizerImpl> layer_synchronizer;
 #endif
 
+  std::unique_ptr<Stream> push_stream;
+  bool push_aborted = false;
+  // As in VLM, keep the producer stream alive and drain it before abort wakes
+  // a sender waiting for layer events. Install cleanup before starting PUSH.
+  auto abort_push = [&]() {
+    if (push_aborted) {
+      return;
+    }
+    push_aborted = true;
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
+    if (layer_synchronizer != nullptr) {
+      CHECK_EQ(push_stream->synchronize(), 0);
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA)
+      // DCU's existing synchronizer has no abort hook; retain its wait policy.
+      layer_synchronizer->abort();
+#endif
+    }
+#endif
+  };
+  auto fail_aborted_push = [&]() {
+    abort_push();
+    if (options_.kv_cache_transfer_mode() == "PUSH" &&
+        !canonical_request_ids.empty()) {
+      KVTransferTaskResult result;
+      result.request_ids = canonical_request_ids;
+      result.error_code = KVTransferErrorCode::FAILED;
+      kv_transfers.add(folly::makeSemiFuture(std::vector<KVTransferTaskResult>{
+                           std::move(result)}),
+                       canonical_request_ids);
+    }
+  };
+  ScopeGuard push_guard([&]() {
+    if (!kv_push_waited) {
+      abort_push();
+      // Drain real writes without entering collectives during unwinding.
+      kv_transfers.wait();
+    }
+  });
+
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
+    push_stream = device_.current_stream();
 #if defined(USE_NPU)
     layer_synchronizer = std::make_shared<NPULayerSynchronizerImpl>(
         context_.get_model_args().n_layers());
@@ -268,8 +311,12 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 #elif defined(USE_DCU)
     layer_synchronizer = std::make_shared<DCULayerSynchronizerImpl>(
         context_.get_model_args().n_layers());
+#elif defined(USE_MUSA)
+    layer_synchronizer = std::make_shared<MUSALayerSynchronizer>(
+        context_.get_model_args().n_layers());
 #endif
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
     const_cast<ModelInputParams*>(&(input.input_params))
         ->parallel.layer_synchronizer = layer_synchronizer;
 
@@ -316,12 +363,13 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     // missing compute events and draining the owner before stack unwinding.
     prefill_layerwise_kv_cache_->abort();
   });
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
   // Begin the cache batch before any PUSH completion can arrive. In particular,
   // invalid prefill metadata must fail without leaving a sender waiting for
   // computation events from a forward that will never execute.
   if (layer_synchronizer != nullptr) {
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA)
     // Preserve the cancellation hook that releases senders waiting for a
     // layer event when the completion object drains after an exception.
     kv_transfers.add(
@@ -378,6 +426,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
   if (!model_output.hidden_states.defined() &&
       !model_output.draft_proposal.has_value()) {
+    fail_aborted_push();
     wait_kv_push();
     if (!failed_request_ids.empty()) {
       return make_failed_output(std::move(failed_request_ids));

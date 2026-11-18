@@ -139,19 +139,23 @@ cc_test(
     GTest::gtest_main
 )
 
-if(USE_NPU)
+if(USE_NPU OR USE_MUSA)
   cc_test(
     NAME llm_worker_output_test
     SRCS llm_worker_output_test.cpp
     DEPS :runtime :models :batch :block :platform GTest::gtest_main
   )
-  target_link_libraries(llm_worker_output_test PRIVATE
-    torch_npu torch_python Python::Python ascendcl hccl c_sec nnopbase)
-  target_link_options(llm_worker_output_test PRIVATE
-    "-Wl,--whole-archive"
-    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
-    "-Wl,--no-whole-archive")
+  if(USE_NPU)
+    target_link_libraries(llm_worker_output_test PRIVATE
+      torch_npu torch_python Python::Python ascendcl hccl c_sec nnopbase)
+    target_link_options(llm_worker_output_test PRIVATE
+      "-Wl,--whole-archive"
+      "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+      "-Wl,--no-whole-archive")
+  endif()
+endif()
 
+if(USE_NPU)
   cc_test(
     NAME dspark_decode_step_test
     SRCS dspark_decode_step_test.cpp

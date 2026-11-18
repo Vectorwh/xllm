@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "core/layers/common/qwen3_next_rms_norm.h"
@@ -84,6 +86,9 @@ class Qwen3HybridDecoderLayerImplBase : public Qwen3HybridDecoderLayerModule {
 
   Qwen3NextRMSNorm input_norm_{nullptr};
   Qwen3NextRMSNorm post_norm_{nullptr};
+
+ private:
+  std::optional<uint32_t> kv_push_layer_index_;
 };
 
 }  // namespace layer

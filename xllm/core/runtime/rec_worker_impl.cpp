@@ -29,6 +29,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/types.h"
 #include "core/common/global_flags.h"
+#include "core/common/macros.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
@@ -54,6 +55,7 @@ limitations under the License.
 #include "framework/sampling/rec_sampler.h"
 #include "framework/state_dict/rec_vocab_dict.h"
 #include "models/model_registry.h"
+#include "platform/platform.h"
 #include "util/env_var.h"
 #include "util/timer.h"
 
@@ -489,6 +491,9 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
 
   if (runtime_.worker.options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
+    if constexpr (Platform::requires_auxiliary_kv_push_rejection()) {
+      NOT_IMPLEMENTED_WITH_MSG("Rec KV PUSH for " << Platform::type_str());
+    }
 #if defined(USE_NPU)
     std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer =
         std::make_shared<NPULayerSynchronizerImpl>(

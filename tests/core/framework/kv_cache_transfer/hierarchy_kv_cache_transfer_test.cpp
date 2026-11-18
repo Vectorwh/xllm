@@ -547,11 +547,7 @@ void verify_committed_linear_round_trip(const char* model_type) {
   ASSERT_TRUE(input_params.synchronize_all_layers());
   EXPECT_FALSE(transfer.take_load_handle(/*batch_id=*/9).has_value());
 
-#if defined(USE_MUSA)
-  constexpr int64_t kConvHistoryAxis = 1;
-#else
   constexpr int64_t kConvHistoryAxis = 0;
-#endif
   const torch::Tensor destination_conv = conv[kDestinationSlot];
   const torch::Tensor source_conv = conv[kSourceSlot];
   EXPECT_TRUE(torch::equal(destination_conv.narrow(kConvHistoryAxis, 0, 3),

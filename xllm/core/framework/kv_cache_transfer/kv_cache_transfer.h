@@ -40,6 +40,10 @@ limitations under the License.
 #if defined(USE_DCU)
 #include "platform/dcu/dcu_layer_synchronizer.h"
 #endif
+#if defined(USE_MUSA)
+#include "platform/musa/musa_layer_synchronizer.h"
+#endif
+
 #include "framework/parallel_state/parallel_args.h"
 #include "platform/device.h"
 #include "util/threadpool.h"
@@ -52,6 +56,8 @@ using KVPushSynchronizerImpl = NPULayerSynchronizerImpl;
 using KVPushSynchronizerImpl = MLULayerSynchronizerImpl;
 #elif defined(USE_DCU)
 using KVPushSynchronizerImpl = DCULayerSynchronizerImpl;
+#elif defined(USE_MUSA)
+using KVPushSynchronizerImpl = MUSALayerSynchronizer;
 #endif
 
 // How a PUSH may map source logical blocks onto the destination's declared
@@ -247,7 +253,8 @@ class KVCacheTransfer {
     push_completion_callback_ = std::move(callback);
   }
 
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
   virtual folly::SemiFuture<std::vector<KVTransferTaskResult>>
   push_kv_blocks_async(
       const std::vector<TransferKVInfo>& transfer_kv_infos,
@@ -261,7 +268,8 @@ class KVCacheTransfer {
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       const ParallelArgs& parallel_args);
 
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
   virtual std::vector<KVTransferTaskResult> push_kv_blocks(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
       std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,

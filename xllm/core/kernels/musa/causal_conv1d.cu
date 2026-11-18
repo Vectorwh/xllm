@@ -332,7 +332,8 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(
     if (has_initial_state) {
 #pragma unroll
       for (int w = 0; w < kWidth - 1; ++w) {
-        initial_state[kNElts - 1 - (kWidth - 2) + w] = conv_states[w];
+        initial_state[kNElts - 1 - (kWidth - 2) + w] =
+            conv_states[w * params.conv_state_l_stride];
       }
     }
     smem_exchange[kNThreads - 1] = reinterpret_cast<vec_t*>(initial_state)[0];
@@ -420,13 +421,15 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(
         reinterpret_cast<vec_t*>(vals_load)[0] = smem_exchange[kNThreads - 1];
 #pragma unroll
         for (int w = 0; w < -final_state_position; ++w) {
-          conv_states[w] = vals_load[kNElts + final_state_position + w];
+          conv_states[w * params.conv_state_l_stride] =
+              vals_load[kNElts + final_state_position + w];
         }
       }
       if ((chunk == n_chunks - 1) && tidx == 0) {
         reinterpret_cast<vec_t*>(vals_load)[0] = smem_exchange[0];
         for (int w = -final_state_position; w < kWidth - 1; ++w) {
-          conv_states[w] = vals_load[w + final_state_position];
+          conv_states[w * params.conv_state_l_stride] =
+              vals_load[w + final_state_position];
         }
         return;
       }
@@ -442,14 +445,18 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(
 #pragma unroll
       for (int w = 0; w < kWidth - 1; ++w) {
         if ((w - seqlen) >= 0 && has_initial_state) {
-          conv_states[w - seqlen] = conv_states[w];
+          conv_states[(w - seqlen) * params.conv_state_l_stride] =
+              conv_states[w * params.conv_state_l_stride];
         } else if ((w - seqlen) >= 0 && !has_initial_state) {
-          conv_states[w - seqlen] = input_t(0.0f);
+          conv_states[(w - seqlen) * params.conv_state_l_stride] =
+              input_t(0.0f);
         }
       }
 #pragma unroll
       for (int w = 0; w < kWidth - 1; ++w) {
-        if (offset + w >= 0) conv_states[w] = x_vals_load[offset + w];
+        if (offset + w >= 0) {
+          conv_states[w * params.conv_state_l_stride] = x_vals_load[offset + w];
+        }
       }
     } else {
       const int offset = ((seqlen - (kWidth - 1)) % (kNElts));
@@ -460,7 +467,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(
       reinterpret_cast<vec_t*>(x_vals_load)[0] = smem_exchange[last_thread];
 #pragma unroll
       for (int w = 0; w < kWidth - 1; ++w) {
-        conv_states[w] = x_vals_load[offset + w];
+        conv_states[w * params.conv_state_l_stride] = x_vals_load[offset + w];
       }
     }
   }

@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/kernels/musa/gdn_ops.h"
+#include "core/kernels/param.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 
@@ -138,6 +139,111 @@ TEST(MusaGdnTest, PrefillMatchesReferenceForBothHeadCountsAndSequenceLayouts) {
           << " actual_max=" << actual_state.abs().max().item<float>()
           << " expected_max=" << expected_state.abs().max().item<float>();
     }
+  }
+}
+
+TEST(MusaGdnTest, ConvolutionUpdatesSharedHistoryMajorStorageThroughView) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "No MUSA device available";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  torch::set_num_threads(1);
+  torch::manual_seed(29);
+  const torch::Device target(torch::kPrivateUse1, /*index=*/0);
+  constexpr int64_t kDim = 3;
+  constexpr int64_t kHistory = 3;
+  const auto options = torch::TensorOptions().dtype(torch::kFloat32);
+  // Square axes and asymmetric data prevent shape-only transpose checks.
+  const torch::Tensor initial =
+      torch::arange(3 * kHistory * kDim, options).reshape({3, kHistory, kDim}) /
+      10;
+  const torch::Tensor weight = torch::randn({kDim, kHistory + 1}, options);
+  const std::vector<int32_t> cu = {0, 1, 1026};
+  const std::vector<int32_t> indices = {2, 0};
+  const torch::Tensor has_initial =
+      torch::tensor({true, false}, torch::kBool).to(target);
+  const torch::Tensor device_cu = torch::tensor(cu, torch::kInt32).to(target);
+  const torch::Tensor device_indices =
+      torch::tensor(indices, torch::kInt32).to(target);
+  const torch::Tensor device_weight = weight.to(target);
+  const torch::Tensor input = torch::randn({cu.back(), kDim}, options);
+  torch::Tensor expected_state = initial.clone();
+  torch::Tensor expected_output = torch::empty_like(input);
+  for (int64_t sequence = 0; sequence < 2; ++sequence) {
+    torch::Tensor history = expected_state[indices[sequence]];
+    if (sequence == 1) {
+      history.zero_();
+    }
+    for (int64_t token = cu[sequence]; token < cu[sequence + 1]; ++token) {
+      const torch::Tensor window =
+          torch::cat({history, input[token].unsqueeze(0)}, /*dim=*/0);
+      expected_output[token] = (window.transpose(0, 1) * weight).sum(-1);
+      history.copy_(window.narrow(/*dim=*/0, /*start=*/1, kHistory));
+    }
+  }
+
+  // Exercise both prefill kernels directly, independent of the runtime toggle.
+  for (const bool token_major : {false, true}) {
+    SCOPED_TRACE(token_major);
+    torch::Tensor storage = initial.to(target);
+    torch::Tensor view = storage.transpose(-1, -2);
+    ASSERT_EQ(storage.data_ptr(), view.data_ptr());
+    ASSERT_FALSE(view.is_contiguous());
+    torch::Tensor x =
+        token_major ? input.to(target) : input.t().contiguous().to(target);
+    torch::Tensor output = torch::empty_like(x);
+    if (token_major) {
+      causal_conv1d_fwd_token_major(x,
+                                    device_weight,
+                                    output,
+                                    std::nullopt,
+                                    view,
+                                    device_cu,
+                                    device_indices,
+                                    has_initial,
+                                    /*silu_activation=*/false,
+                                    /*pad_slot_id=*/-1);
+    } else {
+      causal_conv1d_fwd(x,
+                        device_weight,
+                        output,
+                        std::nullopt,
+                        view,
+                        device_cu,
+                        device_indices,
+                        has_initial,
+                        /*silu_activation=*/false,
+                        /*pad_slot_id=*/-1);
+    }
+    const torch::Tensor actual = token_major ? output.cpu() : output.cpu().t();
+    EXPECT_TRUE(torch::allclose(actual, expected_output, 1e-5, 1e-5));
+    EXPECT_TRUE(torch::equal(storage.cpu(), expected_state));
+
+    // Decode consumes the same view and must update the backing storage.
+    const torch::Tensor decode_input = torch::randn({2, kDim}, options);
+    torch::Tensor expected_decode = torch::empty_like(decode_input);
+    torch::Tensor decode_state = expected_state.clone();
+    for (int64_t sequence = 0; sequence < 2; ++sequence) {
+      torch::Tensor history = decode_state[indices[sequence]];
+      const torch::Tensor window =
+          torch::cat({history, decode_input[sequence].unsqueeze(0)}, /*dim=*/0);
+      expected_decode[sequence] = (window.transpose(0, 1) * weight).sum(-1);
+      history.copy_(window.narrow(/*dim=*/0, /*start=*/1, kHistory));
+    }
+    CausalConv1dUpdateParams params;
+    params.x = decode_input.to(target);
+    params.weight = device_weight;
+    params.conv_state = view;
+    params.conv_state_indices = device_indices;
+    params.query_start_loc = torch::tensor({0, 1, 2}, torch::kInt32).to(target);
+    params.activation = false;
+    const torch::Tensor decode_output = torch::empty_like(params.x);
+    const torch::Tensor actual_decode =
+        causal_conv1d_update(params, decode_output).cpu();
+    EXPECT_TRUE(torch::allclose(actual_decode, expected_decode, 1e-5, 1e-5));
+    EXPECT_TRUE(torch::equal(storage.cpu(), decode_state));
   }
 }
 

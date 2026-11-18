@@ -119,7 +119,9 @@ TEST(MusaAttentionTest, DispatchHonorsCompiledContractAndOverrides) {
   }
   EXPECT_DEATH(
       ([] {
-        AttentionMetadata metadata;
+        AttentionMetadata metadata{};
+        metadata.is_prefill = false;
+        metadata.is_chunked_prefill = false;
         metadata.max_seq_len = 1;
         torch::Tensor query = torch::zeros({1, 12, 256}, torch::kBFloat16);
         torch::Tensor key = torch::zeros({1, 2, 256}, torch::kBFloat16);

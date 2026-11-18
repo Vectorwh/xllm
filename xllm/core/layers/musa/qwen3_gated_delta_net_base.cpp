@@ -579,7 +579,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   b = b.view({batch_size, seq_len, num_v_heads_ / tp_size_});
   a = a.view({batch_size, seq_len, num_v_heads_ / tp_size_});
 
-  torch::Tensor conv_cache = kv_cache.get_conv_cache();
+  // Kernels consume [blocks, feature, history]; the shared cache stays
+  // [blocks, history, feature]. Transpose only changes strides, not storage.
+  torch::Tensor conv_cache = kv_cache.get_conv_cache().transpose(-1, -2);
   torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
   torch::Device device = mixed_qkv.device();
   torch::Tensor conv_weight = conv1d_->weight();

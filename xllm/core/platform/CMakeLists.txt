@@ -27,6 +27,7 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda/cuda_utils.h>
     $<$<BOOL:${USE_MUSA}>:musa/musa_csrc_guards.h>
     $<$<BOOL:${USE_MUSA}>:musa/musa_utils.h>
+    $<$<BOOL:${USE_MUSA}>:musa/musa_layer_synchronizer.h>
     $<$<BOOL:${USE_CUDA}>:cuda_profiler.h>
     $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_DCU}>,$<BOOL:${USE_MUSA}>>:torch_profiler.h>
     $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MUSA}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:numa_utils.h>
@@ -41,6 +42,7 @@ cc_library(
     sleepable_allocator.cpp
     batch_memcpy.cpp
     layer_synchronizer.cpp
+    $<$<BOOL:${USE_MUSA}>:musa/musa_layer_synchronizer.cpp>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_batch_memcpy.cpp>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_host_memory.cpp>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.cpp>

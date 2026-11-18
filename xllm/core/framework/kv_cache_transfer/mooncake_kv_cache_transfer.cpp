@@ -33,6 +33,7 @@ limitations under the License.
 #include "framework/parallel_state/linear_attention_parallel.h"
 #include "framework/xtensor/global_xtensor.h"
 #include "framework/xtensor/xtensor_allocator.h"
+#include "platform/platform.h"
 #include "util/net.h"
 #include "util/utils.h"
 #include "util/uuid.h"
@@ -223,15 +224,7 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
   context.layout_family = "token_head_dim";
 #endif
 
-#if defined(USE_NPU)
-  context.backend = "npu";
-#elif defined(USE_MLU)
-  context.backend = "mlu";
-#elif defined(USE_DCU)
-  context.backend = "dcu";
-#else
-  context.backend = "cpu";
-#endif
+  context.backend = Platform::type_str();
   std::ostringstream fingerprint;
   fingerprint << model_args.model_type() << ":" << model_args.n_layers() << ":"
               << tensor_layout.kv_head_count << ":" << model_args.head_dim()

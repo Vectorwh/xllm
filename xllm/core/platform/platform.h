@@ -96,6 +96,12 @@ class Platform final {
     return is_npu() || is_mlu();
   }
 
+  // MUSA Rec/DFlash producers do not publish auxiliary PUSH events yet.
+  // Keep existing backends' request validation unchanged.
+  static constexpr bool requires_auxiliary_kv_push_rejection() {
+    return is_musa();
+  }
+
   static constexpr bool supports_compact_host_kv_transfer() { return is_mlu(); }
 
   static constexpr bool supports_mtp_decode_graph_warmup() {

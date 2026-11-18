@@ -26,11 +26,16 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
     const ModelContext& context,
     int32_t layer_id,
     std::shared_ptr<Qwen3GatedDeltaNetBaseImpl> linear_attention_module) {
+  CHECK_GE(layer_id, 0) << "MUSA hybrid layer index must be non-negative";
   const auto& model_args = context.get_model_args();
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
   const auto& options = context.get_tensor_options();
   const std::string& model_type = model_args.model_type();
+  // Only integrated targets publish here. MTP keeps model-side publication.
+  if (model_type == "qwen3_next" || is_qwen3_5_target_model_type(model_type)) {
+    kv_push_layer_index_ = static_cast<uint32_t>(layer_id);
+  }
   const bool is_qwen35_moe = model_type == "qwen3_5_moe" ||
                              model_type == "qwen3_5_moe_text" ||
                              model_type == "qwen3_5_moe_mtp";
@@ -155,6 +160,13 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
     x = moe_mlp_->forward(x, input_params);
   } else {
     x = mlp_(x);
+  }
+
+  if (kv_push_layer_index_.has_value() &&
+      !input_params.record_layer(*kv_push_layer_index_, x.device())) {
+    LOG(ERROR) << "Failed to record MUSA hybrid layer for KV PUSH, layer="
+               << *kv_push_layer_index_;
+    return {};
   }
 
   return x;

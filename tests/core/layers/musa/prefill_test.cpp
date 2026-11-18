@@ -371,12 +371,14 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
                          lengths);
       };
       torch::Tensor scheduler_metadata = make_metadata();
+      const torch::Tensor populated_k_cache = cache.get_k_cache();
+      const torch::Tensor populated_v_cache = cache.get_v_cache();
       const auto forward = [&]() {
         const auto run_attention =
             decode ? kernel::musa::fa3_decode : kernel::musa::fa3_prefill_paged;
         run_attention(batched_query,
-                      k_cache,
-                      v_cache,
+                      populated_k_cache,
+                      populated_v_cache,
                       cu_query,
                       lengths,
                       pages,

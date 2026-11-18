@@ -16,9 +16,13 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,20 +32,30 @@ limitations under the License.
 #include "framework/model/causal_lm.h"
 #include "platform/device.h"
 #include "runtime/llm_worker_impl.h"
+#if defined(USE_MUSA)
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#endif
 
 namespace xllm {
 namespace {
 
 class OutputTestModel final : public CausalLM {
  public:
-  OutputTestModel(ModelOutput output, torch::TensorOptions options)
-      : output_(std::move(output)), options_(std::move(options)) {}
+  OutputTestModel(ModelOutput output,
+                  torch::TensorOptions options,
+                  std::function<void()> on_forward = {})
+      : output_(std::move(output)),
+        options_(std::move(options)),
+        on_forward_(std::move(on_forward)) {}
 
   ModelOutput forward(const torch::Tensor&,
                       const torch::Tensor&,
                       std::vector<KVCache>&,
                       const ModelInputParams& params) override {
     received_sampling_ = params.sampling.has_value();
+    if (on_forward_) {
+      on_forward_();
+    }
     return output_;
   }
 
@@ -70,6 +84,7 @@ class OutputTestModel final : public CausalLM {
  private:
   ModelOutput output_;
   torch::TensorOptions options_;
+  std::function<void()> on_forward_;
   int32_t logits_calls_ = 0;
   bool received_sampling_ = false;
 };
@@ -95,6 +110,12 @@ class OutputTestWorker final : public LLMWorkerImpl {
     return execute_no_sync_on_stream(
         input, *compute_stream_, record_ready_event);
   }
+
+#if defined(USE_MUSA)
+  void set_kv_transfer(std::shared_ptr<KVCacheTransfer> transfer) {
+    kv_cache_transfer_ = std::move(transfer);
+  }
+#endif
 };
 
 class LLMWorkerOutputTest : public ::testing::TestWithParam<bool> {
@@ -153,6 +174,142 @@ class LLMWorkerOutputTest : public ::testing::TestWithParam<bool> {
   std::string saved_model_impl_;
   bool saved_manual_loader_ = false;
 };
+
+#if defined(USE_MUSA)
+// Use the real synchronizer and completion path, replacing only network I/O.
+class WaitingPushTransfer final : public KVCacheTransfer {
+ public:
+  std::promise<void> started_;
+  std::promise<bool> layer_result_;
+  std::promise<void> release_;
+
+  void get_cache_info(uint64_t&, std::string&) override {}
+  bool link_clusters(const std::vector<uint64_t>&,
+                     const std::vector<std::string>&,
+                     const std::vector<uint16_t>&) override {
+    return false;
+  }
+  bool unlink_cluster(const uint64_t&,
+                      const std::string&,
+                      uint16_t,
+                      bool) override {
+    return false;
+  }
+  bool pull_kv_blocks(uint64_t,
+                      const std::string&,
+                      const std::vector<KVTransferMapping>&) override {
+    return false;
+  }
+  std::vector<KVTransferTaskResult> push_kv_blocks(
+      std::unordered_map<std::string, KVCacheInfo>&,
+      std::shared_ptr<KVPushSynchronizerImpl>&,
+      bool,
+      int32_t,
+      int32_t) override {
+    return {};
+  }
+
+  folly::SemiFuture<std::vector<KVTransferTaskResult>> push_kv_blocks_async(
+      const std::vector<TransferKVInfo>& infos,
+      const ParallelArgs&,
+      std::shared_ptr<KVPushSynchronizerImpl> synchronizer,
+      bool) override {
+    folly::Promise<std::vector<KVTransferTaskResult>> completion;
+    auto future = completion.getSemiFuture();
+    auto released = release_.get_future();
+    threadpool_.schedule([this,
+                          synchronizer = std::move(synchronizer),
+                          ids = unique_transfer_request_ids(infos),
+                          completion = std::move(completion),
+                          released = std::move(released)]() mutable {
+      started_.set_value();
+      const bool ready = synchronizer->synchronize_layer(/*layer_index=*/0);
+      layer_result_.set_value(ready);
+      // A canceled sender may still own source buffers. Hold its completion
+      // until the test verifies that the Worker has not returned yet.
+      released.wait();
+      KVTransferTaskResult result;
+      result.request_ids = std::move(ids);
+      result.error_code =
+          ready ? KVTransferErrorCode::NONE : KVTransferErrorCode::FAILED;
+      completion.setValue(std::vector<KVTransferTaskResult>{std::move(result)});
+    });
+    return future;
+  }
+};
+
+class LLMWorkerPushFailureTest : public LLMWorkerOutputTest {};
+
+TEST_P(LLMWorkerPushFailureTest, ForwardFailureCancelsAndDrainsStartedPush) {
+  options_.enable_speculative_decode(false)
+      .is_draft_engine(false)
+      .num_speculative_tokens(0)
+      .kv_cache_transfer_mode("PUSH")
+      .instance_role(InstanceRole::PREFILL);
+  auto transfer = std::make_shared<WaitingPushTransfer>();
+  auto started = transfer->started_.get_future();
+  auto layer_result = transfer->layer_result_.get_future();
+  const bool throw_on_forward = GetParam();
+  const auto tensor_options =
+      torch::TensorOptions().device(device_.unwrap()).dtype(torch::kFloat);
+  auto model =
+      std::make_unique<OutputTestModel>(ModelOutput(), tensor_options, [&] {
+        EXPECT_EQ(started.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        if (throw_on_forward) {
+          throw std::runtime_error("injected forward failure");
+        }
+      });
+  OutputTestModel* model_ptr = model.get();
+  const ParallelArgs parallel_args(/*rank=*/0, /*world_size=*/1, nullptr);
+  OutputTestWorker worker(
+      parallel_args, device_.unwrap(), options_, std::move(model));
+  worker.set_kv_transfer(transfer);
+  ForwardInput input = make_input();
+  input.input_params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  input.transfer_kv_infos = {TransferKVInfo{.request_id = "request-b"},
+                             TransferKVInfo{.request_id = "request-a"},
+                             TransferKVInfo{.request_id = "request-b"}};
+  auto output = std::async(std::launch::async, [&] {
+    device_.set_device();
+    return worker.run(input, /*record_ready_event=*/false);
+  });
+  const std::future_status cancellation =
+      layer_result.wait_for(std::chrono::seconds(5));
+  EXPECT_EQ(cancellation, std::future_status::ready);
+  // Release even on regression: don't turn a failed assertion into a hang.
+  if (cancellation != std::future_status::ready &&
+      started.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    input.input_params.parallel.layer_synchronizer->abort();
+  }
+  EXPECT_EQ(output.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::timeout);
+  transfer->release_.set_value();
+  ASSERT_EQ(layer_result.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  EXPECT_FALSE(layer_result.get());
+  if (throw_on_forward) {
+    try {
+      output.get();
+      FAIL() << "forward exception was swallowed";
+    } catch (const std::runtime_error& error) {
+      EXPECT_STREQ(error.what(), "injected forward failure");
+    }
+  } else {
+    const auto result = output.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->failed_request_ids,
+              (std::vector<std::string>{"request-a", "request-b"}));
+    EXPECT_FALSE(result->logits.defined());
+    EXPECT_FALSE(result->sample_output.next_tokens.defined());
+  }
+  EXPECT_EQ(model_ptr->logits_calls(), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(EmptyOutputOrException,
+                         LLMWorkerPushFailureTest,
+                         ::testing::Values(false, true));
+#endif
 
 TEST_P(LLMWorkerOutputTest,
        CompletedProposalSkipsLogitsAndKeepsCommonRetirement) {
