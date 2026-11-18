@@ -19,8 +19,10 @@ limitations under the License.
 #include <acl/acl.h>
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 
 #include "tests/scoped_port_range.h"
@@ -49,6 +51,42 @@ void init_npu_test_runtime() {
     const std::string base = std::to_string(hccl_ports.release());
     if (setenv("HCCL_IF_BASE_PORT", base.c_str(), /*overwrite=*/0) != 0) {
       std::fprintf(stderr, "Failed to configure HCCL test ports\n");
+      std::abort();
+    }
+  }
+
+  // HCCL reads the NPU NIC socket range while the process initializes its
+  // runtime, so the variable must be present before aclInit runs; setting it
+  // later only affects processes that re-exec afterwards. HCCL_IF_BASE_PORT
+  // does not cover these sockets. Reserve one block; a forked peer that forms
+  // an independent HCCL group derives the block that follows it (see the
+  // Mooncake round-trip test). A busy host may not have a large contiguous
+  // hole left, so step down to smaller blocks instead of failing the whole
+  // binary; if no block can be reserved, leave the variable unset and let the
+  // cases that require it report the missing range.
+  if (std::getenv("HCCL_NPU_SOCKET_PORT_RANGE") == nullptr) {
+    constexpr int32_t kBlockSizes[] = {64, 16, 4, 2};
+    std::string range;
+    std::string last_error = "no contiguous block found";
+    for (const int32_t block_size : kBlockSizes) {
+      try {
+        xllm::tests::ScopedPortRange npu_ports(block_size);
+        const int32_t base_port = npu_ports.release();
+        range = std::to_string(base_port) + "-" +
+                std::to_string(base_port + block_size - 1);
+        break;
+      } catch (const std::runtime_error& error) {
+        last_error = error.what();
+      }
+    }
+    if (range.empty()) {
+      std::fprintf(stderr,
+                   "Failed to reserve HCCL NPU socket ports: %s\n",
+                   last_error.c_str());
+    } else if (setenv("HCCL_NPU_SOCKET_PORT_RANGE",
+                      range.c_str(),
+                      /*overwrite=*/0) != 0) {
+      std::fprintf(stderr, "Failed to configure HCCL NPU socket ports\n");
       std::abort();
     }
   }

@@ -792,11 +792,33 @@ class ScopedIntraHostNpuTransferEnv final {
   bool ok_ = false;
 };
 
-constexpr int32_t kHcclNpuSocketPortRangeSize = 64;
-
-std::string make_hccl_npu_socket_port_range(int32_t base_port) {
+std::string make_hccl_npu_socket_port_range(int32_t base_port, int32_t count) {
   return std::to_string(base_port) + "-" +
-         std::to_string(base_port + kHcclNpuSocketPortRangeSize - 1);
+         std::to_string(base_port + count - 1);
+}
+
+// Reads the HCCL NPU socket block reserved by the test environment before
+// aclInit. A forked peer that needs its own HCCL group takes the block that
+// follows this one, so both processes start with disjoint ranges.
+bool read_hccl_npu_socket_range(int32_t* base_port, int32_t* count) {
+  const char* value = std::getenv("HCCL_NPU_SOCKET_PORT_RANGE");
+  if (value == nullptr) {
+    return false;
+  }
+  char* first_end = nullptr;
+  const long first = std::strtol(value, &first_end, 10);
+  if (first_end == value || *first_end != '-') {
+    return false;
+  }
+  char* last_end = nullptr;
+  const long last = std::strtol(first_end + 1, &last_end, 10);
+  if (last_end == first_end + 1 || *last_end != '\0' || first <= 0 ||
+      last < first || last > UINT16_MAX) {
+    return false;
+  }
+  *base_port = static_cast<int32_t>(first);
+  *count = static_cast<int32_t>(last - first + 1);
+  return true;
 }
 
 constexpr int32_t kValidatePushCommand = 1;
@@ -3163,12 +3185,6 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   // HCCL derives several listener ports from each process's base port.
   xllm::tests::ScopedPortRange local_hccl_ports(/*count=*/64);
   xllm::tests::ScopedPortRange remote_hccl_ports(/*count=*/64);
-  // HCCL_IF_BASE_PORT does not control NPU NIC sockets. Give each peer its
-  // own available range instead of letting both bind the default port 16666.
-  xllm::tests::ScopedPortRange local_hccl_npu_ports(
-      kHcclNpuSocketPortRangeSize);
-  xllm::tests::ScopedPortRange remote_hccl_npu_ports(
-      kHcclNpuSocketPortRangeSize);
   ASSERT_GT(local_listen_port, 0);
   ASSERT_GT(remote_listen_port, 0);
 
@@ -3180,10 +3196,26 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   xllm::tests::ScopedEnvironmentVariable hccl_base_port("HCCL_IF_BASE_PORT");
   ASSERT_TRUE(hccl_base_port.set(
       std::to_string(remote_hccl_ports.base_port()).c_str()));
+  // HCCL reads this variable while the process initializes its runtime, so
+  // the controller keeps the block reserved before aclInit. The peer re-execs
+  // with its own environment, so give it the adjacent block and restore the
+  // controller's block before it creates its device.
   xllm::tests::ScopedEnvironmentVariable hccl_npu_socket_port_range(
       "HCCL_NPU_SOCKET_PORT_RANGE");
+  int32_t controller_hccl_npu_base = 0;
+  int32_t controller_hccl_npu_count = 0;
+  ASSERT_TRUE(read_hccl_npu_socket_range(&controller_hccl_npu_base,
+                                         &controller_hccl_npu_count))
+      << "HCCL_NPU_SOCKET_PORT_RANGE was not reserved for this process";
+  ASSERT_LE(controller_hccl_npu_base + 2 * controller_hccl_npu_count - 1,
+            UINT16_MAX);
+  const std::string controller_hccl_npu_port_range =
+      make_hccl_npu_socket_port_range(controller_hccl_npu_base,
+                                      controller_hccl_npu_count);
   const std::string remote_hccl_npu_port_range =
-      make_hccl_npu_socket_port_range(remote_hccl_npu_ports.base_port());
+      make_hccl_npu_socket_port_range(
+          controller_hccl_npu_base + controller_hccl_npu_count,
+          controller_hccl_npu_count);
   ASSERT_TRUE(
       hccl_npu_socket_port_range.set(remote_hccl_npu_port_range.c_str()));
 
@@ -3206,7 +3238,6 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   remote_rpc_ports.release();
   remote_hccl_ports.release();
-  remote_hccl_npu_ports.release();
   const pid_t child_pid = fork();
   ASSERT_GE(child_pid, 0);
   if (child_pid == 0) {
@@ -3224,11 +3255,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   ASSERT_TRUE(
       hccl_base_port.set(std::to_string(local_hccl_ports.release()).c_str()));
-  local_hccl_npu_ports.release();
-  const std::string local_hccl_npu_port_range =
-      make_hccl_npu_socket_port_range(local_hccl_npu_ports.base_port());
   ASSERT_TRUE(
-      hccl_npu_socket_port_range.set(local_hccl_npu_port_range.c_str()));
+      hccl_npu_socket_port_range.set(controller_hccl_npu_port_range.c_str()));
   local_rpc_ports.release();
 
   unsetenv(kPeerCommandFdEnv);
