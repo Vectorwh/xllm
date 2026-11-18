@@ -327,7 +327,7 @@ def _run_select_qli(
     )
 
     with (
-        patch.object(glm5_2, "_apply_half_rope", side_effect=lambda _cache, value, _positions: value),
+        patch.object(glm5_2, "_step_half_rope", side_effect=lambda _cache, value, _positions: value),
         patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
         patch.object(glm5_2, "cp_shard_rows", side_effect=shard_rows),
         patch.object(glm5_2.kernels, "lightning_indexer", side_effect=kernel, create=True),
@@ -620,7 +620,7 @@ def _run_quant_select_qli(
     )
 
     with (
-        patch.object(glm5_2, "_apply_half_rope", side_effect=lambda _cache, value, _positions: value),
+        patch.object(glm5_2, "_step_half_rope", side_effect=lambda _cache, value, _positions: value),
         patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
         patch.object(glm5_2, "cp_shard_rows", side_effect=shard_rows),
         patch.object(glm5_2.kernels, "dynamic_quant", side_effect=_cpu_dynamic_quant, create=True),

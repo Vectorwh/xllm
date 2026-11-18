@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import torch
 import torch.nn as nn
@@ -67,6 +67,7 @@ from xllm.python.model_executor.cp_utils import (
 )
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
+    get_forward_context_or_none,
     in_acl_graph,
     record_layer_event,
     wait_for_layer_load,
@@ -77,8 +78,9 @@ from xllm.python.models.deepseek_v32 import (
     DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
 )
 from xllm.python.models.deepseek_v32 import (
-    _apply_half_rope,
+    _apply_half_rope_with_angles,
     _create_hadamard_matrix,
+    _gather_half_rope_cos_sin,
     _gather_interleave_cos_sin,
     _interleave_rope_with,
     _tp_rank_from_device,
@@ -126,6 +128,51 @@ _QLI_NO_WINDOW_LIMIT = 9223372036854775807
 # The fused prolog path is a decode-only fast path; keep the switch so it can
 # be a/b tested and rolled back without a rebuild.
 _MLA_PROLOG = os.environ.get("G53_MLA_PROLOG", "1") == "1"
+
+
+@dataclass(frozen=True, slots=True)
+class _StepRopeRows:
+    """Retain both immutable inputs so their identities cannot be recycled."""
+
+    table: torch.Tensor
+    positions: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+
+def _step_rope_tables(
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    gather: Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather once per forward context; standalone calls remain uncached."""
+    context = get_forward_context_or_none()
+    if context is None:
+        return gather(cos_sin_cache, positions)
+    key = (_StepRopeRows, gather, id(cos_sin_cache), id(positions))
+    rows = cast(_StepRopeRows | None, context.layer_shared_cache.get(key))
+    if rows is None:
+        cos, sin = gather(cos_sin_cache, positions)
+        context.layer_shared_cache[key] = _StepRopeRows(cos_sin_cache, positions, cos, sin)
+        return cos, sin
+    return rows.cos, rows.sin
+
+
+def _step_cos_sin(cos_sin_cache: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Interleaved cos/sin for ``positions``, gathered once per forward."""
+    return _step_rope_tables(cos_sin_cache, positions, _gather_interleave_cos_sin)
+
+
+def _step_half_cos_sin(cos_sin_cache: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Half-rotate (NeoX) cos/sin for ``positions``, gathered once per forward."""
+    return _step_rope_tables(cos_sin_cache, positions, _gather_half_rope_cos_sin)
+
+
+def _step_half_rope(cos_sin_cache: torch.Tensor, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """Half-rotate RoPE with the step-cached angles."""
+    half_cos, half_sin = _step_half_cos_sin(cos_sin_cache, positions)
+    return _apply_half_rope_with_angles(x, half_cos, half_sin)
+
 
 # One-shot diagnostics for the fused MLA prolog path: which gate declined it.
 _PROLOG_LOG = logger
@@ -595,7 +642,7 @@ class Glm52MLAAttention(Attention):
         context: MlaPreprocessContext,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project, normalize, rotate and write the paged KV cache in one op."""
-        cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        cos, sin = _step_cos_sin(cos_sin_cache, positions)
         slot_source = context.slot_mapping
         if context.cache_slot_mapping is not None:
             slot_source = context.cache_slot_mapping
@@ -727,7 +774,7 @@ class Glm52MLAAttention(Attention):
         )
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_latent = kernels.batch_matmul_transpose(q_nope, self.W_UK)
-        cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        cos, sin = _step_cos_sin(cos_sin_cache, positions)
         q_pe = _interleave_rope_with(q_rope, cos, sin)
         kv = self.kv_a_proj_with_mqa(hidden)
         k_latent_raw, k_rope_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -1048,13 +1095,13 @@ class Glm52Indexer(nn.Module):
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         if self.indexer_rope_interleave:
-            cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+            cos, sin = _step_cos_sin(cos_sin_cache, positions)
             q_pe = _interleave_rope_with(q_pe, cos, sin)
-            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, cache_positions)
+            k_cos, k_sin = _step_cos_sin(cos_sin_cache, cache_positions)
             k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
         else:
-            q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
-            k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
+            q_pe = _step_half_rope(cos_sin_cache, q_pe, positions)
+            k_pe = _step_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
         weights = self.weights_proj(hidden)

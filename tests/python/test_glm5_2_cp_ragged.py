@@ -148,7 +148,7 @@ def test_indexer_gathers_padded_rows_and_restores_global_queries(
 
         kernel = MagicMock(return_value=global_topk)
         with (
-            patch.object(glm5_2, "_apply_half_rope", side_effect=lambda _cache, value, _positions: value),
+            patch.object(glm5_2, "_step_half_rope", side_effect=lambda _cache, value, _positions: value),
             patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
             patch.object(glm5_2.kernels, "dynamic_quant", side_effect=dynamic_quant, create=True),
             patch.object(
