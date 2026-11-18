@@ -13,11 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "logits_utils.h"
+#include "core/framework/sampling/logits_utils.h"
 
 #include <torch/torch.h>
 
-#include <memory>
+#include <limits>
 
 namespace xllm {
 
@@ -67,30 +67,49 @@ void apply_temperatures(torch::Tensor& logits,
   logits.div_(unsqueezed_temperatures);
 }
 
+namespace {
 void apply_top_k_top_p_torch_impl(torch::Tensor& logits,
                                   const torch::Tensor& top_k,
                                   const torch::Tensor& top_p) {
-  const int64_t vocab = logits.size(-1);
-  const float inf = -std::numeric_limits<float>::infinity();
+  auto [sorted_logits, logits_idx] =
+      logits.sort(/*dim=*/-1, /*descending=*/true);
+  const float filter_value = -std::numeric_limits<float>::infinity();
 
-  auto [sorted, idx] = logits.sort(-1, /*descending=*/true);
+  if (top_k.defined()) {
+    auto processed_top_k = top_k.unsqueeze(1);
+    constexpr int64_t kMaxInt64 = std::numeric_limits<int64_t>::max();
+    static thread_local torch::Tensor max_value_scalar;
+    const torch::Device& top_k_device = processed_top_k.device();
+    if (!max_value_scalar.defined() ||
+        max_value_scalar.device() != top_k_device) {
+      max_value_scalar = torch::full(
+          {}, kMaxInt64, torch::TensorOptions().device(top_k_device));
+    }
+    processed_top_k =
+        torch::where(processed_top_k <= 0, max_value_scalar, processed_top_k);
 
-  // top-k
-  auto k = top_k.unsqueeze(-1).clamp(1, vocab).to(torch::kLong);
-  auto k_mask = torch::arange(vocab, logits.device()).expand_as(sorted) >= k;
-  sorted.masked_fill_(k_mask, inf);
+    const int64_t vocab_size = logits.size(-1);
+    auto top_k_mask = torch::arange(vocab_size, sorted_logits.device())
+                          .expand_as(sorted_logits);
+    top_k_mask = top_k_mask >= processed_top_k;
+    sorted_logits.masked_fill_(top_k_mask, filter_value);
+  }
 
-  // top-p
-  auto p = top_p.unsqueeze(-1);
-  auto probs = sorted.softmax(-1);
-  auto cum = probs.cumsum(-1);
-  auto p_mask = cum > p;
-  // at least one
-  p_mask.index_put_({torch::indexing::Ellipsis, 0}, false);
-  sorted.masked_fill_(p_mask, inf);
-
-  logits.scatter_(-1, idx, sorted.to(logits.scalar_type()));
+  if (top_p.defined()) {
+    const torch::Tensor processed_top_p = top_p.unsqueeze(1);
+    const torch::Tensor probs =
+        sorted_logits.softmax(/*dim=*/-1, /*dtype=*/torch::kFloat32);
+    const torch::Tensor probs_sum = probs.cumsum(/*dim=*/-1);
+    const torch::Tensor mask = (probs_sum - probs) > processed_top_p;
+    sorted_logits.masked_fill_(mask, filter_value);
+  }
+  // Speculative verification retains an alias of the target logits before
+  // sampling. Preserve that storage so it sees the filtered distribution.
+  logits.scatter_(/*dim=*/-1,
+                  /*index=*/logits_idx,
+                  /*core=*/sorted_logits.to(logits.scalar_type()));
 }
+}  // namespace
 
 void apply_top_k_top_p(torch::Tensor& logits,
                        const torch::Tensor& temperatures,
@@ -114,8 +133,8 @@ void apply_top_k_top_p(torch::Tensor& logits,
   }
 #endif
 
-  if (top_k.defined() && top_p.defined()) {
 #if defined(USE_NPU)
+  if (top_k.defined() && top_p.defined()) {
     constexpr int64_t kMaxInt64 = std::numeric_limits<int64_t>::max();
     static thread_local torch::Tensor max_value_scalar;
     const torch::Device& top_k_device = top_k.device();
@@ -128,51 +147,10 @@ void apply_top_k_top_p(torch::Tensor& logits,
     auto processed_top_k =
         torch::where(top_k <= 0, max_value_scalar, top_k).to(torch::kInt32);
     xllm::kernel::npu::top_k_top_p(logits, processed_top_k, top_p);
-#elif defined(USE_MLU)
-    apply_top_k_top_p_torch_impl(logits, top_k, top_p);
-#endif
-  } else {
-    auto [sorted_logits, logits_idx] =
-        logits.sort(/*dim=*/-1, /*descending=*/true);
-
-    float filter_value = -std::numeric_limits<float>::infinity();
-
-    if (top_k.defined()) {
-      auto processed_top_k = top_k.unsqueeze(1);
-      constexpr int64_t kMaxInt64Else = std::numeric_limits<int64_t>::max();
-      static thread_local torch::Tensor max_value_scalar_else;
-      const torch::Device& top_k_device = processed_top_k.device();
-      if (!max_value_scalar_else.defined() ||
-          max_value_scalar_else.device() != top_k_device) {
-        max_value_scalar_else = torch::full(
-            {}, kMaxInt64Else, torch::TensorOptions().device(top_k_device));
-      }
-
-      processed_top_k = torch::where(
-          processed_top_k <= 0, max_value_scalar_else, processed_top_k);
-
-      auto vocab_size = logits.size(-1);
-      auto top_k_mask = torch::arange(vocab_size, sorted_logits.device())
-                            .expand_as(sorted_logits);
-      top_k_mask = top_k_mask >= processed_top_k;
-      sorted_logits.masked_fill_(top_k_mask, filter_value);
-    }
-
-    if (top_p.defined()) {
-      auto processed_top_p = top_p.unsqueeze(1);
-
-      auto probs = sorted_logits.softmax(/*dim=*/-1).to(torch::kFloat32);
-      auto probs_sum = probs.cumsum(/*dim=*/-1);
-      auto mask = (probs_sum - probs) > processed_top_p;
-
-      sorted_logits.masked_fill_(mask, filter_value);
-    }
-    // Speculative verification retains an alias of the target logits before
-    // sampling. Preserve that storage so it sees the filtered distribution.
-    logits.scatter_(/*dim=*/-1,
-                    /*index=*/logits_idx,
-                    /*core=*/sorted_logits.to(logits.scalar_type()));
+    return;
   }
+#endif
+  apply_top_k_top_p_torch_impl(logits, top_k, top_p);
 }
 
 }  // namespace xllm

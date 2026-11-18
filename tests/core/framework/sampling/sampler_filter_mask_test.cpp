@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "core/framework/constraint/xgrammar_machine.h"
 #include "core/framework/sampling/json_object_grammar.h"
+#include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/rec_sampler.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/sampling/xgrammar_constraint.h"
@@ -607,6 +608,48 @@ TEST(SamplerFilterMaskTest, RequestLargeTopKUsesModelVocabulary) {
 TEST(SamplerFilterMaskTest, MixedTopKOnlyUsesModelVocabulary) {
   check_request_filters(
       /*top_k=*/-1, /*top_p=*/1.F, /*mixed=*/true, /*kept_counts=*/{32, 8});
+}
+
+TEST(SamplerFilterMaskTest, JointFiltersPreserveCrossingTokenAndDisabledTopK) {
+  if (Platform::is_npu() || Platform::is_mlu()) {
+    GTEST_SKIP() << "Dedicated sampling kernels require device tensors";
+  }
+  torch::Tensor logits = torch::tensor({{0.05F, 0.2F, 0.6F, 0.15F},
+                                        {0.05F, 0.2F, 0.6F, 0.15F},
+                                        {0.05F, 0.2F, 0.6F, 0.15F}})
+                             .log();
+  const torch::Tensor original = logits.clone();
+  const torch::Tensor alias = logits;
+  apply_top_k_top_p(logits,
+                    torch::Tensor(),
+                    torch::tensor({2, -1, 0}, torch::kLong),
+                    torch::tensor({0.8F, 0.75F, 1.F}));
+  const torch::Tensor kept =
+      torch::tensor({{0, 1, 1, 0}, {0, 1, 1, 0}, {1, 1, 1, 1}}, torch::kBool);
+  const torch::Tensor expected = original.masked_fill(
+      kept.logical_not(), -std::numeric_limits<float>::infinity());
+  EXPECT_TRUE(torch::equal(logits, expected));
+  EXPECT_TRUE(torch::equal(alias, expected));
+}
+
+TEST(SamplerFilterMaskTest, BFloat16TopPUsesFloat32Probabilities) {
+  if (Platform::is_npu() || Platform::is_mlu()) {
+    GTEST_SKIP() << "Dedicated sampling kernels require device tensors";
+  }
+  torch::Tensor logits =
+      torch::tensor({{0.F, -2.953125F, -10.F}}).to(torch::kBFloat16);
+  const torch::Tensor alias = logits;
+  apply_top_k_top_p(logits,
+                    torch::Tensor(),
+                    torch::tensor({2}, torch::kLong),
+                    torch::tensor({0.95F}));
+  const torch::Tensor expected =
+      torch::tensor({{0.F,
+                      -std::numeric_limits<float>::infinity(),
+                      -std::numeric_limits<float>::infinity()}})
+          .to(torch::kBFloat16);
+  EXPECT_TRUE(torch::equal(logits, expected));
+  EXPECT_TRUE(torch::equal(alias, expected));
 }
 
 TEST(SamplerFilterMaskTest, TopPFilteringPublishesTargetDistribution) {
