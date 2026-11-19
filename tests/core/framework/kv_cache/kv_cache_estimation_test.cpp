@@ -139,6 +139,48 @@ TEST(KVCacheEstimationTest, PrefillLayerwiseCapacityCountsPhysicalIndexSlots) {
   EXPECT_GT(without_index.n_blocks(), with_index.n_blocks());
 }
 
+TEST(KVCacheEstimationTest,
+     PrefillLayerwiseSpeculativeCapacityReservesDraftDeviceCache) {
+  const ModelArgs args = make_standard_args();
+  KVCacheEstimateOptions options = make_estimate_options();
+  options.prefill_layerwise_num_buffers = 2;
+  options.prefill_layerwise_host_memory_bytes = 64 * 1024 * 1024;
+  const KVCacheCapacity target = estimate_kv_cache_capacity(args, options);
+  ASSERT_EQ(target.n_blocks(), 256);
+  EXPECT_EQ(prefill_layerwise_device_block_size_in_bytes(args, target, 2),
+            2 * 16 * 128);
+
+  KVCacheCapacity draft;
+  draft.n_blocks(1000)
+      .cache_size_in_bytes(1024 * 1024)
+      .block_size(16)
+      .slot_size(32)
+      .n_layers(1)
+      .num_full_attention_layers(1);
+  const int64_t combined_block_bytes = 2 * 16 * 128 + 16 * 32;
+  const PrefillLayerwiseSpecPlan replicated_once =
+      prefill_layerwise_blocks_with_draft(args,
+                                          target,
+                                          draft,
+                                          /*num_buffers=*/2,
+                                          /*draft_replicated_block_pages=*/1);
+  EXPECT_EQ(replicated_once.n_blocks, (1024 * 1024) / combined_block_bytes);
+  EXPECT_EQ(replicated_once.budget_bytes,
+            replicated_once.n_blocks * combined_block_bytes);
+
+  const int64_t replicated_twice_block_bytes = 2 * 16 * 128 + 2 * 16 * 32;
+  const PrefillLayerwiseSpecPlan replicated_twice =
+      prefill_layerwise_blocks_with_draft(args,
+                                          target,
+                                          draft,
+                                          /*num_buffers=*/2,
+                                          /*draft_replicated_block_pages=*/2);
+  EXPECT_EQ(replicated_twice.n_blocks,
+            (1024 * 1024) / replicated_twice_block_bytes);
+  EXPECT_EQ(replicated_twice.budget_bytes,
+            replicated_twice.n_blocks * replicated_twice_block_bytes);
+}
+
 TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {
   ModelArgs model_args = make_standard_args();
   KVCacheEstimateOptions options = make_estimate_options();

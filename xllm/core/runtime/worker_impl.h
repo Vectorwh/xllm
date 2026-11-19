@@ -402,6 +402,12 @@ class WorkerImpl {
       bool use_huge_page_allocator = false,
       std::shared_ptr<KVCacheTensorAllocator> tensor_allocator = nullptr);
 
+  // Install the PUSH completion fence after the transfer backend is created.
+  // Both the dedicated and the shared-transfer allocation paths must call it:
+  // composite speculative workers allocate the DFlash2 target cache through
+  // the shared-transfer overload.
+  void install_prefill_layerwise_push_completion();
+
   // Get the effective number of layers based on whether this is a spec draft
   // model
   int64_t get_num_layers() const;

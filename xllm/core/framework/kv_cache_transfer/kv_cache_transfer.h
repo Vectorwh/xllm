@@ -281,6 +281,9 @@ class KVCacheTransfer {
  protected:
   void notify_push_completion(std::optional<int64_t> layer,
                               bool safe_to_reuse) {
+    // The callback fences the target's rotating prefill slots. Draft caches
+    // share this transfer object but are full caches, so their completion must
+    // not release a target slot.
     if (push_completion_callback_) {
       push_completion_callback_(layer, safe_to_reuse);
     }

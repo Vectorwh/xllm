@@ -912,17 +912,9 @@ void init_standard_counts(const ModelArgs& model_args,
     const int64_t layers = kv_cache_cap->n_layers();
     const int32_t buffers = options.prefill_layerwise_num_buffers;
     CHECK_LE(buffers, layers);
-    const std::vector<bool> index_mask =
-        resolve_indexer_cache_enabled_layers(model_args, layers);
-    const std::vector<char> index_slots = index_slots_for_round_robin_buffers(
-        layers, buffers, kv_cache_cap->index_slot_size() > 0, index_mask);
-    const int64_t physical_index_buffers =
-        std::count(index_slots.begin(), index_slots.end(), 1);
     const int64_t device_block_bytes =
-        buffers * kv_cache_cap->block_size() * kv_cache_cap->slot_size() +
-        physical_index_buffers * kv_cache_cap->index_block_size();
-    CHECK_GT(device_block_bytes, 0)
-        << "Prefill layerwise Device slot bytes must be positive.";
+        prefill_layerwise_device_block_size_in_bytes(
+            model_args, *kv_cache_cap, buffers);
     // Host allocations are page-aligned per role/layer. Reserve one rounding
     // unit for K, V, INDEX and INDEX_SCALE each.
     const int64_t alignment_headroom_per_layer = 4 * host_page_size();
@@ -1191,6 +1183,68 @@ estimate_speculative_full_attention_block_cost(
                               : block_size * draft_full_attention_layers *
                                     draft_allocated_full_attention_slot_size;
   return cost;
+}
+
+int64_t prefill_layerwise_device_block_size_in_bytes(
+    const ModelArgs& model_args,
+    const KVCacheCapacity& kv_cache_cap,
+    int32_t num_buffers) {
+  CHECK_GT(num_buffers, 0) << "num_buffers=" << num_buffers;
+  CHECK_GT(kv_cache_cap.block_size(), 0)
+      << "block_size=" << kv_cache_cap.block_size();
+  CHECK_GT(kv_cache_cap.slot_size(), 0)
+      << "slot_size=" << kv_cache_cap.slot_size();
+  const int64_t layers = kv_cache_cap.n_layers();
+  CHECK_GT(layers, 0) << "n_layers=" << layers;
+  const std::vector<bool> index_mask =
+      resolve_indexer_cache_enabled_layers(model_args, layers);
+  const std::vector<char> index_slots = index_slots_for_round_robin_buffers(
+      layers, num_buffers, kv_cache_cap.index_slot_size() > 0, index_mask);
+  const int64_t physical_index_buffers =
+      std::count(index_slots.begin(), index_slots.end(), 1);
+  const int64_t device_block_bytes =
+      static_cast<int64_t>(num_buffers) * kv_cache_cap.block_size() *
+          kv_cache_cap.slot_size() +
+      physical_index_buffers * kv_cache_cap.index_block_size();
+  CHECK_GT(device_block_bytes, 0)
+      << "Prefill layerwise Device slot bytes must be positive.";
+  return device_block_bytes;
+}
+
+PrefillLayerwiseSpecPlan prefill_layerwise_blocks_with_draft(
+    const ModelArgs& target_model_args,
+    const KVCacheCapacity& target_capacity,
+    const KVCacheCapacity& draft_capacity,
+    int32_t num_buffers,
+    int32_t draft_replicated_block_pages) {
+  CHECK_GT(target_capacity.n_blocks(), 0)
+      << "target n_blocks=" << target_capacity.n_blocks();
+  CHECK_GT(draft_capacity.n_blocks(), 0)
+      << "draft n_blocks=" << draft_capacity.n_blocks();
+  CHECK_GE(draft_replicated_block_pages, 1)
+      << "draft_replicated_block_pages=" << draft_replicated_block_pages;
+  const int64_t target_device_block_bytes =
+      prefill_layerwise_device_block_size_in_bytes(
+          target_model_args, target_capacity, num_buffers);
+  const int64_t draft_device_block_bytes =
+      static_cast<int64_t>(draft_replicated_block_pages) *
+      standard_full_cache_block_size_in_bytes(draft_capacity);
+  const int64_t combined_device_block_bytes =
+      target_device_block_bytes + draft_device_block_bytes;
+  CHECK_GT(combined_device_block_bytes, 0)
+      << "target_device_block_bytes=" << target_device_block_bytes
+      << ", draft_device_block_bytes=" << draft_device_block_bytes;
+  const int64_t available_device_bytes =
+      target_capacity.cache_size_in_bytes() -
+      target_capacity.linear_cache_size_in_bytes();
+  CHECK_GT(available_device_bytes, 0)
+      << "No Device memory left for target/draft KV cache.";
+  const int64_t n_blocks =
+      std::min(target_capacity.n_blocks(),
+               available_device_bytes / combined_device_block_bytes);
+  return {n_blocks,
+          target_capacity.linear_cache_size_in_bytes() +
+              n_blocks * combined_device_block_bytes};
 }
 
 }  // namespace xllm

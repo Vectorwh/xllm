@@ -833,7 +833,9 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
     if (!layer_synchronizer->synchronize_layer(layer_index)) {
       LOG(ERROR) << "Synchronize KV cache layer failed, layer=" << layer_index;
       failed_keys.insert(keys.begin(), keys.end());
-      notify_push_completion(layer_index, false);
+      if (!is_spec_draft) {
+        notify_push_completion(layer_index, false);
+      }
       continue;
     }
     bool layer_safe = true;
@@ -868,7 +870,9 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
         layer_safe = false;
       }
     }
-    notify_push_completion(layer_index, layer_safe);
+    if (!is_spec_draft) {
+      notify_push_completion(layer_index, layer_safe);
+    }
   }
   std::vector<KVTransferTaskResult> results;
   results.reserve(failed_keys.size());
@@ -1050,9 +1054,11 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks(
     bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
-  (void)is_spec_draft;
-  return push_kv_blocks_impl(
-      merged_kv_infos, layer_synchronizer, kv_split_rank, kv_split_size);
+  return push_kv_blocks_impl(merged_kv_infos,
+                             layer_synchronizer,
+                             is_spec_draft,
+                             kv_split_rank,
+                             kv_split_size);
 }
 
 bool MooncakeKVCacheTransferXTensor::pull_kv_blocks_impl(
@@ -1123,6 +1129,7 @@ std::vector<KVTransferTaskResult>
 MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
     std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
     std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
+    bool is_spec_draft,
     int32_t kv_split_rank,
     int32_t kv_split_size) {
   if (model_id_.empty()) {
@@ -1153,7 +1160,9 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
       LOG(ERROR) << "Synchronize XTensor KV cache layer failed, layer="
                  << layer_index;
       failed_keys.insert(keys.begin(), keys.end());
-      notify_push_completion(layer_index, false);
+      if (!is_spec_draft) {
+        notify_push_completion(layer_index, false);
+      }
       continue;
     }
 
@@ -1294,7 +1303,9 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
         layer_safe = false;
       }
     }
-    notify_push_completion(layer_index, layer_safe);
+    if (!is_spec_draft) {
+      notify_push_completion(layer_index, layer_safe);
+    }
   }
 
   std::vector<KVTransferTaskResult> results;

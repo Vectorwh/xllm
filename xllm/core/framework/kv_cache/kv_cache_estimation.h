@@ -108,6 +108,34 @@ KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);
 
+// Device bytes one logical block occupies when the target rotates through
+// `num_buffers` round-robin slots. Index tensors are allocated only for the
+// physical buffers whose layer ranges contain an indexer layer.
+int64_t prefill_layerwise_device_block_size_in_bytes(
+    const ModelArgs& model_args,
+    const KVCacheCapacity& kv_cache_cap,
+    int32_t num_buffers);
+
+struct PrefillLayerwiseSpecPlan {
+  int64_t n_blocks = 0;
+  // Device bytes the joint target/draft allocation actually occupies: the
+  // target linear-state reserve plus n_blocks of the combined block. Callers
+  // write it back to both capacities so the returned budgets match n_blocks,
+  // matching the ordinary speculative and plan_shared_kpool conventions.
+  int64_t budget_bytes = 0;
+};
+
+// Target blocks affordable by the layerwise Device slots while a co-located
+// speculative draft keeps its ordinary full cache. The target capacity has
+// already applied its Host budget and its own Device-slot limit, so the result
+// is additionally capped by those.
+PrefillLayerwiseSpecPlan prefill_layerwise_blocks_with_draft(
+    const ModelArgs& target_model_args,
+    const KVCacheCapacity& target_capacity,
+    const KVCacheCapacity& draft_capacity,
+    int32_t num_buffers,
+    int32_t draft_replicated_block_pages);
+
 // Co-located KPool drafts inherit the target's request slots and verify window.
 // Each capacity retains its own model's layer counts and page costs.
 SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,

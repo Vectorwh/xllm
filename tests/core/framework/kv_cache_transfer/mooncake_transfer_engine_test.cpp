@@ -2792,6 +2792,21 @@ TEST_F(DraftKvPushMappingTest, UnsplitDraftIgnoresTargetOnlyCompressedGroups) {
   EXPECT_FALSE(push(/*is_spec_draft=*/false, /*kv_split_size=*/1).empty());
 }
 
+TEST_F(DraftKvPushMappingTest, DraftPushDoesNotReleaseTargetPrefillSlots) {
+  int32_t completion_calls = 0;
+  transfer_->set_push_completion_callback(
+      [&completion_calls](std::optional<int64_t> /*layer*/, bool /*safe*/) {
+        ++completion_calls;
+      });
+  register_draft(/*with_compressed_layer=*/false);
+
+  EXPECT_TRUE(push(/*is_spec_draft=*/true, /*kv_split_size=*/1).empty());
+  // The future is published before the completion guard exits. Join the PUSH
+  // worker before observing the callback count.
+  transfer_.reset();
+  EXPECT_EQ(completion_calls, 0);
+}
+
 TEST_F(DraftKvPushMappingTest, RejectsUnregisteredDraft) {
   info_.mappings.pop_back();
   expect_draft_failure();

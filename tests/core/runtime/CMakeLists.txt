@@ -42,6 +42,21 @@ target_link_libraries(xservice_client_test PRIVATE
   $<$<BOOL:${USE_NPU}>:c_sec>
   $<$<BOOL:${USE_NPU}>:nnopbase>)
 
+cc_test(
+  NAME prefill_layerwise_eligibility_test
+  CPU_ONLY
+  SRCS prefill_layerwise_eligibility_test.cpp
+  DEPS :runtime GTest::gtest_main
+)
+target_link_libraries(prefill_layerwise_eligibility_test PRIVATE
+  Python::Python
+  $<$<BOOL:${USE_NPU}>:torch_npu>
+  $<$<BOOL:${USE_NPU}>:torch_python>
+  $<$<BOOL:${USE_NPU}>:ascendcl>
+  $<$<BOOL:${USE_NPU}>:hccl>
+  $<$<BOOL:${USE_NPU}>:c_sec>
+  $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 if(USE_NPU)
   cc_test(
     NAME py_runtime_module_test

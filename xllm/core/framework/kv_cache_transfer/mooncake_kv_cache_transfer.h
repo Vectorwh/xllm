@@ -199,6 +199,7 @@ class MooncakeKVCacheTransferXTensor final
   std::vector<KVTransferTaskResult> push_kv_blocks_impl(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
       std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
+      bool is_spec_draft,
       int32_t kv_split_rank,
       int32_t kv_split_size);
 

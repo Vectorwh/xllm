@@ -25,6 +25,7 @@ cc_library(
     forward_params.h
     dit_forward_params.h
     params_utils.h
+    prefill_layerwise_eligibility.h
     executor.h
     encoder_executor.h
     executor_impl.h
@@ -102,6 +103,7 @@ cc_library(
     worker_client.cpp
     xservice_client.cpp
     params_utils.cpp
+    prefill_layerwise_eligibility.cpp
     draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
     speculative_worker_utils.cpp

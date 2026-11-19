@@ -615,60 +615,6 @@ TEST(ExecutionConfigTest, EnableGraphWithoutRemovedBackendDoesNotWarn) {
   EXPECT_TRUE(warning.empty());
 }
 
-TEST(KVCacheConfigValidationTest, PrefillOffloadRejectsEmbeddingWorker) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  KVCacheConfig config;
-  config.prefill_layerwise_num_buffers(1);
-  EXPECT_DEATH(config.validate_prefill_layerwise_worker_mode("llm", "embed"),
-               "requires task=generate");
-  EXPECT_NO_FATAL_FAILURE(
-      config.validate_prefill_layerwise_worker_mode("llm", "generate"));
-  config.prefill_layerwise_num_buffers(0);
-  EXPECT_NO_FATAL_FAILURE(
-      config.validate_prefill_layerwise_worker_mode("llm", "embed"));
-}
-
-TEST(KVCacheConfigValidationTest, PrefillOffloadAdmitsContextParallel) {
-  GTEST_FLAG_SET(death_test_style, "threadsafe");
-  KVCacheConfig config;
-  config.prefill_layerwise_num_buffers(1);
-
-  for (int32_t cp_size : {1, 2, 4}) {
-    EXPECT_NO_FATAL_FAILURE(config.validate_prefill_layerwise_parallel_mode(
-        cp_size,
-        /*layerwise_split_size=*/1,
-        /*kv_split_size_effective=*/1));
-  }
-  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
-                   4,
-                   /*layerwise_split_size=*/2,
-                   /*kv_split_size_effective=*/1),
-               "layerwise_split_size=1");
-  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
-                   4,
-                   /*layerwise_split_size=*/1,
-                   /*kv_split_size_effective=*/2),
-               "effective kv_split_size<=1");
-  // kv_split_size=0 inherits cp_size. CP>1 therefore selects the unsupported
-  // sharded path even though the raw flag itself is not greater than one.
-  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
-                   4,
-                   /*layerwise_split_size=*/1,
-                   /*kv_split_size_effective=*/4),
-               "effective kv_split_size<=1");
-  EXPECT_DEATH(config.validate_prefill_layerwise_parallel_mode(
-                   0,
-                   /*layerwise_split_size=*/1,
-                   /*kv_split_size_effective=*/1),
-               "CP >= 1");
-
-  config.prefill_layerwise_num_buffers(0);
-  EXPECT_NO_FATAL_FAILURE(config.validate_prefill_layerwise_parallel_mode(
-      0,
-      /*layerwise_split_size=*/2,
-      /*kv_split_size_effective=*/2));
-}
-
 TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {
   KVCacheConfig config;
 

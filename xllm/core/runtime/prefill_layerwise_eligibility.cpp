@@ -1,0 +1,60 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "runtime/prefill_layerwise_eligibility.h"
+
+#include "core/common/instance_role_util.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "platform/platform.h"
+#include "runtime/options.h"
+
+namespace xllm {
+
+PrefillLayerwiseEligibility build_prefill_layerwise_eligibility(
+    const runtime::Options& options,
+    std::string_view model_type,
+    std::string_view model_impl) {
+  PrefillLayerwiseEligibility eligibility;
+  eligibility.npu = Platform::is_npu();
+  eligibility.torch_kernel_backend = options.npu_kernel_backend() == "TORCH";
+  eligibility.llm_backend = options.backend() == "llm";
+  eligibility.generate_task = options.task_type() == "generate";
+  eligibility.pd_prefill_only = is_pd_prefill_only(options);
+  eligibility.push_transfer = options.kv_cache_transfer_mode() == "PUSH";
+  eligibility.enable_graph = options.enable_graph();
+  eligibility.enable_prefill_piecewise_graph =
+      options.enable_prefill_piecewise_graph();
+  eligibility.is_draft_engine = options.is_draft_engine();
+  eligibility.enable_sleep_mode = options.enable_sleep_mode();
+  eligibility.enable_xtensor = KVCacheConfig::get_instance().enable_xtensor();
+  eligibility.enable_kvcache_store = options.enable_kvcache_store();
+  eligibility.host_blocks_factor = options.host_blocks_factor();
+  eligibility.cp_size = options.cp_size();
+  eligibility.layerwise_split_size =
+      ParallelConfig::get_instance().layerwise_split_size();
+  eligibility.kv_split_size_effective =
+      ParallelConfig::get_instance().kv_split_size_effective();
+  eligibility.has_speculative_decode = options.enable_speculative_decode() ||
+                                       options.num_speculative_tokens() > 0;
+  eligibility.dflash2_target = SpeculativeConfig::is_glm_moe_dsa_dflash2(
+      model_type, options.speculative_algorithm(), model_impl);
+  eligibility.kv_cache_dtype = std::string(options.kv_cache_dtype());
+  eligibility.model_type = std::string(model_type);
+  return eligibility;
+}
+
+}  // namespace xllm

@@ -498,8 +498,10 @@ KVCacheTransfer::push_kv_blocks_async(
                         is_spec_draft,
                         promise = std::move(promise)]() mutable {
     bool push_safe = false;
-    auto completion = folly::makeGuard([this, &push_safe]() {
-      notify_push_completion(std::nullopt, push_safe);
+    auto completion = folly::makeGuard([this, &push_safe, is_spec_draft]() {
+      if (!is_spec_draft) {
+        notify_push_completion(std::nullopt, push_safe);
+      }
     });
     if (is_spec_draft && !prepare_draft_transfer_infos(transfer_kv_infos)) {
       // Structured request failure: no source consumer remains for these

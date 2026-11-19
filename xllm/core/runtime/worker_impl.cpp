@@ -84,6 +84,7 @@ limitations under the License.
 #include "core/framework/parallel_state/context_parallel_topology.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/draft_model_config.h"
+#include "core/runtime/prefill_layerwise_eligibility.h"
 #include "core/runtime/py_runtime_module.h"
 #include "core/runtime/worker_rendezvous.h"
 #include "framework/constraint/xgrammar_support.h"
@@ -596,21 +597,29 @@ bool WorkerImpl::allocate_kv_cache_storage(
   // KV cache over a VMM-backed SleepableAllocator region (see kv_cache.cpp), so
   // sleep()/wake_up() can release / re-acquire it.
   const KVCacheConfig& cache_config = KVCacheConfig::get_instance();
-  cache_config.validate_prefill_layerwise_worker_mode(options_.backend(),
-                                                      options_.task_type());
-  if (cache_config.prefill_layerwise_num_buffers() > 0) {
+  const int32_t prefill_layerwise_num_buffers =
+      cache_config.prefill_layerwise_num_buffers();
+  const PrefillLayerwiseEligibility layerwise_eligibility =
+      build_prefill_layerwise_eligibility(
+          options_,
+          context_.get_model_args().model_type(),
+          ModelConfig::get_instance().model_impl());
+  const bool target_configures_layerwise =
+      prefill_layerwise_num_buffers > 0 && !options_.is_draft_engine();
+  if (target_configures_layerwise) {
+    CHECK(layerwise_eligibility.supported())
+        << layerwise_eligibility.error().value();
     // Only LLMWorkerImpl drives the layer synchronizer and saves each layer
     // back to Host. Other worker lifecycles would reuse the round-robin slots
     // without ever persisting their KV, so reject the flag here rather than
     // silently corrupting their prefill cache.
-    CHECK(Platform::is_npu()) << "Prefill layerwise KV offload requires NPU.";
     CHECK(parallel_args_.world_size() == 1 ||
           parallel_args_.tp_cp_group_ != nullptr)
         << "Prefill layerwise KV preparation requires a TP x CP process group.";
     prefill_layerwise_kv_cache_ = std::make_shared<PrefillLayerwiseKVCache>(
         kv_cache_shape,
         create_options,
-        cache_config.prefill_layerwise_num_buffers(),
+        prefill_layerwise_num_buffers,
         cache_config.prefill_layerwise_host_memory_bytes(),
         kv_caches_);
   } else {
@@ -632,6 +641,17 @@ bool WorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 
   status_ = Status::READY;
   return true;
+}
+
+void WorkerImpl::install_prefill_layerwise_push_completion() {
+  if (prefill_layerwise_kv_cache_ == nullptr) {
+    return;
+  }
+  kv_cache_transfer_->set_push_completion_callback(
+      [cache = prefill_layerwise_kv_cache_](std::optional<int64_t> layer,
+                                            bool safe_to_reuse) {
+        cache->notify_push_completion(layer, safe_to_reuse);
+      });
 }
 
 bool WorkerImpl::allocate_kv_cache_with_transfer(
@@ -665,13 +685,7 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
                                              /*is_spec_draft=*/false,
                                              linear_attention_policy_);
   kv_cache_transfer_->register_kv_cache(kv_caches_, kv_cache_shape, dtype_);
-  if (prefill_layerwise_kv_cache_ != nullptr) {
-    kv_cache_transfer_->set_push_completion_callback(
-        [cache = prefill_layerwise_kv_cache_](std::optional<int64_t> layer,
-                                              bool safe_to_reuse) {
-          cache->notify_push_completion(layer, safe_to_reuse);
-        });
-  }
+  install_prefill_layerwise_push_completion();
 
   status_ = Status::READY;
   return true;
@@ -709,6 +723,10 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
                                                linear_attention_policy_);
     kv_cache_transfer_->register_kv_cache(kv_caches_, kv_cache_shape, dtype_);
   }
+  // The shared transfer is used by both the target and the draft worker. Only
+  // the target owns the layerwise cache, so the draft call keeps the callback
+  // installed here instead of replacing it.
+  install_prefill_layerwise_push_completion();
 
   status_ = Status::READY;
   return true;

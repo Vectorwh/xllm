@@ -24,9 +24,12 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/distributed_runtime/engine_utils.h"
+#include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
+#include "core/runtime/prefill_layerwise_eligibility.h"
 #include "framework/model/mtp_utils.h"
 #include "llm_engine.h"
 #include "util/utils.h"
@@ -173,6 +176,37 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
   KVCacheCapacity draft_kv_cache_cap =
       draft_engine_->estimate_kv_cache_capacity();
 
+  const int32_t prefill_layerwise_num_buffers =
+      KVCacheConfig::get_instance().prefill_layerwise_num_buffers();
+  const PrefillLayerwiseEligibility layerwise_eligibility =
+      build_prefill_layerwise_eligibility(
+          options_,
+          model_args_.model_type(),
+          ModelConfig::get_instance().model_impl());
+  // The target estimate already CHECKed this admission for LLM engines, so an
+  // LLM target is always supported() here. The guard keeps a non-LLM target
+  // (VLMEngine, whose estimate reserves no layerwise budget) on the ordinary
+  // full-cache plan instead of entering the combined allocation.
+  if (prefill_layerwise_num_buffers > 0 && layerwise_eligibility.supported()) {
+    const int32_t replicated_block_pages =
+        SpeculativeConfig::draft_replicated_block_pages(
+            options_.speculative_algorithm(),
+            ParallelConfig::get_instance().kv_split_size_effective());
+    const PrefillLayerwiseSpecPlan plan =
+        prefill_layerwise_blocks_with_draft(model_args_,
+                                            target_kv_cache_cap,
+                                            draft_kv_cache_cap,
+                                            prefill_layerwise_num_buffers,
+                                            replicated_block_pages);
+    CHECK_GT(plan.n_blocks, 0) << "no memory for target/draft kv cache";
+    target_kv_cache_cap.n_blocks(plan.n_blocks)
+        .cache_size_in_bytes(plan.budget_bytes);
+    draft_kv_cache_cap.n_blocks(plan.n_blocks)
+        .cache_size_in_bytes(plan.budget_bytes);
+    return engine_->allocate_kv_cache(target_kv_cache_cap) &&
+           draft_engine_->allocate_kv_cache(draft_kv_cache_cap);
+  }
+
   if (target_kv_cache_cap.c4_count() > 0 ||
       target_kv_cache_cap.c128_count() > 0 ||
       target_kv_cache_cap.c2_count() > 0 ||
@@ -279,8 +313,7 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
           options_.speculative_algorithm(),
           ParallelConfig::get_instance().kv_split_size_effective());
   const int64_t draft_full_attention_block_size_in_bytes =
-      replicated_block_pages *
-      cost.draft_full_attention_block_size_in_bytes;
+      replicated_block_pages * cost.draft_full_attention_block_size_in_bytes;
   const int32_t layerwise_split_size =
       options_.is_draft_engine()
           ? 1
