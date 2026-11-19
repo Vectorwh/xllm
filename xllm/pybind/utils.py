@@ -12,12 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
 import json
 import os
 import socket
+import sys
+import weakref
+from types import FrameType
+from typing import Any
 
 import psutil
 import xllm_export
+
+from scripts.logger import logger
+
+_python_masters: weakref.WeakSet[Any] = weakref.WeakSet()
+# Set once terminal cleanup owns the process. The signal handler and the atexit
+# callback both run on the main thread, so the plain flag needs no locking.
+_terminal_cleanup_started = False
+
+
+def _handle_shutdown_signal(_signum: int, _frame: FrameType | None) -> None:
+    if _terminal_cleanup_started:
+        # Owners or the shared runtime may already be partially stopped. Raising
+        # SystemExit here would only be printed by atexit, which then continues
+        # into later callbacks such as torch_npu's runtime shutdown; exit before
+        # those run and report the signal as a terminal failure.
+        os._exit(1)
+    if hasattr(xllm_export, "_arm_shutdown_deadline"):
+        xllm_export._arm_shutdown_deadline()
+    sys.exit(0)
+
+
+def _shutdown_python_hosts() -> None:
+    global _terminal_cleanup_started
+    # From here on a signal must not inject SystemExit into this atexit
+    # callback: remaining masters and the ATB cache would stay alive while
+    # later NPU finalizers tear their runtime down.
+    _terminal_cleanup_started = True
+    xllm_export._arm_shutdown_deadline()
+    try:
+        for master in tuple(_python_masters):
+            master._shutdown()
+        _python_masters.clear()
+        xllm_export._shutdown_python_host()
+    except Exception:
+        # Native shutdown can leave shared resource users alive. pybind11 maps
+        # C++ failures to several Python types (RuntimeError, MemoryError,
+        # ValueError, ...), and an atexit exception would otherwise let
+        # torch_npu tear their runtime down. This terminal boundary converts
+        # every such failure into exit 1 instead of a fallback.
+        try:
+            logger.exception("Failed to stop offline Python host; aborting terminal teardown")
+        finally:
+            os._exit(1)
+
+
+def _register_python_host_shutdown(master: Any) -> None:
+    # Track actual native owners, including aliases that outlive their wrapper.
+    # Weak ownership preserves ordinary deletion before process shutdown.
+    if not hasattr(xllm_export, "_shutdown_python_host"):
+        return
+    _python_masters.add(master)
+    # Register after construction, including torch_npu and model finalizers.
+    # Python runs atexit callbacks in reverse order: stop all live masters and
+    # the ATB cache before the NPU runtime goes away. Refresh the one callback
+    # when another host is constructed without retaining per-instance hooks.
+    atexit.unregister(_shutdown_python_hosts)
+    atexit.register(_shutdown_python_hosts)
 
 
 def terminate_process(pid: int, timeout: int | float = 30) -> None:

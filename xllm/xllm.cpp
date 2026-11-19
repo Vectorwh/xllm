@@ -20,7 +20,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <csignal>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -74,14 +73,13 @@ limitations under the License.
 #include "core/platform/npu/npu_python_runtime.h"
 #endif
 #include "core/util/net.h"
+#include "core/util/python_runtime.h"
 #include "core/util/utils.h"
 #include "core/util/verbose_trace_logger.h"
 #include "function_call/function_call_parser.h"
 #include "parser/reasoning_parser.h"
 #include "server/xllm_server_registry.h"
 using namespace xllm;
-
-static std::atomic<uint32_t> signal_received{0};
 
 namespace {
 
@@ -388,32 +386,43 @@ void init_npu_python_runtime() {
 }  // namespace
 #endif
 
-// Flush logs/stdio and hard-exit without running global/static destructors.
-//
-// This binary embeds CPython (pybind11) and intentionally never finalizes it.
-// Returning from main (or calling exit()) would destroy global pybind11 type
-// objects during static teardown without holding the GIL, aborting the process
-// with "pybind11::handle::dec_ref() ... PyGILState_Check() failure" whenever a
-// server is stopped (observed on every NPU DeepSeek-V4 eager/MTP run once the
-// HTTP server finishes serving). Bypassing atexit/static teardown lets the OS
-// reclaim the interpreter; glog/stdio are flushed explicitly first so no log
-// records are lost.
-[[noreturn]] void exit_without_python_teardown(int exit_code) {
-  google::FlushLogFiles(google::GLOG_INFO);
-  fflush(nullptr);
-  std::_Exit(exit_code);
+namespace {
+
+// After the first quit is observed, another SIGINT/SIGTERM requests immediate
+// failure instead of waiting for HTTP draining or owner cleanup.
+void exit_on_terminal_signal(int /*signum*/) { std::_Exit(1); }
+
+void replace_terminal_signal_handlers() {
+  struct sigaction action = {};
+  action.sa_handler = exit_on_terminal_signal;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGINT, &action, nullptr) != 0 ||
+      sigaction(SIGTERM, &action, nullptr) != 0) {
+    std::_Exit(1);
+  }
 }
 
-// Signal handlers may only call async-signal-safe functions. In particular,
-// neither logging nor flushing is safe here, so exit without any teardown.
-[[noreturn]] void exit_immediately_without_python_teardown(int exit_code) {
-  std::_Exit(exit_code);
+void prepare_terminal_shutdown() {
+  // Establish the terminal signal policy before arming so repeated quits also
+  // report failure while the HTTP server drains and joins.
+  replace_terminal_signal_handlers();
+  arm_shutdown_deadline();
 }
 
-void shutdown_handler(int signal) {
-  (void)signal;
-  exit_immediately_without_python_teardown(1);
+[[noreturn]] void shutdown_serving_process(std::unique_ptr<Master>& master,
+                                           int32_t exit_code) {
+  // Bound owner destruction, transport shutdown, Python cleanup and flushing
+  // with one deadline. All resource users stop while their runtime stays live.
+  prepare_terminal_shutdown();
+  master.reset();
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
+  MooncakeTransferEngineCore::get_instance().shutdown();
+#endif
+  exit_without_python_teardown(exit_code);
 }
+
+}  // namespace
 
 void validate_config(const std::string& model_type) {
   ModelConfig& model_config = ModelConfig::get_instance();
@@ -770,11 +779,12 @@ int run() {
     auto xllm_server =
         ServerRegistry::get_instance().register_server("HttpServer");
 
-    // start brpc server
-    if (!xllm_server->start(std::move(api_service))) {
+    // Prepare terminal signals and the deadline before Stop()/Join().
+    if (!xllm_server->start(std::move(api_service),
+                            &prepare_terminal_shutdown)) {
       LOG(ERROR) << "Failed to start brpc server on port "
                  << service_config.port();
-      exit_without_python_teardown(1);
+      shutdown_serving_process(master, /*exit_code=*/1);
     }
   } else {
     // No HTTP server on this rank. Stay alive until SIGINT/SIGTERM so
@@ -782,18 +792,7 @@ int run() {
     master->wait();
   }
 
-  // Join serving threads through the master destructor, then hard-exit instead
-  // of returning to main: normal exit would run global/static destructors that
-  // release pybind11 type objects without the GIL (see
-  // exit_without_python_teardown).
-  master.reset();
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
-    defined(USE_MUSA)
-  // Transfer users have stopped. Release the shared transport explicitly;
-  // Coding's hard exit intentionally skips Python and static teardown.
-  MooncakeTransferEngineCore::get_instance().shutdown();
-#endif
-  exit_without_python_teardown(0);
+  shutdown_serving_process(master, /*exit_code=*/0);
 }
 
 int main(int argc, char** argv) {

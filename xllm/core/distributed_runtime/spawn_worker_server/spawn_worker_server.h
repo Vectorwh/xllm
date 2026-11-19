@@ -20,10 +20,9 @@ limitations under the License.
 #include <memory>
 #include <string>
 
-#include "core/common/types.h"
-
 namespace xllm {
 
+class InstanceRole;
 class WorkerServer;
 
 class SpawnWorkerServer final {
@@ -76,6 +75,19 @@ class SpawnWorkerServer final {
   static void handle_signal(int signum);
 
  private:
+#if defined(USE_NPU)
+  enum class ShutdownState : uint8_t {
+    RUNNING,
+    ARMING_DEADLINE,
+    READY_TO_STOP,
+  };
+  static_assert(std::atomic<ShutdownState>::is_always_lock_free,
+                "Spawn signal handling requires a lock-free shutdown state");
+
+  friend class SpawnWorkerServerTestPeer;
+  static bool shutdown_requested();
+  static std::atomic<ShutdownState> shutdown_state_;
+#endif
   std::atomic<bool> done_{false};
   std::unique_ptr<WorkerServer> worker_server_;
 };

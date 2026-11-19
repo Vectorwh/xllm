@@ -15,7 +15,6 @@
 
 import os
 import signal
-import sys
 import threading
 import time
 import uuid
@@ -140,8 +139,8 @@ class LLM:
         max_vit_attention_units_per_chunk: int = 0,
         **kwargs: Any,
     ) -> None:
-        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+        signal.signal(signal.SIGTERM, utils._handle_shutdown_signal)
+        signal.signal(signal.SIGINT, utils._handle_shutdown_signal)
 
         if kwargs:
             unknown = ", ".join(sorted(kwargs.keys()))
@@ -224,6 +223,7 @@ class LLM:
             self.master = VLMMaster(options)
         else:
             self.master = LLMMaster(options)
+        utils._register_python_host_shutdown(self.master)
 
     def finish(self) -> None:
         try:

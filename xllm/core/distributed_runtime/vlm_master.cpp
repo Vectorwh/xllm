@@ -238,8 +238,12 @@ VLMMaster::VLMMaster(const Options& options)
   }
 }
 
-VLMMaster::~VLMMaster() {
-  stoped_.store(true, std::memory_order_relaxed);
+VLMMaster::~VLMMaster() { shutdown(); }
+
+void VLMMaster::shutdown() {
+  if (stoped_.exchange(true, std::memory_order_relaxed)) {
+    return;
+  }
 
   // Drain and join the request thread pool before any of the members its
   // worker lambdas touch are destroyed. Those lambdas dereference
@@ -265,6 +269,14 @@ VLMMaster::~VLMMaster() {
     scheduler_.reset();
     client->shutdown();
   }
+  // A Python reference can keep the object alive past interpreter shutdown.
+  // Stop its resource users and release all derived borrowers before engine_.
+  request_factory_.reset();
+  tokenizer_.reset();
+  processor_.reset();
+  chat_template_.reset();
+  scheduler_.reset();
+  engine_.reset();
 }
 
 void VLMMaster::preprocess(MMContentVec media,

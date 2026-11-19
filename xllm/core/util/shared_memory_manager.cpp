@@ -22,9 +22,7 @@ limitations under the License.
 #include <unistd.h>
 
 #include <cerrno>
-#include <csignal>
 #include <cstring>
-#include <mutex>
 #include <new>
 
 namespace xllm {
@@ -56,14 +54,6 @@ SharedMemoryManager::SharedMemoryManager(const std::string& name,
       size_(static_cast<int64_t>(size)),
       mapping_size_(static_cast<int64_t>(sizeof(SharedMemoryLayoutHeader)) +
                     static_cast<int64_t>(size)) {
-  // Register cleanup handlers for signals (once per process)
-  static std::once_flag flag;
-  std::call_once(flag, [] {
-    signal(SIGINT, cleanup_handler);
-    signal(SIGTERM, cleanup_handler);
-    // signal(SIGSEGV, cleanup_handler);
-  });
-
   CHECK_GT(size_, 0) << "Shared memory payload size must be positive.";
   CHECK_GT(mapping_size_, size_) << "Shared memory mapping size overflow.";
 
@@ -206,14 +196,6 @@ SharedMemoryManager::~SharedMemoryManager() {
                 << shm_name_;
   }
   close(lock_fd_);
-}
-
-void SharedMemoryManager::cleanup_handler(int sig) {
-  // Avoid non-async-signal-safe operations (mutex, logging, shm_unlink, exit).
-  // Just restore default handler and re-raise to terminate normally.
-  // TODO: support cleaning up shared memory properly when signal is received.
-  signal(sig, SIG_DFL);
-  kill(getpid(), sig);
 }
 
 }  // namespace xllm

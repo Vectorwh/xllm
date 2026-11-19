@@ -22,6 +22,7 @@ limitations under the License.
 #include <unistd.h>
 
 #include "core/common/global_flags.h"
+#include "core/common/types.h"
 #include "core/distributed_runtime/worker_server.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/eplb_config.h"
@@ -39,6 +40,7 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
 std::string get_backend_from_worker_type(const std::string& worker_type) {
   if (worker_type == "LLM" || worker_type == "ELM") {
     return "llm";
@@ -209,20 +211,25 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
 
 SpawnWorkerServer::~SpawnWorkerServer() = default;
 
-void SpawnWorkerServer::handle_signal(int signum) {
-  (void)signum;
-  _exit(0);
-}
-
 void SpawnWorkerServer::run() {
   signal(SIGINT, SpawnWorkerServer::handle_signal);
   signal(SIGTERM, SpawnWorkerServer::handle_signal);
   signal(SIGHUP, SpawnWorkerServer::handle_signal);
 
+#if defined(USE_NPU)
+  // Poll instead of pause(): the signal can arrive on another thread or just
+  // before the wait, and must still let run() reach terminal cleanup.
+  while (!shutdown_requested()) {
+    sleep(1);
+  }
+  LOG(INFO) << "Stopping spawned NPU worker before Python subprocess cleanup";
+  worker_server_.reset();
+#else
   // Keep process alive until SIGTERM/SIGINT arrives from parent teardown.
   while (true) {
     pause();
   }
+#endif
 }
 
 }  // namespace xllm

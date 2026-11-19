@@ -43,8 +43,6 @@ class SharedMemoryManager {
   int64_t size_ = 0;
   int64_t mapping_size_ = 0;
   int64_t current_offset_ = 0;
-
-  static void cleanup_handler(int sig);
 };
 
 }  // namespace xllm

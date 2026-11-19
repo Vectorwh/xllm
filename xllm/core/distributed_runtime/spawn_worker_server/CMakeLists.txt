@@ -9,8 +9,10 @@ cc_binary(
   SRCS
     spawn_worker_server.cpp
     spawn_worker_server_process.cpp
+    spawn_worker_server_signal.cpp
   DEPS
     :distributed_runtime
+    $<$<BOOL:${USE_NPU}>:python_runtime>
 )
 
 add_dependencies(export_module spawn_worker)

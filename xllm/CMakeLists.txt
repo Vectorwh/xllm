@@ -98,6 +98,7 @@ else()
       :xllm_server
       :master
       :util
+      :python_runtime
       absl::strings
       Boost::serialization
       gflags::gflags

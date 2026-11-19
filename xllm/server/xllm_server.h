@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <functional>
+
 #include "api_service/api_service.h"
 #include "core/distributed_runtime/collective_service.h"
 #include "core/distributed_runtime/disagg_pd_service.h"
@@ -29,7 +31,11 @@ class XllmServer final {
   XllmServer();
   ~XllmServer();
 
-  bool start(std::unique_ptr<APIService> api_service);
+  // on_quit runs once after the first quit signal is observed and before the
+  // server is stopped, so the caller can start a terminal deadline that also
+  // covers Stop()/Join().
+  bool start(std::unique_ptr<APIService> api_service,
+             const std::function<void()>& on_quit = {});
   bool start(std::unique_ptr<DisaggPDService> disagg_pd_service);
   bool start(std::unique_ptr<PDOOCService> pd_ooc_service);
   bool start(std::shared_ptr<CollectiveService> service,

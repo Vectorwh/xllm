@@ -2,6 +2,20 @@ include(cc_test)
 
 cc_test(
   NAME
+    python_subprocess_lifecycle_test
+  CPU_ONLY
+  SRCS
+    python_subprocess_lifecycle_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/distributed_runtime/spawn_worker_server/spawn_worker_server_signal.cpp
+  DEPS
+    :python_runtime
+    GTest::gtest_main
+  LINKOPTS
+    -Wl,--wrap=alarm
+)
+
+cc_test(
+  NAME
     util_test
   CPU_ONLY
   SRCS

@@ -208,5 +208,42 @@ TEST(SharedMemoryManagerTest, ConcurrentLastOwnerHandoffKeepsOneGeneration) {
   }
 }
 
+void dummy_signal_handler(int /*signum*/) {}
+
+TEST(SharedMemoryManagerTest, PreservesExistingSignalHandlers) {
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        struct sigaction custom = {};
+        custom.sa_handler = dummy_signal_handler;
+        sigemptyset(&custom.sa_mask);
+        if (sigaction(SIGINT, &custom, nullptr) != 0 ||
+            sigaction(SIGTERM, &custom, nullptr) != 0) {
+          std::_Exit(2);
+        }
+
+        const std::string name = "xllm_shm_signal_test_" +
+                                 std::to_string(static_cast<int64_t>(getpid()));
+        constexpr size_t kSize = 4096;
+        shm_unlink(name.c_str());
+        bool is_creator = false;
+        {
+          SharedMemoryManager manager(name, kSize, is_creator);
+        }
+
+        struct sigaction sigint_action = {};
+        struct sigaction sigterm_action = {};
+        if (sigaction(SIGINT, nullptr, &sigint_action) != 0 ||
+            sigaction(SIGTERM, nullptr, &sigterm_action) != 0 ||
+            sigint_action.sa_handler != dummy_signal_handler ||
+            sigterm_action.sa_handler != dummy_signal_handler) {
+          std::_Exit(3);
+        }
+        std::_Exit(0);
+      },
+      testing::ExitedWithCode(0),
+      "");
+}
+
 }  // namespace
 }  // namespace xllm

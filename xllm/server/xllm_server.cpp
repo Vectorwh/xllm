@@ -131,7 +131,8 @@ XllmServer::~XllmServer() {
   }
 }
 
-bool XllmServer::start(std::unique_ptr<APIService> service) {
+bool XllmServer::start(std::unique_ptr<APIService> service,
+                       const std::function<void()>& on_quit) {
   server_ = std::make_unique<brpc::Server>();
   if (const char* routes = get_api_service_routes_for_current_mode();
       routes != nullptr) {
@@ -178,6 +179,13 @@ bool XllmServer::start(std::unique_ptr<APIService> service) {
 
   install_quit_signal_handler();
   wait_for_quit_signal();
+
+  // The first quit signal has arrived. Start the caller's terminal deadline
+  // here so draining and joining the server share the same bound as the
+  // cleanup that follows.
+  if (on_quit) {
+    on_quit();
+  }
 
   LOG(INFO) << "     Shutting down";
   LOG(INFO) << "     Waiting for application shutdown.";

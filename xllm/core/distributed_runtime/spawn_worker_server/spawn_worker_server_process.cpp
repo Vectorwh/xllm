@@ -21,6 +21,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 
+#include "core/common/types.h"
 #include "core/distributed_runtime/spawn_worker_server/spawn_worker_protocol.h"
 #include "core/distributed_runtime/spawn_worker_server/spawn_worker_server.h"
 #include "core/framework/config/config_utils.h"
@@ -30,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/multimodal_config.h"
 #if defined(USE_NPU)
 #include "core/platform/npu/npu_python_runtime.h"
+#include "core/util/python_runtime.h"
 #endif
 
 // Worker argv from engine process:
@@ -273,14 +275,8 @@ int main(int argc, char* argv[]) {
   worker.run();
 
 #if defined(USE_NPU)
-  // initialize_python_runtime() above created a process-lifetime interpreter.
-  // Returning from main would destroy global pybind11 type objects during
-  // static teardown without holding the GIL and abort (same failure the
-  // serving binary documents in exit_without_python_teardown); bypass static
-  // teardown and let the OS reclaim everything.
-  google::FlushLogFiles(google::GLOG_INFO);
-  fflush(nullptr);
-  std::_Exit(0);
+  // run() has stopped every worker user of the process-lifetime interpreter.
+  xllm::exit_without_python_teardown(/*exit_code=*/0);
 #endif
   return 0;
 }

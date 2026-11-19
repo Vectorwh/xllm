@@ -2,6 +2,18 @@ include(cc_library)
 
 cc_library(
   NAME
+    python_runtime
+  HDRS
+    python_runtime.h
+  SRCS
+    python_runtime.cpp
+  DEPS
+    pybind11::embed
+    glog::glog
+)
+
+cc_library(
+  NAME
     util
   HDRS
     concurrent_queue.h

@@ -47,6 +47,10 @@ class VLMMaster : public Master {
   explicit VLMMaster(const Options& options);
   ~VLMMaster();
 
+  // Terminally drain requests and release engine resources. Request APIs must
+  // not be used afterwards; repeated shutdown and destruction are harmless.
+  void shutdown();
+
   // completion
   void handle_request(std::string prompt,
                       MMData mm_data,

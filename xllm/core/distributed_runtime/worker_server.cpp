@@ -75,9 +75,6 @@ limitations under the License.
 extern char** environ;
 
 namespace xllm {
-namespace {
-void handle_signal(int signum) { _exit(0); }
-}  // namespace
 
 void WorkerServer::create_server(const runtime::Options& options,
                                  std::atomic<bool>& done,
@@ -510,9 +507,10 @@ WorkerServer::WorkerServer(int32_t local_worker_idx,
                           worker_type);
       return;
     } else {
-      // worker process should handle SIGTREM and SIGINT signals.
-      signal(SIGINT, handle_signal);
-      signal(SIGTERM, handle_signal);
+      // The host owns SIGINT/SIGTERM: CLI serving uses Master/XllmServer, and
+      // offline LLM/VLM Python wrappers install handlers before the master is
+      // constructed. Other embedded callers provide their own signal policy.
+      // A worker must not replace these handlers with _exit(0).
 
       // start worker in a thread.
       worker_thread_ =

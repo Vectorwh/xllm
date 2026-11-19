@@ -15,8 +15,10 @@
 import importlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -158,6 +160,139 @@ class PublicModelImplTest(unittest.TestCase):
                 self._construct(module_name, class_name, nnodes=2)
         self._export.LLMMaster.assert_not_called()
         self._export.VLMMaster.assert_not_called()
+
+    def test_offline_shutdown_releases_owners_before_npu_and_preserves_exit_status(self) -> None:
+        script = textwrap.dedent("""
+            import atexit
+            import gc
+            import importlib
+            import json
+            import os
+            import signal
+            import sys
+            import types
+            import weakref
+            from pathlib import Path
+
+            root, model, module_name, class_name, release_owner, result_path = sys.argv[1:]
+            package = types.ModuleType("xllm")
+            package.__path__ = [str(Path(root) / "xllm")]
+            bindings = types.ModuleType("xllm.pybind")
+            bindings.__path__ = [str(Path(root) / "xllm" / "pybind")]
+            export = types.ModuleType("xllm_export")
+            export.Options = types.SimpleNamespace
+            export.RequestParams = types.SimpleNamespace
+            export.RequestOutput = types.SimpleNamespace
+            export.init_config_from_option = lambda *args: None
+            export.get_model_backend = lambda *args: "llm"
+            sys.modules.update({"xllm": package, "xllm.pybind": bindings,
+                                "xllm_export": export, "psutil": types.ModuleType("psutil")})
+            events = []
+            live_masters = 0
+            comm_alive = True
+
+            class Master:
+                def __init__(self, options: object) -> None:
+                    global live_masters
+                    live_masters += 1
+                    self.stopped = False
+
+                def __del__(self) -> None:
+                    self._shutdown()
+
+                def _shutdown(self) -> None:
+                    global live_masters
+                    if self.stopped:
+                        return
+                    if release_owner == "error":
+                        raise RuntimeError("injected native Master shutdown failure")
+                    if release_owner == "foreign_error":
+                        raise MemoryError("injected non-RuntimeError shutdown failure")
+                    if release_owner == "signal":
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    self.stopped = True
+                    live_masters -= 1
+                    events.append("master-stopped")
+
+            def shutdown_comms() -> None:
+                global comm_alive
+                if live_masters:
+                    os._exit(89)
+                comm_alive = False
+                events.append("comms-released")
+
+            def shutdown_npu() -> None:
+                events.append("npu-shutdown")
+                Path(result_path).write_text(json.dumps({"events": events,
+                    "live_masters": live_masters, "comm_alive": comm_alive}))
+                if live_masters or comm_alive:
+                    os._exit(88)
+
+            export.LLMMaster = Master
+            export.VLMMaster = Master
+            export._arm_shutdown_deadline = lambda: events.append("deadline")
+            export._shutdown_python_host = shutdown_comms
+            # Model construction happens after the host imports torch_npu.
+            atexit.register(shutdown_npu)
+            module = importlib.import_module("xllm.pybind." + module_name)
+            owner = getattr(module, class_name)(model)
+            if release_owner == "alias":
+                retained_master = owner.master
+            if release_owner in ("release", "alias"):
+                reference = weakref.ref(owner)
+                del owner
+                gc.collect()
+                if reference() is not None:
+                    os._exit(87)
+            sys.exit(7)
+        """)
+        for module_name, class_name in (("llm", "LLM"), ("vlm", "VLM"), ("embedding", "Embedding")):
+            ownership_modes = ("retain", "release", "alias")
+            if module_name == "llm":
+                ownership_modes += ("error", "foreign_error", "signal")
+            for release_owner in ownership_modes:
+                with self.subTest(api=class_name, owner=release_owner):
+                    result_path = self._model / f"shutdown-{module_name}-{release_owner}.json"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            script,
+                            str(_ROOT),
+                            str(self._model),
+                            module_name,
+                            class_name,
+                            release_owner,
+                            str(result_path),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    if release_owner == "signal":
+                        # A signal during terminal cleanup must not raise
+                        # SystemExit inside atexit; the process exits 1 before
+                        # later NPU callbacks run.
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertNotIn("Exception ignored in atexit callback", result.stderr)
+                        self.assertFalse(result_path.exists(), "NPU shutdown ran after a terminal cleanup signal")
+                        continue
+                    if release_owner in ("error", "foreign_error"):
+                        message = {
+                            "error": "injected native Master shutdown failure",
+                            "foreign_error": "injected non-RuntimeError shutdown failure",
+                        }[release_owner]
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn(message, result.stderr)
+                        self.assertFalse(result_path.exists(), "NPU shutdown ran after failed Master teardown")
+                        continue
+                    self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                    state = json.loads(result_path.read_text())
+                    self.assertEqual(state["live_masters"], 0)
+                    self.assertFalse(state["comm_alive"])
+                    self.assertLess(state["events"].index("master-stopped"), state["events"].index("comms-released"))
+                    self.assertLess(state["events"].index("comms-released"), state["events"].index("npu-shutdown"))
 
 
 class PythonModelPathTest(unittest.TestCase):

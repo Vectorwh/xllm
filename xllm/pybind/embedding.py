@@ -15,7 +15,6 @@
 
 import os
 import signal
-import sys
 import time
 from typing import Any
 
@@ -62,8 +61,8 @@ class Embedding:
         model_impl: str = "native",
         **kwargs: Any,
     ) -> None:
-        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+        signal.signal(signal.SIGTERM, utils._handle_shutdown_signal)
+        signal.signal(signal.SIGINT, utils._handle_shutdown_signal)
 
         if kwargs:
             unknown = ", ".join(sorted(kwargs.keys()))
@@ -119,6 +118,7 @@ class Embedding:
         options.output_shm_size = output_shm_size
         init_config_from_option(options, model_type)
         self.master = LLMMaster(options)
+        utils._register_python_host_shutdown(self.master)
 
     def finish(self) -> None:
         try:

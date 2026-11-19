@@ -59,6 +59,7 @@ def test_import_does_not_abort_and_registers_xllm_runtime(tmp_path: Path) -> Non
     artifact = _export_path()
     symbols = ", ".join(repr(name) for name in _RUNTIME_SYMBOLS)
     script = f"""
+import atexit
 import importlib.util
 import sys
 
@@ -90,13 +91,24 @@ assert options.model_impl == "native"
 options.model_impl = "python"
 assert options.model_impl == "python"
 assert "xllm_weight_loader" not in sys.modules
+
+if hasattr(module, "_shutdown_python_host"):
+    assert hasattr(module.LLMMaster, "_shutdown")
+    assert hasattr(module.VLMMaster, "_shutdown")
+    module._arm_shutdown_deadline()
+    # An empty ATB cache exercises the real native exit callback without a device.
+    module._shutdown_python_host()
+atexit.register(lambda: print("python-finalizer-completed", flush=True))
+sys.exit(int(sys.argv[2]))
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script, str(artifact)],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    for exit_code in (0, 7):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(artifact), str(exit_code)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == exit_code, result.stdout + result.stderr
+        assert "python-finalizer-completed" in result.stdout

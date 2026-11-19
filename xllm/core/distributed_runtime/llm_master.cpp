@@ -136,8 +136,12 @@ LLMMaster::LLMMaster(const Options& options)
       });
 }
 
-LLMMaster::~LLMMaster() {
-  stoped_.store(true, std::memory_order_relaxed);
+LLMMaster::~LLMMaster() { shutdown(); }
+
+void LLMMaster::shutdown() {
+  if (stoped_.exchange(true, std::memory_order_relaxed)) {
+    return;
+  }
   LOG(INFO) << "LLMMaster stopping...";
 
   // Drain and join the request thread pool before any of the members its
@@ -164,6 +168,13 @@ LLMMaster::~LLMMaster() {
     scheduler_.reset();
     xservice_client_->shutdown();
   }
+  // Release derived borrowers before the base-owned engine even if Python
+  // still retains this Master object through another reference.
+  request_factory_.reset();
+  tokenizer_.reset();
+  chat_template_.reset();
+  scheduler_.reset();
+  engine_.reset();
 }
 
 void LLMMaster::handle_batch_request(std::vector<std::string> prompts,

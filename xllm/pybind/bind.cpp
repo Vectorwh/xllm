@@ -20,6 +20,8 @@ limitations under the License.
 #include <torch/python.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -47,12 +49,74 @@ limitations under the License.
 #include "core/util/pybind_helper.h"
 #include "models/model_registry.h"
 
+#if defined(USE_NPU)
+#include "core/util/python_runtime.h"
+#include "xllm_atb_layers/core/include/atb_speed/base/external_comm_manager.h"
+#include "xllm_atb_layers/core/include/atb_speed/utils/singleton.h"
+#endif
+
 namespace xllm {
 namespace py = pybind11;
 using namespace pybind11::literals;
 
+namespace {
+
+#if defined(USE_NPU)
+[[noreturn]] void finish_python_host_exit(int exit_code, void* /*unused*/) {
+  // CPython has run its finally/atexit callbacks and finalized the interpreter.
+  // Preserve its actual exit status while skipping the remaining C++ static
+  // destructors, including HCCL topology threads that can no longer shut down
+  // safely after the NPU runtime has stopped.
+  exit_without_python_teardown(exit_code);
+}
+
+template <typename MasterType>
+class PythonMasterDeleter final {
+ public:
+  void operator()(MasterType* master) const {
+    // Python model workers may need the GIL while their owning master joins
+    // them. Python invokes this holder's deleter with the GIL held.
+    py::gil_scoped_release release;
+    delete master;
+  }
+};
+
+template <typename MasterType>
+using PythonMasterHolder =
+    std::unique_ptr<MasterType, PythonMasterDeleter<MasterType>>;
+#else
+template <typename MasterType>
+using PythonMasterHolder = std::unique_ptr<MasterType>;
+#endif
+
+}  // namespace
+
 PYBIND11_MODULE(xllm_export, m) {
   ensure_xllm_runtime_module();
+
+#if defined(USE_NPU)
+  m.def("_arm_shutdown_deadline", &arm_shutdown_deadline);
+  m.def(
+      "_shutdown_python_host",
+      []() {
+        // All offline masters have stopped. The ATB cache outlives them, but
+        // its CommInfo destructors must run before torch_npu's atexit shutdown
+        // unloads the CANN runtime. Reset both the cache and its borrowed
+        // global communicator pointer; no process termination is performed.
+        LOG(INFO) << "Releasing offline Python host ATB communicators...";
+        atb_speed::GetSingleton<atb_speed::ExternalCommManager>() =
+            atb_speed::ExternalCommManager{};
+        LOG(INFO) << "Offline Python host ATB communicators released.";
+        // Register at this late boundary, after all model/communication static
+        // constructors. GNU on_exit supplies CPython's exit status; a Python
+        // atexit callback cannot observe sys.exit(nonzero) reliably.
+        if (::on_exit(finish_python_host_exit, nullptr) != 0) {
+          LOG(ERROR) << "Failed to register offline Python host terminal exit";
+          exit_without_python_teardown(/*exit_code=*/1);
+        }
+      },
+      py::call_guard<py::gil_scoped_release>());
+#endif
 
   // 1. export Options
   py::class_<Options>(m, "Options")
@@ -161,10 +225,15 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("kv_cache_dtype", &Options::kv_cache_dtype_);
 
   // 2. export LLMMaster
-  py::class_<LLMMaster>(m, "LLMMaster")
+  py::class_<LLMMaster, PythonMasterHolder<LLMMaster>>(m, "LLMMaster")
       .def(py::init<const Options&>(),
            py::arg("options"),
            py::call_guard<py::gil_scoped_release>())
+#if defined(USE_NPU)
+      .def("_shutdown",
+           &LLMMaster::shutdown,
+           py::call_guard<py::gil_scoped_release>())
+#endif
       .def("handle_request",
            py::overload_cast<std::string,
                              std::optional<std::vector<int>>,
@@ -428,10 +497,15 @@ PYBIND11_MODULE(xllm_export, m) {
       });
 
   // 15. export VLMMaster
-  py::class_<VLMMaster>(m, "VLMMaster")
+  py::class_<VLMMaster, PythonMasterHolder<VLMMaster>>(m, "VLMMaster")
       .def(py::init<const Options&>(),
            py::arg("options"),
            py::call_guard<py::gil_scoped_release>())
+#if defined(USE_NPU)
+      .def("_shutdown",
+           &VLMMaster::shutdown,
+           py::call_guard<py::gil_scoped_release>())
+#endif
       .def("handle_batch_request",
            py::overload_cast<std::vector<std::string>,
                              std::vector<MMData>,

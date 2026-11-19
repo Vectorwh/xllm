@@ -26,6 +26,9 @@ pybind_extension(
     torch
     c10
 )
+if(USE_NPU)
+  target_link_libraries(xllm_export PRIVATE python_runtime)
+endif()
 target_link_options(xllm_export PRIVATE -Wl,-Bsymbolic)
 target_link_libraries(common PRIVATE leveldb::leveldb OpenSSL::SSL OpenSSL::Crypto protobuf::libprotobuf)
 add_dependencies(common brpc-static)

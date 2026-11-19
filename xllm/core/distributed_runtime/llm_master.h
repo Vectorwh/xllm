@@ -44,6 +44,10 @@ class LLMMaster : public Master {
   explicit LLMMaster(const Options& options);
   ~LLMMaster();
 
+  // Terminally drain requests and release engine resources. Request APIs must
+  // not be used afterwards; repeated shutdown and destruction are harmless.
+  void shutdown();
+
   // handle a request, the engine will execute the request asynchronously
   // completion/encode
   void handle_request(std::string prompt,

@@ -15,7 +15,6 @@
 
 import os
 import signal
-import sys
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -97,8 +96,8 @@ class VLM:
         max_vit_attention_units_per_chunk: int = 0,
         **kwargs: Any,
     ) -> None:
-        signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-        signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+        signal.signal(signal.SIGTERM, utils._handle_shutdown_signal)
+        signal.signal(signal.SIGINT, utils._handle_shutdown_signal)
 
         if kwargs:
             unknown = ", ".join(sorted(kwargs.keys()))
@@ -165,6 +164,7 @@ class VLM:
         options.disable_log_stats = disable_log_stats
         init_config_from_option(options, model_type)
         self.master = VLMMaster(options)
+        utils._register_python_host_shutdown(self.master)
 
     def finish(self) -> None:
         try:
