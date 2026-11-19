@@ -125,6 +125,11 @@ class SpeculativeConfig final {
            (is_mtp_algorithm(algorithm) || is_dflash2_algorithm(algorithm));
   }
 
+  static bool is_qwen3_vl_eagle3(std::string_view model_type,
+                                 std::string_view algorithm) {
+    return model_type == "qwen3_vl" && algorithm == "Eagle3";
+  }
+
   // True for the DSpark block-diffusion draft.
   static bool is_dspark_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, "DSpark");

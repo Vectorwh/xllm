@@ -512,6 +512,13 @@ TEST(SpeculativeConfigTest, AdmitsOnlyQwen35MtpOrDFlash2ForVlmPd) {
       SpeculativeConfig::is_qwen3_5_mtp_or_dflash2("qwen3_vl", "DFlash2"));
 }
 
+TEST(SpeculativeConfigTest, MatchesQwen3VlEagle3Pairing) {
+  EXPECT_TRUE(SpeculativeConfig::is_qwen3_vl_eagle3("qwen3_vl", "Eagle3"));
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_vl_eagle3("qwen3_vl", "eagle3"));
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_vl_eagle3("qwen3_5", "Eagle3"));
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_vl_eagle3("qwen3_vl", "MTP"));
+}
+
 TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
   const JsonReader json = config::parse_json_string(kInlineConfig);
   ConfigFlagGuard flag_guard;

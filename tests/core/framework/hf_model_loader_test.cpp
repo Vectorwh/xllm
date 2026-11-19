@@ -1559,6 +1559,29 @@ TEST(HFModelLoaderTest, NormalizeSpeculatorsNullOrMissingDiscriminatorIsNoOp) {
   EXPECT_EQ(config, missing);
 }
 
+TEST(HFModelLoaderTest, NormalizeLegacyEagle3Architectures) {
+  for (const std::string& architecture :
+       {"LlamaForCausalLMEagle3", "Eagle3LlamaForCausalLM"}) {
+    SCOPED_TRACE(architecture);
+    auto config =
+        nlohmann::json{{"model_type", "llama"},
+                       {"architectures", {architecture}},
+                       {"draft_vocab_size", 32000},
+                       {"use_qk_norm", true},
+                       {"rope_scaling", {{"mrope_section", {24, 20, 20}}}}};
+    auto expected = config;
+    expected["model_type"] = "qwen3_eagle3";
+    normalize_speculators_config(&config);
+    EXPECT_EQ(config, expected);
+  }
+
+  auto ordinary_llama = nlohmann::json{{"model_type", "llama"},
+                                       {"architectures", {"LlamaForCausalLM"}}};
+  const auto original = ordinary_llama;
+  normalize_speculators_config(&ordinary_llama);
+  EXPECT_EQ(ordinary_llama, original);
+}
+
 TEST(HFModelLoaderTest, NormalizeSpeculatorsNonEagle3IsNoOp) {
   auto config = speculators_eagle3_config();
   config["speculators_model_type"] = "dspark";
@@ -1574,6 +1597,13 @@ TEST(HFModelLoaderTest, NormalizeSpeculatorsRewritesConfig) {
   EXPECT_EQ(config.at("model_type"), "qwen3_eagle3");
   // QK norm is inferred from the Qwen3 layer template.
   EXPECT_EQ(config.at("use_qk_norm"), true);
+
+  // A legacy-looking architecture must not bypass speculators normalization.
+  auto combined_format = speculators_eagle3_config();
+  combined_format["architectures"] = {"Eagle3LlamaForCausalLM"};
+  normalize_speculators_config(&combined_format);
+  EXPECT_EQ(combined_format.at("model_type"), "qwen3_eagle3");
+  EXPECT_EQ(combined_format.at("use_qk_norm"), true);
 
   // An explicit use_qk_norm wins over the layer-template inference.
   auto explicit_flag = speculators_eagle3_config();

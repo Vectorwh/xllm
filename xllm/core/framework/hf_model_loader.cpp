@@ -500,10 +500,32 @@ void check_safetensors_cleanup(::Status status,
 
 }  // namespace
 
-// Rewrites a speculators-format Eagle3 draft config toward qwen3_eagle3: sets
-// model_type and resolves use_qk_norm (explicit value wins, else inferred from
-// the layer type). The backbone lift is left to normalize_config_torch_dtype.
+// Normalizes speculators-format and legacy Eagle3 draft configs toward
+// qwen3_eagle3: sets model_type and resolves use_qk_norm (explicit value wins,
+// else inferred from the layer type). The backbone lift is left to
+// normalize_config_torch_dtype.
 void normalize_speculators_config(nlohmann::json* config) {
+  // Legacy Eagle3 configs identify the draft through the architecture name
+  // rather than speculators_model_type. Match the complete names so ordinary
+  // Llama checkpoints remain unchanged.
+  const auto model_type_it = config->find("model_type");
+  const bool is_legacy_llama = model_type_it != config->end() &&
+                               model_type_it->is_string() &&
+                               model_type_it->get<std::string>() == "llama";
+  const auto architectures_it = config->find("architectures");
+  if (is_legacy_llama && architectures_it != config->end() &&
+      architectures_it->is_array() && !architectures_it->empty()) {
+    const auto& architecture = architectures_it->front();
+    if (architecture.is_string()) {
+      const std::string name = architecture.get<std::string>();
+      if (name == "LlamaForCausalLMEagle3" ||
+          name == "Eagle3LlamaForCausalLM") {
+        (*config)["model_type"] = "qwen3_eagle3";
+        return;
+      }
+    }
+  }
+
   // JsonReader treats null like a missing key; match that contract here so a
   // config that explicitly writes "speculators_model_type": null parses
   // instead of throwing nlohmann type_error.302 from json::value().
