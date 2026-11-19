@@ -85,6 +85,8 @@ from xllm.python.model_executor.forward_context import (  # noqa: E402
 )
 from xllm.python.model_executor.input_batch import InputBatch  # noqa: E402
 from xllm.python.model_executor.model_input import ModelInput
+from xllm.python.model_executor.model_output import ModelOutput
+from xllm.python.model_executor.mtp_topk import MtpTopkReuse
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
     DecodeAclGraphRunner,
 )
@@ -2870,6 +2872,84 @@ def test_eager_runner_rejects_missing_cp_lengths(
         runner.execute(torch.zeros(1), torch.zeros(1), metadata)
 
     assert not runner.attention_backend._prepared
+
+
+def _mtp_executor_with_output(output: ModelOutput) -> ModelExecutor:
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor._kv_bound = True
+    executor.layerwise_split_size = 1
+    executor._mtp_topk_reuse = MtpTopkReuse()
+    executor._execution_metadata_builders = []
+    executor._is_spec_draft = False
+    executor._static_kernel = None
+    executor.execution_pipeline = SimpleNamespace(
+        execute=MagicMock(return_value=output), entry_runner=SimpleNamespace(last_graph_rows=0)
+    )
+    executor._attach_persistent_aux_hidden_states = MagicMock(side_effect=lambda output, *args, **kwargs: output)
+    return executor
+
+
+@pytest.mark.parametrize("chunked_decode", [False, True])
+def test_mtp_executor_uses_sampler_current_rows_and_retains_owned_selection(chunked_decode: bool) -> None:
+    source = torch.arange(12).reshape(4, 1, 3)
+    expected = source[[1, 3]].clone()
+    executor = _mtp_executor_with_output(ModelOutput(hidden_states=torch.zeros(4, 4), mtp_topk_indices=source))
+    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=chunked_decode, is_mixed=False)
+    batch_metadata = SimpleNamespace(is_prefilling=[False] * 4) if chunked_decode else None
+    sampling = SimpleNamespace(parameters=SimpleNamespace(selected_token_idxes=torch.tensor([1, 3])))
+    executor.execute(
+        torch.zeros(4, dtype=torch.long),
+        torch.zeros(4, dtype=torch.long),
+        metadata,
+        sampling_input=sampling,
+        input_batch_metadata=batch_metadata,
+        mtp_draft_step=0,
+    )
+    owned = executor._mtp_topk_reuse.input_for_step(1, 2)
+    torch.testing.assert_close(owned, expected)
+    source.fill_(-1)
+    torch.testing.assert_close(owned, expected)
+    executor.execution_pipeline.execute.return_value = ModelOutput(
+        hidden_states=torch.zeros(2, 4), mtp_topk_indices=expected
+    )
+    sampling = SimpleNamespace(parameters=SimpleNamespace(selected_token_idxes=torch.tensor([0, 1])))
+    batch_metadata = SimpleNamespace(is_prefilling=[False] * 2) if chunked_decode else None
+    executor.execute(
+        torch.zeros(2, dtype=torch.long),
+        torch.zeros(2, dtype=torch.long),
+        metadata,
+        sampling_input=sampling,
+        input_batch_metadata=batch_metadata,
+        mtp_draft_step=1,
+    )
+    assert executor.execution_pipeline.execute.call_args.args[0].mtp_topk_indices is owned
+
+
+def test_mtp_executor_prefill_clears_old_state_without_gathering_an_unused_selection() -> None:
+    executor = _mtp_executor_with_output(ModelOutput(hidden_states=torch.zeros(4, 4)))
+    executor._mtp_topk_reuse.finish_step(0, torch.ones(2, 1, 3), None)
+    executor._mtp_topk_reuse.finish_step = MagicMock(wraps=executor._mtp_topk_reuse.finish_step)
+    metadata = SimpleNamespace(is_prefill=True, is_chunked_prefill=False, is_mixed=False)
+    executor.execute(torch.zeros(4, dtype=torch.long), torch.zeros(4, dtype=torch.long), metadata)
+    executor.execution_pipeline.execute.assert_called_once()
+    executor._mtp_topk_reuse.finish_step.assert_not_called()
+    with pytest.raises(ValueError, match="consecutive draft steps"):
+        executor._mtp_topk_reuse.input_for_step(1, 2)
+
+
+def test_mtp_reuse_requires_sampling_before_state_reset_or_forward() -> None:
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor._kv_bound = True
+    executor.layerwise_split_size = 1
+    executor._mtp_topk_reuse = MagicMock()
+    executor.execution_pipeline = MagicMock()
+    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, is_mixed=False)
+
+    with pytest.raises(RuntimeError, match="MTP top-k reuse requires upstream sampling row selection"):
+        executor.execute(torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long), metadata)
+
+    executor._mtp_topk_reuse.input_for_step.assert_not_called()
+    executor.execution_pipeline.execute.assert_not_called()
 
 
 class TestExecuteRouting:

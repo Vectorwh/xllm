@@ -232,6 +232,7 @@ class _DecodeGraphEntry:
         "static_input_ids",
         "static_positions",
         "static_input_embedding",
+        "static_mtp_topk_indices",
         "static_metadata",
         "kv_seq_lens_delta",
         "graph_tasks",
@@ -282,6 +283,7 @@ _GraphKey = tuple[
     tuple[int, ...] | None,
     tuple[int, ...],
     bool,
+    tuple[torch.dtype, torch.device, tuple[int, ...]] | None,
 ]
 
 
@@ -1647,6 +1649,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_batch: InputBatch | None = None,
         *,
         static_kernel: StaticKernelWorker | None = None,
+        mtp_topk_indices: torch.Tensor | None = None,
     ) -> ModelExecutionOutput:
         metadata = self._normalize_metadata(metadata)
         # Keep event wrappers alive until the H2D-ready event has signalled;
@@ -1725,6 +1728,7 @@ class DecodeAclGraphRunner(BaseRunner):
             kpool_query_lens,
             verify_width=verify_width,
             use_dflash_proposal_attention=bool(getattr(metadata, "use_dflash_proposal_attention", False)),
+            mtp_topk_indices=mtp_topk_indices,
         )
         entry = None if static_kernel is not None else self._graphs.get(graph_key)
         first_capture = entry is None
@@ -1739,6 +1743,11 @@ class DecodeAclGraphRunner(BaseRunner):
             )
             entry.static_metadata.dsa_graph_token_capacity = self._graph_token_capacity
             entry.eplb = self._allocate_graph_eplb_state(eplb, padded_batch_size)
+            entry.static_mtp_topk_indices = (
+                mtp_topk_indices.new_full((padded_batch_size, *mtp_topk_indices.shape[1:]), -1)
+                if mtp_topk_indices is not None
+                else None
+            )
         entry_eplb = getattr(entry, "eplb", None)
         if not first_capture and (entry_eplb is None) != (eplb is None):
             raise RuntimeError("EPLB state changed after ACL graph capture")
@@ -1768,6 +1777,9 @@ class DecodeAclGraphRunner(BaseRunner):
             capture_metadata = _CaptureAttentionMetadata(metadata)
 
         def fill_graph_inputs() -> None:
+            if mtp_topk_indices is not None:
+                entry.static_mtp_topk_indices[:batch_size].copy_(mtp_topk_indices)
+                entry.static_mtp_topk_indices[batch_size:].fill_(-1)
             self._fill_entry(
                 entry,
                 input_ids,
@@ -1792,6 +1804,7 @@ class DecodeAclGraphRunner(BaseRunner):
             execution_state=entry.execution_state,
             eplb=entry_eplb,
             execution_contexts=entry.execution_contexts,
+            mtp_topk_indices=entry.static_mtp_topk_indices,
         )
         pending_preparation = None
         restore_history = (
@@ -2136,8 +2149,14 @@ class DecodeAclGraphRunner(BaseRunner):
         kpool_query_lens: tuple[int, ...] = (),
         verify_width: int = 1,
         use_dflash_proposal_attention: bool = False,
+        mtp_topk_indices: torch.Tensor | None = None,
     ) -> _GraphKey:
         """Key the captured attention mode and execution shape."""
+        topk_schema = (
+            (mtp_topk_indices.dtype, mtp_topk_indices.device, tuple(mtp_topk_indices.shape[1:]))
+            if mtp_topk_indices is not None
+            else None
+        )
         if input_embedding is None:
             return (
                 padded_batch_size,
@@ -2148,6 +2167,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 None,
                 kpool_query_lens,
                 use_dflash_proposal_attention,
+                topk_schema,
             )
         return (
             padded_batch_size,
@@ -2158,6 +2178,7 @@ class DecodeAclGraphRunner(BaseRunner):
             tuple(input_embedding.shape[1:]),
             kpool_query_lens,
             use_dflash_proposal_attention,
+            topk_schema,
         )
 
     def _max_graph_context_len(self, metadata: AttentionMetadata) -> int:
@@ -2332,6 +2353,7 @@ class DecodeAclGraphRunner(BaseRunner):
                     metadata,
                 )
         entry.static_input_embedding = None
+        entry.static_mtp_topk_indices = None
         kpool_query_lens = self._graph_kpool_query_lens(
             metadata,
             input_ids.numel(),
@@ -3044,6 +3066,7 @@ class DecodeAclGraphRunner(BaseRunner):
             execution_state=entry.execution_state,
             eplb=getattr(entry, "eplb", None),
             execution_contexts=entry.execution_contexts,
+            mtp_topk_indices=entry.static_mtp_topk_indices,
         )
         # Metadata was filled on the caller stream; warmup must consume the
         # completed padding indices and checkpoint tables.
@@ -3063,6 +3086,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 execution_state=entry.execution_state,
                 eplb=getattr(entry, "eplb", None),
                 execution_contexts=entry.execution_contexts,
+                mtp_topk_indices=entry.static_mtp_topk_indices,
             )
             # Every graph replays serially on ``self._stream``, so one shared pool
             # lets capture scratch reach a high-water mark instead of accumulating

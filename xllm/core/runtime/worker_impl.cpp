@@ -62,6 +62,7 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache_estimation.h"
 #include "core/framework/lora/lora_runtime.h"
+#include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "core/platform/sleepable_allocator.h"
 #if defined(USE_NPU)
@@ -1608,6 +1609,17 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     // CP prepare after global attention-meta consumers.
     processed_input.input_params.parallel.cp_plan.prepare(
         processed_input, npu_cp_plan_runtime_config());
+
+    // Expose the existing sampler's row selection to Python MTP. Top-k
+    // tensors and their iteration lifetime stay entirely in the executor.
+    const ModelArgs& model_args = context_.get_model_args();
+    if (options_.is_draft_engine() &&
+        layer::is_mtp_dsa_topk_reuse_enabled(model_args) &&
+        ModelConfig::is_python_model_impl(context_.get_model_impl())) {
+      ModelSamplingInput sampling;
+      sampling.parameters = processed_input.sampling_params;
+      input_params.sampling = std::move(sampling);
+    }
 
     ProcessGroup* dcp_group = parallel_args_.dcp_group_;
     if (dcp_group != nullptr) {

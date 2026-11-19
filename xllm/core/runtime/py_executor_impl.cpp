@@ -233,21 +233,22 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object eplb_decode_token_mask =
       optional_tensor(params.expert.eplb_decode_token_mask);
 
-  py::object py_output =
-      py_executor_.attr("execute")(execution_tokens,
-                                   positions_arg,
-                                   py_metadata,
-                                   input_embedding,
-                                   py_sync,
-                                   expert_load_data,
-                                   eplb_decode_token_mask,
-                                   params.meta.is_graph_warmup,
-                                   py_input_batch_metadata,
-                                   py_load_sync,
-                                   params.parallel.layers_per_event,
-                                   params.parallel.draft_load_event_index,
-                                   multimodal_inputs,
-                                   py::arg("sampling_input") = sampling_input);
+  py::object py_output = py_executor_.attr("execute")(
+      execution_tokens,
+      positions_arg,
+      py_metadata,
+      input_embedding,
+      py_sync,
+      expert_load_data,
+      eplb_decode_token_mask,
+      params.meta.is_graph_warmup,
+      py_input_batch_metadata,
+      py_load_sync,
+      params.parallel.layers_per_event,
+      params.parallel.draft_load_event_index,
+      multimodal_inputs,
+      py::arg("sampling_input") = sampling_input,
+      py::arg("mtp_draft_step") = params.meta.mtp_draft_step);
   if (py::isinstance(py_output, py_model_output_type_)) {
     ModelOutput output;
     auto tensor = [&](const char* name) {

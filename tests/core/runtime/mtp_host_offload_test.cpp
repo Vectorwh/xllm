@@ -29,6 +29,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/kv_cache/kv_cache_capacity.h"
 #include "core/framework/kv_cache/kv_cache_shape.h"
@@ -315,6 +316,14 @@ class TestMTPWorker final : public MTPWorkerImpl {
     draft_impl_ = std::move(draft);
   }
 
+  void set_validation_context(ModelContext context) {
+    context_ = std::move(context);
+  }
+
+  bool requires_uniform_width() const {
+    return requires_uniform_validate_width();
+  }
+
   void prepare_hierarchy_transfers() { prepare_hierarchy_kv_cache_transfers(); }
 
   void finalize_hierarchy_transfers() {
@@ -390,6 +399,54 @@ class MTPHostOffloadTest : public ::testing::Test {
     }
   }
 };
+
+TEST_F(MTPHostOffloadTest, GlmUniformWidthIsScopedToPythonGraphs) {
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const ParallelArgs parallel_args(/*rank=*/0,
+                                   /*world_size=*/1,
+                                   /*dp_size=*/1,
+                                   /*cp_size=*/1,
+                                   /*process_group=*/nullptr,
+                                   /*ep_size=*/1);
+  const runtime::Options options = make_runtime_options(0.0);
+  const ModelArgs model_args =
+      make_model_args("glm_moe_dsa", /*layer_count=*/1, /*head_dim=*/2);
+  auto target = std::make_unique<HierarchyTransferTestWorker>(
+      parallel_args, device.unwrap(), options, model_args);
+  target->mark_loaded();
+  auto draft = std::make_unique<HierarchyTransferTestWorker>(
+      parallel_args, device.unwrap(), options, model_args);
+  TestMTPWorker worker(parallel_args, device.unwrap(), options);
+  worker.replace_transfer_workers(std::move(target), std::move(draft));
+
+  const bool previous_graph = ExecutionConfig::get_instance().enable_graph();
+  const ScopeGuard graph_guard([previous_graph]() {
+    ExecutionConfig::get_instance().enable_graph(previous_graph);
+  });
+  struct TestCase {
+    std::string model_impl;
+    bool graph_enabled;
+    bool uniform_expected;
+  };
+  const TestCase cases[] = {{"native", true, false},
+                            {"python", true, true},
+                            {"python", false, false}};
+  for (const TestCase& test_case : cases) {
+    SCOPED_TRACE(test_case.model_impl);
+    SCOPED_TRACE(test_case.graph_enabled);
+    ModelContext context(
+        parallel_args,
+        model_args,
+        QuantArgs(),
+        torch::TensorOptions().dtype(torch::kFloat32).device(device.unwrap()));
+    context.set_model_impl(test_case.model_impl);
+    worker.set_validation_context(std::move(context));
+    ExecutionConfig::get_instance().enable_graph(test_case.graph_enabled);
+    EXPECT_EQ(worker.requires_uniform_width(), test_case.uniform_expected);
+  }
+}
 
 TEST(MTPAdaptiveValidateWidthTest, PreservesWidthForPreviousAcceptedTokens) {
   EXPECT_EQ(TestMTPWorker::preserve_checkpoint_width(

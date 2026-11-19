@@ -684,6 +684,13 @@ class Glm52MLAAttention(Attention):
     ) -> torch.Tensor:
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
+            reused_topk = get_forward_context().mtp_topk_indices
+            if reused_topk is not None:
+                if layerwise:
+                    raise ValueError("MTP top-k reuse does not support layerwise splitting")
+                return self.indexer.select_qli(
+                    hidden, q_c, positions, ctx, cos_sin_cache, reused_topk_indices=reused_topk
+                )
             if layerwise:
                 if self.cfg.layerwise_split_rank == layer_owner:
                     topk = self.indexer.select_qli(hidden, q_c, positions, ctx, cos_sin_cache)
@@ -1075,6 +1082,16 @@ class Glm52Indexer(nn.Module):
             return self.wq_b._w8a8.forward_quantized(*qr)
         return self.wq_b(qr)
 
+    def _project_key(self, hidden: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
+        k = self.k_norm(self.wk(hidden))
+        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+        if self.indexer_rope_interleave:
+            cos, sin = _step_cos_sin(cos_sin_cache, positions)
+            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), cos, sin).squeeze(1)
+        else:
+            k_pe = _step_half_rope(cos_sin_cache, k_pe.unsqueeze(1), positions).squeeze(1)
+        return torch.cat([k_pe, k_nope], dim=-1)
+
     def select_qli(
         self,
         hidden: torch.Tensor,
@@ -1084,26 +1101,39 @@ class Glm52Indexer(nn.Module):
         cos_sin_cache: torch.Tensor,
         cache_hidden: torch.Tensor | None = None,
         cache_positions: torch.Tensor | None = None,
+        reused_topk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if reused_topk_indices is not None:
+            if ctx.cp_context is not None:
+                raise ValueError("MTP top-k reuse does not support context parallelism")
+            if reused_topk_indices.shape != (hidden.shape[0], ctx.index_cache.size(2), self.topk):
+                raise ValueError("MTP top-k shape does not match the draft indexer")
+            k = self._project_key(
+                hidden if cache_hidden is None else cache_hidden,
+                positions if cache_positions is None else cache_positions,
+                cos_sin_cache,
+            )
+            if ctx.index_cache.dtype == torch.int8 and ctx.index_cache_scale is not None:
+                k = torch.matmul(k, self.hadamard) * self.head_dim**-0.5
+                k, k_scale = kernels.dynamic_quant(k)
+                ctx.update_index_cache(k, k_scale.unsqueeze(-1).to(torch.float16))
+            else:
+                ctx.update_index_cache(k, None)
+            return reused_topk_indices
+
         actual_seq_q = ctx.actual_seq_q
         actual_seq_kv = ctx.actual_seq_kv
         q = self._project_query(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         cache_hidden = hidden if cache_hidden is None else cache_hidden
         cache_positions = positions if cache_positions is None else cache_positions
-        k = self.wk(cache_hidden)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+        k = self._project_key(cache_hidden, cache_positions, cos_sin_cache)
         if self.indexer_rope_interleave:
             cos, sin = _step_cos_sin(cos_sin_cache, positions)
             q_pe = _interleave_rope_with(q_pe, cos, sin)
-            k_cos, k_sin = _step_cos_sin(cos_sin_cache, cache_positions)
-            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
         else:
             q_pe = _step_half_rope(cos_sin_cache, q_pe, positions)
-            k_pe = _step_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe, k_nope], dim=-1)
         weights = self.weights_proj(hidden)
         # Alpha-plan gate for the CP query-row partition (design.md): when
         # active, both scoring branches below (quant and non-quant) score
@@ -1343,7 +1373,7 @@ def _resolve_qlinear(model: nn.Module, dotted: str) -> QLinear:
 class Glm52ForCausalLM(PyModelBase):
     """GLM-5.2 causal LM. Registered under ``model_type='glm_moe_dsa'``."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, build_model: bool = True) -> None:
         super().__init__()
         self.cfg = Glm52Config.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
@@ -1365,16 +1395,22 @@ class Glm52ForCausalLM(PyModelBase):
         device = torch.device(config.get("device", "cuda"))
         self.dtype = dtype
         self.device = device
+        self.model: Glm52Model | None = None
+        self.lm_head: ColumnParallelLinear | None = None
+        if build_model:
+            self._build_model()
+
+    def _build_model(self) -> None:
         tp = self.cfg.tp_size
         assert self.cfg.vocab_size % tp == 0
-        self.model = Glm52Model(self.cfg, dtype, device)
+        self.model = Glm52Model(self.cfg, self.dtype, self.device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size,
             self.cfg.vocab_size // tp,
             tp,
             gather_output=True,
-            dtype=dtype,
-            device=device,
+            dtype=self.dtype,
+            device=self.device,
         )
 
     def load_weights(
@@ -1382,9 +1418,15 @@ class Glm52ForCausalLM(PyModelBase):
         state_dicts: list,
         tp_rank: int,
         tp_size: int,
+        load_lm_head: bool = True,
+        load_embedding: bool = True,
+        loader: W8A8WeightLoader | None = None,
     ) -> None:
         cfg = self.cfg
-        loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
+        if self.model is None:
+            raise RuntimeError("GLM5.2 model body must be built before loading weights")
+        if loader is None:
+            loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
 
         # Quant-format probe, decided once from the first attention projection:
         # internal static exports (GLM-5.2-w8a8) carry q_a_proj.deq_scale, HF
@@ -1418,7 +1460,8 @@ class Glm52ForCausalLM(PyModelBase):
             module.resolve_quant(True, quant_format=quant_format)
             module.load_w8a8(q_loader, prefix, proj, shard_dims, quant_format=quant_format)
 
-        loader.copy_shard("model.embed_tokens.weight", dim=1)
+        if load_embedding:
+            loader.copy_shard("model.embed_tokens.weight", dim=1)
 
         for i in range(cfg.n_layers):
             p = f"model.layers.{i}."
@@ -1448,4 +1491,5 @@ class Glm52ForCausalLM(PyModelBase):
             self.model.layers[i].mlp.load_from_checkpoint(loader, p + "mlp.")
 
         loader.copy_replicated("model.norm.weight")
-        loader.copy_shard("lm_head.weight", dim=0)
+        if load_lm_head:
+            loader.copy_shard("lm_head.weight", dim=0)

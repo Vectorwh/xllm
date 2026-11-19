@@ -42,7 +42,8 @@ class Glm52EpMetadataBuilder:
 
     @classmethod
     def from_config(cls, config: Mapping[str, object]) -> Glm52EpMetadataBuilder | None:
-        if str(config.get("model_type", "")) != "glm_moe_dsa" or int(config.get("ep_size", 1)) <= 1:
+        model_type = str(config.get("model_type", ""))
+        if model_type not in ("glm_moe_dsa", "glm_moe_dsa_mtp") or int(config.get("ep_size", 1)) <= 1:
             return None
         return cls(int(config.get("dp_size", 1)), int(config.get("dp_rank", 0)))
 

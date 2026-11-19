@@ -679,6 +679,11 @@ py::dict PyCausalLM::build_config_dict(
     d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
     d["enable_eplb"] = eplb_config.enable_eplb();
   }
+  if (model_args_.model_type() == "glm_moe_dsa_mtp") {
+    // Match the target's MoE transport without enabling target EPLB on the
+    // draft.
+    d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();
+  }
   if (mega_moe_comm_resource_ != nullptr) {
     d["enable_mega_moe"] = true;
     d["expert_parallel_degree"] = eplb_config.expert_parallel_degree();

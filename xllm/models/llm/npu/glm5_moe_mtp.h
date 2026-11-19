@@ -22,6 +22,7 @@ limitations under the License.
 #include "core/layers/common/rotary_embedding_util.h"
 #include "deepseek_v32.h"
 #include "models/llm/npu/glm_shared_expert_stream.h"
+#include "models/model_registry.h"
 #include "mtp_model_base.h"
 
 namespace xllm::npu::model {
@@ -157,6 +158,42 @@ REGISTER_MODEL_ARGS(
               std::unordered_set<int32_t>(args->eos_token_id_vec().begin(),
                                           args->eos_token_id_vec().end()));
     }));
+
+namespace glm5_moe_mtp_args {
+
+// Normalizes the exported draft checkpoint before the model is built. The
+// exporter rewrites the target config into a single appended layer, but leaves
+// target-shaped per-layer metadata behind (``mlp_layer_types`` stays 78 long,
+// ``index_topk_pattern`` becomes "S" for the native cross-step top-k plan), so
+// the draft layer's real layout has to be pinned explicitly.
+inline void configure_mtp_args(ModelArgs& args, bool /*is_python_model*/) {
+  if (args.model_type() != "glm_moe_dsa_mtp") {
+    return;
+  }
+  CHECK_EQ(args.n_layers(), 1)
+      << "glm_moe_dsa_mtp draft expects exactly one prediction layer.";
+  CHECK_EQ(args.num_nextn_predict_layers(), 1)
+      << "glm_moe_dsa_mtp draft expects num_nextn_predict_layers=1.";
+  args.first_k_dense_replace(0);
+  args.mlp_layer_types({"sparse"});
+  // The appended layer carries a full DSA indexer, so the Python draft seeds
+  // its own top-k on the first step. indexer_types() has no native consumer;
+  // it only reaches the Python model through PyCausalLM::build_config_dict().
+  args.indexer_types({"full"});
+}
+
+}  // namespace glm5_moe_mtp_args
+
+const bool glm5_moe_mtp_args_registered = []() {
+  ModelRegistry::register_mtp_args_adapter(
+      "glm_moe_dsa_mtp", &glm5_moe_mtp_args::configure_mtp_args);
+  MtpModelCapabilities capabilities;
+  // The Python draft shares the target's embed_tokens/lm_head
+  // (share_python_model_weights) instead of loading its own copies.
+  capabilities.python_draft_owns_embedding_and_lm_head = false;
+  ModelRegistry::register_mtp_capabilities("glm_moe_dsa_mtp", capabilities);
+  return true;
+}();
 
 REGISTER_TOKENIZER_ARGS(glm_moe_dsa_mtp, [&] {
   const std::vector<std::string> parser_visible_special_tokens({"<tool_call>",

@@ -207,7 +207,7 @@ def test_attention_passes_full_cp_layout_to_replicated_indexer() -> None:
         patch.object(
             glm5_2,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend, mtp_topk_indices=None),
         ),
         patch.object(glm5_2, "_gather_interleave_cos_sin", return_value=(torch.empty(0), torch.empty(0))),
         patch.object(glm5_2, "_interleave_rope_with", side_effect=lambda value, *_args: value),

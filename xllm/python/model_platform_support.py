@@ -36,6 +36,7 @@ MODEL_PLATFORM_SUPPORT: dict[str, dict[str, bool]] = {
     # runs on CPU for unit tests and on NPU for serving.
     "deepseek_v41_dspark": {"cuda": False, "npu": True, "cpu": True},
     "glm5_2": {"cuda": False, "npu": True},
+    "glm5_2_mtp": {"cuda": False, "npu": True},
     "glm5_next": {"cuda": False, "npu": True},
     "glm5_next_vl": {"cuda": False, "npu": True},
     "glm5_next_mtp": {"cuda": False, "npu": True},

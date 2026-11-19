@@ -57,7 +57,10 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
   }
   if (is_python_model &&
       (model_type == "deepseek_v32" || model_type == "deepseek_v4" ||
-       model_type == "deepseek_v4_dspark")) {
+       model_type == "deepseek_v4_dspark" || model_type == "glm_moe_dsa")) {
+    // GLM-5.2/5.3 mirrors the GLM-5.3-Flash python verify layout: the target
+    // expands every sequence into one query chunk per verify row, which is the
+    // layout the Python ACL-graph runner admits.
     return TargetSpecVerifyMode::EXPANDED_VERIFY;
   }
   if (model_type == "mimo") {
@@ -66,7 +69,13 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
   return TargetSpecVerifyMode::GENERIC;
 }
 
-bool requires_uniform_spec_verify(std::string_view model_type) {
+bool requires_uniform_spec_verify(std::string_view model_type,
+                                  bool is_python_model,
+                                  bool graph_enabled,
+                                  bool requires_eager_execution) {
+  if (model_type == "glm_moe_dsa") {
+    return is_python_model && graph_enabled && !requires_eager_execution;
+  }
   return is_qwen3_5_target_model_type(model_type) ||
          is_glm5_next_target_model_type(model_type) ||
          model_type == "glm5_next_text";
@@ -142,7 +151,7 @@ bool supports_combined_draft_configuration(
   return false;
 }
 
-bool supports_python_dsv32_continuous_draft_configuration(
+bool supports_torch_combined_first_draft_configuration(
     std::string_view target_model_type,
     std::string_view draft_model_type,
     std::string_view npu_backend,
@@ -152,9 +161,12 @@ bool supports_python_dsv32_continuous_draft_configuration(
     bool has_model_managed_block_tables,
     int32_t target_index_topk,
     int32_t draft_index_topk) {
-  return target_model_type == "deepseek_v32" &&
-         draft_model_type == "deepseek_v32_mtp" && npu_backend == "TORCH" &&
-         dp_size == 1 && is_python_target && is_python_draft &&
+  const bool supported_model_pair = (target_model_type == "deepseek_v32" &&
+                                     draft_model_type == "deepseek_v32_mtp") ||
+                                    (target_model_type == "glm_moe_dsa" &&
+                                     draft_model_type == "glm_moe_dsa_mtp");
+  return supported_model_pair && npu_backend == "TORCH" && dp_size == 1 &&
+         is_python_target && is_python_draft &&
          !has_model_managed_block_tables && target_index_topk > 0 &&
          draft_index_topk > 0;
 }

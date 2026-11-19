@@ -44,6 +44,8 @@ from xllm.python.model_executor.input_batch import (
     InputBatchMetadata,
 )
 from xllm.python.model_executor.model_input import ModelInput
+from xllm.python.model_executor.model_output import ModelOutput
+from xllm.python.model_executor.mtp_topk import MtpTopkReuse
 from xllm.python.model_executor.runner import RunnerConfig
 from xllm.python.model_executor.runners.base import BaseRunner, ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
@@ -394,6 +396,11 @@ class ModelExecutor:
             attention_backend=self.attention_backend,
             restore_history=restore_history,
         )
+        self._mtp_topk_reuse = (
+            MtpTopkReuse()
+            if bool(getattr(self.execution_pipeline.entry_runner.model, "supports_mtp_topk_reuse", False))
+            else None
+        )
 
     @property
     def eager_runner(self) -> EagerRunner:
@@ -553,6 +560,7 @@ class ModelExecutor:
         draft_load_event_index: int | None = None,
         multimodal_inputs: MultimodalInputs | None = None,
         sampling_input: ModelSamplingInput | None = None,
+        mtp_draft_step: int = 0,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -560,6 +568,24 @@ class ModelExecutor:
             raise ValueError("multimodal inputs and speculative hidden states cannot share a forward")
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
+
+        mtp_reuse = self._mtp_topk_reuse
+        if mtp_reuse is not None:
+            is_prefill = metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_mixed
+            # Draft replay/extend can use chunked attention with decode row semantics.
+            if metadata.is_chunked_prefill and input_batch_metadata is not None and input_batch_metadata.is_prefilling:
+                is_prefill = any(input_batch_metadata.is_prefilling)
+            if is_prefill:
+                # Clear a previous iteration, but never retain an unused prefill selection.
+                mtp_reuse.input_for_step(0, input_ids.numel())
+                mtp_reuse = None
+        # A sampler with no selected rows denotes the full-row idle/warmup layout;
+        # omitting the sampler itself is invalid before any draft state is changed.
+        if mtp_reuse is not None and sampling_input is None:
+            raise RuntimeError("MTP top-k reuse requires upstream sampling row selection")
+        mtp_topk_indices = (
+            mtp_reuse.input_for_step(mtp_draft_step, input_ids.numel()) if mtp_reuse is not None else None
+        )
 
         eplb = None
         if expert_load_data is not None:
@@ -594,6 +620,7 @@ class ModelExecutor:
             positions=positions,
             metadata=metadata,
             input_embedding=input_embedding,
+            mtp_topk_indices=mtp_topk_indices,
             layer_synchronizer=layer_synchronizer,
             eplb=eplb,
             input_batch=input_batch,
@@ -616,6 +643,12 @@ class ModelExecutor:
                 output = self.execution_pipeline.execute(inputs)
         else:
             output = self.execution_pipeline.execute(inputs)
+        if mtp_reuse is not None:
+            if not isinstance(output, ModelOutput) or output.mtp_topk_indices is None:
+                raise RuntimeError("MTP draft did not publish its top-k selection")
+            mtp_reuse.finish_step(
+                mtp_draft_step, output.mtp_topk_indices, sampling_input.parameters.selected_token_idxes
+            )
         return self._attach_persistent_aux_hidden_states(
             output,
             input_ids.numel(),

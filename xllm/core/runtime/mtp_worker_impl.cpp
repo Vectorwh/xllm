@@ -37,6 +37,7 @@ limitations under the License.
 #endif
 #include "core/framework/block/block_utils.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
@@ -1020,12 +1021,12 @@ bool MTPWorkerImpl::requires_uniform_validate_width() const {
       impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
     return false;
   }
-  // Qwen3.5 GDN and GLM5 KDA select recurrent checkpoints from a dense 2-D
-  // [sequence, validate_width] table, so every sequence must use the same
-  // width. Keep this model capability check platform-independent; the
-  // checkpoint allocation itself remains NPU-specific.
+  const ModelArgs& model_args = context_.get_model_args();
   return mtp_async::requires_uniform_spec_verify(
-      context_.get_model_args().model_type());
+      model_args.model_type(),
+      ModelConfig::is_python_model_impl(context_.get_model_impl()),
+      ExecutionConfig::get_instance().enable_graph(),
+      model_args.requires_eager_execution());
 }
 
 int32_t MTPWorkerImpl::preserve_checkpoint_validate_width(
@@ -1307,6 +1308,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     draft_input.input_params.embedding.input_embedding =
         embedding_cache_->embedding_placeholder().unsqueeze(0);
     ForwardInput new_input = draft_input;
+    new_input.input_params.meta.mtp_draft_step = 0;
     CHECK(draft_context_replay_policy_.has_value())
         << "Draft context replay policy is not initialized.";
     const int32_t extend_width =
@@ -1337,6 +1339,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
     }
 
     for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
+      // Idle DP shards must replay the same compute/reuse graph as busy peers.
+      draft_input.input_params.meta.mtp_draft_step = i;
       draft_outputs.emplace_back(
           run_worker_no_sync(*draft_impl_, draft_input, draft_step_prepared[i])
               .value());
@@ -1722,11 +1726,16 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       (use_device_target_context || use_prelaunched_first_draft) &&
       combined_draft_execution_path_ ==
           mtp_async::CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
-  const bool use_continuous_python_dsv32_drafts =
+  const bool use_continuous_python_drafts =
       (use_device_target_context || use_prelaunched_first_draft) &&
-      supports_python_dsv32_continuous_drafts(input);
+      supports_torch_combined_first_draft(input);
   const bool use_continuous_drafts =
-      use_continuous_dsa_drafts || use_continuous_python_dsv32_drafts;
+      use_continuous_dsa_drafts || use_continuous_python_drafts;
+  // Continuous drafting does not imply an expanded target layout: native
+  // GLM/ATB retains generic verify correction.
+  const bool use_expanded_verify_metadata =
+      use_continuous_drafts && supports_expanded_spec_verify() &&
+      input.input_params.multi_block_tables.empty();
   std::vector<ForwardInput> later_draft_inputs;
   torch::Tensor accepted_base_positions;
   torch::Tensor accepted_base_kv_seq_lens;
@@ -1799,6 +1808,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     if (reuse_mtp_topk_state) {
       current_draft_input.input_params.mtp_topk_state = mtp_topk_state;
     }
+    current_draft_input.input_params.meta.mtp_draft_step = draft_idx;
     std::optional<ForwardOutput> draft_output_opt;
     if (use_prelaunched_first_draft && draft_idx == 0) {
       draft_output_opt = std::move(pending_draft_context_.output);
@@ -1837,12 +1847,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                               /*static_graph_tasks_prepared=*/false,
                               /*record_ready_event=*/false,
                               /*defer_expanded_paging=*/
-                              use_continuous_python_dsv32_drafts);
+                              use_expanded_verify_metadata);
       {
         c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
         CHECK(prepare_stream_->wait_event(target_context_ready_event))
             << "failed to wait pending target state on prepare stream";
-        if (use_continuous_python_dsv32_drafts) {
+        if (use_expanded_verify_metadata) {
           mtp_async::prepare_expanded_target_verify_from_accepted_state(
               validate_input,
               accepted_tokens,
@@ -1859,7 +1869,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         }
         validate_input.retained_device_tensors = {
             accepted_tokens, target_base_positions, target_base_kv_seq_lens};
-        if (!use_continuous_python_dsv32_drafts) {
+        if (!use_expanded_verify_metadata) {
           record_metadata_ready_event(*prepare_stream_, validate_input);
         }
       }
@@ -1868,7 +1878,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       // target context, but it no longer blocks target metadata submission.
       const std::vector<int32_t>& accepted_base_kv_seq_lens =
           materialize_pending_target_host_state();
-      if (use_continuous_python_dsv32_drafts) {
+      if (use_expanded_verify_metadata) {
         // Build exact host and paged metadata on the prepare stream, then
         // publish one event covering both device and paging correction.
         c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
@@ -2877,23 +2887,43 @@ bool MTPWorkerImpl::supports_combined_first_draft_execution() const {
 #endif
 }
 
-bool MTPWorkerImpl::supports_python_dsv32_continuous_drafts(
+bool MTPWorkerImpl::supports_torch_combined_first_draft(
     const ForwardInput& input) const {
 #if defined(USE_NPU)
   if (!npu_combined_draft_ready()) {
     return false;
   }
 
-  return mtp_async::supports_python_dsv32_continuous_draft_configuration(
-      context_.get_model_args().model_type(),
-      draft_impl_->context_.get_model_args().model_type(),
-      ::xllm::KernelConfig::get_instance().npu_kernel_backend(),
-      parallel_args_.dp_size(),
-      ModelConfig::is_python_model_impl(context_.get_model_impl()),
-      ModelConfig::is_python_model_impl(draft_impl_->context_.get_model_impl()),
-      !input.input_params.multi_block_tables.empty(),
-      context_.get_model_args().index_topk(),
-      draft_impl_->context_.get_model_args().index_topk());
+  const std::string& target_model_type = context_.get_model_args().model_type();
+  const std::string& draft_model_type =
+      draft_impl_->context_.get_model_args().model_type();
+  const std::string& npu_backend =
+      ::xllm::KernelConfig::get_instance().npu_kernel_backend();
+  const bool supported =
+      mtp_async::supports_torch_combined_first_draft_configuration(
+          target_model_type,
+          draft_model_type,
+          npu_backend,
+          parallel_args_.dp_size(),
+          ModelConfig::is_python_model_impl(context_.get_model_impl()),
+          ModelConfig::is_python_model_impl(
+              draft_impl_->context_.get_model_impl()),
+          !input.input_params.multi_block_tables.empty(),
+          context_.get_model_args().index_topk(),
+          draft_impl_->context_.get_model_args().index_topk());
+  LOG_FIRST_N(INFO, 1)
+      << "MTP TORCH combined first draft configuration (admission is checked "
+         "per input)"
+      << ", target=" << target_model_type << ", draft=" << draft_model_type
+      << ", backend=" << npu_backend << ", dp_size=" << parallel_args_.dp_size()
+      << ", python_target="
+      << ModelConfig::is_python_model_impl(context_.get_model_impl())
+      << ", python_draft="
+      << ModelConfig::is_python_model_impl(
+             draft_impl_->context_.get_model_impl())
+      << ", index_topk=" << context_.get_model_args().index_topk() << "/"
+      << draft_impl_->context_.get_model_args().index_topk();
+  return supported;
 #else
   static_cast<void>(input);
   return false;
@@ -2908,7 +2938,7 @@ bool MTPWorkerImpl::can_use_combined_first_draft(
   // DSV32 needs positive topk for expanded verify. Zero topk rejects both
   // prelaunch and continuous drafting; its native combined path is unsupported,
   // so it stays on regular in-loop drafting, not generic verify correction.
-  return supports_python_dsv32_continuous_drafts(input) ||
+  return supports_torch_combined_first_draft(input) ||
          supports_combined_first_draft_execution();
 }
 
@@ -3001,6 +3031,7 @@ void MTPWorkerImpl::submit_pending_first_draft(
       batch_identity_input.input_params.parallel.raw_dp_global_token_nums;
   pending_draft_context_.dp_global_batch_generations =
       batch_identity_input.input_params.parallel.dp_global_batch_generations;
+  draft_input.input_params.meta.mtp_draft_step = 0;
   pending_draft_context_.output =
       run_worker_no_sync_impl(*draft_impl_,
                               draft_input,
@@ -3009,6 +3040,9 @@ void MTPWorkerImpl::submit_pending_first_draft(
                               pending_draft_context_.prepared_input);
   CHECK(pending_draft_context_.output.has_value())
       << "failed to prelaunch next MTP first draft";
+  LOG_FIRST_N(INFO, 1) << "MTP first-draft prelaunch submitted, target="
+                       << context_.get_model_args().model_type() << ", draft="
+                       << draft_impl_->context_.get_model_args().model_type();
 }
 
 bool MTPWorkerImpl::pending_draft_context_matches(
@@ -3976,6 +4010,11 @@ void MTPWorkerImpl::prepare_draft_replay_inputs(
                                    rows.meta.kv_max_seq_len,
                                    std::move(rows.out_kv_seq_lens),
                                    /*update_block_tables=*/true);
+  // A draft step executes its own row geometry (one decode row per replay row),
+  // while base_input's execution batch still describes the target step. Publish
+  // the draft's layout so the Python executor's InputBatch metadata matches the
+  // rows it is handed.
+  specBuilder::update_draft_execution_batch_metadata(input_params, num_rows);
   input_params.attention.rebuild_device_buffer(device_);
   for (auto& embedding : plan.embeddings) {
     embedding = embedding.to(device_);
@@ -4191,6 +4230,14 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                           buf.out_positions,
                                           token_options,
                                           position_options);
+  // base_input's execution batch describes the target prefill/verify rows, but
+  // an MTP draft step executes its own row geometry (one one-token decode row
+  // per built row, or two rows per request on the ATB chunked-prefill path).
+  // The Python executor validates execution_batch against the rows it is
+  // handed, so publish the draft's own layout instead of inheriting the
+  // target's.
+  specBuilder::update_draft_execution_batch_metadata(
+      input_params, extend_input.positions.numel());
   if (use_chunked_prefill) {
     input_params.meta.num_sequences = num_sequences;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;

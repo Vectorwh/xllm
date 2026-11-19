@@ -53,7 +53,7 @@ TEST(MtpAsyncStateTest, ClassifiesClosedTargetSpecVerifyPolicy) {
       {"qwen3_next", Mode::GENERIC, Mode::GENERIC},
       {"qwen3_5_mtp", Mode::GENERIC, Mode::GENERIC},
       {"qwen3_5_moe_mtp", Mode::GENERIC, Mode::GENERIC},
-      {"glm_moe_dsa", Mode::GENERIC, Mode::GENERIC},
+      {"glm_moe_dsa", Mode::GENERIC, Mode::EXPANDED_VERIFY},
       {"mimo_mtp", Mode::GENERIC, Mode::GENERIC},
       {"unknown_model", Mode::GENERIC, Mode::GENERIC},
   };
@@ -80,6 +80,7 @@ TEST(MtpAsyncStateTest, RequiresUniformVerifyWidthsForRecurrentTargets) {
   }
   for (std::string_view model_type : {"deepseek_v32",
                                       "deepseek_v4",
+                                      "glm_moe_dsa",
                                       "mimo",
                                       "glm5_next_mtp",
                                       "qwen3_5_mtp",
@@ -163,6 +164,15 @@ TEST(MtpAsyncStateTest,
   };
   const TestCase cases[] = {
       {"deepseek_v32", "deepseek_v32_mtp", "TORCH", 1, true, true, false, true},
+      {"glm_moe_dsa", "glm_moe_dsa_mtp", "TORCH", 1, true, true, false, true},
+      {"glm_moe_dsa",
+       "glm_moe_dsa_mtp",
+       "TORCH",
+       1,
+       false,
+       false,
+       false,
+       false},
       {"deepseek_v4", "deepseek_v32_mtp", "TORCH", 1, true, true, false, false},
       {"deepseek_v32", "mimo_mtp", "TORCH", 1, true, true, false, false},
       {"deepseek_v32", "deepseek_v32_mtp", "ATB", 1, true, true, false, false},
@@ -218,7 +228,7 @@ TEST(MtpAsyncStateTest,
     SCOPED_TRACE(test_case.npu_backend);
     SCOPED_TRACE(test_case.target_index_topk);
     SCOPED_TRACE(test_case.draft_index_topk);
-    EXPECT_EQ(supports_python_dsv32_continuous_draft_configuration(
+    EXPECT_EQ(supports_torch_combined_first_draft_configuration(
                   test_case.target_model_type,
                   test_case.draft_model_type,
                   test_case.npu_backend,

@@ -807,6 +807,8 @@ struct BatchInputMeta {
   // to be the same; the chunked/expanded layout keeps 1 because its width is
   // already carried by the per-sequence linear-state / query-chunk metadata.
   int32_t spec_verify_width = 1;
+  // Local MTP scheduling metadata; Python owns the cross-step top-k state.
+  int32_t mtp_draft_step = 0;
 };
 
 // Stable, model-execution view of the logical batch. Unlike

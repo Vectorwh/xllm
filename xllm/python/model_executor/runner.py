@@ -159,6 +159,7 @@ class Runner:
         if skip_execution:
             self.execution_mode = None
             return inputs.input_ids
+        mtp_options = {"mtp_topk_indices": inputs.mtp_topk_indices} if inputs.mtp_topk_indices is not None else {}
         if use_graph:
             if inputs.layer_load_context is not None:
                 inputs.layer_load_context.synchronize_all_layers()
@@ -175,6 +176,7 @@ class Runner:
                 eplb=inputs.eplb,
                 input_batch=inputs.input_batch,
                 **collection_options,
+                **mtp_options,
             )
             self.last_graph_rows = getattr(graph, "last_padded_batch_size", None)
             return output
@@ -190,6 +192,7 @@ class Runner:
             input_batch=inputs.input_batch,
             layer_load_context=inputs.layer_load_context,
             multimodal_inputs=inputs.multimodal_inputs,
+            **mtp_options,
         )
 
     def _restore_history(self, metadata: AttentionMetadata) -> None:

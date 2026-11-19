@@ -1101,3 +1101,51 @@ def test_gate_stays_active_under_kv_split_replicated(quant: bool) -> None:
     padding = ~context.shard_valid_mask
     assert bool(padding.any())
     assert torch.equal(result.output[padding], legacy[padding])
+
+
+@pytest.mark.parametrize("quant", [False, True])
+def test_mtp_reuses_first_selection_but_updates_each_steps_index_keys(quant: bool) -> None:
+    """Later draft steps preserve selection without leaving index keys stale."""
+    indexer = _make_indexer()
+    hidden = torch.randn(2, HIDDEN)
+    indices = torch.tensor([[[0, 2, 3]], [[1, 4, 5]]], dtype=torch.int32)
+    cache = torch.zeros(2, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8 if quant else torch.float32)
+    update = MagicMock()
+    ctx = SimpleNamespace(
+        cp_context=None,
+        index_cache=cache,
+        index_cache_scale=torch.ones(2, BLOCK_SIZE, 1, 1) if quant else None,
+        actual_seq_q=torch.tensor([1, 2], dtype=torch.int32),
+        actual_seq_kv=torch.tensor([4, 6], dtype=torch.int32),
+        update_index_cache=update,
+        materialize_index_cache=lambda: (cache, torch.ones(2, BLOCK_SIZE, 1, 1) if quant else None, None),
+        get_quant_indexer_metadata=lambda *args: None,
+    )
+    with (
+        patch.object(glm5_2, "_step_half_rope", side_effect=lambda cache, value, positions: value),
+        patch.object(glm5_2.kernels, "dynamic_quant", side_effect=_cpu_dynamic_quant, create=True),
+        patch.object(glm5_2.kernels, "lightning_indexer", return_value=indices, create=True) as score,
+        patch.object(glm5_2.kernels, "quant_lightning_indexer", return_value=indices, create=True) as quant_score,
+        patch.object(indexer, "_project_query", wraps=indexer._project_query) as query,
+    ):
+        first = indexer.select_qli(hidden, hidden, torch.tensor([3, 5]), ctx, torch.empty(0))
+        next_hidden = hidden + 1
+        reused = indexer.select_qli(
+            next_hidden, next_hidden, torch.tensor([4, 6]), ctx, torch.empty(0), reused_topk_indices=first
+        )
+        assert reused is first
+        assert query.call_count == 1
+        assert indexer.weights_proj.call_count == 1
+        assert (quant_score if quant else score).call_count == 1
+        assert update.call_count == 2
+        expected_key = next_hidden[:, :HEAD_DIM]
+        expected_scale = None
+        if quant:
+            expected_key, expected_scale = _cpu_dynamic_quant(expected_key * HEAD_DIM**-0.5)
+            expected_scale = expected_scale.unsqueeze(-1).to(torch.float16)
+        actual_key, actual_scale = update.call_args.args
+        torch.testing.assert_close(actual_key, expected_key)
+        if quant:
+            torch.testing.assert_close(actual_scale, expected_scale)
+        else:
+            assert actual_scale is None

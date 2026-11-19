@@ -93,6 +93,7 @@ class EagerRunner(BaseRunner):
         input_batch: InputBatch | None = None,
         layer_load_context: LayerLoadContext | None = None,
         multimodal_inputs: MultimodalInputs | None = None,
+        mtp_topk_indices: torch.Tensor | None = None,
     ) -> ModelExecutionOutput:
         cp_context = None
         is_mla = self.attention_backend is not None and self.attention_backend.is_mla
@@ -173,6 +174,7 @@ class EagerRunner(BaseRunner):
                 cp_context=cp_context,
                 eplb=eplb,
                 execution_contexts=execution_contexts,
+                mtp_topk_indices=mtp_topk_indices,
             )
         ):
             # Draft-MTP steps carry the target's (or previous draft step's)

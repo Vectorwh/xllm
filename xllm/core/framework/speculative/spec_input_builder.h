@@ -216,6 +216,11 @@ void update_input_params(ModelInputParams& input_params,
 void update_execution_batch_metadata(ModelInputParams& input_params,
                                      std::vector<int32_t> num_scheduled_tokens);
 
+// A draft executes one decode token per built row, independent of the target's
+// request geometry or the attention batch-forward label.
+void update_draft_execution_batch_metadata(ModelInputParams& input_params,
+                                           int64_t num_rows);
+
 // Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
 

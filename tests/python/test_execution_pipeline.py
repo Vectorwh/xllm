@@ -227,7 +227,9 @@ def test_backbone_capture_lock_covers_warmup_and_capture(
         max_model_len=8,
     )
     runner._stream = Mock()
-    entry = SimpleNamespace(static_metadata=SimpleNamespace(), execution_state=None, execution_contexts={})
+    entry = SimpleNamespace(
+        static_metadata=SimpleNamespace(), execution_state=None, execution_contexts={}, static_mtp_topk_indices=None
+    )
 
     def forward(entry: Any) -> torch.Tensor:
         assert capture_lock_state.held

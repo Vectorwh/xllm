@@ -699,6 +699,7 @@ def test_executor_uses_original_execute_interface(
     model = _DraftModel()
     builder = ModelSamplingMetadataBuilder.from_config({})
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor._mtp_topk_reuse = None
     executor._static_kernel = None
     executor._restore_engram_history = ModelExecutor._resolve_engram_restore(model)
     executor._kv_bound = True

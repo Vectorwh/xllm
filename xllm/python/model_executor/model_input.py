@@ -39,3 +39,4 @@ class ModelInput:
     input_batch: InputBatch | None = None
     layer_load_context: LayerLoadContext | None = None
     multimodal_inputs: MultimodalInputs | None = None
+    mtp_topk_indices: torch.Tensor | None = None

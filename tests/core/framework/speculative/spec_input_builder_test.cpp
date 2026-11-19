@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -371,6 +372,38 @@ TEST(SpecDecodeInputBuilderTest,
             std::vector<int32_t>({3, 5, 8}));
   EXPECT_EQ(params.execution_batch.is_prefilling,
             std::vector<uint8_t>({0, 0, 0}));
+}
+
+TEST(SpecDecodeInputBuilderTest,
+     DraftExecutionRowsUseDecodeSemanticsIndependentOfAttentionMode) {
+  ModelInputParams params;
+  params.meta.num_sequences = 2;
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.execution_batch.num_reqs = 2;
+  params.execution_batch.num_computed_tokens = {17, 22};
+  params.execution_batch.is_prefilling = {1, 1};
+
+  update_draft_execution_batch_metadata(params, /*num_rows=*/4);
+
+  EXPECT_EQ(params.execution_batch.num_reqs, 4);
+  EXPECT_EQ(params.execution_batch.num_tokens, 4);
+  EXPECT_EQ(params.execution_batch.num_scheduled_tokens,
+            std::vector<int32_t>({1, 1, 1, 1}));
+  EXPECT_EQ(params.execution_batch.query_start_loc,
+            std::vector<int32_t>({0, 1, 2, 3, 4}));
+  EXPECT_EQ(params.execution_batch.num_computed_tokens,
+            std::vector<int32_t>({0, 0, 0, 0}));
+  EXPECT_EQ(params.execution_batch.is_prefilling,
+            std::vector<uint8_t>({0, 0, 0, 0}));
+  EXPECT_EQ(params.meta.num_sequences, 2);
+  EXPECT_TRUE(params.meta.batch_forward_type.is_chunked_prefill());
+  EXPECT_DEATH(update_draft_execution_batch_metadata(params, /*num_rows=*/0),
+               "at least one row");
+  EXPECT_DEATH(
+      update_draft_execution_batch_metadata(
+          params,
+          static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1),
+      "int32 range");
 }
 
 TEST(SpecDecodeInputBuilderTest, AppendDecodeRowUsesInputBlockTableLayout) {

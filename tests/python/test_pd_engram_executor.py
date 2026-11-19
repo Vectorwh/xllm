@@ -42,6 +42,7 @@ def test_pd_history_restore_ownership_follows_execution_path(runner_kind: str, o
         events.append("restore")
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    executor._mtp_topk_reuse = None
     executor._static_kernel = None
     executor._kv_bound = True
     executor.layerwise_split_size = 1

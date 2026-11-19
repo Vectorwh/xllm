@@ -42,7 +42,12 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
 bool supports_native_spec_verify_replay_update(TargetSpecVerifyMode mode,
                                                bool is_python_model);
 
-bool requires_uniform_spec_verify(std::string_view model_type);
+// Runtime graph conditions affect GLM DSA only; omitted conditions keep its
+// generic/native behavior conservative.
+bool requires_uniform_spec_verify(std::string_view model_type,
+                                  bool is_python_model = false,
+                                  bool graph_enabled = false,
+                                  bool requires_eager_execution = false);
 
 // Shared allocation/launch width for target verification block tables. The
 // extra entry covers the speculative token that can cross a block boundary.
@@ -78,9 +83,9 @@ bool supports_combined_draft_configuration(
     std::string_view npu_backend,
     int32_t dp_size);
 
-// DSV32 prelaunch and continuous drafts share the same Python MLA policy;
-// the expanded verify correction requires positive index_topk on both models.
-bool supports_python_dsv32_continuous_draft_configuration(
+// Validated Python DSV32 and GLM model pairs share TORCH prelaunch and
+// continuous-draft admission. Verify layout remains a separate capability.
+bool supports_torch_combined_first_draft_configuration(
     std::string_view target_model_type,
     std::string_view draft_model_type,
     std::string_view npu_backend,

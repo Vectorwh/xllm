@@ -132,6 +132,7 @@ class ForwardContext:
     # across requests or graph executions.
     layer_shared_cache: dict[object, object] = field(default_factory=dict)
     layer_load_context: LayerLoadContext | None = None
+    mtp_topk_indices: torch.Tensor | None = None
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)

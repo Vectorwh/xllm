@@ -751,6 +751,19 @@ void update_execution_batch_metadata(
   metadata.query_start_loc = std::move(query_start_loc);
 }
 
+void update_draft_execution_batch_metadata(ModelInputParams& input_params,
+                                           int64_t num_rows) {
+  CHECK_GT(num_rows, 0) << "a draft step must execute at least one row";
+  CHECK_LE(num_rows, std::numeric_limits<int32_t>::max())
+      << "draft execution token count exceeds int32 range";
+  ExecutionBatchMetadata& metadata = input_params.execution_batch;
+  metadata.num_reqs = static_cast<int32_t>(num_rows);
+  metadata.num_computed_tokens.assign(static_cast<size_t>(num_rows), 0);
+  metadata.is_prefilling.assign(static_cast<size_t>(num_rows), 0);
+  update_execution_batch_metadata(
+      input_params, std::vector<int32_t>(static_cast<size_t>(num_rows), 1));
+}
+
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
   return torch::tensor(values,
                        torch::TensorOptions()

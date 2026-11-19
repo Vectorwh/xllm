@@ -45,6 +45,7 @@ from xllm.python.attention.expanded_decode_metadata import ExpandedDecodeMetadat
 from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.model_input import ModelInput
 from xllm.python.model_executor.model_output import DraftProposal, ModelOutput
+from xllm.python.model_executor.mtp_topk import MtpTopkReuse
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
     _CaptureAttentionMetadata,
@@ -384,6 +385,25 @@ def test_ordinary_paging_still_rejects_insufficient_history_capacity(dp_size: in
     else:
         with pytest.raises(RuntimeError, match="cannot hold the KV length"):
             runner.can_execute(ModelInput(torch.arange(4), torch.arange(4), metadata))
+
+
+def test_python_mtp_selection_survives_graph_output_reuse_and_resets_per_iteration() -> None:
+    reuse = MtpTopkReuse()
+    source = torch.arange(24, dtype=torch.int32).reshape(4, 1, 6)
+    assert reuse.input_for_step(0, 4) is None
+    reuse.finish_step(0, source, torch.tensor([1, 3], dtype=torch.int32))
+    selected = reuse.input_for_step(1, 2)
+    expected = source[[1, 3]].clone()
+    source.fill_(-1)
+    torch.testing.assert_close(selected, expected)
+    assert DecodeAclGraphRunner._graph_key(2, False, None) != DecodeAclGraphRunner._graph_key(
+        2, False, None, mtp_topk_indices=selected
+    )
+    reuse.finish_step(1, selected, None)
+    assert reuse.input_for_step(2, 2) is selected
+    assert reuse.input_for_step(0, 1) is None
+    with pytest.raises(ValueError, match="consecutive"):
+        reuse.input_for_step(1, 1)
 
 
 def test_draft_graph_key_keeps_whole_query_blocks() -> None:

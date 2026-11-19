@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/config/eplb_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_input_params.h"
@@ -30,6 +31,8 @@ limitations under the License.
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/quant_args.h"
+#include "core/util/scope_guard.h"
+#include "models/py_model_helper.h"
 
 namespace py = pybind11;
 
@@ -186,6 +189,55 @@ TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
       bridged_swa.attr("data_ptr")().cast<std::uintptr_t>(),
       reinterpret_cast<std::uintptr_t>(cache_tensors.swa_cache.data_ptr()));
 }
+
+#if defined(USE_NPU)
+TEST(PyCausalLMMtpConfigTest, ForwardsGlmDraftEpDegreeWithoutTargetEplb) {
+  auto& eplb_config = EPLBConfig::get_instance();
+  const int32_t previous_degree = eplb_config.expert_parallel_degree();
+  const bool previous_eplb = eplb_config.enable_eplb();
+  const ScopeGuard config_guard(
+      [&eplb_config, previous_degree, previous_eplb]() {
+        eplb_config.expert_parallel_degree(previous_degree)
+            .enable_eplb(previous_eplb);
+      });
+  eplb_config.expert_parallel_degree(2).enable_eplb(false);
+
+  ensure_python_interpreter();
+  py::gil_scoped_acquire gil;
+  register_bridge_test_model();
+  py::object model_patch =
+      py::module_::import("unittest.mock")
+          .attr("patch")(
+              "xllm.python.registry.get_model_class",
+              py::arg("return_value") = py::module_::import(kBridgeTestModule)
+                                            .attr("BridgeTestModel"));
+  model_patch.attr("__enter__")();
+  const ScopeGuard patch_guard([model_patch]() {
+    model_patch.attr("__exit__")(py::none(), py::none(), py::none());
+  });
+
+  ProcessGroup process_group(
+      /*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, &process_group);
+  parallel_args.tp_group_ = &process_group;
+  parallel_args.moe_tp_group_ = &process_group;
+  parallel_args.python_rendezvous_host_ = "127.0.0.1";
+  parallel_args.python_rendezvous_port_ = 1;
+  ModelArgs model_args;
+  model_args.model_type("glm_moe_dsa_mtp");
+  ModelContext context(
+      parallel_args,
+      model_args,
+      QuantArgs(),
+      torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+      /*context=*/nullptr);
+  PyCausalLM model(context, /*is_vlm=*/false);
+  const py::dict config = model.config_dict();
+  EXPECT_EQ(config["expert_parallel_degree"].cast<int32_t>(), 2);
+  EXPECT_FALSE(config["enable_eplb"].cast<bool>());
+}
+#endif
 
 TEST(PyCausalLMTpBridgeTest, InitializesPythonTpWithinEachDpReplica) {
   py::gil_scoped_acquire gil;

@@ -48,3 +48,4 @@ class ModelOutput:
     hidden_states: torch.Tensor | None = None
     residual: torch.Tensor | None = None
     aux_hidden_states: torch.Tensor | None = None
+    mtp_topk_indices: torch.Tensor | None = None

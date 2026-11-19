@@ -281,7 +281,7 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl {
   void flush_pending_target_context();
   bool npu_combined_draft_ready() const;
   bool supports_combined_first_draft_execution() const;
-  bool supports_python_dsv32_continuous_drafts(const ForwardInput& input) const;
+  bool supports_torch_combined_first_draft(const ForwardInput& input) const;
   bool can_use_combined_first_draft(const ForwardInput& input) const;
   bool can_prelaunch_next_first_draft(const ForwardInput& input) const;
   void prepare_next_first_draft_template(const ForwardInput& input,

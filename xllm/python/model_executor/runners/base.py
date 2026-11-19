@@ -146,6 +146,7 @@ class BaseRunner(ABC):
             hidden_states=_trim_optional(output.hidden_states, num_tokens),
             residual=_trim_optional(output.residual, num_tokens),
             aux_hidden_states=_trim_optional(output.aux_hidden_states, num_tokens),
+            mtp_topk_indices=_trim_optional(output.mtp_topk_indices, num_tokens),
         )
 
     @abstractmethod
