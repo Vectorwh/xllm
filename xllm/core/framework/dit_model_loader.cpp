@@ -372,6 +372,29 @@ bool DiTFolderLoader::load_tokenizer_args(
     return true;
   }
 
+  auto directory_has_vocab = [](const std::string& dir) {
+    return std::filesystem::exists(dir + "/tokenizer.json") ||
+           std::filesystem::exists(dir + "/spiece.model") ||
+           std::filesystem::exists(dir + "/tokenizer.model");
+  };
+  // Some QwenImageEditPlus dumps leave tokenizer/ with only
+  // tokenizer_config.json and put tokenizer.json under processor/.
+  // Use that directory when it actually contains a vocab file. If it does
+  // not, fall through and fail below.
+  if (component_name_ == "tokenizer" && !directory_has_vocab(path)) {
+    const std::string processor_dir =
+        std::filesystem::absolute(std::filesystem::path(path).parent_path() /
+                                  "processor")
+            .string();
+    if (directory_has_vocab(processor_dir)) {
+      LOG(INFO) << "No tokenizer vocab in " << path
+                << "; reading tokenizer files from " << processor_dir;
+      path = processor_dir;
+      tokenizer_args_path = path + "/tokenizer_config.json";
+      tokenizer_reader.parse(tokenizer_args_path);
+    }
+  }
+
   bool prefer_sentencepiece = false;
   if (auto v = tokenizer_reader.value<std::string>("tokenizer_class")) {
     const std::string& cls = v.value();
@@ -395,7 +418,7 @@ bool DiTFolderLoader::load_tokenizer_args(
     tokenizer_args_.tokenizer_type() = "sentencepiece";
     tokenizer_args_.vocab_file() = path + "/tokenizer.model";
   } else {
-    LOG(ERROR) << "No tokenizer files found in directory: " << path;
+    LOG(ERROR) << "No tokenizer vocab files found in directory: " << path;
     return false;
   }
 
