@@ -171,6 +171,24 @@ def test_missing_field_keeps_the_conservative_width_one() -> None:
     assert runner._spec_verify_width(36, metadata) == 1
 
 
+def test_query_pack_row_mismatch_falls_back_without_raising() -> None:
+    # A recurrent spec-verify step arrives chunked-prefill-typed with
+    # is_spec_verify set (see DFlashWorkerImpl::run_validate) and keeps one
+    # paging row per request, not per query token. The incompatible graph
+    # shape must select eager, never abort ranks. Either flag alone stays
+    # under the strict row check (expanded verify / plain chunked prefill).
+    runner = _runner(dp_size=2, dp_rank=1, max_seqs_per_batch=16)
+    metadata = _metadata(5, spec_verify_width=1, counts=(5, 5), dp_size=2)
+    metadata.is_spec_verify = True
+    metadata.is_chunked_prefill = True
+    metadata.block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.kv_seq_lens = torch.ones(1, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [1]
+    tokens = torch.zeros(5, dtype=torch.int32)
+
+    assert runner._has_compatible_decode_metadata(tokens, metadata, dp_all_decode=True) is False
+
+
 # --------------------------------------------------------------------------
 # Plain decode (exported width 1) must never change its decision
 # --------------------------------------------------------------------------

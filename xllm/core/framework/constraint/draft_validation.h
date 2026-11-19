@@ -152,12 +152,17 @@ inline std::vector<JsonAcceptedTokenMismatch> verify_json_accepted_rows(
     ConstraintState state = initial_states[sequence_index].initialized()
                                 ? initial_states[sequence_index].fork()
                                 : ConstraintState();
-    if (!state.initialized()) {
+    if (!state.initialized() || state.is_terminated()) {
       continue;
     }
 
     const size_t row_offset = sequence_index * row_width;
     for (size_t token_offset = 0; token_offset < row_width; ++token_offset) {
+      if (state.is_terminated()) {
+        // A terminal token ends this accepted row. Later slots may contain
+        // sampler padding or reused next-step data; none is grammar content.
+        break;
+      }
       const int64_t raw_token_id = accepted_tokens[row_offset + token_offset];
       if (raw_token_id == -1) {
         break;

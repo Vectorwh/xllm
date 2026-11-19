@@ -2172,9 +2172,15 @@ class DeepseekV4Model(nn.Module):
         )
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.embed_tokens(input_ids)
+        if input_embedding is None:
+            hidden = self.embed_tokens(input_ids)
+        else:
+            hidden = input_embedding
         positions = positions.to(torch.int64).contiguous()
         cos_sin_cache = self.rotary.cos_sin_cache
         context = get_forward_context()

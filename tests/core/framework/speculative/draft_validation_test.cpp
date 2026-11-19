@@ -377,5 +377,20 @@ TEST(DFlashJsonObjectStateTest, MaskedResampleAtRejectionReplaysCleanly) {
   EXPECT_TRUE(mismatches.empty());
 }
 
+TEST(DFlashJsonObjectStateTest, ReplayStopsAfterTerminalToken) {
+  JsonObjectGrammar grammar = make_mtp_grammar();
+  const std::vector<ConstraintState> initial_states =
+      make_builtin_test_states(grammar, 1);
+  // Slots after the stop token are outside the accepted row, regardless of
+  // whether they contain zero padding or a nonzero reused token id.
+  const int64_t accepted_tokens[] = {0, 1, 2, 3, 4, 5, 0, 1};
+
+  const std::vector<detail::JsonAcceptedTokenMismatch> mismatches =
+      detail::verify_json_accepted_rows(
+          initial_states, accepted_tokens, /*num_rows=*/1, /*row_width=*/8);
+
+  EXPECT_TRUE(mismatches.empty());
+}
+
 }  // namespace
 }  // namespace xllm

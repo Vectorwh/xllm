@@ -482,6 +482,23 @@ def test_model_returns_pre_hc_hidden_for_mtp_target(
     torch.testing.assert_close(hidden, expected_streams.mean(dim=1) + 5.0)
 
 
+def test_model_uses_supplied_input_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _capture_test_model(
+        monkeypatch,
+        layers_to_capture=(),
+        num_speculative_tokens=1,
+    )
+    input_ids = torch.tensor([1, 2])
+    supplied = torch.tensor([[100.0, 200.0], [300.0, 400.0]])
+
+    output = model(input_ids, torch.tensor([0, 1]), supplied)
+
+    hidden, target_hidden = output
+    expected_streams = supplied.unsqueeze(1).expand(-1, 2, -1) + 1.0
+    torch.testing.assert_close(target_hidden, expected_streams.flatten(1))
+    torch.testing.assert_close(hidden, expected_streams.mean(dim=1) + 5.0)
+
+
 def test_layer_capture_takes_precedence_over_mtp_target_hidden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1377,7 +1377,17 @@ class DecodeAclGraphRunner(BaseRunner):
         Block-table rows, KV lengths, and cache slots are local. A peer with a
         matching layout would still enter the graph.
         """
-        if input_ids.dim() != 1 or not dp_all_decode:
+        is_query_pack = bool(getattr(metadata, "is_spec_verify", False)) and bool(
+            getattr(metadata, "is_chunked_prefill", False)
+        )
+        if input_ids.dim() != 1 or not dp_all_decode or is_query_pack:
+            # A recurrent spec-verify step is chunked-prefill-typed and keeps
+            # one paging row per request while packing several query tokens,
+            # so the strict row check below must not turn its intended eager
+            # fallback into a fatal error. Either flag alone keeps the strict
+            # check: an expanded spec-verify batch (is_spec_verify without the
+            # chunked retyping) and a plain chunked-prefill query batch are
+            # still validated row by row.
             return
         token_rows = int(input_ids.numel())
         block_table = self._effective_block_table(metadata)
