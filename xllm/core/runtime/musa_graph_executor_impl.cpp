@@ -529,6 +529,14 @@ std::optional<ModelInputParams> MusaGraphPersistentParam::update(
              !is_rec_multi_round_mode()) {
     actual_batch_size = static_cast<int64_t>(actual_num_tokens);
   }
+  // Validate row capacity before updating any persistent graph inputs.
+  const int64_t actual_block_table_batch =
+      is_rec_multi_round_mode() ? params.attention.device.block_tables.size(0)
+                                : actual_batch_size;
+  CHECK_LE(actual_block_table_batch, persistent_block_tables_.size(0))
+      << "block_tables exceeds the persistent graph row capacity";
+  CHECK_LE(padded_num_tokens, persistent_block_tables_.size(0))
+      << "padded block-table rows exceed the persistent capacity";
   const int64_t accepted_batch_size =
       params.num_accepted_tokens.defined()
           ? std::min<int64_t>(params.num_accepted_tokens.numel(),
@@ -782,11 +790,6 @@ std::optional<ModelInputParams> MusaGraphPersistentParam::update(
   // Copy block table data. In rec multi-round, block_tables may already be
   // expanded to batch_size * beam_width rows while num_sequences still tracks
   // the logical request count. Use the tensor's real row count here.
-  const int64_t actual_block_table_batch =
-      is_rec_multi_round_mode()
-          ? params.attention.device.block_tables.size(0)
-          : std::min<int64_t>(actual_batch_size,
-                              persistent_block_tables_.size(0));
   CHECK_GE(params.attention.device.block_tables.size(0),
            actual_block_table_batch)
       << "block_tables has fewer rows than the logical graph batch";
@@ -1593,13 +1596,35 @@ ModelOutput MusaGraphExecutorImpl::run(const torch::Tensor& tokens,
   // Decode phase with full graph
   if (is_decode) {
     // Check if conditions are suitable for graph execution (replay or capture)
-    const auto max_seq_len = args_.max_position_embeddings();
+    const int64_t max_seq_len = args_.max_position_embeddings();
     const bool seq_len_supported = params.meta.kv_max_seq_len <= max_seq_len;
+    const int64_t graph_batch_size =
+        is_rec_multi_round_mode() ? params.attention.device.block_tables.size(0)
+                                  : (params.meta.actual_num_sequences > 0
+                                         ? params.meta.actual_num_sequences
+                                         : static_cast<int64_t>(n_tokens));
+    const int64_t graph_row_capacity =
+        persistent_param_->persistent_block_tables(/*actual_batch_size=*/0)
+            .size(0);
+    const int64_t graph_token_capacity =
+        persistent_param_->persistent_tokens(/*actual_tokens=*/0).numel();
+    // Decode graphs have one query token per attention row. Multi-token
+    // Qwen verification uses the chunked-prefill eager path above.
+    const bool graph_capacity_supported =
+        graph_batch_size <= graph_row_capacity &&
+        bucket_num_tokens <= graph_row_capacity &&
+        bucket_num_tokens <= graph_token_capacity;
 
     // Early return if conditions are not suitable for graph operations
-    if (!seq_len_supported) {
+    if (!seq_len_supported || !graph_capacity_supported) {
       LOG(WARNING) << "Not suitable for MUSA graph operations, falling back to "
-                      "eager mode.";
+                      "eager mode: batch_rows="
+                   << graph_batch_size
+                   << ", bucket_tokens=" << bucket_num_tokens
+                   << ", row_capacity=" << graph_row_capacity
+                   << ", token_capacity=" << graph_token_capacity
+                   << ", kv_seq_len=" << params.meta.kv_max_seq_len
+                   << ", max_seq_len=" << max_seq_len;
       COUNTER_INC(num_model_execution_total_eager);
       return model_->forward(tokens, positions, kv_caches, params);
     }

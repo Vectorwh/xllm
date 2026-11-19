@@ -208,7 +208,7 @@ TEST(MusaPrefillTest, ThreeAxisPositionsRequireMropeConfiguration) {
   args.partial_rotary_factor(0.25f);
   const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
   Qwen3NextAttentionImpl attention(args, QuantArgs(), parallel, options, 0);
-  AttentionMetadata metadata;
+  AttentionMetadata metadata{};
   KVCache cache;
   EXPECT_DEATH(attention.forward(torch::zeros({3, 1}, torch::kInt64),
                                  torch::zeros({1, 256}, options),
@@ -254,7 +254,7 @@ TEST(MusaPrefillTest, CachedPrefixesMatchCausalReference) {
     torch::Tensor device_key = new_key.to(device.unwrap());
     torch::Tensor device_value = new_value.to(device.unwrap());
     torch::Tensor output = torch::empty_like(device_query);
-    AttentionMetadata metadata;
+    AttentionMetadata metadata{};
     metadata.is_prefill = true;
     metadata.is_causal = true;
     metadata.max_query_len = 3;
