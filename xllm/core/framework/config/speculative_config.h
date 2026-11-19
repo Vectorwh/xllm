@@ -118,6 +118,13 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
+  // Qwen3.8-27B reports qwen3_5 as its target model_type.
+  static bool is_qwen3_5_mtp_or_dflash2(std::string_view model_type,
+                                        std::string_view algorithm) {
+    return model_type == "qwen3_5" &&
+           (is_mtp_algorithm(algorithm) || is_dflash2_algorithm(algorithm));
+  }
+
   // True for the DSpark block-diffusion draft.
   static bool is_dspark_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, "DSpark");

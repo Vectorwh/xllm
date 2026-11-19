@@ -436,13 +436,8 @@ class DFlash2Qwen3ForCausalLMImpl final
 
   using Base::logits;
 
-  // The DFlash2 draft never registers a draft-local lm_head (see the base
-  // constructor); on NPU the target model shares its fused NpuLmHead here
-  // and logits() projects through it. Declared virtual like the eagle3 peer
-  // (qwen3_eagle3.h): this class derives the generic
-  // ::xllm::LlmForCausalLMImplBase, not the NPU model base that owns the
-  // other set_npu_lm_head, so this introduces its own virtual rather than
-  // overriding one.
+  // The target normally shares its fused NpuLmHead here. Native qwen3_5 VLM
+  // instead shares the plain LmHead through Base::set_lm_head().
   virtual void set_npu_lm_head(layer::NpuLmHead& head) {
     CHECK(!head.is_empty()) << "DFlash2 requires a non-empty shared lm_head";
     shared_npu_lm_head_ = head;
@@ -451,11 +446,11 @@ class DFlash2Qwen3ForCausalLMImpl final
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& selected_idxes,
                        torch::Tensor& out_hidden) override {
-    CHECK(!shared_npu_lm_head_.is_empty())
-        << "DFlash2 draft logits require the shared target npu_lm_head; "
-           "set_npu_lm_head() was never called.";
-    return shared_npu_lm_head_->forward_with_hidden(
-        hidden_states, selected_idxes, out_hidden, /*nodeId=*/0);
+    if (!shared_npu_lm_head_.is_empty()) {
+      return shared_npu_lm_head_->forward_with_hidden(
+          hidden_states, selected_idxes, out_hidden, /*nodeId=*/0);
+    }
+    return Base::logits(hidden_states, selected_idxes, out_hidden);
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader,

@@ -613,13 +613,17 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
 #if defined(USE_NPU)
         const bool dflash2 = SpeculativeConfig::is_dflash2_algorithm(
             options_.speculative_algorithm());
-        // Torch-only models use the plain torch surface. DFlash2 retains the
-        // fused NPU projection under either kernel backend; DFlash v1 keeps
-        // its target embedding sharing on ATB models.
+        const bool use_torch_lm_head =
+            dflash2 && options_.backend() == "vlm" &&
+            impl_->context_.get_model_args().model_type() == "qwen3_5";
+        // Native qwen3_5 VLM exposes only the plain torch projection. Other
+        // DFlash2 targets retain the fused NPU projection under either backend;
+        // DFlash v1 keeps its target embedding sharing on ATB models.
         const bool use_npu_surface =
-            ::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
-                "TORCH" ||
-            dflash2;
+            !use_torch_lm_head &&
+            (::xllm::KernelConfig::get_instance().npu_kernel_backend() !=
+                 "TORCH" ||
+             dflash2);
         if (use_npu_surface) {
           auto head = impl_->get_npu_lm_head();
           draft_impl_->set_npu_lm_head(head);

@@ -497,6 +497,21 @@ TEST(ModelConfigValidationTest, Qwen35PythonDFlashFollowsBackendSupport) {
   }
 }
 
+TEST(SpeculativeConfigTest, AdmitsOnlyQwen35MtpOrDFlash2ForVlmPd) {
+  for (const std::string& algorithm : {"MTP", "mtp", "DFlash2", "dflash2"}) {
+    SCOPED_TRACE(algorithm);
+    EXPECT_TRUE(
+        SpeculativeConfig::is_qwen3_5_mtp_or_dflash2("qwen3_5", algorithm));
+  }
+
+  EXPECT_FALSE(
+      SpeculativeConfig::is_qwen3_5_mtp_or_dflash2("qwen3_5", "DSpark"));
+  EXPECT_FALSE(
+      SpeculativeConfig::is_qwen3_5_mtp_or_dflash2("qwen3_5_mtp", "MTP"));
+  EXPECT_FALSE(
+      SpeculativeConfig::is_qwen3_5_mtp_or_dflash2("qwen3_vl", "DFlash2"));
+}
+
 TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
   const JsonReader json = config::parse_json_string(kInlineConfig);
   ConfigFlagGuard flag_guard;
