@@ -34,6 +34,8 @@ class DeepseekV41DecoderLayerImpl final : public torch::nn::Module {
   void load_hash_state(const StateDict& state);
   void verify_loaded_weights(const std::string& prefix) const;
   bool has_engram() const { return static_cast<bool>(engram_); }
+  // Empty for layers without Engram.
+  DeepseekV41Engram engram() const { return engram_; }
   // Whether the MHC boundaries run the BangC fused kernels. Only fused layers
   // can defer their post into the next layer's boundary.
   bool uses_fused_mhc() const { return use_fused_mhc_; }
@@ -55,7 +57,7 @@ class DeepseekV41DecoderLayerImpl final : public torch::nn::Module {
       Csa2Context& shared,
       std::optional<PendingMHC>& pending,
       bool defer_post,
-      DeepseekV41EngramImpl::HashState* hash_state = nullptr,
+      const EngramLayerInput& engram_input = {},
       const mlu_v4_cp::DeepseekV4CpContext* cp_context = nullptr,
       torch::Tensor* attention_input = nullptr);
 

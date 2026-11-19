@@ -24,7 +24,7 @@ limitations under the License.
 
 namespace xllm {
 struct ModelInputParams;
-struct ModelGraphMetadataState;
+class ModelGraphMetadataState;
 class KVCache;
 
 namespace layer {
@@ -204,6 +204,17 @@ struct has_prepare_graph_forward_metadata<
         std::declval<ModelGraphMetadataState*>(),
         std::declval<const torch::Tensor&>(),
         std::declval<ModelInputParams&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_prepare_graph_forward_inputs : std::false_type {};
+
+template <typename T>
+struct has_prepare_graph_forward_inputs<
+    T,
+    std::void_t<decltype(std::declval<T>()->prepare_graph_forward_inputs(
+        std::declval<ModelGraphMetadataState*>(),
+        std::declval<const torch::Tensor&>(),
+        std::declval<const ModelInputParams&>()))>> : std::true_type {};
 
 template <typename T, typename = void>
 struct has_pooler : std::false_type {};

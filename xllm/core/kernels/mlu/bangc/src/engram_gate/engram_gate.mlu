@@ -1,0 +1,548 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+
+#include <cmath>
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/engram_gate/launcher.h"
+
+namespace {
+
+constexpr int32_t kTile = 8192;
+__nram__ float reduction[64];
+
+__mlu_func__ float tile_sum(float* values, int32_t count) {
+  __bang_sumpool(
+      reduction, values, 32, 1, count / 32, 1, count / 32, count / 32, 1);
+  __bang_sumpool(reduction + 32, reduction, 1, 1, 32, 1, 32, 32, 1);
+  return reduction[32];
+}
+
+__mlu_func__ void load_bf16(float* destination,
+                            bfloat16_t* temporary,
+                            const bfloat16_t* source,
+                            int32_t count,
+                            int32_t padded) {
+  if (count != padded) {
+    __bang_write_value(temporary, padded, static_cast<bfloat16_t>(0.0f));
+  }
+  __memcpy(temporary, source, count * sizeof(bfloat16_t), GDRAM2NRAM);
+  __bang_bfloat162float(destination, temporary, padded);
+}
+
+__mlu_global__ void engram_gate_kernel(const bfloat16_t* hidden,
+                                       const bfloat16_t* kv,
+                                       const bfloat16_t* q_weight,
+                                       const bfloat16_t* k_weight,
+                                       bfloat16_t* output,
+                                       int64_t rows,
+                                       int32_t heads,
+                                       int32_t width,
+                                       float eps) {
+  __nram__ bfloat16_t raw_hidden[kTile];
+  __nram__ bfloat16_t raw_key[kTile];
+  __nram__ bfloat16_t raw_q[kTile];
+  __nram__ bfloat16_t raw_k[kTile];
+  __nram__ float hidden_tile[kTile];
+  __nram__ float key_tile[kTile];
+  __nram__ float q_tile[kTile];
+  __nram__ float k_tile[kTile];
+  __nram__ float work[kTile];
+
+  int64_t cached_head = -1;
+  for (int64_t row = taskId; row < rows; row += taskDim) {
+    const int64_t token = row / heads;
+    const int64_t head = row % heads;
+    const int64_t base = row * width;
+    const int64_t kv_base = token * (static_cast<int64_t>(heads) + 1) * width;
+    float squared_hidden = 0.0f;
+    float squared_key = 0.0f;
+    float dot = 0.0f;
+    for (int64_t offset = 0; offset < width; offset += kTile) {
+      const int32_t count =
+          static_cast<int32_t>(width - offset < kTile ? width - offset : kTile);
+      const int32_t padded = (count + 31) / 32 * 32;
+      load_bf16(hidden_tile, raw_hidden, hidden + base + offset, count, padded);
+      load_bf16(key_tile,
+                raw_key,
+                kv + kv_base + head * width + offset,
+                count,
+                padded);
+      if (width > kTile || cached_head != head) {
+        load_bf16(
+            q_tile, raw_q, q_weight + head * width + offset, count, padded);
+        load_bf16(
+            k_tile, raw_k, k_weight + head * width + offset, count, padded);
+      }
+      __bang_mul(work, hidden_tile, hidden_tile, padded);
+      squared_hidden += tile_sum(work, padded);
+      __bang_mul(work, key_tile, key_tile, padded);
+      squared_key += tile_sum(work, padded);
+      __bang_mul(work, hidden_tile, key_tile, padded);
+      __bang_mul(work, work, q_tile, padded);
+      __bang_mul(work, work, k_tile, padded);
+      dot += tile_sum(work, padded);
+    }
+    cached_head = head;
+    dot *= (1.0f / sqrtf(squared_hidden / width + eps)) *
+           (1.0f / sqrtf(squared_key / width + eps)) / sqrtf(width);
+    const float magnitude = fabsf(dot);
+    const float signed_root = (dot < 0.0f ? -1.0f : 1.0f) *
+                              sqrtf(magnitude < 1.e-6f ? 1.e-6f : magnitude);
+    const float gate = 1.0f / (1.0f + expf(-signed_root));
+    for (int64_t offset = 0; offset < width; offset += kTile) {
+      const int32_t count =
+          static_cast<int32_t>(width - offset < kTile ? width - offset : kTile);
+      const int32_t padded = (count + 31) / 32 * 32;
+      if (width > kTile) {
+        load_bf16(
+            hidden_tile, raw_hidden, hidden + base + offset, count, padded);
+      }
+      load_bf16(key_tile,
+                raw_key,
+                kv + kv_base + static_cast<int64_t>(heads) * width + offset,
+                count,
+                padded);
+      __bang_mul_scalar(work, key_tile, gate, padded);
+      __bang_add(work, hidden_tile, work, padded);
+      __bang_float2bfloat16_rn(raw_hidden, work, padded);
+      __memcpy(output + base + offset,
+               raw_hidden,
+               count * sizeof(bfloat16_t),
+               NRAM2GDRAM);
+    }
+  }
+}
+
+// bf16 -> f32 on the move engine (NRAM -> NRAM), asynchronous on the move
+// queue, so it overlaps vector work. elements * 2 must be a multiple of 64.
+__mlu_func__ void move_bf16_to_f32(float* dst,
+                                   const bfloat16_t* src,
+                                   int32_t elements) {
+  const int32_t sn0 = 64, sn3 = elements * 2 / 64, ss3 = 64, sn4 = 1,
+                ss4 = elements * 2;
+  const int32_t dn0 = 64, dn3 = sn3, ds3 = 128, dn4 = 1, ds4 = elements * 4;
+  __asm__ volatile(
+      "move.tiling.async.nram.nram.b16 [%[dst]], [%[src]], %[sn0], 1, 0, 1, 0, "
+      "%[sn3], %[ss3], "
+      "%[sn4], %[ss4], 1, 0, %[dn0], 1, 0, 1, 0, %[dn3], %[ds3], %[dn4], "
+      "%[ds4], 1, 0,"
+      ".cvt.rn.f32.bf16();" ::[dst] "r"(dst),
+      [src] "r"(src),
+      [sn0] "r"(sn0),
+      [sn3] "r"(sn3),
+      [ss3] "r"(ss3),
+      [sn4] "r"(sn4),
+      [ss4] "r"(ss4),
+      [dn0] "r"(dn0),
+      [dn3] "r"(dn3),
+      [ds3] "r"(ds3),
+      [dn4] "r"(dn4),
+      [ds4] "r"(ds4));
+}
+
+// Head-granular kernel: one task per (token, head). The grid is a multiple of
+// the head count, so each core keeps one head and caches only its q*k. This
+// exposes four times the token parallelism for decode-sized batches; long
+// batches use the token kernel. Sums and gate arithmetic match the generic
+// kernel; cached q*k equals the original association whenever it is exact.
+constexpr int32_t kHeadTile = 8192;
+
+__mlu_global__ void engram_head_kernel(const bfloat16_t* hidden,
+                                       const bfloat16_t* kv,
+                                       const bfloat16_t* q_weight,
+                                       const bfloat16_t* k_weight,
+                                       bfloat16_t* output,
+                                       int64_t rows,
+                                       int32_t heads,
+                                       int32_t width,
+                                       float eps) {
+  constexpr float kMaxCachedWeight = 1.e4f;
+  constexpr float kMaxSquaredNorm = 1.e22f;
+  constexpr float kMinDot = 1.e-6f;
+  constexpr float kMaxFinite = 3.402823466e38f;
+  __nram__ bfloat16_t raw_h[kHeadTile], raw_key[kHeadTile],
+      raw_value[kHeadTile], raw_out[kHeadTile];
+  __nram__ float h[kHeadTile], key[kHeadTile], value[kHeadTile], qk[kHeadTile],
+      k_values[kHeadTile], work[kHeadTile];
+  __nram__ float extremes[64];
+  int64_t row = taskId;
+  if (row >= rows) {
+    return;
+  }
+  const int32_t head = taskId % heads;
+  const int64_t kv_width = (static_cast<int64_t>(heads) + 1) * width;
+  __memcpy_async(raw_h,
+                 q_weight + static_cast<int64_t>(head) * width,
+                 width * sizeof(bfloat16_t),
+                 GDRAM2NRAM);
+  __memcpy_async(raw_key,
+                 k_weight + static_cast<int64_t>(head) * width,
+                 width * sizeof(bfloat16_t),
+                 GDRAM2NRAM);
+  __sync_io();
+  __bang_bfloat162float(qk, raw_h, width);
+  __bang_bfloat162float(k_values, raw_key, width);
+  {
+    const int64_t token = row / heads;
+    __memcpy_async(
+        raw_h, hidden + row * width, width * sizeof(bfloat16_t), GDRAM2NRAM);
+    __memcpy_async(raw_key,
+                   kv + token * kv_width + head * width,
+                   width * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+    __memcpy_async(raw_value,
+                   kv + token * kv_width + static_cast<int64_t>(heads) * width,
+                   width * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+  }
+  // A core with a single task gains nothing from caching q*k: it keeps q in
+  // qk and k in k_values and evaluates the original association directly.
+  const bool single = rows <= taskDim;
+  bool safe_weights = false;
+  if (!single) {
+    __bang_abs(h, qk, width);
+    __bang_argmax(extremes, h, width);
+    __bang_abs(key, k_values, width);
+    __bang_argmax(extremes + 32, key, width);
+    safe_weights =
+        extremes[0] <= kMaxCachedWeight && extremes[32] <= kMaxCachedWeight;
+    __bang_mul(qk, qk, k_values, width);
+  }
+  for (; row < rows; row += taskDim) {
+    __sync_io();
+    if (row != taskId) {
+      __memcpy_async(output + (row - taskDim) * width,
+                     raw_out,
+                     width * sizeof(bfloat16_t),
+                     NRAM2GDRAM);
+    }
+    // Key and value convert on the move engine while the vector unit
+    // converts hidden and reduces its squares.
+    move_bf16_to_f32(key, raw_key, width);
+    move_bf16_to_f32(value, raw_value, width);
+    __bang_bfloat162float(h, raw_h, width);
+    __sync_compute();
+    const int64_t next = row + taskDim;
+    const int64_t next_token = next / heads;
+    if (next < rows) {
+      __memcpy_async(
+          raw_h, hidden + next * width, width * sizeof(bfloat16_t), GDRAM2NRAM);
+    }
+    __bang_mul(work, h, h, width);
+    const float squared_hidden = tile_sum(work, width);
+    __sync_move();
+    if (next < rows) {
+      __memcpy_async(raw_key,
+                     kv + next_token * kv_width + head * width,
+                     width * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+      __memcpy_async(
+          raw_value,
+          kv + next_token * kv_width + static_cast<int64_t>(heads) * width,
+          width * sizeof(bfloat16_t),
+          GDRAM2NRAM);
+    }
+    __bang_mul(work, key, key, width);
+    const float squared_key = tile_sum(work, width);
+    __bang_mul(work, h, key, width);
+    __bang_mul(work, work, qk, width);
+    if (single) {
+      __bang_mul(work, work, k_values, width);
+    }
+    float dot = tile_sum(work, width);
+    const float normalization = (1.0f / sqrtf(squared_hidden / width + eps)) *
+                                (1.0f / sqrtf(squared_key / width + eps)) /
+                                sqrtf(width);
+    dot *= normalization;
+    const bool safe =
+        single || (safe_weights && squared_hidden < kMaxSquaredNorm &&
+                   squared_key < kMaxSquaredNorm && fabsf(dot) < kMaxFinite &&
+                   fabsf(dot) > kMinDot);
+    if (!safe) {
+      // raw_out may still hold the preceding row's pending store.
+      __sync_io();
+      __bang_mul(work, h, key, width);
+      __memcpy(raw_out,
+               q_weight + static_cast<int64_t>(head) * width,
+               width * sizeof(bfloat16_t),
+               GDRAM2NRAM);
+      __bang_bfloat162float(key, raw_out, width);
+      __bang_mul(work, work, key, width);
+      __memcpy(raw_out,
+               k_weight + static_cast<int64_t>(head) * width,
+               width * sizeof(bfloat16_t),
+               GDRAM2NRAM);
+      __bang_bfloat162float(key, raw_out, width);
+      __bang_mul(work, work, key, width);
+      dot = tile_sum(work, width) * normalization;
+    }
+    const float magnitude = fabsf(dot);
+    const float signed_root = (dot < 0.0f ? -1.0f : 1.0f) *
+                              sqrtf(magnitude < 1.e-6f ? 1.e-6f : magnitude);
+    const float gate = 1.0f / (1.0f + expf(-signed_root));
+    __bang_mul_scalar(work, value, gate, width);
+    __bang_add(work, h, work, width);
+    __sync_io();
+    __bang_float2bfloat16_rn(raw_out, work, width);
+    __sync_compute();
+  }
+  __memcpy_async(output + (row - taskDim) * width,
+                 raw_out,
+                 width * sizeof(bfloat16_t),
+                 NRAM2GDRAM);
+  __sync_io();
+}
+
+__mlu_func__ void head_sums(float* dst, float* src, float* scratch) {
+  __bang_sumpool(scratch, src, 32, 4, 160, 1, 160, 160, 1);
+  __bang_transpose(scratch + 128, scratch, 4, 32);
+  __bang_sumpool(dst, scratch + 128, 4, 1, 32, 1, 32, 32, 1);
+}
+
+__mlu_global__ void engram_token_kernel(const bfloat16_t* hidden,
+                                        const bfloat16_t* kv,
+                                        const bfloat16_t* q_weight,
+                                        const bfloat16_t* k_weight,
+                                        bfloat16_t* output,
+                                        int64_t tokens,
+                                        float eps) {
+  constexpr int32_t kWidth = 5120, kElements = 4 * kWidth;
+  constexpr float kMaxCachedWeight = 1.e4f;
+  constexpr float kMaxSquaredNorm = 1.e22f;
+  constexpr float kMinDot = 1.e-6f;
+  constexpr float kMaxFinite = 3.402823466e38f;
+  __nram__ bfloat16_t raw_h[kElements], raw_kv[5 * kWidth], raw_out[kElements];
+  __nram__ float h[kElements], key[kElements], qk[kElements], work[kElements],
+      value[kWidth];
+  __nram__ float hidden_sums[32], key_sums[32], dot_sums[32], scratch[256];
+  __memcpy(raw_h, q_weight, kElements * 2, GDRAM2NRAM);
+  __bang_bfloat162float(qk, raw_h, kElements);
+  __bang_abs(work, qk, kElements);
+  __bang_argmax(scratch, work, kElements);
+  const float max_q = scratch[0];
+  __memcpy(raw_h, k_weight, kElements * 2, GDRAM2NRAM);
+  __bang_bfloat162float(work, raw_h, kElements);
+  __bang_abs(key, work, kElements);
+  __bang_argmax(scratch, key, kElements);
+  const float max_k = scratch[0];
+  // Three BF16 factors fit the FP32 significand. Cached q*k therefore keeps
+  // the original four-factor products when their intermediate exponents are
+  // safe. These conservative bounds keep h*key*q*k below 1e30.
+  const bool safe_weights =
+      max_q <= kMaxCachedWeight && max_k <= kMaxCachedWeight;
+  __bang_mul(qk, qk, work, kElements);
+  int64_t token = taskId;
+  if (token >= tokens) {
+    return;
+  }
+  __memcpy_async(raw_h, hidden + token * kElements, kElements * 2, GDRAM2NRAM);
+  __memcpy_async(raw_kv, kv + token * 5 * kWidth, 5 * kWidth * 2, GDRAM2NRAM);
+  for (; token < tokens; token += taskDim) {
+    __sync_io();
+    // Delay each output store until the next token's compute can overlap it.
+    if (token != taskId) {
+      __memcpy_async(output + (token - taskDim) * kElements,
+                     raw_out,
+                     kElements * 2,
+                     NRAM2GDRAM);
+    }
+    // Key and value convert on the move engine while the vector unit
+    // converts hidden and reduces its squares.
+    move_bf16_to_f32(key, raw_kv, kElements);
+    move_bf16_to_f32(value, raw_kv + kElements, kWidth);
+    __bang_bfloat162float(h, raw_h, kElements);
+    __sync_compute();
+    const int64_t next = token + taskDim;
+    if (next < tokens) {
+      __memcpy_async(
+          raw_h, hidden + next * kElements, kElements * 2, GDRAM2NRAM);
+    }
+    __bang_mul(work, h, h, kElements);
+    head_sums(hidden_sums, work, scratch);
+    __sync_move();
+    if (next < tokens) {
+      __memcpy_async(
+          raw_kv, kv + next * 5 * kWidth, 5 * kWidth * 2, GDRAM2NRAM);
+    }
+    __bang_mul(work, key, key, kElements);
+    head_sums(key_sums, work, scratch);
+    __bang_mul(work, h, key, kElements);
+    __bang_mul(work, work, qk, kElements);
+    head_sums(dot_sums, work, scratch);
+    float squared_hidden[4], squared_key[4];
+    for (int32_t head = 0; head < 4; ++head) {
+      squared_hidden[head] = hidden_sums[head];
+      squared_key[head] = key_sums[head];
+    }
+    __bang_mul_scalar(hidden_sums, hidden_sums, 1.f / kWidth, 32);
+    __bang_add_scalar(hidden_sums, hidden_sums, eps, 32);
+    __bang_rsqrt(hidden_sums, hidden_sums, 32);
+    __bang_mul_scalar(key_sums, key_sums, 1.f / kWidth, 32);
+    __bang_add_scalar(key_sums, key_sums, eps, 32);
+    __bang_rsqrt(key_sums, key_sums, 32);
+    __bang_mul(hidden_sums, hidden_sums, key_sums, 32);
+    __bang_mul_scalar(
+        hidden_sums, hidden_sums, 1.f / sqrtf(static_cast<float>(kWidth)), 32);
+    __bang_mul(dot_sums, dot_sums, hidden_sums, 32);
+    // Re-evaluate nonfinite/extreme inputs and dots near the clamp with the
+    // original association. This also preserves the sign of underflowed zero.
+    bool safe_heads[4];
+    for (int32_t head = 0; head < 4; ++head) {
+      safe_heads[head] =
+          safe_weights && squared_hidden[head] < kMaxSquaredNorm &&
+          squared_key[head] < kMaxSquaredNorm &&
+          fabsf(dot_sums[head]) < kMaxFinite && fabsf(dot_sums[head]) > kMinDot;
+    }
+    __bang_lt_scalar(scratch, dot_sums, 0.f, 32);
+    __bang_mul_scalar(scratch, scratch, -2.f, 32);
+    __bang_add_scalar(scratch, scratch, 1.f, 32);
+    __bang_abs(dot_sums, dot_sums, 32);
+    __bang_nan_maximum_scalar(dot_sums, dot_sums, 1.e-6f, 32);
+    __bang_sqrt(dot_sums, dot_sums, 32);
+    __bang_mul(dot_sums, dot_sums, scratch, 32);
+    __bang_mul_scalar(dot_sums, dot_sums, -1.4426950408889634f, 32);
+    __bang_pow2(dot_sums, dot_sums, 32);
+    __bang_add_scalar(dot_sums, dot_sums, 1.f, 32);
+    __bang_recip(dot_sums, dot_sums, 32);
+    for (int32_t head = 0; head < 4; ++head) {
+      if (!safe_heads[head]) {
+        // raw_out may still hold the preceding token's pending store.
+        __sync_io();
+        __bang_mul(work + head * kWidth,
+                   h + head * kWidth,
+                   key + head * kWidth,
+                   kWidth);
+        __memcpy(raw_out, q_weight + head * kWidth, kWidth * 2, GDRAM2NRAM);
+        __bang_bfloat162float(key + head * kWidth, raw_out, kWidth);
+        __bang_mul(work + head * kWidth,
+                   work + head * kWidth,
+                   key + head * kWidth,
+                   kWidth);
+        __memcpy(raw_out, k_weight + head * kWidth, kWidth * 2, GDRAM2NRAM);
+        __bang_bfloat162float(key + head * kWidth, raw_out, kWidth);
+        __bang_mul(work + head * kWidth,
+                   work + head * kWidth,
+                   key + head * kWidth,
+                   kWidth);
+        const float normalization =
+            (1.f / sqrtf(squared_hidden[head] / kWidth + eps)) *
+            (1.f / sqrtf(squared_key[head] / kWidth + eps)) /
+            sqrtf(static_cast<float>(kWidth));
+        const float dot =
+            tile_sum(work + head * kWidth, kWidth) * normalization;
+        float magnitude = fabsf(dot);
+        float root = (dot < 0 ? -1.f : 1.f) *
+                     sqrtf(magnitude < 1.e-6f ? 1.e-6f : magnitude);
+        dot_sums[head] = 1.f / (1.f + expf(-root));
+      }
+      __bang_mul_scalar(work + head * kWidth, value, dot_sums[head], kWidth);
+    }
+
+    // Preserve the separate FP32 product rounding before residual addition.
+    __bang_add(work, h, work, kElements);
+    __sync_io();
+    __bang_float2bfloat16_rn(raw_out, work, kElements);
+    __sync_compute();
+  }
+  __memcpy_async(output + (token - taskDim) * kElements,
+                 raw_out,
+                 kElements * 2,
+                 NRAM2GDRAM);
+  __sync_io();
+}
+
+}  // namespace
+
+extern "C" int32_t engram_gate_launch(void* queue,
+                                      const void* hidden,
+                                      const void* kv,
+                                      const void* q_weight,
+                                      const void* k_weight,
+                                      void* output,
+                                      int64_t tokens,
+                                      int32_t heads,
+                                      int32_t width,
+                                      float eps) {
+  if (tokens < 0 || heads <= 0 || width <= 0) {
+    return 1;
+  }
+  if (tokens == 0) {
+    return 0;
+  }
+  // Adaptive granularity: head tasks for short batches, token tasks with a
+  // cross-head schedule for long batches, generic tiles otherwise.
+  constexpr int64_t kCores = 32;
+  const bool head_shape =
+      width % 64 == 0 && width <= kHeadTile && heads <= kCores;
+  const int64_t rows = tokens * heads;
+  const int64_t grid = head_shape ? kCores / heads * heads : 1;
+  // Measured MLU590 costs (ns): fixed latency plus rounds of per-core work.
+  // The token kernel steps every 32 tokens, the head kernel every grid rows.
+  constexpr int64_t kHeadFixed = 4300, kHeadRow = 1850;
+  constexpr int64_t kTokenFixed = 9200, kTokenRound = 4700;
+  const int64_t head_cost = kHeadFixed + (rows + grid - 1) / grid * kHeadRow;
+  const int64_t token_cost =
+      kTokenFixed + (tokens + kCores - 1) / kCores * kTokenRound;
+  const bool token_shape = heads == 4 && width == 5120;
+  if (head_shape && (!token_shape || head_cost < token_cost)) {
+    const cnrtDim3_t d{static_cast<uint32_t>(rows < grid ? rows : grid), 1, 1};
+    engram_head_kernel<<<d,
+                         cnrtFuncTypeBlock,
+                         static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const bfloat16_t*>(hidden),
+        static_cast<const bfloat16_t*>(kv),
+        static_cast<const bfloat16_t*>(q_weight),
+        static_cast<const bfloat16_t*>(k_weight),
+        static_cast<bfloat16_t*>(output),
+        rows,
+        heads,
+        width,
+        eps);
+    return 0;
+  }
+  if (token_shape) {
+    const cnrtDim3_t d{static_cast<uint32_t>(tokens < 32 ? tokens : 32), 1, 1};
+    engram_token_kernel<<<d,
+                          cnrtFuncTypeBlock,
+                          static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const bfloat16_t*>(hidden),
+        static_cast<const bfloat16_t*>(kv),
+        static_cast<const bfloat16_t*>(q_weight),
+        static_cast<const bfloat16_t*>(k_weight),
+        static_cast<bfloat16_t*>(output),
+        tokens,
+        eps);
+    return 0;
+  }
+  const uint32_t tasks = static_cast<uint32_t>(rows < 128 ? rows : 128);
+  const cnrtDim3_t dimensions{tasks, 1, 1};
+  engram_gate_kernel<<<dimensions,
+                       cnrtFuncTypeBlock,
+                       static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const bfloat16_t*>(hidden),
+      static_cast<const bfloat16_t*>(kv),
+      static_cast<const bfloat16_t*>(q_weight),
+      static_cast<const bfloat16_t*>(k_weight),
+      static_cast<bfloat16_t*>(output),
+      rows,
+      heads,
+      width,
+      eps);
+  return 0;
+}

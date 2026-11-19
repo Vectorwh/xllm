@@ -273,6 +273,11 @@ class ExecutorV41Model final : public CausalLM {
                                       ModelInputParams& input) override {
     model_->prepare_graph_forward_metadata(state, positions, input);
   }
+  void prepare_graph_forward_inputs(ModelGraphMetadataState* state,
+                                    const torch::Tensor& tokens,
+                                    const ModelInputParams& input) override {
+    model_->prepare_graph_forward_inputs(state, tokens, input);
+  }
   layer::WordEmbedding get_word_embedding() override {
     return model_->get_word_embedding();
   }
@@ -304,7 +309,7 @@ class DeepseekV41CaptureTest : public DeepseekV41MluModelTest {
   void SetUp() override {
     DeepseekV41MluModelTest::SetUp();
     saved_engram_config_ = ModelConfig::get_instance().engram_config();
-    ModelConfig::get_instance().engram_config() = R"({"placement":"gpu"})";
+    ModelConfig::get_instance().engram_config() = R"({"placement":"device"})";
   }
 
   void TearDown() override {
@@ -443,6 +448,195 @@ class DeepseekV41CaptureTest : public DeepseekV41MluModelTest {
   std::string saved_engram_config_;
 };
 
+TEST_F(DeepseekV41CaptureTest,
+       DeviceHashAllLayersMatchHostWithDistinctMultipliers) {
+  torch::InferenceMode inference;
+  torch::DeviceGuard guard(options_.device());
+  args_.n_layers(2)
+      .compress_ratios({0, 0})
+      .window_size(16)
+      .engram_layer_ids({1, 0})
+      .engram_num_embeddings({18, 18})
+      .engram_head_dim(32)
+      .engram_max_ngram_size(3)
+      .engram_pad_token_id(0);
+  auto weights = make_weights();
+  const auto first_layer = weights;
+  for (const auto& [name, tensor] : first_layer) {
+    if (name.rfind("layers.0.", 0) == 0) {
+      weights.emplace("layers.1." + name.substr(9), tensor.clone());
+    }
+  }
+  for (int32_t id = 0; id < 2; ++id) {
+    const std::string prefix = "layers." + std::to_string(id) + ".engram.";
+    weights.emplace(prefix + "embed.weight",
+                    torch::arange(18)
+                        .add(0x30)
+                        .unsqueeze(1)
+                        .expand({18, 32})
+                        .contiguous()
+                        .to(torch::kUInt8));
+    weights.emplace(prefix + "embed.scale",
+                    torch::full({18, 1}, 127, torch::kUInt8));
+    auto wkv = torch::zeros({25600, 64}, torch::kBFloat16);
+    wkv.slice(0, 20480).copy_(
+        torch::linspace(-0.02, 0.02, 5120 * 64).reshape({5120, 64}));
+    weights.emplace(prefix + "wkv.weight", wkv);
+    weights.emplace(prefix + "q_weight",
+                    torch::ones({4, 5120}, torch::kBFloat16));
+    weights.emplace(prefix + "k_weight",
+                    torch::ones({4, 5120}, torch::kBFloat16));
+  }
+  const StateDict hashes({
+      {"token_map", torch::arange(4, torch::kInt64)},
+      {"multipliers", torch::tensor({{1, 3, 5}, {7, 11, 13}}, torch::kInt64)},
+      {"primes", torch::tensor({{7, 11}, {7, 11}}, torch::kInt64)},
+      {"offsets", torch::tensor({{0, 7}, {0, 7}}, torch::kInt64)},
+  });
+  const StateDict state(weights);
+  const auto context = make_context();
+  ModelConfig::get_instance().engram_config() = R"({"placement":"device"})";
+  mlu::model::DeepseekV41Model device(context);
+  device->load_state_dict(state);
+  device->load_hash_state(hashes);
+  device->verify_loaded_weights();
+  ModelConfig::get_instance().engram_config() = R"({"placement":"cpu"})";
+  mlu::model::DeepseekV41Model host(context);
+  host->load_state_dict(state);
+  host->load_hash_state(hashes);
+  host->verify_loaded_weights();
+  const auto make_cache = [&]() {
+    std::vector<KVCache> caches;
+    caches.reserve(2);
+    for (int32_t id = 0; id < 2; ++id) {
+      DeepSeekV4KVCacheTensors tensors;
+      tensors.swa_cache = torch::zeros({1, 1, 128, 512}, options_);
+      caches.emplace_back(tensors);
+    }
+    return caches;
+  };
+  ModelInputParams input;
+  input.meta.batch_forward_type = BatchForwardType::PREFILL;
+  input.meta.num_sequences = 1;
+  input.meta.actual_num_sequences = 1;
+  input.meta.q_max_seq_len = 2;
+  input.meta.kv_max_seq_len = 2;
+  input.attention.host.q_seq_lens = {0, 2};
+  input.attention.host.kv_seq_lens = {0, 2};
+  input.multi_block_tables = {torch::zeros({1, 1}, torch::kInt32)};
+  const auto positions = torch::arange(2, options_.dtype(torch::kInt64));
+  for (int32_t round = 0; round < 3; ++round) {
+    auto host_tokens = torch::tensor({round, (round + 2) % 4}, torch::kInt32);
+    auto tokens = host_tokens.to(options_.device());
+    input.embedding.input_token_ids_host = host_tokens;
+    input.embedding.engram_lookback_token_ids = {(round + 1) % 4, round};
+    auto device_cache = make_cache();
+    const auto expected =
+        device->forward(tokens, positions, device_cache, input);
+    const std::vector<torch::Tensor> snapshots{
+        host_tokens,
+        {},
+        host_tokens.to(torch::kInt64),
+        torch::full_like(host_tokens, -1),
+        torch::stack({host_tokens, host_tokens}, 1).select(1, 0),
+        host_tokens.slice(0, 0, 1),
+        tokens};
+    for (const auto& snapshot : snapshots) {
+      input.embedding.input_token_ids_host = snapshot;
+      auto host_cache = make_cache();
+      const auto actual = host->forward(tokens, positions, host_cache, input);
+      EXPECT_TRUE(torch::equal(actual.hidden_states.cpu(),
+                               expected.hidden_states.cpu()));
+    }
+  }
+
+  // An idle DP shard has no request rows. The model pads it with dummy tokens
+  // for MoE communication, and neither placement may prepare Engram rows.
+  ModelInputParams idle;
+  idle.meta.batch_forward_type = BatchForwardType::DECODE;
+  idle.attention.host.q_seq_lens = {0};
+  idle.attention.host.kv_seq_lens = {0};
+  idle.multi_block_tables = {torch::zeros({0, 1}, torch::kInt32)};
+  for (auto* model : {&device, &host}) {
+    auto idle_cache = make_cache();
+    const auto output =
+        (*model)->forward(torch::empty({0}, options_.dtype(torch::kInt32)),
+                          torch::empty({0}, options_.dtype(torch::kInt64)),
+                          idle_cache,
+                          idle);
+    EXPECT_EQ(output.hidden_states.size(0), args_.dummy_token_count());
+    EXPECT_TRUE(torch::isfinite(output.hidden_states).all().item<bool>());
+  }
+
+  // Validate live host rows independently of the graph's padded token capacity.
+  mlu::model::DeepseekV41GraphState graph;
+  ModelInputParams graph_input;
+  graph_input.meta.batch_forward_type = BatchForwardType::DECODE;
+  graph_input.meta.num_sequences = 3;
+  graph_input.meta.actual_num_sequences = 3;
+  graph_input.meta.q_max_seq_len = 1;
+  graph_input.meta.kv_max_seq_len = 1;
+  graph_input.attention.host.q_seq_lens = {0, 1, 2, 3};
+  graph_input.attention.host.kv_seq_lens = {0, 1, 2, 3};
+  graph_input.embedding.engram_lookback_token_ids = {1, 2, 2, 3, 3, 1};
+  graph_input.multi_block_tables = {torch::zeros({3, 1}, torch::kInt32)};
+  const auto ints = options_.dtype(torch::kInt32);
+  graph_input.attention.device.q_seq_lens = torch::arange(4, ints);
+  graph_input.attention.device.kv_seq_lens = torch::arange(4, ints);
+  graph_input.attention.device.new_cache_slots = torch::arange(3, ints);
+  graph_input.attention.device.block_tables = torch::zeros({3, 1}, ints);
+  const auto graph_positions = torch::zeros({3}, options_.dtype(torch::kInt64));
+  const auto live_tokens = torch::tensor({0, 1, 2}, torch::kInt32);
+  auto graph_tokens =
+      torch::tensor({0, 1, 2}, torch::kInt32).to(options_.device());
+  mlu::GraphLayout layout;
+  layout.num_reqs = 3;
+  layout.padded_num_reqs = 4;
+  layout.padded_num_tokens = 4;
+  mlu::GraphPersistentParam buffers(graph_tokens,
+                                    graph_positions,
+                                    graph_input,
+                                    layout,
+                                    /*main_block_table_columns=*/1);
+  std::vector<torch::Tensor> expected_hashes;
+  for (int32_t scenario = 0; scenario < 5; ++scenario) {
+    SCOPED_TRACE(scenario);
+    graph_input.embedding.input_token_ids_host =
+        scenario == 0 ? torch::Tensor() : live_tokens;
+    graph_input.is_spec_verify = scenario == 3;
+    graph_input.use_dflash_proposal_attention = scenario == 4;
+    if (scenario == 1) {
+      // An upstream host view can be consumed before device tokens are ready.
+      graph_tokens.fill_(-1);
+    } else {
+      graph_tokens.copy_(torch::tensor({0, 1, 2}, torch::kInt32));
+    }
+    if (scenario == 2) {
+      graph_input.embedding.input_token_ids_host = live_tokens.slice(0, 0, 2);
+    } else if (scenario >= 3) {
+      graph_input.embedding.input_token_ids_host =
+          torch::full_like(live_tokens, 3);
+    }
+    buffers.update_input_buffer(
+        graph_tokens, graph_positions, graph_input, layout);
+    host->prepare_graph_forward_metadata(
+        &graph, buffers.positions_, buffers.params_);
+    host->prepare_graph_forward_inputs(
+        &graph, buffers.tokens_, buffers.params_);
+    ASSERT_NE(graph.engram_, nullptr);
+    for (size_t layer = 0; layer < graph.engram_->num_layers(); ++layer) {
+      const auto actual =
+          graph.engram_->hash_state(layer)->forward(buffers.tokens_).cpu();
+      if (scenario == 0) {
+        expected_hashes.emplace_back(actual.clone());
+      } else {
+        EXPECT_TRUE(torch::equal(actual, expected_hashes[layer]));
+      }
+    }
+    graph.finish_input_consumption();
+  }
+}
+
 TEST_F(DeepseekV41CaptureTest, CapturesEnteringResidualWithoutEngram) {
   expect_entering_residual(/*with_engram=*/false, /*value_scale=*/0);
 }
@@ -469,11 +663,16 @@ TEST_F(DeepseekV41CaptureTest,
                            /*model_hidden_size=*/256);
 }
 
-TEST_F(DeepseekV41CaptureTest,
+class DeepseekV41HashPlacementTest
+    : public DeepseekV41CaptureTest,
+      public ::testing::WithParamInterface<const char*> {};
+
+TEST_P(DeepseekV41HashPlacementTest,
        DSparkExecutorRegroupsRealModelAndReplaysAfterCandidateRejection) {
   torch::InferenceMode inference;
   torch::DeviceGuard guard(options_.device());
-  ModelConfig::get_instance().engram_config() = R"({"placement":"cpu"})";
+  ModelConfig::get_instance().engram_config() =
+      std::string("{\"placement\":\"") + GetParam() + "\"}";
   constexpr int32_t kWidth = 6;
   int32_t requests = 3;
   args_.dtype("bfloat16")
@@ -650,6 +849,10 @@ TEST_F(DeepseekV41CaptureTest,
     flat.meta.actual_num_sequences = count * kWidth;
     flat.meta.spec_verify_width = kWidth;
     flat.meta.q_max_seq_len = 1;
+    // Device-generated verify tokens must override an otherwise plausible host
+    // view.
+    flat.embedding.input_token_ids_host =
+        torch::zeros({count * kWidth}, torch::kInt32);
     // Metadata-owning models use one planner state ID per logical request.
     flat.embedding.linear_state_ids.resize(count);
     std::iota(flat.embedding.linear_state_ids.begin(),
@@ -926,6 +1129,10 @@ TEST_F(DeepseekV41MluModelTest, CpuBlockTablesSupportEagerPrefillAndDecode) {
     }
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(EngramPlacement,
+                         DeepseekV41HashPlacementTest,
+                         ::testing::Values("cpu", "device"));
 
 TEST_F(DeepseekV41MluModelTest, RejectsInvalidSinkhornIterations) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");

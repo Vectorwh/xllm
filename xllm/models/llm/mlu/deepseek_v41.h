@@ -25,15 +25,24 @@ limitations under the License.
 #include "layers/common/deepseek_v4_rotary_embedding.h"
 #include "layers/common/word_embedding.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_decoder_layer.h"
+#include "layers/mlu/deepseek_v41/deepseek_v41_engram_inputs.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_metadata.h"
 #include "models/llm/deepseek_v41.h"
 #include "models/llm/llm_model_base.h"
 
 namespace xllm::mlu::model {
-struct DeepseekV41GraphState final : ModelGraphMetadataState {
-  layer::Csa2Context shared;
-  std::optional<ModelInputParams> verify_input;
-  std::vector<std::unique_ptr<layer::DeepseekV41EngramImpl::HashState>> hashes;
+class DeepseekV41GraphState final : public ModelGraphMetadataState {
+ public:
+  void finish_input_consumption() override {
+    if (engram_) {
+      engram_->finish_consumption();
+    }
+  }
+
+  layer::Csa2Context shared_;
+  std::optional<ModelInputParams> verify_input_;
+  // Created by the first metadata preparation of this bucket.
+  std::unique_ptr<layer::DeepseekV41EngramInputs::GraphState> engram_;
 };
 
 class DeepseekV41ModelImpl : public torch::nn::Module {
@@ -96,6 +105,14 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     for (int32_t id = 0; id < args.n_layers(); ++id) {
       layers_.emplace_back(layer::DeepseekV41DecoderLayer(context, id));
     }
+    std::vector<layer::DeepseekV41Engram> engrams;
+    engrams.reserve(layers_.size());
+    for (const auto& layer : layers_) {
+      engrams.emplace_back(layer->engram());
+    }
+    engram_inputs_ = std::make_unique<layer::DeepseekV41EngramInputs>(
+        std::move(engrams),
+        parallel.tp_group_ ? parallel.tp_group_->world_size() : 1);
   }
 
   torch::Tensor get_input_embeddings(torch::Tensor tokens) {
@@ -107,9 +124,7 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
   }
 
   void load_hash_state(const StateDict& state) {
-    for (auto& layer : layers_) {
-      layer->load_hash_state(state);
-    }
+    engram_inputs_->load_hash_state(state);
   }
 
   void load_state_dict(const StateDict& state) {
@@ -136,39 +151,41 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     graph_state_ = dynamic_cast<DeepseekV41GraphState*>(state);
     CHECK(graph_state_ != nullptr);
     CHECK(input.meta.batch_forward_type.is_decode());
-    graph_state_->verify_input.reset();
+    graph_state_->verify_input_.reset();
     const ModelInputParams* grouped = &input;
     if (input.meta.spec_verify_width > 1) {
-      graph_state_->verify_input = group_verify_input(input);
-      grouped = &*graph_state_->verify_input;
+      graph_state_->verify_input_ = group_verify_input(input);
+      grouped = &*graph_state_->verify_input_;
     }
     const auto& metadata = *grouped;
 
-    if (graph_state_->hashes.empty()) {
-      graph_state_->shared.topk.resize(metadata.meta.num_sequences);
-      graph_state_->shared.candidates.resize(metadata.meta.num_sequences);
-      graph_state_->hashes.reserve(layers_.size());
-      for (const auto& layer : layers_) {
-        graph_state_->hashes.emplace_back(layer->create_hash_state(
-            positions.numel(),
-            positions.numel() / metadata.meta.num_sequences));
-      }
+    if (!graph_state_->engram_) {
+      graph_state_->shared_.topk.resize(metadata.meta.num_sequences);
+      graph_state_->shared_.candidates.resize(metadata.meta.num_sequences);
+      graph_state_->engram_ = engram_inputs_->create_graph_state(
+          positions.numel(), positions.numel() / metadata.meta.num_sequences);
     }
-    layer::deepseek_v41::prepare_workspace(graph_state_->shared,
+    layer::deepseek_v41::prepare_workspace(graph_state_->shared_,
                                            metadata,
                                            model_args_,
                                            positions.numel(),
                                            options_);
-    layer::deepseek_v41::prepare_metadata(graph_state_->shared,
+    layer::deepseek_v41::prepare_metadata(graph_state_->shared_,
                                           metadata,
                                           positions,
                                           metadata.meta.actual_num_sequences,
                                           input.graph.kv_seq_len_capacity);
-    for (auto& hash : graph_state_->hashes) {
-      if (hash) {
-        hash->prepare(metadata);
-      }
-    }
+    engram_inputs_->prepare_graph(*graph_state_->engram_, metadata);
+  }
+
+  void prepare_graph_forward_inputs(ModelGraphMetadataState* state,
+                                    const torch::Tensor& tokens,
+                                    const ModelInputParams& input) {
+    auto* graph = dynamic_cast<DeepseekV41GraphState*>(state);
+    CHECK(graph != nullptr);
+    CHECK(graph->engram_ != nullptr)
+        << "Graph metadata must be prepared before graph inputs";
+    engram_inputs_->prefetch_graph(*graph->engram_, tokens, input);
   }
 
   ModelOutput forward(torch::Tensor tokens,
@@ -202,9 +219,14 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
         prepared_input.meta.num_sequences > 0) {
       grouped_input = group_verify_input(prepared_input);
     }
-    const auto& input = raw_input.enable_graph && graph_state_->verify_input
-                            ? *graph_state_->verify_input
+    const auto& input = raw_input.enable_graph && graph_state_->verify_input_
+                            ? *graph_state_->verify_input_
                             : (grouped_input ? *grouped_input : prepared_input);
+    // Started before the stack so host-table lookups overlap with it.
+    auto engram_step = engram_inputs_->begin(
+        tokens,
+        input,
+        input.enable_graph ? graph_state_->engram_.get() : nullptr);
     std::optional<layer::mlu_v4_cp::DeepseekV4CpContext> cp_context;
     if (cp_size_ > 1 && !input.enable_graph &&
         !input.use_dflash_proposal_attention && !input.is_spec_verify &&
@@ -232,6 +254,7 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     }
     torch::Tensor local_tokens = tokens;
     if (cp_context) {
+      engram_step.use_cp_context(*cp_context);
       local_tokens = layer::mlu_v4_cp::shard_rows(tokens, *cp_context);
       positions = cp_context->local_positions;
     }
@@ -249,7 +272,7 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
                      hidden.options().dtype(torch::kFloat32));
     pre.select(1, 0).fill_(1);
     layer::Csa2Context eager_shared;
-    auto& shared = input.enable_graph ? graph_state_->shared : eager_shared;
+    auto& shared = input.enable_graph ? graph_state_->shared_ : eager_shared;
     if (!input.enable_graph) {
       layer::deepseek_v41::prepare_metadata(
           shared,
@@ -272,21 +295,21 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
       torch::Tensor captured;
       const bool capture =
           aux_capture_.should_capture(static_cast<int32_t>(id));
-      hidden = layers_[id]->forward(
-          hidden,
-          pre,
-          tokens,
-          positions,
-          model_args_.compress_ratios()[id] == 0 ? plain_rope_
-                                                 : compressed_rope_,
-          caches,
-          input,
-          shared,
-          pending,
-          can_defer_post(id),
-          input.enable_graph ? graph_state_->hashes[id].get() : nullptr,
-          cp_context ? &*cp_context : nullptr,
-          capture ? &captured : nullptr);
+      hidden = layers_[id]->forward(hidden,
+                                    pre,
+                                    tokens,
+                                    positions,
+                                    model_args_.compress_ratios()[id] == 0
+                                        ? plain_rope_
+                                        : compressed_rope_,
+                                    caches,
+                                    input,
+                                    shared,
+                                    pending,
+                                    can_defer_post(id),
+                                    engram_step.layer(id),
+                                    cp_context ? &*cp_context : nullptr,
+                                    capture ? &captured : nullptr);
       if (capture) {
         aux_capture_.capture_layer(
             static_cast<int32_t>(id), captured, std::nullopt);
@@ -355,6 +378,7 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     return grouped;
   }
 
+  std::unique_ptr<layer::DeepseekV41EngramInputs> engram_inputs_;
   DeepseekV41GraphState* graph_state_ = nullptr;  // Owned by the active graph.
   int32_t cp_size_ = 1;
   ProcessGroup* cp_group_ = nullptr;
@@ -384,6 +408,11 @@ class DeepseekV41ForCausalLMImpl final
                                       const torch::Tensor& positions,
                                       ModelInputParams& input) {
     model_->prepare_graph_forward_metadata(state, positions, input);
+  }
+  void prepare_graph_forward_inputs(ModelGraphMetadataState* state,
+                                    const torch::Tensor& tokens,
+                                    const ModelInputParams& input) {
+    model_->prepare_graph_forward_inputs(state, tokens, input);
   }
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {

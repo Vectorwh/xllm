@@ -15,19 +15,24 @@ xllm --engram_config='{"placement":"cpu","replication":"none"}'
 # 同机模型 ranks 跨 DP/TP 共享一份完整 FP8 表及 scale
 xllm --engram_config='{"placement":"cpu","replication":"per_node"}'
 
+# Eager prefill 在 MLU 计算 hash，CPU 继续负责查表
+xllm --engram_config='{"placement":"cpu","prefill_hash":"device"}'
+
 # 关闭卸载：表常驻 MLU device
-xllm --engram_config='{"placement":"gpu"}'
+xllm --engram_config='{"placement":"device"}'
 ```
 
-host 路径复用已有 hash 计算：CPU 收集当前 token 命中的 FP8 行及 scale，经 pinned staging buffer 搬到 MLU，沿用 device 反量化、集合通信和投影。Graph replay 使用流上的 host callback 更新命中行，避免复用旧 token 的查表结果。大表本体无需锁页，仅 staging buffer 锁页。
+CPU 表路径默认使用已有的 device token 快照，在 MLU 计算 eager prefill 的 hash，将索引下载到 pinned buffer，再由 CPU 查表、上传命中的 FP8 行及 scale，继续在 MLU 反量化、通信和投影；hash 保留在 MLU。设置 `prefill_hash=cpu` 可显式使用 CPU hash。Decode、投机验证、混合批次和 graph replay 继续使用 CPU hash。Graph replay 使用流上的 host callback 更新命中行，避免复用旧 token 的查表结果。大表本体无需锁页，仅 staging buffer 锁页。
+
+`prefill_hash` 默认值为 `device`，仅在提供 device token 快照的 eager prefill 中生效；独立层调用若只提供 host token，仍使用 CPU hash。此选项不改变 device 驻留表的 hash 路径。小 prefill 如需避免 device 启动和索引下载开销，可显式设置 `prefill_hash=cpu`。
 
 `replication=per_node` 默认关闭，开启时要求 `placement=cpu`。加载时利用模型的 world 进程组收集 kernel boot ID，识别同机 ranks。每台主机的首个 rank 创建匿名 `memfd` 存储，其余同机 ranks 通过 `/proc/<pid>/fd/<fd>` 映射同一份存储。同一模型实例的同机 ranks 跨 attention DP/TP 组共享一张完整表，不同主机各保留一份完整副本。同机 ranks 必须处于同一 PID namespace，且有权限访问 leader 的文件描述符。使用不同 world 组的独立服务实例之间不共享表。
 
 加载是模型 world 组上的集合操作。各 rank 仅复制按同机 rank 数分配给自己的 checkpoint 行，初始化等待所有 ranks 完成后才允许查表。单机 attention DP2 × TP4 时，8 个 ranks 分工填充同一份完整表。最后一个映射及文件描述符释放后，存储自动回收；无需命名共享文件或持久化转换缓存。Engram 层的 eager 和 graph 回归覆盖 DP2 × TP4；原生 MLU V4.1 整模型仍要求 DP1，模型及运行时的完整 DP 接入需后续完成。
 
-MLU 原生配置只接受与 SGLang 同名的字符串选项：`placement`（`cpu` 或 `gpu`）和 `replication`（`none` 或 `per_node`）。默认值为 `placement=cpu`、`replication=none`；`placement=gpu` 对应 MLU device 存储。
+MLU 原生配置接受字符串选项：`placement`（`cpu` 或 `device`）、`replication`（`none` 或 `per_node`）、`communication`（`allreduce` 或 `reduce_scatter_allgather`）和 `prefill_hash`（`cpu` 或 `device`）。默认值为 `placement=cpu`、`replication=none`、`communication=reduce_scatter_allgather`、`prefill_hash=device`；`placement=device` 对应 MLU device 存储。`reduce_scatter_allgather` 仅用于启用 CP 的非共享表；共享表继续使用原有通信路径。
 
-共享表保留原始 FP8 E4M3 权重字节及 E8M0 scale 字节，不提前将整表展开成 FP16/BF16。各 rank 独立查询本轮全部命中行，仅将这些行及 scale 经自己的 pinned staging buffer 搬到 MLU 反量化；此模式跳过 Engram 查表结果的 AllReduce。Graph replay 复用同一份共享表和已有 host callback。
+共享表保留原始 FP8 E4M3 权重字节及 E8M0 scale 字节，不提前将整表展开成 FP16/BF16。传输量足够大时，TP ranks 按 hash head 分工查表、上传各自命中行及 scale，并在 TP 组内收集 packed payload 后反量化；小传输继续独立查表。此模式跳过 Engram 查表结果的 AllReduce。Graph replay 复用同一份共享表和已有 host callback。
 
 默认 host 分片模式下，双表在单机 TP=8 时约占每 rank 23.60 GiB，节点内合计约 188.83 GiB。机内共享模式下，每台主机保留一份完整物理表，共享范围不随 attention DP/TP 切分而缩小。各进程都映射完整共享表，直接累加进程 RSS 会重复统计共享页，应看 PSS 或节点物理内存；加载及运行缓冲另计。投影等小权重仍在 MLU。以下章节介绍 NPU 路径，其默认值和支持的表格式与 MLU 不同。
 

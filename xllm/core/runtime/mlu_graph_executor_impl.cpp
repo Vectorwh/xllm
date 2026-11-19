@@ -303,6 +303,12 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
   params_.meta.actual_num_sequences = params.meta.num_sequences;
   params_.embedding.engram_lookback_token_ids =
       params.embedding.engram_lookback_token_ids;
+  // A captured bucket retains its own mode flags, so decide from the current
+  // step whether the host snapshot still describes the device tokens.
+  params_.embedding.input_token_ids_host =
+      has_device_rewritten_tokens(params)
+          ? torch::Tensor()
+          : params.embedding.input_token_ids_host;
   if (mtp_topk_input_ != nullptr) {
     CHECK(params.mtp_topk_state != nullptr);
     mtp_topk_input_->update(*params.mtp_topk_state);
@@ -648,6 +654,9 @@ void MluGraph::prepare_model_graph_metadata(CausalLM* model) {
   model->prepare_graph_forward_metadata(model_graph_metadata_state_.get(),
                                         persistent_param_->positions_,
                                         graph_params);
+  model->prepare_graph_forward_inputs(model_graph_metadata_state_.get(),
+                                      persistent_param_->tokens_,
+                                      graph_params);
 }
 
 void MluGraph::store_output(const ModelOutput& result) {
@@ -725,6 +734,9 @@ ModelOutput MluGraph::capture(CausalLM* model,
   torch_mlu::MLUEvent capture_ready;
   capture_ready.place(capture_stream);
   capture_ready.wait(caller_stream);
+  if (model_graph_metadata_state_) {
+    model_graph_metadata_state_->finish_input_consumption();
+  }
   if (!has_state) {
     return replay();
   }
@@ -736,6 +748,9 @@ ModelOutput MluGraph::replay() {
     piecewise_graph_->replay();
   } else {
     graph_.replay();
+  }
+  if (model_graph_metadata_state_) {
+    model_graph_metadata_state_->finish_input_consumption();
   }
   return output();
 }

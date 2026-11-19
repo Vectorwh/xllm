@@ -179,6 +179,12 @@ class DeepseekV41DSparkForCausalLMImpl final
     model_->prepare_graph_forward_metadata(state, positions, input);
   }
 
+  void prepare_graph_forward_inputs(ModelGraphMetadataState* state,
+                                    const torch::Tensor& tokens,
+                                    const ModelInputParams& input) {
+    model_->prepare_graph_forward_inputs(state, tokens, input);
+  }
+
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string /*prefix*/ = "") override {
     const int32_t last_layer = model_->last_dspark_layer_index();

@@ -20,7 +20,6 @@ limitations under the License.
 #include <unistd.h>
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -28,6 +27,7 @@ limitations under the License.
 #include <cstring>
 #include <exception>
 #include <numeric>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -43,14 +43,19 @@ limitations under the License.
 namespace xllm::layer {
 namespace {
 
-constexpr int32_t kWorldSize = 2;
 constexpr int32_t kSkip = 77;
 constexpr std::chrono::seconds kChildTimeout{120};
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
 enum class ChildOutcome : int8_t { PASSED, SKIPPED, FAILED };
 
-void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
+void verify_cp_engram(ProcessGroup& group,
+                      ProcessGroup& tp_group,
+                      ProcessGroup& cp_group,
+                      const torch::Device& device) {
+  const int32_t world_size = group.world_size();
+  const int32_t cp_size = cp_group.world_size();
+  const int32_t tp_size = tp_group.world_size();
   torch::InferenceMode inference;
   const auto options =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
@@ -66,14 +71,16 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
       .engram_pad_token_id(0)
       .engram_compressed_vocab_size(8)
       .rms_norm_eps(1e-5);
-  // Each rank's TP group has one device; EP spans both CP ranks. Choosing TP
-  // for the Engram reduction would leave half of these lookup rows missing.
+  // CP selects query rows independently of the table's EP row partition.
   ProcessGroup single(/*rank=*/0, /*world_size=*/1, device);
-  ParallelArgs cp_parallel(group.rank(), kWorldSize, &group);
-  cp_parallel.cp_size(kWorldSize).ep_size(kWorldSize).kv_split_size(1);
-  cp_parallel.tp_group_ = &single;
+  ParallelArgs cp_parallel(group.rank(), world_size, &group);
+  cp_parallel.cp_size(cp_size)
+      .tp_size(tp_size)
+      .ep_size(world_size)
+      .kv_split_size(1);
+  cp_parallel.tp_group_ = &tp_group;
   cp_parallel.moe_ep_group_ = &group;
-  cp_parallel.cp_group_ = &group;
+  cp_parallel.cp_group_ = &cp_group;
   ParallelArgs reference_parallel(/*rank=*/0, /*world_size=*/1, &single);
   reference_parallel.tp_group_ = &single;
   auto wkv = torch::zeros({24, 64}, torch::kBFloat16);
@@ -108,23 +115,38 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
       {"primes", torch::tensor({{7, 11}}, torch::kInt64)},
       {"offsets", torch::tensor({{0, 7}}, torch::kInt64)},
   });
-  for (bool cpu_offload : {true, false}) {
-    ModelConfig::get_instance().engram_config() =
-        cpu_offload ? R"({"placement":"cpu"})" : R"({"placement":"gpu"})";
-    DeepseekV41Engram sharded(
+  for (const std::string hash_mode :
+       {"cpu", "device_hash", "device_table", "shared"}) {
+    const bool cpu_offload = hash_mode != "device_table";
+    const bool shared = hash_mode == "shared";
+    const std::string placement = cpu_offload ? "cpu" : "device";
+    const std::string config =
+        "{\"placement\":\"" + placement + "\",\"prefill_hash\":\"" +
+        (hash_mode == "cpu" ? "cpu" : "device") + "\",\"replication\":\"" +
+        (shared ? "per_node" : "none") + "\",\"communication\":\"";
+    ModelConfig::get_instance().engram_config() = config + "allreduce\"}";
+    DeepseekV41Engram baseline(
         ModelContext(cp_parallel, args, QuantArgs(), options), /*engram_id=*/0);
+    ModelConfig::get_instance().engram_config() = R"({"placement":"device"})";
     DeepseekV41Engram reference(
         ModelContext(reference_parallel, args, QuantArgs(), options),
         /*engram_id=*/0);
-    for (auto layer : {sharded, reference}) {
+    ModelConfig::get_instance().engram_config() =
+        config + "reduce_scatter_allgather\"}";
+    DeepseekV41Engram sharded(
+        ModelContext(cp_parallel, args, QuantArgs(), options), /*engram_id=*/0);
+    for (auto layer : {sharded, baseline, reference}) {
       layer->load_state_dict(StateDict(weights));
       layer->load_hash_state(hash_weights);
       layer->verify_loaded_weights();
     }
     // Neither request lengths nor per-rank row counts are rectangular. All
     // halves are nonempty, matching the real model's CP admission contract.
-    for (const std::vector<int32_t>& lengths :
-         {std::vector<int32_t>{7, 11}, std::vector<int32_t>{5, 9, 7}}) {
+    const std::vector<std::vector<int32_t>> requests =
+        shared ? std::vector<std::vector<int32_t>>{{127, 143, 16384}}
+               : std::vector<std::vector<int32_t>>{
+                     {127, 143}, {111, 159, 127}, {2 * cp_size, 1}};
+    for (const std::vector<int32_t>& lengths : requests) {
       const int32_t total =
           std::accumulate(lengths.begin(), lengths.end(), int32_t{0});
       ModelInputParams input;
@@ -150,7 +172,7 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
       const auto positions =
           torch::tensor(position_values, options.dtype(torch::kInt64));
       const auto cp = mlu_v4_cp::build_cp_context(
-          kWorldSize, group.rank(), &group, lengths, positions);
+          cp_size, cp_group.rank(), &cp_group, lengths, positions);
       CHECK(cp.has_value());
       for (const auto& rows : cp->geometry.scatter_rows_by_rank) {
         CHECK(std::find(rows.begin(), rows.end(), cp->geometry.total_tokens) ==
@@ -164,13 +186,18 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
               .remainder(7)
               .add(1);
       const auto tokens = tokens_cpu.to(device);
+      auto prepare_host = [&](DeepseekV41Engram& layer) {
+        if (cpu_offload) {
+          layer->prepare_embeddings(tokens_cpu, input, tokens);
+        }
+      };
       const auto hidden =
           (torch::arange(total * 2 * 8, torch::kFloat32).mul(0.19).cos() * 0.7)
               .reshape({total, 2, 8})
               .to(options);
       // Check the fixture against the small independent 2/3-gram hash formula:
       // global queries touch both physical table shards before local selection.
-      std::array<int32_t, kWorldSize> shard_hits{};
+      std::vector<int32_t> shard_hits(world_size, 0);
       int64_t offset = 0;
       const auto token_values = tokens_cpu.accessor<int64_t, 1>();
       for (size_t seq = 0; seq < lengths.size(); ++seq) {
@@ -182,21 +209,67 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
           const int64_t hash2 = (token ^ (previous * 3)) % 7;
           const int64_t hash3 =
               (token ^ (previous * 3) ^ (earlier * 5)) % 11 + 7;
-          ++shard_hits[hash2 / 9];
-          ++shard_hits[hash3 / 9];
+          ++shard_hits[((hash2 + 1) * world_size - 1) / 18];
+          ++shard_hits[((hash3 + 1) * world_size - 1) / 18];
           earlier = previous;
           previous = token;
         }
       }
-      CHECK_GT(shard_hits[0], 0);
-      CHECK_GT(shard_hits[1], 0);
+      CHECK_GE(std::count_if(shard_hits.begin(),
+                             shard_hits.end(),
+                             [](int32_t hits) { return hits > 0; }),
+               2);
       const auto expected = reference->forward(hidden, tokens, input);
       const auto local_hidden = mlu_v4_cp::shard_rows(hidden, *cp);
-      // Keep the global token pack and global request histories on both ranks.
-      // Production Engram reduces their shard contributions before applying
-      // exactly the model's zigzag local_row_indices.
-      const auto actual = sharded->forward(
-          local_hidden, tokens, input, nullptr, cp->local_row_indices);
+      // Use the same globally agreed layout as the real decoder. Compare both
+      // collective policies with a full table and full-token reference.
+      const auto layout = build_engram_cp_layout(*cp, tp_size);
+      if (lengths.front() == 2 * cp_size && lengths.back() == 1) {
+        // A full zigzag request keeps every front/back half nonempty. The
+        // one-token request adds only to CP0: local sizes are [3,2,...]. At
+        // TP2, every other CP rank's second TP shard contains only padding.
+        CHECK_EQ(cp->geometry.tokens_per_rank.front(), 3);
+        CHECK(std::all_of(cp->geometry.tokens_per_rank.begin() + 1,
+                          cp->geometry.tokens_per_rank.end(),
+                          [](int32_t rows) { return rows == 2; }));
+        if (tp_size == 2) {
+          CHECK_EQ(layout.rows_per_rank, 2);
+          const int64_t valid_rows = std::clamp<int64_t>(
+              layout.local_rows - tp_group.rank() * layout.rows_per_rank,
+              0,
+              layout.rows_per_rank);
+          CHECK_EQ(valid_rows == 0, cp_group.rank() > 0 && tp_group.rank() == 1)
+              << "Fixture must exercise a padding-only TP shard";
+        }
+      }
+      std::unique_ptr<DeepseekV41EngramImpl::HashState> shared_state;
+      if (shared) {
+        // Shared tables shard heads across TP, independently of CP/EP. TP1
+        // keeps both columns; TP2 saves 33 bytes/token and crosses 512KiB.
+        const int64_t local_columns = (2 + tp_size - 1) / tp_size;
+        const int64_t saved_bytes =
+            static_cast<int64_t>(total) * (2 - local_columns) * 33;
+        CHECK_EQ(saved_bytes >= 512 * 1024, tp_size > 1);
+        shared_state = sharded->create_hash_state(total);
+        shared_state->prepare_eager(tokens_cpu, input, tokens);
+        shared_state->forward(tokens);
+        CHECK_EQ(shared_state->lookup_packed_rows().size(0),
+                 static_cast<int64_t>(total) * 2);
+      } else {
+        prepare_host(sharded);
+      }
+      const auto actual = sharded->forward(local_hidden,
+                                           tokens,
+                                           input,
+                                           {shared_state.get(), {}, &layout},
+                                           cp->local_row_indices);
+      prepare_host(baseline);
+      const auto baseline_actual = baseline->forward(local_hidden,
+                                                     tokens,
+                                                     input,
+                                                     {nullptr, {}, &layout},
+                                                     cp->local_row_indices);
+      CHECK(torch::allclose(actual, baseline_actual, 0.02, 0.02));
       const auto expected_local =
           expected.index_select(0, cp->local_row_indices);
       CHECK(torch::allclose(actual, expected_local, 0.02, 0.02))
@@ -207,6 +280,11 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
           << "Engram CP restore differs: cpu_offload=" << cpu_offload;
       CHECK_GT((expected - hidden).abs().max().item<float>(), 0.05f)
           << "Fixture must have a visible Engram contribution";
+      // Configured CP may be inactive for a batch; no row selection/layout
+      // must retain the complete result instead of scattering it.
+      prepare_host(sharded);
+      const auto replicated_actual = sharded->forward(hidden, tokens, input);
+      CHECK(torch::allclose(replicated_actual, expected, 0.02, 0.02));
       // Refresh only the per-request history, preserving tokens and geometry.
       // This exposes implementations that hash local chunks as new sequences.
       for (auto& token : input.embedding.engram_lookback_token_ids) {
@@ -215,8 +293,12 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
       const auto next_expected = reference->forward(hidden, tokens, input);
       CHECK(!torch::allclose(next_expected, expected, 0.02, 0.02))
           << "Fixture must distinguish request histories";
-      const auto next_actual = sharded->forward(
-          local_hidden, tokens, input, nullptr, cp->local_row_indices);
+      prepare_host(sharded);
+      const auto next_actual = sharded->forward(local_hidden,
+                                                tokens,
+                                                input,
+                                                {nullptr, {}, &layout},
+                                                cp->local_row_indices);
       CHECK(
           torch::allclose(next_actual,
                           next_expected.index_select(0, cp->local_row_indices),
@@ -230,24 +312,52 @@ void verify_cp_engram(ProcessGroup& group, const torch::Device& device) {
   }
 }
 
-int32_t run_child(int32_t rank, int32_t port) {
+int32_t run_child(int32_t rank,
+                  int32_t cp_size,
+                  int32_t tp_size,
+                  const std::vector<int32_t>& ports) {
+  const int32_t world_size = cp_size * tp_size;
   try {
-    if (Platform::device_count() < kWorldSize) {
+    if (Platform::device_count() < world_size) {
       return kSkip;
     }
     Device xllm_device(rank);
     xllm_device.set_device();
     const torch::Device device = xllm_device.unwrap();
     auto group = create_process_group(rank,
-                                      kWorldSize,
-                                      kWorldSize,
-                                      port,
+                                      world_size,
+                                      world_size,
+                                      ports[0],
                                       /*trans=*/false,
                                       /*host=*/"127.0.0.1",
-                                      /*group_name=*/"deepseek_v41_engram_cp",
+                                      /*group_name=*/"engram_cp_ep",
                                       device);
     CHECK(group != nullptr);
-    verify_cp_engram(*group, device);
+    ProcessGroup single(/*rank=*/0, /*world_size=*/1, device);
+    std::unique_ptr<ProcessGroup> tp_group;
+    std::unique_ptr<ProcessGroup> cp_group;
+    if (tp_size > 1) {
+      tp_group = create_process_group(rank,
+                                      world_size,
+                                      tp_size,
+                                      ports[1 + rank / tp_size],
+                                      /*trans=*/false,
+                                      /*host=*/"127.0.0.1",
+                                      /*group_name=*/"engram_cp_tp",
+                                      device);
+      cp_group = create_process_group(rank,
+                                      world_size,
+                                      cp_size,
+                                      ports[1 + cp_size + rank % tp_size],
+                                      /*trans=*/true,
+                                      /*host=*/"127.0.0.1",
+                                      /*group_name=*/"engram_cp_query",
+                                      device);
+    }
+    verify_cp_engram(*group,
+                     tp_group ? *tp_group : single,
+                     cp_group ? *cp_group : *group,
+                     device);
     xllm_device.synchronize_default_stream();
     return 0;
   } catch (const std::exception& error) {
@@ -257,14 +367,15 @@ int32_t run_child(int32_t rank, int32_t port) {
 }
 
 ChildOutcome wait_children(const std::vector<pid_t>& pids) {
-  std::array<bool, kWorldSize> finished{};
-  int32_t remaining = kWorldSize;
+  const int32_t world_size = static_cast<int32_t>(pids.size());
+  std::vector<bool> finished(world_size, false);
+  int32_t remaining = world_size;
   int32_t skipped = 0;
   bool failed = false;
   const auto deadline = std::chrono::steady_clock::now() + kChildTimeout;
   while (remaining > 0 && !failed &&
          std::chrono::steady_clock::now() < deadline) {
-    for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+    for (int32_t rank = 0; rank < world_size; ++rank) {
       if (finished[rank]) {
         continue;
       }
@@ -288,7 +399,7 @@ ChildOutcome wait_children(const std::vector<pid_t>& pids) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
-  for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+  for (int32_t rank = 0; rank < world_size; ++rank) {
     if (finished[rank]) {
       continue;
     }
@@ -299,24 +410,31 @@ ChildOutcome wait_children(const std::vector<pid_t>& pids) {
     while (::waitpid(pids[rank], &status, 0) < 0 && errno == EINTR) {
     }
   }
-  if (failed || (skipped != 0 && skipped != kWorldSize)) {
+  if (failed || (skipped != 0 && skipped != world_size)) {
     return ChildOutcome::FAILED;
   }
-  return skipped == kWorldSize ? ChildOutcome::SKIPPED : ChildOutcome::PASSED;
+  return skipped == world_size ? ChildOutcome::SKIPPED : ChildOutcome::PASSED;
 }
 
-TEST(DeepseekV41EngramCpTest,
-     TwoRanksMatchReplicatedForUnevenRequestsAndHistory) {
-  const int32_t port = net::get_local_free_port();
-  ASSERT_GT(port, 0);
+void verify_topology(int32_t cp_size, int32_t tp_size) {
+  const int32_t world_size = cp_size * tp_size;
+  std::vector<int32_t> ports;
+  ports.reserve(1 + cp_size + tp_size);
+  while (ports.size() < 1 + cp_size + tp_size) {
+    const int32_t port = net::get_local_free_port();
+    ASSERT_GT(port, 0);
+    if (std::find(ports.begin(), ports.end(), port) == ports.end()) {
+      ports.emplace_back(port);
+    }
+  }
   std::vector<pid_t> pids;
-  pids.reserve(kWorldSize);
+  pids.reserve(world_size);
   // The parent never initializes MLU; both ranks select their device after
   // fork.
-  for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+  for (int32_t rank = 0; rank < world_size; ++rank) {
     const pid_t pid = ::fork();
     if (pid == 0) {
-      _exit(run_child(rank, port));
+      _exit(run_child(rank, cp_size, tp_size, ports));
     }
     if (pid < 0) {
       for (pid_t child : pids) {
@@ -333,9 +451,67 @@ TEST(DeepseekV41EngramCpTest,
   }
   const ChildOutcome outcome = wait_children(pids);
   if (outcome == ChildOutcome::SKIPPED) {
-    GTEST_SKIP() << "Requires two visible MLU devices";
+    GTEST_SKIP() << "Requires " << world_size << " visible MLU devices";
   }
   EXPECT_EQ(outcome, ChildOutcome::PASSED);
+}
+
+TEST(DeepseekV41EngramCpTest,
+     TwoRanksMatchReplicatedForUnevenRequestsAndHistory) {
+  verify_topology(/*cp_size=*/2, /*tp_size=*/1);
+}
+
+TEST(DeepseekV41EngramCpTest,
+     Cp8MatchesAllreduceAndReplicatedForUnevenRequests) {
+  verify_topology(/*cp_size=*/8, /*tp_size=*/1);
+}
+
+TEST(DeepseekV41EngramCpTest,
+     Cp4Tp2MatchesAllreduceAndReplicatedForUnevenRequests) {
+  verify_topology(/*cp_size=*/4, /*tp_size=*/2);
+}
+
+TEST(DeepseekV41EngramCpTest, LayoutPreservesUnevenRowsAndEmptyCpRanks) {
+  // Exercise the layout contract independently of model CP admission, which
+  // rejects batches requiring dummy query rows. TP neighbours must receive
+  // consecutive portions of each CP rank, including its trailing padding.
+  for (int32_t cp_size : {4, 8}) {
+    for (int32_t tp_size : {1, 2}) {
+      mlu_v4_cp::DeepseekV4CpContext context;
+      context.geometry.total_tokens = 6;
+      context.geometry.rows_by_rank = {{4, 0, 3}, {}, {1}, {2, 5}};
+      context.geometry.rows_by_rank.resize(cp_size);
+      auto source = torch::arange(6 * 2 * 3, torch::kFloat32).view({6, 2, 3});
+      for (int32_t cp_rank = 0; cp_rank < cp_size; ++cp_rank) {
+        SCOPED_TRACE(::testing::Message() << "CP=" << cp_size << " TP="
+                                          << tp_size << " cp_rank=" << cp_rank);
+        context.cp_rank = cp_rank;
+        context.local_row_indices = torch::tensor(
+            context.geometry.rows_by_rank[cp_rank], torch::kInt64);
+        const auto layout = build_engram_cp_layout(context, tp_size);
+        const int64_t expected_rows_per_rank = (3 + tp_size - 1) / tp_size;
+        EXPECT_EQ(layout.rows_per_rank, expected_rows_per_rank);
+        EXPECT_EQ(layout.local_rows, context.local_row_indices.numel());
+        EXPECT_EQ(layout.cp_rank, cp_rank);
+        EXPECT_EQ(layout.cp_size, cp_size);
+        EXPECT_EQ(layout.tp_size, tp_size);
+        ASSERT_EQ(layout.pack_indices.numel(),
+                  cp_size * tp_size * expected_rows_per_rank);
+        EXPECT_TRUE(layout.pack_indices.ge(0).all().item<bool>());
+        EXPECT_TRUE(layout.pack_indices.lt(6).all().item<bool>());
+        auto packed = source.index_select(0, layout.pack_indices);
+        auto rank_shards =
+            packed.view({cp_size, tp_size, expected_rows_per_rank, 2, 3});
+        // allgather_base's [TP,rows,C,D] output can flatten its first two
+        // dimensions directly without changing the token order.
+        auto local = rank_shards.select(0, cp_rank)
+                         .flatten(0, 1)
+                         .narrow(0, 0, layout.local_rows);
+        EXPECT_TRUE(torch::equal(
+            local, source.index_select(0, context.local_row_indices)));
+      }
+    }
+  }
 }
 
 }  // namespace

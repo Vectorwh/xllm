@@ -822,6 +822,12 @@ struct ExecutionBatchMetadata {
 };
 
 struct ModelEmbeddingInput {
+  // Optional upstream host token view. Device-side replacement or generation
+  // can make it stale: it never describes speculative rows (see
+  // has_device_rewritten_tokens), and consumers must still validate its shape
+  // and placeholder ids before reuse.
+  torch::Tensor input_token_ids_host;
+
   // input embedding
   mutable torch::Tensor input_embedding;
 
@@ -869,6 +875,7 @@ struct ModelEmbeddingInput {
         safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
     out.engram_lookback_token_ids = engram_lookback_token_ids;
+    out.input_token_ids_host = input_token_ids_host;
     out.extra_token_ids = extra_token_ids;
     out.engram_history = engram_history;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -1402,5 +1409,12 @@ struct ModelInputParams {
   // masking. Undefined when adapter_ids is empty (pure-base batch).
   torch::Tensor adapter_ids_per_token;
 };
+
+// Speculative verification and DFlash proposal rows are expanded or replaced
+// on device, so host token snapshots taken upstream do not describe them.
+inline bool has_device_rewritten_tokens(const ModelInputParams& params) {
+  return params.is_spec_verify || params.use_dflash_proposal_attention ||
+         params.meta.spec_verify_width > 1;
+}
 
 }  // namespace xllm

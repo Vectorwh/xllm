@@ -1,0 +1,1028 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/engram_hash/launcher.h"
+
+namespace {
+constexpr int32_t kTile = 2048;
+// Capacity-based caches, with the generic path retained for larger metadata.
+constexpr int32_t kRequestCache = 32768;
+constexpr int32_t kHistoryCache = 2048;
+constexpr int32_t kOutputCache = 8192;
+constexpr int32_t kParameterCache = 1024;
+constexpr int64_t kImageSentinel = 129264;
+constexpr int64_t kImagePad = 129265;
+// Lane path capacities: lanes = tile tokens x hash columns.
+constexpr int32_t kLanes = 4096;
+constexpr int32_t kLaneTokens = 256;
+constexpr int32_t kMaxNgram = 8;
+// The generic path needs the larger pool.
+constexpr int32_t kPoolBytes =
+    kTile * (7 * 8 + 8 + 6 * 4) + 2 * kOutputCache * 8;
+// Lane path layout: int32 metadata, window planes, [ngram][tokens] lanes and
+// [tokens][columns] lanes (see hash_lanes).
+constexpr int32_t kLaneWindow = kLaneTokens + kMaxNgram + 32;
+constexpr int32_t kLanePoolBytes =
+    8 * kLaneTokens * 4 + 2 * kLaneWindow * 4 +
+    6 * kMaxNgram * kLaneTokens * 4 + kLaneWindow * 8 +
+    5 * kMaxNgram * kLaneTokens * 8 + 2 * kLanes * 8 + 6 * kLanes * 4;
+static_assert(kLanePoolBytes <= kPoolBytes, "lane buffers exceed the pool");
+
+__mlu_func__ void broadcast_parameter(int64_t* dst,
+                                      const int64_t* src,
+                                      int32_t count,
+                                      bool cached) {
+  if (cached) {
+    __memcpy(dst, src, sizeof(int64_t), NRAM2NRAM);
+  } else {
+    __memcpy(dst, src, sizeof(int64_t), GDRAM2NRAM);
+  }
+  __memcpy(
+      dst + 1, dst, sizeof(int64_t), NRAM2NRAM, sizeof(int64_t), 0, count - 2);
+}
+
+// Generic per-column path. It accepts any int64 modulus/offset and vocab and
+// is selected when a layer's parameters exceed the 32-bit lane arithmetic.
+template <typename Token>
+__mlu_func__ void hash_generic(const Token* tokens,
+                               const int32_t* starts,
+                               const int64_t* history,
+                               const int64_t* token_map,
+                               int64_t* output,
+                               int64_t tokens_count,
+                               int32_t sequences,
+                               int32_t layers,
+                               int32_t ngram,
+                               int32_t columns,
+                               int64_t vocab,
+                               int64_t pad_token,
+                               const int64_t* multiplier_values,
+                               const int64_t* prime_values,
+                               const int64_t* offset_values,
+                               bool cache_parameters,
+                               const int32_t* cached_starts,
+                               bool cache_starts,
+                               const int64_t* cached_history,
+                               bool cache_history,
+                               char* pool) {
+  int64_t* compressed = reinterpret_cast<int64_t*>(pool);
+  int64_t* rolling = compressed + kTile;
+  int64_t* products = rolling + kTile;
+  int64_t* result = products + kTile;
+  int64_t* parameter = result + kTile;
+  uint64_t* map_offsets = reinterpret_cast<uint64_t*>(parameter + kTile);
+  int64_t* raw_values = reinterpret_cast<int64_t*>(map_offsets + kTile);
+  Token* raw_tokens = reinterpret_cast<Token*>(raw_values + kTile);
+  uint32_t* low_bits =
+      reinterpret_cast<uint32_t*>(raw_values + 2 * static_cast<int64_t>(kTile));
+  int32_t* high_bits = reinterpret_cast<int32_t*>(low_bits + kTile);
+  uint32_t* mask = reinterpret_cast<uint32_t*>(high_bits + kTile);
+  uint32_t* scratch = mask + kTile;
+  uint32_t* modular_accum = scratch + kTile;
+  uint32_t* blocked = modular_accum + kTile;
+  int64_t* packed_output = reinterpret_cast<int64_t*>(blocked + kTile);
+  int64_t* transposed_output = packed_output + kOutputCache;
+  // Spread short decode batches across cores; retain vector-sized chunks for
+  // long prefills. The tile is bounded by NRAM capacity, not a case list.
+  const int64_t desired_tile = (tokens_count * layers + taskDim - 1) / taskDim;
+  const int32_t tile =
+      static_cast<int32_t>(desired_tile < kTile ? desired_tile : kTile);
+  const int64_t tiles = (tokens_count + tile - 1) / tile;
+  const int32_t depth = ngram - 1;
+  const int32_t heads = columns / depth;
+  for (int64_t job = taskId; job < tiles * layers; job += taskDim) {
+    const int32_t layer = static_cast<int32_t>(job / tiles);
+    const int64_t first = job % tiles * tile;
+    const int32_t count = static_cast<int32_t>(
+        tokens_count - first < tile ? tokens_count - first : tile);
+    const int32_t aligned = (count + 31) / 32 * 32;
+    const bool pack_output =
+        static_cast<int64_t>(count) * columns <= kOutputCache;
+    int32_t lo = 0;
+    int32_t hi = sequences;
+    while (lo < hi) {
+      const int32_t mid = lo + (hi - lo) / 2;
+      const int32_t boundary = cache_starts ? cached_starts[mid] : starts[mid];
+      if (boundary <= first) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    const int32_t first_sequence = lo - 1;
+    __bang_write_value(blocked, aligned, 0U);
+    __bang_write_value(rolling, aligned, static_cast<int64_t>(0));
+    for (int32_t shift = 0; shift < ngram; ++shift) {
+      __bang_write_value(raw_values, aligned, static_cast<int64_t>(-1));
+      const int32_t prefix =
+          first < shift ? static_cast<int32_t>(shift - first) : 0;
+      if (prefix < count) {
+        if constexpr (sizeof(Token) == sizeof(int64_t)) {
+          __memcpy(raw_values + prefix,
+                   tokens + first + prefix - shift,
+                   (count - prefix) * sizeof(int64_t),
+                   GDRAM2NRAM);
+        } else {
+          __bang_write_value(raw_tokens, aligned, static_cast<Token>(-1));
+          __memcpy(raw_tokens + prefix,
+                   tokens + first + prefix - shift,
+                   (count - prefix) * sizeof(Token),
+                   GDRAM2NRAM);
+          __bang_lt_scalar(high_bits, raw_tokens, 0, aligned);
+          __bang_mul_scalar(high_bits, high_bits, -1, aligned);
+          __memcpy(raw_values,
+                   raw_tokens,
+                   sizeof(int32_t),
+                   NRAM2NRAM,
+                   sizeof(int64_t),
+                   sizeof(int32_t),
+                   aligned - 1);
+          __memcpy(reinterpret_cast<int32_t*>(raw_values) + 1,
+                   high_bits,
+                   sizeof(int32_t),
+                   NRAM2NRAM,
+                   sizeof(int64_t),
+                   sizeof(int32_t),
+                   aligned - 1);
+        }
+      }
+      // Only request boundaries need scalar history patches. Interior tokens
+      // stay in contiguous vectors, independently of total prefill length.
+      for (int32_t seq = first_sequence; seq < sequences; ++seq) {
+        const int32_t begin = cache_starts ? cached_starts[seq] : starts[seq];
+        if (begin >= first + count) {
+          break;
+        }
+        const int32_t next =
+            cache_starts ? cached_starts[seq + 1] : starts[seq + 1];
+        const int64_t end = next < begin + shift ? next : begin + shift;
+        for (int64_t position = first > begin ? first : begin;
+             position < end && position < first + count;
+             ++position) {
+          const int64_t index = static_cast<int64_t>(seq) * depth + shift -
+                                (position - begin) - 1;
+          if (cache_history) {
+            __memcpy(raw_values + position - first,
+                     cached_history + index,
+                     sizeof(int64_t),
+                     NRAM2NRAM);
+          } else {
+            __memcpy(raw_values + position - first,
+                     history + index,
+                     sizeof(int64_t),
+                     GDRAM2NRAM);
+          }
+        }
+      }
+      if (vocab <= 0xffffffffLL) {
+        __memcpy(low_bits,
+                 raw_values,
+                 sizeof(uint32_t),
+                 NRAM2NRAM,
+                 sizeof(uint32_t),
+                 sizeof(int64_t),
+                 aligned - 1);
+        __memcpy(high_bits,
+                 reinterpret_cast<int32_t*>(raw_values) + 1,
+                 sizeof(int32_t),
+                 NRAM2NRAM,
+                 sizeof(int32_t),
+                 sizeof(int64_t),
+                 aligned - 1);
+        __bang_eq_scalar(
+            mask, low_bits, static_cast<uint32_t>(kImageSentinel), aligned);
+        __bang_eq_scalar(
+            scratch, low_bits, static_cast<uint32_t>(kImagePad), aligned);
+        __bang_bor(mask, mask, scratch, aligned);
+        __bang_eq_scalar(
+            reinterpret_cast<int32_t*>(scratch), high_bits, 0, aligned);
+        __bang_band(mask, mask, scratch, aligned);
+        __bang_lt_scalar(
+            reinterpret_cast<int32_t*>(scratch), high_bits, 0, aligned);
+        __bang_bor(mask, mask, scratch, aligned);
+        __bang_bor(blocked, blocked, mask, aligned);
+        __bang_mineq_scalar(
+            low_bits, low_bits, static_cast<uint32_t>(vocab - 1), aligned);
+        __bang_ne_scalar(
+            reinterpret_cast<int32_t*>(mask), high_bits, 0, aligned);
+        __bang_write_value(scratch, aligned, static_cast<uint32_t>(vocab - 1));
+        __bang_sub(scratch, scratch, low_bits, aligned);
+        __bang_mul(scratch, scratch, mask, aligned);
+        __bang_add(low_bits, low_bits, scratch, aligned);
+        __bang_write_value(scratch, aligned, static_cast<uint32_t>(pad_token));
+        __bang_sub(scratch, scratch, low_bits, aligned);
+        __bang_mul(scratch, scratch, blocked, aligned);
+        __bang_add(low_bits, low_bits, scratch, aligned);
+        __bang_write_value(map_offsets, aligned, static_cast<uint64_t>(0));
+        __memcpy(map_offsets,
+                 low_bits,
+                 sizeof(uint32_t),
+                 NRAM2NRAM,
+                 sizeof(uint64_t),
+                 sizeof(uint32_t),
+                 aligned - 1);
+        __bang_mul_scalar(map_offsets,
+                          map_offsets,
+                          static_cast<uint64_t>(sizeof(int64_t)),
+                          aligned);
+      } else {
+        for (int32_t row = 0; row < count; ++row) {
+          const int64_t token = raw_values[row];
+          blocked[row] = blocked[row] || token < 0 || token == kImageSentinel ||
+                         token == kImagePad;
+          const int64_t id =
+              blocked[row] ? pad_token : (token < vocab ? token : vocab - 1);
+          map_offsets[row] = static_cast<uint64_t>(id) * sizeof(int64_t);
+        }
+      }
+      __bang_write_value(compressed, aligned, static_cast<int64_t>(0));
+      __gather(compressed,
+               token_map,
+               map_offsets,
+               sizeof(int64_t),
+               GDRAM2NRAM,
+               sizeof(int64_t),
+               count);
+      broadcast_parameter(
+          parameter,
+          multiplier_values + static_cast<int64_t>(layer) * ngram + shift,
+          aligned,
+          cache_parameters);
+      __bang_mul(products, compressed, parameter, aligned);
+      __bang_bxor(rolling, rolling, products, aligned);
+      if (shift == 0) {
+        continue;
+      }
+      for (int32_t head = 0; head < heads; ++head) {
+        const int32_t column = (shift - 1) * heads + head;
+        const int64_t index = static_cast<int64_t>(layer) * columns + column;
+        broadcast_parameter(
+            parameter, prime_values + index, aligned, cache_parameters);
+        const auto* modulus_bits = reinterpret_cast<const uint32_t*>(parameter);
+        const uint32_t modulus = modulus_bits[0];
+        const auto* offset_bits =
+            reinterpret_cast<const uint32_t*>(offset_values + index);
+        const uint32_t offset_low = offset_bits[0];
+        const bool narrow_offset =
+            modulus_bits[1] == 0 && modulus <= 0x00ffffffU &&
+            offset_bits[1] == 0 &&
+            static_cast<uint64_t>(modulus) + offset_low <= 0xffffffffULL;
+        if (modulus_bits[1] == 0 && modulus <= 0x00ffffffU) {
+          __memcpy(low_bits,
+                   rolling,
+                   sizeof(uint32_t),
+                   NRAM2NRAM,
+                   sizeof(uint32_t),
+                   sizeof(int64_t),
+                   aligned - 1);
+          __memcpy(high_bits,
+                   reinterpret_cast<int32_t*>(rolling) + 1,
+                   sizeof(uint32_t),
+                   NRAM2NRAM,
+                   sizeof(uint32_t),
+                   sizeof(int64_t),
+                   aligned - 1);
+          __bang_write_value(modular_accum, aligned, 0U);
+          // Select the widest radix whose largest intermediate fits uint32.
+          // The number of digits follows the modulus, never the workload shape.
+          int32_t radix_bits = 8;
+          while (radix_bits < 16 &&
+                 modulus <= (0xffffffffU >> (radix_bits + 1))) {
+            ++radix_bits;
+          }
+          const uint32_t radix = 1U << radix_bits;
+          for (int32_t bit = 63 / radix_bits * radix_bits; bit >= 0;
+               bit -= radix_bits) {
+            const uint32_t* word =
+                bit >= 32 ? reinterpret_cast<uint32_t*>(high_bits) : low_bits;
+            __bang_srl(scratch, word, static_cast<uint32_t>(bit % 32), aligned);
+            if (bit < 32 && bit + radix_bits > 32) {
+              __bang_sll(mask,
+                         reinterpret_cast<uint32_t*>(high_bits),
+                         static_cast<uint32_t>(32 - bit),
+                         aligned);
+              __bang_bor(scratch, scratch, mask, aligned);
+            }
+            __bang_band_scalar(scratch, scratch, radix - 1, aligned);
+            __bang_mul_scalar(modular_accum, modular_accum, radix, aligned);
+            __bang_add(modular_accum, modular_accum, scratch, aligned);
+            __bang_rem(modular_accum, modular_accum, modulus, aligned);
+          }
+          if (narrow_offset) {
+            __bang_add_scalar(
+                modular_accum, modular_accum, offset_low, aligned);
+          }
+          __bang_write_value(result, aligned, static_cast<int64_t>(0));
+          __memcpy(result,
+                   modular_accum,
+                   sizeof(uint32_t),
+                   NRAM2NRAM,
+                   sizeof(int64_t),
+                   sizeof(uint32_t),
+                   aligned - 1);
+        } else {
+          __bang_rem(result, rolling, parameter, aligned);
+        }
+        if (!narrow_offset) {
+          broadcast_parameter(
+              parameter, offset_values + index, aligned, cache_parameters);
+          __bang_add(result, result, parameter, aligned);
+        }
+        if (pack_output) {
+          __memcpy(packed_output + static_cast<int64_t>(column) * count,
+                   result,
+                   count * sizeof(int64_t),
+                   NRAM2NRAM);
+        } else {
+          __memcpy(output +
+                       (static_cast<int64_t>(layer) * tokens_count + first) *
+                           columns +
+                       column,
+                   result,
+                   sizeof(int64_t),
+                   NRAM2GDRAM,
+                   columns * sizeof(int64_t),
+                   sizeof(int64_t),
+                   count - 1);
+        }
+      }
+    }
+    if (pack_output) {
+      __bang_transpose(transposed_output, packed_output, columns, count);
+      __memcpy(output + (static_cast<int64_t>(layer) * tokens_count + first) *
+                            columns,
+               transposed_output,
+               static_cast<int64_t>(count) * columns * sizeof(int64_t),
+               NRAM2GDRAM);
+    }
+  }
+}
+
+// Lane path: one vector lane per (token, hash column). Short decode batches
+// then issue a few hundred vector instructions per layer instead of one
+// modular-reduction chain per column, and long prefills keep NRAM-sized
+// token tiles. All n-gram shifts are processed together as [ngram][tokens]
+// int64 lanes; request boundaries are resolved with a vector prefix-max scan,
+// so many one-token sequences no longer cost scalar work. All values match
+// the generic path bit for bit: the modular reduction is exact integer
+// arithmetic in uint32.
+template <typename Token>
+__mlu_func__ void hash_lanes(const Token* tokens,
+                             const int64_t* history,
+                             const int64_t* token_map,
+                             int64_t* output,
+                             int64_t tokens_count,
+                             int32_t sequences,
+                             int32_t layers,
+                             int32_t ngram,
+                             int32_t columns,
+                             int64_t vocab,
+                             int64_t pad_token,
+                             const int64_t* multiplier_values,
+                             const uint32_t* modulus_words,
+                             const uint32_t* offset_words,
+                             int32_t radix_bits,
+                             const int32_t* cached_starts,
+                             const int64_t* cached_history,
+                             bool cache_history,
+                             char* pool) {
+  const int32_t depth = ngram - 1;
+  const int32_t heads = columns / depth;
+  // Tile tokens so that every core receives work, bounded by lane capacity.
+  const int32_t max_tile_tokens =
+      kLanes / columns < kLaneTokens ? kLanes / columns : kLaneTokens;
+  // Balance rounds: the fewest rounds that fit lane capacity, then the
+  // smallest tile that still finishes in that many rounds.
+  const int64_t work = tokens_count * layers;
+  const int64_t round_capacity =
+      static_cast<int64_t>(taskDim) * max_tile_tokens;
+  const int64_t rounds = (work + round_capacity - 1) / round_capacity;
+  const int64_t slots = static_cast<int64_t>(taskDim) * rounds;
+  const int64_t desired_tile = (work + slots - 1) / slots;
+  const int32_t tile = static_cast<int32_t>(
+      desired_tile < max_tile_tokens ? desired_tile : max_tile_tokens);
+  const int64_t tiles = (tokens_count + tile - 1) / tile;
+  if (taskId >= tiles * layers) {
+    return;
+  }
+  constexpr int32_t kWindow = kLaneWindow;
+  constexpr int32_t kShiftLanes = kMaxNgram * kLaneTokens;
+  int32_t* iota = reinterpret_cast<int32_t*>(pool);
+  int32_t* seq_a = iota + kLaneTokens;  // kLaneTokens pad + kLaneTokens
+  int32_t* seq_b = seq_a + 2 * kLaneTokens;
+  int32_t* start_values = seq_b + 2 * kLaneTokens;
+  int32_t* positions = start_values + kLaneTokens;
+  int32_t* history_base = positions + kLaneTokens;
+  uint32_t* window_words =
+      reinterpret_cast<uint32_t*>(history_base + kLaneTokens);
+  // [ngram][aligned] lanes.
+  int32_t* shift_ids = reinterpret_cast<int32_t*>(window_words + 2 * kWindow);
+  uint32_t* window_offsets =
+      reinterpret_cast<uint32_t*>(shift_ids + kShiftLanes);
+  int32_t* lane_positions =
+      reinterpret_cast<int32_t*>(window_offsets + kShiftLanes);
+  int32_t* lane_history = lane_positions + kShiftLanes;
+  uint32_t* map_offsets =
+      reinterpret_cast<uint32_t*>(lane_history + kShiftLanes);
+  int64_t* window64 = reinterpret_cast<int64_t*>(map_offsets + 2 * kShiftLanes);
+  int64_t* values = window64 + kWindow;
+  int64_t* history_values = values + kShiftLanes;
+  int64_t* select = history_values + kShiftLanes;
+  int64_t* blocked = select + kShiftLanes;
+  int64_t* multiplier_lanes = blocked + kShiftLanes;
+  int64_t* replicated = multiplier_lanes + kShiftLanes;
+  int64_t* transposed = replicated + kLanes;
+  uint32_t* lane_words = reinterpret_cast<uint32_t*>(transposed + kLanes);
+  uint32_t* lane_digit = lane_words + 2 * kLanes;
+  uint32_t* lane_accum = lane_digit + kLanes;
+  uint32_t* lane_modulus = lane_accum + kLanes;
+  uint32_t* lane_offset = lane_modulus + kLanes;
+
+  // iota[0, kLaneTokens) by doubling.
+  iota[0] = 0;
+  for (int32_t filled = 1; filled < kLaneTokens; filled *= 2) {
+    __bang_add_scalar(iota + filled, iota, filled, filled);
+  }
+  __bang_write_value(seq_a, kLaneTokens, -1);
+  __bang_write_value(seq_b, kLaneTokens, -1);
+  // Lanes beyond a tile's valid lanes keep a nonzero modulus.
+  __bang_write_value(lane_modulus, kLanes, 1U);
+  __bang_write_value(lane_offset, kLanes, 0U);
+  int32_t cached_layer = -1;
+  int32_t cached_count = -1;
+  const int64_t last_history =
+      sequences > 0 ? static_cast<int64_t>(sequences) * depth - 1 : 0;
+  for (int64_t job = taskId; job < tiles * layers; job += taskDim) {
+    const int32_t layer = static_cast<int32_t>(job / tiles);
+    const int64_t first = job % tiles * tile;
+    const int32_t count = static_cast<int32_t>(
+        tokens_count - first < tile ? tokens_count - first : tile);
+    const int32_t aligned = (count + 31) / 32 * 32;
+    const int32_t shift_lanes = ngram * aligned;
+    const int32_t lanes = count * columns;
+    const int32_t aligned_lanes = (lanes + 31) / 32 * 32;
+    if (count != cached_count) {
+      // Per-row shift ids and window byte offsets (depth - shift + token).
+      for (int32_t shift = 0; shift < ngram; ++shift) {
+        __bang_write_value(shift_ids + shift * aligned, aligned, shift);
+        __bang_add_scalar(
+            reinterpret_cast<int32_t*>(window_offsets) + shift * aligned,
+            iota,
+            depth - shift,
+            aligned);
+      }
+      __bang_mul_scalar(window_offsets,
+                        window_offsets,
+                        static_cast<uint32_t>(sizeof(int64_t)),
+                        shift_lanes);
+    }
+    if (layer != cached_layer || count != cached_count) {
+      for (int32_t shift = 0; shift < ngram; ++shift) {
+        broadcast_parameter(multiplier_lanes + shift * aligned,
+                            multiplier_values + layer * ngram + shift,
+                            aligned < 2 ? 2 : aligned,
+                            /*cached=*/true);
+      }
+      __memcpy(lane_modulus,
+               modulus_words + layer * columns,
+               columns * sizeof(uint32_t),
+               NRAM2NRAM,
+               columns * sizeof(uint32_t),
+               0,
+               count - 1);
+      __memcpy(lane_offset,
+               offset_words + layer * columns,
+               columns * sizeof(uint32_t),
+               NRAM2NRAM,
+               columns * sizeof(uint32_t),
+               0,
+               count - 1);
+      cached_layer = layer;
+      cached_count = count;
+    }
+    // Token window [first - depth, first + count) as int64.
+    const int64_t window_first = first - depth;
+    const int64_t load_first = window_first > 0 ? window_first : 0;
+    const int32_t skipped = static_cast<int32_t>(load_first - window_first);
+    const int32_t window_count = count + depth;
+    const int32_t aligned_window = (window_count + 31) / 32 * 32;
+    if constexpr (sizeof(Token) == sizeof(int32_t)) {
+      uint32_t* low = window_words;
+      uint32_t* high = window_words + aligned_window;
+      if (skipped > 0) {
+        __bang_write_value(low, 32, 0xffffffffU);
+      }
+      __memcpy(low + skipped,
+               tokens + load_first,
+               (window_count - skipped) * sizeof(int32_t),
+               GDRAM2NRAM);
+      __bang_lt_scalar(reinterpret_cast<int32_t*>(high),
+                       reinterpret_cast<int32_t*>(low),
+                       0,
+                       aligned_window);
+      __bang_mul_scalar(high, high, 0xffffffffU, aligned_window);
+      __bang_transpose(reinterpret_cast<uint32_t*>(window64),
+                       window_words,
+                       2,
+                       aligned_window);
+    } else {
+      if (skipped > 0) {
+        __bang_write_value(window64, 32, static_cast<int64_t>(-1));
+      }
+      __memcpy(window64 + skipped,
+               tokens + load_first,
+               (window_count - skipped) * sizeof(int64_t),
+               GDRAM2NRAM);
+    }
+    // Sequence of each token: markers at request starts, then prefix max.
+    int32_t lo = 0;
+    int32_t hi = sequences;
+    while (lo < hi) {
+      const int32_t mid = lo + (hi - lo) / 2;
+      if (cached_starts[mid] <= first) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    int32_t* scan = seq_a + kLaneTokens;
+    int32_t* other = seq_b + kLaneTokens;
+    __bang_write_value(scan, aligned, -1);
+    scan[0] = lo - 1;
+    for (int32_t seq = lo;
+         seq < sequences && cached_starts[seq] < first + count;
+         ++seq) {
+      scan[cached_starts[seq] - first] = seq;
+    }
+    for (int32_t distance = 1; distance < count; distance *= 2) {
+      __bang_maxequal(other, scan, scan - distance, aligned);
+      int32_t* swap = scan;
+      scan = other;
+      other = swap;
+    }
+    uint32_t* start_offsets = reinterpret_cast<uint32_t*>(lane_history);
+    __bang_mul_scalar(reinterpret_cast<int32_t*>(start_offsets),
+                      scan,
+                      static_cast<int32_t>(sizeof(int32_t)),
+                      aligned);
+    __gather(start_values,
+             cached_starts,
+             start_offsets,
+             sizeof(int32_t),
+             NRAM2NRAM,
+             sizeof(int32_t),
+             count);
+    __bang_sub(positions, iota, start_values, aligned);
+    __bang_add_scalar(
+        positions, positions, static_cast<int32_t>(first), aligned);
+    __bang_mul_scalar(history_base, scan, depth, aligned);
+    __bang_sub(history_base, history_base, positions, aligned);
+    __bang_sub_scalar(history_base, history_base, 1, aligned);
+    // Shift s reads token i - s, or history slot base + s before the request.
+    __memcpy(lane_positions,
+             positions,
+             aligned * sizeof(int32_t),
+             NRAM2NRAM,
+             aligned * sizeof(int32_t),
+             0,
+             ngram - 1);
+    __memcpy(lane_history,
+             history_base,
+             aligned * sizeof(int32_t),
+             NRAM2NRAM,
+             aligned * sizeof(int32_t),
+             0,
+             ngram - 1);
+    __bang_lt(lane_positions, lane_positions, shift_ids, shift_lanes);
+    __bang_add(lane_history, lane_history, shift_ids, shift_lanes);
+    __bang_maxeq_scalar(lane_history, lane_history, 0, shift_lanes);
+    __bang_mineq_scalar(lane_history,
+                        lane_history,
+                        static_cast<int32_t>(last_history),
+                        shift_lanes);
+    __bang_mul_scalar(lane_history,
+                      lane_history,
+                      static_cast<int32_t>(sizeof(int64_t)),
+                      shift_lanes);
+    // Word planes [2][lanes]: gather low and high halves directly.
+    uint32_t* window_low = reinterpret_cast<uint32_t*>(select);
+    uint32_t* window_high = window_low + shift_lanes;
+    uint32_t* history_low = reinterpret_cast<uint32_t*>(blocked);
+    uint32_t* history_high = history_low + shift_lanes;
+    const uint32_t* window_source = reinterpret_cast<uint32_t*>(window64);
+    __gather(window_low,
+             window_source,
+             window_offsets,
+             sizeof(uint32_t),
+             NRAM2NRAM,
+             sizeof(uint32_t),
+             shift_lanes);
+    __gather(window_high,
+             window_source + 1,
+             window_offsets,
+             sizeof(uint32_t),
+             NRAM2NRAM,
+             sizeof(uint32_t),
+             shift_lanes);
+    const uint32_t* history_offsets = reinterpret_cast<uint32_t*>(lane_history);
+    if (cache_history) {
+      const uint32_t* source =
+          reinterpret_cast<const uint32_t*>(cached_history);
+      __gather(history_low,
+               source,
+               history_offsets,
+               sizeof(uint32_t),
+               NRAM2NRAM,
+               sizeof(uint32_t),
+               shift_lanes);
+      __gather(history_high,
+               source + 1,
+               history_offsets,
+               sizeof(uint32_t),
+               NRAM2NRAM,
+               sizeof(uint32_t),
+               shift_lanes);
+    } else {
+      const uint32_t* source = reinterpret_cast<const uint32_t*>(history);
+      __gather(history_low,
+               source,
+               history_offsets,
+               sizeof(uint32_t),
+               GDRAM2NRAM,
+               sizeof(uint32_t),
+               shift_lanes);
+      __gather(history_high,
+               source + 1,
+               history_offsets,
+               sizeof(uint32_t),
+               GDRAM2NRAM,
+               sizeof(uint32_t),
+               shift_lanes);
+    }
+    // value = window + (history - window) * (position < shift), mod 2^32.
+    const uint32_t* before = reinterpret_cast<uint32_t*>(lane_positions);
+    __bang_sub(history_low, history_low, window_low, 2 * shift_lanes);
+    __bang_mul(history_low, history_low, before, shift_lanes);
+    __bang_mul(history_high, history_high, before, shift_lanes);
+    __bang_add(window_low, window_low, history_low, 2 * shift_lanes);
+    // Sentinels and negative ids block the remaining n-gram suffix.
+    uint32_t* flags = reinterpret_cast<uint32_t*>(history_values);
+    uint32_t* temporary = flags + shift_lanes;
+    uint32_t* lane_blocked = history_low;
+    __bang_eq_scalar(lane_blocked,
+                     window_low,
+                     static_cast<uint32_t>(kImageSentinel),
+                     shift_lanes);
+    __bang_eq_scalar(
+        temporary, window_low, static_cast<uint32_t>(kImagePad), shift_lanes);
+    __bang_bor(lane_blocked, lane_blocked, temporary, shift_lanes);
+    __bang_eq_scalar(reinterpret_cast<int32_t*>(temporary),
+                     reinterpret_cast<int32_t*>(window_high),
+                     0,
+                     shift_lanes);
+    __bang_band(lane_blocked, lane_blocked, temporary, shift_lanes);
+    __bang_lt_scalar(reinterpret_cast<int32_t*>(temporary),
+                     reinterpret_cast<int32_t*>(window_high),
+                     0,
+                     shift_lanes);
+    __bang_bor(lane_blocked, lane_blocked, temporary, shift_lanes);
+    for (int32_t shift = 1; shift < ngram; ++shift) {
+      __bang_bor(lane_blocked + shift * aligned,
+                 lane_blocked + shift * aligned,
+                 lane_blocked + (shift - 1) * aligned,
+                 aligned);
+    }
+    // Clamp out-of-vocabulary ids, then substitute the pad id when blocked.
+    uint32_t* id = map_offsets;
+    __bang_mineq_scalar(
+        id, window_low, static_cast<uint32_t>(vocab - 1), shift_lanes);
+    __bang_ne_scalar(reinterpret_cast<int32_t*>(flags),
+                     reinterpret_cast<int32_t*>(window_high),
+                     0,
+                     shift_lanes);
+    __bang_mul_scalar(temporary, id, 0xffffffffU, shift_lanes);
+    __bang_add_scalar(
+        temporary, temporary, static_cast<uint32_t>(vocab - 1), shift_lanes);
+    __bang_mul(temporary, temporary, flags, shift_lanes);
+    __bang_add(id, id, temporary, shift_lanes);
+    __bang_mul_scalar(temporary, id, 0xffffffffU, shift_lanes);
+    __bang_add_scalar(
+        temporary, temporary, static_cast<uint32_t>(pad_token), shift_lanes);
+    __bang_mul(temporary, temporary, lane_blocked, shift_lanes);
+    __bang_add(id, id, temporary, shift_lanes);
+    __bang_mul_scalar(
+        map_offsets, id, static_cast<uint32_t>(sizeof(int64_t)), shift_lanes);
+    // Only valid token lanes touch the table.
+    __sync_compute();
+    for (int32_t shift = 0; shift < ngram; ++shift) {
+      __gather_async(values + shift * aligned,
+                     token_map,
+                     map_offsets + shift * aligned,
+                     sizeof(int64_t),
+                     GDRAM2NRAM,
+                     sizeof(int64_t),
+                     count);
+    }
+    __sync_io();
+    __bang_mul(values, values, multiplier_lanes, shift_lanes);
+    for (int32_t shift = 1; shift < ngram; ++shift) {
+      int64_t* rolling = values + shift * aligned;
+      __bang_bxor(rolling, rolling, rolling - aligned, aligned);
+      __memcpy(replicated + (shift - 1) * heads * count,
+               rolling,
+               count * sizeof(int64_t),
+               NRAM2NRAM,
+               count * sizeof(int64_t),
+               0,
+               heads - 1);
+    }
+    // [columns][count] -> [count][columns] -> low/high word planes.
+    const int64_t* token_major = replicated;
+    if (columns > 1) {
+      __bang_transpose(transposed, replicated, columns, count);
+      token_major = transposed;
+    }
+    __bang_transpose(
+        lane_words, reinterpret_cast<const uint32_t*>(token_major), lanes, 2);
+    const uint32_t* lane_low = lane_words;
+    const uint32_t* lane_high = lane_words + lanes;
+    // value mod m = ((high mod m) * 2^32 + low) mod m, low in radix digits.
+    __bang_rem(lane_accum, lane_high, lane_modulus, aligned_lanes);
+    const uint32_t radix = 1U << radix_bits;
+    const int32_t top = 31 / radix_bits * radix_bits;
+    for (int32_t bit = top; bit >= 0; bit -= radix_bits) {
+      // The leading digit holds only the remaining 32 - top bits.
+      const uint32_t scale = bit == top ? 1U << (32 - top) : radix;
+      __bang_srl(
+          lane_digit, lane_low, static_cast<uint32_t>(bit), aligned_lanes);
+      __bang_band_scalar(lane_digit, lane_digit, scale - 1, aligned_lanes);
+      __bang_mul_scalar(lane_accum, lane_accum, scale, aligned_lanes);
+      __bang_add(lane_accum, lane_accum, lane_digit, aligned_lanes);
+      __bang_rem(lane_accum, lane_accum, lane_modulus, aligned_lanes);
+    }
+    __bang_add(lane_accum, lane_accum, lane_offset, aligned_lanes);
+    __bang_uint322int64(transposed, lane_accum, aligned_lanes, 0, 0);
+    __memcpy(
+        output + (static_cast<int64_t>(layer) * tokens_count + first) * columns,
+        transposed,
+        static_cast<int64_t>(lanes) * sizeof(int64_t),
+        NRAM2GDRAM);
+  }
+}
+
+template <typename Token>
+__mlu_global__ void hash_kernel(const Token* tokens,
+                                const int32_t* starts,
+                                const int64_t* history,
+                                const int64_t* token_map,
+                                const int64_t* multipliers,
+                                const int64_t* primes,
+                                const int64_t* offsets,
+                                int64_t* output,
+                                int64_t tokens_count,
+                                int32_t sequences,
+                                int32_t layers,
+                                int32_t ngram,
+                                int32_t columns,
+                                int64_t vocab,
+                                int64_t pad_token) {
+  __nram__ char pool[kPoolBytes];
+  __nram__ int64_t cached_parameters[kParameterCache];
+  __nram__ uint32_t parameter_words[4 * kParameterCache];
+  __nram__ float parameter_flags[2 * kParameterCache];
+  __nram__ int32_t cached_starts[kRequestCache + 1];
+  __nram__ int64_t cached_history[kHistoryCache];
+  const int64_t multiplier_count = static_cast<int64_t>(layers) * ngram;
+  const int64_t modulus_count = static_cast<int64_t>(layers) * columns;
+  const bool cache_parameters =
+      multiplier_count + 2 * modulus_count <= kParameterCache;
+  const bool cache_starts = sequences <= kRequestCache;
+  const bool cache_history =
+      static_cast<int64_t>(sequences) * (ngram - 1) <= kHistoryCache;
+  if (cache_parameters) {
+    __memcpy_async(cached_parameters,
+                   multipliers,
+                   multiplier_count * sizeof(int64_t),
+                   GDRAM2NRAM);
+    __memcpy_async(cached_parameters + multiplier_count,
+                   primes,
+                   modulus_count * sizeof(int64_t),
+                   GDRAM2NRAM);
+    __memcpy_async(cached_parameters + multiplier_count + modulus_count,
+                   offsets,
+                   modulus_count * sizeof(int64_t),
+                   GDRAM2NRAM);
+  }
+  if (cache_starts) {
+    __memcpy_async(
+        cached_starts, starts, (sequences + 1) * sizeof(int32_t), GDRAM2NRAM);
+  }
+  if (cache_history && sequences > 0) {
+    __memcpy_async(
+        cached_history,
+        history,
+        static_cast<int64_t>(sequences) * (ngram - 1) * sizeof(int64_t),
+        GDRAM2NRAM);
+  }
+  __sync_io();
+  const int64_t* multiplier_values =
+      cache_parameters ? cached_parameters : multipliers;
+  const int64_t* prime_values =
+      cache_parameters ? cached_parameters + multiplier_count : primes;
+  const int64_t* offset_values =
+      cache_parameters ? cached_parameters + multiplier_count + modulus_count
+                       : offsets;
+  // The lane path needs 32-bit moduli/offsets (as in the generic narrow
+  // path), 32-bit token-map byte offsets and NRAM-resident metadata.
+  bool lanes = cache_parameters && cache_starts && vocab > 0 &&
+               vocab <= (static_cast<int64_t>(1) << 29) && ngram <= kMaxNgram &&
+               columns <= kLanes && pad_token < vocab;
+  uint32_t* modulus_words = parameter_words;
+  uint32_t* modulus_high = parameter_words + kParameterCache;
+  uint32_t* offset_words = parameter_words + 2 * kParameterCache;
+  uint32_t* offset_high = parameter_words + 3 * kParameterCache;
+  float* modulus_values = parameter_flags;
+  int32_t radix_bits = 8;
+  if (lanes) {
+    const int32_t count = static_cast<int32_t>(modulus_count);
+    const int32_t aligned = (count + 31) / 32 * 32;
+    // Split int64 parameters into 32-bit word planes.
+    const uint32_t* prime_words =
+        reinterpret_cast<const uint32_t*>(prime_values);
+    const uint32_t* offset_parts =
+        reinterpret_cast<const uint32_t*>(offset_values);
+    uint32_t* planes[4] = {
+        modulus_words, modulus_high, offset_words, offset_high};
+    const uint32_t* sources[4] = {
+        prime_words, prime_words + 1, offset_parts, offset_parts + 1};
+    for (int32_t plane = 0; plane < 4; ++plane) {
+      __memcpy(planes[plane],
+               sources[plane],
+               sizeof(uint32_t),
+               NRAM2NRAM,
+               sizeof(uint32_t),
+               sizeof(int64_t),
+               count - 1);
+    }
+    // The pool is unused until a path is selected; borrow it as scratch.
+    uint32_t* bad = reinterpret_cast<uint32_t*>(pool);
+    uint32_t* term = bad + aligned;
+    __bang_write_value(bad, aligned, 0U);
+    __bang_write_value(term, aligned, 0U);
+    __bang_ne_scalar(bad, modulus_high, 0U, count);
+    __bang_ne_scalar(term, offset_high, 0U, count);
+    __bang_bor(bad, bad, term, aligned);
+    __bang_gt_scalar(term, modulus_words, 0x00ffffffU, count);
+    __bang_bor(bad, bad, term, aligned);
+    __bang_eq_scalar(term, modulus_words, 0U, count);
+    __bang_bor(bad, bad, term, aligned);
+    // modulus + offset must not carry out of uint32.
+    __bang_add(term, modulus_words, offset_words, count);
+    __bang_lt(term, term, modulus_words, count);
+    __bang_bor(bad, bad, term, aligned);
+    __bang_uint322float(modulus_values, bad, aligned, 0);
+    float* maximum = reinterpret_cast<float*>(term);
+    __bang_argmax(maximum, modulus_values, aligned);
+    lanes = maximum[0] == 0.0f;
+    // One radix for all columns: the widest whose digit step fits uint32 for
+    // the largest modulus. The reduction is exact for any admissible radix.
+    __bang_write_value(term, aligned, 0U);
+    __memcpy(term, modulus_words, count * sizeof(uint32_t), NRAM2NRAM);
+    __bang_uint322float(modulus_values, term, aligned, 0);
+    __bang_argmax(maximum, modulus_values, aligned);
+    const uint32_t modulus = static_cast<uint32_t>(maximum[0]);
+    while (radix_bits < 16 && modulus <= (0xffffffffU >> (radix_bits + 1))) {
+      ++radix_bits;
+    }
+  }
+  if (lanes) {
+    hash_lanes(tokens,
+               history,
+               token_map,
+               output,
+               tokens_count,
+               sequences,
+               layers,
+               ngram,
+               columns,
+               vocab,
+               pad_token,
+               multiplier_values,
+               modulus_words,
+               offset_words,
+               radix_bits,
+               cached_starts,
+               cached_history,
+               cache_history,
+               pool);
+    return;
+  }
+  hash_generic(tokens,
+               starts,
+               history,
+               token_map,
+               output,
+               tokens_count,
+               sequences,
+               layers,
+               ngram,
+               columns,
+               vocab,
+               pad_token,
+               multiplier_values,
+               prime_values,
+               offset_values,
+               cache_parameters,
+               cached_starts,
+               cache_starts,
+               cached_history,
+               cache_history,
+               pool);
+}
+}  // namespace
+
+extern "C" void engram_hash_launch(void* queue,
+                                   const void* tokens,
+                                   bool int32_tokens,
+                                   const int32_t* starts,
+                                   const int64_t* history,
+                                   const int64_t* token_map,
+                                   const int64_t* multipliers,
+                                   const int64_t* primes,
+                                   const int64_t* offsets,
+                                   int64_t* output,
+                                   int64_t tokens_count,
+                                   int32_t sequences,
+                                   int32_t layers,
+                                   int32_t ngram,
+                                   int32_t columns,
+                                   int64_t vocab,
+                                   int64_t pad_token,
+                                   int32_t cores) {
+  // The kernel derives its tile from taskDim; size the grid for the smaller
+  // lane-path tile so short batches still occupy every core.
+  const int64_t lane_tokens = columns > 0 && kLanes / columns < kLaneTokens
+                                  ? kLanes / columns
+                                  : kLaneTokens;
+  const int64_t max_tile = lane_tokens > 0 ? lane_tokens : 1;
+  const int64_t desired_tile = (tokens_count * layers + cores - 1) / cores;
+  const int64_t tile = desired_tile < max_tile ? desired_tile : max_tile;
+  const int64_t jobs = (tokens_count + tile - 1) / tile * layers;
+  const cnrtDim3_t dimensions{
+      static_cast<uint32_t>(jobs < cores ? jobs : cores), 1, 1};
+  if (int32_tokens) {
+    hash_kernel<<<dimensions,
+                  cnrtFuncTypeBlock,
+                  static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const int32_t*>(tokens),
+        starts,
+        history,
+        token_map,
+        multipliers,
+        primes,
+        offsets,
+        output,
+        tokens_count,
+        sequences,
+        layers,
+        ngram,
+        columns,
+        vocab,
+        pad_token);
+  } else {
+    hash_kernel<<<dimensions,
+                  cnrtFuncTypeBlock,
+                  static_cast<cnrtQueue_t>(queue)>>>(
+        static_cast<const int64_t*>(tokens),
+        starts,
+        history,
+        token_map,
+        multipliers,
+        primes,
+        offsets,
+        output,
+        tokens_count,
+        sequences,
+        layers,
+        ngram,
+        columns,
+        vocab,
+        pad_token);
+  }
+}

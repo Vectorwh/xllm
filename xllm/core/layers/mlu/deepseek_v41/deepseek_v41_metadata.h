@@ -62,6 +62,12 @@ struct Csa2Context {
 namespace deepseek_v41 {
 bool uses_decode_attention(const ModelInputParams& input);
 
+// False for the dummy rows of an idle DP shard: no request owns them, so they
+// only take part in MoE communication and skip Engram and every cache slot.
+inline bool has_request_rows(const ModelInputParams& input) {
+  return input.meta.q_max_seq_len > 0 && input.meta.num_sequences > 0;
+}
+
 void prepare_workspace(Csa2Context& shared,
                        const ModelInputParams& input,
                        const ModelArgs& args,

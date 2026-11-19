@@ -1,0 +1,873 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/engram_common/device_helpers.h"
+#include "kernels/mlu/bangc/src/engram_dequantize/launcher.h"
+
+namespace {
+
+using xllm::kernel::mlu::bangc::engram_detail::decode_fp8_tile;
+using xllm::kernel::mlu::bangc::engram_detail::load_row_hashes;
+
+constexpr int32_t kTile = 16384;
+
+// MTP592 scalar 64-bit arithmetic retains only 48 bits. Compare signed
+// int64 hashes as two 32-bit words, including foreign hashes with equal low
+// bits.
+__mlu_func__ bool hash_is_owned(const int64_t* hash,
+                                uint32_t start_low,
+                                int32_t start_high,
+                                uint32_t end_low,
+                                int32_t end_high) {
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(hash);
+  const uint32_t low = words[0];
+  const int32_t high = static_cast<int32_t>(words[1]);
+  const bool at_start =
+      high > start_high || (high == start_high && low >= start_low);
+  const bool before_end =
+      high < end_high || (high == end_high && low < end_low);
+  return at_start && before_end;
+}
+
+__mlu_func__ int64_t packed_source_row(int64_t row,
+                                       int64_t tokens,
+                                       int64_t columns,
+                                       int64_t head_shards) {
+  if (head_shards == 1) {
+    return row;
+  }
+  const int64_t shard_columns = (columns - 1) / head_shards + 1;
+  const int64_t token = row / columns;
+  const int64_t column = row % columns;
+  return (column / shard_columns * tokens + token) * shard_columns +
+         column % shard_columns;
+}
+
+template <bool Mapped>
+__mlu_func__ void prefetch_packed_rows(uint8_t* destination,
+                                       int64_t* hash_destination,
+                                       const uint8_t* packed,
+                                       const int64_t* hashes,
+                                       int64_t first,
+                                       int32_t count,
+                                       int32_t width,
+                                       int64_t row_stride,
+                                       int64_t tokens,
+                                       int64_t columns,
+                                       int64_t head_shards,
+                                       bool all_owned,
+                                       const int64_t* ordinals,
+                                       int64_t* row_ids,
+                                       int64_t* token_ids,
+                                       int64_t* column_ids,
+                                       int64_t* rank_ids,
+                                       int64_t* offsets,
+                                       const int64_t* row_indices) {
+  if (!Mapped && head_shards == 1 && row_stride == width) {
+    __memcpy_async(
+        destination, packed + first * row_stride, count * width, GDRAM2NRAM);
+  } else if (!Mapped && head_shards == 1 && row_stride <= 0x7fffffffLL) {
+    __memcpy_async(destination,
+                   packed + first * row_stride,
+                   width,
+                   GDRAM2NRAM,
+                   width,
+                   static_cast<int32_t>(row_stride),
+                   count - 1);
+  } else {
+    if constexpr (Mapped) {
+      // Map whole token fragments while preserving their contiguous heads.
+      // A tile normally covers only a few tokens; packed addressing below
+      // still uses the original source-token extent for rank-major shards.
+      int32_t copied = 0;
+      while (copied < count) {
+        const int64_t output_row = first + copied;
+        const int64_t column = output_row % columns;
+        const int32_t length = static_cast<int32_t>(
+            columns - column < count - copied ? columns - column
+                                              : count - copied);
+        const int64_t source =
+            row_indices[output_row / columns] * columns + column;
+        __bang_add_scalar(row_ids + copied, ordinals, source, length);
+        copied += length;
+      }
+    } else {
+      __bang_add_scalar(row_ids, ordinals, first, count);
+    }
+    if (head_shards == 1) {
+      __bang_mul_scalar(offsets, row_ids, row_stride, count);
+    } else {
+      const int64_t shard_columns = (columns - 1) / head_shards + 1;
+      __bang_div(token_ids, row_ids, columns, count);
+      __bang_mul_scalar(column_ids, token_ids, columns, count);
+      __bang_sub(column_ids, row_ids, column_ids, count);
+      __bang_div(rank_ids, column_ids, shard_columns, count);
+      __bang_mul_scalar(offsets, rank_ids, shard_columns, count);
+      __bang_sub(column_ids, column_ids, offsets, count);
+      __bang_mul_scalar(rank_ids, rank_ids, tokens, count);
+      __bang_add(rank_ids, rank_ids, token_ids, count);
+      __bang_mul_scalar(rank_ids, rank_ids, shard_columns, count);
+      __bang_add(rank_ids, rank_ids, column_ids, count);
+      __bang_mul_scalar(offsets, rank_ids, row_stride, count);
+    }
+    __sync_compute();
+    __gather_async(destination,
+                   packed,
+                   reinterpret_cast<uint64_t*>(offsets),
+                   width,
+                   GDRAM2NRAM,
+                   width,
+                   count);
+  }
+  if (!all_owned) {
+    load_row_hashes<Mapped>(
+        hash_destination, hashes, first, count, columns, row_indices);
+  }
+}
+
+template <bool Packed, bool Mapped>
+__mlu_global__ void dequantize_kernel(const uint8_t* bytes,
+                                      const uint8_t* scales,
+                                      const int64_t* hashes,
+                                      const float* fp8_values,
+                                      bfloat16_t* output,
+                                      int64_t rows,
+                                      int32_t dim,
+                                      int32_t scale_dim,
+                                      uint32_t start_low,
+                                      int32_t start_high,
+                                      uint32_t end_low,
+                                      int32_t end_high,
+                                      bool all_owned,
+                                      int64_t packed_row_stride,
+                                      int64_t tokens,
+                                      int64_t columns,
+                                      int64_t head_shards,
+                                      const int64_t* row_indices) {
+  __nram__ uint8_t codes[kTile];
+  __nram__ uint8_t scale_codes[kTile];
+  __nram__ uint32_t indices[kTile];
+  __nram__ float values[kTile];
+  __nram__ bfloat16_t rounded[kTile];
+  __nram__ int32_t lut[256];
+  __memcpy(lut, fp8_values, sizeof(lut), GDRAM2NRAM);
+  const int32_t group_size = dim / scale_dim;
+  for (int64_t row = taskId; row < rows; row += taskDim) {
+    const int64_t logical_row =
+        Mapped ? row_indices[row / columns] * columns + row % columns : row;
+    const bool owned =
+        all_owned ||
+        hash_is_owned(
+            hashes + logical_row, start_low, start_high, end_low, end_high);
+    const int64_t source_row =
+        Packed ? packed_source_row(logical_row, tokens, columns, head_shards)
+               : logical_row;
+    const uint8_t* row_bytes =
+        bytes + source_row * (Packed ? packed_row_stride : dim);
+    const uint8_t* row_scales =
+        Packed ? row_bytes + dim : scales + logical_row * scale_dim;
+    for (int64_t start = 0; start < dim; start += kTile) {
+      const int32_t count = dim - start < kTile ? dim - start : kTile;
+      const int32_t aligned = (count + 31) / 32 * 32;
+      if (!owned) {
+        __bang_write_value(values, aligned, 0.0f);
+      } else {
+        __memcpy(codes, row_bytes + start, count, GDRAM2NRAM);
+        const int32_t first_group = start / group_size;
+        const int32_t groups =
+            (start + count - 1) / group_size - first_group + 1;
+        __memcpy(scale_codes, row_scales + first_group, groups, GDRAM2NRAM);
+        decode_fp8_tile(
+            values, indices, codes, scale_codes, lut, start, count, group_size);
+      }
+      __bang_float2bfloat16_rn(rounded, values, aligned);
+      __memcpy(output + row * dim + start,
+               rounded,
+               count * sizeof(bfloat16_t),
+               NRAM2GDRAM);
+    }
+  }
+}
+
+// Batch the production 32-value scale groups so DMA and LUT instructions
+// operate on thousands of values instead of one short row at a time.
+// Foreign instantiations may hold rows owned by other ranks; keeping them
+// separate leaves the all-owned code free of the ownership machinery.
+template <bool Packed, bool Bf16Cycle, bool Physical, bool Foreign, bool Mapped>
+__mlu_global__ void dequantize_group32_kernel(const uint8_t* bytes,
+                                              const uint8_t* scales,
+                                              const int64_t* hashes,
+                                              const float* fp8_values,
+                                              bfloat16_t* output,
+                                              int64_t rows,
+                                              int32_t dim,
+                                              uint32_t start_low,
+                                              int32_t start_high,
+                                              uint32_t end_low,
+                                              int32_t end_high,
+                                              bool all_owned,
+                                              int64_t packed_row_stride,
+                                              int64_t tokens,
+                                              int64_t columns,
+                                              int64_t head_shards,
+                                              int32_t batch,
+                                              const int64_t* row_indices) {
+  __nram__ uint8_t code_buffers[2][kTile];
+  __nram__ uint8_t packed_buffers[2][kTile + kTile / 32];
+  __nram__ int64_t ordinals[kTile / 32];
+  __nram__ int64_t row_ids[kTile / 32];
+  __nram__ int64_t token_ids[kTile / 32];
+  __nram__ int64_t column_ids[kTile / 32];
+  __nram__ int64_t rank_ids[kTile / 32];
+  __nram__ int64_t offsets[kTile / 32];
+  __nram__ uint8_t scale_buffers[2][kTile / 32];
+  __nram__ int64_t hash_buffers[2][kTile / 32];
+  __nram__ uint32_t indices[kTile];
+  __nram__ float values[kTile];
+  __wram__ float expand_mask[2048];
+  __nram__ float mask_values[2048];
+  __nram__ float expanded[kTile];
+  __nram__ float factors[kTile / 32];
+  __nram__ float minimum[2];
+  __nram__ float maximum[2];
+  __nram__ bfloat16_t bf16_lut[256];
+  __nram__ bfloat16_t output_buffers[2][kTile];
+  __nram__ int32_t lut[256];
+  __nram__ half half_lut[256];
+  __nram__ int64_t start_values[kTile / 32];
+  __nram__ int64_t end_values[kTile / 32];
+  __nram__ int64_t valid_rows[kTile / 32];
+  __nram__ int64_t upper_rows[kTile / 32];
+  __nram__ float valid_float[kTile / 32];
+  __nram__ float bit_values[kTile / 32];
+  __nram__ float bit_columns[kTile / 32];
+  __nram__ float bit_weights[kTile / 32];
+  __nram__ float owned_maximum[2];
+  __nram__ uint32_t ownership_mask[kTile / 32 / 32];
+  __nram__ uint32_t row_offsets[kTile / 32];
+  __memcpy(lut, fp8_values, sizeof(lut), GDRAM2NRAM);
+  __bang_float2half_rn(half_lut, reinterpret_cast<float*>(lut), 256);
+  if constexpr (Bf16Cycle) {
+    __bang_float2bfloat16_rn(bf16_lut, reinterpret_cast<float*>(lut), 256);
+  }
+  __bang_write_value(mask_values, 2048, 1.0f);
+  __memcpy(expand_mask, mask_values, sizeof(mask_values), NRAM2WRAM);
+  const int64_t shard_columns = Packed ? (columns - 1) / head_shards + 1 : 1;
+  // Packed rows owned by other ranks are selected with a vector bit mask:
+  // their codes stay 0 and scales 127, which decode to positive zero.
+  // Short tiles keep the scalar row loop: its cost is below the mask setup.
+  constexpr bool kVectorOwnership = Packed && !Physical && Foreign;
+  constexpr int32_t kVectorOwnershipRows = 64;
+  const bool vector_ownership =
+      kVectorOwnership && !all_owned && batch >= kVectorOwnershipRows;
+  if (vector_ownership) {
+    for (int32_t bit = 0; bit < 16; ++bit) {
+      bit_weights[bit] = static_cast<float>(1 << bit);
+    }
+    row_offsets[0] = 0;
+    __sync();
+    const int32_t mask_rows = (batch + 31) / 32 * 32;
+    __memcpy(bit_weights + 16,
+             bit_weights,
+             16 * sizeof(float),
+             NRAM2NRAM,
+             16 * sizeof(float),
+             0,
+             mask_rows / 16 - 2);
+    const uint32_t width = static_cast<uint32_t>(dim + dim / 32);
+    for (int32_t filled = 1; filled < batch; filled *= 2) {
+      __bang_add_scalar(
+          row_offsets + filled, row_offsets, width * filled, filled);
+    }
+  }
+  const int64_t rank_rows = Physical ? tokens * shard_columns : rows;
+  const int64_t rank_batches = (rank_rows + batch - 1) / batch;
+  const int64_t batches = Physical ? rank_batches * head_shards : rank_batches;
+  if constexpr (Packed) {
+    if (Mapped || (!Physical && head_shards > 1) ||
+        packed_row_stride > 0x7fffffffLL) {
+      for (int32_t i = 0; i < batch; ++i) {
+        ordinals[i] = i;
+      }
+      __sync();
+    }
+  }
+  if (taskId >= batches) {
+    return;
+  }
+  int32_t bank = 0;
+  const int64_t initial_offset = Physical
+                                     ? taskId % rank_batches * batch
+                                     : static_cast<int64_t>(taskId) * batch;
+  const int64_t initial_first =
+      Physical ? taskId / rank_batches * rank_rows + initial_offset
+               : initial_offset;
+  const int32_t initial_count =
+      rank_rows - initial_offset < batch ? rank_rows - initial_offset : batch;
+  if constexpr (Packed) {
+    prefetch_packed_rows<Mapped>(packed_buffers[0],
+                                 hash_buffers[0],
+                                 bytes,
+                                 hashes,
+                                 initial_first,
+                                 initial_count,
+                                 dim + dim / 32,
+                                 packed_row_stride,
+                                 tokens,
+                                 columns,
+                                 Physical ? 1 : head_shards,
+                                 Physical || all_owned,
+                                 ordinals,
+                                 row_ids,
+                                 token_ids,
+                                 column_ids,
+                                 rank_ids,
+                                 offsets,
+                                 row_indices);
+  } else {
+    __memcpy_async(code_buffers[0],
+                   bytes + initial_first * dim,
+                   initial_count * dim,
+                   GDRAM2NRAM);
+    __memcpy_async(scale_buffers[0],
+                   scales + initial_first * dim / 32,
+                   initial_count * dim / 32,
+                   GDRAM2NRAM);
+    if (!all_owned) {
+      __memcpy_async(hash_buffers[0],
+                     hashes + initial_first,
+                     initial_count * sizeof(int64_t),
+                     GDRAM2NRAM);
+    }
+  }
+  __sync_io();
+  for (int64_t tile = taskId; tile < batches; tile += taskDim) {
+    const int64_t rank = Physical ? tile / rank_batches : 0;
+    const int64_t offset =
+        Physical ? tile % rank_batches * batch : tile * batch;
+    const int64_t first = Physical ? rank * rank_rows + offset : offset;
+    const int32_t count =
+        rank_rows - offset < batch ? rank_rows - offset : batch;
+    const int32_t elements = count * dim;
+    const int32_t groups = elements / 32;
+    uint8_t* codes = code_buffers[bank];
+    uint8_t* scale_codes = scale_buffers[bank];
+    int64_t* row_hashes = hash_buffers[bank];
+    bfloat16_t* rounded = output_buffers[bank];
+    const int64_t next = tile + taskDim;
+    if (next < batches) {
+      const int64_t next_offset =
+          Physical ? next % rank_batches * batch : next * batch;
+      const int64_t next_first =
+          Physical ? next / rank_batches * rank_rows + next_offset
+                   : next_offset;
+      const int32_t next_count =
+          rank_rows - next_offset < batch ? rank_rows - next_offset : batch;
+      if constexpr (Packed) {
+        prefetch_packed_rows<Mapped>(packed_buffers[1 - bank],
+                                     hash_buffers[1 - bank],
+                                     bytes,
+                                     hashes,
+                                     next_first,
+                                     next_count,
+                                     dim + dim / 32,
+                                     packed_row_stride,
+                                     tokens,
+                                     columns,
+                                     Physical ? 1 : head_shards,
+                                     Physical || all_owned,
+                                     ordinals,
+                                     row_ids,
+                                     token_ids,
+                                     column_ids,
+                                     rank_ids,
+                                     offsets,
+                                     row_indices);
+      } else {
+        __memcpy_async(code_buffers[1 - bank],
+                       bytes + next_first * dim,
+                       next_count * dim,
+                       GDRAM2NRAM);
+        __memcpy_async(scale_buffers[1 - bank],
+                       scales + next_first * dim / 32,
+                       next_count * dim / 32,
+                       GDRAM2NRAM);
+        if (!all_owned) {
+          __memcpy_async(hash_buffers[1 - bank],
+                         hashes + next_first,
+                         next_count * sizeof(int64_t),
+                         GDRAM2NRAM);
+        }
+      }
+    }
+    const bool vector_tile = vector_ownership && count >= kVectorOwnershipRows;
+    if constexpr (kVectorOwnership) {
+      if (vector_tile) {
+        // bit r of word w = owned(row 32 w + r); 16-bit halves stay exact.
+        const int32_t words = (count + 31) / 32;
+        // Ownership with 32-bit word compares; int64 vector compares are
+        // emulated on mtp_592. [count][2] words -> [2][count] planes.
+        uint32_t* low = reinterpret_cast<uint32_t*>(valid_rows);
+        const int32_t* high = reinterpret_cast<const int32_t*>(low + count);
+        uint32_t* valid = reinterpret_cast<uint32_t*>(upper_rows);
+        uint32_t* term = valid + kTile / 32;
+        uint32_t* other = reinterpret_cast<uint32_t*>(start_values);
+        uint32_t* below = reinterpret_cast<uint32_t*>(end_values);
+        __bang_transpose(
+            low, reinterpret_cast<const uint32_t*>(row_hashes), count, 2);
+        if (start_high == end_high) {
+          __bang_eq_scalar(
+              reinterpret_cast<int32_t*>(valid), high, start_high, count);
+          __bang_ge_scalar(term, low, start_low, count);
+          __bang_band(valid, valid, term, count);
+          __bang_lt_scalar(term, low, end_low, count);
+          __bang_band(valid, valid, term, count);
+        } else {
+          __bang_gt_scalar(
+              reinterpret_cast<int32_t*>(valid), high, start_high, count);
+          __bang_eq_scalar(
+              reinterpret_cast<int32_t*>(term), high, start_high, count);
+          __bang_ge_scalar(other, low, start_low, count);
+          __bang_band(term, term, other, count);
+          __bang_bor(valid, valid, term, count);
+          __bang_lt_scalar(
+              reinterpret_cast<int32_t*>(term), high, end_high, count);
+          __bang_eq_scalar(
+              reinterpret_cast<int32_t*>(other), high, end_high, count);
+          __bang_lt_scalar(below, low, end_low, count);
+          __bang_band(other, other, below, count);
+          __bang_bor(term, term, other, count);
+          __bang_band(valid, valid, term, count);
+        }
+        __bang_write_value(valid_float, words * 32, 0.0f);
+        __bang_uint322float(valid_float, valid, count, 0);
+        __bang_argmax(owned_maximum, valid_float, words * 32);
+        __bang_mul(bit_values, valid_float, bit_weights, words * 32);
+        __bang_transpose(bit_columns, bit_values, words, 32);
+        for (int32_t half_rows = 8; half_rows >= 1; half_rows /= 2) {
+          __bang_add(bit_columns,
+                     bit_columns,
+                     bit_columns + half_rows * words,
+                     half_rows * words);
+          __bang_add(bit_columns + 16 * words,
+                     bit_columns + 16 * words,
+                     bit_columns + (16 + half_rows) * words,
+                     half_rows * words);
+        }
+        uint32_t* high_bits = reinterpret_cast<uint32_t*>(bit_values);
+        __bang_float2int32(
+            reinterpret_cast<int32_t*>(ownership_mask), bit_columns, words, 0);
+        __bang_float2int32(reinterpret_cast<int32_t*>(high_bits),
+                           bit_columns + 16 * words,
+                           words,
+                           0);
+        __bang_mul_scalar(high_bits, high_bits, 65536U, words);
+        __bang_add(ownership_mask, ownership_mask, high_bits, words);
+        __bang_write_value(codes, elements, static_cast<uint8_t>(0));
+        __bang_write_value(scale_codes, groups, static_cast<uint8_t>(127));
+        const bool any_owned = owned_maximum[0] != 0.0f;
+        __sync_compute();
+        if (any_owned) {
+          __gather(codes,
+                   packed_buffers[bank],
+                   row_offsets,
+                   ownership_mask,
+                   dim,
+                   NRAM2NRAM,
+                   dim,
+                   count);
+          __gather(scale_codes,
+                   packed_buffers[bank] + dim,
+                   row_offsets,
+                   ownership_mask,
+                   dim / 32,
+                   NRAM2NRAM,
+                   dim / 32,
+                   count);
+        }
+      }
+    }
+    if (Packed && !vector_tile) {
+      const int32_t scale_dim = dim / 32;
+      const int32_t width = dim + scale_dim;
+      __memcpy_async(
+          codes, packed_buffers[bank], dim, NRAM2NRAM, dim, width, count - 1);
+      __memcpy_async(scale_codes,
+                     packed_buffers[bank] + dim,
+                     scale_dim,
+                     NRAM2NRAM,
+                     scale_dim,
+                     width,
+                     count - 1);
+    }
+    if constexpr (Packed) {
+      __sync_move();
+    }
+    bool bf16_cycle = false;
+    if constexpr (Bf16Cycle) {
+      __bang_uint82float(factors, scale_codes, groups, 0);
+      __bang_argmin(minimum, factors, groups);
+      __bang_argmax(maximum, factors, groups);
+      bf16_cycle = minimum[0] >= 10.0f && maximum[0] <= 246.0f;
+    }
+    if (bf16_cycle) {
+      // Every nonzero finite E4M3 value times these powers of two is a
+      // normal BF16 value. Scaling in BF16 is exact, including signed zero.
+      uint8_t* transposed_codes = reinterpret_cast<uint8_t*>(values);
+      int16_t* index16 = reinterpret_cast<int16_t*>(indices);
+      uint16_t* base_bits = reinterpret_cast<uint16_t*>(indices) + kTile;
+      int16_t* exponent_bits = reinterpret_cast<int16_t*>(factors);
+      __bang_transpose(transposed_codes, codes, groups, 32);
+      __bang_uint82int16(index16, transposed_codes, elements, 0, 0);
+      __bang_lut(reinterpret_cast<int16_t*>(base_bits),
+                 reinterpret_cast<uint16_t*>(index16),
+                 reinterpret_cast<int16_t*>(bf16_lut),
+                 elements,
+                 256);
+      __bang_uint82int16(exponent_bits, scale_codes, groups, 0, 0);
+      __bang_mul_scalar(
+          exponent_bits, exponent_bits, static_cast<int16_t>(128), groups);
+      __bang_cycle_mul(reinterpret_cast<bfloat16_t*>(base_bits),
+                       reinterpret_cast<bfloat16_t*>(base_bits),
+                       reinterpret_cast<bfloat16_t*>(exponent_bits),
+                       elements,
+                       groups);
+      __bang_transpose(
+          rounded, reinterpret_cast<bfloat16_t*>(base_bits), 32, groups);
+    } else {
+      __bang_uint82int16(
+          reinterpret_cast<int16_t*>(indices), codes, elements, 0, 0);
+      __bang_lut(reinterpret_cast<int16_t*>(rounded),
+                 reinterpret_cast<uint16_t*>(indices),
+                 reinterpret_cast<int16_t*>(half_lut),
+                 elements,
+                 256);
+      __bang_half2float(values, reinterpret_cast<half*>(rounded), elements);
+      if constexpr (!Bf16Cycle) {
+        __bang_uint82float(factors, scale_codes, groups, 0);
+        __bang_argmin(minimum, factors, groups);
+      }
+      // The convolution partial path flushes FP32 subnormals. A minimum
+      // exponent code of 10 keeps even the smallest nonzero FP8 value normal.
+      const bool normal_factors = minimum[0] >= 10.0f;
+      __bang_sub_scalar(factors, factors, 127.0f, groups);
+      __bang_pow2(factors, factors, groups);
+      if (normal_factors) {
+        __bang_expand_channel_mul(
+            expanded, factors, expand_mask, values, groups, 32);
+        __bang_float2bfloat16_rn(rounded, expanded, elements);
+      } else {
+        __bang_transpose(expanded, values, groups, 32);
+        __bang_cycle_mul(expanded, expanded, factors, elements, groups);
+        __bang_transpose(values, expanded, 32, groups);
+        __bang_float2bfloat16_rn(rounded, values, elements);
+      }
+    }
+    if (!all_owned && !vector_tile) {
+      for (int32_t row = 0; row < count; ++row) {
+        const int64_t logical_column =
+            Physical ? rank * shard_columns + row % shard_columns : 0;
+        const int64_t logical_row =
+            Physical ? (offset + row) / shard_columns * columns + logical_column
+                     : first + row;
+        const bool owned = Physical ? logical_column < columns &&
+                                          hash_is_owned(hashes + logical_row,
+                                                        start_low,
+                                                        start_high,
+                                                        end_low,
+                                                        end_high)
+                                    : hash_is_owned(row_hashes + row,
+                                                    start_low,
+                                                    start_high,
+                                                    end_low,
+                                                    end_high);
+        if (!owned) {
+          __bang_write_value(
+              rounded + row * dim, dim, static_cast<bfloat16_t>(0.0f));
+        }
+      }
+    }
+    // Complete this bank's arithmetic and the other bank's prefetch before
+    // publishing the output. Its DMA may overlap the next bank's arithmetic.
+    __sync_compute();
+    __sync_io();
+    if constexpr (Physical) {
+      const int64_t remaining_columns = columns - rank * shard_columns;
+      const int32_t valid_columns =
+          remaining_columns < shard_columns ? remaining_columns : shard_columns;
+      if (valid_columns > 0) {
+        __memcpy_async(
+            output +
+                (offset / shard_columns * columns + rank * shard_columns) * dim,
+            rounded,
+            valid_columns * dim * sizeof(bfloat16_t),
+            NRAM2GDRAM,
+            columns * dim * sizeof(bfloat16_t),
+            shard_columns * dim * sizeof(bfloat16_t),
+            count / shard_columns - 1);
+      }
+    } else {
+      __memcpy_async(output + first * dim,
+                     rounded,
+                     elements * sizeof(bfloat16_t),
+                     NRAM2GDRAM);
+    }
+    bank = 1 - bank;
+  }
+  __sync_io();
+}
+
+// Adaptive granularity: rows per task spread short decode batches over the
+// cores and grow toward the NRAM-bounded tile for long prefills. Physical
+// head-shard tiles hold whole tokens of one rank, so they stay a multiple of
+// the shard width.
+constexpr int64_t kCores = 32;
+
+// Below a few rows per core, extra cores add launch and prologue cost
+// without shortening the per-core DMA latency chain (measured on MLU590).
+constexpr int64_t kMinRowsPerCore = 8;
+
+int32_t adaptive_batch(int64_t rows, int64_t capacity, int64_t unit) {
+  // Fewest rounds within the tile capacity, then the smallest balanced tile.
+  const int64_t rounds = (rows + kCores * capacity - 1) / (kCores * capacity);
+  int64_t spread = (rows + kCores * rounds - 1) / (kCores * rounds);
+  spread = spread < kMinRowsPerCore ? kMinRowsPerCore : spread;
+  spread = (spread + unit - 1) / unit * unit;
+  return static_cast<int32_t>(spread < capacity ? spread : capacity);
+}
+
+// Host-side launch data. Pointers borrow caller-owned device storage; the
+// external C entry points populate this once before selecting a kernel.
+struct DequantizeParams {
+  const uint8_t* bytes = nullptr;
+  const uint8_t* scales = nullptr;
+  const int64_t* hashes = nullptr;
+  const float* fp8_values = nullptr;
+  bfloat16_t* output = nullptr;
+  int64_t rows = 0;
+  int32_t dim = 0;
+  int32_t scale_dim = 0;
+  int64_t table_start = 0;
+  int64_t table_end = 0;
+  bool all_owned = false;
+  int64_t packed_row_stride = 0;
+  int64_t tokens = 0;
+  int64_t columns = 0;
+  int64_t head_shards = 1;
+  const int64_t* row_indices = nullptr;
+};
+
+template <bool Packed, bool Bf16Cycle, bool Physical, bool Foreign, bool Mapped>
+void launch_group32_variant(cnrtQueue_t queue,
+                            const DequantizeParams& params,
+                            int32_t batch,
+                            int64_t batches) {
+  const cnrtDim3_t grid = {
+      static_cast<uint32_t>(batches < kCores ? batches : kCores), 1, 1};
+  dequantize_group32_kernel<Packed, Bf16Cycle, Physical, Foreign, Mapped>
+      <<<grid, cnrtFuncTypeBlock, queue>>>(
+          params.bytes,
+          params.scales,
+          params.hashes,
+          params.fp8_values,
+          params.output,
+          params.rows,
+          params.dim,
+          static_cast<uint32_t>(params.table_start),
+          static_cast<int32_t>(static_cast<uint64_t>(params.table_start) >> 32),
+          static_cast<uint32_t>(params.table_end),
+          static_cast<int32_t>(static_cast<uint64_t>(params.table_end) >> 32),
+          params.all_owned,
+          params.packed_row_stride,
+          params.tokens,
+          params.columns,
+          params.head_shards,
+          batch,
+          params.row_indices);
+}
+
+template <bool Packed,
+          bool Bf16Cycle,
+          bool Physical = false,
+          bool Mapped = false>
+void launch_group32(cnrtQueue_t queue,
+                    const DequantizeParams& params,
+                    int32_t batch,
+                    int64_t batches) {
+  if (params.all_owned) {
+    launch_group32_variant<Packed, Bf16Cycle, Physical, false, Mapped>(
+        queue, params, batch, batches);
+  } else {
+    launch_group32_variant<Packed, Bf16Cycle, Physical, true, Mapped>(
+        queue, params, batch, batches);
+  }
+}
+
+template <bool Packed, bool Mapped = false>
+void launch_generic(cnrtQueue_t queue, const DequantizeParams& params) {
+  const cnrtDim3_t grid = {
+      static_cast<uint32_t>(params.rows < kCores ? params.rows : kCores), 1, 1};
+  dequantize_kernel<Packed, Mapped><<<grid, cnrtFuncTypeBlock, queue>>>(
+      params.bytes,
+      params.scales,
+      params.hashes,
+      params.fp8_values,
+      params.output,
+      params.rows,
+      params.dim,
+      params.scale_dim,
+      static_cast<uint32_t>(params.table_start),
+      static_cast<int32_t>(static_cast<uint64_t>(params.table_start) >> 32),
+      static_cast<uint32_t>(params.table_end),
+      static_cast<int32_t>(static_cast<uint64_t>(params.table_end) >> 32),
+      params.all_owned,
+      params.packed_row_stride,
+      params.tokens,
+      params.columns,
+      params.head_shards,
+      params.row_indices);
+}
+
+template <bool Physical, bool Mapped>
+void launch_packed_group32(cnrtQueue_t queue,
+                           const DequantizeParams& params,
+                           int32_t batch,
+                           int64_t batches,
+                           bool long_batch) {
+  if (long_batch) {
+    launch_group32<true, true, Physical, Mapped>(queue, params, batch, batches);
+  } else {
+    launch_group32<true, false, Physical, Mapped>(
+        queue, params, batch, batches);
+  }
+}
+
+template <bool Mapped>
+void launch_packed(cnrtQueue_t queue, const DequantizeParams& params) {
+  if (params.rows == 0) {
+    return;
+  }
+  if (params.dim > kTile ||
+      params.dim != static_cast<int64_t>(params.scale_dim) * 32) {
+    launch_generic<true, Mapped>(queue, params);
+    return;
+  }
+  const int64_t capacity = kTile / params.dim;
+  // The BF16 exponent-scaling variant pays off once each core owns several
+  // full tiles; keep the original full-tile criterion.
+  const bool long_batch = (params.rows + capacity - 1) / capacity > kCores;
+  const int64_t shard_columns = (params.columns - 1) / params.head_shards + 1;
+  if (!Mapped && params.head_shards > 1 && shard_columns <= capacity &&
+      params.columns * static_cast<int64_t>(params.dim) * sizeof(bfloat16_t) <=
+          0x7fffffffLL) {
+    const int64_t rank_rows = params.tokens * shard_columns;
+    const int32_t batch =
+        adaptive_batch(rank_rows * params.head_shards,
+                       capacity / shard_columns * shard_columns,
+                       shard_columns);
+    const int64_t batches =
+        (rank_rows + batch - 1) / batch * params.head_shards;
+    launch_packed_group32<true, Mapped>(
+        queue, params, batch, batches, long_batch);
+    return;
+  }
+  const int32_t batch = adaptive_batch(params.rows, capacity, /*unit=*/1);
+  const int64_t batches = (params.rows + batch - 1) / batch;
+  launch_packed_group32<false, Mapped>(
+      queue, params, batch, batches, long_batch);
+}
+
+}  // namespace
+
+extern "C" void engram_dequantize_launch(void* queue,
+                                         const void* bytes,
+                                         const void* scales,
+                                         const void* hashes,
+                                         const void* fp8_values,
+                                         void* output,
+                                         int64_t rows,
+                                         int32_t dim,
+                                         int32_t scale_dim,
+                                         int64_t table_start,
+                                         int64_t table_end,
+                                         bool all_owned) {
+  if (rows == 0) {
+    return;
+  }
+  DequantizeParams params;
+  params.bytes = static_cast<const uint8_t*>(bytes);
+  params.scales = static_cast<const uint8_t*>(scales);
+  params.hashes = static_cast<const int64_t*>(hashes);
+  params.fp8_values = static_cast<const float*>(fp8_values);
+  params.output = static_cast<bfloat16_t*>(output);
+  params.rows = rows;
+  params.dim = dim;
+  params.scale_dim = scale_dim;
+  params.table_start = table_start;
+  params.table_end = table_end;
+  params.all_owned = all_owned;
+  cnrtQueue_t stream = static_cast<cnrtQueue_t>(queue);
+  if (dim <= kTile && dim == static_cast<int64_t>(scale_dim) * 32) {
+    const int32_t batch = adaptive_batch(rows, kTile / dim, /*unit=*/1);
+    launch_group32<false, false>(
+        stream, params, batch, (rows + batch - 1) / batch);
+    return;
+  }
+  launch_generic<false>(stream, params);
+}
+
+extern "C" void engram_dequantize_packed_launch(void* queue,
+                                                const void* packed,
+                                                const void* hashes,
+                                                const void* fp8_values,
+                                                void* output,
+                                                int64_t rows,
+                                                int32_t dim,
+                                                int32_t scale_dim,
+                                                int64_t packed_row_stride,
+                                                int64_t tokens,
+                                                int64_t columns,
+                                                int64_t head_shard_count,
+                                                int64_t table_start,
+                                                int64_t table_end,
+                                                bool all_owned,
+                                                const void* row_indices) {
+  DequantizeParams params;
+  params.bytes = static_cast<const uint8_t*>(packed);
+  params.hashes = static_cast<const int64_t*>(hashes);
+  params.fp8_values = static_cast<const float*>(fp8_values);
+  params.output = static_cast<bfloat16_t*>(output);
+  params.rows = rows;
+  params.dim = dim;
+  params.scale_dim = scale_dim;
+  params.table_start = table_start;
+  params.table_end = table_end;
+  params.all_owned = all_owned;
+  params.packed_row_stride = packed_row_stride;
+  params.tokens = tokens;
+  params.columns = columns;
+  params.head_shards = head_shard_count;
+  params.row_indices = static_cast<const int64_t*>(row_indices);
+  cnrtQueue_t stream = static_cast<cnrtQueue_t>(queue);
+  if (row_indices != nullptr) {
+    launch_packed<true>(stream, params);
+  } else {
+    launch_packed<false>(stream, params);
+  }
+}

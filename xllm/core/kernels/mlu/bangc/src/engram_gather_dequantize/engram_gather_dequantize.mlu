@@ -1,0 +1,569 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/engram_common/device_helpers.h"
+#include "kernels/mlu/bangc/src/engram_gather_dequantize/launcher.h"
+
+namespace {
+
+using xllm::kernel::mlu::bangc::engram_detail::decode_fp8_tile;
+using xllm::kernel::mlu::bangc::engram_detail::load_row_hashes;
+
+constexpr int32_t kTile = 24576;
+
+template <bool Mapped>
+__mlu_global__ void gather_dequantize_kernel(const uint8_t* bytes,
+                                             const uint8_t* scales,
+                                             const int64_t* hashes,
+                                             const float* fp8_values,
+                                             bfloat16_t* output,
+                                             int64_t rows,
+                                             int32_t dim,
+                                             int32_t scale_dim,
+                                             uint32_t start_low,
+                                             int32_t start_high,
+                                             uint32_t end_low,
+                                             int32_t end_high,
+                                             int64_t columns,
+                                             const int64_t* row_indices) {
+  __nram__ uint8_t codes[kTile];
+  __nram__ uint8_t scale_codes[kTile];
+  __nram__ uint32_t indices[kTile];
+  __nram__ float values[kTile];
+  __nram__ bfloat16_t rounded[kTile];
+  __nram__ int32_t lut[256];
+  __memcpy(lut, fp8_values, sizeof(lut), GDRAM2NRAM);
+  const int32_t group_size = dim / scale_dim;
+  for (int64_t row = taskId; row < rows; row += taskDim) {
+    const int64_t source_row =
+        Mapped ? row_indices[row / columns] * columns + row % columns : row;
+    const uint32_t* hash_parts =
+        reinterpret_cast<const uint32_t*>(hashes + source_row);
+    const uint32_t hash_low = hash_parts[0];
+    const int32_t hash_high = static_cast<int32_t>(hash_parts[1]);
+    const bool above_start = hash_high > start_high ||
+                             (hash_high == start_high && hash_low >= start_low);
+    const bool below_end =
+        hash_high < end_high || (hash_high == end_high && hash_low < end_low);
+    const bool owned = above_start && below_end;
+    uint64_t table_row = 0;
+    if (owned) {
+      const uint32_t difference_low = hash_low - start_low;
+      const uint32_t borrow = hash_low < start_low ? 1 : 0;
+      const uint32_t difference_high = static_cast<uint32_t>(hash_high) -
+                                       static_cast<uint32_t>(start_high) -
+                                       borrow;
+      table_row =
+          (static_cast<uint64_t>(difference_high) << 32) | difference_low;
+    }
+    for (int64_t start = 0; start < dim; start += kTile) {
+      const int32_t count = dim - start < kTile ? dim - start : kTile;
+      const int32_t aligned = (count + 31) / 32 * 32;
+      if (!owned) {
+        __bang_write_value(values, aligned, 0.0f);
+      } else {
+        __memcpy(codes, bytes + table_row * dim + start, count, GDRAM2NRAM);
+        const int32_t first_group = start / group_size;
+        const int32_t groups =
+            (start + count - 1) / group_size - first_group + 1;
+        __memcpy(scale_codes,
+                 scales + table_row * scale_dim + first_group,
+                 groups,
+                 GDRAM2NRAM);
+        decode_fp8_tile(
+            values, indices, codes, scale_codes, lut, start, count, group_size);
+      }
+      __bang_float2bfloat16_rn(rounded, values, aligned);
+      __memcpy(output + row * dim + start,
+               rounded,
+               count * sizeof(bfloat16_t),
+               NRAM2GDRAM);
+    }
+  }
+}
+
+// Batch independent random table reads before vector lookup and scale
+// expansion. Row hashes are already resident; ownership uses 32-bit word
+// compares (int64 vector compares are emulated and ~4x slower on mtp_592).
+__mlu_func__ void prefetch_table_rows(uint8_t* codes,
+                                      uint8_t* scale_codes,
+                                      const int64_t* row_hashes,
+                                      uint32_t* row_words,
+                                      uint64_t* byte_offsets,
+                                      uint64_t* scale_offsets,
+                                      uint32_t* ownership_mask,
+                                      int64_t* valid_rows,
+                                      uint32_t* compare,
+                                      float* valid_float,
+                                      float* minimum_owned,
+                                      float* maximum_owned,
+                                      float* mask_values,
+                                      float* mask_columns,
+                                      const float* bit_weights,
+                                      const uint8_t* bytes,
+                                      const uint8_t* scales,
+                                      int32_t count,
+                                      int32_t dim,
+                                      const int64_t* start_values,
+                                      uint32_t start_low,
+                                      int32_t start_high,
+                                      uint32_t end_low,
+                                      int32_t end_high) {
+  const int32_t elements = count * dim;
+  const int32_t groups = elements / 32;
+  // [count][2] words -> [2][count] low/high planes.
+  __bang_transpose(
+      row_words, reinterpret_cast<const uint32_t*>(row_hashes), count, 2);
+  const uint32_t* low = row_words;
+  const int32_t* high = reinterpret_cast<const int32_t*>(row_words + count);
+  uint32_t* valid = compare;
+  uint32_t* term = compare + kTile / 32;
+  uint32_t* other = term + kTile / 32;
+  if (start_high == end_high) {
+    __bang_eq_scalar(
+        reinterpret_cast<int32_t*>(valid), high, start_high, count);
+    __bang_ge_scalar(term, low, start_low, count);
+    __bang_band(valid, valid, term, count);
+    __bang_lt_scalar(term, low, end_low, count);
+    __bang_band(valid, valid, term, count);
+  } else {
+    uint32_t* low_below = term + 2 * (kTile / 32);
+    __bang_gt_scalar(
+        reinterpret_cast<int32_t*>(valid), high, start_high, count);
+    __bang_eq_scalar(reinterpret_cast<int32_t*>(term), high, start_high, count);
+    __bang_ge_scalar(other, low, start_low, count);
+    __bang_band(term, term, other, count);
+    __bang_bor(valid, valid, term, count);
+    __bang_lt_scalar(reinterpret_cast<int32_t*>(term), high, end_high, count);
+    __bang_eq_scalar(reinterpret_cast<int32_t*>(other), high, end_high, count);
+    __bang_lt_scalar(low_below, low, end_low, count);
+    __bang_band(other, other, low_below, count);
+    __bang_bor(term, term, other, count);
+    __bang_band(valid, valid, term, count);
+  }
+  __bang_uint322float(valid_float, valid, count, 0);
+  __bang_argmin(minimum_owned, valid_float, count);
+  const bool all_owned = minimum_owned[0] == 1.0f;
+  if (all_owned) {
+    __bang_sub(reinterpret_cast<int64_t*>(byte_offsets),
+               row_hashes,
+               start_values,
+               count);
+    __bang_mul_scalar(reinterpret_cast<int64_t*>(scale_offsets),
+                      reinterpret_cast<int64_t*>(byte_offsets),
+                      static_cast<int64_t>(dim / 32),
+                      count);
+    __bang_mul_scalar(reinterpret_cast<int64_t*>(byte_offsets),
+                      reinterpret_cast<int64_t*>(byte_offsets),
+                      static_cast<int64_t>(dim),
+                      count);
+    __sync_compute();
+    __gather_async(codes, bytes, byte_offsets, dim, GDRAM2NRAM, dim, count);
+    __gather_io1_async(scale_codes,
+                       scales,
+                       scale_offsets,
+                       dim / 32,
+                       GDRAM2NRAM,
+                       dim / 32,
+                       count);
+  } else {
+    // Foreign rows have no table address. Initialize their staging to finite
+    // zero and overwrite the result with positive zero after arithmetic.
+    __bang_write_value(codes, elements, static_cast<uint8_t>(0));
+    __bang_write_value(scale_codes, groups, static_cast<uint8_t>(127));
+    __sync_compute();
+    // Build the gather mask with vector arithmetic: bit r of word w is
+    // valid[32 * w + r]. Each 16-bit half sums exactly in FP32.
+    const int32_t words = (count + 31) / 32;
+    __bang_write_value(mask_values, words * 32, 0.0f);
+    __bang_uint322float(mask_values, valid, count, 0);
+    __bang_uint322int64(valid_rows, valid, count, 0, 0);
+    __bang_mul(mask_values, mask_values, bit_weights, words * 32);
+    __bang_transpose(mask_columns, mask_values, words, 32);
+    for (int32_t rows = 8; rows >= 1; rows /= 2) {
+      __bang_add(mask_columns,
+                 mask_columns,
+                 mask_columns + rows * words,
+                 rows * words);
+      __bang_add(mask_columns + 16 * words,
+                 mask_columns + 16 * words,
+                 mask_columns + (16 + rows) * words,
+                 rows * words);
+    }
+    uint32_t* high_half = reinterpret_cast<uint32_t*>(mask_values);
+    __bang_float2int32(
+        reinterpret_cast<int32_t*>(ownership_mask), mask_columns, words, 0);
+    __bang_float2int32(reinterpret_cast<int32_t*>(high_half),
+                       mask_columns + 16 * words,
+                       words,
+                       0);
+    __bang_mul_scalar(high_half, high_half, 65536U, words);
+    __bang_add(ownership_mask, ownership_mask, high_half, words);
+    __bang_argmax(maximum_owned, valid_float, count);
+    const bool any_owned = maximum_owned[0] != 0.0f;
+    // Unsigned arithmetic keeps even foreign INT64_MIN/MAX hashes defined;
+    // only owned lanes have a nonzero offset and a set gather mask bit.
+    __bang_sub(byte_offsets,
+               reinterpret_cast<const uint64_t*>(row_hashes),
+               reinterpret_cast<const uint64_t*>(start_values),
+               count);
+    __bang_mul(byte_offsets,
+               byte_offsets,
+               reinterpret_cast<uint64_t*>(valid_rows),
+               count);
+    __bang_mul_scalar(
+        scale_offsets, byte_offsets, static_cast<uint64_t>(dim / 32), count);
+    __bang_mul_scalar(
+        byte_offsets, byte_offsets, static_cast<uint64_t>(dim), count);
+    __sync_compute();
+    if (any_owned) {
+      __gather_async(codes,
+                     bytes,
+                     byte_offsets,
+                     ownership_mask,
+                     dim,
+                     GDRAM2NRAM,
+                     dim,
+                     count);
+      __gather_io1_async(scale_codes,
+                         scales,
+                         scale_offsets,
+                         ownership_mask,
+                         dim / 32,
+                         GDRAM2NRAM,
+                         dim / 32,
+                         count);
+    }
+  }
+}
+
+template <bool Mapped>
+__mlu_global__ void gather_group32_kernel(const uint8_t* bytes,
+                                          const uint8_t* scales,
+                                          const int64_t* hashes,
+                                          const float* fp8_values,
+                                          bfloat16_t* output,
+                                          int64_t rows,
+                                          int32_t dim,
+                                          int32_t batch,
+                                          uint32_t start_low,
+                                          int32_t start_high,
+                                          uint32_t end_low,
+                                          int32_t end_high,
+                                          int64_t columns,
+                                          const int64_t* row_indices) {
+  __nram__ uint8_t code_buffers[2][kTile];
+  __nram__ uint8_t scale_buffers[2][kTile / 32];
+  __nram__ int64_t hash_buffers[2][kTile / 32];
+  __nram__ uint64_t byte_offsets[kTile / 32];
+  __nram__ uint64_t scale_offsets[kTile / 32];
+  __nram__ uint32_t ownership_mask[kTile / 32 / 32];
+  __nram__ uint32_t indices[kTile];
+  __nram__ float values[kTile];
+  __nram__ float transposed[kTile];
+  __nram__ float factors[kTile / 32];
+  __nram__ int64_t start_values[kTile / 32];
+  __nram__ int64_t valid_rows[kTile / 32];
+  __nram__ uint32_t row_words[2 * (kTile / 32)];
+  __nram__ float valid_float[kTile / 32];
+  __nram__ float minimum_owned[2];
+  __nram__ float maximum_owned[2];
+  __nram__ float mask_values[kTile / 32];
+  __nram__ float mask_columns[kTile / 32];
+  __nram__ float bit_weights[kTile / 32];
+  __nram__ float minimum[2];
+  __nram__ float maximum[2];
+  __nram__ bfloat16_t bf16_lut[256];
+  __nram__ bfloat16_t output_buffers[2][kTile];
+  __nram__ int32_t lut[256];
+  __memcpy(lut, fp8_values, sizeof(lut), GDRAM2NRAM);
+  __bang_float2bfloat16_rn(bf16_lut, reinterpret_cast<float*>(lut), 256);
+  for (int32_t bit = 0; bit < 16; ++bit) {
+    bit_weights[bit] = static_cast<float>(1 << bit);
+  }
+  __memcpy(bit_weights + 16,
+           bit_weights,
+           16 * sizeof(float),
+           NRAM2NRAM,
+           16 * sizeof(float),
+           0,
+           kTile / 32 / 16 - 2);
+  const int64_t batches = rows / batch + (rows % batch != 0);
+  if (taskId >= batches) {
+    return;
+  }
+  // Scalar registers on mtp592 retain only 48 bits. Store both 32-bit
+  // halves explicitly, then replicate for the vector64 subtraction.
+  reinterpret_cast<uint32_t*>(start_values)[0] = start_low;
+  reinterpret_cast<int32_t*>(start_values)[1] = start_high;
+  __sync();
+  if (batch > 1) {
+    __memcpy(start_values + 1,
+             start_values,
+             sizeof(int64_t),
+             NRAM2NRAM,
+             sizeof(int64_t),
+             0,
+             batch - 2);
+  }
+  // Ownership scratch aliases the decode buffer: prefetch finishes its
+  // compute before the current tile's decode writes it.
+  uint32_t* compare = reinterpret_cast<uint32_t*>(transposed);
+  // A non-inlined capture would hoist these NRAM buffers into module globals,
+  // making the mapped and unmapped kernel instances consume NRAM together.
+  auto prefetch = [&](int32_t slot, int32_t bank_index, int32_t count)
+                      __attribute__((always_inline)) {
+                        prefetch_table_rows(code_buffers[bank_index],
+                                            scale_buffers[bank_index],
+                                            hash_buffers[slot],
+                                            row_words,
+                                            byte_offsets,
+                                            scale_offsets,
+                                            ownership_mask,
+                                            valid_rows,
+                                            compare,
+                                            valid_float,
+                                            minimum_owned,
+                                            maximum_owned,
+                                            mask_values,
+                                            mask_columns,
+                                            bit_weights,
+                                            bytes,
+                                            scales,
+                                            count,
+                                            dim,
+                                            start_values,
+                                            start_low,
+                                            start_high,
+                                            end_low,
+                                            end_high);
+                      };
+  auto tile_count = [&](int64_t tile) {
+    const int64_t first = tile * batch;
+    return static_cast<int32_t>(rows - first < batch ? rows - first : batch);
+  };
+  // Hashes stream two tiles ahead so ownership never waits on GDRAM.
+  int32_t bank = 0;
+  int32_t slot = 0;
+  load_row_hashes<Mapped>(hash_buffers[0],
+                          hashes,
+                          static_cast<int64_t>(taskId) * batch,
+                          tile_count(taskId),
+                          columns,
+                          row_indices);
+  __sync_io();
+  prefetch(0, 0, tile_count(taskId));
+  if (taskId + taskDim < batches) {
+    load_row_hashes<Mapped>(hash_buffers[1],
+                            hashes,
+                            (taskId + taskDim) * batch,
+                            tile_count(taskId + taskDim),
+                            columns,
+                            row_indices);
+  }
+  slot = 1;
+  __sync_io();
+  for (int64_t tile = taskId; tile < batches; tile += taskDim) {
+    const int64_t first = tile * batch;
+    const int32_t count = tile_count(tile);
+    const int32_t elements = count * dim;
+    const int32_t groups = elements / 32;
+    uint8_t* codes = code_buffers[bank];
+    uint8_t* scale_codes = scale_buffers[bank];
+    bfloat16_t* rounded = output_buffers[bank];
+    const int64_t next = tile + taskDim;
+    if (next < batches) {
+      prefetch(slot, 1 - bank, tile_count(next));
+      const int64_t after = next + taskDim;
+      if (after < batches) {
+        load_row_hashes<Mapped>(hash_buffers[1 - slot],
+                                hashes,
+                                after * batch,
+                                tile_count(after),
+                                columns,
+                                row_indices);
+      }
+      slot = 1 - slot;
+    }
+    __bang_uint82float(factors, scale_codes, groups, 0);
+    __bang_argmin(minimum, factors, groups);
+    __bang_argmax(maximum, factors, groups);
+    const bool normal_bit_range = minimum[0] >= 10.0f && maximum[0] <= 246.0f;
+    if (normal_bit_range) {
+      uint8_t* transposed_codes = reinterpret_cast<uint8_t*>(values);
+      int16_t* index16 = reinterpret_cast<int16_t*>(indices);
+      int16_t* exponent_bits = reinterpret_cast<int16_t*>(factors);
+      bfloat16_t* bf16_values = reinterpret_cast<bfloat16_t*>(transposed);
+      __bang_transpose(transposed_codes, codes, groups, 32);
+      __bang_uint82int16(index16, transposed_codes, elements, 0, 0);
+      __bang_lut(reinterpret_cast<int16_t*>(bf16_values),
+                 reinterpret_cast<uint16_t*>(index16),
+                 reinterpret_cast<int16_t*>(bf16_lut),
+                 elements,
+                 256);
+      __bang_uint82int16(exponent_bits, scale_codes, groups, 0, 0);
+      __bang_mul_scalar(
+          exponent_bits, exponent_bits, static_cast<int16_t>(128), groups);
+      __bang_cycle_mul(bf16_values,
+                       bf16_values,
+                       reinterpret_cast<bfloat16_t*>(exponent_bits),
+                       elements,
+                       groups);
+      __bang_transpose(rounded, bf16_values, 32, groups);
+    } else {
+      __bang_uint82int32(
+          reinterpret_cast<int32_t*>(indices), codes, elements, 0, 0);
+      __bang_lut(
+          reinterpret_cast<int32_t*>(values), indices, lut, elements, 256);
+      __bang_sub_scalar(factors, factors, 127.0f, groups);
+      __bang_pow2(factors, factors, groups);
+      __bang_transpose(transposed, values, groups, 32);
+      __bang_cycle_mul(transposed, transposed, factors, elements, groups);
+      __bang_transpose(values, transposed, 32, groups);
+      __bang_float2bfloat16_rn(rounded, values, elements);
+    }
+    // Unowned lanes retain initialized code0 and scale127, which decode to
+    // positive zero with the required canonical FP8 LUT. No NaN can enter them.
+    __sync_compute();
+    __sync_io();
+    __memcpy_async(output + first * dim,
+                   rounded,
+                   elements * sizeof(bfloat16_t),
+                   NRAM2GDRAM);
+    bank = 1 - bank;
+  }
+  __sync_io();
+}
+
+template <bool Mapped>
+void launch_gather(void* queue,
+                   const void* bytes,
+                   const void* scales,
+                   const void* hashes,
+                   const void* fp8_values,
+                   void* output,
+                   int64_t rows,
+                   int32_t dim,
+                   int32_t scale_dim,
+                   int64_t table_start,
+                   int64_t table_end,
+                   int64_t columns,
+                   const void* row_indices) {
+  if (rows == 0) {
+    return;
+  }
+  if (dim <= kTile && dim == static_cast<int64_t>(scale_dim) * 32) {
+    // Adaptive granularity: spread short decode batches over the cores and
+    // grow toward the NRAM-bounded tile for long prefills.
+    // Below a few rows per core, extra cores add launch and prologue cost
+    // without shortening the per-core DMA latency chain (MLU590).
+    constexpr int64_t kCores = 32;
+    constexpr int64_t kMinRowsPerCore = 8;
+    const int64_t capacity = kTile / dim;
+    // Fewest rounds within the tile capacity, then the smallest balanced tile.
+    const int64_t rounds = (rows + kCores * capacity - 1) / (kCores * capacity);
+    int64_t spread = (rows + kCores * rounds - 1) / (kCores * rounds);
+    spread = spread < kMinRowsPerCore ? kMinRowsPerCore : spread;
+    const int32_t batch =
+        static_cast<int32_t>(spread < capacity ? spread : capacity);
+    const int64_t batches = rows / batch + (rows % batch != 0);
+    const cnrtDim3_t batched_grid = {
+        static_cast<uint32_t>(batches < 32 ? batches : 32), 1, 1};
+    gather_group32_kernel<Mapped>
+        <<<batched_grid, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>(
+            static_cast<const uint8_t*>(bytes),
+            static_cast<const uint8_t*>(scales),
+            static_cast<const int64_t*>(hashes),
+            static_cast<const float*>(fp8_values),
+            static_cast<bfloat16_t*>(output),
+            rows,
+            dim,
+            batch,
+            static_cast<uint32_t>(table_start),
+            static_cast<int32_t>(static_cast<uint64_t>(table_start) >> 32),
+            static_cast<uint32_t>(table_end),
+            static_cast<int32_t>(static_cast<uint64_t>(table_end) >> 32),
+            columns,
+            static_cast<const int64_t*>(row_indices));
+    return;
+  }
+  cnrtDim3_t grid = {static_cast<unsigned int>(rows < 32 ? rows : 32), 1, 1};
+  gather_dequantize_kernel<Mapped>
+      <<<grid, cnrtFuncTypeBlock, static_cast<cnrtQueue_t>(queue)>>>(
+          static_cast<const uint8_t*>(bytes),
+          static_cast<const uint8_t*>(scales),
+          static_cast<const int64_t*>(hashes),
+          static_cast<const float*>(fp8_values),
+          static_cast<bfloat16_t*>(output),
+          rows,
+          dim,
+          scale_dim,
+          static_cast<uint32_t>(table_start),
+          static_cast<int32_t>(static_cast<uint64_t>(table_start) >> 32),
+          static_cast<uint32_t>(table_end),
+          static_cast<int32_t>(static_cast<uint64_t>(table_end) >> 32),
+          columns,
+          static_cast<const int64_t*>(row_indices));
+}
+
+}  // namespace
+
+extern "C" void engram_gather_dequantize_launch(void* queue,
+                                                const void* bytes,
+                                                const void* scales,
+                                                const void* hashes,
+                                                const void* fp8_values,
+                                                void* output,
+                                                int64_t rows,
+                                                int32_t dim,
+                                                int32_t scale_dim,
+                                                int64_t table_start,
+                                                int64_t table_end,
+                                                int64_t columns,
+                                                const void* row_indices) {
+  if (row_indices != nullptr) {
+    launch_gather<true>(queue,
+                        bytes,
+                        scales,
+                        hashes,
+                        fp8_values,
+                        output,
+                        rows,
+                        dim,
+                        scale_dim,
+                        table_start,
+                        table_end,
+                        columns,
+                        row_indices);
+  } else {
+    launch_gather<false>(queue,
+                         bytes,
+                         scales,
+                         hashes,
+                         fp8_values,
+                         output,
+                         rows,
+                         dim,
+                         scale_dim,
+                         table_start,
+                         table_end,
+                         columns,
+                         nullptr);
+  }
+}

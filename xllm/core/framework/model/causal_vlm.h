@@ -85,6 +85,15 @@ class CausalVLMImpl : public CausalVLM {
     }
   }
 
+  void prepare_graph_forward_inputs(
+      ModelGraphMetadataState* state,
+      const torch::Tensor& tokens,
+      const ModelInputParams& parameters) override {
+    if constexpr (detail::has_prepare_graph_forward_inputs<Model>::value) {
+      model_->prepare_graph_forward_inputs(state, tokens, parameters);
+    }
+  }
+
   bool is_hybrid_linear_attention() override {
     if constexpr (detail::has_is_hybrid_linear_attention<Model>::value) {
       return model_->is_hybrid_linear_attention();

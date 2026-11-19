@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "layers/mlu/deepseek_v41/deepseek_v41_metadata.h"
+
 namespace xllm::layer {
 DeepseekV41DecoderLayerImpl::DeepseekV41DecoderLayerImpl(
     const ModelContext& context,
@@ -142,10 +144,10 @@ torch::Tensor DeepseekV41DecoderLayerImpl::forward(
     Csa2Context& shared,
     std::optional<PendingMHC>& pending,
     bool defer_post,
-    DeepseekV41EngramImpl::HashState* hash_state,
+    const EngramLayerInput& engram_input,
     const mlu_v4_cp::DeepseekV4CpContext* cp_context,
     torch::Tensor* attention_input) {
-  if (input.meta.q_max_seq_len == 0 || input.meta.num_sequences == 0) {
+  if (!deepseek_v41::has_request_rows(input)) {
     // No request owns this row. Participate in MoE communication without
     // evaluating Engram or touching any attention/compressor cache slot.
     torch::Tensor dummy = hidden.select(/*dim=*/1, /*index=*/0).contiguous();
@@ -171,7 +173,7 @@ torch::Tensor DeepseekV41DecoderLayerImpl::forward(
         hidden,
         tokens,
         input,
-        hash_state,
+        engram_input,
         cp_context ? cp_context->local_row_indices : torch::Tensor());
   }
   if (!use_fused_mhc_) {

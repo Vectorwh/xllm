@@ -63,8 +63,13 @@ namespace layer {
 struct AttentionMetadata;
 }
 
-struct ModelGraphMetadataState {
+class ModelGraphMetadataState {
+ public:
   virtual ~ModelGraphMetadataState() = default;
+  // Called outside graph capture, after capture/replay work is enqueued. Input
+  // staging may use this boundary to fence device consumers before reuse.
+  // Currently invoked by the MLU graph executor only.
+  virtual void finish_input_consumption() {}
 };
 
 struct DFlash2CandidateOutput {
@@ -101,6 +106,13 @@ class CausalLM : public torch::nn::Module {
   virtual void prepare_graph_forward_metadata(ModelGraphMetadataState*,
                                               const torch::Tensor&,
                                               ModelInputParams&) {}
+
+  // Start input-dependent work outside capture before graph consumers run.
+  // Called right after prepare_graph_forward_metadata for every capture and
+  // replay. Currently invoked by the MLU graph executor only.
+  virtual void prepare_graph_forward_inputs(ModelGraphMetadataState*,
+                                            const torch::Tensor&,
+                                            const ModelInputParams&) {}
 
   // hidden_states: [num_tokens, hidden_size]
   // seleted_idxes: [num_tokens]
@@ -313,6 +325,15 @@ class CausalLMImpl : public CausalLM {
                                       ModelInputParams& parameters) override {
     if constexpr (detail::has_prepare_graph_forward_metadata<Model>::value) {
       model_->prepare_graph_forward_metadata(state, positions, parameters);
+    }
+  }
+
+  void prepare_graph_forward_inputs(
+      ModelGraphMetadataState* state,
+      const torch::Tensor& tokens,
+      const ModelInputParams& parameters) override {
+    if constexpr (detail::has_prepare_graph_forward_inputs<Model>::value) {
+      model_->prepare_graph_forward_inputs(state, tokens, parameters);
     }
   }
 

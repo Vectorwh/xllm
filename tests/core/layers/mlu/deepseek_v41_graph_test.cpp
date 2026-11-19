@@ -679,7 +679,9 @@ TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
         torch::tensor({0, 11, 24, 41}, torch::kInt64).view({1, 4})}}));
   auto state = engram->create_hash_state(2);
   ModelInputParams input;
+  input.meta.num_sequences = 2;
   input.meta.actual_num_sequences = 2;
+  input.attention.host.q_seq_lens = {0, 1, 2};
   input.embedding.engram_lookback_token_ids = {4, 5, 6, 7};
   state->prepare(input);
   auto tokens = torch::tensor({2, 3}, options.dtype(torch::kInt64));
@@ -700,6 +702,7 @@ TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
   state->prepare(input);
   tokens.copy_(torch::tensor({3, 2}, tokens.options()));
   graph.replay();
+  state->mark_consumed();
   torch_mlu::synchronize();
   EXPECT_TRUE(torch::equal(output.cpu(), expected.flip({0})));
   input.meta.actual_num_sequences = 1;
@@ -707,6 +710,7 @@ TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
   state->prepare(input);
   tokens.copy_(torch::tensor({2, 0}, tokens.options()));
   graph.replay();
+  state->mark_consumed();
   torch_mlu::synchronize();
   EXPECT_TRUE(torch::equal(output[0].cpu(), expected[0]));
   EXPECT_TRUE(torch::equal(output[1].cpu(),
@@ -719,9 +723,13 @@ TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
   auto block = torch::tensor({2, 3, 1}, tokens.options());
   input.meta.actual_num_sequences = 1;
   input.embedding.engram_lookback_token_ids = {4, 5};
+  input.meta.num_sequences = 1;
+  input.attention.host.q_seq_lens = {0, 3};
   grouped->prepare(input);
   input.meta.actual_num_sequences = 3;
   input.embedding.engram_lookback_token_ids = {4, 5, 2, 4, 3, 2};
+  input.meta.num_sequences = 3;
+  input.attention.host.q_seq_lens = {0, 1, 2, 3};
   reference->prepare(input);
   auto grouped_output = grouped->forward(block);
   auto reference_output = reference->forward(block);
@@ -738,9 +746,13 @@ TEST(DeepseekV41GraphTest, HashReplayUpdatesTokensHistoryAndPadding) {
   block.copy_(torch::tensor({3, 2, 1}, block.options()));
   input.meta.actual_num_sequences = 1;
   input.embedding.engram_lookback_token_ids = {6, 7};
+  input.meta.num_sequences = 1;
+  input.attention.host.q_seq_lens = {0, 3};
   grouped->prepare(input);
   input.meta.actual_num_sequences = 3;
   input.embedding.engram_lookback_token_ids = {6, 7, 3, 6, 2, 3};
+  input.meta.num_sequences = 3;
+  input.attention.host.q_seq_lens = {0, 1, 2, 3};
   reference->prepare(input);
   reference_output = reference->forward(block);
   verify_graph.replay();

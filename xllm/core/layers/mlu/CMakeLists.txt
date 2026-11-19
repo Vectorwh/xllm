@@ -1,5 +1,13 @@
 include(cc_library)
 
+# ATen's OpenMP parallel_for becomes serial when its caller is compiled without
+# OpenMP. Enable it only for the CPU-offloaded Engram gather implementation.
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+separate_arguments(engram_openmp_compile_options NATIVE_COMMAND
+                   "${OpenMP_CXX_FLAGS}")
+set_property(SOURCE deepseek_v41/deepseek_v41_engram.cpp APPEND PROPERTY
+             COMPILE_OPTIONS ${engram_openmp_compile_options})
+
 cc_library(
   NAME
     mlu_layers
@@ -25,6 +33,7 @@ cc_library(
     deepseek_v41/deepseek_v41_indexer.h
     deepseek_v41/deepseek_v41_metadata.h
     deepseek_v41/deepseek_v41_engram.h
+    deepseek_v41/deepseek_v41_engram_inputs.h
     deepseek_v41/engram_shared_memory.h
     deepseek_v41/deepseek_v41_vision.h
     deepseek_v4/compressor.h
@@ -72,6 +81,7 @@ cc_library(
     deepseek_v41/deepseek_v41_indexer.cpp
     deepseek_v41/deepseek_v41_metadata.cpp
     deepseek_v41/deepseek_v41_engram.cpp
+    deepseek_v41/deepseek_v41_engram_inputs.cpp
     deepseek_v41/engram_shared_memory.cpp
     deepseek_v41/deepseek_v41_hash.cpp
     deepseek_v41/deepseek_v41_vision.cpp
@@ -105,3 +115,5 @@ cc_library(
     :common_layers
     :util
 )
+
+target_link_libraries(mlu_layers PRIVATE ${OpenMP_CXX_LIBRARIES})

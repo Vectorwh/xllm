@@ -94,7 +94,9 @@ class ModelConfig final {
   PROPERTY(bool, enable_qwen3_reranker) = false;
 
   // Engram configuration as a JSON object. Native MLU accepts placement
-  // (cpu/gpu) and replication (none/per_node), defaulting to cpu/none.
+  // (cpu/device), replication (none/per_node), communication
+  // (allreduce/reduce_scatter_allgather), and prefill_hash (cpu/device),
+  // defaulting to cpu/none/reduce_scatter_allgather/device.
   // The Python NPU executor accepts cpu_offload and dp_shared_memory,
   // both disabled by default (xllm/python/models/engram_config.py).
   PROPERTY(std::string, engram_config) = "{}";

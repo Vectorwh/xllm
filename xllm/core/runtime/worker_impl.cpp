@@ -1537,6 +1537,9 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
       return;
     }
 
+    input_params.embedding.input_token_ids_host =
+        processed_input.token_ids_host;
+
     apply_kv_block_swaps(input_params);
 
 #if defined(USE_NPU)

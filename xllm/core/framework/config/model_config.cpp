@@ -83,10 +83,16 @@ DEFINE_int32(flashinfer_workspace_buffer_size,
 DEFINE_string(engram_config,
               "{}",
               "Engram configuration as a JSON object. Native MLU accepts "
-              "placement (cpu/gpu) and replication (none/per_node), e.g. "
+              "placement (cpu/device), replication (none/per_node), "
+              "communication (allreduce/reduce_scatter_allgather), and "
+              "prefill_hash (cpu/device), e.g. "
               "'{\"placement\":\"cpu\",\"replication\":\"per_node\"}', "
-              "defaulting to cpu/none. The Python NPU executor accepts "
-              "cpu_offload and dp_shared_memory, both disabled by default.");
+              "defaulting to cpu/none/reduce_scatter_allgather/device. "
+              "Communication selection applies to non-shared tables with "
+              "active CP. prefill_hash applies to host-table eager prefill "
+              "with device tokens; decode and graph replay keep CPU hashes. "
+              "The Python NPU executor accepts cpu_offload and "
+              "dp_shared_memory, both disabled by default.");
 
 // NOTE: This is an experimental flag,
 //       it needs to be removed after the function is stable.

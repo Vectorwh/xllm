@@ -421,6 +421,13 @@ cc_test(
     "PYTHONPATH=${_xllm_build_import_root}:$ENV{PYTHONPATH};OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
 )
 
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+separate_arguments(engram_test_openmp_compile_options NATIVE_COMMAND
+                   "${OpenMP_CXX_FLAGS}")
+set_property(SOURCE deepseek_v41_engram_test.cpp APPEND PROPERTY
+             COMPILE_OPTIONS ${engram_test_openmp_compile_options})
+target_link_libraries(deepseek_v41_engram_test PRIVATE ${OpenMP_CXX_LIBRARIES})
+
 # Fork real CP/EP ranks before device initialization in this isolated binary.
 cc_test(
   NAME deepseek_v41_engram_cp_test
