@@ -406,10 +406,18 @@ void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
           params.response_format = ResponseFormatType::REGEX;
           params.response_format_regex = format.regex();
         }
+      } else if (type == "ebnf") {
+        const auto& format = request.response_format();
+        if (!format.has_ebnf() || format.ebnf().empty()) {
+          params.response_format_error = "ebnf requires a non-empty grammar";
+        } else {
+          params.response_format = ResponseFormatType::EBNF;
+          params.response_format_ebnf = format.ebnf();
+        }
       } else {
         params.response_format_error =
             "Unsupported response_format.type: " + type +
-            "; supported types are json_object, json_schema and regex";
+            "; supported types are json_object, json_schema, regex and ebnf";
       }
     }
   }

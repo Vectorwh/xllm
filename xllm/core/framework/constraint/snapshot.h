@@ -23,16 +23,17 @@ limitations under the License.
 namespace xllm {
 
 // Identity of a grammar compiled from a per-request source (xgrammar is the
-// first such backend: every request carries its own schema or regex, unlike
-// builtin's single fixed JSON grammar). A snapshot receiver rebuilds the
-// machine from this spec; an empty source means no per-request grammar and
-// the receiver falls back to the backend's constructed-at-init grammar.
+// first such backend: every request carries its own schema, regex or EBNF
+// grammar, unlike builtin's single fixed JSON grammar). A snapshot receiver
+// rebuilds the machine from this spec; an empty source means no per-request
+// grammar and the receiver falls back to the backend's constructed-at-init
+// grammar.
 class GrammarSpec final {
  public:
   // Shared by compile-time request validation and the packed-input reader.
   // Reject oversized user input before it can reach a descriptor CHECK.
   static constexpr uint64_t kMaxSourceBytes = 1ULL << 24;
-  enum class Type : int8_t { JSON_SCHEMA = 0, REGEX = 1 };
+  enum class Type : int8_t { JSON_SCHEMA = 0, REGEX = 1, EBNF = 2 };
   Type type = Type::JSON_SCHEMA;
   std::string source;
   bool strict = false;

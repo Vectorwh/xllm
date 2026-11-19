@@ -1725,7 +1725,8 @@ void read_json_object_state_snapshots(
     int8_t type = 0;
     read_data(context, type);
     CHECK(type == static_cast<int8_t>(GrammarSpec::Type::JSON_SCHEMA) ||
-          type == static_cast<int8_t>(GrammarSpec::Type::REGEX))
+          type == static_cast<int8_t>(GrammarSpec::Type::REGEX) ||
+          type == static_cast<int8_t>(GrammarSpec::Type::EBNF))
         << "grammar_spec.type out of range: " << type;
     bool strict = false;
     read_data(context, strict);

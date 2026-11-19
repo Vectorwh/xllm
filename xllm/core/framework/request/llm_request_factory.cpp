@@ -336,6 +336,13 @@ LLMRequestFactory::compile_response_format(const RequestParams& sp,
     spec.source = sp.response_format_regex;
     return xgrammar_compiler_->compile_regex(spec.source, error);
   }
+  if (sp.response_format == ResponseFormatType::EBNF) {
+    spec.type = GrammarSpec::Type::EBNF;
+    spec.source = sp.response_format_ebnf;
+    // compile_ebnf also probes the compiled grammar (empty-language
+    // rejection), so an unhealthy grammar fails as a request error here.
+    return xgrammar_compiler_->compile_ebnf(spec.source, error);
+  }
   const bool json_object =
       sp.response_format == ResponseFormatType::JSON_OBJECT;
   spec.type = GrammarSpec::Type::JSON_SCHEMA;

@@ -65,6 +65,8 @@ class XGrammarCompiler final {
   std::shared_ptr<const CompiledXGrammar> compile_regex(
       const std::string& regex,
       std::string& error);
+  std::shared_ptr<const CompiledXGrammar> compile_ebnf(const std::string& ebnf,
+                                                       std::string& error);
 
  private:
   std::mutex mutex_;

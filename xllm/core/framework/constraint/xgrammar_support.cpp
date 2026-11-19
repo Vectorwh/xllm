@@ -107,7 +107,8 @@ std::shared_ptr<XGrammarConstraintMachine> XGrammarMachineCache::get(
     std::string& error) {
   if (spec.empty() || !GrammarSpec::source_within_limit(spec.source) ||
       (spec.type != GrammarSpec::Type::JSON_SCHEMA &&
-       spec.type != GrammarSpec::Type::REGEX)) {
+       spec.type != GrammarSpec::Type::REGEX &&
+       spec.type != GrammarSpec::Type::EBNF)) {
     error = "invalid grammar spec type or source length";
     return nullptr;
   }
@@ -166,6 +167,8 @@ std::shared_ptr<XGrammarConstraintMachine> XGrammarMachineCache::get(
   std::shared_ptr<const CompiledXGrammar> grammar;
   if (spec.type == GrammarSpec::Type::REGEX) {
     grammar = compiler->compile_regex(spec.source, error);
+  } else if (spec.type == GrammarSpec::Type::EBNF) {
+    grammar = compiler->compile_ebnf(spec.source, error);
   } else {
     grammar = compiler->compile_json_schema(spec.source, spec.strict, error);
   }

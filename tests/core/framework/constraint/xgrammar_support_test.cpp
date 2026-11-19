@@ -204,6 +204,35 @@ TEST(XGrammarSupportTest, FinishedRowsReleaseCachedMachines) {
   EXPECT_NE(cache.get(spec, error), nullptr);
 }
 
+TEST(XGrammarSupportTest, EbnfSpecsRebuildThroughTheMachineCache) {
+  // The EBNF spec type rides the same cache as schemas and regexes: a PD
+  // rebuild or snapshot restore gets a working machine whose compiled
+  // grammar admits exactly the strings the EBNF rules allow.
+  CacheTestTokenizer tokenizer;
+  XGrammarMachineCache cache(tokenizer, cache_test_model_args());
+  GrammarSpec spec;
+  spec.type = GrammarSpec::Type::EBNF;
+  spec.source = "root ::= \"A\" | \"B\" \"-\" \"1\"";
+  std::string error;
+  auto machine = cache.get(spec, error);
+  ASSERT_NE(machine, nullptr) << error;
+  EXPECT_EQ(cache.get(spec, error), machine);
+
+  ConstraintState state = machine->initial_state(false);
+  EXPECT_TRUE(machine->can_accept(state, /*token_id=*/0));   // "A"
+  EXPECT_TRUE(machine->can_accept(state, /*token_id=*/1));   // "B"
+  EXPECT_FALSE(machine->can_accept(state, /*token_id=*/3));  // "1"
+
+  // Dead EBNF grammars fail the cache the same way they fail the request
+  // factory: compile-time rejection instead of an all-deny decode stall.
+  GrammarSpec dead;
+  dead.type = GrammarSpec::Type::EBNF;
+  dead.source = "root ::= root";
+  error.clear();
+  EXPECT_EQ(cache.get(dead, error), nullptr);
+  EXPECT_FALSE(error.empty());
+}
+
 TEST(XGrammarSupportTest, HashCollidingSpecsAreCachedNotRecompiled) {
   CacheTestTokenizer tokenizer;
   // Force every spec onto one key so the two sources collide the way two

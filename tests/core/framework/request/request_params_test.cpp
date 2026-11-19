@@ -47,6 +47,21 @@ class ScopedJsonObjectOutput final {
   bool previous_;
 };
 
+class ScopedBackend final {
+ public:
+  explicit ScopedBackend(const std::string& backend)
+      : previous_(ServiceConfig::get_instance().structured_output_backend()) {
+    ServiceConfig::get_instance().structured_output_backend(backend);
+  }
+
+  ~ScopedBackend() {
+    ServiceConfig::get_instance().structured_output_backend(previous_);
+  }
+
+ private:
+  std::string previous_;
+};
+
 TEST(RequestParamsTest, IncludeStopStringInOutputDefaultsToFalse) {
   RequestParams completion_params(proto::CompletionRequest(), "", "");
   RequestParams chat_params(proto::ChatRequest(), "", "");
@@ -135,22 +150,49 @@ TEST(RequestParamsTest, ResponseFormatsRespectBackendSelection) {
       ServiceConfig::get_instance().structured_output_backend();
   for (const std::string backend : {"builtin", "xgrammar"}) {
     ServiceConfig::get_instance().structured_output_backend(backend);
-    for (const std::string type : {"text", "", "regex", "json_schema"}) {
+    for (const std::string type :
+         {"text", "", "regex", "json_schema", "ebnf"}) {
       proto::ChatRequest request;
       request.mutable_response_format()->set_type(type);
       request.mutable_response_format()->set_regex("yes");
+      request.mutable_response_format()->set_ebnf("root ::= \"yes\"");
       request.mutable_response_format()
           ->mutable_json_schema()
           ->mutable_schema();
       const RequestParams params(request, "", "");
       EXPECT_EQ(
           params.response_format != ResponseFormatType::NONE,
-          backend == "xgrammar" && (type == "regex" || type == "json_schema"));
+          backend == "xgrammar" &&
+              (type == "regex" || type == "json_schema" || type == "ebnf"));
       EXPECT_EQ(params.response_format_error.empty(),
                 backend == "xgrammar" || type == "text" || type.empty());
     }
   }
   ServiceConfig::get_instance().structured_output_backend(previous);
+}
+
+TEST(RequestParamsTest, ParsesEbnfResponseFormat) {
+  ScopedBackend xgrammar(/*backend=*/"xgrammar");
+  proto::ChatRequest request;
+  request.mutable_response_format()->set_type("ebnf");
+  request.mutable_response_format()->set_ebnf("root ::= \"yes\"");
+
+  const RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.response_format, ResponseFormatType::EBNF);
+  EXPECT_EQ(params.response_format_ebnf, "root ::= \"yes\"");
+  EXPECT_TRUE(params.response_format_error.empty());
+}
+
+TEST(RequestParamsTest, RejectsEbnfWithoutGrammar) {
+  ScopedBackend xgrammar(/*backend=*/"xgrammar");
+  proto::ChatRequest request;
+  request.mutable_response_format()->set_type("ebnf");
+
+  const RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.response_format, ResponseFormatType::NONE);
+  EXPECT_NE(params.response_format_error.find("ebnf"), std::string::npos);
 }
 
 TEST(RequestParamsTest, CompletionBeamDefaultsTopLogprobsWhenUnset) {

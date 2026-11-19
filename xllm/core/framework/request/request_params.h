@@ -44,6 +44,7 @@ enum class ResponseFormatType : int8_t {
   JSON_OBJECT = 1,
   JSON_SCHEMA = 2,
   REGEX = 3,
+  EBNF = 4,
 };
 
 // Defined in core/framework/sampling/sampling_params.h and
@@ -223,6 +224,7 @@ struct RequestParams {
   std::string response_format_schema;
   bool response_format_strict = false;
   std::string response_format_regex;
+  std::string response_format_ebnf;
 
   bool is_sample_request = false;
 

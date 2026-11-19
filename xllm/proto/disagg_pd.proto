@@ -100,7 +100,7 @@ message DisaggRequest {
   // source (the default for older senders) means no xgrammar constraint;
   // the decode instance rebuilds the grammar from the source instead of
   // decoding the request unconstrained.
-  int32 grammar_type = 44;  // GrammarSpec::Type (0 JSON_SCHEMA, 1 REGEX)
+  int32 grammar_type = 44;  // GrammarSpec::Type (0 JSON_SCHEMA, 1 REGEX, 2 EBNF)
   string grammar_source = 45;
   bool grammar_strict = 46;
 

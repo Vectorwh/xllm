@@ -99,6 +99,44 @@ TEST_F(ConstraintSnapshotTransportTest,
 }
 
 TEST_F(ConstraintSnapshotTransportTest,
+       ForwardInputPackedRoundTripKeepsEbnfGrammarSpec) {
+  // The EBNF spec type must survive the same packed transport as schemas
+  // and regexes: the reader's type CHECK admits it, so a PD decode worker
+  // can rebuild an EBNF machine instead of crashing on the descriptor.
+  ForwardInput input;
+  input.json_object_state_snapshots.resize(1);
+  auto& snapshot = input.json_object_state_snapshots[0];
+  snapshot.enabled = true;
+  snapshot.token_ids = {0, 1};
+  GrammarSpec spec;
+  spec.type = GrammarSpec::Type::EBNF;
+  spec.source = "root ::= \"yes\"";
+  snapshot.grammar_spec = std::make_shared<const GrammarSpec>(std::move(spec));
+
+  bool is_creator = false;
+  auto shm_name =
+      ForwardSharedMemoryManager::create_unique_name("batch_test_ebnf_spec",
+                                                     /*dp_group=*/0,
+                                                     ForwardType::RAW_INPUT,
+                                                     /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 1 << 20, is_creator, ForwardType::RAW_INPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+  ASSERT_TRUE(writer_manager.input_write(input));
+
+  ForwardInput round_trip;
+  reader_manager.input_read(round_trip, torch::Device(torch::kCPU));
+  ASSERT_EQ(round_trip.json_object_state_snapshots.size(), 1u);
+  const auto& out = round_trip.json_object_state_snapshots[0];
+  ASSERT_NE(out.grammar_spec, nullptr);
+  EXPECT_EQ(out.grammar_spec->type, GrammarSpec::Type::EBNF);
+  EXPECT_FALSE(out.grammar_spec->strict);
+  EXPECT_EQ(out.grammar_spec->source, "root ::= \"yes\"");
+}
+
+TEST_F(ConstraintSnapshotTransportTest,
        PackedGrammarSourceCannotReadPastDescriptor) {
   ForwardInput input;
   input.json_object_state_snapshots.resize(1);

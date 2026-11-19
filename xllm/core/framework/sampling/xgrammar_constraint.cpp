@@ -110,6 +110,43 @@ std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_regex(
       [&] { return compiler_->CompileRegex(regex); }, mutex_, error);
 }
 
+std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_ebnf(
+    const std::string& ebnf,
+    std::string& error) {
+  if (!GrammarSpec::source_within_limit(ebnf)) {
+    error = "grammar source exceeds the packed transport limit";
+    return nullptr;
+  }
+  // Unlike schemas and regexes, the EBNF dialect lets users write grammars
+  // whose language is empty, which the matcher surfaces as an all-deny
+  // initial mask. Such a request would never emit a token, so probe inside
+  // the shared compile_grammar protocol (one lock, one error prefix, one
+  // exception family) and fail here with a request-shaped error instead of
+  // stalling decode with an unsatisfiable constraint.
+  return compile_grammar(
+      [&]() -> CompiledXGrammar {
+        // The string overload parses the EBNF source and compiles it; the
+        // root rule name stays the upstream default "root", which the chat
+        // proto documents as the contract for the ebnf response format.
+        CompiledXGrammar grammar = compiler_->CompileGrammar(ebnf);
+        // Throwaway probe: any nonzero grammar_id skips the grammar
+        // re-serialization the identity hash would otherwise perform.
+        const XGrammarState probe(grammar, /*grammar_id=*/1);
+        const std::vector<uint32_t> mask = probe.allowed_bitmask();
+        for (const uint32_t word : mask) {
+          if (word != 0) {
+            return grammar;
+          }
+        }
+        // The helper's catch converts the throw into the shared
+        // "Failed to initialize XGrammar constraint: " request error.
+        throw std::runtime_error(
+            "the grammar admits no tokens at its root rule");
+      },
+      mutex_,
+      error);
+}
+
 XGrammarState::XGrammarState(const CompiledXGrammar& grammar,
                              uint64_t grammar_id)
     : matcher_(std::make_unique<xgrammar::GrammarMatcher>(grammar)),
@@ -251,6 +288,11 @@ std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_json_schema(
   return nullptr;
 }
 std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_regex(
+    const std::string&,
+    std::string& error) {
+  return compile_json_schema({}, false, error);
+}
+std::shared_ptr<const CompiledXGrammar> XGrammarCompiler::compile_ebnf(
     const std::string&,
     std::string& error) {
   return compile_json_schema({}, false, error);

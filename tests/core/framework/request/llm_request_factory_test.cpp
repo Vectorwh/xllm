@@ -256,6 +256,67 @@ TEST_F(LLMRequestFactoryTest, XGrammarRejectsInvalidGrammarAndRequestModes) {
   EXPECT_FALSE(capture.called);
 }
 
+TEST_F(LLMRequestFactoryTest, XGrammarEbnfHealthyPathAndRejections) {
+  ServiceConfig::get_instance().structured_output_backend("xgrammar");
+  auto factory = make_factory(/*vocab_size=*/256,
+                              /*max_position=*/2048,
+                              /*task=*/"generate",
+                              /*model_vocab_size=*/288);
+  // Healthy grammar: mirrors the regex fixture's "yes" acceptance path.
+  // Scoped: the rate-limit slot is released by the request's destructor,
+  // not by finish, so the request must be gone before the count below.
+  {
+    RequestParams healthy_sp;
+    healthy_sp.max_tokens = 16;
+    healthy_sp.response_format = ResponseFormatType::EBNF;
+    healthy_sp.response_format_ebnf = "root ::= \"yes\"";
+    CallbackCapture healthy_capture;
+    auto healthy = make_request(*factory, healthy_sp, healthy_capture);
+    ASSERT_NE(healthy, nullptr);
+    Sequence& sequence = *healthy->sequences().front();
+    sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+    for (const int32_t token_id :
+         {int32_t{'y'}, int32_t{'e'}, int32_t{'s'}, 256}) {
+      sequence.append_token(token_id);
+    }
+    EXPECT_FALSE(healthy->error_status().has_value());
+    EXPECT_TRUE(healthy->finished());
+  }
+
+  // Syntax error: the EBNF parser rejects the unbalanced bracket.
+  RequestParams syntax_sp;
+  syntax_sp.response_format = ResponseFormatType::EBNF;
+  syntax_sp.response_format_ebnf = "root ::= [";
+  CallbackCapture syntax_capture;
+  rate_limiter_.is_limited();
+  EXPECT_EQ(make_request(*factory, syntax_sp, syntax_capture, "FAIL"), nullptr);
+  ASSERT_TRUE(syntax_capture.status.has_value());
+  EXPECT_EQ(syntax_capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(syntax_capture.status->param(), "response_format");
+  // Pin the exception path: the "Failed to initialize" prefix is constructed
+  // only in compile_ebnf's catch block, so its presence proves the EBNF
+  // parse error was caught as a std::runtime_error-family exception and
+  // converted to a request error rather than escaping the compile call.
+  EXPECT_NE(syntax_capture.status->message().find(
+                "Failed to initialize XGrammar constraint"),
+            std::string::npos);
+
+  // Dead grammar: a self-referential root admits no token, so the
+  // compile-time probe rejects the request instead of letting decode stall
+  // on an all-deny mask.
+  RequestParams dead_sp;
+  dead_sp.response_format = ResponseFormatType::EBNF;
+  dead_sp.response_format_ebnf = "root ::= root";
+  CallbackCapture dead_capture;
+  rate_limiter_.is_limited();
+  EXPECT_EQ(make_request(*factory, dead_sp, dead_capture, "FAIL"), nullptr);
+  ASSERT_TRUE(dead_capture.status.has_value());
+  EXPECT_EQ(dead_capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(dead_capture.status->param(), "response_format");
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+  rate_limiter_.is_limited();
+}
+
 #endif
 
 TEST_F(LLMRequestFactoryTest, RerankerRejectsLogprobTokenIdsBeforeEncoding) {
