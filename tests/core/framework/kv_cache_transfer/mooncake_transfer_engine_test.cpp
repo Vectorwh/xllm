@@ -3140,6 +3140,15 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
 TEST(MooncakeKVCacheTransferDefaultTest,
      NpuLinearIndexerScalePushAndPullRoundTrip) {
+  // HCCL_NPU_SOCKET_PORT_RANGE is not honoured on every CANN path, so this
+  // two-process group can lose the default NPU socket port 16666 to a
+  // parallel ctest neighbour. Keep the case for manual runs on an idle host;
+  // enable it explicitly instead of failing every MR pipeline.
+  if (std::getenv("XLLM_RUN_MOONCAKE_NPU_ROUND_TRIP") == nullptr) {
+    GTEST_SKIP() << "Set XLLM_RUN_MOONCAKE_NPU_ROUND_TRIP=1 to run; the "
+                    "default NPU socket port is not isolated on all CANN "
+                    "paths.";
+  }
   ScopedIntraHostNpuTransferEnv env;
   ASSERT_TRUE(env.ok());
 
