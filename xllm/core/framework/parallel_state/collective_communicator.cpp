@@ -448,7 +448,8 @@ void CollectiveCommunicator::create_process_groups(
   // make ranks r and r + tp_size hold the same heads and double-accumulate in
   // the all-reduce, which is a silent numerical error rather than a crash.
   const int32_t normalized_cp_size = cp_size > 0 ? cp_size : 1;
-#if !defined(USE_NPU) && !defined(USE_MLU) && !defined(USE_DCU)
+#if !defined(USE_NPU) && !defined(USE_MLU) && !defined(USE_DCU) && \
+    !defined(USE_MUSA)
   CHECK_EQ(normalized_cp_size, 1)
       << "This backend does not support explicit context-parallel groups.";
 #endif
@@ -523,7 +524,8 @@ void CollectiveCommunicator::create_process_groups(
   }
   port += tp_group_count + single_rank_group_port_gap + single_rank_group_count;
 
-#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
+    defined(USE_MUSA)
   if (cp_topology.has_value()) {
     const std::vector<int32_t>& cp_ranks = cp_topology->pcp_group_ranks();
     const int32_t cp_local_rank = cp_topology->pcp_rank();

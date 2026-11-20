@@ -112,6 +112,7 @@ set(_TORCH_MUSA_KERNEL_SRCS
   causal_conv1d.cu
   gemma_norm.cu
   activation.cu
+  custom_all_reduce_ops.cu
   rope.cu
   mrope.cu
   gdn_state_commit.cu

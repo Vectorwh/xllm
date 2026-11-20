@@ -863,6 +863,35 @@ void LLMEngine::prefetch_from_storage(
 void LLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
                                std::vector<std::string>& addrs,
                                std::vector<uint16_t>& ports) {
+  // MUSA prefill context parallelism leaves the complete KV cache (and the
+  // final recurrent state) on the last CP rank of each DP replica; earlier
+  // ranks hold only their own row range. Publish one worker per DP x (last CP
+  // rank x tp) so a peer PULLs from a full-KV owner and sees a TP-only layout,
+  // matching pull_kv_blocks which indexes the source list by [dp][tp].
+  const bool kv_complete_on_last_cp_rank =
+      Platform::is_musa() && cp_size_ > 1 &&
+      ::xllm::ParallelConfig::get_instance().kv_split_size_effective() == 1;
+  if (kv_complete_on_last_cp_rank) {
+    const size_t published_workers = worker_clients_num_ / cp_size_;
+    cluster_ids.reserve(published_workers);
+    addrs.reserve(published_workers);
+    ports.reserve(published_workers);
+    for (uint32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      const uint32_t base_worker =
+          dp_rank * dp_local_size_ + (cp_size_ - 1) * dp_local_tp_size_;
+      for (uint32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
+        const size_t worker_rank = base_worker + tp_rank;
+        uint64_t cluster_id = 0;
+        std::string addr;
+        uint16_t port = 0;
+        worker_clients_[worker_rank]->get_cache_info(cluster_id, addr, port);
+        cluster_ids.emplace_back(cluster_id);
+        addrs.emplace_back(std::move(addr));
+        ports.emplace_back(port);
+      }
+    }
+    return;
+  }
   cluster_ids.reserve(worker_clients_num_);
   addrs.reserve(worker_clients_num_);
   ports.reserve(worker_clients_num_);

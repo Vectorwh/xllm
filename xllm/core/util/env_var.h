@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <array>
 #include <optional>
 #include <string>
 
@@ -52,6 +53,9 @@ int64_t get_process_group_test_timeout_seconds();
 // prefetch latencies include that query; the worker logs its cost separately as
 // tier_query_time.
 bool store_prefetch_stats_enabled();
+
+// Relative attention-pair and remote-KV-row costs, cached for all CP ranks.
+const std::array<double, 2>& get_musa_pcp_costs();
 
 }  // namespace util
 }  // namespace xllm

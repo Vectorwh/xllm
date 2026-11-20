@@ -17,7 +17,8 @@ limitations under the License.
 
 #include <torch_musa/csrc/distributed/ProcessGroupMCCL.h>
 
-#include "process_group.h"
+#include "core/framework/parallel_state/musa/musa_custom_all_reduce.h"
+#include "core/framework/parallel_state/process_group.h"
 
 namespace xllm {
 
@@ -32,12 +33,6 @@ class ProcessGroupImpl : public ProcessGroup {
                    const std::string& group_name,
                    const torch::Device& device)
       : ProcessGroup(global_rank, world_size, device) {
-    c10::intrusive_ptr<c10d::ProcessGroupMCCL::Options> pg_options =
-        c10d::ProcessGroupMCCL::Options::create();
-#if TORCH_VERSION_MAJOR > 2 || \
-    (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 7)
-    pg_options->group_name = group_name;
-#endif
     int32_t rank = global_rank;
     if (world_size != rank_size) {
       auto [local_rank, group_ranks] =
@@ -45,10 +40,79 @@ class ProcessGroupImpl : public ProcessGroup {
       rank = local_rank;
     }
 
-    auto store = create_tcp_store(host, port, rank);
-    pg_ = std::make_unique<c10d::ProcessGroupMCCL>(
-        store, rank, rank_size, pg_options);
+    auto store = init_mccl(rank, rank_size, port, host, group_name);
+    // Only the tp_group all-reduce path consumes a custom AR from this generic
+    // constructor; other groups (world_group, moe_tp_group, ...) would only
+    // waste the IPC shared memory and store keys that init() allocates.
+    if (group_name == "tp_group") {
+      custom_all_reduce_ = std::make_unique<MusaCustomAllReduce>(
+          rank, rank_size, group_name, device, store);
+    }
   }
+
+  // The caller already resolved this rank's position inside group_ranks.
+  ProcessGroupImpl(int32_t global_rank,
+                   int32_t local_rank,
+                   const std::vector<int32_t>& /*group_ranks*/,
+                   int32_t world_size,
+                   int32_t rank_size,
+                   int32_t port,
+                   const std::string& host,
+                   const std::string& group_name,
+                   const torch::Device& device)
+      : ProcessGroup(global_rank, world_size, device) {
+    auto store = init_mccl(local_rank, rank_size, port, host, group_name);
+    // Explicit CP ranks take this constructor. Prefill PCP broadcasts and
+    // allgathers on cp_group, and those collectives use this all-reduce.
+    if (group_name == "cp_group") {
+      custom_all_reduce_ = std::make_unique<MusaCustomAllReduce>(
+          local_rank, rank_size, group_name, device, store);
+    }
+  }
+
+  std::optional<torch::Tensor> allreduce_custom(
+      const torch::Tensor& input,
+      const std::optional<torch::Tensor>& output = std::nullopt) {
+    if (custom_all_reduce_) {
+      return custom_all_reduce_->allreduce(input, output);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<torch::Tensor> allreduce_tp_custom(const torch::Tensor& input) {
+    if (custom_all_reduce_) {
+      return custom_all_reduce_->allreduce_tp(input);
+    }
+    return std::nullopt;
+  }
+
+  bool custom_allreduce_enabled() const {
+    return custom_all_reduce_ != nullptr && custom_all_reduce_->enabled();
+  }
+
+ private:
+  // Shared MCCL ProcessGroup + store setup used by both constructors. The only
+  // per-constructor differences are how local_rank is resolved (the caller
+  // does that) and which group builds a custom all-reduce (handled after this
+  // returns).
+  c10::intrusive_ptr<c10d::Store> init_mccl(int32_t local_rank,
+                                            int32_t rank_size,
+                                            int32_t port,
+                                            const std::string& host,
+                                            const std::string& group_name) {
+    c10::intrusive_ptr<c10d::ProcessGroupMCCL::Options> pg_options =
+        c10d::ProcessGroupMCCL::Options::create();
+#if TORCH_VERSION_MAJOR > 2 || \
+    (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 7)
+    pg_options->group_name = group_name;
+#endif
+    auto store = create_tcp_store(host, port, local_rank);
+    pg_ = std::make_unique<c10d::ProcessGroupMCCL>(
+        store, local_rank, rank_size, pg_options);
+    return store;
+  }
+
+  std::unique_ptr<MusaCustomAllReduce> custom_all_reduce_;
 };
 
 }  // namespace xllm

@@ -220,6 +220,16 @@ bool is_mlu_model_cp_capable(const std::string& resolved_name) {
   return mlu::model_cp_capabilities().contains(resolved_name);
 }
 
+bool is_musa_model_cp_capable(const std::string& resolved_name) {
+  static const std::unordered_set<std::string> kCpCapableModels = {
+      "qwen3_5",
+      "qwen3_5_text",
+      "qwen3_5_moe",
+      "qwen3_5_moe_text",
+  };
+  return kCpCapableModels.contains(resolved_name);
+}
+
 ModelRegistry* ModelRegistry::get_instance() {
   static ModelRegistry registry;
 

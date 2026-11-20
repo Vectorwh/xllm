@@ -227,6 +227,11 @@ bool is_npu_model_cp_capable(const std::string& resolved_name);
 
 bool is_mlu_model_cp_capable(const std::string& resolved_name);
 
+// Model-side CP capability for the MUSA Qwen3.5 family. Kept separate from the
+// NPU table so Qwen3.5 CP support does not leak into the NPU gate.
+// `resolved_name` must already be backend-resolved (identity on MUSA builds).
+bool is_musa_model_cp_capable(const std::string& resolved_name);
+
 bool resolve_model_registration(const std::string& model_type,
                                 const std::string& requested_npu_kernel_backend,
                                 std::string* effective_npu_kernel_backend,

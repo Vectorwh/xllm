@@ -21,6 +21,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#include "core/layers/musa/pcp_context.h"
 #include "kernels/musa/gdn_ops.h"
 #include "kernels/ops_api.h"
 
@@ -591,6 +592,14 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       get_checkpoint_stride(conv_cache, ssm_cache);
   torch::Tensor linear_state_base_indices =
       build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+
+  // Context-parallel prefill: post the conv/ssm state transfers for this rank
+  // before the projections so they overlap.
+  musa_pcp::Context* pcp_context = attn_metadata.pcp_context;
+  if (pcp_context != nullptr) {
+    musa_pcp::expect_prefix_cache_row(conv_cache, *pcp_context);
+    musa_pcp::expect_prefix_cache_row(ssm_cache, *pcp_context);
+  }
   const bool use_spec_verify = input_params.is_spec_verify;
   const bool use_fused_spec_verify =
       use_spec_verify && conv_kernel_size_ == 4 && head_k_dim_ == 128 &&
@@ -626,6 +635,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     CHECK_EQ(has_initial_state.scalar_type(), torch::kBool);
     CHECK(has_initial_state.device() == mixed_qkv.device())
         << "has_initial_states must be on the same device as mixed_qkv";
+    if (pcp_context != nullptr) {
+      musa_pcp::receive_prefix_cache_row(
+          conv_cache, logical_state_indices, *pcp_context);
+    }
     mixed_qkv =
         xllm::kernel::musa::causal_conv1d_prefill(conv_input,
                                                   conv_weight,
@@ -635,6 +648,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
                                                   logical_state_indices,
                                                   has_initial_state,
                                                   /*silu_activation=*/true);
+    if (pcp_context != nullptr) {
+      musa_pcp::send_prefix_cache_row(
+          conv_cache, logical_state_indices, *pcp_context);
+    }
 
     mixed_qkv = reshape_qkvz_with_pad(attn_metadata, mixed_qkv);
     mixed_qkv = mixed_qkv.transpose(1, 2);
@@ -753,9 +770,17 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   }
   torch::Tensor core_attn_out;
   torch::Tensor last_recurrent_state;
+  // Context-parallel prefill requires the single-sequence Mate GDN prefill;
+  // without PCP keep main's original Mate-vs-chunk selection.
   const bool use_mate_gdn_prefill =
-      kEnableMateGdnPrefill && attn_metadata.is_prefill && !use_spec_verify;
+      !use_spec_verify &&
+      (attn_metadata.pcp_context != nullptr
+           ? (attn_metadata.is_prefill || attn_metadata.is_chunked_prefill)
+           : (kEnableMateGdnPrefill && attn_metadata.is_prefill));
   // Apply chunked or recurrent gated-delta attention and update caches.
+  CHECK(pcp_context == nullptr || (use_mate_gdn_prefill && batch_size == 1))
+      << "context-parallel prefill requires the single-sequence Mate GDN "
+         "prefill";
   if (use_mate_gdn_prefill) {
     xllm::kernel::musa::MateGatedDeltaRulePrefillParams mate_params;
     mate_params.q = processed_q;
@@ -765,11 +790,24 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     mate_params.beta = beta;
     mate_params.scale =
         1.0 / std::sqrt(static_cast<double>(processed_q.size(-1)));
+    if (pcp_context != nullptr &&
+        musa_pcp::receives_prefix_state(*pcp_context)) {
+      // This rank continues the prompt rows of the preceding rank: take its
+      // recurrent state instead of reading the cache.
+      mate_params.initial_state = musa_pcp::take_prefix_rows(*pcp_context);
+    }
     torch::Tensor mate_final_state;
     std::tie(core_attn_out, mate_final_state) =
         xllm::kernel::musa::mate_gated_delta_rule_prefill(mate_params);
-    ssm_cache.index_put_({linear_state_base_indices},
-                         mate_final_state.to(ssm_cache.dtype()));
+    const torch::Tensor final_state = mate_final_state.to(ssm_cache.dtype());
+    ssm_cache.index_put_({linear_state_base_indices}, final_state);
+    if (pcp_context != nullptr) {
+      musa_pcp::send_prefix_rows(final_state, *pcp_context);
+      musa_pcp::defer_final_state(
+          conv_cache, logical_state_indices, *pcp_context);
+      musa_pcp::defer_final_state(
+          ssm_cache, linear_state_base_indices, *pcp_context);
+    }
   } else if (!use_spec_verify && attn_metadata.is_prefill &&
              !attn_metadata.is_chunked_prefill) {
     xllm::kernel::ChunkGatedDeltaRuleParams chunk_gated_delta_params;

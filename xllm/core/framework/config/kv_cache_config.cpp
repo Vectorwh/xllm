@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
+#include "core/platform/platform.h"
 
 DEFINE_int32(block_size,
              128,
@@ -182,6 +183,15 @@ void KVCacheConfig::validate() const {
   CHECK_GT(prefill_layerwise_host_memory_gb_, 0.0);
   CHECK_LE(prefill_layerwise_host_memory_gb_, 1048576.0)
       << "Prefill Host budget must fit in an int64 byte count.";
+  // MUSA only implements the model-dtype KV cache today: kv_cache_dtype
+  // feeds the size estimator but not the allocation, so a non-auto value
+  // would under-count the block budget while tensors stay in the model
+  // dtype. Reject it at startup until the fp8/int8 storage path is ported.
+  if (Platform::is_musa() && kv_cache_dtype_ != "auto") {
+    LOG(FATAL) << "kv_cache_dtype=\"" << kv_cache_dtype_
+               << "\" is not supported on MUSA yet; the KV cache is always "
+               << "allocated in the model dtype. Set --kv_cache_dtype=auto.";
+  }
   if (indexer_cache_dtype_ != "auto" && indexer_cache_dtype_ != "int8") {
     LOG(FATAL) << "Invalid indexer_cache_dtype=\"" << indexer_cache_dtype_
                << "\". Supported values are exactly \"auto\" and \"int8\".";

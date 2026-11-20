@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/kernels/musa/mrope.h"
 #include "core/kernels/musa/musa_ops_api.h"
 #include "core/layers/musa/linear_block_fp8.h"
+#include "core/layers/musa/pcp_context.h"
 #include "core/util/env_var.h"
 
 namespace xllm {
@@ -175,6 +176,15 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
            "require mrope_section in the model configuration";
     CHECK_EQ(positions.size(0), hidden_states.size(0));
   }
+  if (attn_metadata.pcp_context != nullptr) {
+    // Posting before the projection overlaps the transfer with it. The wire
+    // dtype is the projection's compute dtype, not the paged-cache storage
+    // dtype (an FP8 cache still receives BF16 projected rows).
+    musa_pcp::expect_prefix_kv(num_kv_heads_,
+                               head_dim_,
+                               hidden_states.options(),
+                               *attn_metadata.pcp_context);
+  }
   torch::Tensor qkv = qkv_proj_->forward(hidden_states);
   if (use_fused_qkv_) {
     torch::Tensor q_flat;
@@ -202,10 +212,16 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
     }
 
     torch::Tensor out;
-    {
-      out = std::get<0>(
-          attn_->forward(attn_metadata, q_flat, k_flat, v_flat, kv_cache));
+    if (attn_metadata.pcp_context != nullptr) {
+      musa_pcp::exchange_kv(k_flat,
+                            v_flat,
+                            num_kv_heads_,
+                            head_dim_,
+                            kv_cache,
+                            *attn_metadata.pcp_context);
     }
+    out = std::get<0>(
+        attn_->forward(attn_metadata, q_flat, k_flat, v_flat, kv_cache));
     {
       out = out * torch::sigmoid(gate.view({T, q_size_}));
       return o_proj_->forward(out);
@@ -283,6 +299,11 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
         rotary_emb_->forward(positions, q, k);
       }
     }
+  }
+
+  if (attn_metadata.pcp_context != nullptr) {
+    musa_pcp::exchange_kv(
+        k, v, num_kv_heads_, head_dim_, kv_cache, *attn_metadata.pcp_context);
   }
   torch::Tensor out =
       std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));

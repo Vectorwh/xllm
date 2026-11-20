@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cerrno>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -95,6 +97,33 @@ int64_t get_process_group_test_timeout_seconds() {
   constexpr const char* kTimeoutEnvVar =
       "XLLM_PROCESS_GROUP_ASYNC_TIMEOUT_SECONDS";
   return get_int_env(kTimeoutEnvVar, kDefaultTimeoutSeconds);
+}
+
+const std::array<double, 2>& get_musa_pcp_costs() {
+  static const std::array<double, 2> costs = [] {
+    const auto read_cost = [](const std::string& name, double default_value) {
+      const std::optional<std::string> value = get_optional_string_env(name);
+      if (!value.has_value()) {
+        return default_value;
+      }
+      char* end = nullptr;
+      errno = 0;
+      const double cost = std::strtod(value->c_str(), &end);
+      CHECK(end != value->c_str() && end == value->c_str() + value->size() &&
+            errno != ERANGE && std::isfinite(cost) && cost >= 0)
+          << name << " must be a finite non-negative double, got: " << *value;
+      // Canonicalize signed zero for the bytewise CP consensus check.
+      return cost == 0 ? 0.0 : cost;
+    };
+    // Defaults measured for Qwen3.8 FP8 on MTT S5000.
+    const std::array<double, 2> values = {
+        read_cost("XLLM_MUSA_PCP_COST_PAIR", /*default_value=*/9.4e-6),
+        read_cost("XLLM_MUSA_PCP_COST_OTHER_KV_ROW", /*default_value=*/0.04)};
+    LOG(INFO) << "[MUSA_PCP_COST] attention_per_pair=" << values[0]
+              << " other_rank_kv_per_row=" << values[1];
+    return values;
+  }();
+  return costs;
 }
 
 bool store_prefetch_stats_enabled() {

@@ -477,8 +477,47 @@ std::optional<std::string> validate_model_cp(const Options& options,
     return std::nullopt;
   }
 
+  if (Platform::is_musa()) {
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "MUSA CP supports only LLM/SSM engine generation";
+    }
+    if (options.task_type() != "generate") {
+      return "MUSA CP supports only the generate task";
+    }
+    if (!is_musa_model_cp_capable(model_type)) {
+      return "MUSA CP supports only Qwen3.5-family targets, got model_type=" +
+             model_type;
+    }
+    if (options.cp_size() != 2 || options.dp_size() < 1 ||
+        global_world_size != options.dp_size() * options.cp_size()) {
+      return "MUSA CP requires cp_size == 2 and world_size == dp_size * "
+             "cp_size (no tensor parallelism)";
+    }
+    if (ParallelConfig::get_instance().kv_split_size_effective() != 1) {
+      return "MUSA CP keeps the full KV cache on every CP rank; set "
+             "kv_split_size=1";
+    }
+    if (options.instance_role() != InstanceRole::DEFAULT &&
+        options.instance_role() != InstanceRole::PREFILL) {
+      return "MUSA CP supports only DEFAULT or PREFILL roles";
+    }
+    // PUSH is not yet adapted for MUSA context parallelism: the complete KV
+    // cache lives only on the last CP rank, so a per-rank PUSH would ship the
+    // earlier ranks' incomplete halves. PULL serves from the last-rank owner
+    // (see LLMEngine::get_cache_info) and is supported; require it until PUSH
+    // is adapted.
+    if (options.enable_disagg_pd() &&
+        options.kv_cache_transfer_mode() == "PUSH") {
+      return "MUSA CP disaggregated PD supports only "
+             "kv_cache_transfer_mode=PULL; PUSH is not yet adapted for MUSA "
+             "context parallelism (the complete KV cache lives only on the "
+             "last CP rank)";
+    }
+    return std::nullopt;
+  }
+
   return "cp_size > 1 is only supported on platforms with model-side CP "
-         "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
+         "(MLU/NPU/MUSA); disable CP (cp_size=1) or use MLU/NPU/MUSA.";
 }
 
 std::optional<std::string> validate_qwen_dcp_topology(int32_t global_world_size,

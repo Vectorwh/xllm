@@ -50,3 +50,12 @@ cc_test(
 )
 target_link_libraries(musa_qwen3_vision_layer_test PRIVATE
   "$<LINK_GROUP:RESCAN,platform,config,util>")
+
+cc_test(
+  NAME musa_pcp_context_test
+  SRCS pcp_context_test.cpp
+  DEPS :musa_layers :platform :config GTest::gtest_main glog::glog
+  CPU_ONLY
+)
+target_link_libraries(musa_pcp_context_test PRIVATE
+  "$<LINK_GROUP:RESCAN,platform,config,util>")

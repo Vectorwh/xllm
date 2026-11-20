@@ -215,9 +215,14 @@ FlashInferAttentionImpl::forward(const AttentionMetadata& attn_metadata,
         << "MUSA FA3 decode or paged prefill requires at least one sequence";
   }
 
-  // Only reshape and store to cache if k_cache is properly initialized
-  // For prefill without KV cache (e.g., LongCat text encoding), skip this step
-  if (k_cache.defined() && k_cache.dim() >= 2) {
+  // A PCP prefill already wrote this layer's K/V rows in
+  // musa_pcp::exchange_kv(), which Qwen3NextAttentionImpl::forward calls
+  // immediately before attn_->forward(); build_context flags that on the
+  // metadata via kv_cache_written, so reshaping/storing here would
+  // double-write. Non-PCP metadata keeps the flag false and stores normally.
+  // Also skip a prefill without a KV cache (e.g., LongCat text encoding).
+  if (k_cache.defined() && k_cache.dim() >= 2 &&
+      !attn_metadata.kv_cache_written) {
     CHECK(attn_metadata.slot_mapping.defined())
         << "FlashInferAttention requires slot_mapping when KV cache is defined";
     CHECK_EQ(attn_metadata.slot_mapping.numel(), key.size(0))

@@ -7,6 +7,7 @@ set(_MUSA_LAYERS_HDRS
   ../cuda/base_attention_impl.h
   qwen3_gated_delta_net_base.h
   qwen3_next_attention.h
+  pcp_context.h
   qwen3_next_gated_delta_net.h
   qwen3_next_hybrid_decoder_layer_base.h
   qwen3_next_decoder_layer_impl.h
@@ -20,6 +21,7 @@ set(_MUSA_LAYERS_SRCS
   flashinfer_attention.cpp
   qwen3_gated_delta_net_base.cpp
   qwen3_next_attention.cpp
+  pcp_context.cpp
   qwen3_next_gated_delta_net.cpp
   qwen3_next_hybrid_decoder_layer_base.cpp
   qwen3_next_decoder_layer_impl.cpp

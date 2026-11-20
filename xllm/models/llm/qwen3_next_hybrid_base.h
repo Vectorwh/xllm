@@ -45,6 +45,7 @@ limitations under the License.
 #elif defined(USE_MLU)
 #include "core/layers/mlu/qwen3_5/qwen3_5_hybrid_decoder_layer_base.h"
 #elif defined(USE_MUSA)
+#include "core/layers/musa/pcp_context.h"
 #include "core/layers/musa/qwen3_next_hybrid_decoder_layer_base.h"
 #endif
 
@@ -169,6 +170,14 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
     }
 #if defined(USE_MUSA)
     attn_metadata.fa3_metadata.share_fa3_scheduler_metadata = true;
+    // Auxiliary capture records every row on every rank; keep replicated rows.
+    std::optional<layer::musa_pcp::Context> pcp_context;
+    if (parallel_args_.cp_size() > 1 && !aux_capture_.enabled()) {
+      layer::musa_pcp::build_context(attn_metadata,
+                                     parallel_args_,
+                                     static_cast<int32_t>(tokens.size(0)),
+                                     &pcp_context);
+    }
 #endif
     const int32_t num_tokens = static_cast<int32_t>(tokens.size(0));
     const auto& batch_forward_type = input_params.meta.batch_forward_type;
@@ -193,6 +202,16 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
     if (is_sequence_sharded(fc1_ctx)) {
       h = shard_sequence(h, fc1_ctx);
     }
+
+    const layer::AttentionMetadata* layer_metadata = &attn_metadata;
+#if defined(USE_MUSA)
+    if (pcp_context.has_value()) {
+      h = layer::musa_pcp::shard_rows(h, *pcp_context, /*dim=*/0);
+      positions = layer::musa_pcp::shard_rows(
+          positions, *pcp_context, /*dim=*/positions.dim() - 1);
+      layer_metadata = &pcp_context->local_metadata;
+    }
+#endif
 
     torch::Tensor mrope_cos_sin;
     for (const auto& layer : layers_) {
@@ -237,11 +256,19 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
       h = layer->forward(h,
                          residual,
                          positions,
-                         attn_metadata,
+                         *layer_metadata,
                          kv_caches[i],
                          input_params,
                          mrope_cos_sin);
       if (!h.defined()) {
+#if defined(USE_MUSA)
+        if (pcp_context.has_value()) {
+          LOG(FATAL) << "MUSA PCP layer " << i
+                     << " failed mid-forward; aborting so the CP peer is not "
+                        "left blocked in a collective. Drop the PCP prefill "
+                        "chunk or this layer's failure before enabling CP.";
+        }
+#endif
         return ModelOutput();
       }
 #if defined(USE_NPU)
@@ -257,6 +284,11 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
     if (is_sequence_sharded(fc1_ctx)) {
       h = gather_sequence(h, fc1_ctx);
     }
+#if defined(USE_MUSA)
+    if (pcp_context.has_value()) {
+      h = layer::musa_pcp::finish(h, *pcp_context);
+    }
+#endif
     return aux_capture_.finalize(h);
   }
 

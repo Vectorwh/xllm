@@ -18,6 +18,9 @@ limitations under the License.
 #include "core/kernels/npu/npu_ops_api.h"
 #endif
 #include "parallel_state.h"
+#if defined(USE_MUSA)
+#include "core/framework/parallel_state/musa/musa_custom_all_reduce.h"
+#endif
 
 namespace xllm {
 namespace parallel_state {
@@ -95,6 +98,16 @@ ReduceAsyncCtx launch_reduce(torch::Tensor input, ProcessGroup* process_group) {
   if (kernel::npu::try_quantized_all_reduce(
           ctx.tensor, *process_group, &quantized_work)) {
     ctx.work = std::move(quantized_work);
+    return ctx;
+  }
+#elif defined(USE_MUSA)
+  // Prefer the MUSA custom all-reduce for the TP allreduce; it enqueues on the
+  // producer/consumer stream and returns separate output storage. Fall back to
+  // MCCL when the tensor shape is unsupported.
+  std::optional<torch::Tensor> custom_output =
+      musa_allreduce_tp_custom(process_group, ctx.tensor);
+  if (custom_output.has_value()) {
+    ctx.tensor = std::move(custom_output.value());
     return ctx;
   }
 #endif

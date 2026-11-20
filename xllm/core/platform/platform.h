@@ -58,7 +58,7 @@ class Platform final {
 
   // Model-side CP: shard after embed, gather+restore before LM head.
   static constexpr bool uses_model_cp_sharding() {
-    return is_mlu() || is_npu();
+    return is_mlu() || is_npu() || is_musa();
   }
 
   // KPool stores compressed index pages with a separate per-request tail.
