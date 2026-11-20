@@ -84,10 +84,9 @@ inline SamplingParameters make_draft_sampling_params(
 
 }  // namespace dflash_detail
 
-// DFlash2 proposal attention follows the prelaunch gate: A3, Python, CP 1,
-// schedule overlap, and the same PD role and adaptive-decode limits.
-bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
-                                 const torch::Device& device,
+// DFlash/DFlash2 proposal XFIA platform and execution-mode eligibility.
+// Final prelaunch admission also checks KV layout and model capabilities.
+bool enable_dflash_proposal_xfia(const torch::Device& device,
                                  const runtime::Options& options);
 
 class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {

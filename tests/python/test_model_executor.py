@@ -643,6 +643,31 @@ class TestCreateAttentionBackend:
         assert backend.init_kwargs["xfia_query_width"] == 8
         native_query.assert_not_called()
 
+    @pytest.mark.parametrize("dcp_size", [None, 2])
+    def test_block_query_graph_uses_draft_kv_layout(self, dcp_size: int | None) -> None:
+        dcp_group = None if dcp_size is None else MagicMock()
+        if dcp_group is not None:
+            dcp_group.size.return_value = dcp_size
+        attention = _make_attention_layer(num_kv_heads=1, head_dim=128)
+        attention.attention_window = (7, 3)
+        with (
+            patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
+            patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=dcp_group),
+            patch("xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend", StubAttentionBackend),
+        ):
+            backend = _create_attention_backend(
+                attention,
+                MagicMock(type="npu", index=0),
+                torch.bfloat16,
+                {"cp_size": 2, "is_draft_engine": True, "draft_query_width": 4},
+                block_query_graph_metadata=True,
+            )
+        assert isinstance(backend, StubAttentionBackend)
+        assert backend.init_kwargs["graph_capturable"] is (dcp_size is None)
+        assert backend.init_kwargs["draft_query_width"] == 4
+        assert backend.init_kwargs["draft_graph_window_size"] is None
+        assert backend.init_kwargs["sliding_window"] == attention.sliding_window
+
     @pytest.mark.parametrize("is_ascend_a3", [False, True])
     @pytest.mark.parametrize("dflash_xfia_enabled", [False, True])
     @pytest.mark.parametrize("block_query_graph_metadata", [False, True])

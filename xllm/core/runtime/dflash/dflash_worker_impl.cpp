@@ -399,8 +399,7 @@ std::vector<int64_t> build_accepted_context_rows(
 
 }  // namespace
 
-bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
-                                 const torch::Device& device,
+bool enable_dflash_proposal_xfia(const torch::Device& device,
                                  const runtime::Options& options) {
   if (options.speculative_algorithm() != "DFlash" &&
       !SpeculativeConfig::is_dflash2_algorithm(
@@ -416,7 +415,6 @@ bool enable_dflash_proposal_xfia(const ParallelArgs& parallel_args,
          ModelConfig::is_python_model_impl(
              ModelConfig::get_instance().model_impl()) &&
          device.is_privateuseone() && options.enable_schedule_overlap() &&
-         parallel_args.cp_size() == 1 &&
          (!options.enable_disagg_pd() ||
           options.instance_role() == InstanceRole::DECODE) &&
          !options.enable_adaptive_speculative_decode();
@@ -487,7 +485,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
             const DraftWorkerConfig config = resolve_draft_worker_config(
                 parallel_args,
                 options,
-                enable_dflash_proposal_xfia(parallel_args, device, options));
+                enable_dflash_proposal_xfia(device, options));
             return std::make_unique<LLMWorkerImpl>(
                 config.parallel_args, device, config.options);
           }) {
@@ -497,8 +495,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                                  ModelConfig::get_instance().model_impl());
   async_output_enabled_ = python_dflash && enable_schedule_overlap() &&
                           !options.enable_adaptive_speculative_decode();
-  proposal_xfia_enabled_ =
-      enable_dflash_proposal_xfia(parallel_args, device, options);
+  proposal_xfia_enabled_ = enable_dflash_proposal_xfia(device, options);
   // Python block-query graphs need proposal metadata on non-XFIA NPUs too.
   proposal_attention_enabled_ =
       proposal_xfia_enabled_ ||

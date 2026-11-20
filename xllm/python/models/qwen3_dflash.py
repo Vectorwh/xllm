@@ -144,8 +144,6 @@ class DFlashQwen3Config(Qwen3Config):
                     raise ValueError("sliding_attention layers require use_sliding_window=true")
                 if self.sliding_window <= 0:
                     raise ValueError("DFlash sliding attention requires sliding_window > 0")
-                if self.cp_size != 1:
-                    raise ValueError("sliding-window draft attention requires cp_size=1")
         self.head_split()
 
     def _requires_explicit_sliding_layer_types(self) -> bool:
@@ -418,8 +416,7 @@ class DFlashQwen3ForCausalLM(PyModelBase):
         import xllm_runtime
 
         return (
-            self.cfg.cp_size == 1
-            and self.cfg.n_heads % self.cfg.tp_size == 0
+            self.cfg.n_heads % self.cfg.tp_size == 0
             and self.cfg.n_kv_heads % self.cfg.tp_size == 0
             and self.cfg.head_dim == 128
             and kv_page_size == 128

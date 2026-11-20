@@ -439,22 +439,46 @@ def test_dflash_mixed_windows_preserve_dflash2_block_attention() -> None:
     [
         ({}, "use_sliding_window=true"),
         ({"use_sliding_window": False}, "use_sliding_window=true"),
-        ({"use_sliding_window": True, "cp_size": 2}, "cp_size=1"),
     ],
 )
-def test_dflash_sliding_rejects_disabled_or_sharded_configuration(overrides: dict, message: str) -> None:
+def test_dflash_sliding_rejects_disabled_configuration(overrides: dict, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         _config(layer_types=["sliding_attention"], sliding_window=8, **overrides)
 
+
+@pytest.mark.parametrize("dflash2", [False, True])
+def test_sliding_draft_accepts_target_context_parallelism(dflash2: bool) -> None:
+    from xllm.python.models.qwen3_dflash2 import DFlash2Qwen3Config
+
+    values = _config_dict(
+        hidden_size=16,
+        cp_size=2,
+        world_size=2,
+        use_sliding_window=True,
+        sliding_window=8,
+        layer_types=["sliding_attention"],
+        dflash2_block_size=4,
+        dflash2_conv_group_size=16,
+        dflash2_conv_kernel_size=2,
+        dflash2_selector_rank=4,
+        dflash2_selector_top_k=4,
+    )
+    config_cls = DFlash2Qwen3Config if dflash2 else DFlashQwen3Config
+    config = config_cls.from_dict(values)
+    config.validate()
+    assert config.cp_size == 2
+    assert config.layer_types == ("sliding_attention",)
 
 @pytest.mark.parametrize(
     "variant,expected",
     [
         ("full", True),
+        ("full-cp2", True),
         ("scalar-window", False),
         ("causal", False),
         ("mixed", False),
         ("dflash2", True),
+        ("dflash2-cp2", True),
         ("dflash2-width", False),
     ],
 )
@@ -493,6 +517,8 @@ def test_device_only_decode_admits_only_matching_attention(
             use_sliding_window=True,
             layer_types=["sliding_attention", "sliding_attention" if variant == "causal" else "full_attention"],
         )
+    if variant.endswith("-cp2"):
+        config.update(cp_size=2, world_size=2)
     model = model_cls(config)
     if variant == "dflash2-width":
         model.draft_query_width = 3

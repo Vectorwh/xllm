@@ -1316,3 +1316,39 @@ def test_kv_offload_rejects_unsafe_metadata_and_graph_before_kv_or_selection_wri
             backend.bind_kv_caches([LayerCache(key=original.clone(), value=None)])
     assert backend._kv_caches is original_binding and backend._offload_state is original_state
     assert backend._offload_state.layers == original_layers
+
+@pytest.mark.parametrize("unsafe_layout", ["cp-context", "kv-split"])
+def test_draft_proposal_rejects_sharded_execution_layout(
+    monkeypatch: pytest.MonkeyPatch, unsafe_layout: str
+) -> None:
+    backend = NpuPagedAttentionBackend(
+        1, 1, 128, 128**-0.5, 0, False, torch.device("cpu"), torch.bfloat16,
+        use_xfia_decode=True, xfia_query_width=2, draft_query_width=2,
+    )
+    cache = torch.empty(1, 128, 1, 128, dtype=torch.bfloat16)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
+    metadata = SimpleNamespace(
+        is_prefill=False, is_chunked_prefill=True, is_spec_verify=False, is_mixed=False,
+        kv_split_size=1, use_dflash_proposal_attention=True,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([2], dtype=torch.int32), slot_mapping=torch.arange(2),
+    )
+    context = ForwardContext(
+        backend, torch.device("cpu"), metadata, [LayerCache(cache, cache)],
+        cp_context=SimpleNamespace(cp_size=2) if unsafe_layout == "cp-context" else None,
+    )
+
+    def forbid_kernel(*args: object, **kwargs: object) -> None:
+        raise AssertionError("unsafe proposal layout reached a device kernel")
+
+    monkeypatch.setattr(backend, "_xfia_decode", forbid_kernel)
+    monkeypatch.setattr(sys.modules[NpuPagedAttentionBackend.__module__].kernels,
+                        "reshape_paged_cache", forbid_kernel, raising=False)
+    with forward_context(context):
+        backend.prepare(metadata)
+        if unsafe_layout == "kv-split":
+            metadata.kv_split_size = 2
+        query = torch.zeros(2, 1, 128)
+        layer = SimpleNamespace(layer_id=0, causal=False, attention_window=None)
+        with pytest.raises(NotImplementedError, match="unsharded KV pool"):
+            backend.execute(query, query, query, layer)
