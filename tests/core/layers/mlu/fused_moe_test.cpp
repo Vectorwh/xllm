@@ -46,7 +46,8 @@ class CountingReduceProcessGroup : public test::MockProcessGroup {
  public:
   CountingReduceProcessGroup(const torch::Device& device, int64_t size)
       : test::MockProcessGroup(device, 0, size) {}
-  void allreduce(torch::Tensor& input) override {
+  void allreduce(torch::Tensor& input,
+                 c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
     ++calls;
     input.mul_(world_size());
   }

@@ -18,6 +18,7 @@ cc_library(
     npu_adalayernorm.cpp
     matmul.cpp
     matmul_reduce_scatter.cpp
+    quantized_all_reduce.cpp
     npu_causal_conv1d.cpp
     npu_fused_infer_attention.cpp
     npu_gemma_rms_norm.cpp
@@ -41,6 +42,7 @@ cc_library(
   DEPS
     :torch_npu_kernels
     :tilelang_kernels
+    triton_adapter
     xllm_ops
     nnopbase
     opapi

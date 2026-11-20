@@ -221,16 +221,19 @@ c10::intrusive_ptr<c10d::Store> create_tcp_store(const std::string& host,
   return c10::make_intrusive<c10d::TCPStore>(host, tcp_options);
 }
 
-void ProcessGroup::allreduce(torch::Tensor& input) {
+void ProcessGroup::allreduce(torch::Tensor& input, c10d::ReduceOp op) {
   CHECK(pg_ != nullptr) << "Process group is not initialized.";
-  allreduce_async(input)->wait();
+  allreduce_async(input, op)->wait();
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroup::allreduce_async(
-    torch::Tensor& input) {
+    torch::Tensor& input,
+    c10d::ReduceOp op) {
   CHECK(pg_ != nullptr) << "Process group is not initialized.";
   std::vector<torch::Tensor> input_tensors = {input};
-  return pg_->allreduce(input_tensors);
+  c10d::AllreduceOptions opts;
+  opts.reduceOp = op;
+  return pg_->allreduce(input_tensors, opts);
 }
 
 void ProcessGroup::allgather(const torch::Tensor& input,

@@ -67,10 +67,13 @@ class ProcessGroup {
 
   // allreduce: reduce the input tensor across all processes, and all processes
   // get the result.
-  virtual void allreduce(torch::Tensor& input);
+  virtual void allreduce(torch::Tensor& input,
+                         c10d::ReduceOp op = c10d::ReduceOp::SUM);
 
   // allreduce_async: enqueue allreduce and return an async work handle.
-  virtual c10::intrusive_ptr<c10d::Work> allreduce_async(torch::Tensor& input);
+  virtual c10::intrusive_ptr<c10d::Work> allreduce_async(
+      torch::Tensor& input,
+      c10d::ReduceOp op = c10d::ReduceOp::SUM);
 
   // allgather: gather tensors from all processes and concatenate them.
   virtual void allgather(const torch::Tensor& input,

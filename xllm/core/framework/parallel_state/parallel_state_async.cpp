@@ -14,6 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include "core/util/utils.h"
+#if defined(USE_NPU)
+#include "core/kernels/npu/npu_ops_api.h"
+#endif
 #include "parallel_state.h"
 
 namespace xllm {
@@ -77,6 +80,24 @@ ReduceAsyncCtx launch_reduce(torch::Tensor input, ProcessGroup* process_group) {
   }
 
   ctx.tensor = input.contiguous();
+#if defined(USE_NPU)
+  // Funnel for the native (C++ layers) all-reduce. Try the opt-in int8
+  // quantized all-reduce first; it reduces ctx.tensor in place and the
+  // helper falls back per-call for any unqualified collective. Its gates
+  // (global config, Atlas A2, FlashComm1, world_size <= 8, numel >=
+  // min_numel) are identical on every rank of a well-formed collective, so
+  // the quantize vs plain branch cannot diverge across ranks. Oversized
+  // EP/MC2 groups fall out via the world_size <= 8 gate; small EP groups
+  // intentionally keep the upstream size-based policy (no group-identity
+  // gate here). The two quantized collectives are chained into one waitable
+  // handle so the async overlap is preserved end to end.
+  c10::intrusive_ptr<c10d::Work> quantized_work;
+  if (kernel::npu::try_quantized_all_reduce(
+          ctx.tensor, *process_group, &quantized_work)) {
+    ctx.work = std::move(quantized_work);
+    return ctx;
+  }
+#endif
   ctx.work = process_group->allreduce_async(ctx.tensor);
   return ctx;
 }

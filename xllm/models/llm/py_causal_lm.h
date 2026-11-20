@@ -190,6 +190,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   ProcessGroup* moe_ep_group_ = nullptr;
   ProcessGroup* eplb_group_ = nullptr;
 #if defined(USE_NPU)
+  bool enable_quantized_all_reduce_ = false;
   std::shared_ptr<MegaMoeCommResource> mega_moe_comm_resource_;
 #endif
 

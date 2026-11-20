@@ -34,6 +34,27 @@ limitations under the License.
 #include "utils.h"
 
 namespace xllm::kernel::npu {
+namespace {
+
+// Uppercased SoC name for the is_ascend_a2/is_ascend_a3 checks; empty when
+// aclrtGetSocName reports nothing.
+std::string normalized_soc_name() {
+  const char* soc_name = aclrtGetSocName();
+  if (soc_name == nullptr) {
+    return {};
+  }
+  std::string normalized(soc_name);
+  std::transform(normalized.begin(),
+                 normalized.end(),
+                 normalized.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::toupper(character));
+                 });
+  return normalized;
+}
+
+}  // namespace
+
 aclDataType type_info::get_acl_type(const torch::ScalarType& dtype) {
   switch (dtype) {
     case torch::kInt64:
@@ -105,6 +126,16 @@ bool is_ascend950() {
   const char* soc_name = aclrtGetSocName();
   return soc_name != nullptr &&
          std::string(soc_name).find("Ascend950") != std::string::npos;
+}
+
+bool is_ascend_a2() {
+  static const bool kIsAscendA2 = []() {
+    const std::string soc_name = normalized_soc_name();
+    return soc_name.find("910") != std::string::npos &&
+           soc_name.find("910C") == std::string::npos &&
+           soc_name.find("910_93") == std::string::npos;
+  }();
+  return kIsAscendA2;
 }
 
 bool is_ascend_a3() {

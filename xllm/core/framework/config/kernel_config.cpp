@@ -77,6 +77,16 @@ DEFINE_bool(enable_flashcomm1,
             false,
             "Enable Flash Communication 1 sequence-parallel optimization.");
 
+DEFINE_bool(enable_quantized_all_reduce,
+            false,
+            "Enable optional INT8 communication for large BF16 TP AllReduce "
+            "on Atlas A2. Requires TP size <= 8 and is disabled with "
+            "FlashComm1 or sequence parallelism.");
+
+DEFINE_int64(quantized_all_reduce_min_numel,
+             16777216,
+             "Minimum BF16 element count for quantized TP AllReduce.");
+
 DEFINE_bool(enable_dsa_cp,
             false,
             "Enable TP-group DSA query parallelism for Python DeepSeek-V4.1 "
@@ -144,6 +154,8 @@ void KernelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mega_moe);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dspark_native_sas);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_flashcomm1);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_quantized_all_reduce);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(quantized_all_reduce_min_numel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dsa_cp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_kda_cp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(flashcomm1_min_prefill_tokens);
@@ -166,6 +178,8 @@ void KernelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mega_moe);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dspark_native_sas);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_flashcomm1);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_quantized_all_reduce);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(quantized_all_reduce_min_numel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dsa_cp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_kda_cp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(flashcomm1_min_prefill_tokens);
@@ -176,6 +190,8 @@ void KernelConfig::from_json(const JsonReader& json) {
       << "enable_dspark_native_sas is only supported on NPU.";
   CHECK(!json.value_or<bool>("enable_dsa_cp", false))
       << "enable_dsa_cp is only supported on NPU.";
+  CHECK(!json.value_or<bool>("enable_quantized_all_reduce", false))
+      << "enable_quantized_all_reduce is only supported on NPU.";
   CHECK(!json.value_or<bool>("enable_kda_cp", false))
       << "enable_kda_cp is only supported on NPU.";
 #endif
@@ -210,6 +226,10 @@ void KernelConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_flashcomm1);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_quantized_all_reduce);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, quantized_all_reduce_min_numel);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dsa_cp);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_kda_cp);
@@ -233,6 +253,8 @@ void KernelConfig::initialize() {
     from_json(*json_config);
   }
 #if defined(USE_NPU)
+  CHECK_GT(quantized_all_reduce_min_numel(), 0)
+      << "quantized_all_reduce_min_numel must be positive.";
   enable_fused_mc2(resolve_fused_mc2_mode(enable_fused_mc2()));
 #endif
 }

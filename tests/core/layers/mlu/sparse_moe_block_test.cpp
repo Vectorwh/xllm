@@ -46,9 +46,10 @@ class RecordingProcessGroup final : public test::MockProcessGroup {
                         int64_t world_size = 1)
       : test::MockProcessGroup(device, rank, world_size) {}
 
-  void allreduce(torch::Tensor& input) override {
+  void allreduce(torch::Tensor& input,
+                 c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
     ++allreduce_calls_;
-    test::MockProcessGroup::allreduce(input);
+    test::MockProcessGroup::allreduce(input, op);
   }
 
   c10::intrusive_ptr<c10d::Work> allgather_base_async(

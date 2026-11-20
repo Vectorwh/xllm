@@ -23,6 +23,10 @@ limitations under the License.
 
 #include "custom_functions_npu/atb_common.h"
 
+namespace c10d {
+class Work;
+}  // namespace c10d
+
 namespace xllm {
 class ProcessGroup;
 }  // namespace xllm
@@ -131,6 +135,32 @@ void batch_chunked_paged_prefill(const torch::Tensor& query,
 torch::Tensor matmul(const torch::Tensor& a,
                      const torch::Tensor& b,
                      const std::optional<torch::Tensor>& bias);
+
+void quantized_all_reduce(torch::Tensor& input,
+                          ProcessGroup& process_group,
+                          int64_t min_numel,
+                          c10::intrusive_ptr<c10d::Work>* work = nullptr);
+
+// Attempts the int8 quantized all-reduce for large bf16 TP collectives on
+// the native (C++ layers) path: it cuts the collective payload to one byte
+// per element plus a per-tensor scale, trading one amax reduce and a
+// quantize/dequantize pair for cheaper communication on bandwidth-bound
+// prefill all-reduces. Returns true when the quantized path handled
+// the reduction (in place); false means the caller must fall back to a plain
+// bf16 all-reduce. When `work` is not null it receives a waitable handle for
+// the whole quantize-reduce-dequantize chain (null on fallback).
+bool try_quantized_all_reduce(torch::Tensor& input,
+                              ProcessGroup& process_group,
+                              c10::intrusive_ptr<c10d::Work>* work = nullptr);
+
+// Per-tensor symmetric quantize (defined in xllm_ops/quantize.cpp); declared
+// here so the quantized all-reduce kernel has a single entry header for its
+// xllm_ops dependencies.
+at::Tensor quantize_per_tensor(const at::Tensor& self,
+                               const at::Tensor& scales,
+                               const at::Tensor& zero_points,
+                               at::ScalarType dtype,
+                               int64_t axis);
 
 torch::Tensor matmul_reduce_scatter(
     const torch::Tensor& a,

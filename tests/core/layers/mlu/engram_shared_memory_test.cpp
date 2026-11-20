@@ -71,7 +71,10 @@ class SimulatedHostsProcessGroup final : public ProcessGroup {
     return hosts.to(input.device());
   }
 
-  void allreduce(torch::Tensor& input) override { world_.allreduce(input); }
+  void allreduce(torch::Tensor& input,
+                 c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
+    world_.allreduce(input, op);
+  }
 
  private:
   ProcessGroup& world_;

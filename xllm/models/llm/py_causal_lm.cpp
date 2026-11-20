@@ -43,6 +43,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/parallel_state/mega_moe_comm_resource.h"
 #include "core/kernels/npu/npu_ops_api.h"
+#include "core/kernels/npu/utils.h"
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
 
@@ -191,6 +192,22 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
 
 #if defined(USE_NPU)
   const auto& kernel_config = KernelConfig::get_instance();
+  enable_quantized_all_reduce_ = kernel_config.enable_quantized_all_reduce();
+  if (enable_quantized_all_reduce_) {
+    CHECK_LE(tp_size_, 8)
+        << "enable_quantized_all_reduce requires TP size <= 8, got " << tp_size_
+        << ".";
+  }
+  if (enable_quantized_all_reduce_ && kernel_config.enable_flashcomm1()) {
+    LOG(WARNING) << "Quantized TP AllReduce is incompatible with FlashComm1; "
+                    "disabling quantized TP AllReduce.";
+    enable_quantized_all_reduce_ = false;
+  }
+  if (enable_quantized_all_reduce_) {
+    CHECK(kernel::npu::is_ascend_a2())
+        << "enable_quantized_all_reduce is supported only on Atlas A2; "
+           "Atlas A3 and other devices must use BF16 AllReduce.";
+  }
   const auto& eplb_config = EPLBConfig::get_instance();
   const auto& model_type = model_args_.model_type();
   const bool is_glm_mega_moe_model = model_type == "glm_moe_dsa" ||
@@ -475,6 +492,20 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
   config_dict_["is_multimodal"] = is_vlm;
   py_model_ = model_cls(config_dict_);
   py_model_.attr("eval")();
+#if defined(USE_NPU)
+  if (enable_quantized_all_reduce_ &&
+      config_dict_.contains("sequence_parallel_enabled") &&
+      config_dict_["sequence_parallel_enabled"].cast<bool>()) {
+    LOG(WARNING) << "Quantized TP AllReduce is incompatible with sequence "
+                    "parallelism; disabling quantized TP AllReduce.";
+    enable_quantized_all_reduce_ = false;
+  }
+  if (enable_quantized_all_reduce_) {
+    LOG(INFO) << "Quantized TP AllReduce enabled: tp_size=" << tp_size_
+              << ", min_numel="
+              << KernelConfig::get_instance().quantized_all_reduce_min_numel();
+  }
+#endif
 }
 
 PyCausalLM::~PyCausalLM() {
@@ -824,9 +855,21 @@ void PyCausalLM::set_active_instance(PyCausalLM* py_causal_lm) {
 }
 
 void PyCausalLM::tp_all_reduce(torch::Tensor& tensor) {
-  if (tp_group_ != nullptr) {
-    tp_group_->allreduce(tensor);
+  if (tp_group_ == nullptr) {
+    return;
   }
+#if defined(USE_NPU)
+  // TP==1 has no communication to shrink; skip the quantize/dequantize
+  // round-trip to avoid its numerical error entirely.
+  if (enable_quantized_all_reduce_ && tp_size_ > 1) {
+    kernel::npu::quantized_all_reduce(
+        tensor,
+        *tp_group_,
+        KernelConfig::get_instance().quantized_all_reduce_min_numel());
+    return;
+  }
+#endif
+  tp_group_->allreduce(tensor);
 }
 
 torch::Tensor PyCausalLM::tp_all_gather(const torch::Tensor& tensor,

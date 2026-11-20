@@ -165,9 +165,10 @@ class CountingProcessGroup final : public MockProcessGroup {
                        int32_t world_size)
       : MockProcessGroup(device, rank, world_size) {}
 
-  void allreduce(torch::Tensor& input) override {
+  void allreduce(torch::Tensor& input,
+                 c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
     ++allreduce_calls_;
-    MockProcessGroup::allreduce(input);
+    MockProcessGroup::allreduce(input, op);
   }
 
   void reduce_scatter(const torch::Tensor& input,

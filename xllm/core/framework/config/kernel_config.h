@@ -52,6 +52,8 @@ class KernelConfig final {
          "enable_mega_moe",
          "enable_dspark_native_sas",
          "enable_flashcomm1",
+         "enable_quantized_all_reduce",
+         "quantized_all_reduce_min_numel",
          "enable_dsa_cp",
          "enable_kda_cp",
          "flashcomm1_min_prefill_tokens",
@@ -84,6 +86,10 @@ class KernelConfig final {
   PROPERTY(bool, enable_dspark_native_sas) = false;
 
   PROPERTY(bool, enable_flashcomm1) = false;
+
+  PROPERTY(bool, enable_quantized_all_reduce) = false;
+
+  PROPERTY(int64_t, quantized_all_reduce_min_numel) = 16777216;
 
   PROPERTY(bool, enable_dsa_cp) = false;
 

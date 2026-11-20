@@ -80,7 +80,8 @@ class UnreducedAttentionProcessGroup final : public test::MockProcessGroup {
   UnreducedAttentionProcessGroup(const torch::Device& device, int64_t rank)
       : test::MockProcessGroup(device, rank, /*world_size=*/2) {}
 
-  void allreduce(torch::Tensor& /*input*/) override {
+  void allreduce(torch::Tensor& /*input*/,
+                 c10d::ReduceOp /*op*/ = c10d::ReduceOp::SUM) override {
     ADD_FAILURE() << "Attention must leave TP_SHARD reduction to the caller";
   }
 };

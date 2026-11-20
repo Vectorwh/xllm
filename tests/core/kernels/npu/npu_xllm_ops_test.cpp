@@ -32,6 +32,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/parallel_state/process_group.h"
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -350,6 +351,50 @@ void expect_same_storage(const torch::Tensor& output,
   EXPECT_EQ(output.const_data_ptr(), input.const_data_ptr());
 }
 
+// Immediately-completed work handle for mocks that enqueue nothing.
+class CompletedWork : public c10d::Work {
+ public:
+  CompletedWork() { finish(); }
+};
+
+class RecordingAllReduceGroup final : public ProcessGroup {
+ public:
+  explicit RecordingAllReduceGroup(int32_t world_size,
+                                   int64_t sum_multiplier = 1)
+      : ProcessGroup(/*rank=*/0,
+                     world_size,
+                     torch::Device(torch::kPrivateUse1)),
+        sum_multiplier(sum_multiplier) {}
+
+  void allreduce(torch::Tensor& input, c10d::ReduceOp op) override {
+    ops.push_back(op);
+    if (op == c10d::ReduceOp::MAX) {
+      amax = input.clone();
+    } else if (input.scalar_type() == torch::kChar) {
+      quantized = input.clone();
+      // Simulate a multi-rank SUM so the dequantized result differs from the
+      // input; lets tests tell a real copy-back apart from an untouched buffer.
+      if (sum_multiplier != 1) {
+        input.mul_(sum_multiplier);
+      }
+    }
+  }
+
+  c10::intrusive_ptr<c10d::Work> allreduce_async(
+      torch::Tensor& input,
+      c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
+    allreduce(input, op);
+    return c10::make_intrusive<CompletedWork>();
+  }
+
+  std::vector<c10d::ReduceOp> ops;
+  torch::Tensor amax;
+  torch::Tensor quantized;
+
+ private:
+  int64_t sum_multiplier;
+};
+
 class NpuXllmOpsTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -424,6 +469,93 @@ TEST_F(NpuXllmOpsTest, DispatcherQuantizeMatchesStaticW8A8Reference) {
           .to(torch::kInt8);
   EXPECT_EQ(actual.scalar_type(), torch::kInt8);
   EXPECT_TRUE(torch::equal(actual.cpu(), expected));
+}
+
+TEST_F(NpuXllmOpsTest, QuantizedAllReduceUsesGlobalAmaxAndBoundedScale) {
+  py::gil_scoped_acquire gil;
+  const auto cpu_options = torch::TensorOptions().dtype(torch::kBFloat16);
+  torch::Tensor input_cpu = torch::zeros({2, 64}, cpu_options);
+  input_cpu[0][0].fill_(62.0);
+  input_cpu[1][0].fill_(-62.0);
+  torch::Tensor input = input_cpu.to(torch::kPrivateUse1);
+  // The dequantized result must be written into the caller's buffer (zero
+  // extra copy), not into a freshly allocated tensor copied back afterwards.
+  const void* input_ptr = input.const_data_ptr();
+  RecordingAllReduceGroup process_group(/*world_size=*/4);
+
+  kernel::npu::quantized_all_reduce(input, process_group, /*min_numel=*/1);
+
+  ASSERT_EQ(process_group.ops.size(), 2);
+  EXPECT_EQ(process_group.ops[0], c10d::ReduceOp::MAX);
+  EXPECT_EQ(process_group.ops[1], c10d::ReduceOp::SUM);
+  ASSERT_TRUE(process_group.amax.defined());
+  ASSERT_TRUE(process_group.quantized.defined());
+  EXPECT_EQ(process_group.quantized.scalar_type(), torch::kChar);
+  EXPECT_FLOAT_EQ(process_group.amax[0].item<float>(), 62.0);
+  EXPECT_EQ(process_group.quantized[0][0].item<int32_t>(), 31);
+  EXPECT_EQ(process_group.quantized[1][0].item<int32_t>(), -31);
+  EXPECT_LE(process_group.quantized.abs().max().item<int32_t>(), 31);
+  EXPECT_EQ(input.const_data_ptr(), input_ptr);
+  torch::Tensor output_cpu = input.cpu();
+  EXPECT_FLOAT_EQ(output_cpu[0][0].item<float>(), 62.0);
+  EXPECT_FLOAT_EQ(output_cpu[1][0].item<float>(), -62.0);
+}
+
+TEST_F(NpuXllmOpsTest, QuantizedAllReduceCopiesBackForNonContiguousInput) {
+  py::gil_scoped_acquire gil;
+  const auto cpu_options = torch::TensorOptions().dtype(torch::kBFloat16);
+  torch::Tensor base_cpu = torch::zeros({64, 2}, cpu_options);
+  base_cpu[0][0].fill_(62.0);
+  base_cpu[1][0].fill_(-62.0);
+  torch::Tensor base = base_cpu.to(torch::kPrivateUse1);
+  torch::Tensor input = base.transpose(0, 1);  // {2, 64}, non-contiguous
+  // Double the reduced int8 payload: a real copy-back must land 2x values in
+  // the transposed coordinates (input[i][j] == base[j][i], so -62 lives at
+  // [0][1], not [1][0]); a skipped copy-back would leave 62/-62/0 behind.
+  RecordingAllReduceGroup process_group(/*world_size=*/4, /*sum_multiplier=*/2);
+
+  kernel::npu::quantized_all_reduce(input, process_group, /*min_numel=*/1);
+
+  ASSERT_EQ(process_group.ops.size(), 2);
+  EXPECT_EQ(process_group.ops[0], c10d::ReduceOp::MAX);
+  EXPECT_EQ(process_group.ops[1], c10d::ReduceOp::SUM);
+  torch::Tensor output_cpu = input.cpu();
+  EXPECT_FLOAT_EQ(output_cpu[0][0].item<float>(), 124.0);
+  EXPECT_FLOAT_EQ(output_cpu[1][0].item<float>(), 0.0);
+  EXPECT_FLOAT_EQ(output_cpu[0][1].item<float>(), -124.0);
+}
+
+TEST_F(NpuXllmOpsTest, QuantizedAllReduceFallsBackForIneligibleInputs) {
+  py::gil_scoped_acquire gil;
+  const auto bf16_options = torch::TensorOptions()
+                                .dtype(torch::kBFloat16)
+                                .device(torch::kPrivateUse1);
+  auto expect_fallback =
+      [](torch::Tensor input, int32_t world_size, int64_t min_numel) {
+        torch::Tensor expected = input.clone();
+        RecordingAllReduceGroup process_group(world_size);
+        kernel::npu::quantized_all_reduce(input, process_group, min_numel);
+        ASSERT_EQ(process_group.ops.size(), 1);
+        EXPECT_EQ(process_group.ops[0], c10d::ReduceOp::SUM);
+        EXPECT_FALSE(process_group.amax.defined());
+        EXPECT_TRUE(torch::equal(input.cpu(), expected.cpu()));
+      };
+
+  expect_fallback(torch::zeros({2, 64}, bf16_options),
+                  /*world_size=*/2,
+                  /*min_numel=*/129);
+  expect_fallback(torch::zeros({128}, bf16_options),
+                  /*world_size=*/2,
+                  /*min_numel=*/1);
+  expect_fallback(torch::zeros({2, 63}, bf16_options),
+                  /*world_size=*/2,
+                  /*min_numel=*/1);
+  expect_fallback(torch::zeros({2, 64}, bf16_options.dtype(torch::kFloat32)),
+                  /*world_size=*/2,
+                  /*min_numel=*/1);
+  expect_fallback(torch::zeros({2, 64}, bf16_options),
+                  /*world_size=*/9,
+                  /*min_numel=*/1);
 }
 
 TEST_F(NpuXllmOpsTest, EmbeddedInterpreterSeesOps) {

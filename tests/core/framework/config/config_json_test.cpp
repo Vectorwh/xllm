@@ -253,6 +253,36 @@ inline constexpr std::string_view kMalformedConfig = R"json({
 })json";
 
 #if defined(USE_NPU)
+TEST(KernelConfigTest, QuantizedAllReduceJsonRoundTripAndValidation) {
+  google::FlagSaver flag_saver;
+  KernelConfig kernel_config;
+  EXPECT_FALSE(kernel_config.enable_quantized_all_reduce());
+  EXPECT_EQ(kernel_config.quantized_all_reduce_min_numel(), 16777216);
+
+  kernel_config.from_json(config::parse_json_string(
+      R"json({"enable_quantized_all_reduce":true,"quantized_all_reduce_min_numel":1024})json"));
+  EXPECT_TRUE(kernel_config.enable_quantized_all_reduce());
+  EXPECT_EQ(kernel_config.quantized_all_reduce_min_numel(), 1024);
+  nlohmann::ordered_json output = nlohmann::ordered_json::object();
+  kernel_config.append_config_json(output);
+  EXPECT_TRUE(output.at("enable_quantized_all_reduce").get<bool>());
+  EXPECT_EQ(output.at("quantized_all_reduce_min_numel").get<int64_t>(), 1024);
+  const auto& option_names = KernelConfig::option_category().option_names;
+  EXPECT_NE(std::find(option_names.begin(),
+                      option_names.end(),
+                      "enable_quantized_all_reduce"),
+            option_names.end());
+  EXPECT_NE(std::find(option_names.begin(),
+                      option_names.end(),
+                      "quantized_all_reduce_min_numel"),
+            option_names.end());
+
+  google::SetCommandLineOption("quantized_all_reduce_min_numel", "0");
+  KernelConfig invalid_config;
+  EXPECT_DEATH(invalid_config.initialize(),
+               "quantized_all_reduce_min_numel must be positive");
+}
+
 TEST(KernelConfigTest, DsaCpJsonRoundTrip) {
   KernelConfig kernel_config;
   EXPECT_FALSE(kernel_config.enable_dsa_cp());
@@ -282,6 +312,13 @@ TEST(KernelConfigTest, RejectsNpuOnlyDsaCp) {
   KernelConfig kernel_config;
   EXPECT_DEATH(kernel_config.from_json(json_config),
                "enable_dsa_cp is only supported on NPU");
+}
+TEST(KernelConfigTest, RejectsNpuOnlyQuantizedAllReduce) {
+  JsonReader json_config = config::parse_json_string(
+      R"json({"enable_quantized_all_reduce":true})json");
+  KernelConfig kernel_config;
+  EXPECT_DEATH(kernel_config.from_json(json_config),
+               "enable_quantized_all_reduce is only supported on NPU");
 }
 #endif
 

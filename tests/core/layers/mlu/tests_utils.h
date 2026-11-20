@@ -177,13 +177,15 @@ class MockProcessGroup : public xllm::ProcessGroup {
     pg_ = std::make_unique<MockBackend>(rank, world_size);
   }
 
-  void allreduce(torch::Tensor& input) override {
+  void allreduce(torch::Tensor& input,
+                 c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
     // Mock implementation - do nothing for testing
   }
 
   c10::intrusive_ptr<c10d::Work> allreduce_async(
-      torch::Tensor& input) override {
-    allreduce(input);
+      torch::Tensor& input,
+      c10d::ReduceOp op = c10d::ReduceOp::SUM) override {
+    allreduce(input, op);
     return make_completed_work();
   }
 
