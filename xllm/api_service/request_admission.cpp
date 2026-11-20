@@ -17,6 +17,9 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <limits>
+
+#include "core/framework/config/service_config.h"
 #include "core/framework/lora/lora_runtime.h"
 
 namespace xllm::api_service_internal {
@@ -39,7 +42,8 @@ Status model_not_supported_status() {
 Status admit_rpc_request(const std::string& model,
                          const absl::flat_hash_set<std::string>& models,
                          RateLimiter* rate_limiter,
-                         bool supports_lora) {
+                         bool supports_lora,
+                         int64_t num_requests) {
   // Only services that resolve and pin an adapter may admit its name.
   // Otherwise a request can pass admission and silently execute the base.
   if (!models.contains(model)) {
@@ -51,8 +55,20 @@ Status admit_rpc_request(const std::string& model,
     }
   }
 
+  CHECK_GT(num_requests, 0);
+  const int32_t max = ServiceConfig::get_instance().max_concurrent_requests();
+  // A batch that cannot fit even on an idle server will not benefit from
+  // retrying. Reserve 429 for temporary occupancy by other requests.
+  if (max > 0 && num_requests > max) {
+    return Status::invalid_parameter(
+        "documents count exceeds max_concurrent_requests", "documents");
+  }
+  if (num_requests > std::numeric_limits<int32_t>::max()) {
+    return Status::invalid_parameter(
+        "documents count exceeds supported request count", "documents");
+  }
   CHECK(rate_limiter != nullptr);
-  if (rate_limiter->is_limited()) {
+  if (rate_limiter->is_limited(static_cast<int32_t>(num_requests))) {
     return rate_limiter_rejection_status(*rate_limiter);
   }
   return {};

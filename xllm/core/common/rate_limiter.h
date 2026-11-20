@@ -29,8 +29,10 @@ class RateLimiter final {
   ~RateLimiter() = default;
 
   // Returns true if request is rate-limited or sleeping.
-  // If not limited and not sleeping, increments the counter.
+  // Atomically reserves num_requests slots, or reserves none on rejection.
+  // Each admitted Request releases one slot when destroyed.
   bool is_limited();
+  bool is_limited(int32_t num_requests);
 
   void decrease_one_request();
 

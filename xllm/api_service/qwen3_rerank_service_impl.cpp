@@ -30,17 +30,32 @@ void Qwen3RerankServiceImpl::process_async_impl(
     std::shared_ptr<RerankCall> call) {
   const auto& rpc_request = call->request();
   const auto& model = rpc_request.model();
-  if (!models_.contains(model)) {
-    call->finish_with_error(api_service_internal::model_not_supported_status());
+  if (rpc_request.documents().empty()) {
+    // Keep model errors ahead of empty-input errors without reserving slots.
+    const Status status =
+        models_.contains(model)
+            ? Status::invalid_parameter("documents must not be empty",
+                                        "documents")
+            : api_service_internal::model_not_supported_status();
+    call->finish_with_error(status);
+    return;
+  }
+  const int64_t num_requests =
+      static_cast<int64_t>(rpc_request.documents_size());
+  const Status admission =
+      api_service_internal::admit_rpc_request(model,
+                                              models_,
+                                              master_->get_rate_limiter(),
+                                              /*supports_lora=*/false,
+                                              num_requests);
+  if (!admission.ok()) {
+    call->finish_with_error(admission);
     return;
   }
 
   auto query = rpc_request.query();
-  std::vector<std::string> documents;
-  if (rpc_request.documents_size() > 0) {
-    documents = std::vector<std::string>(rpc_request.documents().begin(),
-                                         rpc_request.documents().end());
-  }
+  std::vector<std::string> documents(rpc_request.documents().begin(),
+                                     rpc_request.documents().end());
 
   std::vector<std::string> reqs;
   reqs.reserve(documents.size());
@@ -87,7 +102,8 @@ void Qwen3RerankServiceImpl::process_async_impl(
     return true;
   };
 
-  master_->handle_batch_request(reqs, sps, batch_callback);
+  master_->handle_batch_request(
+      std::move(reqs), std::move(sps), batch_callback);
 }
 
 }  // namespace xllm

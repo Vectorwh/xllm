@@ -23,6 +23,7 @@ limitations under the License.
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <vector>
 
 #include "api_service/api_service.h"
 #include "api_service/http_auth.h"
@@ -452,6 +453,91 @@ TEST_F(RateLimitMetricsTest, AdmissionHandoffReleasesExactlyOnce) {
     request.reset();
     EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
   }
+}
+
+TEST_F(RateLimitMetricsTest, RerankBatchSlotsReleaseWithRequests) {
+  ServiceConfig::get_instance().max_concurrent_requests(32);
+  RateLimiter rate_limiter;
+  const absl::flat_hash_set<std::string> models = {"supported-model"};
+  for (int32_t batch = 0; batch < 2; ++batch) {
+    ASSERT_TRUE(api_service_internal::admit_rpc_request("supported-model",
+                                                        models,
+                                                        &rate_limiter,
+                                                        /*supports_lora=*/false,
+                                                        /*num_requests=*/32)
+                    .ok());
+    std::vector<std::unique_ptr<RequestBase>> requests;
+    requests.reserve(32);
+    for (int32_t i = 0; i < 32; ++i) {
+      requests.emplace_back(std::make_unique<RequestBase>(
+          "rerank-document", "x-request", "time", "", "", &rate_limiter));
+    }
+    EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 32);
+    requests.clear();
+    EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+  }
+}
+
+TEST_F(RateLimitMetricsTest, RerankOversizedBatchIsNotRetryable) {
+  using CompletionCall =
+      NonStreamCall<proto::CompletionRequest, proto::CompletionResponse>;
+  ServiceConfig::get_instance().max_concurrent_requests(32);
+  RateLimiter rate_limiter;
+  const absl::flat_hash_set<std::string> models = {"supported-model"};
+  const double limited_before = COUNTER_VALUE(server_request_total_limit);
+  const Status oversized =
+      api_service_internal::admit_rpc_request("supported-model",
+                                              models,
+                                              &rate_limiter,
+                                              /*supports_lora=*/false,
+                                              /*num_requests=*/33);
+  EXPECT_EQ(oversized.reason(), FailureReason::INVALID_PARAMETER);
+  const auto permanent_error = api_service::public_error_from_status(oversized);
+  EXPECT_EQ(permanent_error.status_code, 400);
+  EXPECT_EQ(permanent_error.param, "documents");
+  EXPECT_FALSE(permanent_error.retryable);
+  brpc::Controller controller;
+  api_service::write_http_error(&controller, oversized);
+  ASSERT_NE(controller.http_response().GetHeader("X-Xllm-Retryable"), nullptr);
+  EXPECT_EQ(*controller.http_response().GetHeader("X-Xllm-Retryable"), "false");
+  EXPECT_EQ(controller.http_response().GetHeader("Retry-After"), nullptr);
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+  EXPECT_EQ(COUNTER_VALUE(server_request_total_limit), limited_before);
+
+  const Status unknown =
+      api_service_internal::admit_rpc_request("unknown-model",
+                                              models,
+                                              &rate_limiter,
+                                              /*supports_lora=*/false,
+                                              /*num_requests=*/33);
+  EXPECT_EQ(unknown.reason(), FailureReason::MODEL_NOT_FOUND);
+
+  ASSERT_TRUE(api_service_internal::admit_rpc_request("supported-model",
+                                                      models,
+                                                      &rate_limiter,
+                                                      /*supports_lora=*/false,
+                                                      /*num_requests=*/32)
+                  .ok());
+  const Status occupied = api_service_internal::admit_rpc_request(
+      "supported-model", models, &rate_limiter);
+  EXPECT_EQ(occupied.reason(), FailureReason::CONCURRENCY_LIMIT_REACHED);
+  const auto temporary_error = api_service::public_error_from_status(occupied);
+  EXPECT_EQ(temporary_error.status_code, 429);
+  EXPECT_TRUE(temporary_error.retryable);
+  brpc::Controller occupied_controller;
+  api_service::write_http_error(&occupied_controller, occupied);
+  ASSERT_NE(occupied_controller.http_response().GetHeader("Retry-After"),
+            nullptr);
+  EXPECT_EQ(*occupied_controller.http_response().GetHeader("X-Xllm-Retryable"),
+            "true");
+  EXPECT_EQ(*occupied_controller.http_response().GetHeader("Retry-After"), "1");
+  finish_rejection<CompletionCall>(
+      occupied, /*streaming=*/false, /*http=*/true);
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 32);
+  for (int32_t i = 0; i < 32; ++i) {
+    rate_limiter.decrease_one_request();
+  }
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
 }
 
 TEST_F(RateLimitMetricsTest, NonStreamConcurrencyRejectionCountsOnce) {

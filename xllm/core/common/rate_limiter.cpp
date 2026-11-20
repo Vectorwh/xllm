@@ -17,13 +17,18 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 
+#include <limits>
+
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/service_config.h"
 
 namespace xllm {
 
-bool RateLimiter::is_limited() {
+bool RateLimiter::is_limited() { return is_limited(/*num_requests=*/1); }
+
+bool RateLimiter::is_limited(int32_t num_requests) {
+  CHECK_GT(num_requests, 0);
   const int32_t max =
       ::xllm::ServiceConfig::get_instance().max_concurrent_requests();
   int32_t expected = num_concurrent_requests_.load(std::memory_order_relaxed);
@@ -33,7 +38,9 @@ bool RateLimiter::is_limited() {
       return true;
     }
     // Check rate limit.
-    if (max > 0 && expected >= max) {
+    const int64_t requested = static_cast<int64_t>(expected) + num_requests;
+    if (requested > std::numeric_limits<int32_t>::max() ||
+        (max > 0 && requested > max)) {
       COUNTER_INC(server_request_total_limit);
       return true;
     }
@@ -41,10 +48,10 @@ bool RateLimiter::is_limited() {
     // retry (re-checking the sleep/limit conditions above with the new value).
     if (num_concurrent_requests_.compare_exchange_weak(
             expected,
-            expected + 1,
+            expected + num_requests,
             std::memory_order_acq_rel,
             std::memory_order_relaxed)) {
-      GAUGE_SET(num_concurrent_requests, expected + 1);
+      GAUGE_SET(num_concurrent_requests, expected + num_requests);
       return false;
     }
   }

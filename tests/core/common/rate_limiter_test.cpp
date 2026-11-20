@@ -1,4 +1,4 @@
-#include "rate_limiter.h"
+#include "core/common/rate_limiter.h"
 
 #include <gtest/gtest.h>
 
@@ -52,6 +52,25 @@ TEST_F(RequestLimiterTest, NoLimitWhenMaxIsZero) {
   rate_limiter.decrease_one_request();
   rate_limiter.decrease_one_request();
   EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(RequestLimiterTest, BatchReservesAllSlotsOrNone) {
+  ServiceConfig::get_instance().max_concurrent_requests(3);
+  RateLimiter rate_limiter;
+  EXPECT_FALSE(rate_limiter.is_limited(/*num_requests=*/2));
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 2);
+  EXPECT_TRUE(rate_limiter.is_limited(/*num_requests=*/2));
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 2);
+  EXPECT_FALSE(rate_limiter.is_limited());
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 3);
+  for (int32_t i = 0; i < 3; ++i) {
+    rate_limiter.decrease_one_request();
+  }
+  EXPECT_EQ(rate_limiter.get_num_concurrent_requests(), 0);
+  EXPECT_TRUE(rate_limiter.try_set_sleeping());
+  EXPECT_TRUE(rate_limiter.is_limited(/*num_requests=*/2));
+  EXPECT_TRUE(rate_limiter.is_sleeping());
+  EXPECT_TRUE(rate_limiter.try_wakeup());
 }
 
 TEST_F(RequestLimiterTest, SleepBlocksAcquisition) {

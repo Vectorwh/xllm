@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <absl/container/flat_hash_set.h>
 
+#include <cstdint>
 #include <string>
 
 #include "core/common/rate_limiter.h"
@@ -30,9 +31,13 @@ Status rate_limiter_rejection_status(const RateLimiter& rate_limiter);
 // Shared rejection for an unknown model name across all API services.
 Status model_not_supported_status();
 
+// Validates model, batch budget, then current occupancy. Callers must validate
+// request shape and supply a positive count. A batch larger than the total
+// budget is a non-retryable parameter error; contention remains retryable.
 Status admit_rpc_request(const std::string& model,
                          const absl::flat_hash_set<std::string>& models,
                          RateLimiter* rate_limiter,
-                         bool supports_lora = false);
+                         bool supports_lora = false,
+                         int64_t num_requests = 1);
 
 }  // namespace xllm::api_service_internal
