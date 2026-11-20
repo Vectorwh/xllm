@@ -32,6 +32,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/macros.h"
+#include "core/kernels/musa/gdn_ops.h"
 #include "core/kernels/musa/musa_ops_api.h"
 #include "core/kernels/musa/musa_tvmffi_stream.h"
 #include "core/kernels/param.h"
@@ -2032,6 +2033,7 @@ __global__ void fused_gdn_decode_kernel(
     const scalar_t* __restrict__ b,
     const int32_t* __restrict__ state_indices,
     scalar_t* __restrict__ output,
+    int64_t num_state_slots,
     int64_t num_k_heads,
     int64_t num_v_heads,
     int64_t head_k_dim,
@@ -2056,6 +2058,11 @@ __global__ void fused_gdn_decode_kernel(
           static_cast<int64_t>(v);
       output[out_off] = static_cast<scalar_t>(0);
     }
+    return;
+  }
+
+  if (slot >= num_state_slots) {
+    __trap();
     return;
   }
 
@@ -2167,31 +2174,55 @@ __global__ void fused_gdn_decode_kernel(
 constexpr int32_t kFusedGdnH128Threads = 128;
 constexpr int32_t kFusedGdnH128LanesPerWarp = 32;
 constexpr int32_t kFusedGdnH128ValuesPerLane = 4;
-constexpr int32_t kFusedGdnH128RowsPerBlock = 16;
-constexpr int32_t kFusedGdnH128BlocksPerState = 8;
+constexpr int32_t kFusedGdnH128RowsPerBlock = 8;
+constexpr int32_t kFusedGdnH128BlocksPerState = 16;
 static_assert(kFusedGdnH128LanesPerWarp * kFusedGdnH128ValuesPerLane == 128);
 static_assert(kFusedGdnH128RowsPerBlock * kFusedGdnH128BlocksPerState == 128);
 
+struct GdnTensorStrides {
+  int64_t batch;
+  int64_t token;
+  int64_t head;
+  int64_t element;
+};
+
+GdnTensorStrides gdn_tensor_strides(const torch::Tensor& tensor) {
+  return {
+      tensor.stride(0), tensor.stride(1), tensor.stride(2), tensor.stride(3)};
+}
+
 template <typename scalar_t>
 __global__ void __launch_bounds__(kFusedGdnH128Threads, 1)
-    fused_gdn_decode_h128_tiled_kernel(
-        const scalar_t* __restrict__ mixed_qkv,
-        int64_t mixed_qkv_row_stride,
-        float* __restrict__ state,
-        const float* __restrict__ a_log_f32,
-        const scalar_t* __restrict__ a,
-        const float* __restrict__ dt_bias_f32,
-        const scalar_t* __restrict__ b,
-        const int32_t* __restrict__ state_indices,
-        scalar_t* __restrict__ output,
-        int64_t num_k_heads,
-        int64_t num_v_heads,
-        int64_t qk_cols,
-        float scale,
-        float softplus_beta,
-        float softplus_threshold) {
+    fused_gdn_h128_tiled_kernel(const scalar_t* __restrict__ query,
+                                const scalar_t* __restrict__ key,
+                                const scalar_t* __restrict__ value,
+                                GdnTensorStrides query_strides,
+                                GdnTensorStrides key_strides,
+                                GdnTensorStrides value_strides,
+                                float* __restrict__ state,
+                                const float* __restrict__ a_log_f32,
+                                const scalar_t* __restrict__ a,
+                                const float* __restrict__ dt_bias_f32,
+                                const scalar_t* __restrict__ b,
+                                const int32_t* __restrict__ state_indices,
+                                const int64_t* __restrict__ checkpoint_indices,
+                                const int64_t* __restrict__ accepted_tokens,
+                                scalar_t* __restrict__ output,
+                                int64_t num_state_slots,
+                                int64_t state_value_stride,
+                                int64_t state_key_stride,
+                                int64_t num_k_heads,
+                                int64_t num_v_heads,
+                                int64_t seq_len,
+                                float scale,
+                                float softplus_beta,
+                                float softplus_threshold) {
   constexpr uint32_t kFullWarpMask = 0xffffffffu;
   constexpr int32_t kHeadDim = 128;
+  constexpr int32_t kWarpsPerBlock =
+      kFusedGdnH128Threads / kFusedGdnH128LanesPerWarp;
+  constexpr int32_t kRowsPerWarp = kFusedGdnH128RowsPerBlock / kWarpsPerBlock;
+  extern __shared__ float checkpoint_tile[];
 
   const int32_t batch = static_cast<int32_t>(blockIdx.x);
   const int32_t hv = static_cast<int32_t>(blockIdx.y);
@@ -2202,118 +2233,203 @@ __global__ void __launch_bounds__(kFusedGdnH128Threads, 1)
       static_cast<int32_t>(threadIdx.x) / kFusedGdnH128LanesPerWarp;
   const int32_t v_block_start = v_block * kFusedGdnH128RowsPerBlock;
 
-  const int64_t slot = static_cast<int64_t>(state_indices[batch]);
-  if (slot < 0) {
-    for (int32_t v_offset = warp; v_offset < kFusedGdnH128RowsPerBlock;
-         v_offset += kFusedGdnH128Threads / kFusedGdnH128LanesPerWarp) {
-      const int32_t v = v_block_start + v_offset;
-      if (lane == 0) {
-        const int64_t out_offset =
-            (static_cast<int64_t>(batch) * num_v_heads + hv) * kHeadDim + v;
-        output[out_offset] = static_cast<scalar_t>(0);
+  int64_t slot = state_indices == nullptr ? batch : state_indices[batch];
+  if (checkpoint_indices != nullptr) {
+    const int64_t accepted = accepted_tokens[batch];
+    if (accepted < 1 || accepted > seq_len) {
+      __trap();
+      return;
+    }
+    slot = checkpoint_indices[batch * seq_len + accepted - 1];
+    for (int64_t token = 0; token < seq_len; ++token) {
+      const int64_t checkpoint = checkpoint_indices[batch * seq_len + token];
+      if (checkpoint < 0 || checkpoint >= num_state_slots) {
+        __trap();
+        return;
       }
     }
+  }
+  if (slot < 0) {
+    for (int64_t token = 0; token < seq_len; ++token) {
+      for (int32_t row = 0; row < kRowsPerWarp; ++row) {
+        const int32_t v = v_block_start + warp + row * kWarpsPerBlock;
+        const int64_t out_offset =
+            ((static_cast<int64_t>(batch) * seq_len + token) * num_v_heads +
+             hv) *
+                kHeadDim +
+            v;
+        if (lane == 0) {
+          output[out_offset] = static_cast<scalar_t>(0);
+        }
+      }
+    }
+    return;
+  }
+
+  // Negative slots are graph padding. Other invalid slots must fail before
+  // accessing state; CUDA_KERNEL_ASSERT is disabled by Torch-MUSA.
+  if (slot >= num_state_slots) {
+    __trap();
     return;
   }
 
   const int32_t head_group_size =
       static_cast<int32_t>(num_v_heads / num_k_heads);
   const int32_t hk = hv / head_group_size;
-  const scalar_t* qkv_row =
-      mixed_qkv + static_cast<int64_t>(batch) * mixed_qkv_row_stride;
-  const int64_t query_base = static_cast<int64_t>(hk) * kHeadDim;
-  const int64_t key_base = qk_cols + static_cast<int64_t>(hk) * kHeadDim;
-  const int64_t value_base = 2 * qk_cols + static_cast<int64_t>(hv) * kHeadDim;
-
-  float query_values[kFusedGdnH128ValuesPerLane];
-  float key_values[kFusedGdnH128ValuesPerLane];
-  float query_sum = 0.0f;
-  float key_sum = 0.0f;
+  const int64_t state_head = (slot * num_v_heads + hv) * kHeadDim * kHeadDim;
+  const float a_log_exp = lane == 0 ? expf(a_log_f32[hv]) : 0.0f;
+  float state_values[kRowsPerWarp][kFusedGdnH128ValuesPerLane];
 #pragma unroll
-  for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
-    const int32_t k = lane + index * kFusedGdnH128LanesPerWarp;
-    query_values[index] = static_cast<float>(qkv_row[query_base + k]);
-    key_values[index] = static_cast<float>(qkv_row[key_base + k]);
-    query_sum += query_values[index] * query_values[index];
-    key_sum += key_values[index] * key_values[index];
-  }
-#pragma unroll
-  for (int32_t offset = kFusedGdnH128LanesPerWarp / 2; offset > 0;
-       offset >>= 1) {
-    query_sum += __shfl_xor_sync(
-        kFullWarpMask, query_sum, offset, kFusedGdnH128LanesPerWarp);
-    key_sum += __shfl_xor_sync(
-        kFullWarpMask, key_sum, offset, kFusedGdnH128LanesPerWarp);
-  }
-  const float query_norm = rsqrtf(query_sum + 1e-6f) * scale;
-  const float key_norm = rsqrtf(key_sum + 1e-6f);
-#pragma unroll
-  for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
-    query_values[index] *= query_norm;
-    key_values[index] *= key_norm;
-  }
-
-  float alpha = 0.0f;
-  float beta = 0.0f;
-  if (lane == 0) {
-    const int64_t gate_offset = static_cast<int64_t>(batch) * num_v_heads + hv;
-    const float a_value = static_cast<float>(a[gate_offset]);
-    const float b_value = static_cast<float>(b[gate_offset]);
-    const float pre = a_value + dt_bias_f32[hv];
-    const float scaled_pre = softplus_beta * pre;
-    const float softplus = scaled_pre > softplus_threshold
-                               ? pre
-                               : log1pf(expf(scaled_pre)) / softplus_beta;
-    alpha = expf(-expf(a_log_f32[hv]) * softplus);
-    beta = 1.0f / (1.0f + expf(-b_value));
-  }
-  alpha = __shfl_sync(kFullWarpMask, alpha, 0, kFusedGdnH128LanesPerWarp);
-  beta = __shfl_sync(kFullWarpMask, beta, 0, kFusedGdnH128LanesPerWarp);
-
-  constexpr int32_t kWarpsPerBlock =
-      kFusedGdnH128Threads / kFusedGdnH128LanesPerWarp;
-  for (int32_t v_offset = warp; v_offset < kFusedGdnH128RowsPerBlock;
-       v_offset += kWarpsPerBlock) {
-    const int32_t v = v_block_start + v_offset;
-    const int64_t state_row =
-        ((slot * num_v_heads + hv) * kHeadDim + v) * kHeadDim;
-    float state_values[kFusedGdnH128ValuesPerLane];
-    float state_key_sum = 0.0f;
+  for (int32_t row = 0; row < kRowsPerWarp; ++row) {
+    const int32_t v = v_block_start + warp + row * kWarpsPerBlock;
 #pragma unroll
     for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
       const int32_t k = lane + index * kFusedGdnH128LanesPerWarp;
-      state_values[index] = alpha * state[state_row + k];
-      state_key_sum += state_values[index] * key_values[index];
+      state_values[row][index] =
+          state[state_head + v * state_value_stride + k * state_key_stride];
+    }
+  }
+
+  // Decode and verification execute the same runtime loop and FP32
+  // recurrence. Checkpoint writes do not change the state retained for the
+  // next token.
+  for (int64_t token = 0; token < seq_len; ++token) {
+    const int64_t query_base = batch * query_strides.batch +
+                               token * query_strides.token +
+                               hk * query_strides.head;
+    const int64_t key_base = batch * key_strides.batch +
+                             token * key_strides.token + hk * key_strides.head;
+    const int64_t value_base = batch * value_strides.batch +
+                               token * value_strides.token +
+                               hv * value_strides.head;
+    float query_values[kFusedGdnH128ValuesPerLane];
+    float key_values[kFusedGdnH128ValuesPerLane];
+    float query_sum = 0.0f;
+    float key_sum = 0.0f;
+#pragma unroll
+    for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
+      const int32_t k = lane + index * kFusedGdnH128LanesPerWarp;
+      query_values[index] =
+          static_cast<float>(query[query_base + k * query_strides.element]);
+      key_values[index] =
+          static_cast<float>(key[key_base + k * key_strides.element]);
+      query_sum += query_values[index] * query_values[index];
+      key_sum += key_values[index] * key_values[index];
     }
 #pragma unroll
     for (int32_t offset = kFusedGdnH128LanesPerWarp / 2; offset > 0;
          offset >>= 1) {
-      state_key_sum += __shfl_xor_sync(
-          kFullWarpMask, state_key_sum, offset, kFusedGdnH128LanesPerWarp);
+      query_sum += __shfl_xor_sync(
+          kFullWarpMask, query_sum, offset, kFusedGdnH128LanesPerWarp);
+      key_sum += __shfl_xor_sync(
+          kFullWarpMask, key_sum, offset, kFusedGdnH128LanesPerWarp);
     }
-
-    float value =
-        lane == 0 ? static_cast<float>(qkv_row[value_base + v]) : 0.0f;
-    value = __shfl_sync(kFullWarpMask, value, 0, kFusedGdnH128LanesPerWarp);
-    const float delta = (value - state_key_sum) * beta;
-    float state_query_sum = 0.0f;
+    const float query_norm = rsqrtf(query_sum + 1e-6f) * scale;
+    const float key_norm = rsqrtf(key_sum + 1e-6f);
 #pragma unroll
     for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
-      const int32_t k = lane + index * kFusedGdnH128LanesPerWarp;
-      state_values[index] += key_values[index] * delta;
-      state_query_sum += state_values[index] * query_values[index];
-      state[state_row + k] = state_values[index];
+      query_values[index] *= query_norm;
+      key_values[index] *= key_norm;
     }
-#pragma unroll
-    for (int32_t offset = kFusedGdnH128LanesPerWarp / 2; offset > 0;
-         offset >>= 1) {
-      state_query_sum += __shfl_xor_sync(
-          kFullWarpMask, state_query_sum, offset, kFusedGdnH128LanesPerWarp);
-    }
+
+    float alpha = 0.0f;
+    float beta = 0.0f;
     if (lane == 0) {
+      const int64_t gate_offset = (batch * seq_len + token) * num_v_heads + hv;
+      const float pre = static_cast<float>(a[gate_offset]) + dt_bias_f32[hv];
+      const float scaled_pre = softplus_beta * pre;
+      const float softplus = scaled_pre > softplus_threshold
+                                 ? pre
+                                 : log1pf(expf(scaled_pre)) / softplus_beta;
+      alpha = expf(-a_log_exp * softplus);
+      beta = 1.0f / (1.0f + expf(-static_cast<float>(b[gate_offset])));
+    }
+    alpha = __shfl_sync(kFullWarpMask, alpha, 0, kFusedGdnH128LanesPerWarp);
+    beta = __shfl_sync(kFullWarpMask, beta, 0, kFusedGdnH128LanesPerWarp);
+#pragma unroll
+    for (int32_t row = 0; row < kRowsPerWarp; ++row) {
+      const int32_t v = v_block_start + warp + row * kWarpsPerBlock;
+      float state_key_sum = 0.0f;
+#pragma unroll
+      for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
+        state_values[row][index] *= alpha;
+        state_key_sum += state_values[row][index] * key_values[index];
+      }
+#pragma unroll
+      for (int32_t offset = kFusedGdnH128LanesPerWarp / 2; offset > 0;
+           offset >>= 1) {
+        state_key_sum += __shfl_xor_sync(
+            kFullWarpMask, state_key_sum, offset, kFusedGdnH128LanesPerWarp);
+      }
+      float v_value = lane == 0
+                          ? static_cast<float>(
+                                value[value_base + v * value_strides.element])
+                          : 0.0f;
+      v_value =
+          __shfl_sync(kFullWarpMask, v_value, 0, kFusedGdnH128LanesPerWarp);
+      const float delta = (v_value - state_key_sum) * beta;
+      float state_query_sum = 0.0f;
+#pragma unroll
+      for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
+        state_values[row][index] += key_values[index] * delta;
+        state_query_sum += state_values[row][index] * query_values[index];
+      }
+#pragma unroll
+      for (int32_t offset = kFusedGdnH128LanesPerWarp / 2; offset > 0;
+           offset >>= 1) {
+        state_query_sum += __shfl_xor_sync(
+            kFullWarpMask, state_query_sum, offset, kFusedGdnH128LanesPerWarp);
+      }
       const int64_t output_offset =
-          (static_cast<int64_t>(batch) * num_v_heads + hv) * kHeadDim + v;
-      output[output_offset] = static_cast<scalar_t>(state_query_sum);
+          ((batch * seq_len + token) * num_v_heads + hv) * kHeadDim + v;
+      if (lane == 0) {
+        output[output_offset] = static_cast<scalar_t>(state_query_sum);
+      }
+      if (checkpoint_indices != nullptr) {
+        const int64_t checkpoint = checkpoint_indices[batch * seq_len + token];
+        const int64_t checkpoint_head =
+            (checkpoint * num_v_heads + hv) * kHeadDim * kHeadDim;
+#pragma unroll
+        for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
+          const int32_t k = lane + index * kFusedGdnH128LanesPerWarp;
+          if (state_key_stride == 1) {
+            state[checkpoint_head + v * state_value_stride + k] =
+                state_values[row][index];
+          } else {
+            checkpoint_tile[(v - v_block_start) * kHeadDim + k] =
+                state_values[row][index];
+          }
+        }
+      }
+    }
+    if (checkpoint_indices != nullptr && state_key_stride != 1) {
+      // Transpose this block's FP32 tile in shared memory for coalesced KV
+      // cache writes, without a global checkpoint tensor or layout copy.
+      __syncthreads();
+      const int64_t checkpoint_head =
+          (checkpoint_indices[batch * seq_len + token] * num_v_heads + hv) *
+          kHeadDim * kHeadDim;
+      for (int32_t index = static_cast<int32_t>(threadIdx.x);
+           index < kFusedGdnH128RowsPerBlock * kHeadDim;
+           index += kFusedGdnH128Threads) {
+        const int32_t v = index % kFusedGdnH128RowsPerBlock;
+        const int32_t k = index / kFusedGdnH128RowsPerBlock;
+        state[checkpoint_head + (v_block_start + v) * state_value_stride +
+              k * state_key_stride] = checkpoint_tile[v * kHeadDim + k];
+      }
+      __syncthreads();
+    }
+  }
+  if (checkpoint_indices == nullptr) {
+#pragma unroll
+    for (int32_t row = 0; row < kRowsPerWarp; ++row) {
+      const int32_t v = v_block_start + warp + row * kWarpsPerBlock;
+#pragma unroll
+      for (int32_t index = 0; index < kFusedGdnH128ValuesPerLane; ++index) {
+        const int32_t k = lane + index * kFusedGdnH128LanesPerWarp;
+        state[state_head + v * state_value_stride + k * state_key_stride] =
+            state_values[row][index];
+      }
     }
   }
 }
@@ -2338,20 +2454,31 @@ void launch_fused_gdn_h128_tiled(const torch::Tensor& mixed_qkv,
   const dim3 grid(static_cast<unsigned int>(batch_size),
                   static_cast<unsigned int>(num_v_heads),
                   kFusedGdnH128BlocksPerState);
-  fused_gdn_decode_h128_tiled_kernel<scalar_t>
+  const scalar_t* mixed = mixed_qkv.data_ptr<scalar_t>();
+  const GdnTensorStrides strides{mixed_qkv.stride(0), 0, 128, 1};
+  fused_gdn_h128_tiled_kernel<scalar_t>
       <<<grid, kFusedGdnH128Threads, 0, stream>>>(
-          mixed_qkv.data_ptr<scalar_t>(),
-          mixed_qkv.stride(0),
+          mixed,
+          mixed + qk_cols,
+          mixed + 2 * qk_cols,
+          strides,
+          strides,
+          strides,
           state.data_ptr<float>(),
           a_log_f32.data_ptr<float>(),
           a.data_ptr<scalar_t>(),
           dt_bias_f32.data_ptr<float>(),
           b.data_ptr<scalar_t>(),
           state_indices_i32.data_ptr<int32_t>(),
+          /*checkpoint_indices=*/nullptr,
+          /*accepted_tokens=*/nullptr,
           output.data_ptr<scalar_t>(),
+          state.size(0),
+          state.stride(2),
+          state.stride(3),
           num_k_heads,
           num_v_heads,
-          qk_cols,
+          /*seq_len=*/1,
           scale,
           softplus_beta,
           softplus_threshold);
@@ -2416,6 +2543,7 @@ void launch(const torch::Tensor& mixed_qkv,
       b.data_ptr<scalar_t>(),
       state_indices_i32.data_ptr<int32_t>(),
       output.data_ptr<scalar_t>(),
+      state.size(0),
       num_k_heads,
       num_v_heads,
       head_k_dim,
@@ -2582,6 +2710,236 @@ torch::Tensor fused_gated_delta_rule_decode(
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+  return output;
+}
+
+namespace {
+
+template <typename Scalar>
+__global__ void causal_conv_spec_verify_kernel(const Scalar* input,
+                                               const Scalar* weight,
+                                               Scalar* state,
+                                               const int64_t* state_indices,
+                                               const int64_t* accepted,
+                                               int64_t num_state_slots,
+                                               int64_t dim,
+                                               int64_t seq_len,
+                                               int64_t state_slot_stride,
+                                               int64_t state_channel_stride,
+                                               int64_t state_history_stride,
+                                               Scalar* output) {
+  const int64_t row = blockIdx.y;
+  const int64_t channel =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (channel >= dim) {
+    return;
+  }
+  const int64_t slot = state_indices[row];
+  const int64_t input_offset = (row * dim + channel) * seq_len;
+  if (slot < 0) {
+    for (int64_t token = 0; token < seq_len; ++token) {
+      output[input_offset + token] = static_cast<Scalar>(0);
+    }
+    return;
+  }
+  if (slot >= num_state_slots || accepted[row] < 1 || accepted[row] > seq_len) {
+    __trap();
+    return;
+  }
+  const int64_t state_offset =
+      slot * state_slot_stride + channel * state_channel_stride;
+  const int64_t start = accepted[row] - 1;
+  float history[3];
+  for (int32_t index = 0; index < 3; ++index) {
+    history[index] = static_cast<float>(
+        state[state_offset + (start + index) * state_history_stride]);
+  }
+  const float prefix0 = history[1];
+  const float prefix1 = history[2];
+  for (int64_t token = 0; token < seq_len; ++token) {
+    const float x = static_cast<float>(input[input_offset + token]);
+    float value = x * static_cast<float>(weight[channel * 4 + 3]);
+    for (int32_t index = 0; index < 3; ++index) {
+      value += history[index] * static_cast<float>(weight[channel * 4 + index]);
+    }
+    output[input_offset + token] =
+        static_cast<Scalar>(value / (1.0f + expf(-value)));
+    history[0] = history[1];
+    history[1] = history[2];
+    history[2] = x;
+  }
+  state[state_offset] = static_cast<Scalar>(prefix0);
+  state[state_offset + state_history_stride] = static_cast<Scalar>(prefix1);
+  for (int64_t token = 0; token < seq_len; ++token) {
+    state[state_offset + (2 + token) * state_history_stride] =
+        input[input_offset + token];
+  }
+}
+
+}  // namespace
+
+bool gdn_spec_verify_supported(int64_t query_heads,
+                               int64_t value_heads,
+                               int64_t seq_len,
+                               torch::ScalarType dtype) {
+  return dtype == torch::kBFloat16 && seq_len >= 2 && query_heads > 0 &&
+         value_heads > 0 && value_heads % query_heads == 0;
+}
+
+torch::Tensor causal_conv1d_spec_verify(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    torch::Tensor& state,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& num_accepted_tokens) {
+  CHECK_EQ(input.dim(), 3);
+  CHECK_EQ(state.dim(), 3);
+  CHECK(input.scalar_type() == torch::kBFloat16 ||
+        input.scalar_type() == torch::kFloat16);
+  CHECK_EQ(weight.numel(), input.size(1) * 4);
+  CHECK_EQ(state.size(1), input.size(1));
+  CHECK_EQ(state.size(2), input.size(2) + 2);
+  CHECK_EQ(state.scalar_type(), input.scalar_type());
+  CHECK_EQ(weight.scalar_type(), input.scalar_type());
+  for (const torch::Tensor& tensor :
+       {weight, state, state_indices, num_accepted_tokens}) {
+    CHECK(tensor.device() == input.device());
+  }
+  CHECK(state.is_non_overlapping_and_dense());
+  const auto guard = at::cuda::OptionalCUDAGuard(input.device());
+  const torch::Tensor x = input.contiguous();
+  const torch::Tensor w = weight.contiguous();
+  const torch::Tensor indices = state_indices.to(torch::kLong).contiguous();
+  const torch::Tensor accepted =
+      num_accepted_tokens.to(torch::kLong).contiguous();
+  CHECK_EQ(indices.numel(), input.size(0));
+  CHECK_EQ(accepted.numel(), input.size(0));
+  torch::Tensor output = torch::empty_like(x);
+  if (input.size(0) == 0) {
+    return output;
+  }
+  constexpr int32_t kThreads = 256;
+  const dim3 grid(
+      static_cast<uint32_t>((input.size(1) + kThreads - 1) / kThreads),
+      static_cast<uint32_t>(input.size(0)));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  DISPATCH_HALF_TYPES(x.scalar_type(), "causal_conv1d_spec_verify", [&] {
+    causal_conv_spec_verify_kernel<scalar_t>
+        <<<grid, kThreads, 0, stream>>>(x.data_ptr<scalar_t>(),
+                                        w.data_ptr<scalar_t>(),
+                                        state.data_ptr<scalar_t>(),
+                                        indices.data_ptr<int64_t>(),
+                                        accepted.data_ptr<int64_t>(),
+                                        state.size(0),
+                                        input.size(1),
+                                        input.size(2),
+                                        state.stride(0),
+                                        state.stride(1),
+                                        state.stride(2),
+                                        output.data_ptr<scalar_t>());
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
+
+torch::Tensor gated_delta_rule_spec_verify(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    torch::Tensor& state,
+    const torch::Tensor& checkpoint_indices,
+    const torch::Tensor& num_accepted_tokens,
+    const torch::Tensor& a_log,
+    const torch::Tensor& a,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& b,
+    double scale,
+    bool state_layout_vk) {
+  CHECK_EQ(query.dim(), 4);
+  CHECK_EQ(value.dim(), 4);
+  CHECK_EQ(state.dim(), 4);
+  CHECK_EQ(a.dim(), 3);
+  CHECK_EQ(a.sizes(), b.sizes());
+  CHECK_EQ(a.size(0), query.size(0));
+  CHECK_EQ(a.size(1), query.size(1));
+  CHECK_EQ(a.size(2), value.size(2));
+  CHECK_EQ(a_log.numel(), value.size(2));
+  CHECK_EQ(dt_bias.numel(), value.size(2));
+  for (const torch::Tensor& tensor : {key, value, a, b}) {
+    CHECK(tensor.device() == query.device());
+    CHECK_EQ(tensor.scalar_type(), query.scalar_type());
+  }
+  CHECK(state.device() == query.device());
+  CHECK(checkpoint_indices.device() == query.device());
+  CHECK(num_accepted_tokens.device() == query.device());
+  CHECK(a_log.device() == query.device());
+  CHECK(dt_bias.device() == query.device());
+  CHECK_EQ(query.sizes(), key.sizes());
+  CHECK_EQ(query.size(0), value.size(0));
+  CHECK_EQ(query.size(1), value.size(1));
+  CHECK_EQ(query.size(3), 128);
+  CHECK_EQ(value.size(3), 128);
+  CHECK(gdn_spec_verify_supported(
+      query.size(2), value.size(2), query.size(1), query.scalar_type()));
+  CHECK_EQ(state.scalar_type(), torch::kFloat32);
+  CHECK(state.is_contiguous());
+  CHECK_EQ(state.size(1), value.size(2));
+  CHECK_EQ(state.size(2), 128);
+  CHECK_EQ(state.size(3), 128);
+  CHECK_EQ(checkpoint_indices.dim(), 2);
+  CHECK_EQ(checkpoint_indices.size(0), query.size(0));
+  CHECK_EQ(checkpoint_indices.size(1), query.size(1));
+  CHECK_EQ(num_accepted_tokens.dim(), 1);
+  CHECK_EQ(num_accepted_tokens.numel(), query.size(0));
+  CHECK(std::isfinite(scale) && scale > 0.0);
+  CHECK_LE(query.size(0), std::numeric_limits<int32_t>::max());
+  CHECK_LE(value.size(2), std::numeric_limits<int32_t>::max());
+  const torch::Tensor a_log_f32 = a_log.to(torch::kFloat32).contiguous();
+  const torch::Tensor bias_f32 = dt_bias.to(torch::kFloat32).contiguous();
+  const torch::Tensor gate_a = a.contiguous();
+  const torch::Tensor gate_b = b.contiguous();
+  const torch::Tensor indices =
+      checkpoint_indices.to(torch::kLong).contiguous();
+  const torch::Tensor accepted =
+      num_accepted_tokens.to(torch::kLong).contiguous();
+  torch::Tensor output = torch::empty(value.sizes(), value.options());
+  if (query.size(0) == 0) {
+    return output;
+  }
+  const at::cuda::OptionalCUDAGuard guard(query.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<uint32_t>(query.size(0)),
+                  static_cast<uint32_t>(value.size(2)),
+                  kFusedGdnH128BlocksPerState);
+  const int32_t shared_bytes =
+      state_layout_vk ? 0 : kFusedGdnH128RowsPerBlock * 128 * sizeof(float);
+  fused_gdn_h128_tiled_kernel<torch::BFloat16>
+      <<<grid, kFusedGdnH128Threads, shared_bytes, stream>>>(
+          query.data_ptr<torch::BFloat16>(),
+          key.data_ptr<torch::BFloat16>(),
+          value.data_ptr<torch::BFloat16>(),
+          gdn_tensor_strides(query),
+          gdn_tensor_strides(key),
+          gdn_tensor_strides(value),
+          state.data_ptr<float>(),
+          a_log_f32.data_ptr<float>(),
+          gate_a.data_ptr<torch::BFloat16>(),
+          bias_f32.data_ptr<float>(),
+          gate_b.data_ptr<torch::BFloat16>(),
+          /*state_indices=*/nullptr,
+          indices.data_ptr<int64_t>(),
+          accepted.data_ptr<int64_t>(),
+          output.data_ptr<torch::BFloat16>(),
+          state.size(0),
+          state_layout_vk ? state.stride(2) : state.stride(3),
+          state_layout_vk ? state.stride(3) : state.stride(2),
+          query.size(2),
+          value.size(2),
+          query.size(1),
+          static_cast<float>(scale),
+          /*softplus_beta=*/1.0f,
+          /*softplus_threshold=*/20.0f);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
 

@@ -37,6 +37,33 @@ struct FusedSigmoidGatingDeltaRuleUpdateParams;
 
 namespace musa {
 
+bool gdn_spec_verify_supported(int64_t query_heads,
+                               int64_t value_heads,
+                               int64_t seq_len,
+                               torch::ScalarType dtype);
+
+// Reads the accepted checkpoint and writes every step back to the state pool.
+torch::Tensor gated_delta_rule_spec_verify(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    torch::Tensor& state,
+    const torch::Tensor& checkpoint_indices,
+    const torch::Tensor& num_accepted_tokens,
+    const torch::Tensor& a_log,
+    const torch::Tensor& a,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& b,
+    double scale,
+    bool state_layout_vk);
+
+torch::Tensor causal_conv1d_spec_verify(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    torch::Tensor& state,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& num_accepted_tokens);
+
 // MUSA-owned GDN params. Kept out of core/kernels/param.h so common backend
 // headers stay unchanged; MUSA layers call these via kernel::musa::.
 struct MateGatedDeltaRulePrefillParams {

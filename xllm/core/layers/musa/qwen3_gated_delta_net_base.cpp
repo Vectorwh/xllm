@@ -592,6 +592,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   torch::Tensor linear_state_base_indices =
       build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
   const bool use_spec_verify = input_params.is_spec_verify;
+  const bool use_fused_spec_verify =
+      use_spec_verify && conv_kernel_size_ == 4 && head_k_dim_ == 128 &&
+      head_v_dim_ == 128 &&
+      kernel::musa::gdn_spec_verify_supported(
+          local_nk, local_nv, seq_len, mixed_qkv.scalar_type());
   const bool is_any_prefill =
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
   // Exclude chunked-prefill: seq_len==1 chunked batches must not take the fused
@@ -636,14 +641,29 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   } else if (use_spec_verify) {
     CHECK(input_params.num_accepted_tokens.defined())
         << "num_accepted_tokens must be populated for Qwen3.5 spec verify";
+    CHECK_EQ(input_params.num_accepted_tokens_host.size(),
+             static_cast<size_t>(batch_size));
+    for (int64_t count : input_params.num_accepted_tokens_host) {
+      CHECK_GE(count, 1);
+      CHECK_LE(count, seq_len);
+    }
     torch::Tensor pre_conv_mixed_qkv = mixed_qkv.transpose(1, 2);
-    mixed_qkv = run_spec_verify_conv(pre_conv_mixed_qkv,
-                                     conv_cache,
-                                     logical_state_indices,
-                                     input_params.num_accepted_tokens_host,
-                                     attn_metadata.q_cu_seq_lens,
-                                     conv_weight,
-                                     conv_kernel_size_);
+    if (use_fused_spec_verify) {
+      mixed_qkv = kernel::musa::causal_conv1d_spec_verify(
+          pre_conv_mixed_qkv,
+          conv_weight,
+          conv_cache,
+          logical_state_indices,
+          input_params.num_accepted_tokens);
+    } else {
+      mixed_qkv = run_spec_verify_conv(pre_conv_mixed_qkv,
+                                       conv_cache,
+                                       logical_state_indices,
+                                       input_params.num_accepted_tokens_host,
+                                       attn_metadata.q_cu_seq_lens,
+                                       conv_weight,
+                                       conv_kernel_size_);
+    }
   } else {
     // Decode uses the in-place causal convolution update on the cache layout.
     xllm::kernel::CausalConv1dUpdateParams conv1d_params;
@@ -691,8 +711,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   const bool fla_ssm_state_layout = use_fla_ssm_state_layout();
   torch::Tensor g;
   torch::Tensor beta;
-  // Compute gated delta net decay and beta terms.
-  if (use_spec_verify || checkpoint_stride > 1) {
+  // Checkpoint storage must not change ordinary prefill gating precision.
+  if ((use_spec_verify || (!is_any_prefill && checkpoint_stride > 1)) &&
+      !use_fused_spec_verify) {
     beta = torch::sigmoid(b);
     torch::Tensor A_log_exp = A_log_.exp();
     torch::Tensor a_float = a.to(torch::kFloat32);
@@ -702,7 +723,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         torch::nn::functional::SoftplusFuncOptions().beta(1.0).threshold(20.0));
     g = -A_log_exp * softplus_out;
     g = g.to(a.dtype()).contiguous();
-  } else if (is_any_prefill) {
+  } else if (is_any_prefill && !use_fused_spec_verify) {
     xllm::kernel::FusedGdnGatingParams gdn_params;
     gdn_params.A_log = A_log_;
     gdn_params.a = a.contiguous().view({-1, a.size(-1)});
@@ -713,7 +734,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     std::tie(g, beta) = xllm::kernel::fused_gdn_gating(gdn_params);
     g = g.squeeze(0).contiguous().view({batch_size, seq_len, a.size(-1)});
     beta = beta.squeeze(0).contiguous().view({batch_size, seq_len, b.size(-1)});
-  } else if (!use_flat_mixed_qkv_decode) {
+  } else if (!use_flat_mixed_qkv_decode && !use_fused_spec_verify) {
     xllm::kernel::FusedGdnGatingParams gdn_params;
     gdn_params.A_log = A_log_;
     gdn_params.a = a.view({-1, a.size(-1)});
@@ -817,19 +838,35 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     torch::Tensor checkpoint_indices =
         spec_linear_state_base_indices.unsqueeze(1) + step_offsets;
     double scale = 1.0 / std::sqrt(static_cast<float>(processed_q.size(-1)));
-    core_attn_out =
-        run_spec_verify_gated_delta_rule(processed_q,
-                                         processed_k,
-                                         processed_v,
-                                         g,
-                                         beta,
-                                         ssm_cache,
-                                         checkpoint_indices,
-                                         input_params.num_accepted_tokens_host,
-                                         attn_metadata.q_cu_seq_lens,
-                                         attn_metadata.q_seq_lens_vec,
-                                         fla_ssm_state_layout,
-                                         scale);
+    if (use_fused_spec_verify) {
+      core_attn_out = kernel::musa::gated_delta_rule_spec_verify(
+          processed_q,
+          processed_k,
+          processed_v,
+          ssm_cache,
+          checkpoint_indices,
+          input_params.num_accepted_tokens,
+          A_log_,
+          a,
+          dt_bias_,
+          b,
+          scale,
+          fla_ssm_state_layout);
+    } else {
+      core_attn_out = run_spec_verify_gated_delta_rule(
+          processed_q,
+          processed_k,
+          processed_v,
+          g,
+          beta,
+          ssm_cache,
+          checkpoint_indices,
+          input_params.num_accepted_tokens_host,
+          attn_metadata.q_cu_seq_lens,
+          attn_metadata.q_seq_lens_vec,
+          fla_ssm_state_layout,
+          scale);
+    }
   } else if (is_any_prefill) {
     CHECK_GE(attn_metadata.q_seq_lens_vec.size(),
              static_cast<size_t>(batch_size))

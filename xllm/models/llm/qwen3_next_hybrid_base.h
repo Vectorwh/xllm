@@ -298,11 +298,12 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
     if (input_params.graph.attn_mask.defined()) {
       return input_params.graph.attn_mask;
     }
-    // NPU and MLU hybrid attention do not consume attn_metadata.attn_mask:
+    // NPU, MLU and MUSA hybrid attention do not consume dense attn_mask:
     // their full-attention kernels handle causality internally, and linear
     // attention needs no mask. Avoid quadratic allocations for long contexts,
     // including MTP decode graph capture. Preserve an explicit graph buffer.
-    if constexpr (Platform::is_npu() || Platform::is_mlu()) {
+    if constexpr (Platform::is_npu() || Platform::is_mlu() ||
+                  Platform::is_musa()) {
       return torch::Tensor();
     }
     max_seq_len_ = std::max(input_params.meta.kv_max_seq_len, max_seq_len_);

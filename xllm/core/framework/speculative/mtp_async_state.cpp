@@ -118,7 +118,7 @@ torch::Tensor make_speculative_verify_control_block_table(
 
 CombinedDraftExecutionPath classify_combined_draft_execution_path(
     std::string_view model_type) {
-  if (model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp") {
+  if (is_qwen3_5_mtp_model_type(model_type)) {
     return CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION;
   }
   if (model_type == "glm_moe_dsa_mtp") {

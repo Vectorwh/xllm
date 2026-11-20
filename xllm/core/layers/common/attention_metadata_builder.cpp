@@ -303,6 +303,22 @@ AttentionMetadata build_attention_metadata(
   AttentionMetadata attn_metadata;
 #if defined(USE_MUSA)
   if (params.attn_metadata != nullptr) {
+    // The executor refreshes metadata before capture/replay. Only reuse it
+    // for the same batch phase and query geometry, preserving persistent views.
+    if (params.attn_metadata->enable_cuda_graph) {
+      CHECK_EQ(params.attn_metadata->is_prefill,
+               params.meta.batch_forward_type.is_prefill());
+      CHECK_EQ(params.attn_metadata->is_chunked_prefill,
+               params.meta.batch_forward_type.is_mixed() ||
+                   params.meta.batch_forward_type.is_chunked_prefill());
+      CHECK_EQ(params.attn_metadata->is_spec_verify, params.is_spec_verify);
+      CHECK_EQ(params.attn_metadata->max_query_len,
+               params.meta.q_max_seq_len == 0 ? 1 : params.meta.q_max_seq_len);
+      CHECK_GE(params.attn_metadata->max_seq_len,
+               std::max<int64_t>(params.meta.kv_max_seq_len,
+                                 params.graph.kv_seq_len_capacity));
+      return *params.attn_metadata;
+    }
     attn_metadata.fa3_metadata = params.attn_metadata->fa3_metadata;
   }
 #endif

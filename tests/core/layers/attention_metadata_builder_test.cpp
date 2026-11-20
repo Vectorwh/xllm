@@ -396,6 +396,7 @@ TEST(AttentionMetadataBuilderTest, PreservesMaterializedDummyQueryGeometry) {
 TEST(AttentionMetadataBuilderTest, BuildsMusaMetadataWithCommonBuilder) {
   for (const BatchForwardType type : {BatchForwardType::PREFILL,
                                       BatchForwardType::CHUNKED_PREFILL,
+                                      BatchForwardType::MIXED,
                                       BatchForwardType::DECODE}) {
     SCOPED_TRACE(type.value());
     ModelInputParams params;
@@ -427,6 +428,9 @@ TEST(AttentionMetadataBuilderTest, BuildsMusaMetadataWithCommonBuilder) {
     AttentionMetadata metadata =
         AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
 
+    EXPECT_EQ(metadata.is_chunked_prefill,
+              type.is_mixed() || type.is_chunked_prefill());
+
     EXPECT_TRUE(torch::equal(metadata.q_cu_seq_lens,
                              torch::tensor({0, 1, 2}, torch::kInt32)));
     EXPECT_TRUE(torch::equal(metadata.kv_cu_seq_lens,
@@ -455,6 +459,19 @@ TEST(AttentionMetadataBuilderTest, BuildsMusaMetadataWithCommonBuilder) {
     EXPECT_TRUE(torch::equal(
         metadata.fa3_metadata.fa3_scheduler_metadata,
         params.attn_metadata->fa3_metadata.fa3_scheduler_metadata));
+
+    const auto eager_metadata = params.attn_metadata;
+    params.attn_metadata = std::make_shared<AttentionMetadata>(metadata);
+    params.attn_metadata->enable_cuda_graph = true;
+    const AttentionMetadata graph_metadata =
+        AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
+    EXPECT_EQ(graph_metadata.q_cu_seq_lens.data_ptr(),
+              metadata.q_cu_seq_lens.data_ptr());
+    EXPECT_EQ(graph_metadata.kv_seq_lens.data_ptr(),
+              metadata.kv_seq_lens.data_ptr());
+    EXPECT_EQ(graph_metadata.block_table.data_ptr(),
+              metadata.block_table.data_ptr());
+    params.attn_metadata = eager_metadata;
 
     params.meta.num_sequences = 0;
     params.execution_batch.num_tokens = 2;

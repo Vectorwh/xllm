@@ -860,6 +860,10 @@ inline bool is_qwen3_5_target_model_type(std::string_view model_type) {
          model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text";
 }
 
+inline bool is_qwen3_5_mtp_model_type(std::string_view model_type) {
+  return model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
+}
+
 inline bool is_glm5_next_target_model_type(std::string_view model_type) {
   return model_type == "glm5_3_flash" || model_type == "glm5_next";
 }

@@ -37,9 +37,11 @@ using c10::musa::MUSAStream;
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -90,12 +92,15 @@ class MusaGraphPersistentParam final {
     }
     return persistent_tokens_;
   }
-  torch::Tensor persistent_positions(uint32_t actual_tokens) const {
+  torch::Tensor persistent_positions(uint32_t actual_tokens,
+                                     bool use_mrope = false) const {
+    const torch::Tensor& positions =
+        use_mrope ? persistent_mrope_positions_ : persistent_positions_;
     if (actual_tokens > 0) {
-      return persistent_positions_.slice(
-          /*dim=*/0, /*start=*/0, /*end=*/actual_tokens);
+      return positions.slice(
+          /*dim=*/use_mrope ? 1 : 0, /*start=*/0, /*end=*/actual_tokens);
     }
-    return persistent_positions_;
+    return positions;
   }
   torch::Tensor persistent_new_cache_slots(uint32_t actual_tokens) const {
     if (actual_tokens > 0) {
@@ -243,6 +248,7 @@ class MusaGraphPersistentParam final {
   // Persistent tensors - basic parameters
   torch::Tensor persistent_tokens_;
   torch::Tensor persistent_positions_;
+  torch::Tensor persistent_mrope_positions_;
   torch::Tensor persistent_new_cache_slots_;
   torch::Tensor persistent_block_tables_;
   torch::Tensor hidden_states_;
@@ -271,7 +277,11 @@ class MusaGraph final {
                      c10::musa::MUSAStream capture_stream)
       : persistent_param_(persistent_param),
         device_index_(device_index),
-        capture_stream_(capture_stream) {}
+        capture_stream_(capture_stream) {
+    replay_streams_.reserve(1);
+  }
+
+  ~MusaGraph();
 
   // Capture computation graph for given bucket num_tokens
   bool capture(CausalLM* model,
@@ -308,7 +318,11 @@ class MusaGraph final {
   // Native MUSA capture stream owned by MusaGraphExecutorImpl.
   c10::musa::MUSAStream capture_stream_;
 
+  // Keep every replay stream: the worker may switch streams between calls.
+  std::vector<c10::musa::MUSAStream> replay_streams_;
+
   uint32_t padded_num_tokens_ = 0;
+  torch::Tensor captured_positions_;
 
   // FA3 scheduler metadata consumed by the captured full-attention kernels.
   // Its address is fixed at capture time; replay copies freshly generated
@@ -360,6 +374,12 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
 
   // Lazy-loaded MUSA graphs for decode phase (by bucket_num_tokens).
   absl::flat_hash_map<uint32_t, std::unique_ptr<MusaGraph>> graphs_;
+  // Ragged verification retains exact shapes in a bounded LRU cache.
+  using SpecVerifyGraphKey =
+      std::tuple<uint32_t, int32_t, int64_t, int64_t, bool>;
+  absl::flat_hash_map<SpecVerifyGraphKey, std::unique_ptr<MusaGraph>>
+      spec_verify_graphs_;
+  std::deque<SpecVerifyGraphKey> spec_verify_graph_keys_;
 
   // Persistent parameters shared across all MusaGraph instances
   std::unique_ptr<MusaGraphPersistentParam> persistent_param_;

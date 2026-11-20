@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/kernels/musa/musa_ops_api.h"
 #include "core/layers/musa/flashinfer_attention.h"
 #include "core/layers/musa/qwen3_next_attention.h"
+#include "core/layers/musa/qwen3_next_gated_delta_net.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "torch_musa/csrc/aten/musa/MUSAGraph.h"
@@ -33,6 +34,70 @@ limitations under the License.
 
 namespace xllm::layer {
 namespace {
+
+TEST(MusaPrefillTest, GdnCheckpointStridePreservesPrefillOutputAndState) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "No MUSA device available";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  torch::NoGradGuard no_grad;
+  torch::manual_seed(831);
+  ProcessGroup group(/*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+  ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &group);
+  parallel.tp_group_ = &group;
+  ModelArgs args;
+  args.hidden_size(256);
+  args.linear_num_key_heads(2);
+  args.linear_num_value_heads(4);
+  args.linear_key_head_dim(128);
+  args.linear_value_head_dim(128);
+  args.linear_conv_kernel_dim(4);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
+  Qwen3_5GatedDeltaNet layer(args, QuantArgs(), parallel, options);
+  for (auto& parameter : layer->named_parameters()) {
+    parameter.value().copy_(torch::randn(parameter.value().sizes()) * 0.05);
+  }
+  layer->named_parameters()["norm.weight"].fill_(1.0);
+  const torch::Tensor hidden = torch::randn({7, 256}).to(options);
+  AttentionMetadata metadata{};
+  metadata.max_query_len = 4;
+  metadata.q_seq_lens_vec = {3, 4};
+  metadata.q_cu_seq_lens =
+      torch::tensor({0, 3, 7}, options.dtype(torch::kInt32));
+  metadata.has_initial_states = torch::zeros({2}, options.dtype(torch::kBool));
+  ModelInputParams params;
+  params.embedding.linear_state_ids = {0, 1};
+  params.linear_state_validity_mask = {0, 0};
+  // The MTP layout has four SSM checkpoints and six conv-history tokens per
+  // slot, but ordinary prefill must retain the non-MTP numerical contract.
+  for (const bool chunked : {false, true}) {
+    SCOPED_TRACE(chunked);
+    metadata.is_prefill = !chunked;
+    metadata.is_chunked_prefill = chunked;
+    KVCache baseline(LinearAttentionKVCacheTensors{
+        torch::zeros({2, 1024, 3}, options),
+        torch::zeros({2, 4, 128, 128}, options.dtype(torch::kFloat32))});
+    KVCache checkpointed(LinearAttentionKVCacheTensors{
+        torch::zeros({2, 1024, 6}, options),
+        torch::zeros({8, 4, 128, 128}, options.dtype(torch::kFloat32))});
+    const torch::Tensor expected =
+        layer->forward(hidden, metadata, baseline, params).cpu();
+    const torch::Tensor expected_state = baseline.get_ssm_cache().cpu();
+    const torch::Tensor actual =
+        layer->forward(hidden, metadata, checkpointed, params).cpu();
+    const torch::Tensor actual_state =
+        checkpointed.get_ssm_cache()
+            .index_select(0,
+                          torch::tensor({0, 4}, options.dtype(torch::kInt64)))
+            .cpu();
+    ASSERT_GT(expected_state.abs().max().item<float>(), 0.0f);
+    EXPECT_TRUE(torch::equal(actual, expected));
+    EXPECT_TRUE(torch::equal(actual_state, expected_state));
+  }
+}
 
 TEST(MusaPrefillTest, FusedQkvScalesFollowTensorParallelWeightPartitions) {
   QuantArgs quant;
