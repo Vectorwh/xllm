@@ -100,6 +100,22 @@ TEST(RequestParamsTest, IncludeStopStringInOutputUsesVllmJsonName) {
   EXPECT_TRUE(params.include_stop_str_in_output);
 }
 
+TEST(RequestParamsTest, MultimodalChatPreservesServicePdRouting) {
+  proto::MMChatRequest request;
+  const auto status = google::protobuf::util::JsonStringToMessage(
+      R"({"routing":{"prefill_name":"XLLM:PREFILL:127.0.0.1:18100","decode_name":"XLLM:DECODE:127.0.0.1:18110"},
+          "service_request_id":"service-request",
+          "source_xservice_addr":"127.0.0.1:18001"})",
+      &request);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  const RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.decode_address, "XLLM:DECODE:127.0.0.1:18110");
+  EXPECT_EQ(params.service_request_id, "service-request");
+  EXPECT_EQ(params.source_xservice_addr, "127.0.0.1:18001");
+}
+
 TEST(RequestParamsTest, ParsesJsonObjectResponseFormat) {
   const ServiceConfig default_config;
   EXPECT_TRUE(default_config.enable_json_object_output());
