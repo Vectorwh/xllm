@@ -915,8 +915,8 @@ void init_standard_counts(const ModelArgs& model_args,
     const int64_t device_block_bytes =
         prefill_layerwise_device_block_size_in_bytes(
             model_args, *kv_cache_cap, buffers);
-    // Host allocations are page-aligned per role/layer. Reserve one rounding
-    // unit for K, V, INDEX and INDEX_SCALE each.
+    // Every layer, including resident layer 0, keeps a complete Host mirror.
+    // Reserve one rounding unit for K, V, INDEX and INDEX_SCALE per layer.
     const int64_t alignment_headroom_per_layer = 4 * host_page_size();
     const int64_t host_budget = options.prefill_layerwise_host_memory_bytes -
                                 layers * alignment_headroom_per_layer;
@@ -1198,12 +1198,14 @@ int64_t prefill_layerwise_device_block_size_in_bytes(
   CHECK_GT(layers, 0) << "n_layers=" << layers;
   const std::vector<bool> index_mask =
       resolve_indexer_cache_enabled_layers(model_args, layers);
-  const std::vector<char> index_slots = index_slots_for_round_robin_buffers(
+  const std::vector<char> index_slots = prefill_layerwise_index_slots(
       layers, num_buffers, kv_cache_cap.index_slot_size() > 0, index_mask);
   const int64_t physical_index_buffers =
       std::count(index_slots.begin(), index_slots.end(), 1);
+  // index_block_size() already includes quantized indexer scale bytes;
+  // scale_slot_size() describes main-KV quantization, excluded by eligibility.
   const int64_t device_block_bytes =
-      static_cast<int64_t>(num_buffers) * kv_cache_cap.block_size() *
+      static_cast<int64_t>(index_slots.size()) * kv_cache_cap.block_size() *
           kv_cache_cap.slot_size() +
       physical_index_buffers * kv_cache_cap.index_block_size();
   CHECK_GT(device_block_bytes, 0)

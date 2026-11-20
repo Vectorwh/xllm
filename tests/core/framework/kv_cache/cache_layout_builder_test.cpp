@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -87,6 +88,9 @@ TEST(CacheLayoutBuilderTest,
     for (int32_t layer = 0; layer < 2; ++layer) {
       owners[rank]->host_caches()[layer].get_k_cache().fill_(rank * 10 + layer);
     }
+    // A different Host value proves that preparation and prefix reuse do
+    // not reload resident layer 0 from its mirror.
+    caches[rank][0].get_k_cache().fill_(rank * 10 + 100);
     groups[rank] = std::make_unique<PreparationProcessGroup>(
         rank, kWorldSize, /*peer_prepared=*/rank == 0);
   }
@@ -105,13 +109,12 @@ TEST(CacheLayoutBuilderTest,
                                      groups[rank].get()));
     EXPECT_EQ(groups[rank]->allgather_count(), 1);
     for (int32_t layer = 0; layer < 2; ++layer) {
-      EXPECT_TRUE(owners[rank]
-                      ->host_caches()[layer]
-                      .get_k_cache()
-                      .eq(rank * 10 + layer)
-                      .all()
-                      .item<bool>());
+      const torch::Tensor& history =
+          owners[rank]->host_caches()[layer].get_k_cache();
+      EXPECT_TRUE(history.eq(rank * 10 + layer).all().item<bool>());
     }
+    EXPECT_TRUE(
+        caches[rank][0].get_k_cache().eq(rank * 10 + 100).all().item<bool>());
     groups[rank]->peer_prepared(true);
     ASSERT_TRUE(owners[rank]->begin(params,
                                     /*block_size=*/2,
@@ -123,20 +126,33 @@ TEST(CacheLayoutBuilderTest,
       ASSERT_TRUE(owners[rank]->synchronize_layer(layer));
       EXPECT_TRUE(caches[rank][layer]
                       .get_k_cache()[1]
-                      .eq(rank * 10 + layer)
+                      .eq(layer == 0 ? rank * 10 + 100 : rank * 10 + layer)
                       .all()
                       .item<bool>());
     }
     ASSERT_TRUE(owners[rank]->finish());
+    EXPECT_TRUE(owners[rank]
+                    ->host_caches()[0]
+                    .get_k_cache()[1]
+                    .eq(rank * 10 + 100)
+                    .all()
+                    .item<bool>());
+    EXPECT_TRUE(owners[rank]
+                    ->host_caches()[0]
+                    .get_k_cache()[0]
+                    .eq(rank * 10)
+                    .all()
+                    .item<bool>());
   }
 }
 
 TEST(CacheLayoutBuilderTest,
      PrefillLayerwiseBuffersPreservePrefixAndChunkHistory) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
-  // Exercise the production cache owner on CPU. B=1, B=2 and B=N cover a
-  // serial reusable slot, pipelined slots and the independent-buffer control.
+  // B=1, B=2 and B=N cover one shared slot, pipelined shared slots and the
+  // independent-buffer control. Layer 0 stays resident in every layout.
   for (int32_t buffers : {1, 2, 5}) {
+    const int32_t shared_buffers = std::min(buffers, 4);
     proto::KVCacheShape proto_shape;
     for (int64_t dim : {6, 4, 1, 8}) {
       proto_shape.add_key_cache_shape(dim);
@@ -162,14 +178,25 @@ TEST(CacheLayoutBuilderTest,
                                     /*host_memory_bytes=*/1024 * 1024,
                                     caches);
     ASSERT_EQ(caches.size(), 5);
-    EXPECT_EQ(offload.device_bytes() * 5, offload.host_bytes() * buffers);
-    if (buffers < 5) {
-      EXPECT_EQ(caches[0].get_k_cache().data_ptr(),
-                caches[buffers].get_k_cache().data_ptr());
-      EXPECT_EQ(caches[0].get_index_cache().data_ptr(),
-                caches[buffers].get_index_cache().data_ptr());
-      EXPECT_NE(offload.host_caches()[0].get_k_cache().data_ptr(),
-                offload.host_caches()[buffers].get_k_cache().data_ptr());
+    EXPECT_EQ(offload.device_bytes() * 5,
+              offload.host_bytes() * (1 + shared_buffers));
+    EXPECT_TRUE(offload.host_caches()[0].get_k_cache().defined());
+    EXPECT_NE(offload.host_caches()[0].get_k_cache().data_ptr(),
+              caches[0].get_k_cache().data_ptr());
+    for (int64_t layer = 1; layer < 5; ++layer) {
+      EXPECT_NE(caches[0].get_k_cache().data_ptr(),
+                caches[layer].get_k_cache().data_ptr());
+      EXPECT_NE(caches[0].get_index_cache().data_ptr(),
+                caches[layer].get_index_cache().data_ptr());
+    }
+    if (shared_buffers < 4) {
+      EXPECT_EQ(caches[1].get_k_cache().data_ptr(),
+                caches[1 + shared_buffers].get_k_cache().data_ptr());
+      EXPECT_EQ(caches[1].get_index_cache().data_ptr(),
+                caches[1 + shared_buffers].get_index_cache().data_ptr());
+      EXPECT_NE(
+          offload.host_caches()[1].get_k_cache().data_ptr(),
+          offload.host_caches()[1 + shared_buffers].get_k_cache().data_ptr());
     }
     const std::vector<int64_t> blocks{1, 3};
     ModelInputParams params;
@@ -195,9 +222,9 @@ TEST(CacheLayoutBuilderTest,
       }
     }
     ASSERT_TRUE(offload.finish());
-    // A prefix hit needs every layer reloaded even though the scheduler still
-    // calls these Device-tier blocks. The second chunk writes only block 3;
-    // the old boundary-page entries and full block 1 must survive.
+    // A prefix hit reads layer 0 directly from its resident Device cache and
+    // reloads later layers using the same scheduler block ids. The second
+    // chunk writes only block 3; its old rows and full block 1 must survive.
     params.attention.host.kv_seq_lens = {8};
     params.attention.host.q_seq_lens = {2};
     ASSERT_TRUE(
@@ -212,8 +239,8 @@ TEST(CacheLayoutBuilderTest,
     }
     ASSERT_TRUE(offload.finish());
     for (int64_t layer = 0; layer < 5; ++layer) {
-      for (const KVCacheTensor& tensor :
-           offload.host_caches()[layer].get_cache_tensors()) {
+      const KVCache& history = offload.host_caches()[layer];
+      for (const KVCacheTensor& tensor : history.get_cache_tensors()) {
         EXPECT_TRUE(tensor.tensor[1].eq(layer + 1).all().item<bool>());
         EXPECT_TRUE(
             tensor.tensor[3].slice(0, 0, 2).eq(layer + 11).all().item<bool>());
@@ -251,22 +278,29 @@ TEST(CacheLayoutBuilderTest,
                               {},
                               /*compute_stream=*/nullptr,
                               /*expect_push=*/true));
-    for (int64_t layer = 0; layer < buffers; ++layer) {
+    for (int64_t layer = 0; layer <= shared_buffers; ++layer) {
       ASSERT_TRUE(offload.synchronize_layer(layer));
     }
-    if (buffers < 5) {
+    if (shared_buffers < 4) {
       auto next_layer = std::async(std::launch::async, [&]() {
-        return offload.synchronize_layer(buffers);
+        return offload.synchronize_layer(1 + shared_buffers);
       });
       EXPECT_EQ(next_layer.wait_for(std::chrono::milliseconds(100)),
                 std::future_status::timeout);
       EXPECT_TRUE(caches[0].get_k_cache()[1].eq(1).all().item<bool>());
+      // Completion of the resident layer cannot release a shared slot.
       offload.notify_push_completion(0, true);
+      EXPECT_EQ(next_layer.wait_for(std::chrono::milliseconds(100)),
+                std::future_status::timeout);
+      offload.notify_push_completion(1, true);
       ASSERT_TRUE(next_layer.get());
-      EXPECT_TRUE(
-          caches[buffers].get_k_cache()[1].eq(buffers + 1).all().item<bool>());
-      for (int64_t layer = buffers + 1; layer < 5; ++layer) {
-        offload.notify_push_completion(layer - buffers, true);
+      EXPECT_TRUE(caches[1 + shared_buffers]
+                      .get_k_cache()[1]
+                      .eq(shared_buffers + 2)
+                      .all()
+                      .item<bool>());
+      for (int64_t layer = shared_buffers + 2; layer < 5; ++layer) {
+        offload.notify_push_completion(layer - shared_buffers, true);
         ASSERT_TRUE(offload.synchronize_layer(layer));
       }
     }
@@ -283,12 +317,12 @@ TEST(CacheLayoutBuilderTest,
                               {},
                               /*compute_stream=*/nullptr,
                               /*expect_push=*/true));
-    for (int64_t layer = 0; layer < buffers; ++layer) {
+    for (int64_t layer = 0; layer <= shared_buffers; ++layer) {
       ASSERT_TRUE(offload.synchronize_layer(layer));
     }
     auto failed_push = std::async(std::launch::async, [&]() {
-      return buffers < 5 ? offload.synchronize_layer(buffers)
-                         : offload.finish();
+      return shared_buffers < 4 ? offload.synchronize_layer(1 + shared_buffers)
+                                : offload.finish();
     });
     EXPECT_EQ(failed_push.wait_for(std::chrono::milliseconds(100)),
               std::future_status::timeout);

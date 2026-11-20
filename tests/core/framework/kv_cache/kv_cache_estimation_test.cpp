@@ -104,14 +104,26 @@ TEST(KVCacheEstimationTest,
   KVCacheEstimateOptions options = make_estimate_options();
   options.prefill_layerwise_num_buffers = 2;
   options.prefill_layerwise_host_memory_bytes = 64 * 1024 * 1024;
-  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 256);
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 170);
   options.prefill_layerwise_num_buffers = 1;
-  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 512);
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 256);
   options.prefill_layerwise_host_memory_bytes =
       4 * host_page_size() * args.n_layers() + 512 * 1024;
   const KVCacheCapacity host_limited =
       estimate_kv_cache_capacity(args, options);
   EXPECT_EQ(host_limited.n_blocks(), 64);
+  // At B=N the shared pool is capped at N-1. A one-layer model still needs
+  // its complete Host mirror, whose budget can limit resident block count.
+  options.prefill_layerwise_num_buffers = 4;
+  options.prefill_layerwise_host_memory_bytes = 64 * 1024 * 1024;
+  EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 128);
+  ModelArgs single_layer_args = args;
+  single_layer_args.n_layers(1);
+  options.prefill_layerwise_num_buffers = 1;
+  options.prefill_layerwise_host_memory_bytes =
+      4 * host_page_size() + 128 * 1024;
+  EXPECT_EQ(estimate_kv_cache_capacity(single_layer_args, options).n_blocks(),
+            64);
   options.prefill_layerwise_num_buffers = 0;
   EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 128);
   options.dp_size = 2;
@@ -119,6 +131,9 @@ TEST(KVCacheEstimationTest,
   EXPECT_EQ(estimate_kv_cache_capacity(args, options).n_blocks(), 128);
   options.prefill_layerwise_num_buffers = 1;
   EXPECT_DEATH(estimate_kv_cache_capacity(args, options), "requires DP=1");
+  EXPECT_EQ(prefill_layerwise_buffer_index(/*layer=*/0, /*buffers=*/0), 0);
+  EXPECT_DEATH(prefill_layerwise_buffer_index(/*layer=*/1, /*buffers=*/0),
+               "layer=1, buffers=0");
 }
 
 TEST(KVCacheEstimationTest, PrefillLayerwiseCapacityCountsPhysicalIndexSlots) {
@@ -137,6 +152,35 @@ TEST(KVCacheEstimationTest, PrefillLayerwiseCapacityCountsPhysicalIndexSlots) {
   EXPECT_EQ(without_index.index_slot_size(), 0);
   EXPECT_GT(with_index.index_slot_size(), 0);
   EXPECT_GT(without_index.n_blocks(), with_index.n_blocks());
+  EXPECT_EQ(prefill_layerwise_device_block_size_in_bytes(
+                index_args, with_index, /*num_buffers=*/2),
+            3 * (with_index.block_size() * with_index.slot_size() +
+                 with_index.index_block_size()));
+#if defined(USE_MLU) || defined(USE_NPU)
+  // FSFS maps index data to the resident slot and only the second shared
+  // slot. The first shared slot holds layers 1 and 3, which reuse top-k.
+  index_args.model_type("glm_moe_dsa").index_topk(8).index_topk_pattern("FSFS");
+  const KVCacheCapacity shared_index =
+      estimate_kv_cache_capacity(index_args, options);
+  EXPECT_EQ(prefill_layerwise_device_block_size_in_bytes(
+                index_args, shared_index, /*num_buffers=*/2),
+            3 * shared_index.block_size() * shared_index.slot_size() +
+                2 * shared_index.index_block_size());
+  options.indexer_cache_dtype = "int8";
+  const KVCacheCapacity quantized_index =
+      estimate_kv_cache_capacity(index_args, options);
+  EXPECT_TRUE(quantized_index.enable_indexer_cache_quant());
+  EXPECT_EQ(quantized_index.scale_slot_size(), 0);
+  // Quantized index block bytes already include the per-token scale. The
+  // FSFS layout needs this complete footprint in two physical index slots.
+  EXPECT_EQ(quantized_index.index_block_size(),
+            options.block_size * (index_args.index_head_dim() +
+                                  static_cast<int64_t>(sizeof(float))));
+  EXPECT_EQ(prefill_layerwise_device_block_size_in_bytes(
+                index_args, quantized_index, /*num_buffers=*/2),
+            3 * quantized_index.block_size() * quantized_index.slot_size() +
+                2 * quantized_index.index_block_size());
+#endif
 }
 
 TEST(KVCacheEstimationTest,
@@ -146,9 +190,9 @@ TEST(KVCacheEstimationTest,
   options.prefill_layerwise_num_buffers = 2;
   options.prefill_layerwise_host_memory_bytes = 64 * 1024 * 1024;
   const KVCacheCapacity target = estimate_kv_cache_capacity(args, options);
-  ASSERT_EQ(target.n_blocks(), 256);
+  ASSERT_EQ(target.n_blocks(), 170);
   EXPECT_EQ(prefill_layerwise_device_block_size_in_bytes(args, target, 2),
-            2 * 16 * 128);
+            3 * 16 * 128);
 
   KVCacheCapacity draft;
   draft.n_blocks(1000)
@@ -157,7 +201,7 @@ TEST(KVCacheEstimationTest,
       .slot_size(32)
       .n_layers(1)
       .num_full_attention_layers(1);
-  const int64_t combined_block_bytes = 2 * 16 * 128 + 16 * 32;
+  const int64_t combined_block_bytes = 3 * 16 * 128 + 16 * 32;
   const PrefillLayerwiseSpecPlan replicated_once =
       prefill_layerwise_blocks_with_draft(args,
                                           target,
@@ -168,7 +212,7 @@ TEST(KVCacheEstimationTest,
   EXPECT_EQ(replicated_once.budget_bytes,
             replicated_once.n_blocks * combined_block_bytes);
 
-  const int64_t replicated_twice_block_bytes = 2 * 16 * 128 + 2 * 16 * 32;
+  const int64_t replicated_twice_block_bytes = 3 * 16 * 128 + 2 * 16 * 32;
   const PrefillLayerwiseSpecPlan replicated_twice =
       prefill_layerwise_blocks_with_draft(args,
                                           target,

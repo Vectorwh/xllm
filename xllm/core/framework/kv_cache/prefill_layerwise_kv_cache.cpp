@@ -130,17 +130,19 @@ PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
   const int64_t layers = options.num_layers();
   const std::vector<bool>& index_mask = options.indexer_cache_enabled_layers();
   CHECK(index_mask.empty() || index_mask.size() == static_cast<size_t>(layers));
-  const std::vector<char> slot_has_index = index_slots_for_round_robin_buffers(
+  const std::vector<char> slot_has_index = prefill_layerwise_index_slots(
       layers, num_buffers_, shape.has_index_cache_shape(), index_mask);
+  num_buffers_ =
+      static_cast<int32_t>(std::min<int64_t>(num_buffers_, layers - 1));
   const auto has_index = [&shape, &index_mask](int64_t layer) {
     return shape.has_index_cache_shape() &&
            (index_mask.empty() || index_mask[static_cast<size_t>(layer)]);
   };
 
   std::vector<KVCache> slots;
-  slots.reserve(static_cast<size_t>(num_buffers_));
+  slots.reserve(slot_has_index.size());
   const torch::Device& device = options.device();
-  for (int32_t slot = 0; slot < num_buffers_; ++slot) {
+  for (size_t slot = 0; slot < slot_has_index.size(); ++slot) {
     KVCacheTensors kv;
     kv.key_cache = allocate_device_tensor(
         shape.key_cache_shape(), options.dtype(), device, options);
@@ -174,7 +176,8 @@ PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
   device_caches.reserve(static_cast<size_t>(layers));
   host_caches_.reserve(static_cast<size_t>(layers));
   for (int64_t layer = 0; layer < layers; ++layer) {
-    const KVCache& slot = slots[static_cast<size_t>(layer % num_buffers_)];
+    const KVCache& slot = slots[static_cast<size_t>(
+        prefill_layerwise_buffer_index(layer, num_buffers_))];
     const KVCacheTensors device_kv{slot.get_k_cache(), slot.get_v_cache()};
     const torch::Tensor index =
         has_index(layer) ? slot.get_index_cache() : torch::Tensor{};
@@ -208,7 +211,7 @@ PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
     save_stream_ = platform_device.get_stream_from_pool(kCopyStreamTimeoutMs);
   }
   LOG(INFO) << "Prefill layerwise KV cache: layers=" << layers
-            << ", buffers=" << num_buffers_
+            << ", resident_layer=0, shared_buffers=" << num_buffers_
             << ", device_bytes=" << device_bytes_
             << ", host_bytes=" << host_bytes_ << ", PD PUSH source=Device";
 }
@@ -346,10 +349,12 @@ bool PrefillLayerwiseKVCache::begin(std::vector<int64_t> read_blocks,
   read_blocks_ = std::move(read_blocks);
   write_blocks_ = std::move(write_blocks);
   current_layer_ = -1;
-  next_load_layer_ = num_buffers_;
+  next_load_layer_ = 1 + num_buffers_;
   std::fill(load_ready_.begin(), load_ready_.end(), nullptr);
   std::fill(save_ready_.begin(), save_ready_.end(), nullptr);
-  for (int32_t layer = 0; layer < num_buffers_; ++layer) {
+  // Layer 0 can compute immediately from its resident prefix while these
+  // initial shared-buffer loads run on the independent H2D stream.
+  for (int64_t layer = 1; layer < next_load_layer_; ++layer) {
     if (!load_layer(layer)) {
       // Only private Device scratch has been touched so far. Drain it before
       // returning a request error; no persistent Host data needs repair.
@@ -394,7 +399,7 @@ bool PrefillLayerwiseKVCache::synchronize_layer(int64_t layer_index) {
     }
     ++next_load_layer_;
   }
-  if (batch_memcpy_ != nullptr &&
+  if (batch_memcpy_ != nullptr && layer_index > 0 &&
       !compute_stream_->wait_event(
           load_ready_[static_cast<size_t>(layer_index)])) {
     abort();
@@ -443,11 +448,11 @@ bool PrefillLayerwiseKVCache::copy_layer(int64_t layer_index, bool load) {
 }
 
 bool PrefillLayerwiseKVCache::load_layer(int64_t layer_index) {
-  if (layer_index >= num_buffers_ &&
+  if (layer_index > num_buffers_ &&
       !wait_push_completion(layer_index - num_buffers_)) {
     return false;
   }
-  if (batch_memcpy_ != nullptr && layer_index >= num_buffers_) {
+  if (batch_memcpy_ != nullptr && layer_index > num_buffers_) {
     const StreamEventPtr& saved =
         save_ready_[static_cast<size_t>(layer_index - num_buffers_)];
     if (saved == nullptr || !load_stream_->wait_event(saved)) {

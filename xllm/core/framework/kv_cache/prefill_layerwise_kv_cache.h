@@ -32,10 +32,10 @@ namespace xllm {
 struct ModelInputParams;
 class ProcessGroup;
 
-// A worker owns one instance and runs one prefill at a time. Logical layers
-// retain private Host data; the model sees round-robin Device buffers. PUSH
-// registers Device slots; both local save and network writes must finish
-// before a slot can be reused.
+// A worker owns one instance and runs one prefill at a time. Every logical
+// layer retains private Host data. Layer 0 also retains its KV on Device for
+// prefix reuse; later layers share round-robin Device buffers. PUSH registers
+// Device slots; both local save and network writes must finish before reuse.
 class PrefillLayerwiseKVCache final : public LayerSynchronizer {
  public:
   PrefillLayerwiseKVCache(const KVCacheShape& shape,
@@ -72,6 +72,8 @@ class PrefillLayerwiseKVCache final : public LayerSynchronizer {
   void abort() override;
   uint32_t size() const override;
 
+  // Complete Host mirror, indexed by logical layer; updated blocks are ready
+  // after finish(). Resident layer 0 skips H2D but still saves its writes.
   std::vector<KVCache>& host_caches() { return host_caches_; }
   int64_t device_bytes() const { return device_bytes_; }
   int64_t host_bytes() const { return host_bytes_; }

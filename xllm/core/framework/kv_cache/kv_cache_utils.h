@@ -224,11 +224,16 @@ bool is_linear_attention_layer(
 // Whether NPU KV cache should use FRACTAL_NZ layout for a model type.
 bool use_npu_nz_kv_cache_layout(const std::string& model_type);
 
-// Per-physical-slot index-cache requirement for a round-robin pool shared by
-// `layers` logical layers. A slot owns index tensors when any layer mapped to
-// it does; both the capacity estimate and the worker allocation must derive
-// this union from the same rule.
-inline std::vector<char> index_slots_for_round_robin_buffers(
+// Layer 0 has a dedicated resident buffer. Layers 1 onward share a
+// round-robin pool; keep allocation and capacity estimation on the same map.
+inline int64_t prefill_layerwise_buffer_index(int64_t layer, int32_t buffers) {
+  CHECK(layer == 0 || buffers > 0)
+      << "layer=" << layer << ", buffers=" << buffers;
+  return layer == 0 ? 0 : 1 + (layer - 1) % buffers;
+}
+
+// A physical slot needs index tensors when any layer mapped to it does.
+inline std::vector<char> prefill_layerwise_index_slots(
     int64_t layers,
     int32_t buffers,
     bool has_index_cache,
@@ -238,14 +243,16 @@ inline std::vector<char> index_slots_for_round_robin_buffers(
   CHECK_LE(buffers, layers);
   CHECK(indexer_layer_mask.empty() ||
         indexer_layer_mask.size() == static_cast<size_t>(layers));
-  std::vector<char> slots(static_cast<size_t>(buffers), 0);
+  const int64_t physical_buffers = 1 + std::min<int64_t>(buffers, layers - 1);
+  std::vector<char> slots(static_cast<size_t>(physical_buffers), 0);
   if (!has_index_cache) {
     return slots;
   }
   for (int64_t layer = 0; layer < layers; ++layer) {
     if (indexer_layer_mask.empty() ||
         indexer_layer_mask[static_cast<size_t>(layer)]) {
-      slots[static_cast<size_t>(layer % buffers)] = 1;
+      slots[static_cast<size_t>(
+          prefill_layerwise_buffer_index(layer, buffers))] = 1;
     }
   }
   return slots;

@@ -67,14 +67,18 @@ DEFINE_int64(
     "for Decode with prefix cache, otherwise derives capacity from the "
     "available KV cache budget.");
 
-DEFINE_int32(prefill_layerwise_num_buffers,
-             0,
-             "Reusable prefill KV layer buffers. 0 disables offload; positive "
-             "values require task=generate, NPU TORCH PREFILL-only/PUSH on "
-             "glm_moe_dsa with DP=1. CP>1 additionally requires an explicit "
-             "kv_split_size=1. Prefill stays eager; graph mode is admitted "
-             "only with the python DFlash2 target, and a positive "
-             "num_speculative_tokens counts as speculative intent.");
+DEFINE_int32(
+    prefill_layerwise_num_buffers,
+    0,
+    "Shared prefill KV buffers for layers 1 onward, plus a dedicated "
+    "resident layer-0 buffer. With uniform layers and a Device-limited "
+    "budget, unchanged B < layers gives about B/(B+1) of the previous "
+    "block count. 0 disables offload; positive "
+    "values require task=generate, NPU TORCH PREFILL-only/PUSH on "
+    "glm_moe_dsa with DP=1. CP>1 additionally requires an explicit "
+    "kv_split_size=1. Prefill stays eager; graph mode is admitted "
+    "only with the python DFlash2 target, and a positive "
+    "num_speculative_tokens counts as speculative intent.");
 
 DEFINE_double(prefill_layerwise_host_memory_gb,
               8.0,

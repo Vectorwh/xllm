@@ -108,9 +108,9 @@ KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);
 
-// Device bytes one logical block occupies when the target rotates through
-// `num_buffers` round-robin slots. Index tensors are allocated only for the
-// physical buffers whose layer ranges contain an indexer layer.
+// Device bytes per logical block: one resident layer-0 slot plus at most
+// `num_buffers` round-robin slots for later layers. Index tensors are allocated
+// only for physical buffers whose layer ranges contain an indexer layer.
 int64_t prefill_layerwise_device_block_size_in_bytes(
     const ModelArgs& model_args,
     const KVCacheCapacity& kv_cache_cap,
