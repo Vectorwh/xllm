@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "kernels/mlu/piecewise_graph.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_attention.h"
+#include "layers/mlu/deepseek_v41/deepseek_v41_attention_utils.h"
 #include "layers/mlu/tests_utils.h"
 
 namespace xllm::layer {
@@ -158,15 +159,15 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   const int32_t num_valid_input_rows = count + 3;
   const int32_t capacity = num_valid_input_rows + 2;
   ModelArgs args;
-  args.hidden_size(32)
+  args.hidden_size(5120)
       .n_heads(8)
       .head_dim(512)
-      .q_lora_rank(16)
+      .q_lora_rank(1280)
       .qk_rope_head_dim(64)
       .o_groups(1)
-      .o_lora_rank(8)
+      .o_lora_rank(1024)
       .window_size(128)
-      .rms_norm_eps(1e-5)
+      .rms_norm_eps(1e-20)
       .index_topk(4)
       .compress_ratios({ratio, ratio})
       .kv_source_layer_ids({0})
@@ -177,18 +178,22 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   DeepseekV41Attention attention(
       ModelContext(parallel, args, QuantArgs(), options),
       /*layer_id=*/1);
-  auto wkv = torch::zeros({512, 32}, options);
+  auto wkv = torch::zeros({512, 5120}, options);
   wkv.select(1, 0).fill_(1);
-  auto wo_a = torch::zeros({1, 8, 4096}, options);
-  wo_a[0].slice(1, 0, 8).copy_(torch::eye(8, options));
-  auto wo_b = torch::zeros({32, 8}, options);
-  wo_b.slice(0, 0, 8).copy_(torch::eye(8, options));
+  auto wo_a = torch::zeros({1024, 4096}, options.dtype(torch::kInt8));
+  wo_a.slice(0, 0, 8).slice(1, 0, 8).copy_(torch::eye(8, options));
+  auto wo_b = torch::zeros({5120, 1024}, options.dtype(torch::kInt8));
+  wo_b.slice(0, 0, 8).slice(1, 0, 8).copy_(torch::eye(8, options));
   attention->load_state_dict(StateDict({
-      {"wq_a.weight", torch::zeros({16, 32}, options)},
-      {"wq_b.weight", torch::zeros({4096, 16}, options)},
+      {"wq_a.weight", torch::zeros({1280, 5120}, options)},
+      {"wq_b.weight", torch::zeros({4096, 1280}, options)},
       {"wkv.weight", wkv},
-      {"q_norm.weight", torch::ones({16}, options)},
+      {"q_norm.weight", torch::ones({1280}, options)},
       {"kv_norm.weight", torch::ones({512}, options)},
+      {"wo_a.weight_scale", torch::full({1024, 1}, 1.0, options)},
+      {"wo_b.weight_scale", torch::full({5120, 1}, 1.0, options)},
+      {"wo_a.smooth", torch::ones({4096}, options)},
+      {"wo_b.smooth", torch::ones({1024}, options)},
       {"wo_a.weight", wo_a},
       {"wo_b.weight", wo_b},
       {"attn_sink", torch::zeros({8}, options)},
@@ -224,7 +229,7 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   const auto original_swa =
       graph_caches[1].get_swa_cache().cpu().view({-1, 512});
   const auto original_main = graph_caches[0].get_k_cache().clone();
-  auto hidden = torch::zeros({capacity, 32}, options);
+  auto hidden = torch::zeros({capacity, 5120}, options);
   hidden.select(1, 0).copy_(
       torch::arange(capacity, ints).remainder(2).mul(2).sub(1));
   auto positions = torch::cat({torch::arange(begin, begin + count, ints),
@@ -313,7 +318,7 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   }
   torch_mlu::synchronize();
   EXPECT_TRUE(torch::equal(graph_caches[1].get_swa_cache(), before_capture));
-  auto reference = torch::zeros({capacity, 32}, torch::kFloat32);
+  auto reference = torch::zeros({capacity, 5120}, torch::kFloat32);
   auto expected_cache = original_swa.clone();
   auto expected_lengths = torch::zeros({capacity}, torch::kInt32);
   const auto main = original_main.cpu().view({-1, 512});

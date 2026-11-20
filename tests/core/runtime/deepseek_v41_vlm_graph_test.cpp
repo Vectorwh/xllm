@@ -44,16 +44,16 @@ TEST(DeepseekV41VlmGraphTest, EncodesImagesAndReplaysDecodeWithFreshMetadata) {
   ModelArgs args;
   args.model_type("deepseek_v41")
       .dtype("bfloat16")
-      .hidden_size(256)
+      .hidden_size(5120)
       .vocab_size(128)
       .n_layers(1)
       .n_heads(8)
       .n_kv_heads(1)
       .head_dim(512)
-      .q_lora_rank(16)
+      .q_lora_rank(1280)
       .qk_rope_head_dim(64)
       .o_groups(1)
-      .o_lora_rank(8)
+      .o_lora_rank(1024)
       .window_size(16)
       .compress_ratios({0})
       .max_position_embeddings(512)
@@ -64,7 +64,7 @@ TEST(DeepseekV41VlmGraphTest, EncodesImagesAndReplaysDecodeWithFreshMetadata) {
       .hc_mult(4)
       .hc_sinkhorn_iters(20)
       .hc_eps(1e-6)
-      .rms_norm_eps(1e-6)
+      .rms_norm_eps(1e-20)
       .n_routed_experts(4)
       .num_experts_per_tok(2)
       .n_group(2)
@@ -86,7 +86,7 @@ TEST(DeepseekV41VlmGraphTest, EncodesImagesAndReplaysDecodeWithFreshMetadata) {
       .mm_num_channels(3)
       .mm_downsample_ratio(2)
       .mm_rope_theta(10000)
-      .mm_projection_dim(256);
+      .mm_projection_dim(5120);
   layer::test::MockProcessGroup group(device);
   ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &group);
   parallel.tp_group_ = &group;
@@ -102,26 +102,37 @@ TEST(DeepseekV41VlmGraphTest, EncodesImagesAndReplaysDecodeWithFreshMetadata) {
         .to(options);
   };
   std::unordered_map<std::string, torch::Tensor> weights{
-      {"embed.weight", random({128, 256})},
-      {"head.weight", random({128, 256})},
-      {"norm.weight", torch::ones({256}, options)},
-      {"layers.0.attn_norm.weight", torch::ones({256}, options)},
-      {"layers.0.ffn_norm.weight", torch::ones({256}, options)},
-      {"layers.0.attn.wq_a.weight", random({16, 256})},
-      {"layers.0.attn.wkv.weight", random({512, 256})},
-      {"layers.0.attn.q_norm.weight", torch::ones({16}, options)},
+      {"embed.weight", random({128, 5120})},
+      {"head.weight", random({128, 5120})},
+      {"norm.weight", torch::ones({5120}, options)},
+      {"layers.0.attn_norm.weight", torch::ones({5120}, options)},
+      {"layers.0.ffn_norm.weight", torch::ones({5120}, options)},
+      {"layers.0.attn.wq_a.weight", random({1280, 5120})},
+      {"layers.0.attn.wkv.weight", random({512, 5120})},
+      {"layers.0.attn.q_norm.weight", torch::ones({1280}, options)},
       {"layers.0.attn.kv_norm.weight", torch::ones({512}, options)},
-      {"layers.0.attn.wq_b.weight", random({4096, 16})},
-      {"layers.0.attn.wo_a.weight", random({1, 8, 4096})},
-      {"layers.0.attn.wo_b.weight", random({256, 8})},
+      {"layers.0.attn.wq_b.weight", random({4096, 1280})},
+      {"layers.0.attn.wo_a.weight_scale",
+       torch::full({1024, 1}, 1.0 / 256, options)},
+      {"layers.0.attn.wo_b.weight_scale",
+       torch::full({5120, 1}, 1.0 / 256, options)},
+      {"layers.0.attn.wo_a.smooth", torch::ones({4096}, options)},
+      {"layers.0.attn.wo_b.smooth", torch::ones({1024}, options)},
+      {"layers.0.attn.wo_a.weight",
+       torch::randint(-16, 17, {1024, 4096}, torch::kInt8)
+           .to(options.device())},
+      {"layers.0.attn.wo_b.weight",
+       torch::randint(-16, 17, {5120, 1024}, torch::kInt8)
+           .to(options.device())},
       {"layers.0.attn.attn_sink", torch::zeros({8}, options)},
-      {"layers.0.ffn.gate.weight", random({4, 256})},
+      {"layers.0.ffn.gate.weight", random({4, 5120})},
       {"layers.0.ffn.gate.bias",
        torch::tensor({20.0f, 10.0f, 0.0f, -10.0f},
                      options.dtype(torch::kFloat32))}};
   for (const std::string& name : {"hc_attn_", "hc_ffn_"}) {
     const std::string prefix = "layers.0." + name;
-    weights.emplace(prefix + "fn", random({24, 1024}).to(torch::kFloat32));
+    weights.emplace(prefix + "fn",
+                    random({24, 4 * args.hidden_size()}).to(torch::kFloat32));
     weights.emplace(prefix + "base", random({24}).to(torch::kFloat32));
     weights.emplace(prefix + "scale",
                     torch::full({3}, 0.1, options.dtype(torch::kFloat32)));
@@ -129,9 +140,9 @@ TEST(DeepseekV41VlmGraphTest, EncodesImagesAndReplaysDecodeWithFreshMetadata) {
   for (int32_t expert = 0; expert < 4; ++expert) {
     const std::string prefix =
         "layers.0.ffn.experts." + std::to_string(expert) + ".";
-    weights.emplace(prefix + "w1.weight", random({128, 256}));
-    weights.emplace(prefix + "w3.weight", random({128, 256}));
-    weights.emplace(prefix + "w2.weight", random({256, 128}));
+    weights.emplace(prefix + "w1.weight", random({128, 5120}));
+    weights.emplace(prefix + "w3.weight", random({128, 5120}));
+    weights.emplace(prefix + "w2.weight", random({5120, 128}));
   }
   weights.emplace("layers.0.ffn.gate.bias_vl",
                   torch::tensor({-10.0f, 0.0f, 10.0f, 20.0f}));
@@ -139,13 +150,13 @@ TEST(DeepseekV41VlmGraphTest, EncodesImagesAndReplaysDecodeWithFreshMetadata) {
       {"vision.patch_embed.proj.weight", {8, 12}},
       {"vision.patch_embed.proj.bias", {8}},
       {"vision.norm.weight", {8}},
-      {"image_start", {256}},
-      {"image_end", {256}},
-      {"image_newline", {256}},
-      {"aligner.w1.weight", {256, 32}},
-      {"aligner.w1.bias", {256}},
-      {"aligner.w2.weight", {256, 256}},
-      {"aligner.w2.bias", {256}},
+      {"image_start", {5120}},
+      {"image_end", {5120}},
+      {"image_newline", {5120}},
+      {"aligner.w1.weight", {5120, 32}},
+      {"aligner.w1.bias", {5120}},
+      {"aligner.w2.weight", {5120, 5120}},
+      {"aligner.w2.bias", {5120}},
       {"vision.blocks.0.attn.wqkv.weight", {24, 8}},
       {"vision.blocks.0.attn.wqkv.bias", {24}},
       {"vision.blocks.0.attn.wo.weight", {8, 8}},

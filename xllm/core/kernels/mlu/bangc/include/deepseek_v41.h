@@ -18,6 +18,48 @@ limitations under the License.
 
 #include <optional>
 namespace xllm::kernel::mlu::bangc {
+struct DSAProjectionOutput {
+  torch::Tensor kv;
+  torch::Tensor qr;
+  // Undefined without compressor weights. A gate packs FP32 raw | scores.
+  torch::Tensor raw_scores;
+};
+
+// Positions index rows of the FP32 RoPE table. Preallocated outputs must be
+// contiguous and disjoint from each other and all inputs.
+DSAProjectionOutput fused_dsa_projection(
+    const torch::Tensor& x,
+    const torch::Tensor& w_kv,
+    const torch::Tensor& w_qa,
+    const torch::Tensor& gamma_kv,
+    const torch::Tensor& gamma_q,
+    const torch::Tensor& positions,
+    const torch::Tensor& rope,
+    float rms_norm_eps,
+    const torch::Tensor& w_ckv = {},
+    const torch::Tensor& w_gate = {},
+    std::optional<DSAProjectionOutput> out = std::nullopt);
+
+// Returns rank-local INT8 activations and FP32 per-token scales for Wo_b.
+std::tuple<torch::Tensor, torch::Tensor> fused_dsa_output_projection(
+    const torch::Tensor& x,
+    const torch::Tensor& positions,
+    const torch::Tensor& rope,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& smooth_a,
+    const torch::Tensor& smooth_b);
+
+// Projects qr with a local Wq_b shard and rotates the last 64 channels of
+// each head. Positions are clamped to the first and last RoPE rows.
+// INT8 weights use per-output scales and per-input smoothing.
+torch::Tensor fused_dsa_qb(const torch::Tensor& qr,
+                           const torch::Tensor& weight,
+                           const torch::Tensor& positions,
+                           const torch::Tensor& rope,
+                           const torch::Tensor& weight_scale = {},
+                           const torch::Tensor& smooth = {});
+
 // Contiguous BF16 qr [T,1280], wq [4096,1280], INT32 positions [T],
 // FP32 rope [M,128] (cos | sin), 1 <= M <= 1048576, T >= 1. Positions
 // must be in [0,M). Returns independent BF16 [T,32,128]; projection and

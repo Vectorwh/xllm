@@ -1,0 +1,2099 @@
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <mlu.h>
+
+#include <cstdint>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_output_projection/output_projection_device.h"
+
+namespace xllm::kernel::mlu::bangc::output_projection {
+
+constexpr int32_t kHeadDim = 512;
+constexpr int32_t kRopeTail = 64;
+constexpr int32_t kHeadPrefix = 448;
+constexpr int32_t kHeadsPerGroup = 8;
+constexpr int32_t kRopeCols = 128;
+constexpr int32_t kWramLtMap16Stride = (512 * 1024) / 16;  // 32768B per LT
+
+__mlu_const__ float kSignPair128[128] = {
+    1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+    1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+    1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+    1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+    1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,
+    1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  1.0f,  -1.0f,
+    1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,
+    -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f,
+    1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,
+    -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f,
+    1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,
+    -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f, 1.0f,  -1.0f,
+};
+
+__mlu_func__ inline void ensure_pos_cache(int32_t* pos_cache,
+                                          int32_t& pos_base,
+                                          const int32_t* pos,
+                                          int32_t m,
+                                          int32_t row_start,
+                                          int32_t cur_r,
+                                          uint32_t g_shift,
+                                          int32_t cache_size) {
+  const int32_t tok0 =
+      static_cast<int32_t>(static_cast<uint32_t>(row_start) >> g_shift);
+  const int32_t tok_end =
+      static_cast<int32_t>(static_cast<uint32_t>(row_start + cur_r - 1) >>
+                           g_shift) +
+      1;
+  if (tok0 < pos_base || tok_end > pos_base + cache_size) {
+    // 64B-align GDRAM load start; cache_size >= kMaxR + 16 guarantees [tok0,
+    // tok_end) fits regardless of tile_r or whether a tile crosses a 4096-token
+    // boundary.
+    pos_base = tok0 & ~15;
+    const int32_t cnt =
+        (m - pos_base < cache_size) ? (m - pos_base) : cache_size;
+    __memcpy_io1_async(
+        pos_cache, pos + pos_base, cnt * sizeof(int32_t), GDRAM2NRAM);
+    __sync();
+  }
+}
+
+__mlu_func__ inline int32_t bounded_position(const int32_t* pos,
+                                             int32_t last_pos) {
+  const int32_t row = __load_nram(pos);
+  const int32_t nonnegative = row < 0 ? 0 : row;
+  return nonnegative < last_pos ? nonnegative : last_pos;
+}
+
+__mlu_func__ inline void load_rope_rows(float* dst_cs,
+                                        const float* rope,
+                                        int32_t last_pos,
+                                        const int32_t* pos,
+                                        int32_t num_toks) {
+  int32_t t = 0;
+  while (t < num_toks) {
+    const int32_t p0 = bounded_position(pos + t, last_pos);
+    int32_t run = 1;
+    while (t + run < num_toks) {
+      const int32_t pn = bounded_position(pos + t + run, last_pos);
+      if (pn - p0 != run) {
+        break;
+      }
+      ++run;
+    }
+    __memcpy_io1_async(dst_cs + t * kRopeCols,
+                       rope + static_cast<int64_t>(p0) * kRopeCols,
+                       run * kRopeCols * sizeof(float),
+                       GDRAM2NRAM);
+    t += run;
+  }
+}
+
+__mlu_func__ inline void issue_tile_qa_io1(bfloat16_t* dst_x,
+                                           float* dst_cs,
+                                           const bfloat16_t* x,
+                                           const float* rope,
+                                           int32_t last_pos,
+                                           const int32_t* pos_cache,
+                                           int32_t pos_base,
+                                           int32_t row_start,
+                                           int32_t cur_r,
+                                           uint32_t g_shift) {
+  __memcpy_io1_async(dst_x,
+                     x + static_cast<int64_t>(row_start) * kGroupWidth,
+                     cur_r * kGroupWidth * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+  const int32_t tok0 =
+      static_cast<int32_t>(static_cast<uint32_t>(row_start) >> g_shift);
+  const int32_t tok_last = static_cast<int32_t>(
+      static_cast<uint32_t>(row_start + cur_r - 1) >> g_shift);
+  load_rope_rows(dst_cs,
+                 rope,
+                 last_pos,
+                 pos_cache + (tok0 - pos_base),
+                 tok_last - tok0 + 1);
+}
+
+__mlu_func__ inline void move_cvt_bf16_to_f32_async(float* dst,
+                                                    const bfloat16_t* src,
+                                                    int32_t elem_count) {
+  const int32_t nb = elem_count >> 5;
+  asm volatile(
+      "move.tiling.async.nram.nram.b16 [%[dst]], [%[src]], "
+      "64, 1, 0, 1, 0, %[nb], 64, 1, 0, 1, 0, "
+      "64, 1, 0, 1, 0, %[nb], 128, 1, 0, 1, 0, "
+      ".cvt.f32.bf16();\n\t" ::[dst] "r"(dst),
+      [src] "r"(src),
+      [nb] "r"(nb)
+      : "memory");
+}
+
+__mlu_func__ inline void rotate_extracted_tail_to_buf(
+    bfloat16_t* x_buf,
+    float* cs_buf,
+    bfloat16_t* tail_bf16,
+    bfloat16_t* tail_bf16_swapped,
+    float* tail_f32,
+    float* tail_swapped,
+    float* sin_signed,
+    const float* sign_nram,
+    int32_t row_start,
+    int32_t rows,
+    uint32_t g_shift) {
+  const int32_t total_heads = rows * kHeadsPerGroup;
+  const int32_t total_tail_elems = total_heads * kRopeTail;
+  const int32_t total_pairs = total_tail_elems >> 1;
+
+  asm volatile(
+      "fuse.nram.u32 [%[dst]], %[cnt], [%[src]], .ror(16);\n\t" ::[dst] "r"(
+          tail_bf16_swapped),
+      [cnt] "r"(total_pairs),
+      [src] "r"(tail_bf16)
+      : "memory");
+  __bang_bfloat162float(tail_swapped, tail_bf16_swapped, total_tail_elems);
+
+  if (g_shift == 0u && rows > 1) {
+    __bang_cycle_mul(cs_buf, cs_buf, sign_nram, rows * kRopeCols, kRopeCols);
+    for (int32_t r = 0; r < rows; ++r) {
+      float* cs_row = cs_buf + r * kRopeCols;
+      float* ts_row = tail_swapped + r * (kHeadsPerGroup * kRopeTail);
+      float* tf_row = tail_f32 + r * (kHeadsPerGroup * kRopeTail);
+      __bang_cycle_mul(ts_row,
+                       ts_row,
+                       cs_row + kRopeTail,
+                       kHeadsPerGroup * kRopeTail,
+                       kRopeTail);
+      __bang_cycle_mul(
+          tf_row, tf_row, cs_row, kHeadsPerGroup * kRopeTail, kRopeTail);
+    }
+  } else {
+    int32_t r_span = 0;
+    int32_t t_idx = 0;
+    while (r_span < rows) {
+      const uint32_t cur_tok =
+          static_cast<uint32_t>(row_start + r_span) >> g_shift;
+      int32_t span = 1;
+      while (r_span + span < rows &&
+             (static_cast<uint32_t>(row_start + r_span + span) >> g_shift) ==
+                 cur_tok) {
+        ++span;
+      }
+      const int32_t span_elems = span * kHeadsPerGroup * kRopeTail;
+      float* cs_row = cs_buf + t_idx * kRopeCols;
+      float* ss_row = sin_signed + t_idx * kRopeTail;
+      float* ts_row = tail_swapped + r_span * (kHeadsPerGroup * kRopeTail);
+      float* tf_row = tail_f32 + r_span * (kHeadsPerGroup * kRopeTail);
+      __bang_mul(ss_row, cs_row + kRopeTail, sign_nram + kRopeTail, kRopeTail);
+      __bang_cycle_mul(ts_row, ts_row, ss_row, span_elems, kRopeTail);
+      __bang_cycle_mul(tf_row, tf_row, cs_row, span_elems, kRopeTail);
+      r_span += span;
+      ++t_idx;
+    }
+  }
+  asm volatile("add.nram.bf16.f32 [%[dst]], [%[src0]], [%[src1]], %[sz];\n\t" ::
+                   [dst] "r"(tail_bf16),
+               [src0] "r"(tail_f32),
+               [src1] "r"(tail_swapped),
+               [sz] "r"(total_tail_elems)
+               : "memory");
+
+  asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+  __memcpy_async(x_buf + kHeadPrefix,
+                 tail_bf16,
+                 kRopeTail * sizeof(bfloat16_t),
+                 NRAM2NRAM,
+                 kHeadDim * sizeof(bfloat16_t),
+                 kRopeTail * sizeof(bfloat16_t),
+                 total_heads - 1);
+}
+
+// Kernel 1: Contiguous [M, G, 4096] Inverse RoPE + BF16 round #1 + smooth_a +
+// dynamic INT8 quant.
+__mlu_global__ void rope_quant_wo_a_kernel(const bfloat16_t* x,
+                                           const int32_t* pos,
+                                           const float* rope,
+                                           int32_t last_pos,
+                                           const float* smooth_a,
+                                           int8_t* q_a,
+                                           float* scale_a,
+                                           int32_t m,
+                                           int32_t g,
+                                           uint32_t g_shift) {
+  if (!__is_ipu()) {
+    return;
+  }
+
+  constexpr int32_t kMaxR = 8;
+  constexpr int32_t kPosCacheSize = 4096;
+  static_assert(
+      kPosCacheSize >= kMaxR + 16,
+      "pos_cache must cover any tile plus 16-element alignment slack");
+
+  __nram__ float smooth_nram[kGroupWidth];
+  __nram__ float sign_nram[kRopeCols];
+  __nram__ uint16_t x_ring_u16[3][kMaxR * kGroupWidth];
+  __nram__ float cs_ring[3][kMaxR * kRopeCols];
+  __nram__ float v_f32[kMaxR * kGroupWidth];
+  __nram__ int8_t q_pingpong[2][kMaxR * kGroupWidth];
+  __nram__ float scale_ring[4][16];
+  __nram__ uint16_t tail_bf16_u16[kMaxR * kHeadsPerGroup * kRopeTail];
+  __nram__ uint16_t tail_bf16_swapped_u16[kMaxR * kHeadsPerGroup * kRopeTail];
+  __nram__ float tail_f32[kMaxR * kHeadsPerGroup * kRopeTail];
+  __nram__ float tail_swapped[kMaxR * kHeadsPerGroup * kRopeTail];
+  __nram__ float sin_signed[kMaxR * kRopeTail];
+  __nram__ int32_t pos_cache[kPosCacheSize];
+  __nram__ uint8_t absmax_buf[kMaxR * 16];
+
+  bfloat16_t* tail_bf16 = reinterpret_cast<bfloat16_t*>(tail_bf16_u16);
+  bfloat16_t* tail_bf16_swapped =
+      reinterpret_cast<bfloat16_t*>(tail_bf16_swapped_u16);
+
+  const uint32_t total_rows =
+      static_cast<uint32_t>(m) * static_cast<uint32_t>(g);
+  int32_t tile_r = static_cast<int32_t>((total_rows + 31u) >> 5);
+  if (tile_r < 1) {
+    tile_r = 1;
+  }
+  if (tile_r > kMaxR) {
+    tile_r = kMaxR;
+  }
+
+  const uint32_t total_tiles =
+      (total_rows + static_cast<uint32_t>(tile_r) - 1u) /
+      static_cast<uint32_t>(tile_r);
+  if (static_cast<uint32_t>(taskId) >= total_tiles) {
+    return;
+  }
+
+  __memcpy_io1_async(
+      smooth_nram, smooth_a, kGroupWidth * sizeof(float), GDRAM2NRAM);
+  __memcpy_io1_async(
+      sign_nram, kSignPair128, kRopeCols * sizeof(float), GDRAM2NRAM);
+
+  const uint32_t first_tile = static_cast<uint32_t>(taskId);
+  const int32_t first_row = static_cast<int32_t>(first_tile) * tile_r;
+  const int32_t rem_first = static_cast<int32_t>(total_rows) - first_row;
+  const int32_t first_r = (rem_first < tile_r) ? rem_first : tile_r;
+
+  int32_t pos_base =
+      m;  // sentinel: forces initial load + __sync() for smooth/sign/pos_cache
+  ensure_pos_cache(
+      pos_cache, pos_base, pos, m, first_row, first_r, g_shift, kPosCacheSize);
+
+  bfloat16_t* x0 = reinterpret_cast<bfloat16_t*>(x_ring_u16[0]);
+  issue_tile_qa_io1(x0,
+                    cs_ring[0],
+                    x,
+                    rope,
+                    last_pos,
+                    pos_cache,
+                    pos_base,
+                    first_row,
+                    first_r,
+                    g_shift);
+  asm volatile("sync.pio1.cmv.csimd;\n\t" ::: "memory");
+
+  const uint32_t second_tile = first_tile + taskDim;
+  if (second_tile < total_tiles) {
+    const int32_t second_row = static_cast<int32_t>(second_tile) * tile_r;
+    const int32_t second_rem = static_cast<int32_t>(total_rows) - second_row;
+    const int32_t second_r = (second_rem < tile_r) ? second_rem : tile_r;
+    ensure_pos_cache(pos_cache,
+                     pos_base,
+                     pos,
+                     m,
+                     second_row,
+                     second_r,
+                     g_shift,
+                     kPosCacheSize);
+    issue_tile_qa_io1(reinterpret_cast<bfloat16_t*>(x_ring_u16[1]),
+                      cs_ring[1],
+                      x,
+                      rope,
+                      last_pos,
+                      pos_cache,
+                      pos_base,
+                      second_row,
+                      second_r,
+                      g_shift);
+  }
+
+  __memcpy_async(tail_bf16,
+                 x0 + kHeadPrefix,
+                 kRopeTail * sizeof(bfloat16_t),
+                 NRAM2NRAM,
+                 kRopeTail * sizeof(bfloat16_t),
+                 kHeadDim * sizeof(bfloat16_t),
+                 first_r * kHeadsPerGroup - 1);
+  move_cvt_bf16_to_f32_async(
+      tail_f32, tail_bf16, first_r * kHeadsPerGroup * kRopeTail);
+  asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+  rotate_extracted_tail_to_buf(x0,
+                               cs_ring[0],
+                               tail_bf16,
+                               tail_bf16_swapped,
+                               tail_f32,
+                               tail_swapped,
+                               sin_signed,
+                               sign_nram,
+                               first_row,
+                               first_r,
+                               g_shift);
+  asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+  const int32_t first_mv_rows = (first_r >= 6) ? (first_r - 3) : (first_r >> 1);
+  if (first_mv_rows > 0) {
+    move_cvt_bf16_to_f32_async(v_f32, x0, first_mv_rows * kGroupWidth);
+  }
+
+  uint32_t iter = 0;
+  uint32_t cur_s = 0;
+  uint32_t nxt_s = 1;
+  uint32_t pre_s = 2;
+  for (uint32_t tile = first_tile; tile < total_tiles;
+       tile += taskDim, ++iter) {
+    const int32_t slot = static_cast<int32_t>(iter & 1u);
+    const int32_t slot4 = static_cast<int32_t>(iter & 3u);
+    const int32_t row_start = static_cast<int32_t>(tile) * tile_r;
+    const int32_t rem_rows = static_cast<int32_t>(total_rows) - row_start;
+    const int32_t cur_r = (rem_rows < tile_r) ? rem_rows : tile_r;
+    const int32_t total_elems = cur_r * kGroupWidth;
+
+    const uint32_t next_tile = tile + taskDim;
+    const uint32_t tile2 = next_tile + taskDim;
+    int32_t next_row = 0;
+    int32_t next_r = 0;
+    if (next_tile < total_tiles) {
+      next_row = static_cast<int32_t>(next_tile) * tile_r;
+      const int32_t next_rem = static_cast<int32_t>(total_rows) - next_row;
+      next_r = (next_rem < tile_r) ? next_rem : tile_r;
+
+      // Sync nxt_s (issued 1 full tile ago) BEFORE queuing tile2 IO1 so MV/SIMD
+      // never stall on tile2.
+      asm volatile("sync.pio1.cmv.csimd;\n\t" ::: "memory");
+
+      if (tile2 < total_tiles) {
+        const int32_t row2 = static_cast<int32_t>(tile2) * tile_r;
+        const int32_t rem2 = static_cast<int32_t>(total_rows) - row2;
+        const int32_t r2 = (rem2 < tile_r) ? rem2 : tile_r;
+        ensure_pos_cache(
+            pos_cache, pos_base, pos, m, row2, r2, g_shift, kPosCacheSize);
+        issue_tile_qa_io1(reinterpret_cast<bfloat16_t*>(x_ring_u16[pre_s]),
+                          cs_ring[pre_s],
+                          x,
+                          rope,
+                          last_pos,
+                          pos_cache,
+                          pos_base,
+                          row2,
+                          r2,
+                          g_shift);
+      }
+    }
+
+    bfloat16_t* x_cur = reinterpret_cast<bfloat16_t*>(x_ring_u16[cur_s]);
+    const int32_t mv_rows = (cur_r >= 6) ? (cur_r - 3) : (cur_r >> 1);
+    const int32_t simd_rows = cur_r - mv_rows;
+    const int32_t mv_elems = mv_rows * kGroupWidth;
+    const int32_t simd_elems = simd_rows * kGroupWidth;
+
+    // SIMD processes rows [mv_rows .. cur_r-1] while MV finishes rows [0 ..
+    // mv_rows-1].
+    __bang_bfloat162float(v_f32 + mv_elems, x_cur + mv_elems, simd_elems);
+    __bang_cycle_mul(v_f32 + mv_elems,
+                     v_f32 + mv_elems,
+                     smooth_nram,
+                     simd_elems,
+                     kGroupWidth);
+    for (int32_t r = mv_rows; r < cur_r; ++r) {
+      asm volatile("absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                       absmax_buf + r * 16),
+                   [src] "r"(v_f32 + r * kGroupWidth),
+                   [sz] "i"(kGroupWidth)
+                   : "memory");
+    }
+
+    if (mv_elems > 0) {
+      asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+    }
+    // Explicitly release x_ring_u16[cur_s] (consumed by SIMD above and MV via
+    // sync.pmv.csimd) before next iter's IO1 overwrites it as pre_s,
+    // independent of __sync_compute() below.
+    asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+
+    if (next_tile < total_tiles) {
+      if (mv_elems == 0) {
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+      }
+      __memcpy_async(
+          tail_bf16,
+          reinterpret_cast<bfloat16_t*>(x_ring_u16[nxt_s]) + kHeadPrefix,
+          kRopeTail * sizeof(bfloat16_t),
+          NRAM2NRAM,
+          kRopeTail * sizeof(bfloat16_t),
+          kHeadDim * sizeof(bfloat16_t),
+          next_r * kHeadsPerGroup - 1);
+      move_cvt_bf16_to_f32_async(
+          tail_f32, tail_bf16, next_r * kHeadsPerGroup * kRopeTail);
+    }
+
+    if (mv_elems > 0) {
+      __bang_cycle_mul(v_f32, v_f32, smooth_nram, mv_elems, kGroupWidth);
+      for (int32_t r = 0; r < mv_rows; ++r) {
+        asm volatile(
+            "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                absmax_buf + r * 16),
+            [src] "r"(v_f32 + r * kGroupWidth),
+            [sz] "i"(kGroupWidth)
+            : "memory");
+      }
+    }
+
+    __sync_compute();
+
+    if (next_tile < total_tiles) {
+      asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+      rotate_extracted_tail_to_buf(
+          reinterpret_cast<bfloat16_t*>(x_ring_u16[nxt_s]),
+          cs_ring[nxt_s],
+          tail_bf16,
+          tail_bf16_swapped,
+          tail_f32,
+          tail_swapped,
+          sin_signed,
+          sign_nram,
+          next_row,
+          next_r,
+          g_shift);
+    }
+
+    int8_t* q_cur = q_pingpong[slot];
+    float* s_cur = scale_ring[slot4];
+    asm volatile("sync.pio0.csimd;\n\t" ::: "memory");
+    for (int32_t r = 0; r < mv_rows; ++r) {
+      const float peak =
+          __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+      float s_val = 0.0f;
+      float m_val = 0.0f;
+      if (peak > 0.0f) {
+        s_val = peak / 127.0f;
+        m_val = 127.0f / peak;
+      }
+      __store_nram(s_cur + r, s_val);
+      asm volatile(
+          "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], %[sz];\n\t" ::
+              [dst] "r"(q_cur + r * kGroupWidth),
+          [src] "r"(v_f32 + r * kGroupWidth),
+          [mv] "r"(m_val),
+          [sz] "i"(kGroupWidth)
+          : "memory");
+    }
+
+    // Ensure next_tile's tail_wb on MV is visible to next iter's SIMD before
+    // queuing next_tile MV cvt.
+    if (next_tile < total_tiles) {
+      asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+      const int32_t next_mv_rows = (next_r >= 6) ? (next_r - 3) : (next_r >> 1);
+      if (next_mv_rows > 0) {
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        move_cvt_bf16_to_f32_async(
+            v_f32,
+            reinterpret_cast<bfloat16_t*>(x_ring_u16[nxt_s]),
+            next_mv_rows * kGroupWidth);
+      }
+    }
+
+    for (int32_t r = mv_rows; r < cur_r; ++r) {
+      const float peak =
+          __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+      float s_val = 0.0f;
+      float m_val = 0.0f;
+      if (peak > 0.0f) {
+        s_val = peak / 127.0f;
+        m_val = 127.0f / peak;
+      }
+      __store_nram(s_cur + r, s_val);
+      asm volatile(
+          "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], %[sz];\n\t" ::
+              [dst] "r"(q_cur + r * kGroupWidth),
+          [src] "r"(v_f32 + r * kGroupWidth),
+          [mv] "r"(m_val),
+          [sz] "i"(kGroupWidth)
+          : "memory");
+    }
+    asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+
+    __memcpy_io0_async(q_a + static_cast<int64_t>(row_start) * kGroupWidth,
+                       q_cur,
+                       total_elems * sizeof(int8_t),
+                       NRAM2GDRAM);
+    __memcpy_io0_async(
+        scale_a + row_start, s_cur, cur_r * sizeof(float), NRAM2GDRAM);
+
+    const uint32_t tmp_s = cur_s;
+    cur_s = nxt_s;
+    nxt_s = pre_s;
+    pre_s = tmp_s;
+  }
+  __sync();
+}
+
+__mlu_func__ inline void load_qa_sram(int8_t* dst_sram,
+                                      float* dst_sa,
+                                      const int8_t* q_a,
+                                      const float* scale_a,
+                                      int32_t m_row,
+                                      int32_t rows,
+                                      int32_t grp,
+                                      int32_t g) {
+  const int8_t* src_qa =
+      q_a + (static_cast<int64_t>(m_row) * g + grp) * kGroupWidth;
+  if (g == 1) {
+    __memcpy_async(
+        dst_sram, src_qa, rows * kGroupWidth * sizeof(int8_t), GDRAM2SRAM);
+  } else {
+    __memcpy_async(dst_sram,
+                   src_qa,
+                   kGroupWidth * sizeof(int8_t),
+                   GDRAM2SRAM,
+                   kGroupWidth * sizeof(int8_t),
+                   g * kGroupWidth * sizeof(int8_t),
+                   rows - 1);
+  }
+  __memcpy_async(dst_sa,
+                 scale_a + static_cast<int64_t>(m_row) * g,
+                 rows * g * sizeof(float),
+                 GDRAM2SRAM);
+}
+
+__mlu_func__ inline void move_and_expand_sa(float* dst_48x128,
+                                            float* tmp_128x48,
+                                            float* sa_48,
+                                            const float* src_sram_sa,
+                                            int32_t rows,
+                                            int32_t grp,
+                                            int32_t g) {
+  if (g == 1) {
+    __memcpy_async(sa_48, src_sram_sa, rows * sizeof(float), SRAM2NRAM);
+  } else {
+    __memcpy_async(sa_48,
+                   src_sram_sa + grp,
+                   sizeof(float),
+                   SRAM2NRAM,
+                   sizeof(float),
+                   g * sizeof(float),
+                   rows - 1);
+  }
+  __memcpy_async(tmp_128x48,
+                 sa_48,
+                 48 * sizeof(float),
+                 NRAM2NRAM,
+                 48 * sizeof(float),
+                 0,
+                 127);
+  asm volatile(
+      "trans.tiling.async.nram.nram.b32 [%[dst]], [%[src]], "
+      "64, 16, 192, 1, 0, 8, 3072, 3, 64, 1, 0, "
+      "64, 16, 512, 1, 0, 8, 64, 3, 8192, 1, 0;\n\t" ::[dst] "r"(dst_48x128),
+      [src] "r"(tmp_128x48)
+      : "memory");
+}
+
+__mlu_func__ inline void load_wram_direct(int8_t* wram_b,
+                                          const int8_t* w_sub_gdram) {
+  __memcpy_io0_async(wram_b,
+                     w_sub_gdram,
+                     kGroupWidth * sizeof(int8_t),
+                     GDRAM2WRAM,
+                     kGroupWidth * sizeof(int8_t),
+                     3,
+                     kWramLtMap16Stride,
+                     15,
+                     kGroupWidth * sizeof(int8_t),
+                     63,
+                     0,
+                     0);
+  __memcpy_io1_async(wram_b + 4 * kGroupWidth,
+                     w_sub_gdram + 64 * kGroupWidth,
+                     kGroupWidth * sizeof(int8_t),
+                     GDRAM2WRAM,
+                     kGroupWidth * sizeof(int8_t),
+                     3,
+                     kWramLtMap16Stride,
+                     15,
+                     kGroupWidth * sizeof(int8_t),
+                     63,
+                     0,
+                     0);
+}
+
+// Kernel 2: 4-stage pipelined weight-stationary grouped W8A8 GEMM with 32-IPU
+// direct 3D GDRAM2WRAM weight load.
+__mlu_global__ void grouped_w8a8_gemm_kernel(const int8_t* q_a,
+                                             const float* scale_a,
+                                             const int8_t* weight,
+                                             const float* scale_w,
+                                             bfloat16_t* y_out,
+                                             int32_t m,
+                                             int32_t g) {
+  constexpr int32_t kBlockN = 512;
+  constexpr int32_t kTileM = 48;
+  constexpr int32_t kDealN = 128;
+
+  __mlu_shared__ int8_t sram_a[2][kTileM * kGroupWidth];
+  __mlu_shared__ float sram_sa[2][kTileM * 8];
+  __mlu_shared__ float sram_sw[2][kBlockN];
+  __mlu_shared__ int8_t sram_w[4][96 * kGroupWidth];  // 1.5 MiB for idle-MPU
+                                                      // Job 1+ weight prefetch
+
+  __nram__ int8_t nram_a[2][kTileM * kGroupWidth];
+  __nram__ float nram_comb[2][kTileM * kDealN];
+  __nram__ float sa_128x48[kDealN * kTileM];
+  __nram__ float sa_48[kTileM];
+  __nram__ float nram_sw[kDealN];
+  __nram__ uint16_t nram_out_u16[2][kTileM * kDealN];
+
+  __wram__ int8_t wram_b[512 * 1024];
+
+  // 2 N-blocks of 512 per group. Shard M when total_n_blocks < 8 so all 8
+  // clusters stay active.
+  uint32_t m_shards = 1u;
+  uint32_t shard_shift = 0u;
+  if (g == 1 && m >= 4) {
+    m_shards = 4u;
+    shard_shift = 2u;
+  } else if (g == 2 && m >= 2) {
+    m_shards = 2u;
+    shard_shift = 1u;
+  }
+  uint32_t n_blk_shift = 1u;
+  if (g == 2) {
+    n_blk_shift = 2u;
+  } else if (g == 4) {
+    n_blk_shift = 3u;
+  } else if (g == 8) {
+    n_blk_shift = 4u;
+  }
+
+  const uint32_t total_n_blocks = static_cast<uint32_t>(g) * 2u;
+  const uint32_t n_blk_mask = total_n_blocks - 1u;
+  const uint32_t total_jobs = m_shards * total_n_blocks;
+  const int32_t m_per_shard = static_cast<int32_t>(
+      (static_cast<uint32_t>(m) + m_shards - 1u) >> shard_shift);
+
+  const int32_t ipu_n_off = coreId * kDealN;
+
+  bool prefetched_next = false;
+  bool prefetched_w = false;
+  uint32_t a_slot_off = 0u;
+  uint32_t job_iter = 0u;
+  for (uint32_t job = taskIdY; job < total_jobs; job += taskDimY, ++job_iter) {
+    const uint32_t m_shard_idx = job >> n_blk_shift;
+    const uint32_t gn_blk = job & n_blk_mask;
+    const int32_t grp = static_cast<int32_t>(gn_blk >> 1);
+    const int32_t n_blk = static_cast<int32_t>(gn_blk & 1u);
+    const int32_t n_start = n_blk * kBlockN;
+
+    const int32_t shard_m_begin =
+        static_cast<int32_t>(m_shard_idx) * m_per_shard;
+    const int32_t shard_m_end =
+        (shard_m_begin + m_per_shard < m) ? (shard_m_begin + m_per_shard) : m;
+    const int32_t shard_m = shard_m_end - shard_m_begin;
+    if (shard_m <= 0) {
+      prefetched_next = false;
+      prefetched_w = false;
+      a_slot_off = 0u;
+      continue;
+    }
+
+    const uint32_t num_m_blocks =
+        (static_cast<uint32_t>(shard_m) + kTileM - 1u) / kTileM;
+    const int32_t sw_slot = static_cast<int32_t>(job_iter & 1u);
+    const int32_t deal_m0 = (shard_m < kTileM) ? shard_m : kTileM;
+
+    const int8_t* w_grp =
+        weight + static_cast<int64_t>(grp) * kGroupOut * kGroupWidth;
+    const float* sw_grp = scale_w + static_cast<int64_t>(grp) * kGroupOut;
+
+    // Step 1: Load 512 KiB weights per IPU into WRAM.
+    // On Job 0: 32-IPU direct dual-IO GDRAM2WRAM.
+    // On Job 1+ (when prefetched_w): 75% (384 KiB) SRAM2WRAM on MV || 25% (128
+    // KiB) GDRAM2WRAM on IO0+IO1!
+    if (__is_ipu()) {
+      const int8_t* w_sub_gdram =
+          w_grp + static_cast<int64_t>(n_start + ipu_n_off) * kGroupWidth;
+      if (prefetched_w) {
+        asm volatile("sync.psimd.cio;\n\t" ::: "memory");
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        __memcpy_io0_async(wram_b + 8 * kWramLtMap16Stride + 4 * kGroupWidth,
+                           w_sub_gdram + 96 * kGroupWidth,
+                           kGroupWidth * sizeof(int8_t),
+                           GDRAM2WRAM,
+                           kGroupWidth * sizeof(int8_t),
+                           3,
+                           kWramLtMap16Stride,
+                           3,
+                           kGroupWidth * sizeof(int8_t),
+                           15,
+                           0,
+                           0);
+        __memcpy_io1_async(wram_b + 12 * kWramLtMap16Stride + 4 * kGroupWidth,
+                           w_sub_gdram + 112 * kGroupWidth,
+                           kGroupWidth * sizeof(int8_t),
+                           GDRAM2WRAM,
+                           kGroupWidth * sizeof(int8_t),
+                           3,
+                           kWramLtMap16Stride,
+                           3,
+                           kGroupWidth * sizeof(int8_t),
+                           15,
+                           0,
+                           0);
+        __memcpy_async(wram_b,
+                       sram_w[coreId],
+                       kGroupWidth * sizeof(int8_t),
+                       SRAM2WRAM,
+                       kGroupWidth * sizeof(int8_t),
+                       3,
+                       kWramLtMap16Stride,
+                       15,
+                       kGroupWidth * sizeof(int8_t),
+                       63,
+                       0,
+                       0);
+        __memcpy_async(wram_b + 4 * kGroupWidth,
+                       sram_w[coreId] + 64 * kGroupWidth,
+                       kGroupWidth * sizeof(int8_t),
+                       SRAM2WRAM,
+                       kGroupWidth * sizeof(int8_t),
+                       3,
+                       kWramLtMap16Stride,
+                       7,
+                       kGroupWidth * sizeof(int8_t),
+                       31,
+                       0,
+                       0);
+      } else {
+        asm volatile("sync.psimd.cio;\n\t" ::: "memory");
+        load_wram_direct(wram_b, w_sub_gdram);
+      }
+    }
+
+    if (!prefetched_next) {
+      if (__is_mpu()) {
+        __memcpy_async(sram_sw[sw_slot],
+                       sw_grp + n_start,
+                       kBlockN * sizeof(float),
+                       GDRAM2SRAM);
+        load_qa_sram(sram_a[0],
+                     sram_sa[0],
+                     q_a,
+                     scale_a,
+                     shard_m_begin,
+                     deal_m0,
+                     grp,
+                     g);
+        if (num_m_blocks > 1u) {
+          const int32_t deal_m1 =
+              (shard_m - kTileM < kTileM) ? (shard_m - kTileM) : kTileM;
+          load_qa_sram(sram_a[1],
+                       sram_sa[1],
+                       q_a,
+                       scale_a,
+                       shard_m_begin + kTileM,
+                       deal_m1,
+                       grp,
+                       g);
+        }
+        asm volatile("barrier.sync.local.pio.cio 2, 5;\n\t" ::: "memory");
+      }
+      if (__is_ipu()) {
+        asm volatile("barrier.sync.local.cmv 2, 5;\n\t" ::: "memory");
+      }
+    }
+
+    // Step 2: IPUs move sram_sw -> nram_sw and sram_a[a_slot_off] -> nram_a[0]
+    // on MV in full overlap with GDRAM2WRAM streaming on IO!
+    if (__is_ipu()) {
+      if (!prefetched_w) {
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+      }
+      __memcpy_async(nram_sw,
+                     sram_sw[sw_slot] + ipu_n_off,
+                     kDealN * sizeof(float),
+                     SRAM2NRAM);
+      __memcpy_async(nram_a[0],
+                     sram_a[a_slot_off],
+                     deal_m0 * kGroupWidth * sizeof(int8_t),
+                     SRAM2NRAM);
+      if (shard_m <= 24) {
+        if (g == 1) {
+          __memcpy_async(
+              sa_48, sram_sa[a_slot_off], deal_m0 * sizeof(float), SRAM2NRAM);
+        } else {
+          __memcpy_async(sa_48,
+                         sram_sa[a_slot_off] + grp,
+                         sizeof(float),
+                         SRAM2NRAM,
+                         sizeof(float),
+                         g * sizeof(float),
+                         deal_m0 - 1);
+        }
+        __sync_move();
+      } else {
+        move_and_expand_sa(nram_comb[0],
+                           sa_128x48,
+                           sa_48,
+                           sram_sa[a_slot_off],
+                           deal_m0,
+                           grp,
+                           g);
+      }
+      asm volatile("barrier.sync.local.pmv.cmv 3, 5;\n\t" ::: "memory");
+    }
+    if (__is_mpu()) {
+      asm volatile("barrier.sync.local.pio.cio 3, 5;\n\t" ::: "memory");
+    }
+
+    const uint32_t next_job = job + taskDimY;
+    bool do_prefetch_next = false;
+    bool do_prefetch_w = false;
+    int32_t next_grp = 0;
+    int32_t next_n_start = 0;
+    int32_t next_shard_m_begin = 0;
+    const float* next_sw_ptr = nullptr;
+    const int8_t* next_w_base = nullptr;
+    if (next_job < total_jobs && num_m_blocks >= 2u) {
+      const uint32_t next_m_shard_idx = next_job >> n_blk_shift;
+      next_shard_m_begin = static_cast<int32_t>(next_m_shard_idx) * m_per_shard;
+      const int32_t next_shard_m_end = (next_shard_m_begin + m_per_shard < m)
+                                           ? (next_shard_m_begin + m_per_shard)
+                                           : m;
+      const int32_t next_shard_m = next_shard_m_end - next_shard_m_begin;
+      if (next_shard_m >= 2 * kTileM) {
+        const uint32_t next_gn_blk = next_job & n_blk_mask;
+        next_grp = static_cast<int32_t>(next_gn_blk >> 1);
+        next_n_start = static_cast<int32_t>(next_gn_blk & 1u) * kBlockN;
+        next_sw_ptr =
+            scale_w + static_cast<int64_t>(next_grp) * kGroupOut + next_n_start;
+        do_prefetch_next = true;
+        if (num_m_blocks >= 14u) {
+          next_w_base = weight + (static_cast<int64_t>(next_grp) * kGroupOut +
+                                  next_n_start) *
+                                     kGroupWidth;
+          do_prefetch_w = true;
+        }
+      }
+    }
+
+    // Steady-state 4-stage loop: MPU Load(m_blk+2) (+ idle-MPU 1.5MiB weight
+    // prefetch) || IPU Move || Compute || Store.
+    for (uint32_t m_blk = 0; m_blk < num_m_blocks; ++m_blk) {
+      const int32_t n_slot = static_cast<int32_t>(m_blk & 1u);
+      const int32_t next_n_slot = n_slot ^ 1;
+      const int32_t s_slot = static_cast<int32_t>((m_blk + a_slot_off) & 1u);
+      const int32_t next_s_slot = s_slot ^ 1;
+      const int32_t local_m_start = static_cast<int32_t>(m_blk) * kTileM;
+      const int32_t deal_m = (shard_m - local_m_start < kTileM)
+                                 ? (shard_m - local_m_start)
+                                 : kTileM;
+
+      if (__is_mpu()) {
+        if (m_blk + 2u < num_m_blocks) {
+          const int32_t load_m_start =
+              static_cast<int32_t>(m_blk + 2u) * kTileM;
+          const int32_t load_deal_m = (shard_m - load_m_start < kTileM)
+                                          ? (shard_m - load_m_start)
+                                          : kTileM;
+          load_qa_sram(sram_a[s_slot],
+                       sram_sa[s_slot],
+                       q_a,
+                       scale_a,
+                       shard_m_begin + load_m_start,
+                       load_deal_m,
+                       grp,
+                       g);
+          if (do_prefetch_w && m_blk + 14u >= num_m_blocks) {
+            const uint32_t k =
+                m_blk + 14u - num_m_blocks;  // 0 .. 11 (12 x 128KiB = 1.5MiB)
+            const uint32_t dst_ipu = k / 3u;
+            const uint32_t chunk = k - dst_ipu * 3u;
+            __memcpy_async(sram_w[dst_ipu] +
+                               static_cast<int64_t>(chunk) * 32 * kGroupWidth,
+                           next_w_base + static_cast<int64_t>(dst_ipu * kDealN +
+                                                              chunk * 32) *
+                                             kGroupWidth,
+                           32 * kGroupWidth * sizeof(int8_t),
+                           GDRAM2SRAM);
+          }
+        } else if (do_prefetch_next) {
+          if (m_blk + 2u == num_m_blocks) {
+            __memcpy_async(sram_sw[sw_slot ^ 1],
+                           next_sw_ptr,
+                           kBlockN * sizeof(float),
+                           GDRAM2SRAM);
+            load_qa_sram(sram_a[s_slot],
+                         sram_sa[s_slot],
+                         q_a,
+                         scale_a,
+                         next_shard_m_begin,
+                         kTileM,
+                         next_grp,
+                         g);
+          } else {
+            load_qa_sram(sram_a[s_slot],
+                         sram_sa[s_slot],
+                         q_a,
+                         scale_a,
+                         next_shard_m_begin + kTileM,
+                         kTileM,
+                         next_grp,
+                         g);
+          }
+        }
+        asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+      }
+
+      if (__is_ipu()) {
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        if (m_blk + 1u < num_m_blocks) {
+          const int32_t next_m_start =
+              static_cast<int32_t>(m_blk + 1u) * kTileM;
+          const int32_t next_deal_m = (shard_m - next_m_start < kTileM)
+                                          ? (shard_m - next_m_start)
+                                          : kTileM;
+          __memcpy_async(nram_a[next_n_slot],
+                         sram_a[next_s_slot],
+                         next_deal_m * kGroupWidth * sizeof(int8_t),
+                         SRAM2NRAM);
+          move_and_expand_sa(nram_comb[next_n_slot],
+                             sa_128x48,
+                             sa_48,
+                             sram_sa[next_s_slot],
+                             next_deal_m,
+                             grp,
+                             g);
+        }
+
+        float* comb_cur = nram_comb[n_slot];
+        if (shard_m <= 24) {
+          for (int32_t r = 0; r < deal_m; ++r) {
+            __bang_mul_scalar(
+                comb_cur + r * kDealN, nram_sw, __load_nram(sa_48 + r), kDealN);
+          }
+        } else {
+          __bang_cycle_mul(
+              comb_cur, comb_cur, nram_sw, deal_m * kDealN, kDealN);
+        }
+
+        bfloat16_t* dst_ptr =
+            y_out +
+            static_cast<int64_t>(shard_m_begin + local_m_start) *
+                (g * kGroupOut) +
+            grp * kGroupOut + n_start + ipu_n_off;
+
+        if (n_slot == 0) {
+          bfloat16_t* out0 = reinterpret_cast<bfloat16_t*>(nram_out_u16[0]);
+          if (m_blk == 0u) {
+            asm volatile("sync.pio.csimd;\n\t" ::: "memory");
+          } else {
+            asm volatile("sync.pio0.csimd;\n\t" ::: "memory");
+          }
+          asm volatile(
+              "conv.nram.rn.f32.s8.s8 [%[out]], [%[a]], [%[b]], %[k], 1, %[m], "
+              "1, 1, 1, 1, %[n], "
+              ".mul.partial.rn([%[comb]]), .cvt.dst.rn.bf16();\n\t" ::[out] "r"(
+                  out0),
+              [a] "r"(nram_a[0]),
+              [b] "r"(wram_b),
+              [comb] "r"(comb_cur),
+              [m] "r"(deal_m),
+              [n] "i"(kDealN),
+              [k] "i"(kGroupWidth)
+              : "memory");
+          asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+          __memcpy_io0_async(dst_ptr,
+                             out0,
+                             kDealN * sizeof(bfloat16_t),
+                             NRAM2GDRAM,
+                             g * kGroupOut * sizeof(bfloat16_t),
+                             kDealN * sizeof(bfloat16_t),
+                             deal_m - 1);
+        } else {
+          bfloat16_t* out1 = reinterpret_cast<bfloat16_t*>(nram_out_u16[1]);
+          asm volatile("sync.pio1.csimd;\n\t" ::: "memory");
+          asm volatile(
+              "conv.nram.rn.f32.s8.s8 [%[out]], [%[a]], [%[b]], %[k], 1, %[m], "
+              "1, 1, 1, 1, %[n], "
+              ".mul.partial.rn([%[comb]]), .cvt.dst.rn.bf16();\n\t" ::[out] "r"(
+                  out1),
+              [a] "r"(nram_a[1]),
+              [b] "r"(wram_b),
+              [comb] "r"(comb_cur),
+              [m] "r"(deal_m),
+              [n] "i"(kDealN),
+              [k] "i"(kGroupWidth)
+              : "memory");
+          asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+          __memcpy_io1_async(dst_ptr,
+                             out1,
+                             kDealN * sizeof(bfloat16_t),
+                             NRAM2GDRAM,
+                             g * kGroupOut * sizeof(bfloat16_t),
+                             kDealN * sizeof(bfloat16_t),
+                             deal_m - 1);
+        }
+
+        asm volatile("barrier.sync.local.pmv.cmv 1, 5;\n\t" ::: "memory");
+      }
+    }
+
+    if (do_prefetch_next) {
+      a_slot_off = (num_m_blocks - 2u + a_slot_off) & 1u;
+      prefetched_next = true;
+      prefetched_w = do_prefetch_w;
+    } else {
+      a_slot_off = 0u;
+      prefetched_next = false;
+      prefetched_w = false;
+    }
+  }
+  if (__is_ipu()) {
+    __sync();
+  }
+}
+
+// Kernel 3: Multi-row pipelined smooth_b + per-token dynamic INT8 quantization
+// over [M, 1024*G].
+__mlu_global__ void quant_wo_b_kernel(const bfloat16_t* y_in,
+                                      const float* smooth_b,
+                                      int8_t* out_q,
+                                      float* out_scale,
+                                      int32_t m,
+                                      int32_t cols) {
+  if (!__is_ipu()) {
+    return;
+  }
+
+  constexpr int32_t kMaxBatchElems = 32768;
+  constexpr int32_t kMaxRows = 32;
+
+  __nram__ float smooth_nram[8192];
+  __nram__ uint16_t y_pingpong_u16[2][kMaxBatchElems];
+  __nram__ float v_f32[kMaxBatchElems];
+  __nram__ int8_t q_pingpong[2][kMaxBatchElems];
+  __nram__ float scale_ring[4][kMaxRows];
+  __nram__ uint8_t absmax_buf[kMaxRows * 16];
+
+  const int32_t max_r = static_cast<int32_t>(
+      static_cast<uint32_t>(kMaxBatchElems) / static_cast<uint32_t>(cols));
+  int32_t tile_r = static_cast<int32_t>((static_cast<uint32_t>(m) + 31u) >> 5);
+  if (tile_r < 1) {
+    tile_r = 1;
+  }
+  if (tile_r > max_r) {
+    tile_r = max_r;
+  }
+
+  const uint32_t total_tiles =
+      (static_cast<uint32_t>(m) + static_cast<uint32_t>(tile_r) - 1u) /
+      static_cast<uint32_t>(tile_r);
+  if (static_cast<uint32_t>(taskId) >= total_tiles) {
+    return;
+  }
+
+  __memcpy_io1_async(smooth_nram, smooth_b, cols * sizeof(float), GDRAM2NRAM);
+
+  const uint32_t first_tile = static_cast<uint32_t>(taskId);
+  const int32_t first_tok = static_cast<int32_t>(first_tile) * tile_r;
+  const int32_t first_r = (m - first_tok < tile_r) ? (m - first_tok) : tile_r;
+  bfloat16_t* y0 = reinterpret_cast<bfloat16_t*>(y_pingpong_u16[0]);
+  __memcpy_io1_async(y0,
+                     y_in + static_cast<int64_t>(first_tok) * cols,
+                     first_r * cols * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+  asm volatile("sync.pio1.cmv.csimd;\n\t" ::: "memory");
+
+  const int32_t first_mv_rows = first_r >> 1;
+  if (first_mv_rows > 0) {
+    move_cvt_bf16_to_f32_async(v_f32, y0, first_mv_rows * cols);
+  }
+
+  uint32_t iter = 0;
+  for (uint32_t tile = first_tile; tile < total_tiles;
+       tile += taskDim, ++iter) {
+    const int32_t slot = static_cast<int32_t>(iter & 1u);
+    const int32_t slot4 = static_cast<int32_t>(iter & 3u);
+    const int32_t tok_start = static_cast<int32_t>(tile) * tile_r;
+    const int32_t cur_r = (m - tok_start < tile_r) ? (m - tok_start) : tile_r;
+    const int32_t total_elems = cur_r * cols;
+
+    const uint32_t next_tile = tile + taskDim;
+    int32_t next_r = 0;
+    if (next_tile < total_tiles) {
+      const int32_t next_tok = static_cast<int32_t>(next_tile) * tile_r;
+      next_r = (m - next_tok < tile_r) ? (m - next_tok) : tile_r;
+      __memcpy_io1_async(
+          reinterpret_cast<bfloat16_t*>(y_pingpong_u16[slot ^ 1]),
+          y_in + static_cast<int64_t>(next_tok) * cols,
+          next_r * cols * sizeof(bfloat16_t),
+          GDRAM2NRAM);
+    }
+
+    bfloat16_t* y_cur = reinterpret_cast<bfloat16_t*>(y_pingpong_u16[slot]);
+    const int32_t mv_rows = cur_r >> 1;
+    const int32_t simd_rows = cur_r - mv_rows;
+    const int32_t mv_elems = mv_rows * cols;
+    const int32_t simd_elems = simd_rows * cols;
+
+    __bang_bfloat162float(v_f32 + mv_elems, y_cur + mv_elems, simd_elems);
+    __bang_cycle_mul(
+        v_f32 + mv_elems, v_f32 + mv_elems, smooth_nram, simd_elems, cols);
+    for (int32_t r = mv_rows; r < cur_r; ++r) {
+      asm volatile("absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                       absmax_buf + r * 16),
+                   [src] "r"(v_f32 + r * cols),
+                   [sz] "r"(cols)
+                   : "memory");
+    }
+    if (mv_elems > 0) {
+      asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+      __bang_cycle_mul(v_f32, v_f32, smooth_nram, mv_elems, cols);
+      for (int32_t r = 0; r < mv_rows; ++r) {
+        asm volatile(
+            "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                absmax_buf + r * 16),
+            [src] "r"(v_f32 + r * cols),
+            [sz] "r"(cols)
+            : "memory");
+      }
+    }
+
+    // Explicitly release y_pingpong_u16[slot] (consumed by SIMD and MV via
+    // sync.pmv.csimd) before next iter's IO1 overwrites it, independent of
+    // __sync_compute() below.
+    asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+    __sync_compute();
+
+    int8_t* q_cur = q_pingpong[slot];
+    float* s_cur = scale_ring[slot4];
+    asm volatile("sync.pio0.csimd;\n\t" ::: "memory");
+    for (int32_t r = 0; r < mv_rows; ++r) {
+      const float peak =
+          __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+      float s_val = 0.0f;
+      float m_val = 0.0f;
+      if (peak > 0.0f) {
+        s_val = peak / 127.0f;
+        m_val = 127.0f / peak;
+      }
+      __store_nram(s_cur + r, s_val);
+      asm volatile(
+          "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], %[sz];\n\t" ::
+              [dst] "r"(q_cur + r * cols),
+          [src] "r"(v_f32 + r * cols),
+          [mv] "r"(m_val),
+          [sz] "r"(cols)
+          : "memory");
+    }
+
+    if (next_tile < total_tiles) {
+      // Wait for next_tile IO1 load (into slot^1) before MV starts converting
+      // next_mv_rows and before next iter SIMD reads y_pingpong[slot^1].
+      asm volatile("sync.pio1.cmv.csimd;\n\t" ::: "memory");
+      const int32_t next_mv_rows = next_r >> 1;
+      if (next_mv_rows > 0) {
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        move_cvt_bf16_to_f32_async(
+            v_f32,
+            reinterpret_cast<bfloat16_t*>(y_pingpong_u16[slot ^ 1]),
+            next_mv_rows * cols);
+      }
+    }
+
+    for (int32_t r = mv_rows; r < cur_r; ++r) {
+      const float peak =
+          __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+      float s_val = 0.0f;
+      float m_val = 0.0f;
+      if (peak > 0.0f) {
+        s_val = peak / 127.0f;
+        m_val = 127.0f / peak;
+      }
+      __store_nram(s_cur + r, s_val);
+      asm volatile(
+          "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], %[sz];\n\t" ::
+              [dst] "r"(q_cur + r * cols),
+          [src] "r"(v_f32 + r * cols),
+          [mv] "r"(m_val),
+          [sz] "r"(cols)
+          : "memory");
+    }
+    asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+
+    __memcpy_io0_async(out_q + static_cast<int64_t>(tok_start) * cols,
+                       q_cur,
+                       total_elems * sizeof(int8_t),
+                       NRAM2GDRAM);
+    __memcpy_io0_async(
+        out_scale + tok_start, s_cur, cur_r * sizeof(float), NRAM2GDRAM);
+  }
+  __sync();
+}
+
+__mlu_func__ inline void load_wram_direct_64_io0(int8_t* wram_dst,
+                                                 const int8_t* w_sub_gdram) {
+  __memcpy_io0_async(wram_dst,
+                     w_sub_gdram,
+                     kGroupWidth * sizeof(int8_t),
+                     GDRAM2WRAM,
+                     kGroupWidth * sizeof(int8_t),
+                     3,
+                     kWramLtMap16Stride,
+                     15,
+                     kGroupWidth * sizeof(int8_t),
+                     63,
+                     0,
+                     0);
+}
+
+// Fully fused single-kernel Decode path for TP=8 (G=1, M<=768):
+// All 3 stages (inverse RoPE + wo_a quant -> W8A8 GEMM -> wo_b quant) execute
+// on-chip per cluster (<=96 tokens/cluster) with zero q_a / y_mid GDRAM traffic
+// and 1 kernel launch.
+__mlu_global__ void fused_decode_tp8_kernel(const bfloat16_t* x,
+                                            const int32_t* pos,
+                                            const float* rope,
+                                            int32_t last_pos,
+                                            const int8_t* weight,
+                                            const float* scale_w,
+                                            const float* smooth_a,
+                                            const float* smooth_b,
+                                            int8_t* out_q,
+                                            float* out_scale,
+                                            int32_t m) {
+  constexpr int32_t kMaxClusterM = 96;
+  constexpr int32_t kTileM = 48;
+  constexpr int32_t kBlockN = 256;
+  constexpr int32_t kDealN = 64;
+  constexpr int32_t kWramSlotStride =
+      4 * kGroupWidth;  // 16384B per LT (2 slots in 32768B LT)
+
+  const int32_t m_per_cluster =
+      static_cast<int32_t>((static_cast<uint32_t>(m) + 7u) >> 3);
+  const int32_t c_m_begin = static_cast<int32_t>(taskIdY) * m_per_cluster;
+  const int32_t c_m_end =
+      (c_m_begin + m_per_cluster < m) ? (c_m_begin + m_per_cluster) : m;
+  const int32_t c_m = c_m_end - c_m_begin;
+  if (c_m <= 0) {
+    return;
+  }
+
+  __mlu_shared__ int8_t sram_a[kMaxClusterM * kGroupWidth];      // 384 KB
+  __mlu_shared__ float sram_sa[kMaxClusterM];                    // 384 B
+  __mlu_shared__ uint16_t sram_y_u16[kMaxClusterM * kGroupOut];  // 192 KB
+  __mlu_shared__ float sram_sw[kGroupOut];                       // 4 KB
+  __mlu_shared__ float sram_smooth_a[kGroupWidth];               // 16 KB
+  __mlu_shared__ float sram_smooth_b[kGroupOut];                 // 4 KB
+  __mlu_shared__ int32_t sram_pos[kMaxClusterM];                 // 384 B
+
+  __nram__ uint64_t nram_pool[(448 * 1024) / sizeof(uint64_t)];
+  __wram__ int8_t wram_b[512 * 1024];
+
+  uint8_t* pool = reinterpret_cast<uint8_t*>(nram_pool);
+
+  // Immediately fire first 256 KiB weight load on IO0 (completely free during
+  // Phase 1!) while MPU stages smooth_a, smooth_b, scale_w, and pos into SRAM.
+  const int32_t ipu_n_off = coreId * kDealN;
+  if (__is_ipu()) {
+    load_wram_direct_64_io0(
+        wram_b, weight + static_cast<int64_t>(ipu_n_off) * kGroupWidth);
+  }
+  if (__is_mpu()) {
+    __memcpy_async(
+        sram_smooth_a, smooth_a, kGroupWidth * sizeof(float), GDRAM2SRAM);
+    __memcpy_async(
+        sram_smooth_b, smooth_b, kGroupOut * sizeof(float), GDRAM2SRAM);
+    __memcpy_async(sram_sw, scale_w, kGroupOut * sizeof(float), GDRAM2SRAM);
+    __memcpy_async(
+        sram_pos, pos + c_m_begin, c_m * sizeof(int32_t), GDRAM2SRAM);
+    asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+  }
+  if (__is_ipu()) {
+    asm volatile("barrier.sync.local.cmv 1, 5;\n\t" ::: "memory");
+  }
+
+  // ==================== Phase 1: Inverse RoPE + wo_a dynamic quant -> SRAM
+  // ====================
+  if (__is_ipu()) {
+    constexpr int32_t kP1MaxR = 8;
+    // Partition 448 KB NRAM pool for Phase 1 (~296 KB used, all 256B aligned)
+    float* smooth_nram = reinterpret_cast<float*>(pool + 0);        // 16 KB
+    float* sign_nram = reinterpret_cast<float*>(pool + 16 * 1024);  // 512 B
+    int32_t* pos_local =
+        reinterpret_cast<int32_t*>(pool + 16 * 1024 + 512);  // 384 B
+    uint8_t* absmax_buf = pool + 16 * 1024 + 1024;           // 128 B
+    float* scale_buf =
+        reinterpret_cast<float*>(pool + 16 * 1024 + 1280);           // 32 B
+    float* cs_buf = reinterpret_cast<float*>(pool + 20 * 1024);      // 4 KB
+    float* sin_signed = reinterpret_cast<float*>(pool + 24 * 1024);  // 2 KB
+    bfloat16_t* tail_bf16 =
+        reinterpret_cast<bfloat16_t*>(pool + 28 * 1024);  // 8 KB
+    bfloat16_t* tail_bf16_swapped =
+        reinterpret_cast<bfloat16_t*>(pool + 36 * 1024);               // 8 KB
+    float* tail_f32 = reinterpret_cast<float*>(pool + 44 * 1024);      // 16 KB
+    float* tail_swapped = reinterpret_cast<float*>(pool + 60 * 1024);  // 16 KB
+    bfloat16_t* x_buf =
+        reinterpret_cast<bfloat16_t*>(pool + 76 * 1024);           // 64 KB
+    float* v_f32 = reinterpret_cast<float*>(pool + 140 * 1024);    // 128 KB
+    int8_t* q_buf = reinterpret_cast<int8_t*>(pool + 268 * 1024);  // 32 KB
+
+    const int32_t rows_per_ipu =
+        static_cast<int32_t>((static_cast<uint32_t>(c_m) + 3u) >> 2);
+    const int32_t ipu_r_begin = coreId * rows_per_ipu;
+    const int32_t ipu_r_end =
+        (ipu_r_begin + rows_per_ipu < c_m) ? (ipu_r_begin + rows_per_ipu) : c_m;
+    const int32_t ipu_rows = ipu_r_end - ipu_r_begin;
+
+    if (ipu_rows > 0) {
+      __memcpy_async(
+          smooth_nram, sram_smooth_a, kGroupWidth * sizeof(float), SRAM2NRAM);
+      __memcpy_async(pos_local, sram_pos, c_m * sizeof(int32_t), SRAM2NRAM);
+      __memcpy_io1_async(
+          sign_nram, kSignPair128, kRopeCols * sizeof(float), GDRAM2NRAM);
+      asm volatile("sync.pio1.pmv.csimd;\n\t" ::: "memory");
+
+      for (int32_t local_off = 0; local_off < ipu_rows; local_off += kP1MaxR) {
+        const int32_t cur_r =
+            (ipu_rows - local_off < kP1MaxR) ? (ipu_rows - local_off) : kP1MaxR;
+        const int32_t c_row = ipu_r_begin + local_off;
+        const int32_t g_row = c_m_begin + c_row;
+        const int32_t total_elems = cur_r * kGroupWidth;
+
+        issue_tile_qa_io1(x_buf,
+                          cs_buf,
+                          x,
+                          rope,
+                          last_pos,
+                          pos_local,
+                          c_m_begin,
+                          g_row,
+                          cur_r,
+                          0u);
+        // Wait for previous iter NRAM2SRAM copy of q_buf & scale_buf AND
+        // current IO1 load.
+        asm volatile("sync.pio1.cmv.csimd;\n\t" ::: "memory");
+
+        __memcpy_async(tail_bf16,
+                       x_buf + kHeadPrefix,
+                       kRopeTail * sizeof(bfloat16_t),
+                       NRAM2NRAM,
+                       kRopeTail * sizeof(bfloat16_t),
+                       kHeadDim * sizeof(bfloat16_t),
+                       cur_r * kHeadsPerGroup - 1);
+        move_cvt_bf16_to_f32_async(
+            tail_f32, tail_bf16, cur_r * kHeadsPerGroup * kRopeTail);
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+
+        rotate_extracted_tail_to_buf(x_buf,
+                                     cs_buf,
+                                     tail_bf16,
+                                     tail_bf16_swapped,
+                                     tail_f32,
+                                     tail_swapped,
+                                     sin_signed,
+                                     sign_nram,
+                                     g_row,
+                                     cur_r,
+                                     0u);
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+
+        const int32_t mv_rows = cur_r >> 1;
+        const int32_t simd_rows = cur_r - mv_rows;
+        const int32_t simd_elems = simd_rows * kGroupWidth;
+        const int32_t mv_elems = mv_rows * kGroupWidth;
+        if (mv_elems > 0) {
+          asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+          move_cvt_bf16_to_f32_async(
+              v_f32 + simd_elems, x_buf + simd_elems, mv_elems);
+        }
+        __bang_bfloat162float(v_f32, x_buf, simd_elems);
+        __bang_cycle_mul(v_f32, v_f32, smooth_nram, simd_elems, kGroupWidth);
+        for (int32_t r = 0; r < simd_rows; ++r) {
+          asm volatile(
+              "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                  absmax_buf + r * 16),
+              [src] "r"(v_f32 + r * kGroupWidth),
+              [sz] "i"(kGroupWidth)
+              : "memory");
+        }
+        if (mv_elems > 0) {
+          asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+          __bang_cycle_mul(v_f32 + simd_elems,
+                           v_f32 + simd_elems,
+                           smooth_nram,
+                           mv_elems,
+                           kGroupWidth);
+          for (int32_t r = simd_rows; r < cur_r; ++r) {
+            asm volatile(
+                "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                    absmax_buf + r * 16),
+                [src] "r"(v_f32 + r * kGroupWidth),
+                [sz] "i"(kGroupWidth)
+                : "memory");
+          }
+        }
+        __sync_compute();
+
+        for (int32_t r = 0; r < cur_r; ++r) {
+          const float peak =
+              __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+          float s_val = 0.0f;
+          float m_val = 0.0f;
+          if (peak > 0.0f) {
+            s_val = peak / 127.0f;
+            m_val = 127.0f / peak;
+          }
+          __store_nram(scale_buf + r, s_val);
+          asm volatile(
+              "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], "
+              "%[sz];\n\t" ::[dst] "r"(q_buf + r * kGroupWidth),
+              [src] "r"(v_f32 + r * kGroupWidth),
+              [mv] "r"(m_val),
+              [sz] "i"(kGroupWidth)
+              : "memory");
+        }
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        __memcpy_async(sram_a + c_row * kGroupWidth,
+                       q_buf,
+                       total_elems * sizeof(int8_t),
+                       NRAM2SRAM);
+        __memcpy_async(
+            sram_sa + c_row, scale_buf, cur_r * sizeof(float), NRAM2SRAM);
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+      }
+    }
+    asm volatile("barrier.sync.local.pmv.cmv 2, 5;\n\t" ::: "memory");
+  }
+  if (__is_mpu()) {
+    asm volatile("barrier.sync.local 2, 5;\n\t" ::: "memory");
+  }
+
+  // ==================== Phase 2: On-chip W8A8 GEMM (4x kBlockN=256,
+  // double-buffered WRAM) -> SRAM ====================
+  if (__is_ipu()) {
+    // Partition 448 KB NRAM pool for Phase 2 (434 KB used, all 256B aligned)
+    int8_t* nram_a_all =
+        reinterpret_cast<int8_t*>(pool + 0);  // 384 KB (all <=96 rows!)
+    float* nram_comb0 = reinterpret_cast<float*>(pool + 384 * 1024);  // 12 KB
+    float* nram_comb1 = reinterpret_cast<float*>(pool + 396 * 1024);  // 12 KB
+    float* sa_64x48 = reinterpret_cast<float*>(pool + 408 * 1024);    // 12 KB
+    bfloat16_t* nram_out0 =
+        reinterpret_cast<bfloat16_t*>(pool + 420 * 1024);  // 6 KB
+    bfloat16_t* nram_out1 =
+        reinterpret_cast<bfloat16_t*>(pool + 426 * 1024);               // 6 KB
+    float* nram_sw = reinterpret_cast<float*>(pool + 432 * 1024);       // 256 B
+    float* sa_all = reinterpret_cast<float*>(pool + 432 * 1024 + 256);  // 384 B
+
+    // Load ALL c_m rows of q_a and scale_a into NRAM ONCE for all 4 N-blocks!
+    __memcpy_async(
+        nram_a_all, sram_a, c_m * kGroupWidth * sizeof(int8_t), SRAM2NRAM);
+    __memcpy_async(sa_all, sram_sa, c_m * sizeof(float), SRAM2NRAM);
+
+    const int32_t num_m_blks = (c_m > kTileM) ? 2 : 1;
+    const int32_t deal_m0 = (c_m > kTileM) ? kTileM : c_m;
+    const int32_t deal_m1 = c_m - deal_m0;
+
+    // Pre-expand sa_all into nram_comb0 (and nram_comb1 if >48 rows) once when
+    // >24 rows!
+    if (c_m > 24) {
+      __memcpy_async(sa_64x48,
+                     sa_all,
+                     48 * sizeof(float),
+                     NRAM2NRAM,
+                     48 * sizeof(float),
+                     0,
+                     63);
+      asm volatile(
+          "trans.tiling.async.nram.nram.b32 [%[dst]], [%[src]], "
+          "64, 16, 192, 1, 0, 4, 3072, 3, 64, 1, 0, "
+          "64, 16, 256, 1, 0, 4, 64, 3, 4096, 1, 0;\n\t" ::[dst] "r"(
+              nram_comb0),
+          [src] "r"(sa_64x48)
+          : "memory");
+      if (num_m_blks == 2) {
+        __memcpy_async(sa_64x48,
+                       sa_all + kTileM,
+                       48 * sizeof(float),
+                       NRAM2NRAM,
+                       48 * sizeof(float),
+                       0,
+                       63);
+        asm volatile(
+            "trans.tiling.async.nram.nram.b32 [%[dst]], [%[src]], "
+            "64, 16, 192, 1, 0, 4, 3072, 3, 64, 1, 0, "
+            "64, 16, 256, 1, 0, 4, 64, 3, 4096, 1, 0;\n\t" ::[dst] "r"(
+                nram_comb1),
+            [src] "r"(sa_64x48)
+            : "memory");
+      }
+    }
+
+    // Reuse sa_64x48 as the per-n_blk scaled comb buffer (12 KB) so
+    // nram_comb0/1 stay untouched!
+    float* comb_scaled = sa_64x48;
+    int32_t out_parity = 0;
+
+    for (int32_t n_blk = 0; n_blk < 4; ++n_blk) {
+      const int32_t n_start = n_blk * kBlockN;
+      const int32_t w_slot = n_blk & 1;
+      int8_t* wram_cur = wram_b + w_slot * kWramSlotStride;
+      int8_t* wram_nxt = wram_b + (w_slot ^ 1) * kWramSlotStride;
+
+      __memcpy_async(nram_sw,
+                     sram_sw + n_start + ipu_n_off,
+                     kDealN * sizeof(float),
+                     SRAM2NRAM);
+      asm volatile("sync.pio0.pmv.csimd;\n\t" ::: "memory");
+
+      // Double-buffer next 256 KiB weights on IO0 in full overlap with conv +
+      // NRAM2SRAM!
+      if (n_blk + 1 < 4) {
+        if (n_blk > 0) {
+          asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+        }
+        load_wram_direct_64_io0(
+            wram_nxt,
+            weight + static_cast<int64_t>((n_blk + 1) * kBlockN + ipu_n_off) *
+                         kGroupWidth);
+      }
+
+      for (int32_t mb = 0; mb < num_m_blks; ++mb) {
+        const int32_t m_off = mb * kTileM;
+        const int32_t dm = (mb == 0) ? deal_m0 : deal_m1;
+        if (c_m <= 24) {
+          for (int32_t r = 0; r < dm; ++r) {
+            __bang_mul_scalar(comb_scaled + r * kDealN,
+                              nram_sw,
+                              __load_nram(sa_all + m_off + r),
+                              kDealN);
+          }
+        } else {
+          float* sa_mat = (mb == 0) ? nram_comb0 : nram_comb1;
+          __bang_cycle_mul(comb_scaled, sa_mat, nram_sw, dm * kDealN, kDealN);
+        }
+
+        bfloat16_t* out_cur = (out_parity == 0) ? nram_out0 : nram_out1;
+        out_parity ^= 1;
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+        asm volatile(
+            "conv.nram.rn.f32.s8.s8 [%[out]], [%[a]], [%[b]], %[k], 1, %[m], "
+            "1, 1, 1, 1, %[n], "
+            ".mul.partial.rn([%[comb]]), .cvt.dst.rn.bf16();\n\t" ::[out] "r"(
+                out_cur),
+            [a] "r"(nram_a_all + m_off * kGroupWidth),
+            [b] "r"(wram_cur),
+            [comb] "r"(comb_scaled),
+            [m] "r"(dm),
+            [n] "i"(kDealN),
+            [k] "i"(kGroupWidth)
+            : "memory");
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        __memcpy_async(reinterpret_cast<bfloat16_t*>(sram_y_u16) +
+                           m_off * kGroupOut + n_start + ipu_n_off,
+                       out_cur,
+                       kDealN * sizeof(bfloat16_t),
+                       NRAM2SRAM,
+                       kGroupOut * sizeof(bfloat16_t),
+                       kDealN * sizeof(bfloat16_t),
+                       dm - 1);
+      }
+    }
+    asm volatile("barrier.sync.local.pmv.cmv 3, 5;\n\t" ::: "memory");
+  }
+  if (__is_mpu()) {
+    asm volatile("barrier.sync.local 3, 5;\n\t" ::: "memory");
+  }
+
+  // ==================== Phase 3: wo_b dynamic quant from SRAM -> GDRAM
+  // ====================
+  if (__is_ipu()) {
+    const int32_t rows_per_ipu =
+        static_cast<int32_t>((static_cast<uint32_t>(c_m) + 3u) >> 2);
+    const int32_t ipu_r_begin = coreId * rows_per_ipu;
+    const int32_t ipu_r_end =
+        (ipu_r_begin + rows_per_ipu < c_m) ? (ipu_r_begin + rows_per_ipu) : c_m;
+    const int32_t ipu_rows = ipu_r_end - ipu_r_begin;
+
+    if (ipu_rows > 0) {
+      // Partition 448 KB NRAM pool for Phase 3 (174 KB used, all <=24 rows in 1
+      // shot!)
+      float* smooth_b_nram = reinterpret_cast<float*>(pool + 0);  // 4 KB
+      uint8_t* absmax_buf = pool + 4 * 1024;                      // 384 B
+      float* scale_buf =
+          reinterpret_cast<float*>(pool + 4 * 1024 + 512);  // 96 B
+      bfloat16_t* y_buf =
+          reinterpret_cast<bfloat16_t*>(pool + 8 * 1024);            // 48 KB
+      float* v_f32 = reinterpret_cast<float*>(pool + 56 * 1024);     // 96 KB
+      int8_t* q_buf = reinterpret_cast<int8_t*>(pool + 152 * 1024);  // 24 KB
+
+      const int32_t total_elems = ipu_rows * kGroupOut;
+      __memcpy_async(
+          smooth_b_nram, sram_smooth_b, kGroupOut * sizeof(float), SRAM2NRAM);
+      __memcpy_async(
+          y_buf,
+          reinterpret_cast<bfloat16_t*>(sram_y_u16) + ipu_r_begin * kGroupOut,
+          total_elems * sizeof(bfloat16_t),
+          SRAM2NRAM);
+      asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+
+      const int32_t mv_rows = ipu_rows >> 1;
+      const int32_t simd_rows = ipu_rows - mv_rows;
+      const int32_t simd_elems = simd_rows * kGroupOut;
+      const int32_t mv_elems = mv_rows * kGroupOut;
+      if (mv_elems > 0) {
+        move_cvt_bf16_to_f32_async(
+            v_f32 + simd_elems, y_buf + simd_elems, mv_elems);
+      }
+      __bang_bfloat162float(v_f32, y_buf, simd_elems);
+      __bang_cycle_mul(v_f32, v_f32, smooth_b_nram, simd_elems, kGroupOut);
+      for (int32_t r = 0; r < simd_rows; ++r) {
+        asm volatile(
+            "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                absmax_buf + r * 16),
+            [src] "r"(v_f32 + r * kGroupOut),
+            [sz] "i"(kGroupOut)
+            : "memory");
+      }
+      if (mv_elems > 0) {
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+        __bang_cycle_mul(v_f32 + simd_elems,
+                         v_f32 + simd_elems,
+                         smooth_b_nram,
+                         mv_elems,
+                         kGroupOut);
+        for (int32_t r = simd_rows; r < ipu_rows; ++r) {
+          asm volatile(
+              "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                  absmax_buf + r * 16),
+              [src] "r"(v_f32 + r * kGroupOut),
+              [sz] "i"(kGroupOut)
+              : "memory");
+        }
+      }
+      __sync_compute();
+
+      for (int32_t r = 0; r < ipu_rows; ++r) {
+        const float peak =
+            __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+        float s_val = 0.0f;
+        float m_val = 0.0f;
+        if (peak > 0.0f) {
+          s_val = peak / 127.0f;
+          m_val = 127.0f / peak;
+        }
+        __store_nram(scale_buf + r, s_val);
+        asm volatile(
+            "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], "
+            "%[sz];\n\t" ::[dst] "r"(q_buf + r * kGroupOut),
+            [src] "r"(v_f32 + r * kGroupOut),
+            [mv] "r"(m_val),
+            [sz] "i"(kGroupOut)
+            : "memory");
+      }
+      asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+      const int32_t out_tok_start = c_m_begin + ipu_r_begin;
+      __memcpy_io0_async(
+          out_q + static_cast<int64_t>(out_tok_start) * kGroupOut,
+          q_buf,
+          total_elems * sizeof(int8_t),
+          NRAM2GDRAM);
+      __memcpy_io0_async(out_scale + out_tok_start,
+                         scale_buf,
+                         ipu_rows * sizeof(float),
+                         NRAM2GDRAM);
+    }
+    __sync();
+  }
+}
+
+// Fused K1+K2 Decode kernel for G in {2, 4, 8} and M*G <= 768 (<=96
+// tokens/cluster): Each cluster owns (grp, m_shard), computes inverse RoPE +
+// wo_a quant into SRAM while overlapping n_blk=0 256KiB WRAM weight load on
+// IO0, then runs 4x kBlockN=256 double-buffered WRAM GEMM directly from
+// NRAM-resident activations and stores y_mid on IO1.
+__mlu_global__ void fused_decode_rope_gemm_kernel(const bfloat16_t* x,
+                                                  const int32_t* pos,
+                                                  const float* rope,
+                                                  int32_t last_pos,
+                                                  const int8_t* weight,
+                                                  const float* scale_w,
+                                                  const float* smooth_a,
+                                                  bfloat16_t* y_out,
+                                                  int32_t m,
+                                                  int32_t g,
+                                                  uint32_t cpg_shift) {
+  constexpr int32_t kMaxClusterM = 96;
+  constexpr int32_t kTileM = 48;
+  constexpr int32_t kBlockN = 256;
+  constexpr int32_t kDealN = 64;
+  constexpr int32_t kWramSlotStride =
+      4 * kGroupWidth;  // 16384B per LT (2 slots)
+
+  const uint32_t clusters_per_grp = 1u << cpg_shift;
+  const uint32_t m_shard =
+      static_cast<uint32_t>(taskIdY) & (clusters_per_grp - 1u);
+  const int32_t grp =
+      static_cast<int32_t>(static_cast<uint32_t>(taskIdY) >> cpg_shift);
+  if (grp >= g) {
+    return;
+  }
+
+  const int32_t m_per_cluster = static_cast<int32_t>(
+      (static_cast<uint32_t>(m) + clusters_per_grp - 1u) >> cpg_shift);
+  const int32_t c_m_begin = static_cast<int32_t>(m_shard) * m_per_cluster;
+  const int32_t c_m_end =
+      (c_m_begin + m_per_cluster < m) ? (c_m_begin + m_per_cluster) : m;
+  const int32_t c_m = c_m_end - c_m_begin;
+  if (c_m <= 0) {
+    return;
+  }
+
+  __mlu_shared__ int8_t sram_a[kMaxClusterM * kGroupWidth];  // 384 KB
+  __mlu_shared__ float sram_sa[kMaxClusterM];                // 384 B
+  __mlu_shared__ float sram_sw[kGroupOut];                   // 4 KB
+  __mlu_shared__ float sram_smooth_a[kGroupWidth];           // 16 KB
+  __mlu_shared__ int32_t sram_pos[kMaxClusterM];             // 384 B
+
+  __nram__ uint64_t nram_pool[(448 * 1024) / sizeof(uint64_t)];
+  __wram__ int8_t wram_b[512 * 1024];
+
+  uint8_t* pool = reinterpret_cast<uint8_t*>(nram_pool);
+  const int32_t ipu_n_off = coreId * kDealN;
+  const int8_t* w_grp =
+      weight + static_cast<int64_t>(grp) * kGroupOut * kGroupWidth;
+  const float* sw_grp = scale_w + static_cast<int64_t>(grp) * kGroupOut;
+
+  // Overlap first 256 KiB weight load on IO0 with Phase 1 RoPE + quant!
+  if (__is_ipu()) {
+    load_wram_direct_64_io0(
+        wram_b, w_grp + static_cast<int64_t>(ipu_n_off) * kGroupWidth);
+  }
+  if (__is_mpu()) {
+    __memcpy_async(
+        sram_smooth_a, smooth_a, kGroupWidth * sizeof(float), GDRAM2SRAM);
+    __memcpy_async(sram_sw, sw_grp, kGroupOut * sizeof(float), GDRAM2SRAM);
+    __memcpy_async(
+        sram_pos, pos + c_m_begin, c_m * sizeof(int32_t), GDRAM2SRAM);
+    asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+  }
+  if (__is_ipu()) {
+    asm volatile("barrier.sync.local.cmv 1, 5;\n\t" ::: "memory");
+  }
+
+  // ==================== Phase 1: Inverse RoPE + wo_a dynamic quant -> SRAM
+  // ====================
+  if (__is_ipu()) {
+    constexpr int32_t kP1MaxR = 8;
+    float* smooth_nram = reinterpret_cast<float*>(pool + 0);        // 16 KB
+    float* sign_nram = reinterpret_cast<float*>(pool + 16 * 1024);  // 512 B
+    int32_t* pos_local =
+        reinterpret_cast<int32_t*>(pool + 16 * 1024 + 512);  // 384 B
+    uint8_t* absmax_buf = pool + 16 * 1024 + 1024;           // 128 B
+    float* scale_buf =
+        reinterpret_cast<float*>(pool + 16 * 1024 + 1280);           // 32 B
+    float* cs_buf = reinterpret_cast<float*>(pool + 20 * 1024);      // 4 KB
+    float* sin_signed = reinterpret_cast<float*>(pool + 24 * 1024);  // 2 KB
+    bfloat16_t* tail_bf16 =
+        reinterpret_cast<bfloat16_t*>(pool + 28 * 1024);  // 8 KB
+    bfloat16_t* tail_bf16_swapped =
+        reinterpret_cast<bfloat16_t*>(pool + 36 * 1024);               // 8 KB
+    float* tail_f32 = reinterpret_cast<float*>(pool + 44 * 1024);      // 16 KB
+    float* tail_swapped = reinterpret_cast<float*>(pool + 60 * 1024);  // 16 KB
+    bfloat16_t* x_buf =
+        reinterpret_cast<bfloat16_t*>(pool + 76 * 1024);           // 64 KB
+    float* v_f32 = reinterpret_cast<float*>(pool + 140 * 1024);    // 128 KB
+    int8_t* q_buf = reinterpret_cast<int8_t*>(pool + 268 * 1024);  // 32 KB
+
+    const int32_t rows_per_ipu =
+        static_cast<int32_t>((static_cast<uint32_t>(c_m) + 3u) >> 2);
+    const int32_t ipu_r_begin = coreId * rows_per_ipu;
+    const int32_t ipu_r_end =
+        (ipu_r_begin + rows_per_ipu < c_m) ? (ipu_r_begin + rows_per_ipu) : c_m;
+    const int32_t ipu_rows = ipu_r_end - ipu_r_begin;
+
+    if (ipu_rows > 0) {
+      __memcpy_async(
+          smooth_nram, sram_smooth_a, kGroupWidth * sizeof(float), SRAM2NRAM);
+      __memcpy_async(pos_local, sram_pos, c_m * sizeof(int32_t), SRAM2NRAM);
+      __memcpy_io1_async(
+          sign_nram, kSignPair128, kRopeCols * sizeof(float), GDRAM2NRAM);
+      asm volatile("sync.pio1.pmv.csimd;\n\t" ::: "memory");
+
+      for (int32_t local_off = 0; local_off < ipu_rows; local_off += kP1MaxR) {
+        const int32_t cur_r =
+            (ipu_rows - local_off < kP1MaxR) ? (ipu_rows - local_off) : kP1MaxR;
+        const int32_t c_row = ipu_r_begin + local_off;
+        const int32_t g_tok = c_m_begin + c_row;
+        const int32_t total_elems = cur_r * kGroupWidth;
+
+        const bfloat16_t* x_src =
+            x + (static_cast<int64_t>(g_tok) * g + grp) * kGroupWidth;
+        if (cur_r == 1) {
+          __memcpy_io1_async(
+              x_buf, x_src, kGroupWidth * sizeof(bfloat16_t), GDRAM2NRAM);
+        } else {
+          __memcpy_io1_async(x_buf,
+                             x_src,
+                             kGroupWidth * sizeof(bfloat16_t),
+                             GDRAM2NRAM,
+                             kGroupWidth * sizeof(bfloat16_t),
+                             g * kGroupWidth * sizeof(bfloat16_t),
+                             cur_r - 1);
+        }
+        load_rope_rows(cs_buf, rope, last_pos, pos_local + c_row, cur_r);
+        asm volatile("sync.pio1.cmv.csimd;\n\t" ::: "memory");
+
+        __memcpy_async(tail_bf16,
+                       x_buf + kHeadPrefix,
+                       kRopeTail * sizeof(bfloat16_t),
+                       NRAM2NRAM,
+                       kRopeTail * sizeof(bfloat16_t),
+                       kHeadDim * sizeof(bfloat16_t),
+                       cur_r * kHeadsPerGroup - 1);
+        move_cvt_bf16_to_f32_async(
+            tail_f32, tail_bf16, cur_r * kHeadsPerGroup * kRopeTail);
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+
+        rotate_extracted_tail_to_buf(x_buf,
+                                     cs_buf,
+                                     tail_bf16,
+                                     tail_bf16_swapped,
+                                     tail_f32,
+                                     tail_swapped,
+                                     sin_signed,
+                                     sign_nram,
+                                     g_tok,
+                                     cur_r,
+                                     0u);
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+
+        const int32_t mv_rows = cur_r >> 1;
+        const int32_t simd_rows = cur_r - mv_rows;
+        const int32_t simd_elems = simd_rows * kGroupWidth;
+        const int32_t mv_elems = mv_rows * kGroupWidth;
+        if (mv_elems > 0) {
+          asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+          move_cvt_bf16_to_f32_async(
+              v_f32 + simd_elems, x_buf + simd_elems, mv_elems);
+        }
+        __bang_bfloat162float(v_f32, x_buf, simd_elems);
+        __bang_cycle_mul(v_f32, v_f32, smooth_nram, simd_elems, kGroupWidth);
+        for (int32_t r = 0; r < simd_rows; ++r) {
+          asm volatile(
+              "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                  absmax_buf + r * 16),
+              [src] "r"(v_f32 + r * kGroupWidth),
+              [sz] "i"(kGroupWidth)
+              : "memory");
+        }
+        if (mv_elems > 0) {
+          asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+          __bang_cycle_mul(v_f32 + simd_elems,
+                           v_f32 + simd_elems,
+                           smooth_nram,
+                           mv_elems,
+                           kGroupWidth);
+          for (int32_t r = simd_rows; r < cur_r; ++r) {
+            asm volatile(
+                "absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t" ::[dst] "r"(
+                    absmax_buf + r * 16),
+                [src] "r"(v_f32 + r * kGroupWidth),
+                [sz] "i"(kGroupWidth)
+                : "memory");
+          }
+        }
+        __sync_compute();
+
+        for (int32_t r = 0; r < cur_r; ++r) {
+          const float peak =
+              __load_nram(reinterpret_cast<float*>(absmax_buf + r * 16));
+          float s_val = 0.0f;
+          float m_val = 0.0f;
+          if (peak > 0.0f) {
+            s_val = peak / 127.0f;
+            m_val = 127.0f / peak;
+          }
+          __store_nram(scale_buf + r, s_val);
+          asm volatile(
+              "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[mv], "
+              "%[sz];\n\t" ::[dst] "r"(q_buf + r * kGroupWidth),
+              [src] "r"(v_f32 + r * kGroupWidth),
+              [mv] "r"(m_val),
+              [sz] "i"(kGroupWidth)
+              : "memory");
+        }
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+        __memcpy_async(sram_a + c_row * kGroupWidth,
+                       q_buf,
+                       total_elems * sizeof(int8_t),
+                       NRAM2SRAM);
+        __memcpy_async(
+            sram_sa + c_row, scale_buf, cur_r * sizeof(float), NRAM2SRAM);
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+      }
+    }
+    asm volatile("barrier.sync.local.pmv.cmv 2, 5;\n\t" ::: "memory");
+  }
+  if (__is_mpu()) {
+    asm volatile("barrier.sync.local 2, 5;\n\t" ::: "memory");
+  }
+
+  // ==================== Phase 2: On-chip W8A8 GEMM (4x kBlockN=256,
+  // double-buffered WRAM) -> GDRAM y_out ====================
+  if (__is_ipu()) {
+    int8_t* nram_a_all = reinterpret_cast<int8_t*>(pool + 0);         // 384 KB
+    float* nram_comb0 = reinterpret_cast<float*>(pool + 384 * 1024);  // 12 KB
+    float* nram_comb1 = reinterpret_cast<float*>(pool + 396 * 1024);  // 12 KB
+    float* sa_64x48 = reinterpret_cast<float*>(pool + 408 * 1024);    // 12 KB
+    bfloat16_t* nram_out0 =
+        reinterpret_cast<bfloat16_t*>(pool + 420 * 1024);  // 6 KB
+    bfloat16_t* nram_out1 =
+        reinterpret_cast<bfloat16_t*>(pool + 426 * 1024);               // 6 KB
+    float* nram_sw = reinterpret_cast<float*>(pool + 432 * 1024);       // 256 B
+    float* sa_all = reinterpret_cast<float*>(pool + 432 * 1024 + 256);  // 384 B
+
+    __memcpy_async(
+        nram_a_all, sram_a, c_m * kGroupWidth * sizeof(int8_t), SRAM2NRAM);
+    __memcpy_async(sa_all, sram_sa, c_m * sizeof(float), SRAM2NRAM);
+
+    const int32_t num_m_blks = (c_m > kTileM) ? 2 : 1;
+    const int32_t deal_m0 = (c_m > kTileM) ? kTileM : c_m;
+    const int32_t deal_m1 = c_m - deal_m0;
+
+    if (c_m > 24) {
+      __memcpy_async(sa_64x48,
+                     sa_all,
+                     48 * sizeof(float),
+                     NRAM2NRAM,
+                     48 * sizeof(float),
+                     0,
+                     63);
+      asm volatile(
+          "trans.tiling.async.nram.nram.b32 [%[dst]], [%[src]], "
+          "64, 16, 192, 1, 0, 4, 3072, 3, 64, 1, 0, "
+          "64, 16, 256, 1, 0, 4, 64, 3, 4096, 1, 0;\n\t" ::[dst] "r"(
+              nram_comb0),
+          [src] "r"(sa_64x48)
+          : "memory");
+      if (num_m_blks == 2) {
+        __memcpy_async(sa_64x48,
+                       sa_all + kTileM,
+                       48 * sizeof(float),
+                       NRAM2NRAM,
+                       48 * sizeof(float),
+                       0,
+                       63);
+        asm volatile(
+            "trans.tiling.async.nram.nram.b32 [%[dst]], [%[src]], "
+            "64, 16, 192, 1, 0, 4, 3072, 3, 64, 1, 0, "
+            "64, 16, 256, 1, 0, 4, 64, 3, 4096, 1, 0;\n\t" ::[dst] "r"(
+                nram_comb1),
+            [src] "r"(sa_64x48)
+            : "memory");
+      }
+    }
+
+    float* comb_scaled = sa_64x48;
+    int32_t out_parity = 0;
+
+    for (int32_t n_blk = 0; n_blk < 4; ++n_blk) {
+      const int32_t n_start = n_blk * kBlockN;
+      const int32_t w_slot = n_blk & 1;
+      int8_t* wram_cur = wram_b + w_slot * kWramSlotStride;
+      int8_t* wram_nxt = wram_b + (w_slot ^ 1) * kWramSlotStride;
+
+      __memcpy_async(nram_sw,
+                     sram_sw + n_start + ipu_n_off,
+                     kDealN * sizeof(float),
+                     SRAM2NRAM);
+      asm volatile("sync.pio0.pmv.csimd;\n\t" ::: "memory");
+
+      // Double-buffer next 256 KiB weights on IO0 while IO1 stores y_out!
+      if (n_blk + 1 < 4) {
+        if (n_blk > 0) {
+          asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+        }
+        load_wram_direct_64_io0(
+            wram_nxt,
+            w_grp + static_cast<int64_t>((n_blk + 1) * kBlockN + ipu_n_off) *
+                        kGroupWidth);
+      }
+
+      for (int32_t mb = 0; mb < num_m_blks; ++mb) {
+        const int32_t m_off = mb * kTileM;
+        const int32_t dm = (mb == 0) ? deal_m0 : deal_m1;
+        if (c_m <= 24) {
+          for (int32_t r = 0; r < dm; ++r) {
+            __bang_mul_scalar(comb_scaled + r * kDealN,
+                              nram_sw,
+                              __load_nram(sa_all + m_off + r),
+                              kDealN);
+          }
+        } else {
+          float* sa_mat = (mb == 0) ? nram_comb0 : nram_comb1;
+          __bang_cycle_mul(comb_scaled, sa_mat, nram_sw, dm * kDealN, kDealN);
+        }
+
+        bfloat16_t* out_cur = (out_parity == 0) ? nram_out0 : nram_out1;
+        out_parity ^= 1;
+        asm volatile("sync.pio1.csimd;\n\t" ::: "memory");
+        asm volatile(
+            "conv.nram.rn.f32.s8.s8 [%[out]], [%[a]], [%[b]], %[k], 1, %[m], "
+            "1, 1, 1, 1, %[n], "
+            ".mul.partial.rn([%[comb]]), .cvt.dst.rn.bf16();\n\t" ::[out] "r"(
+                out_cur),
+            [a] "r"(nram_a_all + m_off * kGroupWidth),
+            [b] "r"(wram_cur),
+            [comb] "r"(comb_scaled),
+            [m] "r"(dm),
+            [n] "i"(kDealN),
+            [k] "i"(kGroupWidth)
+            : "memory");
+        asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+        bfloat16_t* dst_ptr =
+            y_out + static_cast<int64_t>(c_m_begin + m_off) * (g * kGroupOut) +
+            grp * kGroupOut + n_start + ipu_n_off;
+        if (dm == 1) {
+          __memcpy_io1_async(
+              dst_ptr, out_cur, kDealN * sizeof(bfloat16_t), NRAM2GDRAM);
+        } else {
+          __memcpy_io1_async(dst_ptr,
+                             out_cur,
+                             kDealN * sizeof(bfloat16_t),
+                             NRAM2GDRAM,
+                             g * kGroupOut * sizeof(bfloat16_t),
+                             kDealN * sizeof(bfloat16_t),
+                             dm - 1);
+        }
+      }
+      if (n_blk + 1 < 4) {
+        asm volatile("sync.psimd.cmv;\n\t" ::: "memory");
+      }
+    }
+    __sync();
+  }
+}
+}  // namespace xllm::kernel::mlu::bangc::output_projection

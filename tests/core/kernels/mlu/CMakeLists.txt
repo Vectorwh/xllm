@@ -125,6 +125,30 @@ cc_test(
 )
 
 cc_test(
+  NAME fused_dsa_qb_mlu_test
+  RUN_SERIAL
+  SRCS fused_dsa_qb_test.cpp
+  DEPS xllm::mlu_ops torch torch_mlu cnrt glog::glog GTest::gtest_main
+  ENVIRONMENT "OMP_NUM_THREADS=4;MKL_NUM_THREADS=4"
+)
+
+cc_test(
+  NAME fused_dsa_projection_mlu_test
+  RUN_SERIAL
+  SRCS fused_dsa_projection_test.cpp
+  DEPS xllm::mlu_ops torch torch_mlu cnrt glog::glog GTest::gtest_main
+  ENVIRONMENT "OMP_NUM_THREADS=4;MKL_NUM_THREADS=4"
+)
+
+cc_test(
+  NAME fused_dsa_output_projection_mlu_test
+  RUN_SERIAL
+  SRCS fused_dsa_output_projection_test.cpp
+  DEPS xllm::mlu_ops torch torch_mlu cnrt glog::glog GTest::gtest_main
+  ENVIRONMENT "OMP_NUM_THREADS=4;MKL_NUM_THREADS=4"
+)
+
+cc_test(
   NAME fused_compress_kv_cache_mlu_test
   RUN_SERIAL
   SRCS fused_compress_kv_cache_test.cpp fused_compress_kv_cache_placement_test.cpp

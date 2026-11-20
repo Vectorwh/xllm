@@ -15,13 +15,19 @@ limitations under the License.
 
 #include "kernels/mlu/bangc/include/deepseek_v41.h"
 
+#include <ATen/MemoryOverlap.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
 #include "framework/core/MLUStream.h"
+#include "kernels/mlu/bangc/include/deepseek_v41_constants.h"
 #include "kernels/mlu/bangc/src/deepseek_v41/compress_params.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_output_projection/output_projection.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_qb/qb.h"
 #include "kernels/mlu/bangc/src/deepseek_v41/indexer_k_params.h"
 #include "kernels/mlu/bangc/src/deepseek_v41/launch.h"
 #include "kernels/mlu/bangc/torch_api/tensor_checks.h"
@@ -131,6 +137,267 @@ void check_state(const torch::Tensor& tensor,
 }
 
 }  // namespace
+
+DSAProjectionOutput fused_dsa_projection(
+    const torch::Tensor& x,
+    const torch::Tensor& w_kv,
+    const torch::Tensor& w_qa,
+    const torch::Tensor& gamma_kv,
+    const torch::Tensor& gamma_q,
+    const torch::Tensor& positions,
+    const torch::Tensor& rope,
+    float rms_norm_eps,
+    const torch::Tensor& w_ckv,
+    const torch::Tensor& w_gate,
+    std::optional<DSAProjectionOutput> out) {
+  const torch::Device device = x.device();
+  CHECK(device.is_privateuseone());
+  CHECK_EQ(x.dim(), 2);
+  CHECK(std::isfinite(rms_norm_eps) && rms_norm_eps > 0);
+  const int64_t rows = x.size(0);
+  CHECK_LE(rows, projection::kMaxLargeM) << "local projection row limit";
+  const int32_t c = w_ckv.defined() + w_gate.defined();
+  CHECK(!w_gate.defined() || w_ckv.defined());
+  constexpr auto bf16 = torch::kBFloat16;
+  check_contiguous(x, device, {rows, projection::kHidden}, bf16);
+  check_contiguous(w_kv, device, {kHeadDim, projection::kHidden}, bf16);
+  check_contiguous(
+      w_qa, device, {projection::kQRank, projection::kHidden}, bf16);
+  check_contiguous(gamma_kv, device, {kHeadDim}, bf16);
+  check_contiguous(gamma_q, device, {projection::kQRank}, bf16);
+  for (const auto* weight : {&w_ckv, &w_gate}) {
+    if (weight->defined()) {
+      check_contiguous(*weight, device, w_kv.sizes(), bf16);
+    }
+  }
+  check_contiguous(positions, device, {rows}, torch::kInt32);
+  CHECK_EQ(rope.dim(), 2);
+  CHECK_GT(rope.size(0), 0);
+  CHECK_LE(rope.size(0), 1048576);
+  check_contiguous(rope, device, {rope.size(0), kRopeColumns}, torch::kFloat32);
+  const torch::DeviceGuard guard(device);
+  const auto raw_dtype = c == 2 ? torch::kFloat32 : bf16;
+  if (out.has_value()) {
+    check_contiguous(out->kv, device, {rows, kHeadDim}, bf16);
+    check_contiguous(out->qr, device, {rows, projection::kQRank}, bf16);
+    CHECK_EQ(out->raw_scores.defined(), c > 0);
+    if (c > 0) {
+      check_contiguous(
+          out->raw_scores, device, {rows, c * kHeadDim}, raw_dtype);
+    }
+    const torch::Tensor* buffers[] = {&out->kv, &out->qr, &out->raw_scores};
+    for (int32_t i = 0; i < (c > 0 ? 3 : 2); ++i) {
+      for (const auto* input : {&x,
+                                &w_kv,
+                                &w_qa,
+                                &gamma_kv,
+                                &gamma_q,
+                                &positions,
+                                &rope,
+                                &w_ckv,
+                                &w_gate}) {
+        if (input->defined()) {
+          at::assert_no_overlap(*buffers[i], *input);
+        }
+      }
+      for (int32_t j = 0; j < i; ++j) {
+        at::assert_no_overlap(*buffers[i], *buffers[j]);
+      }
+    }
+  } else {
+    out.emplace();
+    out->kv = torch::empty({rows, kHeadDim}, x.options());
+    out->qr = torch::empty({rows, projection::kQRank}, x.options());
+    if (c > 0) {
+      out->raw_scores =
+          torch::empty({rows, c * kHeadDim}, x.options().dtype(raw_dtype));
+    }
+  }
+  const projection::ProjectionArgs args{
+      x.data_ptr(),
+      w_kv.data_ptr(),
+      w_qa.data_ptr(),
+      gamma_kv.data_ptr(),
+      gamma_q.data_ptr(),
+      w_ckv.defined() ? w_ckv.data_ptr() : nullptr,
+      w_gate.defined() ? w_gate.data_ptr() : nullptr,
+      positions.data_ptr<int32_t>(),
+      rope.data_ptr<float>(),
+      out->kv.data_ptr(),
+      out->qr.data_ptr(),
+      c > 0 ? out->raw_scores.data_ptr() : nullptr,
+      static_cast<int32_t>(rows),
+      c,
+      static_cast<int32_t>(rope.size(0)),
+      rms_norm_eps};
+  CHECK_EQ(projection::launch(args, torch_mlu::getCurMLUStream(device.index())),
+           cnrtSuccess);
+  return *out;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_dsa_output_projection(
+    const torch::Tensor& x,
+    const torch::Tensor& positions,
+    const torch::Tensor& rope,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& smooth_a,
+    const torch::Tensor& smooth_b) {
+  const auto device = x.device();
+  CHECK(device.is_privateuseone());
+  CHECK_EQ(x.dim(), 3);
+  CHECK_EQ(weight.dim(), 3);
+  const int64_t groups = weight.size(0);
+  const int64_t rows = x.size(0);
+  CHECK(groups == 1 || groups == 2 || groups == 4 || groups == 8);
+  CHECK_GT(rows, 0);
+  CHECK_LE(rows, std::numeric_limits<int32_t>::max() / groups);
+  constexpr int32_t width = output_projection::kGroupWidth;
+  constexpr int32_t rank = output_projection::kGroupOut;
+  check_contiguous(x, device, {rows, 8 * groups, kHeadDim}, torch::kBFloat16);
+  check_contiguous(weight, device, {groups, rank, width}, torch::kInt8);
+  check_contiguous(positions, device, {rows}, torch::kInt32);
+  CHECK_EQ(rope.dim(), 2);
+  CHECK_GT(rope.size(0), 0);
+  check_contiguous(rope, device, {rope.size(0), kRopeColumns}, torch::kFloat32);
+  check_contiguous(weight_scale, device, {groups * rank}, torch::kFloat32);
+  check_contiguous(smooth_a, device, {width}, torch::kFloat32);
+  check_contiguous(smooth_b, device, {groups * rank}, torch::kFloat32);
+
+  const torch::DeviceGuard guard(device);
+  auto values =
+      torch::empty({rows, groups * rank}, x.options().dtype(torch::kInt8));
+  auto scales = torch::empty({rows}, x.options().dtype(torch::kFloat32));
+  auto bytes =
+      output_projection::get_workspace_layout(rows, groups).total_bytes;
+  torch::Tensor workspace;
+  if (bytes > 0) {
+    workspace = torch::empty({bytes}, x.options().dtype(torch::kUInt8));
+  }
+  const int32_t last_pos = static_cast<int32_t>(
+      std::min<int64_t>(rope.size(0) - 1, std::numeric_limits<int32_t>::max()));
+  CHECK_EQ(output_projection::launch(
+               torch_mlu::getCurMLUStream(device.index()),
+               x.data_ptr(),
+               positions.data_ptr<int32_t>(),
+               rope.data_ptr<float>(),
+               last_pos,
+               weight.data_ptr<int8_t>(),
+               weight_scale.data_ptr<float>(),
+               smooth_a.data_ptr<float>(),
+               smooth_b.data_ptr<float>(),
+               workspace.defined() ? workspace.data_ptr() : nullptr,
+               values.data_ptr<int8_t>(),
+               scales.data_ptr<float>(),
+               rows,
+               groups),
+           cnrtSuccess);
+  return {values, scales};
+}
+
+torch::Tensor fused_dsa_qb(const torch::Tensor& qr,
+                           const torch::Tensor& weight,
+                           const torch::Tensor& positions,
+                           const torch::Tensor& rope,
+                           const torch::Tensor& weight_scale,
+                           const torch::Tensor& smooth) {
+  const torch::Device device = qr.device();
+  CHECK(device.is_privateuseone());
+  CHECK_EQ(qr.dim(), 2);
+  CHECK_LE(qr.size(0), 32768);
+  const int32_t rows = static_cast<int32_t>(qr.size(0));
+  constexpr int32_t kRank = 1280;
+  check_contiguous(qr, device, {rows, kRank}, torch::kBFloat16);
+  CHECK_EQ(weight.dim(), 2);
+  const int64_t width = weight.size(0);
+  CHECK(supports_dsa_qb_width(width))
+      << "Unsupported local Wq_b width " << width;
+  const int32_t cols = static_cast<int32_t>(width);
+  const bool quantized = weight.scalar_type() == torch::kInt8;
+  check_contiguous(weight,
+                   device,
+                   {cols, kRank},
+                   quantized ? torch::kInt8 : torch::kBFloat16);
+  CHECK_EQ(weight_scale.defined(), quantized);
+  CHECK_EQ(smooth.defined(), quantized);
+  if (quantized) {
+    check_contiguous(weight_scale, device, {cols}, torch::kFloat32);
+    check_contiguous(smooth, device, {kRank}, torch::kFloat32);
+  }
+  check_contiguous(positions, device, {rows}, torch::kInt32);
+  CHECK_EQ(rope.dim(), 2);
+  CHECK_GT(rope.size(0), 0);
+  CHECK_LE(rope.size(0), 1048576);
+  check_contiguous(rope, device, {rope.size(0), kRopeColumns}, torch::kFloat32);
+  const torch::DeviceGuard guard(device);
+  torch::Tensor out =
+      torch::empty({rows, cols / kHeadDim, kHeadDim}, qr.options());
+  if (rows == 0) {
+    return out;
+  }
+  const int32_t rope_rows = static_cast<int32_t>(rope.size(0));
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream(device.index());
+  if (!quantized) {
+    CHECK_EQ(dsa_qb::launch_bf16(queue,
+                                 qr.data_ptr(),
+                                 weight.data_ptr(),
+                                 positions.data_ptr(),
+                                 rope.data_ptr(),
+                                 rope_rows,
+                                 out.data_ptr(),
+                                 rows,
+                                 cols),
+             cnrtSuccess);
+  } else if (rows <= 128) {
+    CHECK_EQ(dsa_qb::launch_small_int8(queue,
+                                       qr.data_ptr(),
+                                       smooth.data_ptr(),
+                                       weight.data_ptr(),
+                                       weight_scale.data_ptr(),
+                                       positions.data_ptr(),
+                                       rope.data_ptr(),
+                                       rope_rows,
+                                       out.data_ptr(),
+                                       rows,
+                                       cols),
+             cnrtSuccess);
+  } else {
+    // The large GEMM consumes a 32-lane BF16 encoding of each scale.
+    constexpr int64_t kScaleBytes = 32 * sizeof(uint16_t);
+    const int64_t token_offset = output_projection::align256(rows * kRank);
+    const int64_t weight_offset =
+        token_offset + output_projection::align256(rows * kScaleBytes);
+    torch::Tensor workspace = torch::empty(
+        {weight_offset + output_projection::align256(cols * kScaleBytes)},
+        qr.options().dtype(torch::kUInt8));
+    uint8_t* activations = workspace.data_ptr<uint8_t>();
+    uint8_t* tokens = activations + token_offset;
+    uint8_t* scales = activations + weight_offset;
+    CHECK_EQ(dsa_qb::launch_quantize_smooth(queue,
+                                            qr.data_ptr(),
+                                            smooth.data_ptr(),
+                                            activations,
+                                            rows,
+                                            weight_scale.data_ptr(),
+                                            tokens,
+                                            scales,
+                                            cols),
+             cnrtSuccess);
+    CHECK_EQ(dsa_qb::launch_large_int8(queue,
+                                       activations,
+                                       weight.data_ptr(),
+                                       tokens,
+                                       scales,
+                                       positions.data_ptr(),
+                                       rope.data_ptr(),
+                                       rope_rows,
+                                       out.data_ptr(),
+                                       rows,
+                                       cols),
+             cnrtSuccess);
+  }
+  return out;
+}
 
 torch::Tensor fused_indexer_q(const torch::Tensor& qr,
                               const torch::Tensor& wq,

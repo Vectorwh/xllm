@@ -22,6 +22,7 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
+#include "layers/common/linear.h"
 
 namespace xllm::layer {
 namespace mlu_v4_cp {
@@ -205,6 +206,11 @@ class DeepseekV41EngramImpl final : public torch::nn::Module {
   int64_t scale_dim() const;
   bool shard_hash_heads(int64_t tokens) const;
   int64_t local_hash_columns(int64_t tokens) const;
+  void load_wkv(const StateDict& state);
+  ReplicatedLinear wkv_{nullptr};
+  std::string wkv_module_;
+  QuantArgs wkv_quant_;
+  std::unordered_map<std::string, torch::Tensor> pending_wkv_;
   ModelArgs args_;
   int32_t engram_id_;
   ProcessGroup* lookup_group_;

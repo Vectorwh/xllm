@@ -260,12 +260,12 @@ TEST(DeepseekV41GraphTest, FusedIndexerMatchesIndependentRequests) {
       torch::manual_seed(2026);
       ModelArgs args;
       args.hidden_size() = 5120;
-      args.n_heads() = 1;
+      args.n_heads() = 8;
       args.head_dim() = 512;
       args.q_lora_rank() = 1280;
       args.qk_rope_head_dim() = 64;
       args.o_groups() = 1;
-      args.o_lora_rank() = 8;
+      args.o_lora_rank() = 1024;
       args.window_size() = 16;
       args.rms_norm_eps() = 1e-20;
       args.compress_ratios() = {ratio};
@@ -285,13 +285,21 @@ TEST(DeepseekV41GraphTest, FusedIndexerMatchesIndependentRequests) {
       };
       StateDict state({
           {"wq_a.weight", random({1280, 5120})},
-          {"wq_b.weight", random({512, 1280})},
+          {"wq_b.weight", random({args.n_heads() * args.head_dim(), 1280})},
           {"wkv.weight", random({512, 5120})},
           {"q_norm.weight", torch::ones({1280}, options)},
           {"kv_norm.weight", torch::ones({512}, options)},
-          {"wo_a.weight", random({1, 8, 512})},
-          {"wo_b.weight", random({5120, 8})},
-          {"attn_sink", torch::zeros({1}, options)},
+          {"wo_a.weight_scale", torch::full({1024, 1}, 1.0 / 256, options)},
+          {"wo_b.weight_scale", torch::full({5120, 1}, 1.0 / 256, options)},
+          {"wo_a.smooth", torch::ones({4096}, options)},
+          {"wo_b.smooth", torch::ones({1024}, options)},
+          {"wo_a.weight",
+           torch::randint(-16, 17, {1024, 4096}, torch::kInt8)
+               .to(options.device())},
+          {"wo_b.weight",
+           torch::randint(-16, 17, {5120, 1024}, torch::kInt8)
+               .to(options.device())},
+          {"attn_sink", torch::zeros({args.n_heads()}, options)},
           {"compressor.wkv.weight", random({512, 5120})},
           {"compressor.wgate.weight", random({512, 5120})},
           {"compressor.norm.weight", torch::ones({512}, options)},
@@ -432,13 +440,13 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
   const auto options =
       torch::TensorOptions().device(device).dtype(torch::kBFloat16);
   ModelArgs args;
-  args.hidden_size() = 32;
+  args.hidden_size() = 5120;
   args.n_heads() = 8;
   args.head_dim() = 512;
-  args.q_lora_rank() = 16;
+  args.q_lora_rank() = 1280;
   args.qk_rope_head_dim() = 64;
   args.o_groups() = 1;
-  args.o_lora_rank() = 8;
+  args.o_lora_rank() = 1024;
   args.window_size() = 16;
   args.rms_norm_eps() = 1e-20;
   args.compress_ratios() = {2};
@@ -454,16 +462,24 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
     return torch::randn(shape, options) * 0.1;
   };
   attention->load_state_dict(StateDict({
-      {"wq_a.weight", random({16, 32})},
-      {"wkv.weight", random({512, 32})},
-      {"q_norm.weight", torch::ones({16}, options)},
+      {"wq_a.weight", random({1280, 5120})},
+      {"wkv.weight", random({512, 5120})},
+      {"q_norm.weight", torch::ones({1280}, options)},
       {"kv_norm.weight", torch::ones({512}, options)},
-      {"wq_b.weight", random({4096, 16})},
-      {"wo_a.weight", random({1, 8, 4096})},
-      {"wo_b.weight", random({32, 8})},
+      {"wq_b.weight", random({4096, 1280})},
+      {"wo_a.weight_scale", torch::full({1024, 1}, 1.0 / 256, options)},
+      {"wo_b.weight_scale", torch::full({5120, 1}, 1.0 / 256, options)},
+      {"wo_a.smooth", torch::ones({4096}, options)},
+      {"wo_b.smooth", torch::ones({1024}, options)},
+      {"wo_a.weight",
+       torch::randint(-16, 17, {1024, 4096}, torch::kInt8)
+           .to(options.device())},
+      {"wo_b.weight",
+       torch::randint(-16, 17, {5120, 1024}, torch::kInt8)
+           .to(options.device())},
       {"attn_sink", torch::zeros({8}, options)},
-      {"compressor.wkv.weight", random({512, 32})},
-      {"compressor.wgate.weight", random({512, 32})},
+      {"compressor.wkv.weight", random({512, 5120})},
+      {"compressor.wgate.weight", random({512, 5120})},
       {"compressor.norm.weight", torch::ones({512}, options)},
       {"indexer.wk.weight", random({128, 512})},
       {"indexer.k_norm.weight", torch::ones({128}, options)},
@@ -490,7 +506,7 @@ TEST(DeepseekV41GraphTest, VerifyRejectionRetainsInteriorCompressorRows) {
   // Compare against independent contiguous planes through verify/rejection.
   auto actual = make_cache(/*packed=*/true);
   auto reference = make_cache(/*packed=*/false);
-  auto hidden = random({20, 32});
+  auto hidden = random({20, 5120});
   auto rope =
       torch::cat({torch::ones({32, 64}, options.dtype(torch::kFloat32)),
                   torch::zeros({32, 64}, options.dtype(torch::kFloat32))},
@@ -1052,14 +1068,14 @@ TEST(DeepseekV41GraphTest, SparseGatherAndSinkAttentionReplayUseLiveLengths) {
 
 ModelArgs gather_test_args() {
   ModelArgs args;
-  args.hidden_size(128)
+  args.hidden_size(5120)
       .n_heads(8)
       .head_dim(512)
-      .q_lora_rank(128)
+      .q_lora_rank(1280)
       .qk_rope_head_dim(64)
       .o_groups(1)
-      .o_lora_rank(128)
-      .rms_norm_eps(1e-5)
+      .o_lora_rank(1024)
+      .rms_norm_eps(1e-20)
       .window_size(128)
       .index_topk(512)
       .compress_ratios({0, 2, 2, 1, 1, 0})
@@ -1085,13 +1101,16 @@ std::vector<DeepseekV41Attention> gather_test_layers(
         {"wkv.weight", torch::randn({dim, hidden}, options) * 0.05},
         {"q_norm.weight", torch::ones({rank}, options)},
         {"kv_norm.weight", torch::ones({dim}, options)},
+        {"wo_a.weight_scale", torch::full({1024, 1}, 1.0 / 256, options)},
+        {"wo_b.weight_scale", torch::full({5120, 1}, 1.0 / 256, options)},
+        {"wo_a.smooth", torch::ones({4096}, options)},
+        {"wo_b.smooth", torch::ones({1024}, options)},
         {"wo_a.weight",
-         torch::randn({args.o_groups(), args.o_lora_rank(), heads * dim},
-                      options) *
-             0.05},
+         torch::randint(-16, 17, {1024, 4096}, torch::kInt8)
+             .to(options.device())},
         {"wo_b.weight",
-         torch::randn({hidden, args.o_groups() * args.o_lora_rank()}, options) *
-             0.05},
+         torch::randint(-16, 17, {hidden, 1024}, torch::kInt8)
+             .to(options.device())},
         {"attn_sink", torch::randn({heads}, options.dtype(torch::kFloat32))},
     }));
   }

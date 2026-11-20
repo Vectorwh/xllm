@@ -48,7 +48,14 @@ class DeepseekV41GraphState final : public ModelGraphMetadataState {
 class DeepseekV41ModelImpl : public torch::nn::Module {
  public:
   explicit DeepseekV41ModelImpl(const ModelContext& context)
-      : model_args_(context.get_model_args()),
+      : DeepseekV41ModelImpl(context, "layers") {
+    build_decoder_layers(context);
+  }
+
+ protected:
+  DeepseekV41ModelImpl(const ModelContext& context, std::string layer_stack)
+      : layer_stack_(std::move(layer_stack)),
+        model_args_(context.get_model_args()),
         options_(context.get_tensor_options()),
         aux_capture_(context.get_model_args(),
                      context.get_tensor_options(),
@@ -101,20 +108,27 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
         rope_options);
     plain_rope_ = plain.get_cos_sin_cache("default");
     compressed_rope_ = compressed.get_cos_sin_cache("c4");
-    layers_.reserve(args.n_layers());
-    for (int32_t id = 0; id < args.n_layers(); ++id) {
-      layers_.emplace_back(layer::DeepseekV41DecoderLayer(context, id));
+  }
+
+  void build_decoder_layers(const ModelContext& context) {
+    CHECK(layers_.empty());
+    layers_.reserve(model_args_.n_layers());
+    for (int32_t id = 0; id < model_args_.n_layers(); ++id) {
+      layers_.emplace_back(
+          layer::DeepseekV41DecoderLayer(context, id, layer_stack_));
     }
     std::vector<layer::DeepseekV41Engram> engrams;
     engrams.reserve(layers_.size());
     for (const auto& layer : layers_) {
       engrams.emplace_back(layer->engram());
     }
+    const auto& parallel = context.get_parallel_args();
     engram_inputs_ = std::make_unique<layer::DeepseekV41EngramInputs>(
         std::move(engrams),
         parallel.tp_group_ ? parallel.tp_group_->world_size() : 1);
   }
 
+ public:
   torch::Tensor get_input_embeddings(torch::Tensor tokens) {
     return embed_tokens_(tokens);
   }
@@ -132,8 +146,8 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
         std::vector<std::string>{"embed.", "embed_tokens."}));
     norm_->load_state_dict(state.get_dict_with_prefix("norm."));
     for (size_t id = 0; id < layers_.size(); ++id) {
-      layers_[id]->load_state_dict(
-          state.get_dict_with_prefix("layers." + std::to_string(id) + "."));
+      layers_[id]->load_state_dict(state.get_dict_with_prefix(
+          layer_stack_ + "." + std::to_string(id) + "."));
     }
   }
 
@@ -141,7 +155,8 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     CHECK(embed_tokens_->is_weight_loaded()) << "Missing weight embed.weight";
     norm_->verify_loaded_weights(/*prefix=*/"norm.");
     for (size_t id = 0; id < layers_.size(); ++id) {
-      layers_[id]->verify_loaded_weights("layers." + std::to_string(id) + ".");
+      layers_[id]->verify_loaded_weights(layer_stack_ + "." +
+                                         std::to_string(id) + ".");
     }
   }
 
@@ -384,6 +399,7 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
   ProcessGroup* cp_group_ = nullptr;
 
  protected:
+  std::string layer_stack_;
   ModelArgs model_args_;
   torch::TensorOptions options_;
   layer::WordEmbedding embed_tokens_{nullptr};

@@ -1,0 +1,134 @@
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_output_projection/output_projection_device.h"
+
+namespace xllm::kernel::mlu::bangc::output_projection {
+cnrtRet_t launch(cnrtQueue_t queue,
+                 const void* x,
+                 const int32_t* pos,
+                 const float* rope,
+                 int32_t last_pos,
+                 const int8_t* weight,
+                 const float* scale,
+                 const float* smooth_a,
+                 const float* smooth_b,
+                 void* workspace,
+                 int8_t* out_q,
+                 float* out_scale,
+                 int32_t m,
+                 int32_t g) {
+  if (g == 1 && m <= kFusedDecodeMaxRows) {
+    const uint32_t active_clusters = (m < 8) ? static_cast<uint32_t>(m) : 8u;
+    cnrtDim3_t dim{4, active_clusters, 1};
+    fused_decode_tp8_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(
+        static_cast<const bfloat16_t*>(x),
+        pos,
+        rope,
+        last_pos,
+        weight,
+        scale,
+        smooth_a,
+        smooth_b,
+        out_q,
+        out_scale,
+        m);
+    return cnrtGetLastError();
+  }
+
+  const WorkspaceLayout ws = get_workspace_layout(m, g);
+  uint8_t* ws_base = static_cast<uint8_t*>(workspace);
+  bfloat16_t* y_mid = reinterpret_cast<bfloat16_t*>(ws_base + ws.y_offset);
+
+  if (static_cast<int64_t>(m) * g <= kFusedDecodeMaxRows) {
+    uint32_t cpg_shift = 0u;
+    if (g == 2) {
+      cpg_shift = 2u;
+    } else if (g == 4) {
+      cpg_shift = 1u;
+    }
+    cnrtDim3_t dim_fg{4, 8, 1};
+    fused_decode_rope_gemm_kernel<<<dim_fg, cnrtFuncTypeUnion1, queue>>>(
+        static_cast<const bfloat16_t*>(x),
+        pos,
+        rope,
+        last_pos,
+        weight,
+        scale,
+        smooth_a,
+        y_mid,
+        m,
+        g,
+        cpg_shift);
+    cnrtRet_t ret = cnrtGetLastError();
+    if (ret != cnrtSuccess) {
+      return ret;
+    }
+
+    uint32_t q_clusters = static_cast<uint32_t>((m + 3) >> 2);
+    if (q_clusters < 1u) {
+      q_clusters = 1u;
+    }
+    if (q_clusters > 8u) {
+      q_clusters = 8u;
+    }
+    cnrtDim3_t dim_q{4, q_clusters, 1};
+    quant_wo_b_kernel<<<dim_q, cnrtFuncTypeUnion1, queue>>>(
+        y_mid, smooth_b, out_q, out_scale, m, g * kGroupOut);
+    return cnrtGetLastError();
+  }
+
+  int8_t* q_a = reinterpret_cast<int8_t*>(ws_base + ws.qa_offset);
+  float* scale_a = reinterpret_cast<float*>(ws_base + ws.sa_offset);
+
+  uint32_t g_shift = 0;
+  if (g == 2) {
+    g_shift = 1;
+  } else if (g == 4) {
+    g_shift = 2;
+  } else if (g == 8) {
+    g_shift = 3;
+  }
+
+  cnrtDim3_t dim{4, 8, 1};
+  rope_quant_wo_a_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(
+      static_cast<const bfloat16_t*>(x),
+      pos,
+      rope,
+      last_pos,
+      smooth_a,
+      q_a,
+      scale_a,
+      m,
+      g,
+      g_shift);
+  cnrtRet_t ret = cnrtGetLastError();
+  if (ret != cnrtSuccess) {
+    return ret;
+  }
+
+  grouped_w8a8_gemm_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(
+      q_a, scale_a, weight, scale, y_mid, m, g);
+  ret = cnrtGetLastError();
+  if (ret != cnrtSuccess) {
+    return ret;
+  }
+
+  quant_wo_b_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(
+      y_mid, smooth_b, out_q, out_scale, m, g * kGroupOut);
+  return cnrtGetLastError();
+}
+
+}  // namespace xllm::kernel::mlu::bangc::output_projection

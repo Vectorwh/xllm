@@ -22,13 +22,15 @@ limitations under the License.
 namespace xllm::layer {
 DeepseekV41DecoderLayerImpl::DeepseekV41DecoderLayerImpl(
     const ModelContext& context,
-    int32_t layer_id) {
+    int32_t layer_id,
+    const std::string& layer_stack) {
   const auto& args = context.get_model_args();
   const auto& options = context.get_tensor_options();
   CHECK_GT(args.hc_sinkhorn_iters(), 0);
   const auto& quant = context.get_quant_args();
-  const std::string prefix = "layers." + std::to_string(layer_id);
-  attention_ = register_module("attn", DeepseekV41Attention(context, layer_id));
+  const std::string prefix = layer_stack + "." + std::to_string(layer_id);
+  attention_ = register_module(
+      "attn", DeepseekV41Attention(context, layer_id, layer_stack));
   const auto& engram_layers = args.engram_layer_ids();
   const auto it =
       std::find(engram_layers.begin(), engram_layers.end(), layer_id);

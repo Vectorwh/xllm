@@ -55,18 +55,22 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
   ProcessGroup single(/*rank=*/0, /*world_size=*/1, device);
   ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, &single);
   parallel.tp_group_ = &single;
-  auto wkv = torch::zeros({512, 32}, options);
+  auto wkv = torch::zeros({512, 5120}, options);
   wkv.select(1, 0).fill_(0.125);
-  auto wo_a = torch::zeros({1, 8, 4096}, options);
-  wo_a[0].slice(1, 0, 8).copy_(torch::eye(8, options));
-  auto wo_b = torch::zeros({32, 8}, options);
-  wo_b.slice(0, 0, 8).copy_(torch::eye(8, options));
+  auto wo_a = torch::zeros({1024, 4096}, options.dtype(torch::kInt8));
+  wo_a.slice(0, 0, 8).slice(1, 0, 8).copy_(torch::eye(8, options));
+  auto wo_b = torch::zeros({5120, 1024}, options.dtype(torch::kInt8));
+  wo_b.slice(0, 0, 8).slice(1, 0, 8).copy_(torch::eye(8, options));
   const StateDict weights({
-      {"wq_a.weight", torch::zeros({16, 32}, options)},
-      {"wq_b.weight", torch::zeros({4096, 16}, options)},
+      {"wq_a.weight", torch::zeros({1280, 5120}, options)},
+      {"wq_b.weight", torch::zeros({4096, 1280}, options)},
       {"wkv.weight", wkv},
-      {"q_norm.weight", torch::ones({16}, options)},
+      {"q_norm.weight", torch::ones({1280}, options)},
       {"kv_norm.weight", torch::ones({512}, options)},
+      {"wo_a.weight_scale", torch::full({1024, 1}, 1.0, options)},
+      {"wo_b.weight_scale", torch::full({5120, 1}, 1.0, options)},
+      {"wo_a.smooth", torch::ones({4096}, options)},
+      {"wo_b.smooth", torch::ones({1024}, options)},
       {"wo_a.weight", wo_a},
       {"wo_b.weight", wo_b},
       {"attn_sink", torch::zeros({8}, options)},
@@ -82,13 +86,13 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
                  1);
   for (int32_t ratio : {0, 1, 2}) {
     ModelArgs args;
-    args.hidden_size(32)
+    args.hidden_size(5120)
         .n_heads(8)
         .head_dim(512)
-        .q_lora_rank(16)
+        .q_lora_rank(1280)
         .qk_rope_head_dim(64)
         .o_groups(1)
-        .o_lora_rank(8)
+        .o_lora_rank(1024)
         .window_size(16)
         .rms_norm_eps(1e-20)
         .compress_ratios({ratio, ratio})
@@ -132,11 +136,11 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
       const auto cp = mlu_v4_cp::build_cp_context(
           kWorldSize, group.rank(), &group, lengths, positions);
       CHECK(cp.has_value());
-      auto hidden = torch::arange(total * 32, options.dtype(torch::kFloat32))
+      auto hidden = torch::arange(total * 5120, options.dtype(torch::kFloat32))
                         .remainder(9)
                         .sub(4)
                         .div(8)
-                        .view({total, 32})
+                        .view({total, 5120})
                         .to(options);
       const auto local_hidden = mlu_v4_cp::shard_rows(hidden, *cp);
       ModelInputParams input;

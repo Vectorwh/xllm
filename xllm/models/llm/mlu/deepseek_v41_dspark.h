@@ -30,17 +30,17 @@ limitations under the License.
 #include "models/llm/dspark_markov_head.h"
 #include "models/llm/dspark_weight_source.h"
 #include "models/llm/mlu/deepseek_v41.h"
+#include "models/llm/mlu/deepseek_v41_dspark_quant_args.h"
 #include "models/model_registry.h"
 
 namespace xllm::mlu::model {
 // DSpark projects captured target trunks into shared context KV, then evaluates
 // an unmasked draft block through the existing V4.1 MLU decoder layers.
-// The compressed checkpoint retains BF16 mtp weights; target quantization
-// patterns also match mtp names and must not be applied to these draft layers.
 class DeepseekV41DSparkModelImpl final : public DeepseekV41ModelImpl {
  public:
   explicit DeepseekV41DSparkModelImpl(const ModelContext& context)
-      : DeepseekV41ModelImpl(context.with_quant_args(QuantArgs())),
+      : DeepseekV41ModelImpl(context, "mtp"),
+        decoder_context_(context),
         markov_head_(context.get_tensor_options(),
                      context.get_model_args().markov_rank()) {
     const ModelArgs& args = context.get_model_args();
@@ -65,9 +65,16 @@ class DeepseekV41DSparkModelImpl final : public DeepseekV41ModelImpl {
         layer::RMSNorm(args.hidden_size(), args.rms_norm_eps(), options));
   }
 
+  void prepare_decoder(const std::vector<std::unique_ptr<StateDict>>& shards) {
+    CHECK(decoder_context_) << "DSpark decoder already initialized";
+    const auto quant = build_dspark_decoder_quant_args(
+        model_args_, decoder_context_->get_quant_args(), shards);
+    build_decoder_layers(decoder_context_->with_quant_args(quant));
+    decoder_context_.reset();
+  }
+
   void load_state_dict(const StateDict& state_dict) {
-    const int32_t last_layer = static_cast<int32_t>(layers_.size()) - 1;
-    CHECK_GE(last_layer, 0);
+    const int32_t last_layer = last_dspark_layer_index();
 
     for (int32_t i = 0; i <= last_layer; ++i) {
       StateDict layer_dict =
@@ -121,7 +128,8 @@ class DeepseekV41DSparkModelImpl final : public DeepseekV41ModelImpl {
   }
 
   int32_t last_dspark_layer_index() const {
-    return static_cast<int32_t>(layers_.size()) - 1;
+    CHECK_EQ(layers_.size(), model_args_.dspark_num_layers());
+    return model_args_.dspark_num_layers() - 1;
   }
 
   torch::Tensor dspark_markov_bias(
@@ -153,6 +161,7 @@ class DeepseekV41DSparkModelImpl final : public DeepseekV41ModelImpl {
   }
 
  private:
+  std::optional<ModelContext> decoder_context_;
   layer::ReplicatedLinear main_proj_{nullptr};
   layer::RMSNorm main_norm_{nullptr};
   DSparkMarkovHead markov_head_;
@@ -187,9 +196,10 @@ class DeepseekV41DSparkForCausalLMImpl final
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string /*prefix*/ = "") override {
+    const auto& shards = loader->get_state_dicts();
+    model_->prepare_decoder(shards);
     const int32_t last_layer = model_->last_dspark_layer_index();
-    CHECK_GE(last_layer, 0);
-    for (const auto& shard : loader->get_state_dicts()) {
+    for (const auto& shard : shards) {
       std::unordered_map<std::string, torch::Tensor> normalized;
       for (const auto& [name, weight] : *shard) {
         normalized.emplace(name.rfind("model.", 0) == 0 ? name.substr(6) : name,

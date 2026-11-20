@@ -25,7 +25,9 @@ limitations under the License.
 namespace xllm::layer {
 class DeepseekV41AttentionImpl final : public torch::nn::Module {
  public:
-  DeepseekV41AttentionImpl(const ModelContext& context, int32_t layer_id);
+  DeepseekV41AttentionImpl(const ModelContext& context,
+                           int32_t layer_id,
+                           const std::string& layer_stack = "layers");
   void load_state_dict(const StateDict& state);
   void verify_loaded_weights() const;
   void write_context_kv(const torch::Tensor& hidden,
@@ -43,6 +45,10 @@ class DeepseekV41AttentionImpl final : public torch::nn::Module {
       const mlu_v4_cp::DeepseekV4CpContext* cp_context = nullptr);
 
  private:
+  void load_output_weights(const StateDict& state);
+  torch::Tensor project_query(const torch::Tensor& qr,
+                              const torch::Tensor& positions,
+                              const torch::Tensor& rope);
   void decode_attention(const torch::Tensor& q,
                         const torch::Tensor& selected,
                         const torch::Tensor& lengths,
@@ -65,11 +71,12 @@ class DeepseekV41AttentionImpl final : public torch::nn::Module {
                          const torch::Tensor& indices,
                          int64_t begin,
                          torch::Tensor output);
-  torch::Tensor project_output(torch::Tensor output,
+  torch::Tensor project_output(const torch::Tensor& output,
                                const torch::Tensor& positions,
                                const torch::Tensor& rope);
   ModelArgs args_;
   int32_t layer_id_;
+  std::string attn_prefix_;
   int32_t source_ = -1;
   int32_t ratio_ = 0;
   bool index_source_ = false;
@@ -79,7 +86,6 @@ class DeepseekV41AttentionImpl final : public torch::nn::Module {
   torch::TensorOptions options_;
   std::unordered_map<std::string, torch::Tensor> weights_;
   ColumnParallelLinear wq_b_{nullptr};
-  RowParallelLinear wo_b_{nullptr};
   DeepseekV41Indexer indexer_{nullptr};
 };
 TORCH_MODULE(DeepseekV41Attention);

@@ -35,8 +35,7 @@ inline torch::Tensor dense_projection(const torch::Tensor& x,
 inline torch::Tensor rotate(torch::Tensor x,
                             const torch::Tensor& positions,
                             const torch::Tensor& cache,
-                            int64_t dim,
-                            bool inverse = false) {
+                            int64_t dim) {
   torch::Tensor cs = cache.index_select(0, positions.to(torch::kInt64));
   torch::Tensor cos = cs.slice(-1, 0, dim);
   torch::Tensor sin = cs.slice(-1, dim, 2 * dim);
@@ -49,7 +48,7 @@ inline torch::Tensor rotate(torch::Tensor x,
   torch::Tensor swapped =
       torch::stack({-pairs.select(-1, 1), pairs.select(-1, 0)}, -1)
           .reshape_as(tail);
-  tail = tail * cos + swapped * (inverse ? -sin : sin);
+  tail = tail * cos + swapped * sin;
   x.slice(-1, x.size(-1) - dim).copy_(tail.to(x.scalar_type()));
   return x;
 }

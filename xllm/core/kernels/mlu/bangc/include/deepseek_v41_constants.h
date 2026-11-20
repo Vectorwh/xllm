@@ -23,4 +23,8 @@ namespace xllm::kernel::mlu::bangc {
 // Candidate-selection blocks have an independent width from ModelArgs.
 inline constexpr int32_t kDeepseekV41MluKVBlockSize = 128;
 
+inline constexpr bool supports_dsa_qb_width(int64_t width) {
+  return width == 4096 || width == 8192 || width == 16384 || width == 32768;
+}
+
 }  // namespace xllm::kernel::mlu::bangc

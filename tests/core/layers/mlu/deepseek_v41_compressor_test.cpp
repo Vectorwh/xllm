@@ -38,13 +38,13 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
   for (int32_t ratio : {1, 2}) {
     SCOPED_TRACE(ratio);
     ModelArgs args;
-    args.hidden_size(32)
+    args.hidden_size(5120)
         .n_heads(8)
         .head_dim(512)
-        .q_lora_rank(16)
+        .q_lora_rank(1280)
         .qk_rope_head_dim(64)
         .o_groups(1)
-        .o_lora_rank(8)
+        .o_lora_rank(1024)
         .window_size(16)
         .rms_norm_eps(1e-20)
         .compress_ratios({ratio})
@@ -53,7 +53,7 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
         .index_topk(0)
         .num_speculative_tokens(5);
     auto channels = torch::arange(512, cpu);
-    auto weight = torch::zeros({512, 32}, cpu);
+    auto weight = torch::zeros({512, 5120}, cpu);
     weight.select(1, 0).copy_(0.5 + channels.remainder(64) / 64);
     weight.select(1, 1).fill_(1);
     auto gate_weight = torch::zeros_like(weight);
@@ -66,13 +66,19 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
     DeepseekV41Attention attention(
         ModelContext(parallel, args, QuantArgs(), options), /*layer_id=*/0);
     attention->load_state_dict(StateDict({
-        {"wq_a.weight", torch::zeros({16, 32}, options)},
-        {"wkv.weight", torch::zeros({512, 32}, options)},
-        {"q_norm.weight", torch::ones({16}, options)},
+        {"wq_a.weight", torch::zeros({1280, 5120}, options)},
+        {"wkv.weight", torch::zeros({512, 5120}, options)},
+        {"q_norm.weight", torch::ones({1280}, options)},
         {"kv_norm.weight", torch::ones({512}, options)},
-        {"wq_b.weight", torch::zeros({4096, 16}, options)},
-        {"wo_a.weight", torch::zeros({1, 8, 4096}, options)},
-        {"wo_b.weight", torch::zeros({32, 8}, options)},
+        {"wq_b.weight", torch::zeros({4096, 1280}, options)},
+        {"wo_a.weight_scale", torch::full({1024, 1}, 1.0, options)},
+        {"wo_b.weight_scale", torch::full({5120, 1}, 1.0, options)},
+        {"wo_a.smooth", torch::ones({4096}, options)},
+        {"wo_b.smooth", torch::ones({1024}, options)},
+        {"wo_a.weight",
+         torch::zeros({1024, 4096}, options.dtype(torch::kInt8))},
+        {"wo_b.weight",
+         torch::zeros({5120, 1024}, options.dtype(torch::kInt8))},
         {"attn_sink", torch::zeros({8}, options)},
         {"compressor.wkv.weight", weight.to(options)},
         {"compressor.wgate.weight", gate_weight.to(options)},
@@ -97,7 +103,7 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
     auto expected_index = tensors.index_cache.cpu().view({512, 128});
     auto expected_state = torch::full({64, 512}, -7, cpu);
     auto expected_scores = torch::full_like(expected_state, -7);
-    auto hidden = torch::zeros({2, 132, 32}, cpu);
+    auto hidden = torch::zeros({2, 132, 5120}, cpu);
     hidden.select(2, 0).copy_(
         (1 + torch::arange(264, cpu).remainder(5) / 8).view({2, 132}));
     hidden.select(2, 1).fill_(1.0 / 512);
@@ -149,7 +155,7 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
       deepseek_v41::prepare_metadata(
           shared, input, positions, input.meta.num_sequences);
       attention->forward(
-          hidden.slice(1, begin, end).reshape({2 * count, 32}).to(options),
+          hidden.slice(1, begin, end).reshape({2 * count, 5120}).to(options),
           positions,
           rope,
           caches,

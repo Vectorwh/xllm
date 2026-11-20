@@ -19,6 +19,7 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -66,6 +67,33 @@ class DraftConfigDirectory final {
  private:
   std::string path_;
 };
+
+StateDict draft_weights(const ModelArgs& args,
+                        const torch::TensorOptions& options) {
+  auto weights = test::make_deepseek_v41_dspark_weights(args, options);
+  // Preserve the compact fixture's projection variance (two heads per group
+  // and 32 total latent channels) at the W8A8 kernel's physical dimensions.
+  const int64_t input_width =
+      args.n_heads() * args.head_dim() / args.o_groups();
+  const int64_t latent_width = args.o_groups() * args.o_lora_rank();
+  const double a_gain = std::sqrt(2.0 * args.head_dim() / input_width);
+  const double b_gain = std::sqrt(32.0 / latent_width);
+  // Unit-variance Q and hyper-connection projections keep BF16 rounding
+  // between padded and eager batches from dominating the peer-idle check.
+  constexpr double kFixtureStd = 0.05;
+  const double q_gain = 1.0 / (kFixtureStd * std::sqrt(args.q_lora_rank()));
+  const double hc_gain =
+      1.0 / (kFixtureStd * std::sqrt(args.hidden_size() * args.hc_mult()));
+  for (int32_t layer = 0; layer < args.n_layers(); ++layer) {
+    const auto prefix = "mtp." + std::to_string(layer) + ".";
+    weights.get_tensor(prefix + "attn.wo_a.weight_scale").mul_(a_gain);
+    weights.get_tensor(prefix + "attn.wo_b.weight_scale").mul_(b_gain);
+    weights.get_tensor(prefix + "attn.wq_b.weight").mul_(q_gain);
+    weights.get_tensor(prefix + "hc_attn_fn").mul_(hc_gain);
+    weights.get_tensor(prefix + "hc_ffn_fn").mul_(hc_gain);
+  }
+  return weights;
+}
 
 int32_t run_rank(int32_t rank,
                  const std::array<int32_t, 15>& ports,
@@ -127,15 +155,13 @@ int32_t run_rank(int32_t rank,
   parallel.single_rank_group_ = single.get();
   const bool full_geometry =
       util::get_bool_env("XLLM_DP_REPRO_FULL_GEOMETRY", false);
-  const int64_t hidden_size = full_geometry ? 5120 : 256;
-  const int64_t q_rank = full_geometry ? 1280 : 16;
-  const int64_t heads = full_geometry ? 64 : 8;
+  const int64_t heads = full_geometry ? 64 : 32;
   const int64_t groups = full_geometry ? 8 : 4;
-  const int64_t o_rank = full_geometry ? 1024 : 8;
+  const int64_t o_rank = 1024;
   ModelArgs args;
   args.model_type("deepseek_v41")
       .dtype("bfloat16")
-      .hidden_size(hidden_size)
+      .hidden_size(5120)
       .vocab_size(128)
       .n_layers(kLayers)
       .dspark_num_layers(kLayers)
@@ -144,7 +170,7 @@ int32_t run_rank(int32_t rank,
       .n_heads(heads)
       .n_kv_heads(1)
       .head_dim(512)
-      .q_lora_rank(q_rank)
+      .q_lora_rank(1280)
       .qk_rope_head_dim(64)
       .o_groups(groups)
       .o_lora_rank(o_rank)
@@ -158,7 +184,7 @@ int32_t run_rank(int32_t rank,
       .hc_mult(4)
       .hc_sinkhorn_iters(20)
       .hc_eps(1e-6)
-      .rms_norm_eps(1e-6)
+      .rms_norm_eps(1e-20)
       .n_shared_experts(1)
       .n_routed_experts(kExperts)
       .num_experts_per_tok(3)
@@ -186,8 +212,8 @@ int32_t run_rank(int32_t rank,
   const ModelContext context(parallel, args, QuantArgs(), options);
   auto model = create_llm_model(context);
   CHECK(model != nullptr);
-  model->load_model(std::make_unique<test::TensorModelLoader>(
-      test::make_deepseek_v41_dspark_weights(args, options)));
+  model->load_model(
+      std::make_unique<test::TensorModelLoader>(draft_weights(args, options)));
   DeepSeekV4KVCacheTensors cache_tensors;
   cache_tensors.swa_cache = torch::zeros({8, 128, 1, 512}, options);
   std::vector<KVCache> caches;

@@ -112,7 +112,10 @@ class DeepseekV41EngramTest : public ::testing::Test {
                            const ModelContext& context) {
     ModelConfig::get_instance().engram_config() = config;
     DeepseekV41Engram layer(context, /*engram_id=*/0);
-    layer->load_state_dict(StateDict(weights_));
+    layer->load_state_dict(
+        StateDict(weights_,
+                  "layers." + std::to_string(args_.engram_layer_ids().front()) +
+                      ".engram."));
     layer->load_hash_state(StateDict(hash_weights_));
     layer->verify_loaded_weights();
     return layer;
@@ -129,6 +132,46 @@ class DeepseekV41EngramTest : public ::testing::Test {
   std::string saved_config_;
   std::string saved_death_test_style_;
 };
+
+TEST_F(DeepseekV41EngramTest, QuantizedWkvUsesCheckpointLayerId) {
+  torch::InferenceMode inference;
+  torch::DeviceGuard guard(options_.device());
+  args_.engram_layer_ids({14});
+  auto smooth = torch::linspace(0.5, 1.5, 64).to(torch::kBFloat16);
+  auto scale =
+      torch::linspace(0.001, 0.01, 24).to(torch::kBFloat16).view({24, 1});
+  auto weight = torch::arange(24 * 64)
+                    .remainder(17)
+                    .sub(8)
+                    .to(torch::kInt8)
+                    .view({24, 64});
+  weights_["wkv.weight"] =
+      (weight.to(torch::kFloat32) * scale * smooth).to(torch::kBFloat16);
+  ParallelArgs parallel(0, 1, &group_);
+  parallel.tp_group_ = &group_;
+  QuantArgs quant;
+  quant.quant_method() = "compressed-tensors";
+  quant.is_compressed_tensors_w8a8_dynamic() = true;
+  quant.compressed_groups() = {{{"layers.14.engram.wkv"}, 8, 0, true}};
+  const ModelContext context(parallel, args_, quant, options_);
+  auto reference = create("{}", context);
+  DeepseekV41Engram layer(context, /*engram_id=*/0);
+  layer->load_state_dict(
+      StateDict({{"wkv.smooth", smooth}, {"wkv.weight_scale", scale}},
+                "layers.14.engram."));
+  weights_["wkv.weight"] = weight;
+  layer->load_state_dict(StateDict(weights_, "layers.14.engram."));
+  layer->load_hash_state(StateDict(hash_weights_));
+  layer->verify_loaded_weights();
+  auto tokens =
+      torch::tensor({2, 5, 1, 7}, torch::kInt64).to(options_.device());
+  auto hidden = torch::linspace(-1, 1, 64).reshape({4, 2, 8}).to(options_);
+  auto actual =
+      layer->forward(hidden, tokens, input_).cpu().to(torch::kFloat32);
+  auto expected =
+      reference->forward(hidden, tokens, input_).cpu().to(torch::kFloat32);
+  EXPECT_TRUE(torch::allclose(actual, expected, 0.035, 0.035));
+}
 
 TEST_F(DeepseekV41EngramTest, DefaultHostMatchesDeviceAndSelectedRows) {
   torch::InferenceMode inference;

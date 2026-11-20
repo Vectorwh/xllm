@@ -26,7 +26,9 @@ limitations under the License.
 namespace xllm::layer {
 class DeepseekV41DecoderLayerImpl final : public torch::nn::Module {
  public:
-  DeepseekV41DecoderLayerImpl(const ModelContext& context, int32_t layer_id);
+  DeepseekV41DecoderLayerImpl(const ModelContext& context,
+                              int32_t layer_id,
+                              const std::string& layer_stack = "layers");
   void load_state_dict(const StateDict& state);
   std::unique_ptr<DeepseekV41EngramImpl::HashState> create_hash_state(
       int64_t rows,

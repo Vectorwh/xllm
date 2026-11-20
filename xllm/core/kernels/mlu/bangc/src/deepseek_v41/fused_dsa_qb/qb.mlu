@@ -1,0 +1,2430 @@
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <mlu.h>
+
+#include <cstdint>
+#include <type_traits>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_qb/qb.h"
+
+namespace xllm::kernel::mlu::bangc::dsa_qb {
+
+namespace {
+
+constexpr int32_t kK = 1280;
+constexpr int32_t kHeadDim = 512;
+constexpr int32_t kRopeDim = 64;
+constexpr int32_t kGemmTileM = 64;
+constexpr int32_t kGemmTileN = 64;
+
+// Convert signed positions to byte offsets into 128-float RoPE rows.
+__mlu_func__ void rope_offsets(uint32_t* offsets,
+                               int32_t count,
+                               int32_t rope_rows) {
+  asm volatile(
+      "fuse.nram.s32 [%[off]], %[n], [%[off]], .max(%[lo]), .min(%[hi]), "
+      ".mul(%[stride]);\n\t" ::[off] "r"(offsets),
+      [n] "r"(count),
+      [lo] "r"(0),
+      [hi] "r"(rope_rows - 1),
+      [stride] "r"(128 * sizeof(float))
+      : "memory");
+}
+
+class RopePermTable64 final {
+ public:
+  uint16_t data[kRopeDim * kRopeDim];
+  constexpr RopePermTable64() : data{} {
+    for (int32_t j = 0; j < kRopeDim / 2; ++j) {
+      data[(2 * j) * kRopeDim + (2 * j + 1)] = 0xBF80u;  // -1.0f in BF16
+      data[(2 * j + 1) * kRopeDim + (2 * j)] = 0x3F80u;  // +1.0f in BF16
+    }
+  }
+};
+
+alignas(128) __mlu_device__ const RopePermTable64 kRopePerm64{};
+
+__mlu_func__ void load_rope_perm(bfloat16_t* wram_perm,
+                                 bfloat16_t* nram_scratch) {
+  const uint16_t* src_perm = kRopePerm64.data;
+  const uint32_t perm_bytes = kRopeDim * kRopeDim * sizeof(uint16_t);
+  asm volatile(
+      "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+      :
+      : [dst] "r"(nram_scratch), [src] "r"(src_perm), [sz] "r"(perm_bytes)
+      : "memory");
+  asm volatile("sync.pio0.cmv;\n\t" ::: "memory");
+  __bang_reshape_filter_async(
+      wram_perm, nram_scratch, kRopeDim, 1, 1, kRopeDim, NRAM2WRAM);
+}
+
+template <int32_t kN>
+__mlu_global__ void quantize_smooth_kernel(const bfloat16_t* qr,
+                                           const float* smooth,
+                                           int8_t* q_int8,
+                                           float* token_scale,
+                                           int32_t m,
+                                           const int32_t* positions,
+                                           const float* rope_cache,
+                                           int32_t rope_rows,
+                                           float* cos_sin,
+                                           const float* weight_scale,
+                                           uint16_t* ts_bf16,
+                                           uint16_t* ws_bf16) {
+  if (__is_mpu()) {
+    return;
+  }
+
+  constexpr int32_t kMaxQuantBatch = 32;
+  constexpr int32_t kMaxMyRows = 1024;  // ceil(32768 / 32)
+
+  __nram__ float nram_smooth[kK];
+  alignas(128) __nram__ uint32_t nram_all_off[kMaxMyRows];
+  __nram__ uint16_t nram_qr_u16[2 * kMaxQuantBatch * kK];
+  bfloat16_t* nram_qr = reinterpret_cast<bfloat16_t*>(nram_qr_u16);
+  alignas(128) __nram__ float nram_cs_raw[2 * kMaxQuantBatch * 128];
+  __nram__ float nram_fp32[kMaxQuantBatch * kK];
+  __nram__ float nram_max[kMaxQuantBatch * 4];
+  __nram__ int8_t nram_qi[2 * kMaxQuantBatch * kK];
+  __nram__ float nram_sx[2 * kMaxQuantBatch];
+  __nram__ float nram_cos[2 * kMaxQuantBatch * kRopeDim];
+  __nram__ float nram_sin[2 * kMaxQuantBatch * kRopeDim];
+  __nram__ uint16_t nram_ts_mat[32 * 32];
+  __nram__ uint16_t nram_ts_out[2 * 32 * 32];
+  __nram__ uint16_t nram_ts_b012[3 * 32];
+  __nram__ float nram_ts_tmp[32];
+  __nram__ float nram_ts_rem[32];
+
+  const int32_t base_rows = static_cast<int32_t>(
+      static_cast<uint32_t>(m) / static_cast<uint32_t>(taskDim));
+  const int32_t rem = static_cast<int32_t>(static_cast<uint32_t>(m) %
+                                           static_cast<uint32_t>(taskDim));
+  const int32_t my_rows = base_rows + (taskId < rem ? 1 : 0);
+  const int32_t r_start = taskId * base_rows + (taskId < rem ? taskId : rem);
+
+  if (my_rows > 0) {
+    __memcpy_io0_async(nram_smooth, smooth, kK * sizeof(float), GDRAM2NRAM);
+    if (cos_sin != nullptr) {
+      const int32_t* src_pos = positions + r_start;
+      uint32_t* p_all_off = nram_all_off;
+      const uint32_t pos_bytes =
+          static_cast<uint32_t>(my_rows) * sizeof(uint32_t);
+      asm volatile(
+          "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+          :
+          : [dst] "r"(p_all_off), [src] "r"(src_pos), [sz] "r"(pos_bytes)
+          : "memory");
+    }
+    const int32_t cur_b0 =
+        (my_rows < kMaxQuantBatch) ? my_rows : kMaxQuantBatch;
+    const bfloat16_t* src_qr0 = qr + static_cast<int64_t>(r_start) * kK;
+    const uint32_t qr0_bytes =
+        static_cast<uint32_t>(cur_b0) * kK * sizeof(bfloat16_t);
+    asm volatile(
+        "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+        :
+        : [dst] "r"(nram_qr), [src] "r"(src_qr0), [sz] "r"(qr0_bytes)
+        : "memory");
+    if (ts_bf16 != nullptr) {
+      __bang_write_value(nram_ts_mat, 32 * 32, static_cast<uint16_t>(0));
+    }
+  }
+
+  // Convert local weight_scale columns per IPU on IO1/SIMD/MV overlapped with
+  // IO0 Prologue loads
+  if (ws_bf16 != nullptr && weight_scale != nullptr) {
+    constexpr int32_t kWsCols = kN / 32;
+    const int32_t c_start = taskId * kWsCols;
+    float* ws_in = nram_fp32;
+    float* ws_tmp = nram_fp32 + kWsCols;
+    float* ws_rem = nram_fp32 + 2 * kWsCols;
+    uint16_t* ws_b012 = reinterpret_cast<uint16_t*>(nram_fp32 + 3 * kWsCols);
+    uint16_t* ws_mat = reinterpret_cast<uint16_t*>(nram_fp32 + 5 * kWsCols);
+    uint16_t* ws_out = reinterpret_cast<uint16_t*>(nram_qi);
+    bfloat16_t* wb0 = reinterpret_cast<bfloat16_t*>(ws_b012);
+    bfloat16_t* wb1 = wb0 + kWsCols;
+    bfloat16_t* wb2 = wb0 + 2 * kWsCols;
+
+    __bang_write_value(ws_mat, 32 * kWsCols, static_cast<uint16_t>(0));
+    __memcpy_io1_async(
+        ws_in, weight_scale + c_start, kWsCols * sizeof(float), GDRAM2NRAM);
+    __sync_io0_io1_move_compute<false,
+                                true,
+                                true,
+                                true,
+                                false,
+                                true,
+                                true,
+                                true>();
+    __bang_float2bfloat16_rn(wb0, ws_in, kWsCols);
+    __bang_bfloat162float(ws_tmp, wb0, kWsCols);
+    __bang_sub(ws_rem, ws_in, ws_tmp, kWsCols);
+    __bang_float2bfloat16_rn(wb1, ws_rem, kWsCols);
+    __bang_bfloat162float(ws_tmp, wb1, kWsCols);
+    __bang_sub(ws_rem, ws_rem, ws_tmp, kWsCols);
+    __bang_float2bfloat16_rn(wb2, ws_rem, kWsCols);
+    asm volatile("sync.psimd.cmv;\n\t" : "+r"(wb2)::"memory");
+#pragma unroll
+    for (int32_t g = 0; g < 3; ++g) {
+      __memcpy_async(ws_mat + (3 * g + 0) * kWsCols,
+                     ws_b012,
+                     kWsCols * sizeof(uint16_t),
+                     NRAM2NRAM);
+      __memcpy_async(ws_mat + (3 * g + 1) * kWsCols,
+                     ws_b012 + kWsCols,
+                     kWsCols * sizeof(uint16_t),
+                     NRAM2NRAM);
+      __memcpy_async(ws_mat + (3 * g + 2) * kWsCols,
+                     ws_b012 + 2 * kWsCols,
+                     kWsCols * sizeof(uint16_t),
+                     NRAM2NRAM);
+    }
+    int16_t* ws_mat_i16 = reinterpret_cast<int16_t*>(ws_mat);
+    int16_t* ws_out_i16 = reinterpret_cast<int16_t*>(ws_out);
+    asm volatile("sync.pmv.csimd;\n\t"
+                 : "+r"(ws_mat_i16), "+r"(ws_out_i16)::"memory");
+    __bang_transpose(ws_out_i16, ws_mat_i16, 32, kWsCols);
+    asm volatile("sync.psimd.cio1;\n\t" : "+r"(ws_out_i16)::"memory");
+    uint16_t* dst_ws = ws_bf16 + static_cast<int64_t>(c_start) * 32;
+    const uint32_t ws_bytes = kWsCols * 32 * sizeof(uint16_t);
+    asm volatile(
+        "st.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], %[sz];\n\t"
+        :
+        : [dst] "r"(dst_ws), [src] "r"(ws_out), [sz] "r"(ws_bytes)
+        : "memory");
+  }
+
+  if (my_rows <= 0) {
+    __sync_io();
+    return;
+  }
+
+  if (cos_sin != nullptr) {
+    uint32_t* p_all_off = nram_all_off;
+    float* dst_cs0 = nram_cs_raw;
+    const uint32_t cur_b0_u32 = static_cast<uint32_t>(
+        (my_rows < kMaxQuantBatch) ? my_rows : kMaxQuantBatch);
+    asm volatile("sync.pio0.csimd;\n\t" ::: "memory");
+    rope_offsets(p_all_off, my_rows, rope_rows);
+    asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+    asm volatile(
+        "gather.vector.async.scmnormal.nram.gdram.nram.io0.u32 [%[dst]], "
+        "[%[src]], [%[off]], 512, %[cnt], 512;\n\t"
+        :
+        : [dst] "r"(dst_cs0),
+          [src] "r"(rope_cache),
+          [off] "r"(p_all_off),
+          [cnt] "r"(cur_b0_u32)
+        : "memory");
+  }
+  __sync_io_move_compute();
+
+  const int32_t num_steps =
+      static_cast<int32_t>(static_cast<uint32_t>(my_rows + kMaxQuantBatch - 1) /
+                           static_cast<uint32_t>(kMaxQuantBatch));
+
+  for (int32_t e = 0; e < num_steps + 1; ++e) {
+    // Stage 2 (IO1 Async Store): store step e - 1
+    const int32_t s_st = e - 1;
+    if (s_st >= 0 && s_st < num_steps) {
+      const int32_t off_st = s_st * kMaxQuantBatch;
+      const int32_t cur_b = (my_rows - off_st < kMaxQuantBatch)
+                                ? (my_rows - off_st)
+                                : kMaxQuantBatch;
+      const int32_t r0 = r_start + off_st;
+      const int32_t slot_st = s_st & 1;
+
+      int8_t* src_qi = nram_qi + slot_st * (kMaxQuantBatch * kK);
+      int8_t* dst_qi = q_int8 + static_cast<int64_t>(r0) * kK;
+      const uint32_t qi_bytes =
+          static_cast<uint32_t>(cur_b) * kK * sizeof(int8_t);
+      asm volatile(
+          "st.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], %[sz];\n\t"
+          :
+          : [dst] "r"(dst_qi), [src] "r"(src_qi), [sz] "r"(qi_bytes)
+          : "memory");
+
+      if (ts_bf16 != nullptr) {
+        uint16_t* src_ts = nram_ts_out + slot_st * (32 * 32);
+        uint16_t* dst_ts = ts_bf16 + static_cast<int64_t>(r0) * 32;
+        const uint32_t ts_bytes =
+            static_cast<uint32_t>(cur_b) * 32 * sizeof(uint16_t);
+        asm volatile(
+            "st.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], %[sz];\n\t"
+            :
+            : [dst] "r"(dst_ts), [src] "r"(src_ts), [sz] "r"(ts_bytes)
+            : "memory");
+      }
+
+      if (token_scale != nullptr) {
+        float* src_sx = nram_sx + slot_st * kMaxQuantBatch;
+        float* dst_sx = token_scale + r0;
+        const uint32_t sx_bytes = static_cast<uint32_t>(cur_b) * sizeof(float);
+        asm volatile(
+            "st.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], %[sz];\n\t"
+            :
+            : [dst] "r"(dst_sx), [src] "r"(src_sx), [sz] "r"(sx_bytes)
+            : "memory");
+      }
+
+      if (cos_sin != nullptr) {
+        float* src_cos = nram_cos + slot_st * (kMaxQuantBatch * kRopeDim);
+        float* src_sin = nram_sin + slot_st * (kMaxQuantBatch * kRopeDim);
+        float* dst_cos = cos_sin + static_cast<int64_t>(r0) * kRopeDim;
+        float* dst_sin = cos_sin + static_cast<int64_t>(m + r0) * kRopeDim;
+        const uint32_t cs_bytes =
+            static_cast<uint32_t>(cur_b) * kRopeDim * sizeof(float);
+        asm volatile(
+            "st.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], %[sz];\n\t"
+            :
+            : [dst] "r"(dst_cos), [src] "r"(src_cos), [sz] "r"(cs_bytes)
+            : "memory");
+        asm volatile(
+            "st.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], %[sz];\n\t"
+            :
+            : [dst] "r"(dst_sin), [src] "r"(src_sin), [sz] "r"(cs_bytes)
+            : "memory");
+      }
+    }
+
+    // Stage 0 (IO0 Async Load): async load step e + 1 qr + rope_cache rows
+    const int32_t s_ld = e + 1;
+    if (s_ld < num_steps) {
+      const int32_t off_ld = s_ld * kMaxQuantBatch;
+      const int32_t cur_b = (my_rows - off_ld < kMaxQuantBatch)
+                                ? (my_rows - off_ld)
+                                : kMaxQuantBatch;
+      const int32_t r0 = r_start + off_ld;
+      const int32_t slot_ld = s_ld & 1;
+      bfloat16_t* dst_qr = nram_qr + slot_ld * (kMaxQuantBatch * kK);
+      const bfloat16_t* src_qr = qr + static_cast<int64_t>(r0) * kK;
+      const uint32_t qr_bytes =
+          static_cast<uint32_t>(cur_b) * kK * sizeof(bfloat16_t);
+      asm volatile(
+          "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+          :
+          : [dst] "r"(dst_qr), [src] "r"(src_qr), [sz] "r"(qr_bytes)
+          : "memory");
+      if (cos_sin != nullptr) {
+        float* dst_cs_raw = nram_cs_raw + slot_ld * (kMaxQuantBatch * 128);
+        uint32_t* off_ptr = nram_all_off + off_ld;
+        const uint32_t cur_b_u32 = static_cast<uint32_t>(cur_b);
+        asm volatile(
+            "gather.vector.async.scmnormal.nram.gdram.nram.io0.u32 [%[dst]], "
+            "[%[src]], [%[off]], 512, %[cnt], 512;\n\t"
+            :
+            : [dst] "r"(dst_cs_raw),
+              [src] "r"(rope_cache),
+              [off] "r"(off_ptr),
+              [cnt] "r"(cur_b_u32)
+            : "memory");
+      }
+    }
+
+    // Stage 1 (SIMD + MV): quantize step e while IO0 Load(e + 1) and IO1
+    // Store(e - 1) stream concurrently
+    const int32_t s_cp = e;
+    if (s_cp < num_steps) {
+      const int32_t off_cp = s_cp * kMaxQuantBatch;
+      const int32_t cur_b = (my_rows - off_cp < kMaxQuantBatch)
+                                ? (my_rows - off_cp)
+                                : kMaxQuantBatch;
+      const int32_t slot_cp = s_cp & 1;
+      bfloat16_t* cur_qr = nram_qr + slot_cp * (kMaxQuantBatch * kK);
+      int8_t* cur_qi = nram_qi + slot_cp * (kMaxQuantBatch * kK);
+      float* cur_sx = nram_sx + slot_cp * kMaxQuantBatch;
+
+      if (cos_sin != nullptr) {
+        float* cur_cs_raw = nram_cs_raw + slot_cp * (kMaxQuantBatch * 128);
+        float* dst_cos = nram_cos + slot_cp * (kMaxQuantBatch * kRopeDim);
+        float* dst_sin = nram_sin + slot_cp * (kMaxQuantBatch * kRopeDim);
+        __memcpy_async(dst_cos,
+                       cur_cs_raw,
+                       kRopeDim * sizeof(float),
+                       NRAM2NRAM,
+                       kRopeDim * sizeof(float),
+                       128 * sizeof(float),
+                       cur_b - 1);
+        __memcpy_async(dst_sin,
+                       cur_cs_raw + kRopeDim,
+                       kRopeDim * sizeof(float),
+                       NRAM2NRAM,
+                       kRopeDim * sizeof(float),
+                       128 * sizeof(float),
+                       cur_b - 1);
+      }
+
+      __bang_bfloat162float(nram_fp32, cur_qr, cur_b * kK);
+      __bang_cycle_mul(nram_fp32, nram_fp32, nram_smooth, cur_b * kK, kK);
+      for (int32_t i = 0; i < cur_b; ++i) {
+        float* dst_max = nram_max + i * 4;
+        float* src_row = nram_fp32 + i * kK;
+        __asm__ volatile("absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t"
+                         : [dst] "+r"(dst_max)
+                         : [src] "r"(src_row), [sz] "r"(kK)
+                         : "memory");
+      }
+      __sync_compute();
+
+      for (int32_t i = 0; i < cur_b; ++i) {
+        float amax = nram_max[i * 4];
+        cur_sx[i] = amax / 127.0f;
+        float inv_sx = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        __bang_mul_scalar(nram_fp32 + i * kK, nram_fp32 + i * kK, inv_sx, kK);
+      }
+      for (int32_t i = cur_b; i < kMaxQuantBatch; ++i) {
+        cur_sx[i] = 0.0f;
+      }
+      __bang_float2int8_rn(cur_qi, nram_fp32, cur_b * kK, 0);
+
+      if (ts_bf16 != nullptr) {
+        uint16_t* cur_ts_out = nram_ts_out + slot_cp * (32 * 32);
+        bfloat16_t* tb0 = reinterpret_cast<bfloat16_t*>(nram_ts_b012);
+        bfloat16_t* tb1 = tb0 + 32;
+        bfloat16_t* tb2 = tb0 + 64;
+        __bang_float2bfloat16_rn(tb0, cur_sx, 32);
+        __bang_bfloat162float(nram_ts_tmp, tb0, 32);
+        __bang_sub(nram_ts_rem, cur_sx, nram_ts_tmp, 32);
+        __bang_float2bfloat16_rn(tb1, nram_ts_rem, 32);
+        __bang_bfloat162float(nram_ts_tmp, tb1, 32);
+        __bang_sub(nram_ts_rem, nram_ts_rem, nram_ts_tmp, 32);
+        __bang_float2bfloat16_rn(tb2, nram_ts_rem, 32);
+        asm volatile("sync.psimd.cmv;\n\t" : "+r"(tb2)::"memory");
+#pragma unroll
+        for (int32_t r = 0; r < 3; ++r) {
+          __memcpy_async(nram_ts_mat + r * 32,
+                         nram_ts_b012,
+                         32 * sizeof(uint16_t),
+                         NRAM2NRAM);
+          __memcpy_async(nram_ts_mat + (r + 3) * 32,
+                         nram_ts_b012 + 32,
+                         32 * sizeof(uint16_t),
+                         NRAM2NRAM);
+          __memcpy_async(nram_ts_mat + (r + 6) * 32,
+                         nram_ts_b012 + 64,
+                         32 * sizeof(uint16_t),
+                         NRAM2NRAM);
+        }
+        int16_t* ts_mat_i16 = reinterpret_cast<int16_t*>(nram_ts_mat);
+        int16_t* ts_out_i16 = reinterpret_cast<int16_t*>(cur_ts_out);
+        asm volatile("sync.pmv.csimd;\n\t"
+                     : "+r"(ts_mat_i16), "+r"(ts_out_i16)::"memory");
+        __bang_transpose(ts_out_i16, ts_mat_i16, 32, 32);
+      }
+    }
+
+    __sync_io_move_compute();
+  }
+}
+
+__mlu_func__ void load_sram_async(void* dst_sram,
+                                  const void* src_gdram,
+                                  uint32_t size) {
+  asm volatile("ld.async.sram.gdram.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+               :
+               : [dst] "r"(dst_sram), [src] "r"(src_gdram), [sz] "r"(size)
+               : "memory");
+}
+
+__mlu_func__ void move_weight_128(int8_t* wram_dst,
+                                  const int8_t* sram_base,
+                                  int32_t ipu_n_idx,
+                                  int32_t ipu_m_idx,
+                                  int32_t sub_stride_bytes) {
+  constexpr int32_t dwidth = sizeof(int8_t);
+  constexpr int32_t data_size = kK * dwidth;
+  constexpr int32_t wram_lt_stride = (__MLU_WRAM_SIZE__ * 1024) / 16;
+#pragma unroll
+  for (int32_t step = 0; step < 2; ++step) {
+    const int32_t sub_i = step ^ ipu_m_idx;
+    const int32_t u = 2 * ipu_n_idx + sub_i;
+    __memcpy_async(wram_dst + sub_i * 4 * kK,
+                   const_cast<int8_t*>(sram_base + u * sub_stride_bytes),
+                   data_size,
+                   SRAM2WRAM,
+                   data_size,
+                   4 - 1,
+                   wram_lt_stride,
+                   16 - 1,
+                   data_size,
+                   64 - 1,
+                   0,
+                   0);
+  }
+}
+
+__mlu_func__ void move_scale_128(bfloat16_t* wram_dst,
+                                 const bfloat16_t* sram_base,
+                                 int32_t ipu_n_idx,
+                                 int32_t ipu_m_idx,
+                                 int32_t sub_stride_elems) {
+  constexpr int32_t data_elems = 32;
+  constexpr int32_t data_size = data_elems * sizeof(bfloat16_t);
+  constexpr int32_t wram_lt_stride = (__MLU_WRAM_SIZE__ * 1024) / 16;
+#pragma unroll
+  for (int32_t step = 0; step < 2; ++step) {
+    const int32_t sub_i = step ^ ipu_m_idx;
+    const int32_t u = 2 * ipu_n_idx + sub_i;
+    __memcpy_async(wram_dst + sub_i * 4 * data_elems,
+                   const_cast<bfloat16_t*>(sram_base + u * sub_stride_elems),
+                   data_size,
+                   SRAM2WRAM,
+                   data_size,
+                   4 - 1,
+                   wram_lt_stride,
+                   16 - 1,
+                   data_size,
+                   64 - 1,
+                   0,
+                   0);
+  }
+}
+
+template <int32_t kN>
+__mlu_global__ void gemm_large_int8(const int8_t* q_int8,
+                                    const int8_t* weight,
+                                    const bfloat16_t* ts_bf16,
+                                    const bfloat16_t* ws_bf16,
+                                    const int32_t* positions,
+                                    const float* rope_cache,
+                                    int32_t rope_rows,
+                                    bfloat16_t* out_bf16,
+                                    int32_t m) {
+  constexpr int32_t kBlockN = 256;
+  constexpr int32_t kBlockM = 256;
+  constexpr int32_t kDealM = 128;
+  constexpr int32_t kDealN = 128;
+  constexpr int32_t kRopeChunkM = 32;
+  constexpr int32_t kScaleCh = 32;
+  constexpr int32_t kSubBytesB = 64 * kK + 512;
+  constexpr int32_t kSubElemsWs = 64 * kScaleCh + 256;
+  constexpr int32_t kHalfBytesA = kDealM * kK + 512;
+  constexpr int32_t kSlotBytesA = 2 * kHalfBytesA;
+
+  __mlu_shared__ int8_t sram_b0[4 * kSubBytesB];
+  __mlu_shared__ int8_t sram_b1[4 * kSubBytesB];
+  __mlu_shared__ uint16_t sram_wscale0_u16[4 * kSubElemsWs];
+  __mlu_shared__ uint16_t sram_wscale1_u16[4 * kSubElemsWs];
+  __mlu_shared__ int8_t sram_a[2 * kSlotBytesA];
+  __mlu_shared__ uint16_t sram_tscale_u16[2 * kBlockM * kScaleCh];
+  alignas(128) __mlu_shared__ float sram_cs_raw[2 * kBlockM * 128];
+  bfloat16_t* sram_wscale0 = reinterpret_cast<bfloat16_t*>(sram_wscale0_u16);
+  bfloat16_t* sram_wscale1 = reinterpret_cast<bfloat16_t*>(sram_wscale1_u16);
+  bfloat16_t* sram_tscale = reinterpret_cast<bfloat16_t*>(sram_tscale_u16);
+
+  __nram__ int8_t nram_a[2 * kDealM * kK];
+  __nram__ uint16_t nram_ts32_u16[2 * kDealM * kScaleCh];
+  bfloat16_t* nram_ts32 = reinterpret_cast<bfloat16_t*>(nram_ts32_u16);
+  __wram__ int8_t wram_buf[__MLU_WRAM_SIZE__ * 1024];
+  __nram__ float nram_c[kDealM * kDealN];
+  __nram__ float nram_cs_exp[2 * kRopeChunkM * kDealN];
+  __nram__ uint16_t nram_out_u16[2 * kDealM * kDealN];
+  alignas(128) __nram__ uint32_t nram_pos_my[64];
+  bfloat16_t* nram_out = reinterpret_cast<bfloat16_t*>(nram_out_u16);
+
+  // Each N lane owns eight heads and follows the 16-step weight/RoPE schedule.
+  // With fewer lanes, independent cluster groups cover disjoint row intervals.
+  constexpr int32_t kNLanes = kN / (8 * kHeadDim);
+  const int32_t n_lane = (kN == 32768) ? taskIdY : taskIdY % kNLanes;
+  if constexpr (kN < 32768) {
+    constexpr int32_t kRowGroups = 8 / kNLanes;
+    const int32_t rows = (m + kRowGroups - 1) / kRowGroups;
+    const int32_t first = (taskIdY / kNLanes) * rows;
+    if (first >= m) {
+      return;
+    }
+    m = (m - first < rows) ? m - first : rows;
+    positions += first;
+    out_bf16 += int64_t(first) * kN;
+    q_int8 += int64_t(first) * kK;
+    ts_bf16 += int64_t(first) * kScaleCh;
+  }
+  const int32_t num_n_blocks = kN / kBlockN;
+  const int32_t my_n_blocks =
+      (kN < 32768)
+          ? 16
+          : static_cast<int32_t>(
+                static_cast<uint32_t>(num_n_blocks - taskIdY + taskDimY - 1) /
+                static_cast<uint32_t>(taskDimY));
+  const int32_t num_m_steps = static_cast<int32_t>(
+      static_cast<uint32_t>(m + kBlockM - 1) / static_cast<uint32_t>(kBlockM));
+  const int32_t total_steps = my_n_blocks * num_m_steps;
+  if (total_steps <= 0) {
+    return;
+  }
+  const int32_t first_m = (m < kBlockM) ? m : kBlockM;
+
+  // Prologue: ms = 0, nb = 0 loads head h = taskIdY cols [0..255] + first
+  // M-block activations
+  if (__is_mpu()) {
+    const int32_t col0 = n_lane * kHeadDim;
+    for (int32_t u = 0; u < 4; ++u) {
+      const int32_t col_u = col0 + u * 64;
+      __memcpy_async(sram_b0 + u * kSubBytesB,
+                     weight + static_cast<int64_t>(col_u) * kK,
+                     64 * kK * sizeof(int8_t),
+                     GDRAM2SRAM);
+      __memcpy_async(sram_wscale0 + u * kSubElemsWs,
+                     ws_bf16 + static_cast<int64_t>(col_u) * kScaleCh,
+                     64 * kScaleCh * sizeof(bfloat16_t),
+                     GDRAM2SRAM);
+    }
+    const int32_t m_h0 = (first_m < kDealM) ? first_m : kDealM;
+    load_sram_async(
+        sram_a, q_int8, static_cast<uint32_t>(m_h0) * kK * sizeof(int8_t));
+    if (first_m > kDealM) {
+      load_sram_async(
+          sram_a + kHalfBytesA,
+          q_int8 + static_cast<int64_t>(kDealM) * kK,
+          static_cast<uint32_t>(first_m - kDealM) * kK * sizeof(int8_t));
+    }
+    load_sram_async(
+        sram_tscale,
+        ts_bf16,
+        static_cast<uint32_t>(first_m) * kScaleCh * sizeof(bfloat16_t));
+    asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+  }
+  if (__is_ipu()) {
+    bfloat16_t* wram_perm64 = reinterpret_cast<bfloat16_t*>(wram_buf + 28672);
+    load_rope_perm(wram_perm64, nram_out);
+    asm volatile("barrier.sync.local.pio.pmv.cio.cmv.csimd 1, 5;\n\t" ::
+                     : "memory");
+  }
+
+  int32_t ms_ld = 0, nb_ld = 1;
+  int32_t ms_mv = 0, nb_mv = 0;
+  int32_t ms_cp = 0, nb_cp = 0;
+  int32_t ms_st = 0, nb_st = 0;
+
+  for (int32_t e = 0; e < total_steps + 2; ++e) {
+    // Stage 0 (MPU IO): ms-outer / nb-inner schedule with bank-skewed
+    // sub-blocks + staggered activation prefetch
+    if (__is_mpu()) {
+      const int32_t s_ld = e + 1;
+      if (s_ld < total_steps) {
+        int8_t* dst_sram_b = (s_ld & 1) ? sram_b1 : sram_b0;
+        bfloat16_t* dst_sram_ws = (s_ld & 1) ? sram_wscale1 : sram_wscale0;
+        if (nb_ld < 8) {
+          const int32_t col0 = (nb_ld * kNLanes + n_lane) * kHeadDim;
+          for (int32_t u = 0; u < 4; ++u) {
+            const int32_t col_u = col0 + u * 64;
+            __memcpy_async(dst_sram_b + u * kSubBytesB,
+                           weight + static_cast<int64_t>(col_u) * kK,
+                           64 * kK * sizeof(int8_t),
+                           GDRAM2SRAM);
+            __memcpy_async(dst_sram_ws + u * kSubElemsWs,
+                           ws_bf16 + static_cast<int64_t>(col_u) * kScaleCh,
+                           64 * kScaleCh * sizeof(bfloat16_t),
+                           GDRAM2SRAM);
+          }
+        } else if (nb_ld < 12) {
+          const int32_t h0 = ((nb_ld - 8) * kNLanes + n_lane) * 2;
+          for (int32_t u = 0; u < 4; ++u) {
+            const int32_t col_u =
+                (h0 + (u >> 1)) * kHeadDim + 256 + (u & 1) * 64;
+            __memcpy_async(dst_sram_b + u * kSubBytesB,
+                           weight + static_cast<int64_t>(col_u) * kK,
+                           64 * kK * sizeof(int8_t),
+                           GDRAM2SRAM);
+            __memcpy_async(dst_sram_ws + u * kSubElemsWs,
+                           ws_bf16 + static_cast<int64_t>(col_u) * kScaleCh,
+                           64 * kScaleCh * sizeof(bfloat16_t),
+                           GDRAM2SRAM);
+          }
+        } else {
+          const int32_t sub_off = (nb_ld < 14) ? 384 : 448;
+          const int32_t g =
+              ((nb_ld < 14) ? (nb_ld - 12) : (nb_ld - 14)) * kNLanes + n_lane;
+          for (int32_t u = 0; u < 4; ++u) {
+            const int32_t col_u = (4 * g + u) * kHeadDim + sub_off;
+            __memcpy_async(dst_sram_b + u * kSubBytesB,
+                           weight + static_cast<int64_t>(col_u) * kK,
+                           64 * kK * sizeof(int8_t),
+                           GDRAM2SRAM);
+            __memcpy_async(dst_sram_ws + u * kSubElemsWs,
+                           ws_bf16 + static_cast<int64_t>(col_u) * kScaleCh,
+                           64 * kScaleCh * sizeof(bfloat16_t),
+                           GDRAM2SRAM);
+          }
+        }
+        if (nb_ld >= 4 && nb_ld < 8 && (ms_ld + 1) < num_m_steps) {
+          const int32_t next_ms = ms_ld + 1;
+          const int32_t m0_next = next_ms * kBlockM;
+          const int32_t blk_m_next =
+              (m - m0_next < kBlockM) ? (m - m0_next) : kBlockM;
+          const int32_t q_chunk = nb_ld - 4;
+          const int32_t r_in_blk = q_chunk * 64;
+          if (blk_m_next > r_in_blk) {
+            const int32_t chunk_rows =
+                (blk_m_next - r_in_blk < 64) ? (blk_m_next - r_in_blk) : 64;
+            int8_t* dst_sram_a = sram_a + (next_ms & 1) * kSlotBytesA +
+                                 (q_chunk >> 1) * kHalfBytesA +
+                                 (q_chunk & 1) * (64 * kK);
+            load_sram_async(
+                dst_sram_a,
+                q_int8 + static_cast<int64_t>(m0_next + r_in_blk) * kK,
+                static_cast<uint32_t>(chunk_rows) * kK * sizeof(int8_t));
+          }
+        } else if (nb_ld == 8 && (ms_ld + 1) < num_m_steps) {
+          const int32_t next_ms = ms_ld + 1;
+          const int32_t m0_next = next_ms * kBlockM;
+          const int32_t blk_m_next =
+              (m - m0_next < kBlockM) ? (m - m0_next) : kBlockM;
+          bfloat16_t* dst_sram_ts =
+              sram_tscale + (next_ms & 1) * (kBlockM * kScaleCh);
+          load_sram_async(dst_sram_ts,
+                          ts_bf16 + static_cast<int64_t>(m0_next) * kScaleCh,
+                          static_cast<uint32_t>(blk_m_next) * kScaleCh *
+                              sizeof(bfloat16_t));
+        }
+        if (++nb_ld == my_n_blocks) {
+          nb_ld = 0;
+          ++ms_ld;
+        }
+      }
+      if (e + 1 < total_steps + 2) {
+        asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+      }
+    }
+
+    if (__is_ipu()) {
+      const int32_t ipu_m_idx = coreId >> 1;
+      const int32_t ipu_n_idx = coreId & 1;
+      const int32_t row_off = ipu_m_idx * kDealM;
+      int8_t* wram_b0 = wram_buf;
+      int8_t* wram_b1 = wram_buf + (kDealN / 16) * kK * sizeof(int8_t);
+      bfloat16_t* wram_ws0 = reinterpret_cast<bfloat16_t*>(wram_buf + 24576);
+      bfloat16_t* wram_ws1 = reinterpret_cast<bfloat16_t*>(wram_buf + 26624);
+      bfloat16_t* wram_perm64 = reinterpret_cast<bfloat16_t*>(wram_buf + 28672);
+
+      // Stage 3 (IPU IO): store step e - 2 from NRAM to GDRAM
+      const int32_t s_st = e - 2;
+      if (s_st >= 0 && s_st < total_steps) {
+        const int32_t m0_st = ms_st * kBlockM;
+        const int32_t blk_m_st = (m - m0_st < kBlockM) ? (m - m0_st) : kBlockM;
+        const int32_t cur_m_st =
+            (blk_m_st > row_off)
+                ? ((blk_m_st - row_off < kDealM) ? (blk_m_st - row_off)
+                                                 : kDealM)
+                : 0;
+        if (cur_m_st > 0) {
+          bfloat16_t* src_out = nram_out + (s_st & 1) * (kDealM * kDealN);
+          bfloat16_t* row_base =
+              out_bf16 + static_cast<int64_t>(m0_st + row_off) * kN;
+          if (nb_st < 8) {
+            const int32_t col_off =
+                (nb_st * kNLanes + n_lane) * kHeadDim + ipu_n_idx * 128;
+            __memcpy_async(row_base + col_off,
+                           src_out,
+                           kDealN * sizeof(bfloat16_t),
+                           NRAM2GDRAM,
+                           kN * sizeof(bfloat16_t),
+                           kDealN * sizeof(bfloat16_t),
+                           cur_m_st - 1);
+          } else if (nb_st < 12) {
+            const int32_t h_st =
+                ((nb_st - 8) * kNLanes + n_lane) * 2 + ipu_n_idx;
+            const int32_t col_off = h_st * kHeadDim + 256;
+            __memcpy_async(row_base + col_off,
+                           src_out,
+                           kDealN * sizeof(bfloat16_t),
+                           NRAM2GDRAM,
+                           kN * sizeof(bfloat16_t),
+                           kDealN * sizeof(bfloat16_t),
+                           cur_m_st - 1);
+          } else {
+            const int32_t sub_off = (nb_st < 14) ? 384 : 448;
+            const int32_t g =
+                ((nb_st < 14) ? (nb_st - 12) : (nb_st - 14)) * kNLanes + n_lane;
+            const int32_t h_a = 4 * g + 2 * ipu_n_idx;
+            __memcpy_async(row_base + h_a * kHeadDim + sub_off,
+                           src_out,
+                           64 * sizeof(bfloat16_t),
+                           NRAM2GDRAM,
+                           kN * sizeof(bfloat16_t),
+                           kDealN * sizeof(bfloat16_t),
+                           cur_m_st - 1);
+            __memcpy_async(row_base + (h_a + 1) * kHeadDim + sub_off,
+                           src_out + 64,
+                           64 * sizeof(bfloat16_t),
+                           NRAM2GDRAM,
+                           kN * sizeof(bfloat16_t),
+                           kDealN * sizeof(bfloat16_t),
+                           cur_m_st - 1);
+          }
+        }
+        if (++nb_st == my_n_blocks) {
+          nb_st = 0;
+          ++ms_st;
+        }
+      }
+
+      // Stage 1 (IPU MV): bank-skewed XOR-dephased SRAM2WRAM weight+scale move
+      const int32_t s_mv = e;
+      if (s_mv < total_steps) {
+        int8_t* dst_wram_b = (s_mv & 1) ? wram_b1 : wram_b0;
+        int8_t* src_sram_b = (s_mv & 1) ? sram_b1 : sram_b0;
+        bfloat16_t* dst_wram_ws = (s_mv & 1) ? wram_ws1 : wram_ws0;
+        bfloat16_t* src_sram_ws = (s_mv & 1) ? sram_wscale1 : sram_wscale0;
+        move_weight_128(
+            dst_wram_b, src_sram_b, ipu_n_idx, ipu_m_idx, kSubBytesB);
+        move_scale_128(
+            dst_wram_ws, src_sram_ws, ipu_n_idx, ipu_m_idx, kSubElemsWs);
+
+        if (ms_mv == 0 && nb_mv == 0) {
+          const int32_t blk_m_mv = (m < kBlockM) ? m : kBlockM;
+          const int32_t cur_m_mv =
+              (blk_m_mv > row_off)
+                  ? ((blk_m_mv - row_off < kDealM) ? (blk_m_mv - row_off)
+                                                   : kDealM)
+                  : 0;
+          if (cur_m_mv > 0) {
+            int8_t* src_sram_a = sram_a + ipu_m_idx * kHalfBytesA;
+            __memcpy_async(
+                nram_a, src_sram_a, cur_m_mv * kK * sizeof(int8_t), SRAM2NRAM);
+            __memcpy_async(nram_ts32,
+                           sram_tscale + row_off * kScaleCh,
+                           cur_m_mv * kScaleCh * sizeof(bfloat16_t),
+                           SRAM2NRAM);
+          }
+        } else if (nb_mv >= 8 && nb_mv <= 12 && (ms_mv + 1) < num_m_steps) {
+          const int32_t next_ms = ms_mv + 1;
+          const int32_t m0_next = next_ms * kBlockM;
+          const int32_t blk_m_next =
+              (m - m0_next < kBlockM) ? (m - m0_next) : kBlockM;
+          const int32_t cur_m_next =
+              (blk_m_next > row_off)
+                  ? ((blk_m_next - row_off < kDealM) ? (blk_m_next - row_off)
+                                                     : kDealM)
+                  : 0;
+          if (nb_mv < 12) {
+            const int32_t sub_r = (nb_mv - 8) * 32;
+            if (cur_m_next > sub_r) {
+              const int32_t rows_mv =
+                  (cur_m_next - sub_r < 32) ? (cur_m_next - sub_r) : 32;
+              int8_t* dst_a =
+                  nram_a + (next_ms & 1) * (kDealM * kK) + sub_r * kK;
+              int8_t* src_sram_a = sram_a + (next_ms & 1) * kSlotBytesA +
+                                   ipu_m_idx * kHalfBytesA + sub_r * kK;
+              __memcpy_async(
+                  dst_a, src_sram_a, rows_mv * kK * sizeof(int8_t), SRAM2NRAM);
+            }
+          } else if (cur_m_next > 0) {
+            bfloat16_t* dst_ts32 =
+                nram_ts32 + (next_ms & 1) * (kDealM * kScaleCh);
+            bfloat16_t* src_sram_ts = sram_tscale +
+                                      (next_ms & 1) * (kBlockM * kScaleCh) +
+                                      row_off * kScaleCh;
+            __memcpy_async(dst_ts32,
+                           src_sram_ts,
+                           cur_m_next * kScaleCh * sizeof(bfloat16_t),
+                           SRAM2NRAM);
+          }
+        }
+        if (nb_mv == 9 || nb_mv == 10) {
+          const int32_t m0_cur = ms_mv * kBlockM;
+          const int32_t blk_m_cur =
+              (m - m0_cur < kBlockM) ? (m - m0_cur) : kBlockM;
+          const int32_t base_r = blk_m_cur >> 2;
+          const int32_t rem_r = blk_m_cur & 3;
+          const int32_t my_cnt = base_r + (coreId < rem_r ? 1 : 0);
+          const int32_t r_sub =
+              coreId * base_r + (coreId < rem_r ? coreId : rem_r);
+          if (my_cnt > 0) {
+            uint32_t* p_off = nram_pos_my;
+            if (nb_mv == 9) {
+              const int32_t* src_pos = positions + m0_cur + r_sub;
+              const uint32_t pos_bytes =
+                  static_cast<uint32_t>(my_cnt) * sizeof(uint32_t);
+              asm volatile(
+                  "ld.async.nram.gdram.io1.scmnormal [%[dst]], [%[src]], "
+                  "%[sz];\n\t"
+                  :
+                  : [dst] "r"(p_off), [src] "r"(src_pos), [sz] "r"(pos_bytes)
+                  : "memory");
+            } else {
+              float* dst_sram_cs =
+                  sram_cs_raw + (ms_mv & 1) * (kBlockM * 128) + r_sub * 128;
+              const uint32_t cnt_u32 = static_cast<uint32_t>(my_cnt);
+              rope_offsets(p_off, my_cnt, rope_rows);
+              asm volatile("sync.psimd.cio1;\n\t" : "+r"(p_off)::"memory");
+              asm volatile(
+                  "gather.vector.async.scmnormal.sram.gdram.nram.io1.u32 "
+                  "[%[dst]], [%[src]], [%[off]], 512, %[cnt], 512;\n\t"
+                  :
+                  : [dst] "r"(dst_sram_cs),
+                    [src] "r"(rope_cache),
+                    [off] "r"(p_off),
+                    [cnt] "r"(cnt_u32)
+                  : "memory");
+            }
+          }
+        }
+        if (++nb_mv == my_n_blocks) {
+          nb_mv = 0;
+          ++ms_mv;
+        }
+      }
+
+      // Stage 2 (IPU SIMD): BF16 K=32 24-bit exact scale_mat outer product +
+      // INT8 conv
+      const int32_t s_cp = e - 1;
+      if (s_cp >= 0 && s_cp < total_steps) {
+        const int32_t m0_cp = ms_cp * kBlockM;
+        const int32_t blk_m_cp = (m - m0_cp < kBlockM) ? (m - m0_cp) : kBlockM;
+        const int32_t cur_m_cp =
+            (blk_m_cp > row_off)
+                ? ((blk_m_cp - row_off < kDealM) ? (blk_m_cp - row_off)
+                                                 : kDealM)
+                : 0;
+        int8_t* cur_wram_b = (s_cp & 1) ? wram_b1 : wram_b0;
+        bfloat16_t* cur_wram_ws = (s_cp & 1) ? wram_ws1 : wram_ws0;
+        if (cur_m_cp > 0) {
+          int8_t* src_a = nram_a + (ms_cp & 1) * (kDealM * kK);
+          bfloat16_t* src_ts32 = nram_ts32 + (ms_cp & 1) * (kDealM * kScaleCh);
+          bfloat16_t* dst_out = nram_out + (s_cp & 1) * (kDealM * kDealN);
+          float* c_ptr = nram_c;
+          if (nb_cp >= 14) {
+            const int32_t cm0 =
+                (cur_m_cp < kRopeChunkM) ? cur_m_cp : kRopeChunkM;
+            const float* src_sram_cs0 =
+                sram_cs_raw + (ms_cp & 1) * (kBlockM * 128) + row_off * 128;
+            float* cos0 = nram_cs_exp;
+            float* sin0 = nram_cs_exp + kRopeChunkM * kDealN;
+            __memcpy_async(cos0,
+                           src_sram_cs0,
+                           kRopeDim * sizeof(float),
+                           SRAM2NRAM,
+                           kDealN * sizeof(float),
+                           128 * sizeof(float),
+                           cm0 - 1);
+            __memcpy_async(cos0 + kRopeDim,
+                           src_sram_cs0,
+                           kRopeDim * sizeof(float),
+                           SRAM2NRAM,
+                           kDealN * sizeof(float),
+                           128 * sizeof(float),
+                           cm0 - 1);
+            __memcpy_async(sin0,
+                           src_sram_cs0 + kRopeDim,
+                           kRopeDim * sizeof(float),
+                           SRAM2NRAM,
+                           kDealN * sizeof(float),
+                           128 * sizeof(float),
+                           cm0 - 1);
+            __memcpy_async(sin0 + kRopeDim,
+                           src_sram_cs0 + kRopeDim,
+                           kRopeDim * sizeof(float),
+                           SRAM2NRAM,
+                           kDealN * sizeof(float),
+                           128 * sizeof(float),
+                           cm0 - 1);
+          }
+          __asm__ volatile(
+              "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[kernel]], 32, "
+              "%[m], 1, 1, 1, 1, 1, %[n];\n\t"
+              : [dst] "+r"(c_ptr)
+              : [src] "r"(src_ts32),
+                [kernel] "r"(cur_wram_ws),
+                [m] "r"(cur_m_cp),
+                [n] "r"(kDealN)
+              : "memory");
+          __asm__ volatile(
+              "conv.nram.rn.f32.s8.s8 [%[dst]], [%[src]], [%[kernel]], %[k], "
+              "%[m], 1, 1, 1, 1, 1, %[n], .mul.partial.rn([%[scale_mat]]), "
+              ".cvt.dst.rn.bf16();\n\t"
+              : [dst] "+r"(dst_out), [scale_mat] "+r"(c_ptr)
+              : [src] "r"(src_a),
+                [kernel] "r"(cur_wram_b),
+                [k] "r"(kK),
+                [m] "r"(cur_m_cp),
+                [n] "r"(kDealN)
+              : "memory");
+          if (nb_cp >= 14) {
+            const float* src_sram_cs =
+                sram_cs_raw + (ms_cp & 1) * (kBlockM * 128) + row_off * 128;
+            float* r_tail = c_ptr;
+            float* r_swapped = c_ptr + kRopeChunkM * kDealN;
+            float* buf_odd = c_ptr + 2 * kRopeChunkM * kDealN;
+            if (cur_m_cp > kRopeChunkM) {
+              asm volatile("sync.psimd.cmv;\n\t" : "+r"(buf_odd)::"memory");
+            }
+            for (int32_t c0 = 0, idx = 0; c0 < cur_m_cp;
+                 c0 += kRopeChunkM, ++idx) {
+              const int32_t cm =
+                  (cur_m_cp - c0 < kRopeChunkM) ? (cur_m_cp - c0) : kRopeChunkM;
+              const int32_t elems = cm * kDealN;
+              bfloat16_t* sub_dst = dst_out + c0 * kDealN;
+              float* cur_cos = (idx & 1) ? buf_odd : nram_cs_exp;
+              float* cur_sin = cur_cos + kRopeChunkM * kDealN;
+              __bang_bfloat162float(r_tail, sub_dst, elems);
+              __bang_conv(r_swapped,
+                          sub_dst,
+                          wram_perm64,
+                          kRopeDim,
+                          2 * cm,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          kRopeDim);
+              asm volatile(
+                  "sync.pmv.csimd;\n\t"
+                  : "+r"(cur_cos), "+r"(cur_sin), "+r"(sub_dst)::"memory");
+              if (c0 + kRopeChunkM < cur_m_cp) {
+                const int32_t c_next = c0 + kRopeChunkM;
+                const int32_t cm_next = (cur_m_cp - c_next < kRopeChunkM)
+                                            ? (cur_m_cp - c_next)
+                                            : kRopeChunkM;
+                const float* c_src = src_sram_cs + c_next * 128;
+                const float* s_src = c_src + kRopeDim;
+                float* nxt_cos = (idx & 1) ? nram_cs_exp : buf_odd;
+                float* nxt_sin = nxt_cos + kRopeChunkM * kDealN;
+                if (idx > 0) {
+                  asm volatile("sync.psimd.cmv;\n\t"
+                               : "+r"(nxt_cos), "+r"(nxt_sin)::"memory");
+                }
+                __memcpy_async(nxt_cos,
+                               c_src,
+                               kRopeDim * sizeof(float),
+                               SRAM2NRAM,
+                               kDealN * sizeof(float),
+                               128 * sizeof(float),
+                               cm_next - 1);
+                __memcpy_async(nxt_cos + kRopeDim,
+                               c_src,
+                               kRopeDim * sizeof(float),
+                               SRAM2NRAM,
+                               kDealN * sizeof(float),
+                               128 * sizeof(float),
+                               cm_next - 1);
+                __memcpy_async(nxt_sin,
+                               s_src,
+                               kRopeDim * sizeof(float),
+                               SRAM2NRAM,
+                               kDealN * sizeof(float),
+                               128 * sizeof(float),
+                               cm_next - 1);
+                __memcpy_async(nxt_sin + kRopeDim,
+                               s_src,
+                               kRopeDim * sizeof(float),
+                               SRAM2NRAM,
+                               kDealN * sizeof(float),
+                               128 * sizeof(float),
+                               cm_next - 1);
+              }
+              __bang_mul(r_tail, r_tail, cur_cos, elems);
+              __bang_fusion(
+                  FUSION_FMA, r_tail, r_swapped, cur_sin, r_tail, elems, elems);
+              __bang_float2bfloat16_rn(sub_dst, r_tail, elems);
+            }
+          }
+        }
+        if (++nb_cp == my_n_blocks) {
+          nb_cp = 0;
+          ++ms_cp;
+        }
+      }
+
+      if (e + 1 < total_steps + 2) {
+        asm volatile(
+            "barrier.sync.local.pio.pmv.psimd.cio.cmv.csimd 1, 5;\n\t" ::
+                : "memory");
+      }
+    }
+  }
+  if (__is_ipu()) {
+    __sync_io();
+  }
+}
+
+template <typename T>
+__mlu_func__ void move_weight_64(T* wram_dst, const T* sram_src) {
+  constexpr int32_t dwidth = sizeof(T);
+  constexpr int32_t data_size = kK * dwidth;
+  constexpr int32_t wram_lt_stride = (__MLU_WRAM_SIZE__ * 1024) / 16;
+  __memcpy_async(wram_dst,
+                 const_cast<T*>(sram_src),
+                 data_size,
+                 SRAM2WRAM,
+                 data_size,
+                 4 - 1,
+                 wram_lt_stride,
+                 16 - 1,
+                 data_size,
+                 64 - 1,
+                 0,
+                 0);
+}
+
+template <int32_t kN>
+__mlu_global__ void gemm_small_int8(const bfloat16_t* qr_bf16,
+                                    const float* smooth,
+                                    const int8_t* weight,
+                                    const float* weight_scale,
+                                    const int32_t* positions,
+                                    const float* rope_cache,
+                                    int32_t rope_rows,
+                                    bfloat16_t* out_bf16,
+                                    int32_t m) {
+  constexpr int32_t kMaxSmallM = 128;
+  constexpr int32_t kBlockN = 256;
+  constexpr int32_t kQuantChunk = 16;
+  constexpr int32_t kWramStrideB = (kGemmTileN / 16) * kK * sizeof(int8_t);
+
+  __mlu_shared__ int8_t sram_a[kMaxSmallM * kK];
+  __mlu_shared__ float sram_tscale[kMaxSmallM];
+  __mlu_shared__ int8_t sram_b[3 * kBlockN * kK];
+  __mlu_shared__ float sram_wscale[3 * kBlockN];
+  __mlu_shared__ float sram_cs_raw[kMaxSmallM * 128];
+
+  __nram__ int8_t nram_a[kMaxSmallM * kK];
+  __nram__ float nram_tscale_16[kMaxSmallM * 16];
+  __nram__ float nram_wscale_16[2 * kGemmTileN * 16];
+  __wram__ int8_t wram_buf[__MLU_WRAM_SIZE__ * 1024];
+  __nram__ float nram_c[kMaxSmallM * kGemmTileN];
+  __nram__ uint16_t nram_out_u16[3 * kMaxSmallM * kGemmTileN];
+  bfloat16_t* nram_out = reinterpret_cast<bfloat16_t*>(nram_out_u16);
+  __nram__ int32_t nram_pos[kMaxSmallM];
+  __nram__ float nram_cs_my[(kMaxSmallM / 4) * 128];
+  __nram__ float nram_cos[kMaxSmallM * kRopeDim];
+  __nram__ float nram_sin[kMaxSmallM * kRopeDim];
+  __nram__ float nram_swapped[kMaxSmallM * kRopeDim];
+  __nram__ float nram_smooth[kK];
+  __nram__ float nram_q_fp32[kQuantChunk * kK];
+  __nram__ float nram_q_max[kQuantChunk * 4];
+  __nram__ float nram_q_sx[kQuantChunk];
+
+  const int32_t num_blocks = kN / kBlockN;
+  const int32_t my_blocks = static_cast<int32_t>(
+      static_cast<uint32_t>(num_blocks - taskIdY + taskDimY - 1) /
+      static_cast<uint32_t>(taskDimY));
+
+  // Prologue: MPU issues block 0 (IO0 -> Slot 0) and block 1 (IO1 -> Slot 1,
+  // non-blocking across barrier 1)
+  if (__is_mpu()) {
+    if (my_blocks > 0) {
+      __memcpy_io0_async(sram_b,
+                         weight + static_cast<int64_t>(taskIdY * kBlockN) * kK,
+                         kBlockN * kK * sizeof(int8_t),
+                         GDRAM2SRAM);
+      __memcpy_io0_async(sram_wscale,
+                         weight_scale + taskIdY * kBlockN,
+                         kBlockN * sizeof(float),
+                         GDRAM2SRAM);
+    }
+    if (my_blocks > 1) {
+      const int32_t blk1 = taskDimY + (taskIdY ^ 1);
+      __memcpy_io1_async(sram_b + kBlockN * kK,
+                         weight + static_cast<int64_t>(blk1 * kBlockN) * kK,
+                         kBlockN * kK * sizeof(int8_t),
+                         GDRAM2SRAM);
+      __memcpy_io1_async(sram_wscale + kBlockN,
+                         weight_scale + blk1 * kBlockN,
+                         kBlockN * sizeof(float),
+                         GDRAM2SRAM);
+    }
+    asm volatile("barrier.sync.local.pio0.cio0 1, 5;\n\t" ::: "memory");
+  }
+  if (__is_ipu()) {
+    __bang_write_value(nram_tscale_16, kMaxSmallM * 16, 0.0f);
+    __bang_write_value(nram_wscale_16, 2 * kGemmTileN * 16, 0.0f);
+    __memcpy_io0_async(nram_smooth, smooth, kK * sizeof(float), GDRAM2NRAM);
+    __memcpy_io1_async(nram_pos, positions, m * sizeof(int32_t), GDRAM2NRAM);
+    __sync_io_move_compute();
+
+    int32_t my_cnt = 0;
+    for (int32_t r = coreId; r < m; r += 4) {
+      const int32_t nonnegative = nram_pos[r] < 0 ? 0 : nram_pos[r];
+      const int32_t pos = nonnegative < rope_rows ? nonnegative : rope_rows - 1;
+      __memcpy_io1_async(nram_cs_my + my_cnt * 128,
+                         rope_cache + pos * 128,
+                         128 * sizeof(float),
+                         GDRAM2NRAM);
+      ++my_cnt;
+    }
+
+    const int32_t base_r = m >> 2;
+    const int32_t rem_r = m & 3;
+    const int32_t my_rows = base_r + (coreId < rem_r ? 1 : 0);
+    const int32_t r_start = coreId * base_r + (coreId < rem_r ? coreId : rem_r);
+    bfloat16_t* p_qr = reinterpret_cast<bfloat16_t*>(nram_a);
+    int8_t* p_qi =
+        nram_a + kQuantChunk * kK * static_cast<int32_t>(sizeof(bfloat16_t));
+
+    for (int32_t off = 0; off < my_rows; off += kQuantChunk) {
+      const int32_t cur_b =
+          (my_rows - off < kQuantChunk) ? (my_rows - off) : kQuantChunk;
+      const int32_t r0 = r_start + off;
+      const bfloat16_t* src_qr = qr_bf16 + static_cast<int64_t>(r0) * kK;
+      const uint32_t qr_bytes =
+          static_cast<uint32_t>(cur_b) * kK * sizeof(bfloat16_t);
+      asm volatile(
+          "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+          :
+          : [dst] "r"(p_qr), [src] "r"(src_qr), [sz] "r"(qr_bytes)
+          : "memory");
+      asm volatile("sync.pio0.csimd;\n\t" ::: "memory");
+      __bang_bfloat162float(nram_q_fp32, p_qr, cur_b * kK);
+      __bang_cycle_mul(nram_q_fp32, nram_q_fp32, nram_smooth, cur_b * kK, kK);
+      for (int32_t i = 0; i < cur_b; ++i) {
+        float* dst_max = nram_q_max + i * 4;
+        float* src_row = nram_q_fp32 + i * kK;
+        __asm__ volatile("absmax.nram.f32 [%[dst]], [%[src]], %[sz];\n\t"
+                         : [dst] "+r"(dst_max)
+                         : [src] "r"(src_row), [sz] "r"(kK)
+                         : "memory");
+      }
+      __sync_compute();
+      for (int32_t i = 0; i < cur_b; ++i) {
+        float amax = nram_q_max[i * 4];
+        nram_q_sx[i] = amax / 127.0f;
+        float inv_sx = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        __bang_mul_scalar(
+            nram_q_fp32 + i * kK, nram_q_fp32 + i * kK, inv_sx, kK);
+      }
+      __bang_float2int8_rn(p_qi, nram_q_fp32, cur_b * kK, 0);
+      __sync_compute();
+      __memcpy_async(
+          sram_a + r0 * kK, p_qi, cur_b * kK * sizeof(int8_t), NRAM2SRAM);
+      __memcpy_async(
+          sram_tscale + r0, nram_q_sx, cur_b * sizeof(float), NRAM2SRAM);
+      __sync_move();
+    }
+
+    asm volatile("sync.pio1.cmv;\n\t" ::: "memory");
+    if (my_cnt > 0) {
+      __memcpy_async(sram_cs_raw + coreId * 128,
+                     nram_cs_my,
+                     128 * sizeof(float),
+                     NRAM2SRAM,
+                     4 * 128 * sizeof(float),
+                     128 * sizeof(float),
+                     my_cnt - 1);
+    }
+    asm volatile("barrier.sync.local.pmv.cmv 2, 4;\n\t" ::: "memory");
+    __memcpy_async(nram_a, sram_a, m * kK * sizeof(int8_t), SRAM2NRAM);
+    __memcpy_async(nram_tscale_16,
+                   sram_tscale,
+                   sizeof(float),
+                   SRAM2NRAM,
+                   16 * sizeof(float),
+                   sizeof(float),
+                   m - 1);
+    __memcpy_async(nram_cos,
+                   sram_cs_raw,
+                   kRopeDim * sizeof(float),
+                   SRAM2NRAM,
+                   kRopeDim * sizeof(float),
+                   128 * sizeof(float),
+                   m - 1);
+    __memcpy_async(nram_sin,
+                   sram_cs_raw + kRopeDim,
+                   kRopeDim * sizeof(float),
+                   SRAM2NRAM,
+                   kRopeDim * sizeof(float),
+                   128 * sizeof(float),
+                   m - 1);
+    asm volatile("barrier.sync.local.pio.pmv.psimd.cmv.csimd 1, 5;\n\t" ::
+                     : "memory");
+  }
+
+  int32_t slot_ld = 2;
+  int32_t slot_mv = 0;
+  int32_t slot_cp = 0;
+  int32_t slot_st = 0;
+
+  for (int32_t e = 0; e < my_blocks; ++e) {
+    // Stage 0 (MPU IO): issue block e + 2 on IO((e+2)&1) while waiting only on
+    // block e + 1 on IO((e+1)&1)
+    if (__is_mpu()) {
+      const int32_t s_ld = e + 2;
+      if (s_ld < my_blocks) {
+        const int32_t blk_ld = s_ld * taskDimY + (taskIdY ^ (s_ld & 1));
+        int8_t* dst_sram_b = sram_b + slot_ld * (kBlockN * kK);
+        float* dst_sram_ws = sram_wscale + slot_ld * kBlockN;
+        if ((s_ld & 1) == 0) {
+          __memcpy_io0_async(
+              dst_sram_b,
+              weight + static_cast<int64_t>(blk_ld * kBlockN) * kK,
+              kBlockN * kK * sizeof(int8_t),
+              GDRAM2SRAM);
+          __memcpy_io0_async(dst_sram_ws,
+                             weight_scale + blk_ld * kBlockN,
+                             kBlockN * sizeof(float),
+                             GDRAM2SRAM);
+        } else {
+          __memcpy_io1_async(
+              dst_sram_b,
+              weight + static_cast<int64_t>(blk_ld * kBlockN) * kK,
+              kBlockN * kK * sizeof(int8_t),
+              GDRAM2SRAM);
+          __memcpy_io1_async(dst_sram_ws,
+                             weight_scale + blk_ld * kBlockN,
+                             kBlockN * sizeof(float),
+                             GDRAM2SRAM);
+        }
+        if (++slot_ld == 3) {
+          slot_ld = 0;
+        }
+      }
+      if (e + 1 < my_blocks) {
+        if ((e & 1) == 0) {
+          asm volatile("barrier.sync.local.pio1.cio1 1, 5;\n\t" ::: "memory");
+        } else {
+          asm volatile("barrier.sync.local.pio0.cio0 1, 5;\n\t" ::: "memory");
+        }
+      }
+    }
+
+    if (__is_ipu()) {
+      float* wram_ws0 = reinterpret_cast<float*>(wram_buf + 16384);
+      float* wram_ws1 = reinterpret_cast<float*>(wram_buf + 18432);
+      bfloat16_t* wram_perm = reinterpret_cast<bfloat16_t*>(wram_buf + 20480);
+
+      // Stage 3 (IPU IO0/IO1): store swizzled block e - 2 from 3-slot nram_out
+      const int32_t s_st = e - 2;
+      if (s_st >= 0) {
+        const int32_t blk_st = s_st * taskDimY + (taskIdY ^ (s_st & 1));
+        const int32_t sub_st = (coreId + (s_st >> 1)) & 3;
+        bfloat16_t* src_out = nram_out + slot_st * (kMaxSmallM * kGemmTileN);
+        if (++slot_st == 3) {
+          slot_st = 0;
+        }
+        bfloat16_t* dst_g = out_bf16 + blk_st * kBlockN + sub_st * kGemmTileN;
+        const uint32_t seg = static_cast<uint32_t>(m - 1);
+        if ((s_st & 1) == 0) {
+          asm volatile(
+              "st.stride.async.io0.gdram.nram [%[dst]], [%[src]], 128, "
+              "%[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_g),
+                [src] "r"(src_out),
+                [seg] "r"(seg)
+              : "memory");
+        } else {
+          asm volatile(
+              "st.stride.async.io1.gdram.nram [%[dst]], [%[src]], 128, "
+              "%[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_g),
+                [src] "r"(src_out),
+                [seg] "r"(seg)
+              : "memory");
+        }
+      }
+
+      // Stage 1 (IPU MV): issue block e SRAM->WRAM/NRAM moves FIRST so MV
+      // overlaps SIMD
+      const int32_t s_mv = e;
+      const int32_t sub_mv = (coreId + (s_mv >> 1)) & 3;
+      int8_t* dst_wram = wram_buf + (s_mv & 1) * kWramStrideB;
+      int8_t* src_sram_b = sram_b + slot_mv * (kBlockN * kK);
+      float* dst_ws16 = nram_wscale_16 + (s_mv & 1) * (kGemmTileN * 16);
+      float* dst_wram_ws = (s_mv & 1) ? wram_ws1 : wram_ws0;
+      float* src_sram_ws = sram_wscale + slot_mv * kBlockN;
+      if (++slot_mv == 3) {
+        slot_mv = 0;
+      }
+      move_weight_64(dst_wram, src_sram_b + sub_mv * kGemmTileN * kK);
+      __memcpy_async(dst_ws16,
+                     src_sram_ws + sub_mv * kGemmTileN,
+                     sizeof(float),
+                     SRAM2NRAM,
+                     16 * sizeof(float),
+                     sizeof(float),
+                     kGemmTileN - 1);
+      __bang_reshape_filter_async(
+          dst_wram_ws, dst_ws16, kGemmTileN, 1, 1, 16, NRAM2WRAM);
+
+      // Stage 2 (IPU): on e==0 load precomputed wram_perm from LLC; on e>=1
+      // compute block e-1 + RoPE
+      if (e == 0) {
+        load_rope_perm(wram_perm, reinterpret_cast<bfloat16_t*>(nram_swapped));
+      }
+      const int32_t s_cp = e - 1;
+      if (s_cp >= 0) {
+        const int32_t blk_cp = s_cp * taskDimY + (taskIdY ^ (s_cp & 1));
+        const int32_t sub_cp = (coreId + (s_cp >> 1)) & 3;
+        int8_t* cur_wram = wram_buf + (s_cp & 1) * kWramStrideB;
+        float* cur_wram_ws = (s_cp & 1) ? wram_ws1 : wram_ws0;
+        bfloat16_t* dst_out = nram_out + slot_cp * (kMaxSmallM * kGemmTileN);
+        if (++slot_cp == 3) {
+          slot_cp = 0;
+        }
+        float* c_ptr = nram_c;
+
+        __bang_conv(c_ptr,
+                    nram_tscale_16,
+                    cur_wram_ws,
+                    16,
+                    m,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    kGemmTileN);
+        __asm__ volatile(
+            "conv.nram.rn.f32.s8.s8 [%[dst]], [%[src]], [%[kernel]], %[k], "
+            "%[m], 1, 1, 1, 1, 1, %[n], .mul.partial.rn([%[scale_mat]]), "
+            ".cvt.dst.rn.bf16();\n\t"
+            : [dst] "+r"(dst_out), [scale_mat] "+r"(c_ptr)
+            : [src] "r"(nram_a),
+              [kernel] "r"(cur_wram),
+              [k] "r"(kK),
+              [m] "r"(m),
+              [n] "r"(kGemmTileN)
+            : "memory");
+        if (((blk_cp & 1) == 1) && (sub_cp == 3)) {
+          const int32_t elems = m * kRopeDim;
+          __bang_bfloat162float(c_ptr, dst_out, elems);
+          __bang_conv(nram_swapped,
+                      dst_out,
+                      wram_perm,
+                      kRopeDim,
+                      m,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      kRopeDim);
+          __bang_mul(c_ptr, c_ptr, nram_cos, elems);
+          __bang_fusion(
+              FUSION_FMA, c_ptr, nram_swapped, nram_sin, c_ptr, elems, elems);
+          __bang_float2bfloat16_rn(dst_out, c_ptr, elems);
+        }
+      }
+
+      if (e + 1 < my_blocks) {
+        asm volatile(
+            "barrier.sync.local.pio.pmv.psimd.cio.cmv.csimd 1, 5;\n\t" ::
+                : "memory");
+      } else {
+        const uint32_t seg = static_cast<uint32_t>(m - 1);
+        if (my_blocks >= 2) {
+          const int32_t s_st1 = my_blocks - 2;
+          const int32_t blk_st1 = s_st1 * taskDimY + (taskIdY ^ (s_st1 & 1));
+          const int32_t sub_st1 = (coreId + (s_st1 >> 1)) & 3;
+          bfloat16_t* src_out1 = nram_out + slot_st * (kMaxSmallM * kGemmTileN);
+          if (++slot_st == 3) {
+            slot_st = 0;
+          }
+          bfloat16_t* dst_g1 =
+              out_bf16 + blk_st1 * kBlockN + sub_st1 * kGemmTileN;
+          if ((s_st1 & 1) == 0) {
+            asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+            asm volatile(
+                "st.stride.async.io0.gdram.nram [%[dst]], [%[src]], 128, "
+                "%[stride], 128, %[seg];\n\t"
+                :
+                : [stride] "i"(kN * sizeof(bfloat16_t)),
+                  [dst] "r"(dst_g1),
+                  [src] "r"(src_out1),
+                  [seg] "r"(seg)
+                : "memory");
+          } else {
+            asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+            asm volatile(
+                "st.stride.async.io1.gdram.nram [%[dst]], [%[src]], 128, "
+                "%[stride], 128, %[seg];\n\t"
+                :
+                : [stride] "i"(kN * sizeof(bfloat16_t)),
+                  [dst] "r"(dst_g1),
+                  [src] "r"(src_out1),
+                  [seg] "r"(seg)
+                : "memory");
+          }
+        }
+        const int32_t s_last = my_blocks - 1;
+        const int32_t blk_last = s_last * taskDimY + (taskIdY ^ (s_last & 1));
+        const int32_t sub_last = (coreId + (s_last >> 1)) & 3;
+        int8_t* last_wram = wram_buf + (s_last & 1) * kWramStrideB;
+        float* last_wram_ws = (s_last & 1) ? wram_ws1 : wram_ws0;
+        bfloat16_t* dst_last = nram_out + slot_cp * (kMaxSmallM * kGemmTileN);
+        float* c_ptr = nram_c;
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+        __bang_conv(c_ptr,
+                    nram_tscale_16,
+                    last_wram_ws,
+                    16,
+                    m,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    kGemmTileN);
+        __asm__ volatile(
+            "conv.nram.rn.f32.s8.s8 [%[dst]], [%[src]], [%[kernel]], %[k], "
+            "%[m], 1, 1, 1, 1, 1, %[n], .mul.partial.rn([%[scale_mat]]), "
+            ".cvt.dst.rn.bf16();\n\t"
+            : [dst] "+r"(dst_last), [scale_mat] "+r"(c_ptr)
+            : [src] "r"(nram_a),
+              [kernel] "r"(last_wram),
+              [k] "r"(kK),
+              [m] "r"(m),
+              [n] "r"(kGemmTileN)
+            : "memory");
+        if (((blk_last & 1) == 1) && (sub_last == 3)) {
+          const int32_t elems = m * kRopeDim;
+          __bang_bfloat162float(c_ptr, dst_last, elems);
+          __bang_conv(nram_swapped,
+                      dst_last,
+                      wram_perm,
+                      kRopeDim,
+                      m,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      kRopeDim);
+          __bang_mul(c_ptr, c_ptr, nram_cos, elems);
+          __bang_fusion(
+              FUSION_FMA, c_ptr, nram_swapped, nram_sin, c_ptr, elems, elems);
+          __bang_float2bfloat16_rn(dst_last, c_ptr, elems);
+        }
+        bfloat16_t* dst_glast =
+            out_bf16 + blk_last * kBlockN + sub_last * kGemmTileN;
+        if ((s_last & 1) == 0) {
+          asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+          asm volatile(
+              "st.stride.async.io0.gdram.nram [%[dst]], [%[src]], 128, "
+              "%[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_glast),
+                [src] "r"(dst_last),
+                [seg] "r"(seg)
+              : "memory");
+        } else {
+          asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+          asm volatile(
+              "st.stride.async.io1.gdram.nram [%[dst]], [%[src]], 128, "
+              "%[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_glast),
+                [src] "r"(dst_last),
+                [seg] "r"(seg)
+              : "memory");
+        }
+      }
+    }
+  }
+  if (__is_ipu()) {
+    __sync_io();
+  }
+}
+
+template <int32_t kN>
+__mlu_global__ void gemm_small_bf16(const bfloat16_t* qr_bf16,
+                                    const bfloat16_t* weight_bf16,
+                                    const int32_t* positions,
+                                    const float* rope_cache,
+                                    int32_t rope_rows,
+                                    bfloat16_t* out_bf16,
+                                    int32_t m) {
+  constexpr int32_t kMaxSmallM = 96;
+  constexpr int32_t kBlockN = 256;
+  constexpr int32_t kBlockElems = kBlockN * kK;
+  constexpr int32_t kWramStride = (kGemmTileN / 16) * kK * sizeof(bfloat16_t);
+
+  // Dedicated sram_cs_raw decouples Slot 2 from IPU rope_cache gather (1920 +
+  // 48 = 1968 KiB <= 2016 KiB)
+  __mlu_shared__ uint16_t sram_b_u16[3 * kBlockElems];
+  alignas(128) __mlu_shared__ float sram_cs_raw[kMaxSmallM * 128];
+  bfloat16_t* sram_b = reinterpret_cast<bfloat16_t*>(sram_b_u16);
+
+  __nram__ uint16_t nram_a_u16[kMaxSmallM * kK];
+  bfloat16_t* nram_a = reinterpret_cast<bfloat16_t*>(nram_a_u16);
+  __wram__ int8_t wram_buf[__MLU_WRAM_SIZE__ * 1024];
+  __nram__ uint16_t nram_out_u16[3 * kMaxSmallM * kGemmTileN];
+  bfloat16_t* nram_out = reinterpret_cast<bfloat16_t*>(nram_out_u16);
+  alignas(64) __nram__ uint32_t nram_off[kMaxSmallM];
+  __nram__ float nram_cos[kMaxSmallM * kRopeDim];
+  __nram__ float nram_sin[kMaxSmallM * kRopeDim];
+  __nram__ float nram_tail_f32[kMaxSmallM * kRopeDim];
+  __nram__ float nram_swapped[kMaxSmallM * kRopeDim];
+  __nram__ float nram_tmp[kMaxSmallM * kRopeDim];
+
+  const int32_t num_blocks = kN / kBlockN;
+  const int32_t my_blocks = static_cast<int32_t>(
+      static_cast<uint32_t>(num_blocks - taskIdY + taskDimY - 1) /
+      static_cast<uint32_t>(taskDimY));
+
+  // Prologue: MPU streams block 0 (IO0) and block 1 (IO1);
+  // IPU queues qr_bf16+perm (IO0) and hardware gather.vector rope_cache->SRAM
+  // (IO1) with ZERO scalar/DMA wait!
+  if (__is_mpu()) {
+    if (my_blocks > 0) {
+      __memcpy_io0_async(
+          sram_b,
+          weight_bf16 + static_cast<int64_t>(taskIdY * kBlockN) * kK,
+          kBlockElems * sizeof(bfloat16_t),
+          GDRAM2SRAM);
+    }
+    if (my_blocks > 1) {
+      const int32_t blk1 = taskDimY + (taskIdY ^ 1);
+      __memcpy_io1_async(
+          sram_b + kBlockElems,
+          weight_bf16 + static_cast<int64_t>(blk1 * kBlockN) * kK,
+          kBlockElems * sizeof(bfloat16_t),
+          GDRAM2SRAM);
+    }
+    asm volatile("barrier.sync.local.pio0.cio0 1, 5;\n\t" ::: "memory");
+  }
+  if (__is_ipu()) {
+    const uint32_t qr_bytes =
+        static_cast<uint32_t>(m) * kK * sizeof(bfloat16_t);
+    asm volatile(
+        "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+        :
+        : [dst] "r"(nram_a), [src] "r"(qr_bf16), [sz] "r"(qr_bytes)
+        : "memory");
+    bfloat16_t* tmp_perm_bf16 = reinterpret_cast<bfloat16_t*>(nram_swapped);
+    const uint16_t* src_perm = kRopePerm64.data;
+    const uint32_t perm_bytes = kRopeDim * kRopeDim * sizeof(uint16_t);
+    asm volatile(
+        "ld.async.nram.gdram.io0.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+        :
+        : [dst] "r"(tmp_perm_bf16), [src] "r"(src_perm), [sz] "r"(perm_bytes)
+        : "memory");
+
+    const int32_t base_r = m >> 2;
+    const int32_t rem_r = m & 3;
+    const int32_t my_rows = base_r + (coreId < rem_r ? 1 : 0);
+    const int32_t r_start = coreId * base_r + (coreId < rem_r ? coreId : rem_r);
+    if (my_rows > 0) {
+      uint32_t* p_off = nram_off;
+      float* dst_sram_cs = sram_cs_raw + r_start * 128;
+      const uint32_t cnt_u32 = static_cast<uint32_t>(my_rows);
+      __memcpy_io1_async(
+          p_off, positions + r_start, cnt_u32 * sizeof(uint32_t), GDRAM2NRAM);
+      asm volatile("sync.pio1.csimd;\n\t" ::: "memory");
+      rope_offsets(p_off, my_rows, rope_rows);
+      asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+      asm volatile(
+          "gather.vector.async.scmnormal.sram.gdram.nram.io1.u32 [%[dst]], "
+          "[%[src]], [%[off]], 512, %[cnt], 512;\n\t"
+          :
+          : [dst] "r"(dst_sram_cs),
+            [src] "r"(rope_cache),
+            [off] "r"(p_off),
+            [cnt] "r"(cnt_u32)
+          : "memory");
+    }
+    asm volatile("barrier.sync.local.cmv 1, 5;\n\t" ::: "memory");
+  }
+
+  int32_t slot_ld = 2;
+  int32_t slot_mv = 0;
+  int32_t slot_cp = 0;
+  int32_t slot_st = 0;
+
+  for (int32_t e = 0; e < my_blocks; ++e) {
+    // Stage 0 (MPU IO): issue block e + 2 on IO((e+2)&1) while waiting only on
+    // block e + 1 on IO((e+1)&1)
+    if (__is_mpu()) {
+      const int32_t s_ld = e + 2;
+      if (s_ld < my_blocks) {
+        const int32_t blk_ld = s_ld * taskDimY + (taskIdY ^ (s_ld & 1));
+        bfloat16_t* dst_sram_b = sram_b + slot_ld * kBlockElems;
+        const bfloat16_t* src_w =
+            weight_bf16 + static_cast<int64_t>(blk_ld * kBlockN) * kK;
+        if ((s_ld & 1) == 0) {
+          __memcpy_io0_async(
+              dst_sram_b, src_w, kBlockElems * sizeof(bfloat16_t), GDRAM2SRAM);
+        } else {
+          __memcpy_io1_async(
+              dst_sram_b, src_w, kBlockElems * sizeof(bfloat16_t), GDRAM2SRAM);
+        }
+        if (++slot_ld == 3) {
+          slot_ld = 0;
+        }
+      }
+      if (e + 1 < my_blocks) {
+        if ((e & 1) == 0) {
+          asm volatile("barrier.sync.local.pio1.cio1 1, 5;\n\t" ::: "memory");
+        } else {
+          asm volatile("barrier.sync.local.pio0.cio0 1, 5;\n\t" ::: "memory");
+        }
+      }
+    }
+
+    if (__is_ipu()) {
+      bfloat16_t* wram_perm =
+          reinterpret_cast<bfloat16_t*>(wram_buf + 2 * kWramStride);
+
+      // Stage 3 (IPU IO0/IO1): store block e - 2 from 3-slot nram_out
+      const int32_t s_st = e - 2;
+      if (s_st >= 0) {
+        const int32_t blk_st = s_st * taskDimY + (taskIdY ^ (s_st & 1));
+        const int32_t sub_st = (coreId + (s_st >> 1)) & 3;
+        bfloat16_t* src_out = nram_out + slot_st * (kMaxSmallM * kGemmTileN);
+        if (++slot_st == 3) {
+          slot_st = 0;
+        }
+        bfloat16_t* dst_g = out_bf16 + blk_st * kBlockN + sub_st * kGemmTileN;
+        const uint32_t seg = static_cast<uint32_t>(m - 1);
+        if ((s_st & 1) == 0) {
+          asm volatile(
+              "st.stride.async.gdram.nram.io0.dcmnormal [%[dst]], [%[src]], "
+              "128, %[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_g),
+                [src] "r"(src_out),
+                [seg] "r"(seg)
+              : "memory");
+        } else {
+          asm volatile(
+              "st.stride.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], "
+              "128, %[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_g),
+                [src] "r"(src_out),
+                [seg] "r"(seg)
+              : "memory");
+        }
+      }
+
+      // Stage 1 (IPU MV): issue block e SRAM->WRAM move FIRST so MV overlaps
+      // gather completion
+      const int32_t s_mv = e;
+      const int32_t sub_mv = (coreId + (s_mv >> 1)) & 3;
+      bfloat16_t* dst_wram =
+          reinterpret_cast<bfloat16_t*>(wram_buf + (s_mv & 1) * kWramStride);
+      bfloat16_t* src_sram_b = sram_b + slot_mv * kBlockElems;
+      move_weight_64(dst_wram, src_sram_b + sub_mv * kGemmTileN * kK);
+      if (++slot_mv == 3) {
+        slot_mv = 0;
+      }
+
+      // Stage 2 (IPU): on e==0 finish perm + cos/sin SRAM2NRAM while MPU
+      // streams; on e>=1 compute block e-1 + RoPE
+      if (e == 0) {
+        asm volatile("sync.pio0.cmv;\n\t" ::: "memory");
+        __bang_reshape_filter_async(wram_perm,
+                                    reinterpret_cast<bfloat16_t*>(nram_swapped),
+                                    kRopeDim,
+                                    1,
+                                    1,
+                                    kRopeDim,
+                                    NRAM2WRAM);
+        asm volatile("barrier.sync.local.pio1.cmv 2, 4;\n\t" ::: "memory");
+        __memcpy_async(nram_cos,
+                       sram_cs_raw,
+                       kRopeDim * sizeof(float),
+                       SRAM2NRAM,
+                       kRopeDim * sizeof(float),
+                       128 * sizeof(float),
+                       m - 1);
+        __memcpy_async(nram_sin,
+                       sram_cs_raw + kRopeDim,
+                       kRopeDim * sizeof(float),
+                       SRAM2NRAM,
+                       kRopeDim * sizeof(float),
+                       128 * sizeof(float),
+                       m - 1);
+      }
+      const int32_t s_cp = e - 1;
+      if (s_cp >= 0) {
+        const int32_t blk_cp = s_cp * taskDimY + (taskIdY ^ (s_cp & 1));
+        const int32_t sub_cp = (coreId + (s_cp >> 1)) & 3;
+        bfloat16_t* cur_wram =
+            reinterpret_cast<bfloat16_t*>(wram_buf + (s_cp & 1) * kWramStride);
+        bfloat16_t* dst_out = nram_out + slot_cp * (kMaxSmallM * kGemmTileN);
+        if (++slot_cp == 3) {
+          slot_cp = 0;
+        }
+        if (s_cp >= 3) {
+          if (((s_cp - 3) & 1) == 0) {
+            asm volatile("sync.pio0.csimd;\n\t" : "+r"(dst_out)::"memory");
+          } else {
+            asm volatile("sync.pio1.csimd;\n\t" : "+r"(dst_out)::"memory");
+          }
+        }
+        __asm__ volatile(
+            "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[kernel]], %[k], "
+            "%[m], 1, 1, 1, 1, 1, %[n], .cvt.dst.rn.bf16();\n\t"
+            : [dst] "+r"(dst_out)
+            : [src] "r"(nram_a),
+              [kernel] "r"(cur_wram),
+              [k] "r"(kK),
+              [m] "r"(m),
+              [n] "r"(kGemmTileN)
+            : "memory");
+        if (((blk_cp & 1) == 1) && (sub_cp == 3)) {
+          const int32_t elems = m * kRopeDim;
+          __bang_bfloat162float(nram_tail_f32, dst_out, elems);
+          __bang_conv(nram_swapped,
+                      dst_out,
+                      wram_perm,
+                      kRopeDim,
+                      m,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      kRopeDim);
+          __bang_mul(nram_tmp, nram_tail_f32, nram_cos, elems);
+          __bang_fusion(FUSION_FMA,
+                        nram_tmp,
+                        nram_swapped,
+                        nram_sin,
+                        nram_tmp,
+                        elems,
+                        elems);
+          __bang_float2bfloat16_rn(dst_out, nram_tmp, elems);
+        }
+      }
+
+      if (e + 1 < my_blocks) {
+        if (e == 0) {
+          asm volatile(
+              "barrier.sync.local.pio0.pmv.psimd.cio.cmv.csimd 1, 5;\n\t" ::
+                  : "memory");
+        } else {
+          asm volatile("barrier.sync.local.pmv.psimd.cio.cmv.csimd 1, 5;\n\t" ::
+                           : "memory");
+        }
+      } else {
+        const uint32_t seg = static_cast<uint32_t>(m - 1);
+        if (my_blocks >= 2) {
+          const int32_t s_st1 = my_blocks - 2;
+          const int32_t blk_st1 = s_st1 * taskDimY + (taskIdY ^ (s_st1 & 1));
+          const int32_t sub_st1 = (coreId + (s_st1 >> 1)) & 3;
+          bfloat16_t* src_out1 = nram_out + slot_st * (kMaxSmallM * kGemmTileN);
+          if (++slot_st == 3) {
+            slot_st = 0;
+          }
+          bfloat16_t* dst_g1 =
+              out_bf16 + blk_st1 * kBlockN + sub_st1 * kGemmTileN;
+          if ((s_st1 & 1) == 0) {
+            asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+            asm volatile(
+                "st.stride.async.gdram.nram.io0.dcmnormal [%[dst]], [%[src]], "
+                "128, %[stride], 128, %[seg];\n\t"
+                :
+                : [stride] "i"(kN * sizeof(bfloat16_t)),
+                  [dst] "r"(dst_g1),
+                  [src] "r"(src_out1),
+                  [seg] "r"(seg)
+                : "memory");
+          } else {
+            asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+            asm volatile(
+                "st.stride.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], "
+                "128, %[stride], 128, %[seg];\n\t"
+                :
+                : [stride] "i"(kN * sizeof(bfloat16_t)),
+                  [dst] "r"(dst_g1),
+                  [src] "r"(src_out1),
+                  [seg] "r"(seg)
+                : "memory");
+          }
+        }
+        const int32_t s_last = my_blocks - 1;
+        const int32_t blk_last = s_last * taskDimY + (taskIdY ^ (s_last & 1));
+        const int32_t sub_last = (coreId + (s_last >> 1)) & 3;
+        bfloat16_t* last_wram = reinterpret_cast<bfloat16_t*>(
+            wram_buf + (s_last & 1) * kWramStride);
+        bfloat16_t* dst_last = nram_out + slot_cp * (kMaxSmallM * kGemmTileN);
+        if (s_last >= 3) {
+          if (((s_last - 3) & 1) == 0) {
+            asm volatile("sync.pio0.csimd;\n\t" : "+r"(dst_last)::"memory");
+          } else {
+            asm volatile("sync.pio1.csimd;\n\t" : "+r"(dst_last)::"memory");
+          }
+        }
+        asm volatile("sync.pmv.csimd;\n\t" ::: "memory");
+        __asm__ volatile(
+            "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[kernel]], %[k], "
+            "%[m], 1, 1, 1, 1, 1, %[n], .cvt.dst.rn.bf16();\n\t"
+            : [dst] "+r"(dst_last)
+            : [src] "r"(nram_a),
+              [kernel] "r"(last_wram),
+              [k] "r"(kK),
+              [m] "r"(m),
+              [n] "r"(kGemmTileN)
+            : "memory");
+        if (((blk_last & 1) == 1) && (sub_last == 3)) {
+          const int32_t elems = m * kRopeDim;
+          __bang_bfloat162float(nram_tail_f32, dst_last, elems);
+          __bang_conv(nram_swapped,
+                      dst_last,
+                      wram_perm,
+                      kRopeDim,
+                      m,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      kRopeDim);
+          __bang_mul(nram_tmp, nram_tail_f32, nram_cos, elems);
+          __bang_fusion(FUSION_FMA,
+                        nram_tmp,
+                        nram_swapped,
+                        nram_sin,
+                        nram_tmp,
+                        elems,
+                        elems);
+          __bang_float2bfloat16_rn(dst_last, nram_tmp, elems);
+        }
+        bfloat16_t* dst_glast =
+            out_bf16 + blk_last * kBlockN + sub_last * kGemmTileN;
+        if ((s_last & 1) == 0) {
+          asm volatile("sync.psimd.cio0;\n\t" ::: "memory");
+          asm volatile(
+              "st.stride.async.gdram.nram.io0.dcmnormal [%[dst]], [%[src]], "
+              "128, %[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_glast),
+                [src] "r"(dst_last),
+                [seg] "r"(seg)
+              : "memory");
+        } else {
+          asm volatile("sync.psimd.cio1;\n\t" ::: "memory");
+          asm volatile(
+              "st.stride.async.gdram.nram.io1.dcmnormal [%[dst]], [%[src]], "
+              "128, %[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_glast),
+                [src] "r"(dst_last),
+                [seg] "r"(seg)
+              : "memory");
+        }
+      }
+    }
+  }
+  if (__is_ipu()) {
+    __sync_io();
+  }
+}
+
+template <int32_t kN>
+__mlu_global__ void gemm_large_bf16(const bfloat16_t* qr_bf16,
+                                    const bfloat16_t* weight_bf16,
+                                    const int32_t* positions,
+                                    const float* rope_cache,
+                                    int32_t rope_rows,
+                                    bfloat16_t* out_bf16,
+                                    int32_t m) {
+  constexpr int32_t kBlockM = 95;
+  constexpr int32_t kBlockN = 256;
+  constexpr int32_t kDealN = 64;
+  constexpr int32_t kNumNBlocks = kN / kBlockN;
+  constexpr int32_t kWramStride = (kDealN / 16) * kK * sizeof(bfloat16_t);
+  constexpr int32_t kMaxSubM = 6176;
+
+  __mlu_shared__ uint16_t sram_b_u16[2 * kBlockN * kK];
+  __mlu_shared__ uint16_t sram_a_u16[2 * kBlockM * kK];
+  alignas(128) __mlu_shared__ float sram_cs_raw[2 * 96 * 128];
+  alignas(128) __mlu_shared__ uint32_t sram_pos_off[kMaxSubM];
+  bfloat16_t* sram_b = reinterpret_cast<bfloat16_t*>(sram_b_u16);
+  bfloat16_t* sram_a = reinterpret_cast<bfloat16_t*>(sram_a_u16);
+
+  __nram__ uint16_t nram_a_u16[2 * kBlockM * kK];
+  __nram__ uint16_t nram_out_u16[2 * kBlockM * kDealN];
+  __wram__ int8_t wram_buf[__MLU_WRAM_SIZE__ * 1024];
+  bfloat16_t* nram_a = reinterpret_cast<bfloat16_t*>(nram_a_u16);
+  bfloat16_t* nram_out = reinterpret_cast<bfloat16_t*>(nram_out_u16);
+
+  // Each N lane owns eight heads and follows the 16-step weight/RoPE schedule.
+  // With fewer lanes, independent cluster groups cover disjoint row intervals.
+  constexpr int32_t kNLanes = kN / (8 * kHeadDim);
+  const int32_t n_lane = (kN == 32768) ? taskIdY : taskIdY % kNLanes;
+  if constexpr (kN < 32768) {
+    constexpr int32_t kRowGroups = 8 / kNLanes;
+    const int32_t rows = (m + kRowGroups - 1) / kRowGroups;
+    const int32_t first = (taskIdY / kNLanes) * rows;
+    if (first >= m) {
+      return;
+    }
+    m = (m - first < rows) ? m - first : rows;
+    positions += first;
+    out_bf16 += int64_t(first) * kN;
+    qr_bf16 += int64_t(first) * kK;
+  }
+  const int32_t my_n_blocks =
+      (kN < 32768)
+          ? 16
+          : static_cast<int32_t>(
+                static_cast<uint32_t>(kNumNBlocks - taskIdY + taskDimY - 1) /
+                static_cast<uint32_t>(taskDimY));
+  const int32_t total_m_blocks = static_cast<int32_t>(
+      static_cast<uint32_t>(m + kBlockM - 1) / static_cast<uint32_t>(kBlockM));
+  const int32_t num_sb =
+      (m <= 6144)
+          ? 1
+          : static_cast<int32_t>(static_cast<uint32_t>(m + 4095) / 4096u);
+  const int32_t sb_m_blocks =
+      static_cast<int32_t>(static_cast<uint32_t>(total_m_blocks + num_sb - 1) /
+                           static_cast<uint32_t>(num_sb));
+  const int32_t sb_stride = sb_m_blocks * kBlockM;
+
+  for (int32_t m_base = 0; m_base < m; m_base += sb_stride) {
+    const int32_t sub_m = (m - m_base < sb_stride) ? (m - m_base) : sb_stride;
+    const int32_t num_m_steps =
+        static_cast<int32_t>(static_cast<uint32_t>(sub_m + kBlockM - 1) /
+                             static_cast<uint32_t>(kBlockM));
+    const int32_t total_steps = my_n_blocks * num_m_steps;
+    if (total_steps <= 0) {
+      continue;
+    }
+    const int32_t first_m = (sub_m < kBlockM) ? sub_m : kBlockM;
+    const bfloat16_t* qr_sub = qr_bf16 + static_cast<int64_t>(m_base) * kK;
+    bfloat16_t* out_sub = out_bf16 + static_cast<int64_t>(m_base) * kN;
+
+    if (__is_mpu()) {
+      const int32_t col0 = n_lane * kHeadDim;
+      __memcpy_async(sram_b,
+                     weight_bf16 + static_cast<int64_t>(col0) * kK,
+                     kBlockN * kK * sizeof(bfloat16_t),
+                     GDRAM2SRAM);
+      load_sram_async(sram_a,
+                      qr_sub,
+                      static_cast<uint32_t>(first_m) * kK * sizeof(bfloat16_t));
+      asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+    }
+    if (__is_ipu()) {
+      if (m_base == 0) {
+        bfloat16_t* wram_perm64 =
+            reinterpret_cast<bfloat16_t*>(wram_buf + 2 * kWramStride);
+        load_rope_perm(wram_perm64, nram_out);
+      }
+      const int32_t p_base = sub_m >> 2;
+      const int32_t p_rem = sub_m & 3;
+      const int32_t p_cnt = p_base + (coreId < p_rem ? 1 : 0);
+      const int32_t p_off0 =
+          coreId * p_base + (coreId < p_rem ? coreId : p_rem);
+      if (p_cnt > 0) {
+        uint32_t* p_tmp = reinterpret_cast<uint32_t*>(nram_a);
+        const int32_t* src_pos = positions + m_base + p_off0;
+        const uint32_t pos_bytes =
+            static_cast<uint32_t>(p_cnt) * sizeof(uint32_t);
+        asm volatile(
+            "ld.async.nram.gdram.io1.scmnormal [%[dst]], [%[src]], %[sz];\n\t"
+            :
+            : [dst] "r"(p_tmp), [src] "r"(src_pos), [sz] "r"(pos_bytes)
+            : "memory");
+        asm volatile("sync.pio1.csimd;\n\t" ::: "memory");
+        rope_offsets(p_tmp, p_cnt, rope_rows);
+        asm volatile("sync.psimd.cmv;\n\t" : "+r"(p_tmp)::"memory");
+        __memcpy_async(sram_pos_off + p_off0, p_tmp, pos_bytes, NRAM2SRAM);
+      }
+      asm volatile("barrier.sync.local.pio.pmv.psimd.cio.cmv.csimd 1, 5;\n\t" ::
+                       : "memory");
+    }
+
+    int32_t n_ld = (num_m_steps == 1) ? 1 : 0;
+    int32_t ms_ld = (num_m_steps == 1) ? 0 : 1;
+    int32_t n_mv = 0, ms_mv = 0;
+    int32_t n_cp = 0, ms_cp = 0;
+    int32_t n_st = 0, ms_st = 0;
+
+    for (int32_t e = 0; e < total_steps + 2; ++e) {
+      if (__is_mpu()) {
+        const int32_t s_ld = e + 1;
+        if (s_ld < total_steps) {
+          const int32_t m0_ld = ms_ld * kBlockM;
+          const int32_t cur_m_ld =
+              (sub_m - m0_ld < kBlockM) ? (sub_m - m0_ld) : kBlockM;
+          bfloat16_t* dst_sram_a = sram_a + (s_ld & 1) * (kBlockM * kK);
+          if (num_m_steps >= 5) {
+            if (ms_ld >= 1 && ms_ld <= 4 && (n_ld + 1) < my_n_blocks) {
+              const int32_t n_next = n_ld + 1;
+              const int32_t u_pre = ms_ld - 1;
+              bfloat16_t* dst_sram_b =
+                  sram_b + (n_next & 1) * (kBlockN * kK) + u_pre * 64 * kK;
+              int32_t col_u = 0;
+              if (n_next < 8) {
+                col_u = (n_next * kNLanes + n_lane) * kHeadDim + u_pre * 64;
+              } else if (n_next < 12) {
+                const int32_t h0 = ((n_next - 8) * kNLanes + n_lane) * 2;
+                col_u = (h0 + (u_pre >> 1)) * kHeadDim + 256 + (u_pre & 1) * 64;
+              } else {
+                const int32_t sub_off = (n_next < 14) ? 384 : 448;
+                const int32_t g =
+                    ((n_next < 14) ? (n_next - 12) : (n_next - 14)) * kNLanes +
+                    n_lane;
+                col_u = (4 * g + u_pre) * kHeadDim + sub_off;
+              }
+              __memcpy_async(dst_sram_b,
+                             weight_bf16 + static_cast<int64_t>(col_u) * kK,
+                             64 * kK * sizeof(bfloat16_t),
+                             GDRAM2SRAM);
+            }
+          } else if (ms_ld == 0) {
+            bfloat16_t* dst_sram_b = sram_b + (n_ld & 1) * (kBlockN * kK);
+            if (n_ld < 8) {
+              const int32_t col0 = (n_ld * kNLanes + n_lane) * kHeadDim;
+              __memcpy_async(dst_sram_b,
+                             weight_bf16 + static_cast<int64_t>(col0) * kK,
+                             kBlockN * kK * sizeof(bfloat16_t),
+                             GDRAM2SRAM);
+            } else if (n_ld < 12) {
+              const int32_t h0 = ((n_ld - 8) * kNLanes + n_lane) * 2;
+              for (int32_t u = 0; u < 2; ++u) {
+                const int32_t col_u = (h0 + u) * kHeadDim + 256;
+                __memcpy_async(dst_sram_b + u * 128 * kK,
+                               weight_bf16 + static_cast<int64_t>(col_u) * kK,
+                               128 * kK * sizeof(bfloat16_t),
+                               GDRAM2SRAM);
+              }
+            } else {
+              const int32_t sub_off = (n_ld < 14) ? 384 : 448;
+              const int32_t g =
+                  ((n_ld < 14) ? (n_ld - 12) : (n_ld - 14)) * kNLanes + n_lane;
+              for (int32_t u = 0; u < 4; ++u) {
+                const int32_t col_u = (4 * g + u) * kHeadDim + sub_off;
+                __memcpy_async(dst_sram_b + u * 64 * kK,
+                               weight_bf16 + static_cast<int64_t>(col_u) * kK,
+                               64 * kK * sizeof(bfloat16_t),
+                               GDRAM2SRAM);
+              }
+            }
+          }
+          load_sram_async(
+              dst_sram_a,
+              qr_sub + static_cast<int64_t>(m0_ld) * kK,
+              static_cast<uint32_t>(cur_m_ld) * kK * sizeof(bfloat16_t));
+          if (++ms_ld == num_m_steps) {
+            ms_ld = 0;
+            ++n_ld;
+          }
+        }
+        asm volatile("barrier.sync.local.pio.cio 1, 5;\n\t" ::: "memory");
+      }
+
+      if (__is_ipu()) {
+        bfloat16_t* wram_perm64 =
+            reinterpret_cast<bfloat16_t*>(wram_buf + 2 * kWramStride);
+
+        // Stage 3 (IPU IO0): store step e - 2 with LLC write-allocate, keeping
+        // IO1 dedicated for gather
+        const int32_t s_st = e - 2;
+        if (s_st >= 0 && s_st < total_steps) {
+          const int32_t m0_st = ms_st * kBlockM;
+          const int32_t cur_m_st =
+              (sub_m - m0_st < kBlockM) ? (sub_m - m0_st) : kBlockM;
+          bfloat16_t* src_out = nram_out + (s_st & 1) * (kBlockM * kDealN);
+          int32_t col_offset = 0;
+          if (n_st < 8) {
+            col_offset = (n_st * kNLanes + n_lane) * kHeadDim + coreId * kDealN;
+          } else if (n_st < 12) {
+            const int32_t h0 =
+                ((n_st - 8) * kNLanes + n_lane) * 2 + (coreId >> 1);
+            col_offset = h0 * kHeadDim + 256 + (coreId & 1) * kDealN;
+          } else {
+            const int32_t sub_off = (n_st < 14) ? 384 : 448;
+            const int32_t g =
+                ((n_st < 14) ? (n_st - 12) : (n_st - 14)) * kNLanes + n_lane;
+            col_offset = (4 * g + coreId) * kHeadDim + sub_off;
+          }
+          bfloat16_t* dst_g =
+              out_sub + static_cast<int64_t>(m0_st) * kN + col_offset;
+          const uint32_t seg = static_cast<uint32_t>(cur_m_st - 1);
+          asm volatile(
+              "st.stride.async.gdram.nram.io0.dcmtransient [%[dst]], [%[src]], "
+              "128, %[stride], 128, %[seg];\n\t"
+              :
+              : [stride] "i"(kN * sizeof(bfloat16_t)),
+                [dst] "r"(dst_g),
+                [src] "r"(src_out),
+                [seg] "r"(seg)
+              : "memory");
+          if (++ms_st == num_m_steps) {
+            ms_st = 0;
+            ++n_st;
+          }
+        }
+
+        // Stage 1 (IPU MV + IO1 gather): issue step e SRAM->NRAM/WRAM moves +
+        // on-chip rope_cache gather for n_mv>=14
+        const int32_t s_mv = e;
+        if (s_mv < total_steps) {
+          const int32_t m0_mv = ms_mv * kBlockM;
+          const int32_t cur_m_mv =
+              (sub_m - m0_mv < kBlockM) ? (sub_m - m0_mv) : kBlockM;
+          if (ms_mv == 0) {
+            bfloat16_t* dst_wram_b = reinterpret_cast<bfloat16_t*>(
+                wram_buf + (n_mv & 1) * kWramStride);
+            bfloat16_t* src_sram_b = sram_b + (n_mv & 1) * (kBlockN * kK);
+            move_weight_64(dst_wram_b, src_sram_b + coreId * kDealN * kK);
+          }
+          bfloat16_t* dst_a = nram_a + (s_mv & 1) * (kBlockM * kK);
+          bfloat16_t* src_sram_a = sram_a + (s_mv & 1) * (kBlockM * kK);
+          __memcpy_async(
+              dst_a, src_sram_a, cur_m_mv * kK * sizeof(bfloat16_t), SRAM2NRAM);
+          if (n_mv >= 14) {
+            const int32_t base_r = cur_m_mv >> 2;
+            const int32_t rem_r = cur_m_mv & 3;
+            const int32_t my_cnt = base_r + (coreId < rem_r ? 1 : 0);
+            const int32_t r_sub =
+                coreId * base_r + (coreId < rem_r ? coreId : rem_r);
+            if (my_cnt > 0) {
+              float* dst_sram_cs =
+                  sram_cs_raw + (s_mv & 1) * (96 * 128) + r_sub * 128;
+              uint32_t* off_ptr = sram_pos_off + m0_mv + r_sub;
+              const uint32_t cnt_u32 = static_cast<uint32_t>(my_cnt);
+              asm volatile(
+                  "gather.vector.async.scmnormal.sram.gdram.sram.io1.u32 "
+                  "[%[dst]], [%[src]], [%[off]], 512, %[cnt], 512;\n\t"
+                  :
+                  : [dst] "r"(dst_sram_cs),
+                    [src] "r"(rope_cache),
+                    [off] "r"(off_ptr),
+                    [cnt] "r"(cnt_u32)
+                  : "memory");
+            }
+          }
+          if (++ms_mv == num_m_steps) {
+            ms_mv = 0;
+            ++n_mv;
+          }
+        }
+
+        // Stage 2 (IPU SIMD): compute step e - 1 + on-chip RoPE for n_cp >= 14
+        const int32_t s_cp = e - 1;
+        if (s_cp >= 0 && s_cp < total_steps) {
+          const int32_t m0_cp = ms_cp * kBlockM;
+          const int32_t cur_m_cp =
+              (sub_m - m0_cp < kBlockM) ? (sub_m - m0_cp) : kBlockM;
+          bfloat16_t* src_a = nram_a + (s_cp & 1) * (kBlockM * kK);
+          bfloat16_t* cur_wram_b = reinterpret_cast<bfloat16_t*>(
+              wram_buf + (n_cp & 1) * kWramStride);
+          bfloat16_t* dst_out = nram_out + (s_cp & 1) * (kBlockM * kDealN);
+          __asm__ volatile(
+              "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[kernel]], "
+              "%[k], "
+              "%[m], 1, 1, 1, 1, 1, %[n], .cvt.dst.rn.bf16();\n\t"
+              : [dst] "+r"(dst_out)
+              : [src] "r"(src_a),
+                [kernel] "r"(cur_wram_b),
+                [k] "r"(kK),
+                [m] "r"(cur_m_cp),
+                [n] "r"(kDealN)
+              : "memory");
+          if (n_cp >= 14) {
+            const int32_t elems = cur_m_cp * kRopeDim;
+            const float* src_cs_raw = sram_cs_raw + (s_cp & 1) * (96 * 128);
+            float* r_tail = reinterpret_cast<float*>(src_a);
+            float* r_swapped = r_tail + kBlockM * kDealN;
+            float* r_cos = r_swapped + kBlockM * kDealN;
+            float* r_sin = r_cos + kBlockM * kRopeDim;
+            asm volatile("sync.psimd.cmv;\n\t"
+                         : "+r"(r_cos), "+r"(r_sin)::"memory");
+            __memcpy_async(r_cos,
+                           const_cast<float*>(src_cs_raw),
+                           kRopeDim * sizeof(float),
+                           SRAM2NRAM,
+                           kRopeDim * sizeof(float),
+                           128 * sizeof(float),
+                           cur_m_cp - 1);
+            __memcpy_async(r_sin,
+                           const_cast<float*>(src_cs_raw + kRopeDim),
+                           kRopeDim * sizeof(float),
+                           SRAM2NRAM,
+                           kRopeDim * sizeof(float),
+                           128 * sizeof(float),
+                           cur_m_cp - 1);
+            __bang_bfloat162float(r_tail, dst_out, elems);
+            __bang_conv(r_swapped,
+                        dst_out,
+                        wram_perm64,
+                        kRopeDim,
+                        cur_m_cp,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        kRopeDim);
+            asm volatile("sync.pmv.csimd;\n\t"
+                         : "+r"(r_cos), "+r"(r_sin)::"memory");
+            __bang_mul(r_tail, r_tail, r_cos, elems);
+            __bang_fusion(
+                FUSION_FMA, r_tail, r_swapped, r_sin, r_tail, elems, elems);
+            __bang_float2bfloat16_rn(dst_out, r_tail, elems);
+          }
+          if (++ms_cp == num_m_steps) {
+            ms_cp = 0;
+            ++n_cp;
+          }
+        }
+
+        asm volatile(
+            "barrier.sync.local.pio.pmv.psimd.cio.cmv.csimd 1, 5;\n\t" ::
+                : "memory");
+      }
+    }
+  }
+  if (__is_ipu()) {
+    __sync_io();
+  }
+}
+
+template <typename Launch>
+cnrtRet_t dispatch_width(int32_t n, Launch launch) {
+  switch (n) {
+    case 4096:
+      launch(std::integral_constant<int32_t, 4096>{});
+      break;
+    case 8192:
+      launch(std::integral_constant<int32_t, 8192>{});
+      break;
+    case 16384:
+      launch(std::integral_constant<int32_t, 16384>{});
+      break;
+    case 32768:
+      launch(std::integral_constant<int32_t, 32768>{});
+      break;
+    default:
+      return cnrtErrorArgsInvalid;
+  }
+  return cnrtPeekAtLastError();
+}
+
+}  // namespace
+
+cnrtRet_t launch_quantize_smooth(cnrtQueue_t queue,
+                                 const void* qr,
+                                 const void* smooth,
+                                 void* q_int8,
+                                 int32_t m,
+                                 const void* weight_scale,
+                                 void* ts_bf16,
+                                 void* ws_bf16,
+                                 int32_t n) {
+  return dispatch_width(n, [&](auto width) {
+    cnrtDim3_t dim = {4, 8, 1};
+    quantize_smooth_kernel<decltype(width)::value>
+        <<<dim, cnrtFuncTypeUnion1, queue>>>(
+            static_cast<const bfloat16_t*>(qr),
+            static_cast<const float*>(smooth),
+            static_cast<int8_t*>(q_int8),
+            nullptr,
+            m,
+            nullptr,
+            nullptr,
+            /*rope_rows=*/0,
+            nullptr,
+            static_cast<const float*>(weight_scale),
+            static_cast<uint16_t*>(ts_bf16),
+            static_cast<uint16_t*>(ws_bf16));
+  });
+}
+
+cnrtRet_t launch_small_int8(cnrtQueue_t queue,
+                            const void* qr_bf16,
+                            const void* smooth,
+                            const void* weight,
+                            const void* weight_scale,
+                            const void* positions,
+                            const void* rope_cache,
+                            int32_t rope_rows,
+                            void* out_bf16,
+                            int32_t m,
+                            int32_t n) {
+  return dispatch_width(n, [&](auto width) {
+    cnrtDim3_t dim = {4, 8, 1};
+    gemm_small_int8<decltype(width)::value><<<dim, cnrtFuncTypeUnion1, queue>>>(
+        static_cast<const bfloat16_t*>(qr_bf16),
+        static_cast<const float*>(smooth),
+        static_cast<const int8_t*>(weight),
+        static_cast<const float*>(weight_scale),
+        static_cast<const int32_t*>(positions),
+        static_cast<const float*>(rope_cache),
+        rope_rows,
+        static_cast<bfloat16_t*>(out_bf16),
+        m);
+  });
+}
+
+cnrtRet_t launch_large_int8(cnrtQueue_t queue,
+                            const void* q_int8,
+                            const void* weight,
+                            const void* token_scale,
+                            const void* weight_scale,
+                            const void* positions,
+                            const void* rope_cache,
+                            int32_t rope_rows,
+                            void* out_bf16,
+                            int32_t m,
+                            int32_t n) {
+  return dispatch_width(n, [&](auto width) {
+    cnrtDim3_t dim = {4, 8, 1};
+    gemm_large_int8<decltype(width)::value><<<dim, cnrtFuncTypeUnion1, queue>>>(
+        static_cast<const int8_t*>(q_int8),
+        static_cast<const int8_t*>(weight),
+        static_cast<const bfloat16_t*>(token_scale),
+        static_cast<const bfloat16_t*>(weight_scale),
+        static_cast<const int32_t*>(positions),
+        static_cast<const float*>(rope_cache),
+        rope_rows,
+        static_cast<bfloat16_t*>(out_bf16),
+        m);
+  });
+}
+
+cnrtRet_t launch_bf16(cnrtQueue_t queue,
+                      const void* qr_bf16,
+                      const void* weight_bf16,
+                      const void* positions,
+                      const void* rope_cache,
+                      int32_t rope_rows,
+                      void* out_bf16,
+                      int32_t m,
+                      int32_t n) {
+  return dispatch_width(n, [&](auto width) {
+    cnrtDim3_t dim = {4, 8, 1};
+    if (m <= 96) {
+      gemm_small_bf16<decltype(width)::value>
+          <<<dim, cnrtFuncTypeUnion1, queue>>>(
+              static_cast<const bfloat16_t*>(qr_bf16),
+              static_cast<const bfloat16_t*>(weight_bf16),
+              static_cast<const int32_t*>(positions),
+              static_cast<const float*>(rope_cache),
+              rope_rows,
+              static_cast<bfloat16_t*>(out_bf16),
+              m);
+    } else {
+      gemm_large_bf16<decltype(width)::value>
+          <<<dim, cnrtFuncTypeUnion1, queue>>>(
+              static_cast<const bfloat16_t*>(qr_bf16),
+              static_cast<const bfloat16_t*>(weight_bf16),
+              static_cast<const int32_t*>(positions),
+              static_cast<const float*>(rope_cache),
+              rope_rows,
+              static_cast<bfloat16_t*>(out_bf16),
+              m);
+    }
+  });
+}
+
+}  // namespace xllm::kernel::mlu::bangc::dsa_qb

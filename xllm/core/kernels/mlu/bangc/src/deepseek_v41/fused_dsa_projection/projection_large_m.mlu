@@ -1,0 +1,738 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
+ */
+#include <bang.h>
+#include <cnrt.h>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection_large_m.h"
+
+namespace xllm::kernel::mlu::bangc::projection {
+namespace {
+
+#define LM_DIV_UP(x, y) (((x) + (y) - 1) / (y))
+#define LM_PAD_UP(x, y) (LM_DIV_UP(x, y) * (y))
+
+constexpr int32_t kLmNramBytes = 480 * 1024;
+constexpr int32_t kLmWramBytes = 512 * 1024;
+constexpr int32_t kLmSramBytes = 1920 * 1024;
+constexpr int32_t kLmLtStride = kLmWramBytes / 16;
+
+constexpr int32_t kLmNormCap = 512;  // exact 512-row buffer bound (16 x 32)
+constexpr int32_t kLmNormChunk = 32;
+
+constexpr int32_t kLmKb = 256;
+constexpr uint32_t kLmSteps = kHidden / kLmKb;
+constexpr int32_t kLmCw = 256;
+
+__mlu_func__ void move_filter_async(bfloat16_t* wram_dst,
+                                    const bfloat16_t* sram_src,
+                                    int32_t n,
+                                    int32_t k,
+                                    int32_t ld) {
+  const int32_t bytes = k * 2;
+  const int32_t row =
+      static_cast<int32_t>((static_cast<uint32_t>(bytes) + 63u) & ~63u);
+  const uint32_t blocks = static_cast<uint32_t>(n) >> 6;
+  for (uint32_t i = 0; i < blocks; ++i) {
+    __memcpy_async(wram_dst,
+                   sram_src,
+                   bytes,
+                   SRAM2WRAM,
+                   row,
+                   3,
+                   kLmLtStride,
+                   15,
+                   ld * 2,
+                   63,
+                   0,
+                   0);
+    wram_dst += (static_cast<uint32_t>(row) << 1);
+    sram_src += 64 * ld;
+  }
+}
+
+__mlu_func__ void lm_conv_last_bf16(bfloat16_t* dst,
+                                    bfloat16_t* src,
+                                    bfloat16_t* filter,
+                                    float* partial,
+                                    int32_t ci,
+                                    int32_t h,
+                                    int32_t co) {
+  asm volatile(
+      "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[filter]], %[ci], 1, "
+      "%[h], 1, 1, 1, 1, %[co], .add.partial([%[opnd]]), .cvt.dst.rn.bf16();"
+      "\n\t" ::[dst] "r"(dst),
+      [src] "r"(src),
+      [filter] "r"(filter),
+      [ci] "r"(ci),
+      [h] "r"(h),
+      [co] "r"(co),
+      [opnd] "r"(partial));
+}
+
+__mlu_func__ void lm_row_sums(const bfloat16_t* b16,
+                              float* x,
+                              float* part,
+                              int32_t n,
+                              int32_t rows) {
+  asm volatile(
+      "mult.nram.f32.bf16 [%[d]], [%[a]], [%[a]], %[n];\n\t" ::[d] "r"(x),
+      [a] "r"(b16),
+      [n] "r"(rows * n));
+  __bang_sumpool(part, x, 32, rows, n / 32, 1, n / 32, n / 32, 1);
+}
+
+__mlu_func__ void lm_row_gamma(float* x,
+                               const bfloat16_t* b16,
+                               const bfloat16_t* gamma,
+                               int32_t n,
+                               int32_t rows) {
+  asm volatile(
+      "mult.cycle.nram.f32.bf16 [%[dst]], [%[src]], [%[g]], %[n0], "
+      "%[n1];\n\t" ::[dst] "r"(x),
+      [src] "r"(b16),
+      [g] "r"(gamma),
+      [n0] "r"(rows * n),
+      [n1] "r"(n));
+}
+
+__mlu_func__ void lm_row_apply(bfloat16_t* b16,
+                               const float* x,
+                               const float* scale,
+                               int32_t n,
+                               int32_t rows) {
+  for (int32_t i = 0; i < rows; ++i) {
+    asm volatile(
+        "mult.scalar.nram.bf16.f32 [%[dst]], [%[src]], %[s], %[n];\n\t" ::
+            [dst] "r"(b16 + i * n),
+        [src] "r"(x + i * n),
+        [s] "r"(scale[i]),
+        [n] "r"(n));
+  }
+}
+
+void build_large_m_tiles(int32_t width, LargeMGemmParams* p) {
+  p->bn = width;
+  p->col_tiles = 0;
+  for (int32_t i = 0; i < p->nseg; ++i) {
+    for (int32_t off = 0; off < p->seg[i].n_len; off += width) {
+      const int32_t left = p->seg[i].n_len - off;
+      p->tile_n0[p->col_tiles] = p->seg[i].n_begin + off;
+      p->tile_w[p->col_tiles] = left < width ? left : width;
+      ++p->col_tiles;
+    }
+  }
+}
+
+void choose_large_m_bm(int32_t clusters, LargeMGemmParams* p) {
+  // Up to mt_max = 136 (bm = 544) fits in 480 KB NRAM; conv.nram aligns h to 8.
+  int64_t best_cost = -1;
+  int32_t best_bm = 512;
+  for (int32_t mt = 136; mt >= 64; mt -= 8) {
+    const int32_t bm = mt * 4;
+    const int64_t rbs = LM_DIV_UP(p->m, bm);
+    const int64_t waves = LM_DIV_UP(rbs * p->col_tiles, clusters);
+    const int64_t cost = waves * LM_PAD_UP(mt, 8);
+    if (best_cost < 0 || cost < best_cost || (cost == best_cost && mt == 128)) {
+      best_cost = cost;
+      best_bm = bm;
+    }
+  }
+  p->bm = best_bm;
+  p->row_blocks = LM_DIV_UP(p->m, p->bm);
+}
+
+__mlu_func__ void lm_norm_device(const NormParams& p,
+                                 int8_t* nram,
+                                 int32_t ipu_id,
+                                 int32_t ipu_dim);
+
+}  // namespace
+
+__mlu_global__ void large_m_gemm_kernel(LargeMGemmParams p) {
+  __nram__ int8_t nram[kLmNramBytes];
+  __wram__ int8_t wram[kLmWramBytes];
+  __mlu_shared__ int8_t sram[kLmSramBytes];
+
+  const int32_t cid = p.fuse_norm ? clusterId : taskIdY;
+  const int32_t cdim = p.fuse_norm ? clusterDim : taskDimY;
+  const int32_t mt_max =
+      static_cast<int32_t>((static_cast<uint32_t>(p.bm) + 3u) >> 2);
+  constexpr int32_t kb = kLmKb;
+  constexpr int32_t steps = static_cast<int32_t>(kLmSteps);
+
+  constexpr int32_t kPair = 2;
+  bfloat16_t* sram_b0 = reinterpret_cast<bfloat16_t*>(sram);
+  bfloat16_t* sram_b1 = sram_b0 + kPair * p.bn * kb;
+  bfloat16_t* nram_a0 = reinterpret_cast<bfloat16_t*>(nram);
+  bfloat16_t* nram_a1 = nram_a0 + mt_max * kb;
+  float* acc = reinterpret_cast<float*>(nram_a1 + mt_max * kb);
+  bfloat16_t* out16 = reinterpret_cast<bfloat16_t*>(acc + mt_max * p.bn);
+  bfloat16_t* wram_b0 = reinterpret_cast<bfloat16_t*>(wram);
+  bfloat16_t* wram_b1 = wram_b0 + (static_cast<uint32_t>(p.bn * kb) >> 4);
+
+  const int32_t units = p.row_blocks * p.col_tiles;
+  const int32_t my_units = cid < units ? LM_DIV_UP(units - cid, cdim) : 0;
+  const int32_t total = my_units * steps;
+  const int32_t mi = __is_ipu() ? coreId : 0;
+
+  bool has_prev = false;
+  int32_t prev_s = 0, prev_mt = 0, prev_row = 0, prev_seg = 0, prev_n0 = 0;
+  int32_t prev_w = 0, pprev_seg = 0;
+
+  const bool split0 =
+      total > 0 && p.col_tiles >= 2 && p.tile_w[0] == 512 && p.tile_w[1] == 512;
+  if (split0) {
+    const int32_t g_rbs = p.row_blocks < 4 ? p.row_blocks : 4;
+    const int32_t rb = cid % g_rbs;
+    const int32_t t = (cid / g_rbs) % p.col_tiles;
+    const int32_t r0 = rb * p.bm;
+    const int32_t rows = p.m - r0 < p.bm ? p.m - r0 : p.bm;
+    const int32_t n0 = p.tile_n0[t];
+    int32_t si = 0;
+    for (int32_t i = 1; i < p.nseg; ++i) {
+      if (n0 >= p.seg[i].n_begin) {
+        si = i;
+      }
+    }
+    const int32_t base = static_cast<int32_t>(static_cast<uint32_t>(rows) >> 2);
+    const int32_t rem = rows & 3;
+    const int32_t mt = base + (mi < rem ? 1 : 0);
+    const int32_t moff = mi * base + (mi < rem ? mi : rem);
+    const bfloat16_t* wb =
+        static_cast<const bfloat16_t*>(p.seg[si].weight) +
+        static_cast<size_t>(n0 - p.seg[si].n_begin) * kHidden;
+    const int32_t ld = kPair * kb;
+    if (__is_mpu()) {
+      __memcpy_async(sram_b0, wb, ld * 2, GDRAM2SRAM, ld * 2, kHidden * 2, 255);
+      __sync_io();
+    } else if (mt > 0) {
+      __memcpy_io0_async(nram_a0,
+                         static_cast<const bfloat16_t*>(p.x) +
+                             static_cast<size_t>(r0 + moff) * kHidden,
+                         kb * 2,
+                         GDRAM2NRAM,
+                         kb * 2,
+                         kHidden * 2,
+                         mt - 1);
+    }
+    __sync_cluster_wait(0, 5, true, true, false, true, true, false);
+    if (__is_mpu()) {
+      __memcpy_async(sram_b0 + 256 * ld,
+                     wb + static_cast<size_t>(256) * kHidden,
+                     ld * 2,
+                     GDRAM2SRAM,
+                     ld * 2,
+                     kHidden * 2,
+                     255);
+      __sync_io();
+    } else if (mt > 0) {
+      move_filter_async(wram_b0, sram_b0, 256, kb, ld);
+      __sync_io0_io1_move_compute<true,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      __bang_conv(acc, nram_a0, wram_b0, kb, mt, 1, 1, 1, 1, 1, 256);
+    }
+    __sync_cluster_wait(0, 5, true, true, false, true, true, false);
+    if (__is_ipu() && mt > 0) {
+      move_filter_async(wram_b0 + 16 * kb, sram_b0 + 256 * ld, 256, kb, ld);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      __bang_conv(acc + mt_max * 256,
+                  nram_a0,
+                  wram_b0 + 16 * kb,
+                  kb,
+                  mt,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  256);
+    }
+    has_prev = true;
+    prev_mt = mt;
+    prev_row = r0 + moff;
+    prev_seg = si;
+    prev_n0 = n0;
+    prev_w = 512;
+  }
+
+  for (int32_t it = split0 ? 1 : 0; it <= total; ++it) {
+    const bool has_cur = it < total;
+    int32_t s = 0, r0 = 0, rows = 0, n0 = 0, si = 0, mt = 0, moff = 0,
+            width = 0;
+    bfloat16_t* sb =
+        ((static_cast<uint32_t>(it) >> 1) & 1u) ? sram_b1 : sram_b0;
+    if (has_cur) {
+      const uint32_t uit = static_cast<uint32_t>(it);
+      const int32_t u = cid + static_cast<int32_t>(uit / kLmSteps) * cdim;
+      s = static_cast<int32_t>(uit % kLmSteps);
+      constexpr int32_t kRbGroup = 4;
+      const int32_t group_span = kRbGroup * p.col_tiles;
+      const int32_t g_idx = u / group_span;
+      const int32_t rb_base = g_idx * kRbGroup;
+      const int32_t g_rem = u % group_span;
+      const int32_t g_rbs =
+          p.row_blocks - rb_base < kRbGroup ? p.row_blocks - rb_base : kRbGroup;
+      const int32_t shift =
+          (g_rbs == kRbGroup && (group_span & 7) == 0) ? (g_idx & 1) : 0;
+      const int32_t rb = rb_base + g_rem % g_rbs;
+      const int32_t t = (g_rem / g_rbs + shift) % p.col_tiles;
+      r0 = rb * p.bm;
+      rows = p.m - r0 < p.bm ? p.m - r0 : p.bm;
+      n0 = p.tile_n0[t];
+      width = p.tile_w[t];
+      for (int32_t i = 1; i < p.nseg; ++i) {
+        if (n0 >= p.seg[i].n_begin) {
+          si = i;
+        }
+      }
+      const int32_t base = rows / 4;
+      const int32_t rem = rows % 4;
+      mt = base + (mi < rem ? 1 : 0);
+      moff = mi * base + (mi < rem ? mi : rem);
+      if (__is_mpu() && (s & 1) == 0) {
+        const bfloat16_t* wb =
+            static_cast<const bfloat16_t*>(p.seg[si].weight) +
+            static_cast<size_t>(n0 - p.seg[si].n_begin) * kHidden + s * kb;
+        __memcpy_async(sb,
+                       wb,
+                       kPair * kb * 2,
+                       GDRAM2SRAM,
+                       kPair * kb * 2,
+                       kHidden * 2,
+                       width - 1);
+        __sync_io();
+      }
+    }
+    if (!has_cur || (s & 1) == 0) {
+      __sync_cluster_wait(0, 5, true, true, false, true, true, false);
+    }
+    if (__is_ipu()) {
+      const bool step0_done = split0 && it == 1;
+      if (has_cur && mt > 0) {
+        if (!step0_done) {
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      true,
+                                      false,
+                                      true,
+                                      false>();
+        }
+        bfloat16_t* na = (it & 1) ? nram_a1 : nram_a0;
+        bfloat16_t* wb = (it & 1) ? wram_b1 : wram_b0;
+        const bfloat16_t* xa = static_cast<const bfloat16_t*>(p.x) +
+                               static_cast<size_t>(r0 + moff) * kHidden +
+                               s * kb;
+        __memcpy_io0_async(
+            na, xa, kb * 2, GDRAM2NRAM, kb * 2, kHidden * 2, mt - 1);
+        move_filter_async(wb, sb + (s & 1) * kb, width, kb, kPair * kb);
+      }
+      if (has_prev && prev_mt > 0 && !step0_done) {
+        bfloat16_t* a = ((it - 1) & 1) ? nram_a1 : nram_a0;
+        bfloat16_t* w = ((it - 1) & 1) ? wram_b1 : wram_b0;
+        const Segment& sg = p.seg[prev_seg];
+        constexpr int32_t cw = kLmCw;
+        const int32_t chunks =
+            static_cast<int32_t>(static_cast<uint32_t>(prev_w) >> 8);
+        const bool first = prev_s == 0;
+        const bool last = prev_s == steps - 1;
+        if (last && !sg.fp32_out) {
+          __sync_io0_io1_move_compute<false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true>();
+        }
+        for (int32_t jj = 0; jj < chunks; ++jj) {
+          const int32_t j = first ? chunks - 1 - jj : jj;
+          const int32_t blk = chunks == 1 && 2 * cw <= p.bn ? 1 : j;
+          float* aj = acc + blk * mt_max * cw;
+          bfloat16_t* wj = w + j * (cw / 16) * kb;
+          bfloat16_t* oj = j == 0 ? out16 : reinterpret_cast<bfloat16_t*>(acc);
+          if (last && !sg.fp32_out) {
+            lm_conv_last_bf16(oj, a, wj, aj, kb, prev_mt, cw);
+          } else if (first) {
+            if (blk == 0 || p.seg[pprev_seg].fp32_out) {
+              __sync_io0_io1_move_compute<false,
+                                          true,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          true>();
+            }
+            __bang_conv(aj, a, wj, kb, prev_mt, 1, 1, 1, 1, 1, cw);
+          } else {
+            __bang_conv_partial(aj, a, wj, aj, kb, prev_mt, 1, 1, 1, 1, 1, cw);
+          }
+          if (last) {
+            const int32_t col = prev_n0 - sg.n_begin + j * cw;
+            const int32_t esize = sg.fp32_out ? 4 : 2;
+            int8_t* dst = static_cast<int8_t*>(sg.out) +
+                          (static_cast<size_t>(prev_row) * sg.ld + col) * esize;
+            void* src =
+                sg.fp32_out ? static_cast<void*>(aj) : static_cast<void*>(oj);
+            __sync_io0_io1_move_compute<false,
+                                        false,
+                                        false,
+                                        true,
+                                        false,
+                                        true,
+                                        false,
+                                        false>();
+            __memcpy_io1_async(dst,
+                               src,
+                               cw * esize,
+                               NRAM2GDRAM,
+                               sg.ld * esize,
+                               cw * esize,
+                               prev_mt - 1);
+          }
+        }
+      }
+      __sync_io0_io1_move_compute<true,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  true>();
+    }
+    has_prev = has_cur;
+    if (has_cur && s == 0) {
+      pprev_seg = prev_seg;
+    }
+    prev_s = s;
+    prev_mt = mt;
+    prev_row = r0 + moff;
+    prev_seg = si;
+    prev_n0 = n0;
+    prev_w = width;
+  }
+  if (__is_ipu()) {
+    __sync_io();
+    if (p.fuse_norm) {
+      __sync_all_ipu();
+      lm_norm_device(p.norm, nram, cid * 4 + coreId, cdim * 4);
+    }
+  }
+}
+
+namespace {
+
+__mlu_func__ void lm_norm_device(const NormParams& p,
+                                 int8_t* nram,
+                                 int32_t ipu_id,
+                                 int32_t ipu_dim) {
+  const int32_t rows_per = LM_DIV_UP(p.m, ipu_dim);
+  const int32_t r_begin = ipu_id * rows_per;
+  const int32_t r_end = r_begin + rows_per < p.m ? r_begin + rows_per : p.m;
+  if (r_begin >= r_end) {
+    return;
+  }
+
+  constexpr int32_t kRowElems = kKvDim + kQRank;
+  constexpr int32_t kChunkElems = kLmNormChunk * kRowElems;
+  constexpr int32_t kScratchFloats = 32 * kKvDim;  // 64 KB (fits 12x1280 Q)
+  float* x = reinterpret_cast<float*>(nram);
+  float* part = x + kScratchFloats;                          // 64 x 32 FP32
+  float* part_t = part + 2048;                               // 32 x 64 FP32
+  float* scale = part_t + 2048;                              // 64 FP32
+  float* scale_s = scale + 64;                               // 64 FP32
+  float* sign = scale_s + 64;                                // 64 FP32
+  float* invn = sign + 64;                                   // 64 FP32
+  int32_t* posb = reinterpret_cast<int32_t*>(invn + 64);     // 512 INT32
+  float* fpos = reinterpret_cast<float*>(posb + 512);        // 512 FP32
+  uint32_t* offs = reinterpret_cast<uint32_t*>(fpos + 512);  // 512 UINT32
+  float* cs = reinterpret_cast<float*>(offs + 512);          // 3 x 2 x 32 x 64
+  bfloat16_t* gkv =
+      reinterpret_cast<bfloat16_t*>(cs + 6 * kLmNormChunk * kRotary);
+  bfloat16_t* gq = gkv + kKvDim;
+  bfloat16_t* slot0 = gq + kQRank;  // 3 x 32 x 1792 BF16
+  float* tailf = x + kScratchFloats - kLmNormChunk * kRotary * 3;
+  float* swapf = tailf + kLmNormChunk * kRotary;
+  bfloat16_t* tail16 =
+      reinterpret_cast<bfloat16_t*>(swapf + kLmNormChunk * kRotary);
+  bfloat16_t* swap16 = tail16 + kLmNormChunk * kRotary;
+
+  __memcpy_io0_async(gkv, p.gamma_kv, kKvDim * 2, GDRAM2NRAM);
+  __memcpy_io0_async(gq, p.gamma_q, kQRank * 2, GDRAM2NRAM);
+  for (int32_t i = 0; i < 64; ++i) {
+    sign[i] = (i & 1) ? 1.0f : -1.0f;
+    invn[i] = i < 32 ? 1.0f / kKvDim : 1.0f / kQRank;
+  }
+
+  for (int32_t r_slice = r_begin; r_slice < r_end; r_slice += kLmNormCap) {
+    const int32_t slice_rows =
+        r_end - r_slice < kLmNormCap ? r_end - r_slice : kLmNormCap;
+    const int32_t chunks = LM_DIV_UP(slice_rows, kLmNormChunk);
+    bfloat16_t* kv_base =
+        static_cast<bfloat16_t*>(p.kv) + static_cast<size_t>(r_slice) * kKvDim;
+    bfloat16_t* q_base =
+        static_cast<bfloat16_t*>(p.qr) + static_cast<size_t>(r_slice) * kQRank;
+    auto rows_of = [&](int32_t c) {
+      const int32_t rem = slice_rows - c * kLmNormChunk;
+      return rem < kLmNormChunk ? rem : kLmNormChunk;
+    };
+    auto load_rows = [&](int32_t c) {
+      const int32_t rows = rows_of(c);
+      const uint32_t slot = static_cast<uint32_t>(c) % 3u;
+      bfloat16_t* buf = slot0 + slot * kChunkElems;
+      __memcpy_io0_async(
+          buf,
+          kv_base + static_cast<size_t>(c) * kLmNormChunk * kKvDim,
+          rows * kKvDim * 2,
+          GDRAM2NRAM);
+      __memcpy_io0_async(
+          buf + kLmNormChunk * kKvDim,
+          q_base + static_cast<size_t>(c) * kLmNormChunk * kQRank,
+          rows * kQRank * 2,
+          GDRAM2NRAM);
+    };
+    auto gather_rope = [&](int32_t c) {
+      const int32_t rows = rows_of(c);
+      const uint32_t slot = static_cast<uint32_t>(c) % 3u;
+      float* cos_s = cs + slot * 2 * kLmNormChunk * kRotary;
+      __gather_io0_async(
+          cos_s, p.rope, offs + c * kLmNormChunk, 256, GDRAM2NRAM, 256, rows);
+      __gather_io0_async(cos_s + kLmNormChunk * kRotary,
+                         p.rope + 64,
+                         offs + c * kLmNormChunk,
+                         256,
+                         GDRAM2NRAM,
+                         256,
+                         rows);
+    };
+    auto store_rows = [&](int32_t c) {
+      const int32_t rows = rows_of(c);
+      const uint32_t slot = static_cast<uint32_t>(c) % 3u;
+      bfloat16_t* buf = slot0 + slot * kChunkElems;
+      __memcpy_io1_async(
+          kv_base + static_cast<size_t>(c) * kLmNormChunk * kKvDim,
+          buf,
+          rows * kKvDim * 2,
+          NRAM2GDRAM);
+      __memcpy_io1_async(
+          q_base + static_cast<size_t>(c) * kLmNormChunk * kQRank,
+          buf + kLmNormChunk * kKvDim,
+          rows * kQRank * 2,
+          NRAM2GDRAM);
+    };
+
+    __memcpy_io0_async(posb, p.positions + r_slice, slice_rows * 4, GDRAM2NRAM);
+    load_rows(0);
+    __sync_io0_io1_move_compute<true,
+                                false,
+                                false,
+                                false,
+                                false,
+                                false,
+                                false,
+                                true>();
+    __bang_int322float(fpos, posb, slice_rows, 0);
+    __bang_maxeq_scalar(fpos, fpos, 0.0f, slice_rows);
+    __bang_mineq_scalar(
+        fpos, fpos, static_cast<float>(p.rope_rows - 1), slice_rows);
+    __bang_mul_scalar(fpos, fpos, 512.0f, slice_rows);
+    __bang_float2int32(reinterpret_cast<int32_t*>(offs), fpos, slice_rows, 0);
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                true,
+                                false,
+                                false,
+                                false>();
+    gather_rope(0);
+
+    for (int32_t c = 0; c < chunks; ++c) {
+      __sync_io0_io1_move_compute<true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      if (c + 1 < chunks) {
+        __sync_io0_io1_move_compute<false,
+                                    true,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    false>();
+        load_rows(c + 1);
+        gather_rope(c + 1);
+      }
+      if (c >= 1) {
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    true,
+                                    false,
+                                    false>();
+        store_rows(c - 1);
+      }
+      const int32_t rows = rows_of(c);
+      const uint32_t slot = static_cast<uint32_t>(c) % 3u;
+      bfloat16_t* kvb = slot0 + slot * kChunkElems;
+      bfloat16_t* qb = kvb + kLmNormChunk * kKvDim;
+      float* cosb = cs + slot * 2 * kLmNormChunk * kRotary;
+      float* sinb = cosb + kLmNormChunk * kRotary;
+
+      lm_row_sums(kvb, x, part, kKvDim, rows);
+      for (int32_t qr0 = 0; qr0 < rows; qr0 += 12) {
+        const int32_t qr_n = rows - qr0 < 12 ? rows - qr0 : 12;
+        lm_row_sums(qb + qr0 * kQRank, x, part + (32 + qr0) * 32, kQRank, qr_n);
+      }
+      __bang_transpose(part_t, part, 64, 32);
+      __bang_sumpool(scale, part_t, 64, 32, 1, 32, 1, 1, 1);
+      __bang_mul(scale, scale, invn, 64);
+      __bang_add_scalar(scale, scale, p.eps, 64);
+      __bang_rsqrt(scale, scale, 64);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      __memcpy_async(scale_s, scale, 64 * 4, NRAM2NRAM);
+      lm_row_gamma(x, kvb, gkv, kKvDim, rows);
+      __sync_move();
+      lm_row_apply(kvb, x, scale_s, kKvDim, rows);
+
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      __memcpy_async(tail16,
+                     kvb + (kKvDim - kRotary),
+                     kRotary * 2,
+                     NRAM2NRAM,
+                     kRotary * 2,
+                     kKvDim * 2,
+                     rows - 1);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      __bang_rol(reinterpret_cast<uint32_t*>(swap16),
+                 reinterpret_cast<uint32_t*>(tail16),
+                 16,
+                 rows * kRotary / 2);
+      const int32_t pair = (kLmNormChunk + rows) * kRotary;
+      __bang_cycle_mul(sinb, sinb, sign, rows * kRotary, kRotary);
+      __bang_bfloat162float(tailf, tail16, pair);
+      __bang_mul(tailf, tailf, cosb, pair);
+      __bang_add(tailf, tailf, swapf, rows * kRotary);
+      __bang_float2bfloat16_rn(tail16, tailf, rows * kRotary);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      __memcpy_async(kvb + (kKvDim - kRotary),
+                     tail16,
+                     kRotary * 2,
+                     NRAM2NRAM,
+                     kKvDim * 2,
+                     kRotary * 2,
+                     rows - 1);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  true>();
+      for (int32_t qr0 = 0; qr0 < rows; qr0 += 12) {
+        const int32_t qr_n = rows - qr0 < 12 ? rows - qr0 : 12;
+        lm_row_gamma(x, qb + qr0 * kQRank, gq, kQRank, qr_n);
+        lm_row_apply(qb + qr0 * kQRank, x, scale_s + 32 + qr0, kQRank, qr_n);
+      }
+    }
+    __sync_compute();
+    store_rows(chunks - 1);
+    __sync_io();
+  }
+}
+
+}  // namespace
+
+__mlu_global__ void large_m_norm_kernel(NormParams p) {
+  __nram__ int8_t nram[kLmNramBytes];
+  if (!__is_ipu()) {
+    return;
+  }
+  lm_norm_device(p, nram, taskIdY * 4 + coreId, taskDimY * 4);
+}
+
+int32_t launch_large_m(const ProjectionArgs& args,
+                       int32_t clusters,
+                       cnrtQueue_t queue) {
+  LargeMGemmParams g = {};
+  init_projection(g, args);
+  g.kb = 256;
+  build_large_m_tiles(512, &g);
+  choose_large_m_bm(clusters, &g);
+
+  g.fuse_norm = (clusters == 8) ? 1 : 0;
+
+  if (g.fuse_norm) {
+    cnrtDim3_t fused_dim = {32, 1, 1};
+    large_m_gemm_kernel<<<fused_dim, cnrtFuncTypeUnion8, queue>>>(g);
+    return static_cast<int>(cnrtGetLastError());
+  }
+
+  cnrtDim3_t gemm_dim = {4, static_cast<uint32_t>(clusters), 1};
+  large_m_gemm_kernel<<<gemm_dim, cnrtFuncTypeUnion1, queue>>>(g);
+  const cnrtRet_t status = cnrtGetLastError();
+  if (status != cnrtSuccess) {
+    return status;
+  }
+  cnrtDim3_t norm_dim = {4, static_cast<uint32_t>(clusters), 1};
+  large_m_norm_kernel<<<norm_dim, cnrtFuncTypeUnion1, queue>>>(g.norm);
+  return static_cast<int>(cnrtGetLastError());
+}
+
+}  // namespace xllm::kernel::mlu::bangc::projection

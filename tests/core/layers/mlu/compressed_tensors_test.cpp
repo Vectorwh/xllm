@@ -165,6 +165,7 @@ ModelArgs moe_model_args() {
   model.moe_intermediate_size() = 256;
   model.n_routed_experts() = 4;
   model.num_experts_per_tok() = 2;
+  model.routed_scaling_factor() = 1.0f;
   model.n_shared_experts() = 0;
   model.n_group() = 1;
   model.topk_group() = 1;

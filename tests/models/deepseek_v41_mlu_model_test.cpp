@@ -17,6 +17,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,7 @@ limitations under the License.
 #include "core/runtime/options.h"
 #include "models/llm/mlu/deepseek_v41.h"
 #include "tests/core/layers/mlu/tests_utils.h"
+#include "tests/core/runtime/deepseek_v41_test_utils.h"
 
 namespace xllm {
 namespace {
@@ -46,9 +48,11 @@ class InMemoryModelLoader final : public ModelLoader {
  public:
   InMemoryModelLoader(ModelArgs args,
                       std::string path,
-                      std::vector<Weights> shards)
+                      std::vector<Weights> shards,
+                      QuantArgs quant = {})
       : path_(std::move(path)) {
     args_ = std::move(args);
+    quant_args_ = std::move(quant);
     states_.reserve(shards.size());
     for (auto& shard : shards) {
       states_.emplace_back(std::make_unique<StateDict>(std::move(shard)));
@@ -90,18 +94,18 @@ class DeepseekV41MluModelTest : public ::testing::Test {
         .n_layers(1)
         .hidden_size(5120)
         .vocab_size(4)
-        .n_heads(1)
+        .n_heads(8)
         .head_dim(512)
-        .q_lora_rank(128)
+        .q_lora_rank(1280)
         .qk_rope_head_dim(64)
         .index_n_heads(1)
         .index_head_dim(128)
         .o_groups(1)
-        .o_lora_rank(128)
+        .o_lora_rank(1024)
         .hc_mult(4)
         .hc_sinkhorn_iters(4)
         .hc_eps(1e-6)
-        .rms_norm_eps(1e-5)
+        .rms_norm_eps(1e-20)
         .rope_theta(10000)
         .compress_rope_theta(160000)
         .max_position_embeddings(32)
@@ -142,9 +146,16 @@ class DeepseekV41MluModelTest : public ::testing::Test {
         {"layers.0.attn.wkv.weight", torch::zeros({512, hidden}, options)},
         {"layers.0.attn.q_norm.weight", torch::ones({qr}, options)},
         {"layers.0.attn.kv_norm.weight", torch::ones({512}, options)},
+        {"layers.0.attn.wo_a.weight_scale",
+         torch::full({1024, 1}, 1.0, options)},
+        {"layers.0.attn.wo_b.weight_scale",
+         torch::full({5120, 1}, 1.0, options)},
+        {"layers.0.attn.wo_a.smooth", torch::ones({4096}, options)},
+        {"layers.0.attn.wo_b.smooth", torch::ones({1024}, options)},
         {"layers.0.attn.wo_a.weight",
-         torch::zeros({1, 128, heads * 512}, options)},
-        {"layers.0.attn.wo_b.weight", torch::zeros({hidden, 128}, options)},
+         torch::zeros({1024, heads * 512}, options.dtype(torch::kInt8))},
+        {"layers.0.attn.wo_b.weight",
+         torch::zeros({hidden, 1024}, options.dtype(torch::kInt8))},
         {"layers.0.attn.attn_sink", torch::zeros({heads}, torch::kFloat32)},
         {"layers.0.attn_norm.weight", torch::ones({hidden}, options)},
         {"layers.0.ffn_norm.weight", torch::ones({hidden}, options)},
@@ -212,7 +223,7 @@ class DeepseekV41MluModelTest : public ::testing::Test {
 
   void set_cache_role(int32_t ratio) {
     if (ratio > 0) {
-      args_.q_lora_rank(1280).index_n_heads(32).rms_norm_eps(1e-20);
+      args_.index_n_heads(32);
     }
     args_.compress_ratios({ratio});
     args_.kv_source_layer_ids(ratio == 0 ? std::vector<int32_t>{}
@@ -243,6 +254,65 @@ class DeepseekV41MluModelTest : public ::testing::Test {
   ModelArgs args_;
   std::filesystem::path path_;
 };
+
+TEST_F(DeepseekV41MluModelTest, LoadsQuantizedDraftFromShards) {
+  torch::InferenceMode inference;
+  torch::DeviceGuard guard(options_.device());
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  args_.model_type("deepseek_v41_dspark")
+      .dspark_num_layers(1)
+      .dspark_block_size(5)
+      .markov_rank(8)
+      .n_shared_experts(1);
+  QuantArgs quant;
+  quant.quant_method() = "compressed-tensors";
+  quant.is_compressed_tensors_w8a8_dynamic() = true;
+  quant.compressed_groups() = {
+      {{"re:mtp.*attn.*", "re:mtp.*shared_experts.*"}, 8, 0, true},
+      {{"mtp.0.ffn.experts.*"}, 4, 128, true}};
+  Weights bf16, integer, scales;
+  const auto weights = test::make_deepseek_v41_dspark_weights(
+      args_, torch::dtype(torch::kBFloat16));
+  for (const auto& [name, weight] : weights) {
+    const std::string key = "model." + name;
+    auto value = weight;
+    if (name.starts_with("mtp.0.attn.wo_")) {
+      if (name.ends_with(".weight")) {
+        integer.emplace(key, value);
+        bf16.emplace(key, value.to(torch::kBFloat16));
+      } else {
+        scales.emplace(key, value);
+      }
+      continue;
+    }
+    bf16.emplace(key, value);
+    const bool packed = name.starts_with("mtp.0.ffn.experts.");
+    if (!packed && !name.starts_with("mtp.0.ffn.shared_experts.") &&
+        name != "mtp.0.attn.wq_b.weight" && name != "mtp.0.attn.wo_a.weight" &&
+        name != "mtp.0.attn.wo_b.weight") {
+      integer.emplace(key, value);
+      continue;
+    }
+    const std::string module = key.substr(0, key.size() - 6);
+    const int64_t out = value.size(0);
+    const int64_t in = value.size(1);
+    integer.emplace(key,
+                    torch::zeros({out, packed ? in / 2 : in}, torch::kInt8));
+    scales.emplace(module + "weight_scale",
+                   torch::ones({out, packed ? in / 128 : 1}, torch::kBFloat16));
+    scales.emplace(module + "smooth", torch::ones({in}, torch::kBFloat16));
+  }
+  auto load = [&](std::vector<Weights> shards) {
+    auto draft = create_llm_model(make_context().with_quant_args(quant));
+    ASSERT_NE(draft, nullptr);
+    draft->load_model(std::make_unique<InMemoryModelLoader>(
+        args_, "", std::move(shards), quant));
+  };
+  EXPECT_DEATH(load({bf16}), "mtp.0.attn.wo_[ab]");
+  load({scales, integer});
+  scales.erase("model.mtp.0.attn.wo_a.weight_scale");
+  EXPECT_DEATH(load({integer, scales}), "Missing mtp.0.attn.wo_a.weight_scale");
+}
 
 // Count host model entries without replacing any V4.1 forward/metadata logic.
 class ExecutorV41Model final : public CausalLM {
@@ -319,18 +389,15 @@ class DeepseekV41CaptureTest : public DeepseekV41MluModelTest {
 
   void expect_entering_residual(bool with_engram,
                                 double value_scale,
-                                int32_t capture_layer = 0,
-                                int64_t model_hidden_size = 5120) {
+                                int32_t capture_layer = 0) {
     torch::InferenceMode inference;
     torch::DeviceGuard guard(options_.device());
-    // Fused MHC runs for hc_mult=4 and hidden_size=5120; other hidden sizes
-    // take the unfused boundaries.
-    args_.layers_to_capture({capture_layer})
+    args_.n_heads(8)
+        .layers_to_capture({capture_layer})
         .n_layers(capture_layer + 1)
         .compress_ratios(std::vector<int32_t>(capture_layer + 1, 0))
         .window_size(16)
-        .hc_mult(4)
-        .hidden_size(model_hidden_size);
+        .hc_mult(4);
     const int64_t hidden_size = args_.hidden_size();
     auto weights = make_weights();
     // Zero attention/FFN branches and uniform Sinkhorn preserve the BF16
@@ -652,15 +719,74 @@ TEST_F(DeepseekV41CaptureTest,
                            /*capture_layer=*/1);
 }
 
-// Hidden sizes other than 5120 have no fused MHC kernel: the layers run the
-// unfused boundaries and never defer their post.
+TEST_F(DeepseekV41MluModelTest, RejectsUnsupportedProjectionWidth) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  args_.hidden_size(256);
+  EXPECT_DEATH(
+      { layer::DeepseekV41DecoderLayer layer(make_context(), 0); },
+      "hidden_size.*5120");
+}
 
-TEST_F(DeepseekV41CaptureTest,
-       UnsupportedHiddenSizeUsesUnfusedBoundariesWithEngram) {
-  expect_entering_residual(/*with_engram=*/true,
-                           /*value_scale=*/0.5,
-                           /*capture_layer=*/1,
-                           /*model_hidden_size=*/256);
+TEST_F(DeepseekV41MluModelTest, QueryProjectionUsesCheckpointQuantization) {
+  torch::InferenceMode inference;
+  const torch::DeviceGuard guard(options_.device());
+  args_.n_heads(8).window_size(1);
+  const std::string prefix = "layers.0.attn.";
+  auto weights = make_weights();
+  weights.at(prefix + "wq_a.weight").select(1, 0).fill_(1);
+  weights.at(prefix + "wkv.weight").select(1, 0).fill_(1);
+  weights.at(prefix + "wo_a.weight")[0][0].fill_(1);
+  weights.at(prefix + "wo_b.weight")[0][0].fill_(1);
+  auto weight = torch::zeros({4096, 1280}, torch::kInt8);
+  weight.select(1, 0).fill_(1);
+  const auto hidden = torch::ones({1, 5120}, options_);
+  const auto positions = torch::zeros({1}, options_.dtype(torch::kInt32));
+  auto rope = torch::zeros({1, 128}, options_.dtype(torch::kFloat32));
+  rope.slice(1, 0, 64).fill_(1);
+  ModelInputParams input;
+  input.meta.batch_forward_type = BatchForwardType::PREFILL;
+  input.meta.num_sequences = 1;
+  input.attention.host.q_seq_lens = {0, 1};
+  input.multi_block_tables = {torch::zeros({1, 1}, torch::kInt32)};
+  layer::Csa2Context shared;
+  layer::deepseek_v41::prepare_metadata(
+      shared, input, positions, /*num_sequences=*/1);
+  shared.topk.resize(1);
+  DeepSeekV4KVCacheTensors tensors;
+  tensors.swa_cache = torch::zeros({1, 128, 1, 512}, options_);
+  std::vector<KVCache> caches;
+  caches.emplace_back(tensors);
+  constexpr float kScale = 1.0f / 32;
+  for (const bool legacy : {false, true}) {
+    SCOPED_TRACE(legacy);
+    QuantArgs quant;
+    auto checkpoint = weights;
+    if (legacy) {
+      quant.quant_method() = kQuantMethodSmoothquant;
+      quant.ignored_modules() = {prefix + "wo_b"};
+      checkpoint.erase(prefix + "wq_b.weight");
+      checkpoint[prefix + "wq_b.qweight"] = weight;
+      checkpoint[prefix + "wq_b.per_channel_scale"] =
+          torch::full({4096}, kScale);
+      checkpoint[prefix + "wq_b.smooth"] = torch::full({1280}, 2.0f);
+    } else {
+      quant.quant_method() = "compressed-tensors";
+      quant.is_compressed_tensors_w8a8_dynamic() = true;
+      quant.compressed_groups() = {{{prefix + "wq_b"}, 8, 0, false}};
+      checkpoint[prefix + "wq_b.weight"] = weight;
+      checkpoint[prefix + "wq_b.weight_scale"] = torch::full({4096, 1}, kScale);
+    }
+    layer::DeepseekV41Attention attention(make_context().with_quant_args(quant),
+                                          /*layer_id=*/0);
+    attention->load_state_dict(
+        StateDict(std::move(checkpoint)).get_dict_with_prefix(prefix));
+    attention->verify_loaded_weights();
+    const auto output =
+        attention->forward(hidden, positions, rope, caches, input, shared);
+    // One all-ones KV row competes with a zero-logit sink.
+    const float logit = std::sqrt(512.0f) * kScale * (legacy ? 2.0f : 1.0f);
+    EXPECT_NEAR(output[0][0].item<float>(), 1 / (1 + std::exp(-logit)), 0.005);
+  }
 }
 
 class DeepseekV41HashPlacementTest
@@ -706,11 +832,15 @@ TEST_P(DeepseekV41HashPlacementTest,
   weights["embed.weight"] = patterned({8, hidden_size}, 0.5);
   weights["layers.0.attn.wq_b.weight"] =
       patterned({4096, args_.q_lora_rank()}, 0.01);
-  weights["layers.0.attn.wo_a.weight"] = patterned({1, 128, 4096}, 0.01);
+  for (const std::string name : {"wo_a", "wo_b"}) {
+    auto& weight = weights.at("layers.0.attn." + name + ".weight");
+    weight = patterned(weight.sizes().vec(), 32).round().to(torch::kInt8);
+    weights.at("layers.0.attn." + name + ".weight_scale")
+        .fill_(name == "wo_a" ? 0.01 / 32 : 0.02 / 32);
+  }
   weights["layers.0.attn.attn_sink"] = torch::zeros({8}, torch::kFloat32);
   for (const std::string name : {"wq_a",
                                  "wkv",
-                                 "wo_b",
                                  "compressor.wkv",
                                  "compressor.wgate",
                                  "indexer.wq_b",

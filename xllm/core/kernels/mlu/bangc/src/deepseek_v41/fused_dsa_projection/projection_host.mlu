@@ -1,0 +1,115 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
+ */
+#include <cnrt.h>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection_device.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection_large_m.h"
+
+namespace xllm::kernel::mlu::bangc::projection {
+namespace {
+
+// Splits every segment into column tiles of `width` (the last tile of a
+// segment may be 256 wide when the segment length is not a multiple).
+void build_tiles(int32_t width, GemmParams* p) {
+  p->bn = width;
+  p->col_tiles = 0;
+  for (int32_t i = 0; i < p->nseg; ++i) {
+    for (int32_t off = 0; off < p->seg[i].n_len; off += width) {
+      const int32_t left = p->seg[i].n_len - off;
+      p->tile_n0[p->col_tiles] = p->seg[i].n_begin + off;
+      p->tile_w[p->col_tiles] = left < width ? left : width;
+      ++p->col_tiles;
+    }
+  }
+}
+
+void choose_tiles(int32_t clusters, GemmParams* p) {
+  if (p->m >= 2048) {
+    // 512-wide column tiles halve X re-reads; one row block per cluster.
+    p->kb = 256;
+    p->split_n = 1;
+    build_tiles(512, p);
+    const int32_t rows = (p->m + clusters - 1) / clusters;
+    p->bm = ((rows + 3) / 4) * 4;
+    if (p->bm > 512) {
+      p->bm = 512;
+    }
+    p->row_blocks = (p->m + p->bm - 1) / p->bm;
+    // Each IPU loads its private X rows on its own IO queue; the MPU only
+    // stages the shared weight K-tiles.
+    p->a_direct = 1;
+    return;
+  }
+  p->kb = 512;
+  build_tiles(256, p);
+  if (p->m <= 64) {
+    p->split_n = 4;
+    p->bm = p->m;
+  } else if (p->m <= 256) {
+    p->split_n = 2;
+    p->bm = p->m;
+  } else {
+    // Four IPUs split rows (<= 128 each); pick the row block that minimises
+    // the number of rows the busiest cluster has to process.
+    p->split_n = 1;
+    int64_t best = -1;
+    for (int32_t bm = 512; bm >= 256; bm -= 64) {
+      const int64_t blocks = (p->m + bm - 1) / bm;
+      const int64_t rounds = (blocks * p->col_tiles + clusters - 1) / clusters;
+      const int64_t cost = rounds * bm;
+      if (best < 0 || cost < best) {
+        best = cost;
+        p->bm = bm;
+      }
+    }
+  }
+  p->row_blocks = (p->m + p->bm - 1) / p->bm;
+}
+
+}  // namespace
+}  // namespace xllm::kernel::mlu::bangc::projection
+
+int32_t xllm::kernel::mlu::bangc::projection::launch(const ProjectionArgs& args,
+                                                     cnrtQueue_t queue) {
+  if (args.m < 0 || args.m > kMaxLargeM || args.c < 0 || args.c > 2) {
+    return static_cast<int>(cnrtErrorArgsInvalid);
+  }
+  if (args.m == 0) {
+    return 0;
+  }
+  int32_t device = 0;
+  int32_t clusters = 0;
+  cnrtRet_t status = cnrtGetDevice(&device);
+  if (status != cnrtSuccess) {
+    return status;
+  }
+  status = cnrtDeviceGetAttribute(&clusters, cnrtAttrClusterCount, device);
+  if (status != cnrtSuccess) {
+    return status;
+  }
+  if (clusters <= 0) {
+    return cnrtErrorArgsInvalid;
+  }
+  if (args.m > kMaxSmallM) {
+    return launch_large_m(args, clusters, queue);
+  }
+  GemmParams g = {};
+  init_projection(g, args);
+  choose_tiles(clusters, &g);
+
+  g.tail_norm = g.split_n == 1 && g.row_blocks % clusters == 0 ? 1 : 0;
+  cnrtDim3_t gemm_dim = {4, static_cast<uint32_t>(clusters), 1};
+  gemm_kernel<<<gemm_dim, cnrtFuncTypeUnion1, queue>>>(g);
+  status = cnrtGetLastError();
+  if (status != cnrtSuccess || g.tail_norm) {
+    return status;
+  }
+
+  cnrtDim3_t norm_dim = {static_cast<uint32_t>(4 * clusters), 1, 1};
+  norm_kernel<<<norm_dim, cnrtFuncTypeBlock, queue>>>(g.norm);
+  return static_cast<int>(cnrtGetLastError());
+}

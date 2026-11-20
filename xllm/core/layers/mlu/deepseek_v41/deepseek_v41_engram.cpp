@@ -34,7 +34,6 @@ limitations under the License.
 #include "kernels/mlu/bangc/include/engram_gate.h"
 #include "kernels/mlu/bangc/include/engram_gather_dequantize.h"
 #include "kernels/mlu/bangc/include/engram_hash.h"
-#include "kernels/ops_api.h"
 #include "layers/mlu/deepseek_v4/deepseek_v4_cp_context.h"
 #include "layers/mlu/deepseek_v41/engram_shared_memory.h"
 #include "util/json_reader.h"
@@ -348,6 +347,10 @@ DeepseekV41EngramImpl::DeepseekV41EngramImpl(const ModelContext& context,
   CHECK_GT(args_.engram_n_heads(), 0);
   CHECK_GT(args_.engram_compressed_vocab_size(), 0);
   CHECK_GT(args_.engram_num_embeddings()[engram_id_], 0);
+  wkv_module_ = "layers." +
+                std::to_string(args_.engram_layer_ids().at(engram_id_)) +
+                ".engram.wkv";
+  wkv_quant_ = context.get_quant_args().for_module(wkv_module_);
   const EngramOptions engram_options =
       parse_engram_options(ModelConfig::get_instance().engram_config());
   cpu_offload_ = engram_options.cpu_offload;
@@ -380,9 +383,66 @@ DeepseekV41EngramImpl::DeepseekV41EngramImpl(const ModelContext& context,
                     .to(options_.device());
 }
 
+void DeepseekV41EngramImpl::load_wkv(const StateDict& state) {
+  if (state.size() == 0) {
+    return;
+  }
+  const int64_t in = (args_.engram_max_ngram_size() - 1) *
+                     args_.engram_n_heads() * args_.engram_head_dim();
+  const int64_t out = (args_.hc_mult() + 1) * args_.hidden_size();
+  for (const auto& [name, tensor] : state) {
+    if (name != "weight" && name != "weight_scale" && name != "smooth") {
+      continue;
+    }
+    CHECK(!wkv_ && pending_wkv_.emplace(name, tensor).second)
+        << "Unexpected additional tensor " << wkv_module_ << "." << name;
+    if (name == "weight") {
+      CHECK_EQ(tensor.sizes(), torch::IntArrayRef({out, in}))
+          << wkv_module_ << ".weight";
+      CHECK(tensor.scalar_type() == torch::kBFloat16 ||
+            tensor.scalar_type() == torch::kInt8)
+          << wkv_module_ << ".weight";
+    } else {
+      CHECK_EQ(tensor.scalar_type(), torch::kBFloat16)
+          << wkv_module_ << "." << name;
+      if (name == "smooth") {
+        CHECK_EQ(tensor.sizes(), torch::IntArrayRef({in}))
+            << wkv_module_ << ".smooth";
+      } else {
+        CHECK_EQ(tensor.sizes(), torch::IntArrayRef({out, 1}))
+            << wkv_module_ << ".weight_scale";
+      }
+    }
+  }
+  const auto weight = pending_wkv_.find("weight");
+  if (weight == pending_wkv_.end()) {
+    return;
+  }
+  const bool integer = weight->second.scalar_type() == torch::kInt8;
+  if (integer) {
+    CHECK(wkv_quant_.is_compressed_tensors_w8a8_dynamic() &&
+          wkv_quant_.bits() == 8 && wkv_quant_.group_size() == 0 &&
+          wkv_quant_.preserve_smooth())
+        << wkv_module_;
+    if (!pending_wkv_.contains("weight_scale") ||
+        !pending_wkv_.contains("smooth")) {
+      return;
+    }
+  } else {
+    CHECK_EQ(pending_wkv_.size(), 1)
+        << "Unexpected quantization tensors for BF16 " << wkv_module_;
+  }
+  wkv_ = register_module(
+      "wkv",
+      ReplicatedLinear(
+          in, out, false, integer ? wkv_quant_ : QuantArgs(), options_));
+  wkv_->load_state_dict(StateDict(std::move(pending_wkv_), wkv_module_ + "."));
+}
+
 void DeepseekV41EngramImpl::load_state_dict(const StateDict& state) {
+  load_wkv(state.get_dict_with_prefix("wkv."));
   for (const std::string name :
-       {"wkv.weight", "q_weight", "k_weight", "embed.weight", "embed.scale"}) {
+       {"q_weight", "k_weight", "embed.weight", "embed.scale"}) {
     torch::Tensor value = state.get_tensor(name);
     if (!value.defined()) {
       continue;
@@ -472,9 +532,16 @@ void DeepseekV41EngramImpl::lookup_host_rows(const torch::Tensor& hashes,
 }
 
 void DeepseekV41EngramImpl::verify_loaded_weights() const {
+  if (!wkv_) {
+    for (const std::string key : {"weight", "weight_scale", "smooth"}) {
+      CHECK(pending_wkv_.contains(key))
+          << "Missing " << wkv_module_ << "." << key;
+    }
+  }
+  CHECK(wkv_ && wkv_->is_weight_loaded()) << wkv_module_;
   CHECK(token_map_.defined()) << "Missing Engram hash state";
   for (const std::string name :
-       {"wkv.weight", "q_weight", "k_weight", "embed.weight", "embed.scale"}) {
+       {"q_weight", "k_weight", "embed.weight", "embed.scale"}) {
     CHECK(weights_.count(name)) << "Missing Engram weight " << name;
   }
 }
@@ -1065,12 +1132,7 @@ torch::Tensor DeepseekV41EngramImpl::forward(
       rows = rows.index_select(/*dim=*/0, row_indices);
     }
   }
-  // The MLU matmul wrapper accepts the existing [out_features, in_features]
-  // weight layout and transposes its right input internally.
-  kernel::MatmulParams wkv;
-  wkv.a = rows.flatten(1);
-  wkv.b = weights_.at("wkv.weight");
-  torch::Tensor kv = kernel::matmul(wkv);
+  torch::Tensor kv = wkv_->forward(rows.flatten(1));
   torch::Tensor output =
       kernel::mlu::bangc::engram_gate(gate_hidden,
                                       kv,

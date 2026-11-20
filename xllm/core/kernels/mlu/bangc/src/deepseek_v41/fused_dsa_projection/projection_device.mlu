@@ -1,0 +1,932 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
+ */
+#include <bang.h>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_projection/projection_device.h"
+
+namespace xllm::kernel::mlu::bangc::projection {
+
+#define DIV_UP(x, y) (((x) + (y) - 1) / (y))
+#define PAD_UP(x, y) (DIV_UP(x, y) * (y))
+
+constexpr int32_t kNramBytes = 384 * 1024;
+constexpr int32_t kGemmNramBytes = 480 * 1024;
+constexpr int32_t kWramBytes = 512 * 1024;
+constexpr int32_t kSramBytes = 1920 * 1024;
+constexpr int32_t kLtStride = kWramBytes / 16;  // bytes between WRAM LT blocks
+
+// SRAM [n, k] BF16 rows (row stride `ld` elements) -> WRAM matrix-filter
+// layout (n multiple of 64): every 4 consecutive rows go to one of 16 LT
+// blocks.
+__mlu_func__ void move_filter_lt16(bfloat16_t* wram_dst,
+                                   const bfloat16_t* sram_src,
+                                   int32_t n,
+                                   int32_t k,
+                                   int32_t ld) {
+  const int32_t bytes = k * 2;
+  const int32_t row = PAD_UP(bytes, 64);
+  for (int32_t i = 0; i < n / 64; ++i) {
+    __memcpy_async(wram_dst,
+                   sram_src,
+                   bytes,
+                   SRAM2WRAM,
+                   row,
+                   3,
+                   kLtStride,
+                   15,
+                   ld * 2,
+                   63,
+                   0,
+                   0);
+    wram_dst += 4 * row / 2;
+    sram_src += 64 * ld;
+  }
+}
+
+constexpr int32_t kNormRows = 24;               // rows per pipeline chunk
+constexpr int32_t kRowElems = kKvDim + kQRank;  // kv | q BF16 per row
+constexpr int32_t kNormMaxTaskRows = 512;
+constexpr int32_t kChunkElems = kNormRows * kRowElems;
+// norm_range NRAM regions, in the order used by the GEMM tail:
+//   x      R x 1280 FP32; the RoPE tail buffers alias its end
+//   part   partial sums, their transpose and the 64 row scales
+//   consts BF16 gamma, sign and 1/n patterns, positions, gather offsets
+//   rope   3 (cos, sin) slots then 3 row slots; the prologue writes only
+//          the first slot of each (kNormEarlyBytes)
+constexpr int32_t kNormXBytes = kNormRows * kQRank * 4;
+constexpr int32_t kNormPartBytes = 2 * 2048 * 4 + 2 * 64 * 4;
+constexpr int32_t kNormConstBytes =
+    (kKvDim + kQRank) * 2 + 2 * 64 * 4 + 3 * kNormMaxTaskRows * 4;
+constexpr int32_t kNormEarlyBytes = 6 * kNormRows * 64 * 4 + kChunkElems * 2;
+constexpr int32_t kNormRopeBytes = kNormEarlyBytes + 2 * kChunkElems * 2;
+constexpr int32_t kNormConstOff = kNormXBytes + kNormPartBytes;
+constexpr int32_t kNormRopeOff = kNormConstOff + kNormConstBytes;
+constexpr int32_t kNormBytes = kNormRopeOff + kNormRopeBytes;
+
+struct NormBufs {
+  bfloat16_t* gkv;  // 512
+  bfloat16_t* gq;   // 1280
+  float* sign;      // 64: -1, +1, ... (RoPE even/odd)
+  float* invn;      // 64: 1/512 (kv rows 0..31), 1/1280 (q rows 32..63)
+  uint32_t* offs;
+  int32_t* posb;
+  float* fpos;
+  float* cs;           // 3 slots x (cos, sin) R x 64
+  bfloat16_t* slot0;   // 3 slots x R rows (kv | q)
+  float* part;         // 64 x 32: kv rows 0..31, q rows 32..63
+  float* part_t;       // 32 x 64
+  float* scale;        // 64
+  float* scale_s;      // 64: copy of scale read by the scalar unit
+  float* x;            // R x 1280
+  float* tailf;        // R x 64 (aliases x)
+  float* swapf;        // R x 64 (aliases x)
+  bfloat16_t* tail16;  // aliases x
+  bfloat16_t* swap16;  // aliases x
+};
+
+__mlu_func__ NormBufs norm_bufs(int8_t* nram) {
+  NormBufs b;
+  b.gkv = reinterpret_cast<bfloat16_t*>(nram + kNormConstOff);
+  b.gq = b.gkv + kKvDim;
+  b.sign = reinterpret_cast<float*>(b.gq + kQRank);
+  b.invn = b.sign + 64;
+  b.offs = reinterpret_cast<uint32_t*>(b.invn + 64);
+  b.posb = reinterpret_cast<int32_t*>(b.offs + kNormMaxTaskRows);
+  b.fpos = reinterpret_cast<float*>(b.posb + kNormMaxTaskRows);
+  b.cs = reinterpret_cast<float*>(nram + kNormRopeOff);
+  b.slot0 = reinterpret_cast<bfloat16_t*>(b.cs + 6 * kNormRows * 64);
+  b.x = reinterpret_cast<float*>(nram);
+  b.part = reinterpret_cast<float*>(nram + kNormXBytes);
+  b.part_t = b.part + 2048;
+  b.scale = b.part_t + 2048;
+  b.scale_s = b.scale + 64;
+  // RoPE buffers at the end of x: past the kv rows (rows x 512) that
+  // row_apply reads just before the RoPE.
+  b.tailf = b.x + kNormRows * kQRank - kNormRows * 64 * 3;
+  b.swapf = b.tailf + kNormRows * 64;
+  b.tail16 = reinterpret_cast<bfloat16_t*>(b.swapf + kNormRows * 64);
+  b.swap16 = b.tail16 + kNormRows * 64;
+  return b;
+}
+
+__mlu_func__ void norm_prologue(const NormParams& p,
+                                const NormBufs& b,
+                                int32_t r_begin,
+                                int32_t n_rows);
+__mlu_func__ void norm_range(const NormParams& p,
+                             const NormBufs& b,
+                             int32_t r_begin,
+                             int32_t n_rows,
+                             bool prefetched,
+                             bool wait_stores);
+
+// Last K-step of a BF16-output chunk: dst = bf16_rn(conv(src, filter) +
+// partial) in one instruction (conv post-ops), so no separate FP32->BF16
+// conversion pass is needed.
+__mlu_func__ void conv_last_bf16(bfloat16_t* dst,
+                                 bfloat16_t* src,
+                                 bfloat16_t* filter,
+                                 float* partial,
+                                 int32_t ci,
+                                 int32_t h,
+                                 int32_t co) {
+  asm volatile(
+      "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[filter]], %[ci], 1, "
+      "%[h], 1, 1, 1, 1, %[co], .add.partial([%[opnd]]), .cvt.dst.rn.bf16();"
+      "\n\t" ::[dst] "r"(dst),
+      [src] "r"(src),
+      [filter] "r"(filter),
+      [ci] "r"(ci),
+      [h] "r"(h),
+      [co] "r"(co),
+      [opnd] "r"(partial));
+}
+
+// Pass 1: Y = X W^T for all segments. kv/q are stored as BF16 (the mandatory
+// GEMM->Norm rounding boundary). Compressor is BF16 for c=1, FP32 for c=2.
+// Union1; MPU stages A/B K-tiles into SRAM, IPUs move them to NRAM/WRAM and
+// run the BF16 conv with FP32 accumulation.
+__mlu_global__ void gemm_kernel(GemmParams p) {
+  __nram__ int8_t nram[kGemmNramBytes];
+  __wram__ int8_t wram[kWramBytes];
+  __mlu_shared__ int8_t sram[kSramBytes];
+
+  const int32_t split_n = p.split_n;
+  const int32_t split_m = 4 / split_n;
+  const int32_t ncore = p.bn / split_n;
+  const int32_t mt_max = DIV_UP(p.bm, split_m);
+  const int32_t kb = p.kb;
+  const int32_t steps = kHidden / kb;
+
+  int8_t* sram_a[2];
+  int8_t* sram_b[2];
+  sram_a[0] = sram;
+  sram_a[1] = sram_a[0] + p.bm * kb * 2;
+  sram_b[0] = sram_a[1] + p.bm * kb * 2;
+  sram_b[1] = sram_b[0] + p.bn * kb * 2;
+  bfloat16_t* nram_a[2];
+  nram_a[0] = reinterpret_cast<bfloat16_t*>(nram);
+  nram_a[1] = nram_a[0] + mt_max * kb;
+  // Accumulators and out16 sit at the top of NRAM: the tail norm's first
+  // chunk (low NRAM) starts while the last tile's stores still read them.
+  // out16 holds chunk 0's BF16 last-step output; chunk 1 writes its BF16
+  // output into chunk 0's accumulator, which is dead by then.
+  float* acc = reinterpret_cast<float*>(nram + kGemmNramBytes -
+                                        mt_max * 256 * 2 - mt_max * ncore * 4);
+  bfloat16_t* out16 = reinterpret_cast<bfloat16_t*>(acc + mt_max * ncore);
+  bfloat16_t* wram_b[2];
+  wram_b[0] = reinterpret_cast<bfloat16_t*>(wram);
+  wram_b[1] = wram_b[0] + ncore * kb / 16;
+
+  // With X loaded by the IPUs and <= 64 rows per IPU (short conv steps),
+  // stage two weight K-steps per cluster barrier (half the barriers).
+  const int32_t kpair = p.a_direct && mt_max <= 64 && steps % 2 == 0 &&
+                                4 * p.bn * kb * 2 <= kSramBytes
+                            ? 2
+                            : 1;
+  if (kpair == 2) {
+    sram_b[0] = sram;
+    sram_b[1] = sram + 2 * p.bn * kb * 2;
+  }
+  const int32_t units = p.row_blocks * p.col_tiles;
+  const int32_t my_units =
+      taskIdY < units ? DIV_UP(units - taskIdY, taskDimY) : 0;
+  const int32_t total = my_units * steps;
+  const int32_t core = __is_ipu() ? coreId : 0;
+  const int32_t ni = core % split_n;
+  const int32_t mi = core / split_n;
+
+  // Tail norm NRAM (norm_bufs): x and part are written by compute only, so
+  // they may overlay the X buffers (in order after the last convs). The
+  // scalar-written constants must lie between the X buffers and the
+  // accumulators. When the first rope/row slots also fit there ("high"),
+  // the prologue runs before the final convs; otherwise its IO0 loads wait
+  // for the final tile's chunk-0 store only (see the last K-step).
+  const int32_t acc_off =
+      kGemmNramBytes - mt_max * 256 * 2 - mt_max * ncore * 4;
+  const bool tail_fits = kNormConstOff >= 2 * mt_max * kb * 2 &&
+                         kNormRopeOff <= acc_off &&
+                         kNormBytes <= kGemmNramBytes;
+  const bool high = tail_fits && kNormRopeOff + kNormEarlyBytes <= acc_off;
+  const NormBufs nb = norm_bufs(nram);
+  // One row block per cluster: this IPU's norm rows.
+  const bool one_block = p.tail_norm && p.row_blocks == taskDimY;
+  int32_t norm_r0 = 0, norm_mt = 0;
+  if (one_block) {
+    const int32_t r0 = taskIdY * p.bm;
+    const int32_t rows = p.m - r0 < p.bm ? p.m - r0 : p.bm;
+    const int32_t base = rows / split_m;
+    const int32_t rem = rows % split_m;
+    norm_mt = base + (mi < rem ? 1 : 0);
+    norm_r0 = r0 + mi * base + (mi < rem ? mi : rem);
+  }
+  bool prefetched = false;
+  bool has_prev = false;
+  int32_t prev_s = 0, prev_mt = 0, prev_row = 0, prev_seg = 0, prev_n0 = 0;
+  int32_t prev_nc = 0, pprev_seg = 0;
+  // Startup: the first K-step's weights arrive in two column halves (one
+  // extra barrier) so the first conv starts after half of the tile instead
+  // of after the whole DMA and filter move; the loop then starts at it=1
+  // with step 0's convs already issued.
+  bool split0 = false;
+  if (total > 0 && split_n == 1 && p.a_direct) {
+    split0 = p.tile_w[taskIdY / p.row_blocks] == 512;
+  }
+  if (split0) {
+    const int32_t t = taskIdY / p.row_blocks;
+    const int32_t r0 = (taskIdY % p.row_blocks) * p.bm;
+    const int32_t rows = p.m - r0 < p.bm ? p.m - r0 : p.bm;
+    const int32_t n0 = p.tile_n0[t];
+    int32_t si = 0;
+    for (int32_t i = 1; i < p.nseg; ++i) {
+      if (n0 >= p.seg[i].n_begin) {
+        si = i;
+      }
+    }
+    const int32_t base = rows / split_m;
+    const int32_t rem = rows % split_m;
+    const int32_t mt = base + (mi < rem ? 1 : 0);
+    const int32_t moff = mi * base + (mi < rem ? mi : rem);
+    const int32_t ks = (taskIdY * steps / taskDimY) / kpair * kpair % steps;
+    const bfloat16_t* wb =
+        static_cast<const bfloat16_t*>(p.seg[si].weight) +
+        static_cast<size_t>(n0 - p.seg[si].n_begin) * kHidden + ks * kb;
+    bfloat16_t* sb = reinterpret_cast<bfloat16_t*>(sram_b[0]);
+    const int32_t ld = kpair * kb;
+    if (__is_mpu()) {
+      __memcpy_async(sb, wb, ld * 2, GDRAM2SRAM, ld * 2, kHidden * 2, 255);
+      __sync_io();
+    } else if (mt > 0) {
+      __memcpy_io0_async(nram_a[0],
+                         static_cast<const bfloat16_t*>(p.x) +
+                             static_cast<size_t>(r0 + moff) * kHidden + ks * kb,
+                         kb * 2,
+                         GDRAM2NRAM,
+                         kb * 2,
+                         kHidden * 2,
+                         mt - 1);
+    }
+    __sync_cluster_wait(0, 5, true, true, false, true, true, false);
+    if (__is_mpu()) {
+      __memcpy_async(sb + 256 * ld,
+                     wb + static_cast<size_t>(256) * kHidden,
+                     ld * 2,
+                     GDRAM2SRAM,
+                     ld * 2,
+                     kHidden * 2,
+                     255);
+      __sync_io();
+    } else if (mt > 0) {
+      move_filter_lt16(wram_b[0], sb, 256, kb, ld);
+      __sync_io0_io1_move_compute<true,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      __bang_conv(acc, nram_a[0], wram_b[0], kb, mt, 1, 1, 1, 1, 1, 256);
+    }
+    __sync_cluster_wait(0, 5, true, true, false, true, true, false);
+    if (__is_ipu() && mt > 0) {
+      move_filter_lt16(wram_b[0] + 16 * kb, sb + 256 * ld, 256, kb, ld);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      __bang_conv(acc + mt_max * 256,
+                  nram_a[0],
+                  wram_b[0] + 16 * kb,
+                  kb,
+                  mt,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  256);
+    }
+    has_prev = true;
+    prev_mt = mt;
+    prev_row = r0 + moff;
+    prev_seg = si;
+    prev_n0 = n0;
+    prev_nc = 512;
+  }
+  for (int32_t it = split0 ? 1 : 0; it <= total; ++it) {
+    const bool has_cur = it < total;
+    int32_t s = 0, ks = 0, r0 = 0, rows = 0, n0 = 0, si = 0, mt = 0, moff = 0;
+    int32_t width = 0;
+    if (has_cur) {
+      const int32_t u = taskIdY + (it / steps) * taskDimY;
+      s = it % steps;
+      // Clusters walk the K dimension from staggered starting steps so that
+      // they never fetch the identical weight K-slice at the same moment.
+      ks = (s + (taskIdY * steps / taskDimY) / kpair * kpair) % steps;
+      const int32_t rb = u % p.row_blocks;
+      const int32_t t = u / p.row_blocks;
+      r0 = rb * p.bm;
+      rows = p.m - r0 < p.bm ? p.m - r0 : p.bm;
+      n0 = p.tile_n0[t];
+      width = p.tile_w[t];
+      for (int32_t i = 1; i < p.nseg; ++i) {
+        if (n0 >= p.seg[i].n_begin) {
+          si = i;
+        }
+      }
+      const int32_t base = rows / split_m;
+      const int32_t rem = rows % split_m;
+      mt = base + (mi < rem ? 1 : 0);
+      moff = mi * base + (mi < rem ? mi : rem);
+      if (__is_mpu() && s % kpair == 0) {
+        if (!p.a_direct) {
+          const bfloat16_t* xa = static_cast<const bfloat16_t*>(p.x) +
+                                 static_cast<size_t>(r0) * kHidden + ks * kb;
+          __memcpy_async(sram_a[it & 1],
+                         xa,
+                         kb * 2,
+                         GDRAM2SRAM,
+                         kb * 2,
+                         kHidden * 2,
+                         rows - 1);
+        }
+        const bfloat16_t* wb =
+            static_cast<const bfloat16_t*>(p.seg[si].weight) +
+            static_cast<size_t>(n0 - p.seg[si].n_begin) * kHidden + ks * kb;
+        __memcpy_async(sram_b[(it / kpair) & 1],
+                       wb,
+                       kpair * kb * 2,
+                       GDRAM2SRAM,
+                       kpair * kb * 2,
+                       kHidden * 2,
+                       width - 1);
+        __sync_io();
+      }
+    }
+    if (!has_cur || s % kpair == 0) {
+      // Cluster barrier over IO and Move only: __sync_cluster also waits for
+      // Compute, which would drain conv(it-1) at every K-step. Operands of
+      // the next conv are guarded by the in-core syncs.
+      __sync_cluster_wait(0, 5, true, true, false, true, true, false);
+    }
+    if (__is_ipu()) {
+      if (!has_cur && high && one_block && norm_mt > 0 &&
+          p.seg[prev_seg].fp32_out) {
+        // Last iteration of an FP32 (compressor) tile: all kv/q stores
+        // were issued in earlier tiles; order the norm loads after them,
+        // then start the norm prologue before the final convs.
+        __sync_io0_io1_move_compute<false,
+                                    true,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    false>();
+        norm_prologue(p.norm, nb, norm_r0, norm_mt);
+        prefetched = true;
+      }
+      const bool step0_done = split0 && it == 1;
+      if (has_cur && mt > 0) {
+        // Queue-level dependency (no scalar stall): these loads into
+        // buffers [it & 1] wait for conv(it-2), issued before this point;
+        // conv(it-1) is issued after them. Buffers [1] are untouched before
+        // it=1 of a split startup.
+        if (!step0_done) {
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      true,
+                                      false,
+                                      true,
+                                      false>();
+        }
+        if (p.a_direct) {
+          // Private rows: the IPU's own IO queue relieves the MPU.
+          const bfloat16_t* xa = static_cast<const bfloat16_t*>(p.x) +
+                                 static_cast<size_t>(r0 + moff) * kHidden +
+                                 ks * kb;
+          __memcpy_io0_async(nram_a[it & 1],
+                             xa,
+                             kb * 2,
+                             GDRAM2NRAM,
+                             kb * 2,
+                             kHidden * 2,
+                             mt - 1);
+        } else {
+          __memcpy_async(nram_a[it & 1],
+                         sram_a[it & 1] + moff * kb * 2,
+                         mt * kb * 2,
+                         SRAM2NRAM);
+        }
+        move_filter_lt16(
+            wram_b[it & 1],
+            reinterpret_cast<const bfloat16_t*>(sram_b[(it / kpair) & 1]) +
+                ni * (width / split_n) * kpair * kb + (s % kpair) * kb,
+            width / split_n,
+            kb,
+            kpair * kb);
+      }
+      if (has_prev && prev_mt > 0 && !step0_done) {
+        bfloat16_t* a = nram_a[(it - 1) & 1];
+        bfloat16_t* w = wram_b[(it - 1) & 1];
+        // Columns are issued in chunks of <= 256 (n=256 convs run ~4% faster
+        // than n=512); chunk j accumulates into its own [mt, cw] block
+        // (block 1 for single-chunk tiles when two blocks fit).
+        const int32_t cw = prev_nc < 256 ? prev_nc : 256;
+        const int32_t chunks = prev_nc / cw;
+        // Chunk j's output store runs on IO1 right after that chunk's last
+        // conv, so it overlaps the following chunk's conv.
+        const bool first = prev_s == 0;
+        const bool last = prev_s == steps - 1;
+        const Segment& sg = p.seg[prev_seg];
+        if (last && !sg.fp32_out) {
+          // The previous tile's store of out16 has completed.
+          __sync_io0_io1_move_compute<false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true>();
+        }
+        for (int32_t jj = 0; jj < chunks; ++jj) {
+          // A tile's first step fills block 1 before block 0: the previous
+          // tile's last stores read block 0 (BF16 chunk 1 or FP32 chunk 0),
+          // and they complete while block 1's conv runs.
+          const int32_t j = first ? chunks - 1 - jj : jj;
+          const int32_t blk = chunks == 1 && 2 * cw <= ncore ? 1 : j;
+          float* aj = acc + blk * mt_max * cw;
+          bfloat16_t* wj = w + j * (cw / 16) * kb;
+          bfloat16_t* oj = j == 0 ? out16 : reinterpret_cast<bfloat16_t*>(acc);
+          if (last && !sg.fp32_out) {
+            conv_last_bf16(oj, a, wj, aj, kb, prev_mt, cw);
+          } else if (first) {
+            // The previous tile's stores (IO1) have left this block.
+            if (blk == 0 || p.seg[pprev_seg].fp32_out) {
+              __sync_io0_io1_move_compute<false,
+                                          true,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          false,
+                                          true>();
+            }
+            __bang_conv(aj, a, wj, kb, prev_mt, 1, 1, 1, 1, 1, cw);
+          } else {
+            __bang_conv_partial(aj, a, wj, aj, kb, prev_mt, 1, 1, 1, 1, 1, cw);
+          }
+          if (last) {
+            const int32_t col = prev_n0 - sg.n_begin + ni * prev_nc + j * cw;
+            const int32_t esize = sg.fp32_out ? 4 : 2;
+            int8_t* dst = static_cast<int8_t*>(sg.out) +
+                          (static_cast<size_t>(prev_row) * sg.ld + col) * esize;
+            void* src =
+                sg.fp32_out ? static_cast<void*>(aj) : static_cast<void*>(oj);
+            // Output stores use IO1; IO0 carries the per-step X loads.
+            __sync_io0_io1_move_compute<false,
+                                        false,
+                                        false,
+                                        true,
+                                        false,
+                                        true,
+                                        false,
+                                        false>();
+            __memcpy_io1_async(dst,
+                               src,
+                               cw * esize,
+                               NRAM2GDRAM,
+                               sg.ld * esize,
+                               cw * esize,
+                               prev_mt - 1);
+            if (!has_cur && j == 0 && sg.fp32_out && chunks > 1) {
+              // Final K-step: the tail norm's loads (IO0) may overwrite
+              // chunk 0's accumulator once its store has left; chunk 1's
+              // store can still be in flight.
+              __sync_io0_io1_move_compute<false,
+                                          true,
+                                          false,
+                                          false,
+                                          true,
+                                          false,
+                                          false,
+                                          false>();
+            }
+          }
+        }
+      }
+      // X loads (IO0) and Move done before the next barrier (SRAM reuse)
+      // and before conv(it). Compute is not drained: conv(it-1) keeps
+      // running across the barrier.
+      __sync_io0_io1_move_compute<true,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  true,
+                                  true,
+                                  true>();
+    }
+    has_prev = has_cur;
+    if (has_cur && s == 0) {
+      pprev_seg = prev_seg;
+    }
+    prev_s = s;
+    prev_mt = mt;
+    prev_row = r0 + moff;
+    prev_seg = si;
+    prev_n0 = n0;
+    prev_nc = width / split_n;
+  }
+  if (p.tail_norm && __is_ipu()) {
+    // Normalise the rows this IPU computed in every row block of this
+    // cluster. The convs are done; norm_range orders its accumulator-region
+    // use after the outstanding output stores (IO1). When the last tile was
+    // BF16 (kv/q or c=1 raw), its stores must land before the norm loads
+    // (IO0) read the rows;
+    // earlier tiles' stores were awaited by a later tile's first step.
+    // The compute queue keeps the norm behind the final convs.
+    if (prefetched) {
+      norm_range(p.norm, nb, norm_r0, norm_mt, true, false);
+      return;
+    }
+    if (!tail_fits) {
+      __sync();
+    }
+    if (!p.seg[prev_seg].fp32_out) {
+      __sync_io0_io1_move_compute<false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false>();
+    }
+    for (int32_t rb = taskIdY; rb < p.row_blocks; rb += taskDimY) {
+      const int32_t r0 = rb * p.bm;
+      const int32_t rows = p.m - r0 < p.bm ? p.m - r0 : p.bm;
+      const int32_t base = rows / split_m;
+      const int32_t rem = rows % split_m;
+      const int32_t mt = base + (mi < rem ? 1 : 0);
+      const int32_t moff = mi * base + (mi < rem ? mi : rem);
+      if (mt > 0) {
+        norm_range(p.norm, nb, r0 + moff, mt, false, false);
+      }
+    }
+  }
+}
+
+constexpr int32_t kNormNramBytes = 480 * 1024;
+// RMSNorm pieces for `rows` (<= 32) BF16 rows of width n held in b16; x
+// holds rows * n FP32. Products of two BF16 values are exact in FP32, so the
+// squares and x * gamma come straight from the BF16 operands; the row scale
+// is applied last with the BF16 rounding fused in.
+// Per-row partial sums of squares -> part [rows, 32].
+__mlu_func__ void row_sums(const bfloat16_t* b16,
+                           float* x,
+                           float* part,
+                           int32_t n,
+                           int32_t rows) {
+  asm volatile(
+      "mult.nram.f32.bf16 [%[d]], [%[a]], [%[a]], %[n];\n\t" ::[d] "r"(x),
+      [a] "r"(b16),
+      [n] "r"(rows * n));
+  // [rows, n/32, 32] -> per-row partial sums [rows, 32]
+  __bang_sumpool(part, x, 32, rows, n / 32, 1, n / 32, n / 32, 1);
+}
+
+// b16 = bf16(x * scale[row]) with x = b16 * gamma from row_gamma; scale must
+// be readable by the scalar unit (compute synchronised).
+__mlu_func__ void row_apply(bfloat16_t* b16,
+                            const float* x,
+                            const float* scale,
+                            int32_t n,
+                            int32_t rows) {
+  for (int32_t i = 0; i < rows; ++i) {
+    asm volatile(
+        "mult.scalar.nram.bf16.f32 [%[dst]], [%[src]], %[s], %[n];\n\t" ::
+            [dst] "r"(b16 + i * n),
+        [src] "r"(x + i * n),
+        [s] "r"(scale[i]),
+        [n] "r"(n));
+  }
+}
+
+// x = b16 * gamma (exact), cycled over rows of width n.
+__mlu_func__ void row_gamma(float* x,
+                            const bfloat16_t* b16,
+                            const bfloat16_t* gamma,
+                            int32_t n,
+                            int32_t rows) {
+  asm volatile(
+      "mult.cycle.nram.f32.bf16 [%[dst]], [%[src]], [%[g]], %[n0], "
+      "%[n1];\n\t" ::[dst] "r"(x),
+      [src] "r"(b16),
+      [g] "r"(gamma),
+      [n0] "r"(rows * n),
+      [n1] "r"(n));
+}
+
+#define NORM_HELPERS                                                          \
+  bfloat16_t* kv_base =                                                       \
+      static_cast<bfloat16_t*>(p.kv) + static_cast<size_t>(r_begin) * kKvDim; \
+  bfloat16_t* q_base =                                                        \
+      static_cast<bfloat16_t*>(p.qr) + static_cast<size_t>(r_begin) * kQRank; \
+  auto rows_of = [&](int32_t c) {                                             \
+    return n_rows - c * kNormRows < kNormRows ? n_rows - c * kNormRows        \
+                                              : kNormRows;                    \
+  };                                                                          \
+  auto load_rows = [&](int32_t c) {                                           \
+    const int32_t rows = rows_of(c);                                          \
+    bfloat16_t* buf = b.slot0 + (c % 3) * kChunkElems;                        \
+    __memcpy_io0_async(buf,                                                   \
+                       kv_base + static_cast<size_t>(c) * kNormRows * kKvDim, \
+                       rows * kKvDim * 2,                                     \
+                       GDRAM2NRAM);                                           \
+    __memcpy_io0_async(buf + kNormRows * kKvDim,                              \
+                       q_base + static_cast<size_t>(c) * kNormRows * kQRank,  \
+                       rows * kQRank * 2,                                     \
+                       GDRAM2NRAM);                                           \
+  };                                                                          \
+  auto gather_rope = [&](int32_t c) {                                         \
+    const int32_t rows = rows_of(c);                                          \
+    float* cos_s = b.cs + (c % 3) * 2 * kNormRows * 64;                       \
+    __gather_io0_async(                                                       \
+        cos_s, p.rope, b.offs + c * kNormRows, 256, GDRAM2NRAM, 256, rows);   \
+    __gather_io0_async(cos_s + kNormRows * 64,                                \
+                       p.rope + 64,                                           \
+                       b.offs + c * kNormRows,                                \
+                       256,                                                   \
+                       GDRAM2NRAM,                                            \
+                       256,                                                   \
+                       rows);                                                 \
+  };
+
+// Prologue: gamma, positions and chunk 0 rows are fetched together (one
+// DRAM latency), gather offsets clamp(pos) * 512 bytes are computed on the
+// vector unit (positions < 2^20, exact in FP32), then chunk 0's rope rows
+// are gathered. Writes only the first kNormEarlyBytes of the head region.
+__mlu_func__ void norm_prologue(const NormParams& p,
+                                const NormBufs& b,
+                                int32_t r_begin,
+                                int32_t n_rows) {
+  NORM_HELPERS
+  __memcpy_io0_async(b.gkv, p.gamma_kv, kKvDim * 2, GDRAM2NRAM);
+  __memcpy_io0_async(b.gq, p.gamma_q, kQRank * 2, GDRAM2NRAM);
+  __memcpy_io0_async(b.posb, p.positions + r_begin, n_rows * 4, GDRAM2NRAM);
+  load_rows(0);
+  for (int32_t i = 0; i < 64; ++i) {
+    b.sign[i] = (i & 1) ? 1.0f : -1.0f;
+    b.invn[i] = i < 32 ? 1.0f / kKvDim : 1.0f / kQRank;
+  }
+  __sync_io0_io1_move_compute<true,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              true>();
+  __bang_int322float(b.fpos, b.posb, n_rows, 0);
+  __bang_maxeq_scalar(b.fpos, b.fpos, 0.0f, n_rows);
+  __bang_mineq_scalar(
+      b.fpos, b.fpos, static_cast<float>(p.rope_rows - 1), n_rows);
+  __bang_mul_scalar(b.fpos, b.fpos, 512.0f, n_rows);
+  __bang_float2int32(reinterpret_cast<int32_t*>(b.offs), b.fpos, n_rows, 0);
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              true,
+                              false,
+                              false,
+                              false>();
+  gather_rope(0);
+}
+
+// In-place RMSNorm of kv/qr rows [r_begin, r_begin + n_rows) and RoPE on
+// their final 64 kv dimensions.
+// Each task owns a contiguous row range processed in 24-row chunks with a
+// three-slot pipeline: load(c+1) (IO0) and store(c-1) (IO1) overlap
+// compute(c) and each other; only the needed queue pairs are synchronised.
+// `prefetched`: norm_prologue was already issued. `wait_stores`: earlier
+// output stores (IO1) may still read NRAM that the compute scratch uses.
+__mlu_func__ void norm_range(const NormParams& p,
+                             const NormBufs& b,
+                             int32_t r_begin,
+                             int32_t n_rows,
+                             bool prefetched,
+                             bool wait_stores) {
+  NORM_HELPERS
+  const int32_t chunks = DIV_UP(n_rows, kNormRows);
+  auto load = [&](int32_t c) {
+    load_rows(c);
+    gather_rope(c);
+  };
+  auto store = [&](int32_t c) {
+    const int32_t rows = rows_of(c);
+    bfloat16_t* buf = b.slot0 + (c % 3) * kChunkElems;
+    __memcpy_io1_async(kv_base + static_cast<size_t>(c) * kNormRows * kKvDim,
+                       buf,
+                       rows * kKvDim * 2,
+                       NRAM2GDRAM);
+    __memcpy_io1_async(q_base + static_cast<size_t>(c) * kNormRows * kQRank,
+                       buf + kNormRows * kKvDim,
+                       rows * kQRank * 2,
+                       NRAM2GDRAM);
+  };
+  bfloat16_t* slot0 = b.slot0;
+  float* cs = b.cs;
+  float* x = b.x;
+  float* part = b.part;
+  float* part_t = b.part_t;
+  float* scale = b.scale;
+  float* tailf = b.tailf;
+  float* swapf = b.swapf;
+  bfloat16_t* tail16 = b.tail16;
+  bfloat16_t* swap16 = b.swap16;
+  const bfloat16_t* gkv = b.gkv;
+  const bfloat16_t* gq = b.gq;
+  float* sign = b.sign;
+  const int32_t chunk_elems = kChunkElems;
+
+  if (!prefetched) {
+    norm_prologue(p, b, r_begin, n_rows);
+  }
+  if (wait_stores) {
+    __sync_io0_io1_move_compute<false,
+                                true,
+                                false,
+                                false,
+                                false,
+                                false,
+                                false,
+                                true>();
+  }
+  for (int32_t c = 0; c < chunks; ++c) {
+    // IO0 -> Compute: load(c) landed (load(c+1) is not issued yet).
+    __sync_io0_io1_move_compute<true,
+                                false,
+                                false,
+                                false,
+                                false,
+                                false,
+                                false,
+                                true>();
+    if (c + 1 < chunks) {
+      // IO1 -> IO0: store(c-2) left slot (c+1)%3 before it is refilled.
+      __sync_io0_io1_move_compute<false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false>();
+      load(c + 1);
+    }
+    if (c >= 1) {
+      // Compute -> IO1: chunk c-1 is final.
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  false,
+                                  false>();
+      store(c - 1);
+    }
+    const int32_t rows = rows_of(c);
+    bfloat16_t* kvb = slot0 + (c % 3) * chunk_elems;
+    bfloat16_t* qb = kvb + kNormRows * kKvDim;
+    float* cosb = cs + (c % 3) * 2 * kNormRows * 64;
+    float* sinb = cosb + kNormRows * 64;
+    // Row scales of kv and q together: rsqrt(sum(x^2) / n + eps).
+    row_sums(kvb, x, part, kKvDim, rows);
+    row_sums(qb, x, part + 32 * 32, kQRank, rows);
+    __bang_transpose(part_t, part, 64, 32);
+    __bang_sumpool(scale, part_t, 64, 32, 1, 32, 1, 1, 1);
+    __bang_mul(scale, scale, b.invn, 64);
+    __bang_add_scalar(scale, scale, p.eps, 64);
+    __bang_rsqrt(scale, scale, 64);
+    // The scalar unit reads the scales from a Move-queue copy, so it waits
+    // for the rsqrt only while row_gamma keeps the compute queue busy.
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                true,
+                                false>();
+    __memcpy_async(b.scale_s, scale, 64 * 4, NRAM2NRAM);
+    row_gamma(x, kvb, gkv, kKvDim, rows);
+    __sync_move();
+    row_apply(kvb, x, b.scale_s, kKvDim, rows);
+    // RoPE on kv columns 448..511; rotating each 32-bit word by 16 bits
+    // swaps the (even, odd) BF16 pair.
+    // The tail copies run on the Move queue with queue-level dependencies
+    // (a blocking __memcpy would drain the compute queue twice per chunk).
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                true,
+                                false>();
+    __memcpy_async(tail16,
+                   kvb + (kKvDim - kRotary),
+                   kRotary * 2,
+                   NRAM2NRAM,
+                   kRotary * 2,
+                   kKvDim * 2,
+                   rows - 1);
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                false,
+                                false,
+                                true>();
+    __bang_rol(reinterpret_cast<uint32_t*>(swap16),
+               reinterpret_cast<uint32_t*>(tail16),
+               16,
+               rows * kRotary / 2);
+    // tail16|swap16, tailf|swapf and cos|sin are each R x 64 apart, so one
+    // instruction covers both halves (rows beyond `rows` are scratch).
+    const int32_t pair = (kNormRows + rows) * kRotary;
+    __bang_cycle_mul(sinb, sinb, sign, rows * kRotary, kRotary);
+    __bang_bfloat162float(tailf, tail16, pair);
+    __bang_mul(tailf, tailf, cosb, pair);
+    __bang_add(tailf, tailf, swapf, rows * kRotary);
+    __bang_float2bfloat16_rn(tail16, tailf, rows * kRotary);
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                true,
+                                false>();
+    __memcpy_async(kvb + (kKvDim - kRotary),
+                   tail16,
+                   kRotary * 2,
+                   NRAM2NRAM,
+                   kKvDim * 2,
+                   kRotary * 2,
+                   rows - 1);
+    // kvb is complete for store(c) (IO1 waits Move below) and x may be
+    // rewritten by compute once the copy has read tail16.
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                true,
+                                false,
+                                true>();
+    row_gamma(x, qb, gq, kQRank, rows);
+    row_apply(qb, x, b.scale_s + 32, kQRank, rows);
+  }
+  __sync_compute();
+  store(chunks - 1);
+  __sync_io();
+}
+
+// Pass 2 (separate launch): rows split evenly over all tasks.
+__mlu_global__ void norm_kernel(NormParams p) {
+  __nram__ int8_t nram[kNormNramBytes];
+  const int32_t rows_per = DIV_UP(p.m, taskDim);
+  const int32_t r_begin = taskId * rows_per;
+  const int32_t r_end = r_begin + rows_per < p.m ? r_begin + rows_per : p.m;
+  if (r_begin >= r_end) {
+    return;
+  }
+  for (int32_t row = r_begin; row < r_end; row += kNormMaxTaskRows) {
+    const int32_t remaining = r_end - row;
+    norm_range(p,
+               norm_bufs(nram),
+               row,
+               remaining < kNormMaxTaskRows ? remaining : kNormMaxTaskRows,
+               false,
+               false);
+  }
+}
+
+}  // namespace xllm::kernel::mlu::bangc::projection
