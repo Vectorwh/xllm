@@ -22,10 +22,15 @@ limitations under the License.
 #include <glog/logging.h>
 #include <musa_runtime_api.h>
 #include <torch/torch.h>
+#include <torch_musa/csrc/core/MUSAGuard.h>
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "core/common/metrics.h"
@@ -41,6 +46,8 @@ limitations under the License.
 #include "core/layers/musa/flashinfer_attention.h"
 #include "core/platform/cuda/device_capture_lock.h"
 #include "core/platform/device.h"
+#include "core/platform/shared_vmm_allocator.h"
+#include "core/platform/vmm_torch_allocator.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/util/env_var.h"
 #include "core/util/rec_model_utils.h"
@@ -1154,6 +1161,9 @@ bool MusaGraph::capture(CausalLM* model,
   const uint32_t actual_num_tokens = tokens.size(0);
   CHECK_GE(padded_num_tokens_, actual_num_tokens)
       << "bucket_num_tokens >= actual_num_tokens";
+  // torch_musa 2.9.1 capture_begin takes the pool id. MemPoolContext existed
+  // only on torch <= 2.7.
+  (void)pool_ptr;
 
   // Guard MUSA graph capture region with a device-level exclusive lock to
   // prevent conflicting GPU work from other streams (e.g., prepare streams) on
@@ -1285,16 +1295,6 @@ bool MusaGraph::capture(CausalLM* model,
               << " Mate FFI scratch tensors for decode graph capture, "
                  "bucket_num_tokens="
               << bucket_num_tokens;
-
-    // MemPoolContext has been deprecated in torch >= 2.8
-#if TORCH_VERSION_MAJOR <= 2 && TORCH_VERSION_MINOR <= 7
-    // Activate VMM mempool only for the actual capture to keep scratch
-    // allocations out of the shared physical memory pool.
-    std::optional<c10::musa::MemPoolContext> mempool_ctx;
-    if (pool_ptr != nullptr) {
-      mempool_ctx.emplace(pool_ptr);
-    }
-#endif
 
     // Begin graph capture (capture_mode defaults to
     // musaStreamCaptureModeGlobal)
@@ -1492,47 +1492,201 @@ namespace {
 constexpr uint32_t kPhysicalPoolIdDecode = 1;
 }  // namespace
 
-struct MusaGraphExecutorImpl::VmmPoolState {};
+struct MusaGraphExecutorImpl::VmmPoolState {
+  std::unique_ptr<xllm::SharedVMMAllocator> allocator;
+  std::unique_ptr<xllm::VMMTorchAllocator> torch_allocator;
+  std::unordered_map<uint32_t, std::unique_ptr<MusaMemPool>> mempools_by_shape;
+};
 
 MusaGraphExecutorImpl::~MusaGraphExecutorImpl() {
+  // Replay is asynchronous. Wait before releasing graphs and the VMM pools
+  // they still read. A normal shutdown finds an empty queue.
+  if (!vmm_pools_.empty()) {
+    const c10::musa::MUSAGuard device_guard(device_.index());
+    CHECK_EQ(musaDeviceSynchronize(), musaSuccess);
+  }
   graphs_.clear();
   spec_verify_graphs_.clear();
+  // torch_musa 2.9.1 is pinned in aot_config.py. Its MUSAGraph::reset() does
+  // not call releasePool, so a pool that was captured stays at use_count 2.
+  // ~MemPool asserts use_count == 1 and aborts. Leak the MemPool objects
+  // instead of destroying them. Do not delete this until torch_musa releases
+  // the pool from graph reset.
+  for (auto& entry : vmm_pools_) {
+    if (!entry.second) {
+      continue;
+    }
+    for (auto& pool : entry.second->mempools_by_shape) {
+      pool.second.release();
+    }
+  }
+  vmm_pools_.clear();
 }
 
 MusaGraphExecutorImpl::VmmPoolState&
 MusaGraphExecutorImpl::get_or_create_vmm_pool_state(uint32_t physical_pool_id) {
-  LOG(FATAL) << "Graph VMM pool is not enabled for MUSA builds";
+  std::lock_guard<std::mutex> lock(vmm_mutex_);
+  std::unordered_map<uint32_t, std::unique_ptr<VmmPoolState>>::iterator found =
+      vmm_pools_.find(physical_pool_id);
+  if (found != vmm_pools_.end() && found->second) {
+    return *found->second;
+  }
+  auto state = std::make_unique<VmmPoolState>();
+  state->allocator = std::make_unique<xllm::SharedVMMAllocator>();
+  state->allocator->init(device_.index());
+  CHECK(state->allocator->is_initialized())
+      << "SharedVMMAllocator init failed for device " << device_.index();
+  state->torch_allocator =
+      std::make_unique<xllm::VMMTorchAllocator>(state->allocator.get());
+  std::unique_ptr<VmmPoolState>& slot = vmm_pools_[physical_pool_id];
+  slot = std::move(state);
+  LOG(INFO) << "Created VMM pool state for executor " << this << ", device "
+            << device_.index() << ", physical_pool_id: " << physical_pool_id;
+  return *slot;
 }
 
 MusaMemPool* MusaGraphExecutorImpl::get_or_create_vmm_mempool(
     uint32_t physical_pool_id,
     uint32_t shape_id) {
-  (void)physical_pool_id;
-  (void)shape_id;
-  LOG(FATAL) << "Graph VMM pool is not enabled for MUSA builds";
-  return nullptr;
+  VmmPoolState& state = get_or_create_vmm_pool_state(physical_pool_id);
+  std::lock_guard<std::mutex> lock(vmm_mutex_);
+  std::unordered_map<uint32_t, std::unique_ptr<MusaMemPool>>& mempools =
+      state.mempools_by_shape;
+  std::unordered_map<uint32_t, std::unique_ptr<MusaMemPool>>::iterator found =
+      mempools.find(shape_id);
+  if (found != mempools.end()) {
+    return found->second.get();
+  }
+  auto pool = std::make_unique<MusaMemPool>(state.torch_allocator.get(),
+                                            /*is_user_created=*/true);
+  MusaMemPool* pool_ptr = pool.get();
+  mempools[shape_id] = std::move(pool);
+  VLOG(kGraphExecutorLogVerboseLevel)
+      << "Created per-shape VMM MemPool for executor " << this << ", device "
+      << device_.index() << ", physical_pool_id: " << physical_pool_id
+      << ", shape_id: " << shape_id << ", pool_id: {" << pool_ptr->id().first
+      << ", " << pool_ptr->id().second << "}";
+  return pool_ptr;
 }
 
 MusaMemPool* MusaGraphExecutorImpl::get_vmm_mempool(uint32_t physical_pool_id,
                                                     uint32_t shape_id) {
-  (void)physical_pool_id;
-  (void)shape_id;
-  return nullptr;
+  std::lock_guard<std::mutex> lock(vmm_mutex_);
+  std::unordered_map<uint32_t, std::unique_ptr<VmmPoolState>>::iterator pool =
+      vmm_pools_.find(physical_pool_id);
+  if (pool == vmm_pools_.end() || !pool->second) {
+    return nullptr;
+  }
+  std::unordered_map<uint32_t, std::unique_ptr<MusaMemPool>>& mempools =
+      pool->second->mempools_by_shape;
+  std::unordered_map<uint32_t, std::unique_ptr<MusaMemPool>>::iterator found =
+      mempools.find(shape_id);
+  if (found == mempools.end()) {
+    return nullptr;
+  }
+  return found->second.get();
 }
 
 void MusaGraphExecutorImpl::reset_vmm_allocator_offset(
     uint32_t physical_pool_id) {
-  (void)physical_pool_id;
+  // Each capture abandons the previous virtual space before it starts. A
+  // failed capture is left there; the next capture reuses physical pages from
+  // offset 0. There is no separate rollback path.
+  VmmPoolState& state = get_or_create_vmm_pool_state(physical_pool_id);
+  CHECK(state.allocator != nullptr && state.allocator->is_initialized())
+      << "VMM allocator is not initialized for physical_pool_id "
+      << physical_pool_id;
+  state.allocator->switch_to_new_virtual_space();
+  VLOG(kGraphExecutorLogVerboseLevel)
+      << "Reset VMM allocator for device " << device_.index()
+      << ", physical_pool_id: " << physical_pool_id;
 }
 
 MusaGraphExecutorImpl::GraphMemoryUsageStats
 MusaGraphExecutorImpl::get_graph_memory_usage_stats() {
-  return GraphMemoryUsageStats{};
+  GraphMemoryUsageStats stats;
+  if (!::xllm::ExecutionConfig::get_instance().enable_graph_vmm_pool()) {
+    const c10::musa::MempoolId_t pool = get_mem_pool();
+    const GraphPoolMemoryUsage usage =
+        get_graph_pool_memory_usage(device_.index(), pool);
+    stats.executor_total_bytes = usage.reserved_bytes;
+    stats.allocated_pool_bytes = usage.allocated_bytes;
+    stats.active_pool_bytes = usage.active_bytes;
+    stats.pool_high_water_mark_bytes = usage.allocated_bytes;
+
+    if (stats.executor_total_bytes == 0) {
+      const GraphPoolMemoryUsage private_pool_usage =
+          get_private_pools_memory_usage(device_.index());
+      if (private_pool_usage.reserved_bytes >
+          baseline_private_pool_reserved_bytes_) {
+        stats.executor_total_bytes = private_pool_usage.reserved_bytes -
+                                     baseline_private_pool_reserved_bytes_;
+      }
+      if (private_pool_usage.allocated_bytes >
+          baseline_private_pool_allocated_bytes_) {
+        stats.allocated_pool_bytes = private_pool_usage.allocated_bytes -
+                                     baseline_private_pool_allocated_bytes_;
+      }
+      if (private_pool_usage.active_bytes >
+          baseline_private_pool_active_bytes_) {
+        stats.active_pool_bytes = private_pool_usage.active_bytes -
+                                  baseline_private_pool_active_bytes_;
+      }
+      stats.pool_high_water_mark_bytes = stats.allocated_pool_bytes;
+    }
+
+    if (stats.executor_total_bytes == 0) {
+      const size_t allocator_reserved_bytes =
+          get_allocator_reserved_bytes(device_.index());
+      if (allocator_reserved_bytes > baseline_allocator_reserved_bytes_) {
+        stats.executor_total_bytes =
+            allocator_reserved_bytes - baseline_allocator_reserved_bytes_;
+      }
+    }
+  } else {
+    std::lock_guard<std::mutex> lock(vmm_mutex_);
+    for (const auto& entry : vmm_pools_) {
+      if (!entry.second || entry.second->allocator == nullptr) {
+        continue;
+      }
+      const VmmPoolState& pool_state = *entry.second;
+      stats.executor_total_bytes += pool_state.allocator->mapped_size();
+      stats.allocated_pool_bytes += pool_state.allocator->high_water_mark();
+      stats.active_pool_bytes += pool_state.allocator->current_offset();
+    }
+    stats.pool_high_water_mark_bytes = stats.allocated_pool_bytes;
+  }
+  stats.persistent_param_bytes =
+      persistent_param_ ? persistent_param_->get_persistent_tensor_bytes() : 0;
+  stats.executor_total_bytes += stats.persistent_param_bytes;
+  return stats;
 }
 
-size_t MusaGraphExecutorImpl::get_graph_memory_usage_bytes() { return 0; }
+size_t MusaGraphExecutorImpl::get_graph_memory_usage_bytes() {
+  return get_graph_memory_usage_stats().executor_total_bytes;
+}
 
-void MusaGraphExecutorImpl::log_graph_memory_after_capture() {}
+void MusaGraphExecutorImpl::log_graph_memory_after_capture() {
+  const GraphMemoryUsageStats stats = get_graph_memory_usage_stats();
+  if (stats.executor_total_bytes <= last_logged_executor_total_bytes_) {
+    return;
+  }
+  last_logged_executor_total_bytes_ = stats.executor_total_bytes;
+  auto format_size = [](size_t bytes) {
+    return c10::CachingDeviceAllocator::format_size(bytes);
+  };
+  LOG(INFO) << "GraphExecutorMemory Usage:"
+            << " enable_graph_vmm_pool="
+            << ::xllm::ExecutionConfig::get_instance().enable_graph_vmm_pool()
+            << " executor_total_memory="
+            << format_size(stats.executor_total_bytes)
+            << " persistent_param=" << format_size(stats.persistent_param_bytes)
+            << " allocated_pool_memory="
+            << format_size(stats.allocated_pool_bytes)
+            << " active_pool_memory=" << format_size(stats.active_pool_bytes)
+            << " pool_high_water_mark="
+            << format_size(stats.pool_high_water_mark_bytes);
+}
 
 // Get graph memory pool id for capture. When VMM is enabled, uses per-shape
 // MemPool under (physical_pool_id, shape_id).

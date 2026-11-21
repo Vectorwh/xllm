@@ -16,7 +16,7 @@ limitations under the License.
 #pragma once
 
 // VMMTorchAllocator is only available for platforms using PyTorch's
-// CUDACachingAllocator interface (CUDA, ILU, ROCm).
+// CUDACachingAllocator interface (CUDA, ILU, ROCm, MUSA).
 #if defined(USE_CUDA) || defined(USE_ILU)
 #if TORCH_VERSION_MAJOR >= 2 && TORCH_VERSION_MINOR >= 10
 #include <ATen/cuda/MemPool.h>
@@ -304,4 +304,226 @@ class VMMTorchAllocator
 
 }  // namespace xllm
 
-#endif  // USE_CUDA || USE_ILU
+#elif defined(USE_MUSA)
+
+#include <glog/logging.h>
+#include <musa_runtime_api.h>
+#include <torch_musa/csrc/core/MUSACachingAllocator.h>
+#include <torch_musa/csrc/core/MUSAStream.h>
+
+#include <functional>
+#include <string>
+
+#include "core/platform/shared_vmm_allocator.h"
+
+namespace xllm {
+
+// Matches the torch_musa 2.9.1 MUSAAllocator vtable pinned in aot_config.py.
+// Re-pinning to 2.12+ must add getExpandableSegmentSizes and update snapshot
+// and recordHistory. Capture allocation uses raw_alloc and raw_delete.
+// raw_alloc_with_stream is part of the vtable and is not called by capture.
+class VMMTorchAllocator final
+    : public c10::musa::MUSACachingAllocator::MUSAAllocator {
+ public:
+  explicit VMMTorchAllocator(SharedVMMAllocator* vmm_allocator)
+      : vmm_allocator_(vmm_allocator) {}
+
+  ~VMMTorchAllocator() override = default;
+
+  VMMTorchAllocator(const VMMTorchAllocator&) = delete;
+  VMMTorchAllocator& operator=(const VMMTorchAllocator&) = delete;
+
+  void* raw_alloc(size_t nbytes) override {
+    void* ptr = vmm_allocator_->allocate(nbytes);
+    total_allocated_ += nbytes;
+    alloc_count_++;
+    VLOG(10) << "VMMTorchAllocator::raw_alloc(" << nbytes << " bytes) -> "
+             << ptr << ", total_allocated: " << total_allocated_
+             << ", alloc_count: " << alloc_count_
+             << ", current_offset: " << vmm_allocator_->current_offset()
+             << ", high_water_mark: " << vmm_allocator_->high_water_mark();
+    return ptr;
+  }
+
+  void* raw_alloc_with_stream(size_t nbytes, musaStream_t /*stream*/) override {
+    void* ptr = vmm_allocator_->allocate(nbytes);
+    total_allocated_ += nbytes;
+    alloc_count_++;
+    VLOG(10) << "VMMTorchAllocator::raw_alloc_with_stream(" << nbytes
+             << " bytes) -> " << ptr
+             << ", total_allocated: " << total_allocated_
+             << ", alloc_count: " << alloc_count_
+             << ", current_offset: " << vmm_allocator_->current_offset()
+             << ", high_water_mark: " << vmm_allocator_->high_water_mark();
+    return ptr;
+  }
+
+  void raw_delete(void* ptr) override {
+    VLOG(10) << "VMMTorchAllocator::raw_delete(" << ptr << ")";
+    vmm_allocator_->deallocate(ptr);
+  }
+
+  c10::DataPtr allocate(size_t /*n*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::allocate() called unexpectedly!";
+  }
+
+  void copy_data(void* /*dest*/,
+                 const void* /*src*/,
+                 std::size_t /*count*/) const override {
+    LOG(FATAL) << "VMMTorchAllocator::copy_data() called unexpectedly!";
+  }
+
+  void init(int /*device_count*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::init() called unexpectedly!";
+  }
+
+  bool initialized() override {
+    LOG(FATAL) << "VMMTorchAllocator::initialized() called unexpectedly!";
+  }
+
+  std::string name() override { return "VMMTorchAllocator"; }
+
+  c10::CachingDeviceAllocator::DeviceStats getDeviceStats(
+      c10::DeviceIndex /*device*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::getDeviceStats() called unexpectedly!";
+  }
+
+  void resetAccumulatedStats(c10::DeviceIndex /*device*/) override {
+    LOG(FATAL)
+        << "VMMTorchAllocator::resetAccumulatedStats() called unexpectedly!";
+  }
+
+  void resetPeakStats(c10::DeviceIndex /*device*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::resetPeakStats() called unexpectedly!";
+  }
+
+  double getMemoryFraction(c10::DeviceIndex /*device*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::getMemoryFraction() called unexpectedly!";
+  }
+
+  void setMemoryFraction(double /*fraction*/,
+                         c10::DeviceIndex /*device*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::setMemoryFraction() called unexpectedly!";
+  }
+
+  void enable(bool /*value*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::enable() called unexpectedly!";
+  }
+
+  bool isEnabled() const override {
+    LOG(FATAL) << "VMMTorchAllocator::isEnabled() called unexpectedly!";
+  }
+
+  void cacheInfo(c10::DeviceIndex /*device*/, size_t* /*largestBlock*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::cacheInfo() called unexpectedly!";
+  }
+
+  void* getBaseAllocation(void* /*ptr*/, size_t* /*size*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::getBaseAllocation() called unexpectedly!";
+  }
+
+  void recordStream(const c10::DataPtr& /*ptr*/,
+                    c10::musa::MUSAStream /*stream*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::recordStream() called unexpectedly!";
+  }
+
+  c10::musa::MUSACachingAllocator::ShareableHandle shareIpcHandle(
+      void* /*ptr*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::shareIpcHandle() is not supported";
+    return {};
+  }
+
+  std::shared_ptr<void> getIpcDevPtr(std::string /*handle*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::getIpcDevPtr() is not supported";
+    return nullptr;
+  }
+
+  void attachOutOfMemoryObserver(
+      c10::musa::MUSACachingAllocator::OutOfMemoryObserver /*observer*/)
+      override {
+    LOG(FATAL) << "VMMTorchAllocator::attachOutOfMemoryObserver() called "
+                  "unexpectedly!";
+  }
+
+  void attachAllocatorTraceTracker(
+      c10::musa::MUSACachingAllocator::AllocatorTraceTracker /*tracker*/)
+      override {
+    LOG(FATAL) << "VMMTorchAllocator::attachAllocatorTraceTracker() called "
+                  "unexpectedly!";
+  }
+
+  void enablePeerAccess(c10::DeviceIndex /*dev*/,
+                        c10::DeviceIndex /*dev_to_access*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::enablePeerAccess() called unexpectedly!";
+  }
+
+  musaError_t memcpyAsync(void* /*dst*/,
+                          int /*dstDevice*/,
+                          const void* /*src*/,
+                          int /*srcDevice*/,
+                          size_t /*count*/,
+                          musaStream_t /*stream*/,
+                          bool /*p2p_enabled*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::memcpyAsync() called unexpectedly!";
+  }
+
+  c10::musa::MUSACachingAllocator::CheckpointDelta setCheckpointPoolState(
+      c10::DeviceIndex /*device*/,
+      std::shared_ptr<c10::musa::MUSACachingAllocator::AllocatorState> /*pps*/)
+      override {
+    LOG(FATAL)
+        << "VMMTorchAllocator::setCheckpointPoolState() is not supported";
+  }
+
+  void beginAllocateToPool(
+      c10::DeviceIndex /*device*/,
+      c10::MempoolId_t /*mempool_id*/,
+      std::function<bool(musaStream_t)> /*filter*/) override {
+    LOG(FATAL)
+        << "VMMTorchAllocator::beginAllocateToPool() called unexpectedly!";
+  }
+
+  void endAllocateToPool(c10::DeviceIndex /*device*/,
+                         c10::MempoolId_t /*mempool_id*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::endAllocateToPool() called unexpectedly!";
+  }
+
+  void releasePool(c10::DeviceIndex /*device*/,
+                   c10::MempoolId_t /*mempool_id*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::releasePool() called unexpectedly!";
+  }
+
+  std::shared_ptr<c10::musa::MUSACachingAllocator::AllocatorState>
+  getCheckpointState(c10::DeviceIndex /*device*/,
+                     c10::MempoolId_t /*id*/) override {
+    LOG(FATAL)
+        << "VMMTorchAllocator::getCheckpointState() called unexpectedly!";
+  }
+
+  void emptyCache(c10::MempoolId_t /*mempool_id*/ = {0, 0}) override {
+    LOG(FATAL) << "VMMTorchAllocator::emptyCache() called unexpectedly!";
+  }
+
+  c10::musa::MUSACachingAllocator::SnapshotInfo snapshot(
+      c10::MempoolId_t /*mempool_id*/ = {0, 0}) override {
+    LOG(FATAL) << "VMMTorchAllocator::snapshot() called unexpectedly!";
+  }
+
+  void recordHistory(
+      bool /*enabled*/,
+      c10::musa::MUSACachingAllocator::CreateContextFn /*context_recorder*/,
+      size_t /*alloc_trace_max_entries*/,
+      c10::musa::MUSACachingAllocator::RecordContext /*when*/,
+      bool /*clearHistory*/) override {
+    LOG(FATAL) << "VMMTorchAllocator::recordHistory() called unexpectedly!";
+  }
+
+ private:
+  SharedVMMAllocator* vmm_allocator_;
+  size_t total_allocated_ = 0;
+  size_t alloc_count_ = 0;
+};
+
+}  // namespace xllm
+
+#endif  // USE_CUDA || USE_ILU || USE_MUSA
