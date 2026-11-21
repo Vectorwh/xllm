@@ -1383,6 +1383,46 @@ TEST(KVCacheEstimationTest, EstimatesDeepSeekV41Pools) {
   EXPECT_EQ(capacity.n_blocks(), 20);
 }
 
+TEST(KVCacheEstimationTest, DeepSeekV41PdPrefillFairBudgetFitsSameTwoGiBLimit) {
+  // Minimal C1-source fixture, not a copy of the deployed model. Keep the
+  // reported serving limits fixed; only the forwarded DP budget fields vary.
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v41")
+      .n_layers(43)
+      .head_dim(512)
+      .index_head_dim(128)
+      .window_size(128)
+      .compress_ratios(std::vector<int32_t>(/*count=*/43, /*value=*/1))
+      .kv_source_layer_ids({0});
+  KVCacheEstimateOptions options;
+  options.dtype = torch::kBFloat16;
+  options.cache_size_in_bytes = 2LL * 1024 * 1024 * 1024;
+  options.block_size = 128;
+  options.max_seqs_per_batch = 64;
+  options.max_tokens_per_batch = 32768;
+  options.max_tokens_per_chunk_for_prefill = 8192;
+  options.enable_chunked_prefill = true;
+  options.enable_prefix_cache = true;
+  options.enable_disagg_pd = true;
+  options.instance_role = InstanceRole::PREFILL;
+  options.dp_size = 4;
+  options.enable_dp_fair_token_budget = true;
+
+  const KVCacheCapacity capacity =
+      estimate_kv_cache_capacity(model_args, options);
+  // 64 window blocks + 64 per-DP burst blocks + 64 tails + 2 guards.
+  EXPECT_EQ(capacity.swa_count(), 194);
+  EXPECT_GT(capacity.n_blocks(), 0);
+
+  auto missing_dp_fields = options;
+  missing_dp_fields.dp_size = 1;
+  missing_dp_fields.enable_dp_fair_token_budget = false;
+  // The same inputs without the DP fields reserve 386 SWA blocks. This
+  // fixture needs 2,175,533,056 bytes, exceeding the unchanged 2 GiB limit.
+  EXPECT_DEATH(estimate_kv_cache_capacity(model_args, missing_dp_fields),
+               "minimum DSV4 SWA cache");
+}
+
 TEST(KVCacheEstimationTest, DeepSeekV41CountsOnlyKvSourceLayersForTokenGroups) {
   ModelArgs model_args;
   model_args.model_type("deepseek_v41")

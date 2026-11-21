@@ -15,13 +15,21 @@ limitations under the License.
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "framework/block/block_manager_pool.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
+#include "framework/kv_cache/kv_cache_utils.h"
+#include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/model_args.h"
 
 namespace xllm {
+
+class Engine;
+class WorkerClient;
 
 namespace runtime {
 struct Options;
@@ -57,5 +65,46 @@ void configure_dsv4_block_manager_options(const ModelArgs& args,
                                           const KVCacheCapacity& kv_cache_cap,
                                           int32_t block_size,
                                           int32_t max_tokens_per_batch);
+
+// Full DP-local worker group, checked against the actual client count.
+std::vector<uint32_t> dp_group_worker_indices(uint32_t dp_rank,
+                                              uint32_t dp_size,
+                                              uint32_t local_worker_count,
+                                              size_t worker_count);
+
+// Shares request validation, timeout (0 means no deadline), result aggregation,
+// and local worker ordinals between text and multimodal engines.
+void dispatch_storage_prefetch(
+    const std::vector<std::shared_ptr<WorkerClient>>& worker_clients,
+    const std::vector<uint32_t>& worker_indices,
+    std::shared_ptr<const StoragePrefetchRequest> request,
+    uint32_t batch_size,
+    uint32_t configured_timeout_ms,
+    PrefetchResult::StopPredicate stop_requested,
+    PrefetchResult::DoneCallback done);
+
+// Logical block-manager width for kv-split caches; tensor allocation keeps
+// its physical width. Shared by text and multimodal engine setup.
+int32_t fold_kv_cache_block_size(int32_t block_size, int32_t kv_split_size);
+
+HostCacheValidationOptions build_host_cache_validation_options(
+    const runtime::Options& options,
+    const ModelArgs& args,
+    const KVCacheShape& kv_cache_shape,
+    const KVCacheCapacity& kv_cache_cap,
+    int32_t kv_split_size_eff);
+
+// Keeps caller-prepared flat capacities and the LLM MTP-draft policy.
+// grouped_block_size is the physical worker tensor width for both engines.
+// It must not use block_options.block_size(), which can be kv-split folded.
+std::unique_ptr<KVCacheManager> create_kv_cache_manager(
+    BlockManagerPool::Options& block_options,
+    const ModelArgs& args,
+    const runtime::Options& runtime_options,
+    const KVCacheCapacity& kv_cache_cap,
+    bool has_gdn_state,
+    Engine* engine,
+    uint32_t dp_size,
+    int32_t grouped_block_size);
 
 }  // namespace xllm

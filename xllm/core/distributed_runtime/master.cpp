@@ -78,7 +78,10 @@ namespace {
 
 void apply_runtime_kv_cache_options(const Options& source,
                                     runtime::Options& destination) {
+  CHECK(!source.enable_kvcache_store() || source.host_blocks_factor() > 1.0)
+      << "KV cache Store requires Host cache blocks (host_blocks_factor > 1).";
   destination.host_blocks_factor(source.host_blocks_factor())
+      .enable_pd_ooc(source.enable_pd_ooc())
       .enable_kvcache_store(source.enable_kvcache_store())
       .store_protocol(source.store_protocol())
       .store_rdma_devices(source.store_rdma_devices())
@@ -565,11 +568,12 @@ Master::Master(const Options& options, EngineType type)
       std::filesystem::path(options_.model_path()).lexically_normal();
   if (options_.host_blocks_factor() > 1.0) {
     const bool supports_host_offload =
-        type == EngineType::LLM ||
-        (type == EngineType::SSM && SpeculativeConfig::supports_host_kv_cache(
-                                        options_.speculative_algorithm()));
+        type == EngineType::LLM || type == EngineType::VLM ||
+        ((type == EngineType::SSM || type == EngineType::VLMSSM) &&
+         SpeculativeConfig::supports_host_kv_cache(
+             options_.speculative_algorithm()));
     CHECK(supports_host_offload)
-        << "Basic host KV cache offload supports the LLM engine and "
+        << "Basic host KV cache offload supports LLM/VLM engines and "
            "model-based speculative engines only.";
   }
   const auto visible_devices = DeviceNameUtils::parse_devices("auto");
@@ -757,6 +761,7 @@ Master::Master(const Options& options, EngineType type)
   if (type == EngineType::VLM) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
+        .model_id(options_.model_id())
         .devices(devices)
         .backend(options.backend())
         .block_size(options.block_size())
@@ -803,6 +808,8 @@ Master::Master(const Options& options, EngineType type)
         .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode())
         .max_tokens_per_chunk_for_prefill(
             options_.max_tokens_per_chunk_for_prefill());
+
+    apply_runtime_kv_cache_options(options_, eng_options);
 
     auto engine = std::make_unique<VLMEngine>(eng_options);
     engine_ = std::move(engine);

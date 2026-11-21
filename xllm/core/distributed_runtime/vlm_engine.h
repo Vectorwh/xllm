@@ -65,6 +65,10 @@ class VLMEngine : public Engine {
                       const int32_t dst_dp_rank,
                       const std::vector<KVTransferMapping>& mappings) override;
 
+  uint32_t host_transfer_worker_count() const override {
+    return dp_local_size_;
+  }
+
   std::vector<folly::SemiFuture<uint32_t>> transfer_kv_blocks(
       const uint32_t dp_rank,
       const std::vector<BlockTransferInfo>& block_transfer_info) override;
@@ -73,6 +77,12 @@ class VLMEngine : public Engine {
       const uint32_t dp_rank,
       const uint64_t batch_id,
       const std::vector<BlockTransferInfo>& block_transfer_info) override;
+
+  void prefetch_from_storage(
+      const uint32_t dp_rank,
+      std::shared_ptr<const StoragePrefetchRequest> request,
+      PrefetchResult::StopPredicate stop_requested,
+      PrefetchResult::DoneCallback done) override;
 
   void get_cache_info(std::vector<uint64_t>& cluster_ids,
                       std::vector<std::string>& addrs,
@@ -96,6 +106,18 @@ class VLMEngine : public Engine {
   bool unlink_p2p(const std::vector<std::string>& remote_addrs) override;
 
  private:
+  friend class VLMEngineCacheTestPeer;
+
+  // VLM physical-layout guard before common cache-pool setup.
+  static std::unique_ptr<KVCacheManager> make_kv_cache_manager(
+      BlockManagerPool::Options& block_options,
+      const ModelArgs& args,
+      const runtime::Options& runtime_options,
+      const KVCacheCapacity& kv_cache_cap,
+      bool has_gdn_state,
+      Engine* engine,
+      uint32_t dp_size);
+
   template <typename TargetEngine>
   friend class SpeculativeEngineBase;
   bool init_model(MasterStatus master_status);
@@ -130,6 +152,7 @@ class VLMEngine : public Engine {
   uint32_t dp_size_;
   uint32_t cp_size_;
   uint32_t worker_clients_num_;
+  // Full DP-local worker width includes CP; dp_local_tp_size_ is TP-only.
   uint32_t dp_local_size_;
   uint32_t dp_local_tp_size_;
 

@@ -58,7 +58,27 @@ limitations under the License.
 #include "util/pretty_print.h"
 #include "util/tensor_helper.h"
 #include "util/utils.h"
+
 namespace xllm {
+
+std::unique_ptr<KVCacheManager> VLMEngine::make_kv_cache_manager(
+    BlockManagerPool::Options& block_options,
+    const ModelArgs& args,
+    const runtime::Options& runtime_options,
+    const KVCacheCapacity& kv_cache_cap,
+    bool has_gdn_state,
+    Engine* engine,
+    uint32_t dp_size) {
+  return create_kv_cache_manager(
+      block_options,
+      args,
+      runtime_options,
+      kv_cache_cap,
+      has_gdn_state,
+      engine,
+      dp_size,
+      static_cast<int32_t>(kv_cache_cap.block_size()));
+}
 
 VLMEngine::VLMEngine(const runtime::Options& options,
                      std::shared_ptr<DistManager> dist_manager)
@@ -314,6 +334,9 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
   estimate_options.enable_prefix_cache = options_.enable_prefix_cache();
   estimate_options.enable_disagg_pd = options_.enable_disagg_pd();
   estimate_options.instance_role = options_.instance_role();
+  estimate_options.dp_size = options_.dp_size();
+  estimate_options.enable_dp_fair_token_budget =
+      ::xllm::SchedulerConfig::get_instance().enable_dp_fair_token_budget();
 
   KVCacheCapacity kv_cache_cap =
       ::xllm::estimate_kv_cache_capacity(args_, estimate_options);
@@ -376,17 +399,38 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   }
 
   const KVCacheShape kv_cache_shape(kv_cache_cap, args_, dp_local_tp_size_);
+  const int32_t kv_split_size_eff =
+      ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+  const std::optional<std::string> host_cache_error =
+      validate_host_cache_options(build_host_cache_validation_options(
+          options_, args_, kv_cache_shape, kv_cache_cap, kv_split_size_eff));
+  if (host_cache_error.has_value()) {
+    LOG(FATAL) << *host_cache_error;
+  }
 
+  if (has_gdn_state && options_.host_blocks_factor() > 1.0) {
+    CHECK(kv_cache_shape.has_key_cache_shape());
+    CHECK(kv_cache_shape.has_conv_cache_shape());
+    CHECK(kv_cache_shape.has_ssm_cache_shape());
+    CHECK_EQ(kv_cache_shape.key_cache_shape()[0], kv_cache_cap.n_blocks())
+        << "VLM Host LINEAR source block count must match worker shape";
+    CHECK_EQ(kv_cache_shape.conv_cache_shape()[0],
+             kv_cache_cap.num_linear_state_blocks())
+        << "VLM Host LINEAR state slots must match worker shape";
+  }
   kv_cache_shape.print_shapes();
 
   // initialize block manager
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
-      .host_num_blocks(0)  // no host cache for vlm engine currently.
-      .block_size(block_size)
+      .block_size(fold_kv_cache_block_size(block_size, kv_split_size_eff))
       .enable_linear_state(enable_state_cache)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
+      .enable_kvcache_store(options_.enable_kvcache_store())
+      .prefetch_batch_size(options_.prefetch_batch_size())
+      .prefetch_valid_blocks_per_batch(
+          options_.prefetch_valid_blocks_per_batch())
       .hasher_type(mtp_hasher_type(BlockHasherType::MM,
                                    options_.num_speculative_tokens(),
                                    options_.speculative_algorithm()))
@@ -410,7 +454,8 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     options.linear_state_num_slots(
         static_cast<int32_t>(kv_cache_cap.num_linear_state_blocks()));
   }
-  kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
+  kv_cache_manager_ = make_kv_cache_manager(
+      options, args_, options_, kv_cache_cap, has_gdn_state, this, dp_size_);
 
   // A role flag without a PD deployment still runs ordinary local batches.
   // Pass the complete modern shape unchanged to either allocation path.
@@ -834,19 +879,30 @@ bool VLMEngine::pull_kv_blocks(const int32_t src_dp_size,
       dst_dp_rank < 0 || static_cast<uint32_t>(dst_dp_rank) >= dp_size_ ||
       src_cluster_ids.empty() || src_addrs.size() != src_cluster_ids.size() ||
       src_cluster_ids.size() % static_cast<size_t>(src_dp_size) != 0 ||
-      dp_local_tp_size_ == 0) {
+      dp_local_size_ == 0) {
     LOG(ERROR) << "Invalid VLM topology for KV pull";
     return false;
   }
+  // src_cluster_ids includes CP, so src_tp_size is the full DP-local width.
   const size_t src_tp_size =
       src_cluster_ids.size() / static_cast<size_t>(src_dp_size);
+  if (cp_size_ > 1 && src_tp_size != dp_local_size_) {
+    LOG(ERROR) << "VLM CP KV pull requires matching P/D DP-local worker widths";
+    return false;
+  }
+  const auto dst_workers =
+      dp_group_worker_indices(static_cast<uint32_t>(dst_dp_rank),
+                              dp_size_,
+                              dp_local_size_,
+                              worker_clients_.size());
   std::vector<bool> results;
-  results.reserve(dp_local_tp_size_);
-  // nnodes counts hosts, not workers. Dispatch every TP worker in the selected
-  // local DP group, including single-host multi-device deployments.
-  for (uint32_t tp_rank = 0; tp_rank < dp_local_tp_size_; ++tp_rank) {
-    const uint32_t dst_worker_rank =
-        static_cast<uint32_t>(dst_dp_rank) * dp_local_tp_size_ + tp_rank;
+  results.reserve(dst_workers.size());
+  // CP workers also own a shard of the cache and must participate in P/D
+  // transfer. Use the complete DP group stride, not the TP-only subrange.
+  for (const uint32_t dst_worker_rank : dst_workers) {
+    // get_cache_info emits cluster IDs and addresses in worker-rank order;
+    // the PD request preserves that paired order. Do not sort opaque IDs.
+    // Preserve existing LLM/VLM global-rank routing when TP widths differ.
     const size_t src_worker_rank =
         static_cast<size_t>(src_dp_rank) * src_tp_size +
         dst_worker_rank % src_tp_size;
@@ -867,15 +923,13 @@ bool VLMEngine::pull_kv_blocks(const int32_t src_dp_size,
 std::vector<folly::SemiFuture<uint32_t>> VLMEngine::transfer_kv_blocks(
     const uint32_t dp_rank,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  CHECK_LT(dp_rank, dp_size_);
-  CHECK_GT(dp_local_tp_size_, 0U);
+  const auto worker_indices = dp_group_worker_indices(
+      dp_rank, dp_size_, dp_local_size_, worker_clients_.size());
   std::vector<folly::SemiFuture<uint32_t>> futures;
-  futures.reserve(dp_local_tp_size_);
-
-  for (uint32_t local_rank = 0; local_rank < dp_local_tp_size_; ++local_rank) {
+  futures.reserve(worker_indices.size());
+  for (const uint32_t worker_rank : worker_indices) {
     futures.emplace_back(
-        worker_clients_[local_rank + dp_local_tp_size_ * dp_rank]
-            ->transfer_kv_blocks(block_transfer_info));
+        worker_clients_[worker_rank]->transfer_kv_blocks(block_transfer_info));
   }
 
   return futures;
@@ -885,12 +939,28 @@ void VLMEngine::transfer_kv_blocks(
     const uint32_t dp_rank,
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  CHECK_LT(dp_rank, dp_size_);
-  CHECK_GT(dp_local_tp_size_, 0U);
-  for (uint32_t local_rank = 0; local_rank < dp_local_tp_size_; ++local_rank) {
-    worker_clients_[local_rank + dp_local_tp_size_ * dp_rank]
-        ->transfer_kv_blocks(batch_id, block_transfer_info);
+  const auto worker_indices = dp_group_worker_indices(
+      dp_rank, dp_size_, dp_local_size_, worker_clients_.size());
+  for (const uint32_t worker_rank : worker_indices) {
+    worker_clients_[worker_rank]->transfer_kv_blocks(batch_id,
+                                                     block_transfer_info);
   }
+}
+
+void VLMEngine::prefetch_from_storage(
+    const uint32_t dp_rank,
+    std::shared_ptr<const StoragePrefetchRequest> request,
+    PrefetchResult::StopPredicate stop_requested,
+    PrefetchResult::DoneCallback done) {
+  const auto worker_indices = dp_group_worker_indices(
+      dp_rank, dp_size_, dp_local_size_, worker_clients_.size());
+  dispatch_storage_prefetch(worker_clients_,
+                            worker_indices,
+                            std::move(request),
+                            options_.prefetch_batch_size(),
+                            options_.prefetch_timeout(),
+                            std::move(stop_requested),
+                            std::move(done));
 }
 
 void VLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,

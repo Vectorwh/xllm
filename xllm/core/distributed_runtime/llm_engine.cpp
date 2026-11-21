@@ -26,7 +26,6 @@ limitations under the License.
 #include <chrono>
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <memory>
 #include <optional>
 
@@ -49,7 +48,6 @@ limitations under the License.
 #include "core/framework/prefix_cache/block_hasher.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
-#include "framework/block/hierarchy_block_manager_pool.h"
 #include "framework/kv_cache/kv_cache_estimation.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -671,37 +669,9 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
           linear_attention_policy_, dp_local_tp_size_, options_.cp_size()));
   const int32_t kv_split_size_eff =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
-  // Any registered role would fold more than one physical row per logical
-  // block for host transfer: the NPU indexer replicates every kv split page,
-  // and a standalone drafter (DFlash family) replicates the whole pool.
-  const bool needs_transfer_folding =
-      (Platform::requires_dsa_indexer_cache_replication() &&
-       kv_split_size_eff > 1) ||
-      (SpeculativeConfig::draft_replicated_block_pages(
-           options_.speculative_algorithm(), kv_split_size_eff) > 1);
-  HostCacheValidationOptions host_cache_validation_options{
-      .host_blocks_factor = options_.host_blocks_factor(),
-      .device_block_count = kv_cache_cap.n_blocks(),
-      .supports_host_kv_offload = Platform::supports_host_kv_offload(),
-      .enable_prefix_cache = options_.enable_prefix_cache(),
-      .enable_disagg_pd = options_.enable_disagg_pd(),
-      .enable_pd_ooc = options_.enable_pd_ooc(),
-      .enable_kvcache_store = options_.enable_kvcache_store(),
-      .instance_role = options_.instance_role(),
-      .has_key_cache_shape = kv_cache_shape.has_key_cache_shape(),
-      .has_grouped_cache_layout = kv_cache_shape.has_grouped_cache_layout(),
-      .supports_grouped_cache_offload =
-          util::is_deepseek_v4_model_type(args_.model_type()),
-      .has_conv_cache_shape = kv_cache_shape.has_conv_cache_shape(),
-      .has_ssm_cache_shape = kv_cache_shape.has_ssm_cache_shape(),
-      .kv_cache_dtype = options_.kv_cache_dtype(),
-      .indexer_cache_dtype = kv_cache_config.indexer_cache_dtype(),
-      .model_type = args_.model_type(),
-      .is_npu_platform = Platform::is_npu(),
-      .needs_transfer_folding = needs_transfer_folding,
-  };
   const std::optional<std::string> host_cache_error =
-      validate_host_cache_options(host_cache_validation_options);
+      validate_host_cache_options(build_host_cache_validation_options(
+          options_, args_, kv_cache_shape, kv_cache_cap, kv_split_size_eff));
   if (host_cache_error.has_value()) {
     LOG(FATAL) << *host_cache_error;
   }
@@ -715,8 +685,7 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .hasher_type(mtp_hasher_type(BlockHasherType::TEXT,
                                    options_.num_speculative_tokens(),
                                    options_.speculative_algorithm()))
-      .block_size(kv_split_size_eff > 1 ? block_size * kv_split_size_eff
-                                        : block_size)
+      .block_size(fold_kv_cache_block_size(block_size, kv_split_size_eff))
       .host_num_blocks(kv_cache_cap.n_blocks() * options_.host_blocks_factor())
       .enable_linear_state(enable_state_cache)
       .enable_prefix_cache(options_.enable_prefix_cache())
@@ -750,97 +719,14 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
                                        block_size,
                                        options_.max_tokens_per_batch());
 
-  if (options_.enable_kvcache_store()) {
-    CHECK_GT(options_.host_blocks_factor(), 1.0)
-        << "KV cache Store requires Host cache blocks.";
-  }
-
-  const bool is_mtp_draft_engine =
-      options_.is_draft_engine() &&
-      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
-  if (is_mtp_draft_engine) {
-    options.enable_prefix_cache(false);
-  }
-
-  if (options_.host_blocks_factor() > 1.0 && !is_mtp_draft_engine) {
-    // Translate a composite cache capacity into typed Host pools. The
-    // hierarchy layer consumes only this BlockType map and does not need to
-    // identify the model that produced the layout.
-    if (!options.manager_types().empty() || has_gdn_state) {
-      std::map<BlockType, uint32_t> host_capacities;
-      const int64_t host_kv_block_count = scale_host_block_count(
-          kv_cache_cap.n_blocks(), options_.host_blocks_factor());
-      // Hybrid linear-attention models use a flat KV pool plus a separate
-      // recurrent-state slot pool.
-      if (options.manager_types().empty()) {
-        host_capacities.emplace(BlockType::KV,
-                                static_cast<uint32_t>(host_kv_block_count));
-      }
-      if (has_gdn_state) {
-        int64_t host_linear_blocks = 0;
-        if (options_.instance_role() == InstanceRole::DECODE) {
-          host_linear_blocks = kv_cache_cap.num_linear_state_blocks() * 2;
-        } else {
-          // One Host linear checkpoint per prefill chunk that fits in the
-          // Host KV token capacity.
-          const int64_t chunk_size =
-              static_cast<int64_t>(SchedulerConfig::get_instance()
-                                       .max_tokens_per_chunk_for_prefill());
-          host_linear_blocks = prefill_host_linear_block_count(
-              host_kv_block_count, kv_cache_cap.block_size(), chunk_size);
-        }
-        CHECK_LE(host_linear_blocks,
-                 static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-            << "prefill Host linear block count exceeds uint32_t range: "
-            << host_linear_blocks;
-        host_capacities.emplace(BlockType::LINEAR,
-                                static_cast<uint32_t>(host_linear_blocks));
-      }
-      const bool is_v41 = util::is_deepseek_v41_model_type(args_.model_type());
-      // Keep concrete BlockTypes distinct while sharing Host pool sizing.
-      const int64_t indexed_group_count =
-          is_v41 ? kv_cache_cap.c2_count() : kv_cache_cap.c4_count();
-      const int64_t history_group_count =
-          is_v41 ? kv_cache_cap.c1_count() : kv_cache_cap.c128_count();
-      if (history_group_count > 0) {
-        host_capacities.emplace(
-            is_v41 ? BlockType::C1 : BlockType::C128,
-            static_cast<uint32_t>(scale_host_block_count(
-                history_group_count, options_.host_blocks_factor())));
-      }
-      if (kv_cache_cap.swa_count() > 0) {
-        // V4.1 uses C2 as the largest checkpoint, or C1 if C2 is absent.
-        const int64_t swa_source_count = is_v41 && indexed_group_count > 0
-                                             ? indexed_group_count
-                                             : history_group_count;
-        CHECK_GT(swa_source_count, 0)
-            << "DSV4 Host SWA capacity requires a positive history capacity.";
-        const int64_t host_swa_blocks = dsv4_host_swa_block_count(
-            swa_source_count,
-            options_.host_blocks_factor(),
-            options.sliding_window_size(),
-            block_size,
-            dsv41_cache_unit_tokens(
-                is_v41, block_size, options.compress_ratios()));
-        CHECK_LE(host_swa_blocks,
-                 static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
-        host_capacities.emplace(BlockType::SWA,
-                                static_cast<uint32_t>(host_swa_blocks));
-      }
-      if (indexed_group_count > 0) {
-        host_capacities.emplace(
-            is_v41 ? BlockType::C2 : BlockType::C4,
-            static_cast<uint32_t>(scale_host_block_count(
-                indexed_group_count, options_.host_blocks_factor())));
-      }
-      options.host_num_blocks_by_type(std::move(host_capacities));
-    }
-    options.enable_host_offload(true);
-    kv_cache_manager_ =
-        std::make_unique<HierarchyBlockManagerPool>(options, this, dp_size_);
-  } else {
-    kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
-  }
+  kv_cache_manager_ = create_kv_cache_manager(options,
+                                              args_,
+                                              options_,
+                                              kv_cache_cap,
+                                              has_gdn_state,
+                                              this,
+                                              dp_size_,
+                                              block_size);
 
   // init kv cache for each worker in parallel
   std::vector<folly::SemiFuture<bool>> futures;
@@ -942,16 +828,14 @@ bool LLMEngine::pull_kv_blocks(const int32_t src_dp_size,
 std::vector<folly::SemiFuture<uint32_t>> LLMEngine::transfer_kv_blocks(
     const uint32_t dp_rank,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  CHECK_LT(dp_rank, dp_size_);
-  CHECK_GT(dp_local_size_, 0U);
+  const auto worker_indices = dp_group_worker_indices(
+      dp_rank, dp_size_, dp_local_size_, worker_clients_.size());
   std::vector<folly::SemiFuture<uint32_t>> futures;
-  futures.reserve(dp_local_size_);
-
-  for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
-    futures.emplace_back(worker_clients_[local_rank + dp_local_size_ * dp_rank]
-                             ->transfer_kv_blocks(block_transfer_info));
+  futures.reserve(worker_indices.size());
+  for (const uint32_t worker_rank : worker_indices) {
+    futures.emplace_back(
+        worker_clients_[worker_rank]->transfer_kv_blocks(block_transfer_info));
   }
-
   return futures;
 }
 
@@ -959,11 +843,11 @@ void LLMEngine::transfer_kv_blocks(
     const uint32_t dp_rank,
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  CHECK_LT(dp_rank, dp_size_);
-  CHECK_GT(dp_local_size_, 0U);
-  for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
-    worker_clients_[local_rank + dp_local_size_ * dp_rank]->transfer_kv_blocks(
-        batch_id, block_transfer_info);
+  const auto worker_indices = dp_group_worker_indices(
+      dp_rank, dp_size_, dp_local_size_, worker_clients_.size());
+  for (const uint32_t worker_rank : worker_indices) {
+    worker_clients_[worker_rank]->transfer_kv_blocks(batch_id,
+                                                     block_transfer_info);
   }
 }
 
@@ -972,24 +856,15 @@ void LLMEngine::prefetch_from_storage(
     std::shared_ptr<const StoragePrefetchRequest> request,
     PrefetchResult::StopPredicate stop_requested,
     PrefetchResult::DoneCallback done) {
-  CHECK_LT(dp_rank, dp_size_);
-  CHECK_GT(dp_local_size_, 0U);
-  CHECK(request != nullptr);
-  CHECK(request->valid());
-  const uint32_t configured_timeout_ms = options_.prefetch_timeout();
-  const int64_t timeout_ms = configured_timeout_ms == 0
-                                 ? -1
-                                 : static_cast<int64_t>(configured_timeout_ms);
-  auto result = std::make_shared<PrefetchResult>(dp_local_size_,
-                                                 *request,
-                                                 options_.prefetch_batch_size(),
-                                                 timeout_ms,
-                                                 std::move(stop_requested),
-                                                 std::move(done));
-  for (uint32_t local_rank = 0; local_rank < dp_local_size_; ++local_rank) {
-    worker_clients_[local_rank + dp_local_size_ * dp_rank]
-        ->prefetch_from_storage(request, result, local_rank);
-  }
+  const auto worker_indices = dp_group_worker_indices(
+      dp_rank, dp_size_, dp_local_size_, worker_clients_.size());
+  dispatch_storage_prefetch(worker_clients_,
+                            worker_indices,
+                            std::move(request),
+                            options_.prefetch_batch_size(),
+                            options_.prefetch_timeout(),
+                            std::move(stop_requested),
+                            std::move(done));
 }
 
 void LLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,

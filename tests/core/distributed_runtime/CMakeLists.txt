@@ -67,3 +67,11 @@ cc_test(
        etcd_registry_fixture GTest::gtest_main
 )
 target_link_libraries(disagg_pd_service_impl_test PRIVATE Python::Python)
+
+cc_test(
+  NAME vlm_engine_test
+  CPU_ONLY
+  SRCS vlm_engine_test.cpp
+  DEPS :distributed_runtime :block :kv_cache :kv_cache_estimation :config
+       GTest::gtest_main
+)

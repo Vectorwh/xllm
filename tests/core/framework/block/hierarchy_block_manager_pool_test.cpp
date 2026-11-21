@@ -24,6 +24,7 @@ limitations under the License.
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -36,7 +37,9 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/framework/multimodal/mm_data.h"
 #include "core/util/env_var.h"
+#include "core/util/hash_util.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/linear_state_block_manager.h"
@@ -46,6 +49,7 @@ limitations under the License.
 #include "framework/request/sequence.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/sampling/sampling_params.h"
+#include "tests/core/framework/block/mm_test_utils.h"
 
 namespace xllm {
 namespace {
@@ -316,7 +320,8 @@ BlockManagerPool::Options make_typed_cache_options() {
 
 Sequence make_test_sequence(size_t index,
                             const std::vector<int32_t>& prompt_token_ids,
-                            bool enable_schedule_overlap = false) {
+                            bool enable_schedule_overlap = false,
+                            const MMData& mm_data = MMData()) {
   // Sequence borrows these defaults for its entire lifetime.
   static RequestSamplingParam sampling_param;
   static StoppingChecker stopping_checker(/*max_generated_tokens=*/16,
@@ -336,7 +341,6 @@ Sequence make_test_sequence(size_t index,
   seq_params.enable_schedule_overlap = enable_schedule_overlap;
 
   torch::Tensor input_embedding;
-  MMData mm_data;
   IncrementalDecoder decoder("", 1, false, false);
   return Sequence(index,
                   prompt_token_ids,
@@ -349,7 +353,8 @@ Sequence make_test_sequence(size_t index,
 std::shared_ptr<Request> make_test_request(
     const std::vector<int32_t>& prompt_token_ids,
     size_t best_of = 1,
-    size_t generation_budget = 16) {
+    size_t generation_budget = 16,
+    MMData mm_data = MMData()) {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
   StoppingChecker stopping_checker;
@@ -373,6 +378,7 @@ std::shared_ptr<Request> make_test_request(
                              /*enable_schedule_overlap=*/false,
                              /*output_func=*/nullptr,
                              /*outputs_func=*/nullptr);
+  request_state.mm_data = std::move(mm_data);
   return std::make_shared<Request>("request",
                                    "x-request",
                                    "time",
@@ -426,6 +432,22 @@ void dispatch_loads(HierarchyBlockManagerPool& pool,
   std::vector<Batch> batches(dp_size);
   batches.at(static_cast<size_t>(sequence.dp_rank())).add(&sequence);
   pool.transfer_blocks(batches);
+}
+
+using tests::make_image_mm_data;
+
+BlockManagerPool::Options make_v4_options() {
+  auto options = make_typed_cache_options();
+  options.model_type("deepseek_v4")
+      .num_blocks(64)
+      .enable_kvcache_store(true)
+      .sliding_window_size(512)
+      .swa_blocks_per_seq(4)
+      .compress_ratios({0, 4, 128})
+      .manager_types({1, 0, 0})
+      .host_num_blocks_by_type(
+          {{BlockType::SWA, 128}, {BlockType::C4, 64}, {BlockType::C128, 128}});
+  return options;
 }
 
 BlockManagerPool::Options make_v41_options(uint32_t ratio = 0) {
@@ -496,6 +518,59 @@ TEST(HierarchyBlockManagerPoolTest, V41TokenGroupsOffloadAndRestoreCommonUnit) {
     const auto point = pool.select_host_cache_restore(&sequence, 1);
     EXPECT_EQ(point.restore_target_tokens, unit);
     EXPECT_EQ(point.copy_units, 1u);
+  }
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     DeepSeekV4HostPrefixCacheUsesImageIdentity) {
+  for (const bool is_v41 : {false, true}) {
+    SCOPED_TRACE(is_v41 ? "deepseek_v41" : "deepseek_v4");
+    auto options = is_v41 ? make_v41_options() : make_v4_options();
+    options.hasher_type(BlockHasherType::MM);
+    ASSERT_FALSE(options.manager_types().empty());
+    const auto host_capacities = options.host_num_blocks_by_type();
+    ASSERT_EQ(host_capacities.size(), 3u);
+    if (is_v41) {
+      EXPECT_GT(host_capacities.at(BlockType::C1), 0u);
+      EXPECT_GT(host_capacities.at(BlockType::C2), 0u);
+    } else {
+      EXPECT_GT(host_capacities.at(BlockType::C128), 0u);
+      EXPECT_GT(host_capacities.at(BlockType::C4), 0u);
+    }
+    FakePrefetchEngine engine(2);
+    HierarchyBlockManagerPool pool(options, &engine, 1);
+    auto shutdown =
+        folly::makeGuard([&pool, &engine]() { shutdown_pool(pool, engine); });
+
+    const std::vector<int32_t> tokens(kUnitTokens + 1, 83);
+    const MMData image = make_image_mm_data(
+        /*offset=*/0,
+        /*length=*/static_cast<int32_t>(kUnitTokens),
+        /*key_byte=*/3);
+    Sequence source = make_test_sequence(0, tokens, false, image);
+    ASSERT_TRUE(pool.allocate(&source, kUnitTokens));
+    source.kv_state().set_kv_cache_tokens_num(kUnitTokens);
+    pool.deallocate(&source);
+    pool.transfer_blocks();
+    ASSERT_FALSE(engine.offloads_.empty());
+
+    // Force the following probes through Host rather than the still-warm HBM
+    // prefix cache, as happens after the device copy is reclaimed.
+    pool.BlockManagerPool::reset_prefix_cache();
+    Sequence same_image = make_test_sequence(1, tokens, false, image);
+    pool.allocate_shared(&same_image);
+    EXPECT_EQ(same_image.host_kv_state().kv_cache_tokens_num(), kUnitTokens);
+    pool.deallocate(&same_image);
+
+    const MMData different_image = make_image_mm_data(
+        /*offset=*/0,
+        /*length=*/static_cast<int32_t>(kUnitTokens),
+        /*key_byte=*/4);
+    Sequence changed_image =
+        make_test_sequence(2, tokens, false, different_image);
+    pool.allocate_shared(&changed_image);
+    EXPECT_EQ(changed_image.host_kv_state().kv_cache_tokens_num(), 0u);
+    pool.deallocate(&changed_image);
   }
 }
 
@@ -2534,6 +2609,58 @@ TEST(HierarchyBlockManagerPoolTest, V41DecodeOffloadsCommittedTokenUnit) {
   EXPECT_EQ(source.host_kv_state().kv_cache_tokens_num(), 2 * kUnit);
   pool.deallocate(&source);
   pool.transfer_blocks();
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     V41MultimodalDecodeOffloadsCommittedTokenUnit) {
+  constexpr size_t kUnit = 256;
+  for (const bool enable_disagg_pd : {false, true}) {
+    SCOPED_TRACE(enable_disagg_pd ? "PD Decode" : "standalone decode");
+    auto options = make_v41_options();
+    options.hasher_type(BlockHasherType::MM)
+        .instance_is_decode(enable_disagg_pd)
+        .enable_disagg_pd(enable_disagg_pd)
+        .swa_blocks_per_seq(5);
+    FakePrefetchEngine engine(2);
+    HierarchyBlockManagerPool pool(options, &engine, 1);
+    auto shutdown =
+        folly::makeGuard([&pool, &engine]() { shutdown_pool(pool, engine); });
+    auto request = make_test_request(
+        std::vector<int32_t>(kUnit, 83),
+        /*best_of=*/1,
+        /*generation_budget=*/kUnit + 2,
+        make_image_mm_data(/*offset=*/0,
+                           /*length=*/static_cast<int32_t>(kUnit),
+                           /*key_byte=*/3));
+    Sequence& source = *request->sequences().front();
+    if (enable_disagg_pd) {
+      ASSERT_TRUE(pool.try_allocate(&source));
+    } else {
+      ASSERT_TRUE(pool.allocate(&source, source.num_tokens()));
+      source.kv_state().set_kv_cache_tokens_num(kUnit);
+      ASSERT_TRUE(pool.allocate(&source, source.num_tokens()));
+    }
+    pool.transfer_blocks();
+    ASSERT_EQ(source.stage(), SequenceStage::DECODE);
+    ASSERT_EQ(source.host_kv_state().kv_cache_tokens_num(), kUnit);
+    if (enable_disagg_pd) {
+      EXPECT_TRUE(engine.offloads_.empty());
+    }
+    const size_t c2_before = transfer_count(engine, BlockType::C2);
+    const size_t c1_before = transfer_count(engine, BlockType::C1);
+    const size_t swa_before = transfer_count(engine, BlockType::SWA);
+    for (size_t token = 0; token <= kUnit; ++token) {
+      source.append_token(83);
+      ASSERT_TRUE(pool.allocate(&source, source.num_tokens()));
+      pool.transfer_blocks();
+    }
+    EXPECT_EQ(transfer_count(engine, BlockType::C2) - c2_before, 1u);
+    EXPECT_EQ(transfer_count(engine, BlockType::C1) - c1_before, 2u);
+    EXPECT_GT(transfer_count(engine, BlockType::SWA), swa_before);
+    EXPECT_EQ(source.host_kv_state().kv_cache_tokens_num(), 2 * kUnit);
+    pool.deallocate(&source);
+    pool.transfer_blocks();
+  }
 }
 
 TEST(HierarchyBlockManagerPoolTest, EmptyHostConfigurationRejectsAllocation) {

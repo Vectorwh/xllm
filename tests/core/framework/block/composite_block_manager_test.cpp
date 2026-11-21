@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
-#include <cstring>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -42,6 +41,7 @@ limitations under the License.
 #include "framework/sampling/sampling_params.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "tests/core/framework/block/mm_test_utils.h"
 
 namespace xllm {
 
@@ -2688,15 +2688,7 @@ BlockManager::Options make_v41_prefix_options(uint32_t window_size = 128) {
   return options;
 }
 
-MMData make_image_mm_data(int32_t offset, int32_t length, uint8_t key_byte) {
-  MMData mm_data;
-  auto& item = mm_data.add(MMType::IMAGE);
-  item.mutable_state().mutable_token_pos() = {offset, length};
-  std::memset(item.mutable_state().mutable_schedule_data().key.data,
-              key_byte,
-              XXH3_128BITS_HASH_VALUE_LEN);
-  return mm_data;
-}
+using tests::make_image_mm_data;
 
 BlockManagerPool::Options make_v41_prefix_pool_options() {
   const BlockManager::Options source = make_v41_prefix_options();
