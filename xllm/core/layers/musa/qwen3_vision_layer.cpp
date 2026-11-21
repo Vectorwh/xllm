@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <memory>
 #include <tuple>
+#include <utility>
 
 #include "layers/musa/qwen3_vision_attention.h"
 #include "layers/qwen2_5_vision_layer.h"
@@ -30,10 +31,10 @@ Qwen3_VisionLayerImpl::Qwen3_VisionLayerImpl(const ModelContext& context) {
   const ParallelArgs& parallel_args = context.get_parallel_args();
   const torch::TensorOptions& options = context.get_tensor_options();
   const int64_t dim = args.mm_hidden_size();
+  std::shared_ptr<Qwen2VisionAttentionImpl> attention =
+      std::make_shared<Qwen3VisionAttentionImpl>(context);
   attention_ =
-      register_module("self_attn",
-                      Qwen2VisionAttention(
-                          std::make_shared<Qwen3VisionAttentionImpl>(context)));
+      register_module("self_attn", Qwen2VisionAttention(std::move(attention)));
   norm1_ = register_module("norm1", RMSNorm(dim, args.rms_norm_eps(), options));
   norm2_ = register_module("norm2", RMSNorm(dim, args.rms_norm_eps(), options));
   const bool is_gated = apply_qwen3_vision_style(norm1_, norm2_);

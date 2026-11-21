@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cmath>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "core/framework/model/model_args.h"
@@ -88,6 +89,8 @@ class Qwen3VisionAttentionTest : public ::testing::Test {
     }
     device_ = torch::Device(Platform::type_torch(), 0);
     Device xllm_device(device_);
+    xllm_device.set_device();
+    xllm_device.init_device_context();
     xllm_device.set_seed(7);
     options_ = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
 
@@ -105,8 +108,9 @@ class Qwen3VisionAttentionTest : public ::testing::Test {
     qkv_bias_ = torch::randn({qkv_size}, options_) * 0.02;
     proj_weight_ = torch::randn({kHiddenSize, kHiddenSize}, options_) * 0.02;
     proj_bias_ = torch::randn({kHiddenSize}, options_) * 0.02;
-    attention_ = Qwen2VisionAttention(
-        std::make_shared<Qwen3VisionAttentionImpl>(context_));
+    std::shared_ptr<Qwen2VisionAttentionImpl> attention =
+        std::make_shared<Qwen3VisionAttentionImpl>(context_);
+    attention_ = Qwen2VisionAttention(std::move(attention));
     std::unordered_map<std::string, torch::Tensor> weights = {
         {"qkv.weight", qkv_weight_},
         {"qkv.bias", qkv_bias_},

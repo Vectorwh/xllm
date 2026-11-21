@@ -29,6 +29,8 @@ limitations under the License.
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/quant_args.h"
 #include "core/framework/state_dict/state_dict.h"
+#include "core/layers/common/dense_mlp.h"
+#include "core/layers/common/lora/lora_column_parallel_linear.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "layers/qwen2_5_vision_layer.h"
@@ -83,6 +85,8 @@ class Qwen3VisionLayerTest : public ::testing::Test {
     }
     device_ = torch::Device(Platform::type_torch(), 0);
     Device xllm_device(device_);
+    xllm_device.set_device();
+    xllm_device.init_device_context();
     xllm_device.set_seed(7);
     options_ = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
 
@@ -99,6 +103,26 @@ class Qwen3VisionLayerTest : public ::testing::Test {
     context_ = ModelContext(parallel_args_, model_args, QuantArgs(), options_);
   }
 
+  std::unordered_map<std::string, torch::Tensor> checkpoint_weights(
+      const torch::nn::Module& module) const {
+    std::unordered_map<std::string, torch::Tensor> weights;
+    for (const auto& parameter : module.named_parameters()) {
+      weights.emplace(CheckpointKey(parameter.key()),
+                      torch::randn(parameter.value().sizes(), options_) * 0.02);
+    }
+    weights.emplace(
+        "mlp.linear_fc1.weight",
+        torch::randn({kIntermediateSize, kHiddenSize}, options_) * 0.02);
+    weights.emplace("mlp.linear_fc1.bias",
+                    torch::randn({kIntermediateSize}, options_) * 0.02);
+    weights.emplace(
+        "mlp.linear_fc2.weight",
+        torch::randn({kHiddenSize, kIntermediateSize}, options_) * 0.02);
+    weights.emplace("mlp.linear_fc2.bias",
+                    torch::randn({kHiddenSize}, options_) * 0.02);
+    return weights;
+  }
+
   torch::Device device_ = torch::kCPU;
   torch::TensorOptions options_;
   ParallelArgs parallel_args_{0, 1, nullptr};
@@ -112,15 +136,20 @@ TEST_F(Qwen3VisionLayerTest, MatchesQwen3StyleAssembly) {
   Qwen2_5_VisionLayer qwen2_style(context_, /*is_qwen3_style=*/false);
 
   EXPECT_EQ(ParameterShapes(*musa_layer), ParameterShapes(*qwen3_style));
-  EXPECT_GT(Parameter(qwen2_style, "mlp.gate_up_proj.weight").numel(),
-            Parameter(musa_layer, "mlp.gate_up_proj.weight").numel());
-  EXPECT_TRUE(Parameter(musa_layer, "norm1.bias").defined());
-  EXPECT_FALSE(Parameter(qwen2_style, "norm1.bias").defined());
+  const auto* qwen2_gate_up = qwen2_style->named_modules()["mlp.gate_up_proj"]
+                                  ->as<LoRAColumnParallelLinear>();
+  const auto* musa_gate_up = musa_layer->named_modules()["mlp.gate_up_proj"]
+                                 ->as<LoRAColumnParallelLinear>();
+  ASSERT_NE(qwen2_gate_up, nullptr);
+  ASSERT_NE(musa_gate_up, nullptr);
+  EXPECT_GT(qwen2_gate_up->weight().numel(), musa_gate_up->weight().numel());
+  EXPECT_TRUE(Parameter(*musa_layer, "norm1.bias").defined());
+  EXPECT_FALSE(Parameter(*qwen2_style, "norm1.bias").defined());
 }
 
 TEST_F(Qwen3VisionLayerTest, LoadsQwen3CheckpointKeys) {
   Qwen3_VisionLayer layer(context_);
-  std::unordered_map<std::string, torch::Tensor> weights;
+  const auto weights = checkpoint_weights(*layer);
   for (const auto& parameter : layer->named_parameters()) {
     const std::string key = CheckpointKey(parameter.key());
     const bool kept_norm_name =
@@ -128,7 +157,6 @@ TEST_F(Qwen3VisionLayerTest, LoadsQwen3CheckpointKeys) {
                                    parameter.key().rfind("norm2.", 0) == 0);
     ASSERT_TRUE(key != parameter.key() || kept_norm_name)
         << "No Qwen3 checkpoint name for " << parameter.key();
-    weights.emplace(key, torch::randn(parameter.value().sizes(), options_));
   }
 
   layer->load_state_dict(StateDict(weights));
@@ -136,11 +164,27 @@ TEST_F(Qwen3VisionLayerTest, LoadsQwen3CheckpointKeys) {
     const torch::Tensor& expected = weights.at(CheckpointKey(parameter.key()));
     EXPECT_TRUE(torch::allclose(parameter.value(), expected));
   }
+  const auto modules = layer->named_modules();
+  modules["mlp"]->as<DenseMLP>()->verify_loaded_weights("mlp.");
+  EXPECT_TRUE(torch::equal(
+      modules["mlp.gate_up_proj"]->as<LoRAColumnParallelLinear>()->weight(),
+      weights.at("mlp.linear_fc1.weight")));
 }
 
 TEST_F(Qwen3VisionLayerTest, ForwardKeepsTheQwen3StyleShape) {
   Qwen3_VisionLayer musa_layer(context_);
   Qwen2_5_VisionLayer qwen3_style(context_, /*is_qwen3_style=*/true);
+  const StateDict state_dict(checkpoint_weights(*musa_layer));
+  musa_layer->load_state_dict(state_dict);
+  const auto reference_modules = qwen3_style->named_modules();
+  reference_modules["self_attn"]->as<Qwen2VisionAttention>()->load_state_dict(
+      state_dict.get_dict_with_prefix("attn."));
+  reference_modules["mlp"]->as<DenseMLP>()->load_state_dict(
+      state_dict.get_dict_with_prefix("mlp."), {"linear_fc1."}, "linear_fc2.");
+  for (const std::string name : {"norm1", "norm2"}) {
+    reference_modules[name]->as<RMSNorm>()->load_state_dict(
+        state_dict.get_dict_with_prefix(name + "."));
+  }
   torch::Tensor hidden = torch::randn({4, kHiddenSize}, options_);
   torch::Tensor cos = torch::randn({4, kHeadDim}, options_);
   torch::Tensor sin = torch::randn({4, kHeadDim}, options_);
@@ -153,6 +197,7 @@ TEST_F(Qwen3VisionLayerTest, ForwardKeepsTheQwen3StyleShape) {
       qwen3_style->forward(hidden, cos, sin, cu_seq, cu_seq_vec, /*node_id=*/0);
   EXPECT_EQ(actual.sizes(), expected.sizes());
   EXPECT_TRUE(torch::isfinite(actual).all().item<bool>());
+  EXPECT_TRUE(torch::allclose(actual, expected, /*rtol=*/1e-4, /*atol=*/1e-4));
 }
 
 }  // namespace
