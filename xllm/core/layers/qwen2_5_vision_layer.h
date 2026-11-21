@@ -53,5 +53,27 @@ class Qwen2_5_VisionLayerImpl : public torch::nn::Module {
 };
 TORCH_MODULE(Qwen2_5_VisionLayer);
 
+// LayerNorm plus an ungated MLP. Returns the MLP gate flag.
+// Qwen2-VL also reaches this by constructing the layer with
+// is_qwen3_style=true.
+inline bool apply_qwen3_vision_style(RMSNorm& norm1, RMSNorm& norm2) {
+  norm1->set_layernorm_mode();
+  norm2->set_layernorm_mode();
+  return false;
+}
+
+// Qwen3 checkpoint keys. Qwen2-VL loads mlp.fc1/fc2 and does not call this.
+inline void load_qwen3_vision_state_dict(const StateDict& state_dict,
+                                         Qwen2VisionAttention& attention,
+                                         DenseMLP& mlp,
+                                         RMSNorm& norm1,
+                                         RMSNorm& norm2) {
+  attention->load_state_dict(state_dict.get_dict_with_prefix("attn."));
+  mlp->load_state_dict(
+      state_dict.get_dict_with_prefix("mlp."), {"linear_fc1."}, "linear_fc2.");
+  norm1->load_state_dict(state_dict.get_dict_with_prefix("norm1."));
+  norm2->load_state_dict(state_dict.get_dict_with_prefix("norm2."));
+}
+
 }  // namespace layer
 }  // namespace xllm

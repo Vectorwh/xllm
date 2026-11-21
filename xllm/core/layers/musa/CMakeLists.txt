@@ -11,6 +11,7 @@ set(_MUSA_LAYERS_HDRS
   qwen3_next_hybrid_decoder_layer_base.h
   qwen3_next_decoder_layer_impl.h
   qwen3_5_decoder_layer_impl.h
+  qwen3_vision_attention.h
   qwen3_5_fused_moe.h
   rms_norm_gated.h
 )
@@ -23,6 +24,7 @@ set(_MUSA_LAYERS_SRCS
   qwen3_next_hybrid_decoder_layer_base.cpp
   qwen3_next_decoder_layer_impl.cpp
   qwen3_5_decoder_layer_impl.cpp
+  qwen3_vision_attention.cpp
   qwen3_5_fused_moe.cpp
   rms_norm_gated.cpp
 )

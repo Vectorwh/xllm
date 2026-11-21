@@ -16,3 +16,37 @@ cc_test(
 )
 target_link_libraries(musa_prefill_test PRIVATE
   "$<LINK_GROUP:RESCAN,platform,config,util>")
+
+cc_test(
+  NAME
+    musa_qwen3_vision_attention_test
+  SRCS
+    qwen3_vision_attention_test.cpp
+  DEPS
+    :musa_layers
+    :platform
+    :config
+    torch_musa
+    GTest::gtest_main
+    glog::glog
+  RUN_SERIAL
+)
+target_link_libraries(musa_qwen3_vision_attention_test PRIVATE
+  "$<LINK_GROUP:RESCAN,platform,config,util>")
+
+cc_test(
+  NAME
+    musa_qwen3_vision_layer_test
+  SRCS
+    qwen3_vision_layer_test.cpp
+  DEPS
+    :layers
+    :platform
+    :config
+    torch_musa
+    GTest::gtest_main
+    glog::glog
+  RUN_SERIAL
+)
+target_link_libraries(musa_qwen3_vision_layer_test PRIVATE
+  "$<LINK_GROUP:RESCAN,platform,config,util>")

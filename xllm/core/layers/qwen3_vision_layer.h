@@ -15,6 +15,10 @@ limitations under the License.
 
 #pragma once
 
+#if defined(USE_MUSA)
+#include "layers/musa/qwen3_vision_layer.h"
+#else
+
 #include "core/layers/qwen2_5_vision_layer.h"
 
 namespace xllm {
@@ -30,3 +34,5 @@ TORCH_MODULE(Qwen3_VisionLayer);
 
 }  // namespace layer
 }  // namespace xllm
+
+#endif
