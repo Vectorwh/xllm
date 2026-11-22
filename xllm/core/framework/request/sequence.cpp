@@ -1119,7 +1119,7 @@ std::vector<Block> Sequence::get_inflight_blocks() const {
          ++block_index) {
       const Block& block = blocks[block_index];
       if (block.is_valid() && block.manager() != nullptr) {
-        retained.emplace_back(block.retain_for_inflight());
+        retained.emplace_back(block);
       }
     }
   }

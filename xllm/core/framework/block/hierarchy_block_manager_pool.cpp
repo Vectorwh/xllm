@@ -767,13 +767,7 @@ void HierarchyBlockManagerPool::collect_offload_pairs(Sequence* sequence) {
       }
       Block& hbm_block = (*hbm_blocks)[i];
       Block& host_block = (*host_blocks)[i];
-      // Prefix-capable HBM leaves are held by both the sequence and the device
-      // prefix cache. Decode SWA deliberately skips prefix insertion, so its
-      // completed block is sequence-only until this offload pair retains it.
-      // Host is the sequence's unfilled destination block in both cases.
-      const uint32_t expected_hbm_refs = entry.supports_prefix_cache ? 2 : 1;
-      if (hbm_block.ref_count() != expected_hbm_refs ||
-          host_block.ref_count() != 1) {
+      if (host_block.ref_count() != 1) {
         continue;
       }
       // Stamp before enqueue. The HBM block hash is not the chain hash.

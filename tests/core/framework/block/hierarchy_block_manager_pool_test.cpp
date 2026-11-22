@@ -52,6 +52,153 @@ limitations under the License.
 #include "tests/core/framework/block/mm_test_utils.h"
 
 namespace xllm {
+
+// Peer that reaches inside HierarchyBlockManagerPool for verification of host
+// leaf construction. The pool is heavy to spin up; we exercise the plumbing
+// with an Engine stub set to nullptr because the constructor only touches the
+// engine during allocate / transfer paths, not at build time.
+class HierarchyPoolTestPeer final {
+ public:
+  static const std::vector<std::unique_ptr<CompositeBlockManager>>&
+  host_block_managers(const HierarchyBlockManagerPool& pool) {
+    return pool.host_block_managers_;
+  }
+
+  static const CompositeBlockManager::LeafMap& host_leaves(
+      const HierarchyBlockManagerPool& pool,
+      int32_t dp_rank = 0) {
+    return pool.host_block_managers_[dp_rank]->leaf_entries();
+  }
+
+  static std::vector<BlockTransferInfo> pending_load_infos(
+      const HierarchyBlockManagerPool& pool) {
+    std::vector<BlockTransferInfo> infos;
+    for (const auto& per_dp : pool.load_block_transfer_infos_) {
+      infos.insert(infos.end(), per_dp.begin(), per_dp.end());
+    }
+    return infos;
+  }
+
+  static const std::vector<BlockTransferInfo>& pending_load_infos(
+      const HierarchyBlockManagerPool& pool,
+      int32_t dp_rank) {
+    return pool.load_block_transfer_infos_.at(dp_rank);
+  }
+
+  static CompositeBlockManager* device_composite(
+      HierarchyBlockManagerPool& pool) {
+    return static_cast<CompositeBlockManager*>(
+        pool.block_managers_.front().get());
+  }
+
+  static void dispatch_pending_h2d(HierarchyBlockManagerPool& pool) {
+    for (auto& per_dp : pool.load_block_transfer_infos_) {
+      per_dp.clear();
+    }
+  }
+
+  static void collect_offload_pairs(HierarchyBlockManagerPool& pool,
+                                    Sequence* sequence) {
+    pool.collect_offload_pairs(sequence);
+  }
+
+  static size_t pending_offload_pair_count(
+      const HierarchyBlockManagerPool& pool) {
+    size_t count = 0;
+    for (const auto& queue : pool.offload_block_pair_queues_) {
+      count += queue.size_approx();
+    }
+    return count;
+  }
+
+  static size_t pending_offload_pair_count(
+      const HierarchyBlockManagerPool& pool,
+      int32_t dp_rank) {
+    return pool.offload_block_pair_queues_.at(dp_rank).size_approx();
+  }
+
+  static void release_pending_offload_pairs(HierarchyBlockManagerPool& pool) {
+    for (auto& queue : pool.offload_block_pair_queues_) {
+      std::shared_ptr<OffloadBlockPair> pair;
+      while (queue.try_dequeue(pair)) {
+        pair.reset();
+      }
+    }
+  }
+
+  static std::shared_ptr<OffloadBlockPair> take_pending_offload_pair(
+      HierarchyBlockManagerPool& pool,
+      int32_t dp_rank = 0) {
+    std::shared_ptr<OffloadBlockPair> pair;
+    pool.offload_block_pair_queues_.at(dp_rank).try_dequeue(pair);
+    return pair;
+  }
+
+  // Decode that crosses a KV block also queues the completed KV block. Pull
+  // the LINEAR pair out and put the other pairs back in their original order.
+  static std::shared_ptr<OffloadBlockPair> take_linear_offload_pair(
+      HierarchyBlockManagerPool& pool,
+      int32_t dp_rank = 0) {
+    std::vector<std::shared_ptr<OffloadBlockPair>> held;
+    std::shared_ptr<OffloadBlockPair> linear_pair;
+    std::shared_ptr<OffloadBlockPair> pair;
+    while (pool.offload_block_pair_queues_.at(dp_rank).try_dequeue(pair)) {
+      if (pair != nullptr && pair->block_type == BlockType::LINEAR &&
+          linear_pair == nullptr) {
+        linear_pair = std::move(pair);
+        continue;
+      }
+      held.emplace_back(std::move(pair));
+    }
+    for (std::shared_ptr<OffloadBlockPair>& kept : held) {
+      pool.offload_block_pair_queues_.at(dp_rank).enqueue(std::move(kept));
+    }
+    return linear_pair;
+  }
+
+  static Block take_host_linear_front(Sequence& sequence) {
+    return std::move(
+        sequence.host_kv_state().mutable_blocks(BlockType::LINEAR)->front());
+  }
+
+  static void enqueue_offload_pair(HierarchyBlockManagerPool& pool,
+                                   std::shared_ptr<OffloadBlockPair> pair,
+                                   int32_t dp_rank = 0) {
+    pool.offload_block_pair_queues_.at(dp_rank).enqueue(std::move(pair));
+  }
+
+  static std::set<std::pair<BlockType, std::string>> complete_offload_pairs(
+      HierarchyBlockManagerPool& pool) {
+    std::set<std::pair<BlockType, std::string>> stored_keys;
+    std::map<BlockType, std::vector<Block>> host_blocks;
+    std::vector<Block> device_blocks;
+    const size_t pair_count = pending_offload_pair_count(pool);
+    device_blocks.reserve(pair_count);
+    std::shared_ptr<OffloadBlockPair> pair;
+    while (pool.offload_block_pair_queues_.front().try_dequeue(pair)) {
+      stored_keys.emplace(pair->block_type,
+                          std::string(reinterpret_cast<const char*>(
+                                          pair->dst.get_immutable_hash_value()),
+                                      XXH3_128BITS_HASH_VALUE_LEN));
+      auto [blocks, inserted] = host_blocks.try_emplace(pair->block_type);
+      if (inserted) {
+        blocks->second.reserve(pair_count);
+      }
+      blocks->second.emplace_back(std::move(pair->dst));
+      device_blocks.emplace_back(std::move(pair->src));
+      pair.reset();
+    }
+    device_blocks.clear();
+    for (auto& [type, blocks] : host_blocks) {
+      auto* leaf =
+          pool.host_block_managers_.front()->leaf_entries().at(type).leaf.get();
+      leaf->cache(blocks);
+      blocks.clear();
+    }
+    return stored_keys;
+  }
+};
+
 namespace {
 
 struct CapturedTransfer {
@@ -2307,6 +2454,798 @@ TEST(HierarchyBlockManagerPoolTest,
   pool.deallocate(sequence);
 }
 
+// Host hit length is the cursor after the prefetch Host probe and before the
+// Store GET. A pure Store admission logs host_hit_tokens=0.
+TEST(HierarchyBlockManagerPoolTest, PrefetchLogsHostHitBeforeStoreGet) {
+  constexpr int32_t kKvBlockSize = 128;
+  constexpr size_t kPromptTokens = 4228;
+  constexpr size_t kCachedTokens = 4224;
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kKvBlockSize)
+      .enable_kvcache_store(true)
+      .prefetch_batch_size(64);
+  FakePrefetchEngine engine(/*worker_count=*/1,
+                            /*timeout_ms=*/-1,
+                            /*batch_size=*/64);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  std::shared_ptr<Request> request =
+      make_test_request(std::vector<int32_t>(kPromptTokens, 19));
+  Sequence* sequence = request->sequences().front().get();
+  google::SetVLOGLevel("hierarchy_block_manager_pool", 1);
+  testing::internal::CaptureStderr();
+  bool completed = false;
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+  const std::string logged = testing::internal::GetCapturedStderr();
+  const std::string expected =
+      "[HostCache][PrefetchHit] sequence_id=-1 host_hit_tokens=0";
+  EXPECT_NE(logged.find(expected), std::string::npos) << logged;
+  ASSERT_NE(engine.result(), nullptr);
+  const size_t expected_units = kCachedTokens / kKvBlockSize;
+  ASSERT_EQ(engine.request().units.size(), expected_units);
+  engine.finish_worker(/*worker_index=*/0, expected_units);
+  ASSERT_TRUE(completed);
+  EXPECT_EQ(sequence->kv_state().kv_cache_tokens_num(), 0u);
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), kCachedTokens);
+  pool.deallocate(sequence);
+}
+
+namespace {
+
+void seed_host_prefix(BlockManager* leaf, const std::vector<int32_t>& tokens) {
+  ASSERT_NE(leaf, nullptr);
+  const size_t block_count = tokens.size() / leaf->block_size();
+  std::vector<Block> blocks = leaf->allocate(block_count);
+  ASSERT_EQ(blocks.size(), block_count);
+  leaf->cache(tokens, blocks);
+  blocks.clear();
+}
+
+struct LinearTailPrefetchCase {
+  int32_t chunk_stride;
+  int32_t kv_block_size;
+  size_t prompt_tokens;
+  bool seed_regular_checkpoints;
+};
+
+class LinearTailHostPrefetchTest
+    : public ::testing::TestWithParam<LinearTailPrefetchCase> {
+ protected:
+  void SetUp() override {
+    int32_t& chunk_stride =
+        SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+    original_chunk_stride_ = chunk_stride;
+    chunk_stride = GetParam().chunk_stride;
+  }
+
+  void TearDown() override {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride_;
+  }
+
+ private:
+  int32_t original_chunk_stride_ = 0;
+};
+
+std::vector<Block> exhaust_free_blocks(BlockManager* leaf, size_t keep_free) {
+  const size_t free_blocks = leaf->num_free_blocks();
+  CHECK_GE(free_blocks, keep_free);
+  return leaf->allocate(free_blocks - keep_free);
+}
+
+}  // namespace
+
+TEST(HierarchyBlockManagerPoolTest,
+     LinearStorePrefetchDoesNotRepeatMatchedPartialUnit) {
+  constexpr int32_t kChunkStride = 2048;
+  constexpr int32_t kKvBlockSize = 128;
+  constexpr size_t kPromptTokens = 10195;
+  constexpr size_t kMatchedTailTokens = 9984;
+  constexpr size_t kTargetTailTokens = 10112;
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  auto restore_chunk_stride = folly::makeGuard([original_chunk_stride]() {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kChunkStride;
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kKvBlockSize)
+      .enable_linear_state(true)
+      .linear_state_num_slots(80)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 80}})
+      .enable_kvcache_store(true)
+      .prefetch_batch_size(8)
+      .prefetch_valid_blocks_per_batch(8);
+  FakePrefetchEngine engine(/*worker_count=*/1,
+                            /*timeout_ms=*/-1,
+                            /*batch_size=*/8);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  const std::vector<int32_t> cached_tokens(kMatchedTailTokens, 17);
+  seed_host_prefix(host.at(BlockType::KV).leaf.get(), cached_tokens);
+
+  Sequence hash_sequence = make_test_sequence(
+      /*index=*/0, std::vector<int32_t>(kPromptTokens, 17));
+  hash_sequence.update_block_hashes(kKvBlockSize, BlockHasherType::TEXT);
+  std::vector<Block> tail_blocks = host.at(BlockType::LINEAR).leaf->allocate(1);
+  ASSERT_EQ(tail_blocks.size(), 1u);
+  tail_blocks.front().set_hash_value(
+      hash_sequence
+          .block_hashes(kKvBlockSize)[kMatchedTailTokens / kKvBlockSize - 1]
+          .data);
+  host.at(BlockType::LINEAR).leaf->cache(tail_blocks);
+  tail_blocks.clear();
+
+  std::shared_ptr<Request> request =
+      make_test_request(std::vector<int32_t>(kPromptTokens, 17));
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+  const auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+
+  ASSERT_NE(engine.result(), nullptr);
+  ASSERT_EQ(engine.request().units.size(), 1u);
+  EXPECT_EQ(engine.request().units.front().gated_blocks.size() * kKvBlockSize,
+            kTargetTailTokens - kMatchedTailTokens);
+  ASSERT_EQ(engine.request().units.front().non_gated_blocks.size(), 1u);
+
+  const size_t transfer_count =
+      engine.request().batch_transfer_count(0, engine.request().units.size());
+  engine.finish_worker_with_logical_hits(
+      /*worker_index=*/0, std::vector<uint8_t>(transfer_count, 1));
+
+  ASSERT_TRUE(completed);
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), kTargetTailTokens);
+  pool.deallocate(sequence);
+}
+
+TEST_P(LinearTailHostPrefetchTest,
+       RetainsTailBoundaryWithoutPublishingRegularCheckpoint) {
+  const LinearTailPrefetchCase& test_case = GetParam();
+  const size_t kv_block_size = static_cast<size_t>(test_case.kv_block_size);
+  const size_t chunk_stride = static_cast<size_t>(test_case.chunk_stride);
+  const size_t tail_tokens =
+      test_case.prompt_tokens / kv_block_size * kv_block_size;
+  const size_t checkpoint_count = tail_tokens / chunk_stride;
+  ASSERT_GT(tail_tokens, chunk_stride);
+  ASSERT_NE(tail_tokens % chunk_stride, 0u);
+
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(test_case.kv_block_size)
+      .enable_linear_state(true)
+      .linear_state_num_slots(80)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 80}})
+      .enable_kvcache_store(true);
+  FakePrefetchEngine engine(/*worker_count=*/1);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const auto& host = HierarchyPoolTestPeer::host_leaves(pool);
+  BlockManager* linear_leaf = host.at(BlockType::LINEAR).leaf.get();
+  const std::vector<int32_t> tokens(test_case.prompt_tokens, 7);
+  seed_host_prefix(host.at(BlockType::KV).leaf.get(), tokens);
+
+  Sequence hash_sequence = make_test_sequence(/*index=*/0, tokens);
+  hash_sequence.update_block_hashes(test_case.kv_block_size,
+                                    BlockHasherType::TEXT);
+  std::vector<int32_t> regular_block_ids;
+  regular_block_ids.reserve(checkpoint_count);
+  if (test_case.seed_regular_checkpoints) {
+    // The cache API keeps the final slot live and publishes preceding slots.
+    std::vector<Block> regular_blocks =
+        linear_leaf->allocate(checkpoint_count + 1);
+    ASSERT_EQ(regular_blocks.size(), checkpoint_count + 1);
+    for (size_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+      regular_block_ids.emplace_back(regular_blocks[checkpoint].id());
+    }
+    linear_leaf->cache(tokens,
+                       regular_blocks,
+                       /*existed_shared_blocks_num=*/0,
+                       hash_sequence.mm_data(),
+                       hash_sequence.block_hashes(test_case.kv_block_size));
+    regular_blocks.clear();
+  }
+
+  std::vector<Block> tail_blocks = linear_leaf->allocate(1);
+  ASSERT_EQ(tail_blocks.size(), 1u);
+  const int32_t tail_block_id = tail_blocks.front().id();
+  tail_blocks.front().set_hash_value(
+      hash_sequence
+          .block_hashes(
+              test_case.kv_block_size)[tail_tokens / kv_block_size - 1]
+          .data);
+  linear_leaf->cache(tail_blocks);
+  tail_blocks.clear();
+
+  std::shared_ptr<Request> request = make_test_request(tokens);
+  Sequence* sequence = request->sequences().front().get();
+  bool completed = false;
+  auto cleanup = folly::makeGuard([&pool, &engine, sequence] {
+    // Fatal assertions must not leave the pool holding unfinished callbacks.
+    // Unfinished workers are failed, never reported as successful transfers.
+    engine.drain_workers();
+    pool.deallocate(sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  });
+  pool.prefetch_from_storage(
+      request,
+      [&completed](std::shared_ptr<Request> /*request*/) { completed = true; });
+
+  ASSERT_TRUE(completed);
+  EXPECT_TRUE(sequence->host_kv_state().prefix_cache_matched());
+  EXPECT_EQ(sequence->host_kv_state().kv_cache_tokens_num(), tail_tokens);
+  const Slice<Block> retained =
+      sequence->host_kv_state().blocks(BlockType::LINEAR);
+  // Prefetch trim keeps one restore source, the deepest checkpoint.
+  ASSERT_EQ(retained.size(), 1u);
+  ASSERT_TRUE(retained.front().is_valid());
+  EXPECT_EQ(retained.front().id(), tail_block_id);
+  EXPECT_TRUE(XXH3Key(retained.front().get_immutable_hash_value()) ==
+              hash_sequence.block_hashes(
+                  test_case.kv_block_size)[tail_tokens / kv_block_size - 1]);
+  pool.deallocate(sequence);
+  cleanup.dismiss();
+
+  // Each shorter prompt ends one token beyond a regular boundary, so a hit
+  // must restore that exact checkpoint rather than the deeper tail state.
+  CompositeBlockManager* host_manager =
+      HierarchyPoolTestPeer::host_block_managers(pool).front().get();
+  for (size_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+    const size_t boundary = (checkpoint + 1) * chunk_stride;
+    SCOPED_TRACE(boundary);
+    const std::vector<int32_t> shorter_tokens(tokens.begin(),
+                                              tokens.begin() + boundary + 1);
+    Sequence shorter = make_test_sequence(/*index=*/1, shorter_tokens);
+    const auto cleanup_shorter = folly::makeGuard([&pool, &shorter] {
+      pool.deallocate(&shorter);
+      HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+    });
+    host_manager->allocate_shared_for_sequence(&shorter,
+                                               shorter.host_kv_state());
+    const Slice<Block> source =
+        shorter.host_kv_state().blocks(BlockType::LINEAR);
+    if (test_case.seed_regular_checkpoints) {
+      // A seeded regular checkpoint restores one source. The matched length
+      // is a positive multiple of the chunk stride and stops short of the
+      // deeper tail that belongs to the long prompt.
+      const size_t matched = shorter.host_kv_state().kv_cache_tokens_num();
+      EXPECT_GT(matched, 0u);
+      EXPECT_EQ(matched % kv_block_size, 0u);
+      EXPECT_LE(matched, tail_tokens);
+      ASSERT_EQ(source.size(), 1u);
+      EXPECT_TRUE(source.front().is_valid());
+      EXPECT_NE(source.front().id(), tail_block_id);
+    } else {
+      EXPECT_EQ(shorter.host_kv_state().kv_cache_tokens_num(), 0u);
+      EXPECT_TRUE(source.empty());
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MultiChunkTail,
+    LinearTailHostPrefetchTest,
+    ::testing::Values(LinearTailPrefetchCase{8, 4, 13, false},
+                      LinearTailPrefetchCase{8, 4, 13, true},
+                      LinearTailPrefetchCase{8, 4, 21, false},
+                      LinearTailPrefetchCase{8, 4, 21, true},
+                      LinearTailPrefetchCase{8192, 128, 9000, false},
+                      LinearTailPrefetchCase{8192, 128, 9000, true}));
+
+TEST(HierarchyBlockManagerPoolTest,
+     DecodeLinearOffloadKeepsLiveSlotWithInflightReferences) {
+  constexpr int32_t kKvBlockSize = 4;
+  constexpr size_t kAcceptedLength = 1;
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const auto restore_chunk_stride = folly::makeGuard([original_chunk_stride] {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kKvBlockSize;
+
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    BlockManagerPool::Options options = make_flat_kv_options();
+    options.enable_linear_state(true)
+        .block_size(kKvBlockSize)
+        .linear_state_num_slots(64)
+        .host_num_blocks_by_type(
+            {{BlockType::KV, 128}, {BlockType::LINEAR, 64}})
+        .enable_prefix_cache(false)
+        .enable_disagg_pd(true)
+        .instance_is_decode(true)
+        .enable_kvcache_store(true)
+        .num_embedding_blocks(64)
+        .num_speculative_tokens(kAcceptedLength)
+        .enable_schedule_overlap(overlap);
+    HierarchyBlockManagerPool pool(options,
+                                   /*engine=*/nullptr,
+                                   /*dp_size=*/1);
+    CompositeBlockManager* device =
+        HierarchyPoolTestPeer::device_composite(pool);
+    const auto& host_leaves = HierarchyPoolTestPeer::host_leaves(pool);
+    std::map<BlockType, size_t> device_free_before;
+    std::map<BlockType, size_t> host_free_before;
+    for (const BlockType type : {BlockType::KV, BlockType::LINEAR}) {
+      device_free_before.emplace(
+          type, device->leaf_entries().at(type).leaf->num_free_blocks());
+      host_free_before.emplace(type,
+                               host_leaves.at(type).leaf->num_free_blocks());
+    }
+
+    Sequence sequence = make_test_sequence(
+        /*index=*/0, std::vector<int32_t>(9, 103), overlap);
+    auto cleanup = folly::makeGuard([&pool, &sequence] {
+      pool.deallocate(&sequence);
+      HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+    });
+    ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/9));
+    sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+    ASSERT_EQ(sequence.stage(), SequenceStage::DECODE);
+    auto append_generated_token = [&sequence, overlap](int32_t token_id) {
+      if (overlap) {
+        sequence.append_token(/*fake placeholder=*/-1);
+        sequence.update_last_step_token(Token(token_id), /*token_offset=*/0);
+      } else {
+        sequence.append_token(token_id);
+      }
+    };
+    append_generated_token(104);
+    append_generated_token(105);
+    append_generated_token(106);
+    ASSERT_EQ(sequence.kv_state().kv_cache_tokens_num(), 11u);
+    sequence.set_accepted_length(0);
+    ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+    // 11 cached tokens complete two ordinary KV chunks (block_size 4), which
+    // collect_offload_pairs legitimately queues for host offload regardless
+    // of LINEAR state. The absence of a LINEAR pair is what this step is
+    // actually verifying: no checkpoint has completed yet.
+    ASSERT_EQ(HierarchyPoolTestPeer::take_linear_offload_pair(pool), nullptr);
+
+    const Slice<Block> hbm_before =
+        sequence.kv_state().blocks(BlockType::LINEAR);
+    const Slice<Block> host_before =
+        sequence.host_kv_state().blocks(BlockType::LINEAR);
+    ASSERT_EQ(hbm_before.size(), 2u);
+    ASSERT_EQ(host_before.size(), 2u);
+    const int32_t hbm_checkpoint_id = hbm_before.back().id();
+    const int32_t hbm_old_front_id = hbm_before.front().id();
+    const int32_t host_checkpoint_id = host_before.back().id();
+    const int32_t host_old_front_id = host_before.front().id();
+    // allocate_decode keeps the checkpoint at front under overlap (the
+    // pipeline lag already landed it there) and at back otherwise; match
+    // whichever this sequence actually preserved.
+    const int32_t expected_hbm_checkpoint_id =
+        overlap ? hbm_old_front_id : hbm_checkpoint_id;
+    const int32_t expected_host_checkpoint_id =
+        overlap ? host_old_front_id : host_checkpoint_id;
+
+    std::vector<Block> inflight_blocks;
+    inflight_blocks.reserve(hbm_before.size());
+    inflight_blocks.emplace_back(hbm_before.front());
+    inflight_blocks.emplace_back(hbm_before.back());
+    ASSERT_GT(hbm_before.front().ref_count(), 1u);
+    ASSERT_GT(hbm_before.back().ref_count(), 1u);
+    ASSERT_EQ(host_before.front().ref_count(), 1u);
+    ASSERT_EQ(host_before.back().ref_count(), 1u);
+
+    append_generated_token(107);
+    ASSERT_EQ(sequence.kv_state().kv_cache_tokens_num(), 12u);
+    sequence.set_accepted_length(kAcceptedLength);
+    ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+
+    const Slice<Block> hbm_after =
+        sequence.kv_state().blocks(BlockType::LINEAR);
+    const Slice<Block> host_after =
+        sequence.host_kv_state().blocks(BlockType::LINEAR);
+    ASSERT_EQ(hbm_after.size(), 1u);
+    ASSERT_EQ(host_after.size(), 1u);
+    if (overlap) {
+      EXPECT_EQ(hbm_after.back().id(), hbm_checkpoint_id);
+    } else {
+      EXPECT_NE(hbm_after.back().id(), hbm_old_front_id);
+      EXPECT_NE(hbm_after.back().id(), hbm_checkpoint_id);
+    }
+    EXPECT_EQ(host_after.back().id(),
+              overlap ? host_checkpoint_id : host_old_front_id);
+    EXPECT_EQ(hbm_after.back().ref_count(), overlap ? 2u : 1u);
+    EXPECT_EQ(host_after.back().ref_count(), 1u);
+
+    std::shared_ptr<OffloadBlockPair> pair =
+        HierarchyPoolTestPeer::take_linear_offload_pair(pool);
+    ASSERT_NE(pair, nullptr);
+    EXPECT_EQ(pair->block_type, BlockType::LINEAR);
+    EXPECT_EQ(pair->src.id(), expected_hbm_checkpoint_id);
+    EXPECT_NE(pair->src.id(), hbm_after.back().id());
+    EXPECT_EQ(pair->dst.id(), expected_host_checkpoint_id);
+    EXPECT_NE(pair->dst.id(), host_after.back().id());
+    EXPECT_EQ(pair->checkpoint_row, kAcceptedLength);
+    EXPECT_EQ(pair->src.ref_count(), 2u);
+    EXPECT_EQ(pair->dst.ref_count(), 1u);
+    HierarchyPoolTestPeer::enqueue_offload_pair(pool, std::move(pair));
+
+    // Release the sequence, in-flight references, and queue; KV and LINEAR
+    // blocks in both tiers should be reclaimed.
+    pool.deallocate(&sequence);
+    inflight_blocks.clear();
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+    cleanup.dismiss();
+    device->reset_prefix_cache();
+    HierarchyPoolTestPeer::host_block_managers(pool)
+        .front()
+        ->reset_prefix_cache();
+    EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+    EXPECT_FALSE(pool.has_pending_async_block_release());
+    for (const BlockType type : {BlockType::KV, BlockType::LINEAR}) {
+      EXPECT_EQ(device->leaf_entries().at(type).leaf->num_free_blocks(),
+                device_free_before.at(type));
+      EXPECT_EQ(host_leaves.at(type).leaf->num_free_blocks(),
+                host_free_before.at(type));
+    }
+  }
+}
+
+// Decode LINEAR window around a checkpoint boundary.
+//
+// Prefix cache is off here, so the HBM stride is max(KV block, chunk). This
+// test pins the chunk to the KV block. Host LINEAR keeps prefix cache and
+// uses the KV block, so both tiers share the same grid.
+// Decode retains the latest output as the read source and allocates a write
+// slot when needed. The completed span is [cached - accepted - 1, cached). At a
+// boundary, collect removes the checkpoint front and retains the live back in
+// both tiers. An exclusive single slot advances in place below the next
+// boundary.
+TEST(HierarchyBlockManagerPoolTest, DecodeLinearCheckpointWindowFollowsCursor) {
+  constexpr int32_t kKvBlockSize = 8;
+  constexpr int32_t kPrefillChunkSize = 8;
+  constexpr size_t kSpeculativeTokens = 3;
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kKvBlockSize)
+      .enable_linear_state(true)
+      .linear_state_num_slots(64)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 64}})
+      .enable_prefix_cache(false)
+      .enable_disagg_pd(true)
+      .instance_is_decode(true)
+      .enable_kvcache_store(true)
+      .num_embedding_blocks(64)
+      .num_speculative_tokens(kSpeculativeTokens)
+      .enable_schedule_overlap(false);
+
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  auto restore_stride = folly::makeGuard([original_chunk_stride]() {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  // Chunk equals the KV block, so prefix-cache-off HBM and prefix-cache-on
+  // Host use the same checkpoint grid.
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kPrefillChunkSize;
+
+  HierarchyBlockManagerPool pool(options,
+                                 /*engine=*/nullptr,
+                                 /*dp_size=*/1);
+
+  auto linear_ids = [](const KVCacheState& state) {
+    const Slice<Block> blocks = state.blocks(BlockType::LINEAR);
+    std::vector<int32_t> ids;
+    ids.reserve(blocks.size());
+    for (const Block& block : blocks) {
+      ids.emplace_back(block.id());
+    }
+    return ids;
+  };
+
+  // Prompt already covers checkpoint 8. Decode starts with one live slot on
+  // each tier. The next boundary under test is 16.
+  Sequence overlap_off =
+      make_test_sequence(/*index=*/0, std::vector<int32_t>(10, 103));
+  ASSERT_TRUE(pool.allocate(&overlap_off, /*num_tokens=*/10));
+  overlap_off.kv_state().set_kv_cache_tokens_num(10);
+  overlap_off.host_kv_state().set_kv_cache_tokens_num(8);
+  ASSERT_EQ(linear_ids(overlap_off.kv_state()).size(), 1u);
+  ASSERT_EQ(linear_ids(overlap_off.host_kv_state()).size(), 1u);
+  const int32_t hbm_live = linear_ids(overlap_off.kv_state()).front();
+  const int32_t host_live = linear_ids(overlap_off.host_kv_state()).front();
+
+  // Overlap off writes the token index. append_token records the index before
+  // the increment, so four generated tokens leave HBM cached tokens at 13.
+  // 13 plus a 4-token speculative step reaches 17 and crosses 16.
+  // cached - accepted is still below 16, so nothing is offloaded.
+  overlap_off.kv_state().set_kv_cache_tokens_num(17);
+  overlap_off.append_token(104);
+  overlap_off.append_token(105);
+  overlap_off.append_token(106);
+  overlap_off.append_token(107);
+  ASSERT_EQ(overlap_off.num_tokens(), 14u);
+  ASSERT_EQ(overlap_off.kv_state().kv_cache_tokens_num(), 13u);
+  overlap_off.set_accepted_length(0);
+  ASSERT_TRUE(pool.allocate(&overlap_off, /*num_tokens=*/17));
+  const std::vector<int32_t> hbm_window = linear_ids(overlap_off.kv_state());
+  const std::vector<int32_t> host_window =
+      linear_ids(overlap_off.host_kv_state());
+  ASSERT_EQ(hbm_window.size(), 2u);
+  ASSERT_EQ(host_window.size(), 2u);
+  // Host offload appends the fresh write. The filled slot stays at the front
+  // so collect can move it.
+  EXPECT_EQ(hbm_window.front(), hbm_live);
+  EXPECT_EQ(host_window.front(), host_live);
+  EXPECT_NE(hbm_window.back(), hbm_live);
+  EXPECT_NE(host_window.back(), host_live);
+  // 13 and 8 share a KV block, so the window grows without an offload pair.
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+  const int32_t hbm_next = hbm_window.back();
+  const int32_t host_next = host_window.back();
+
+  // The new cursor has not crossed a boundary. Host offload preserves the
+  // completed result at the front and the exclusive write at the back.
+  overlap_off.kv_state().set_kv_cache_tokens_num(14);
+  overlap_off.set_accepted_length(0);
+  ASSERT_EQ(overlap_off.kv_state().kv_cache_tokens_num() -
+                overlap_off.accepted_length(),
+            14u);
+  ASSERT_TRUE(pool.allocate(&overlap_off, /*num_tokens=*/18));
+  ASSERT_EQ(linear_ids(overlap_off.kv_state()).size(), 2u);
+  ASSERT_EQ(linear_ids(overlap_off.host_kv_state()).size(), 2u);
+  // The exclusive window swaps. The previous write becomes the read source
+  // and the other exclusive slot becomes the live write.
+  EXPECT_EQ(linear_ids(overlap_off.kv_state()).front(), hbm_next);
+  EXPECT_EQ(linear_ids(overlap_off.host_kv_state()).front(), host_next);
+  EXPECT_EQ(linear_ids(overlap_off.kv_state()).back(), hbm_live);
+  EXPECT_EQ(linear_ids(overlap_off.host_kv_state()).back(), host_live);
+  const int32_t hbm_completed = linear_ids(overlap_off.kv_state()).front();
+  const int32_t host_completed =
+      linear_ids(overlap_off.host_kv_state()).front();
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(pool), 0u);
+
+  // n-1 result. append_token records the index before the increment, so two
+  // generated tokens leave the cursor at 15. The completed span crosses 16
+  // only when the cursor itself is the boundary.
+  // The completed result stays front. This step predicts a checkpoint, so
+  // host offload releases the stale front and appends a fresh write. Collect
+  // then moves that completed front.
+  overlap_off.append_token(108);
+  overlap_off.append_token(109);
+  overlap_off.kv_state().set_kv_cache_tokens_num(16);
+  overlap_off.set_accepted_length(0);
+  ASSERT_EQ(overlap_off.kv_state().kv_cache_tokens_num(), 16u);
+  ASSERT_TRUE(pool.allocate(&overlap_off, /*num_tokens=*/20));
+  ASSERT_EQ(linear_ids(overlap_off.kv_state()).size(), 1u);
+  ASSERT_EQ(linear_ids(overlap_off.host_kv_state()).size(), 1u);
+  EXPECT_NE(linear_ids(overlap_off.kv_state()).back(), hbm_live);
+  EXPECT_NE(linear_ids(overlap_off.host_kv_state()).back(), host_live);
+  EXPECT_EQ(
+      overlap_off.kv_state().blocks(BlockType::LINEAR).front().ref_count(), 1u);
+  EXPECT_EQ(overlap_off.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+            1u);
+  EXPECT_EQ(
+      overlap_off.host_kv_state().blocks(BlockType::LINEAR).front().ref_count(),
+      1u);
+  EXPECT_EQ(
+      overlap_off.host_kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+      1u);
+  {
+    const std::shared_ptr<OffloadBlockPair> pair =
+        HierarchyPoolTestPeer::take_linear_offload_pair(pool);
+    ASSERT_NE(pair, nullptr);
+    EXPECT_EQ(pair->block_type, BlockType::LINEAR);
+    EXPECT_EQ(pair->src.id(), hbm_live);
+    EXPECT_EQ(pair->dst.id(), host_live);
+    EXPECT_NE(pair->src.id(),
+              overlap_off.kv_state().blocks(BlockType::LINEAR).back().id());
+    HierarchyPoolTestPeer::enqueue_offload_pair(pool, pair);
+  }
+  HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+  EXPECT_EQ(
+      overlap_off.kv_state().blocks(BlockType::LINEAR).front().ref_count(), 1u);
+  EXPECT_EQ(
+      overlap_off.host_kv_state().blocks(BlockType::LINEAR).front().ref_count(),
+      1u);
+
+  // Overlap on writes the n-2 cursor. update_last_step_token records
+  // cur_generated_token_idx_ before incrementing it. After four commits the
+  // HBM cache cursor is 13 while num_tokens is already 14. The manager reads
+  // overlap from its options, not from the sequence.
+  options.enable_schedule_overlap(true);
+  HierarchyBlockManagerPool overlap_pool(options,
+                                         /*engine=*/nullptr,
+                                         /*dp_size=*/1);
+  Sequence overlap_on = make_test_sequence(
+      /*index=*/1,
+      std::vector<int32_t>(10, 203),
+      /*enable_schedule_overlap=*/true);
+  ASSERT_TRUE(overlap_pool.allocate(&overlap_on, /*num_tokens=*/10));
+  overlap_on.kv_state().set_kv_cache_tokens_num(18);
+  overlap_on.host_kv_state().set_kv_cache_tokens_num(8);
+  ASSERT_EQ(linear_ids(overlap_on.kv_state()).size(), 1u);
+  const int32_t overlap_hbm_live = linear_ids(overlap_on.kv_state()).front();
+  const int32_t overlap_host_live =
+      linear_ids(overlap_on.host_kv_state()).front();
+
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(204), /*token_offset=*/0);
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(205), /*token_offset=*/0);
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(206), /*token_offset=*/0);
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(207), /*token_offset=*/0);
+  ASSERT_EQ(overlap_on.num_tokens(), 14u);
+  ASSERT_EQ(overlap_on.kv_state().kv_cache_tokens_num(), 13u);
+  ASSERT_EQ(overlap_on.accepted_length(), 0u);
+  ASSERT_TRUE(overlap_pool.allocate(&overlap_on, /*num_tokens=*/18));
+  const std::vector<int32_t> overlap_hbm = linear_ids(overlap_on.kv_state());
+  const std::vector<int32_t> overlap_host =
+      linear_ids(overlap_on.host_kv_state());
+  ASSERT_EQ(overlap_hbm.size(), 2u);
+  ASSERT_EQ(overlap_host.size(), 2u);
+  EXPECT_EQ(overlap_hbm.front(), overlap_hbm_live);
+  EXPECT_EQ(overlap_host.front(), overlap_host_live);
+  EXPECT_NE(overlap_hbm.back(), overlap_hbm_live);
+  EXPECT_NE(overlap_host.back(), overlap_host_live);
+  // 13 and 8 share a KV block, so the overlap window grows without a pair.
+  EXPECT_EQ(HierarchyPoolTestPeer::pending_offload_pair_count(overlap_pool),
+            0u);
+
+  // Three commits advance the overlap cursor to 16. Allocate preserves the
+  // completed front. Collect moves that front into the checkpoint pair and
+  // leaves the exclusive write as the live slot.
+  const int32_t overlap_hbm_next = overlap_hbm.back();
+  const int32_t overlap_host_next = overlap_host.back();
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(208), /*token_offset=*/0);
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(209), /*token_offset=*/0);
+  overlap_on.append_token(/*fake placeholder=*/-1);
+  overlap_on.update_last_step_token(Token(210), /*token_offset=*/0);
+  ASSERT_EQ(overlap_on.num_tokens(), 17u);
+  ASSERT_EQ(overlap_on.kv_state().kv_cache_tokens_num(), 16u);
+  ASSERT_EQ(overlap_on.accepted_length(), 0u);
+  ASSERT_TRUE(overlap_pool.allocate(&overlap_on, /*num_tokens=*/20));
+  const std::vector<int32_t> overlap_hbm_after =
+      linear_ids(overlap_on.kv_state());
+  const std::vector<int32_t> overlap_host_after =
+      linear_ids(overlap_on.host_kv_state());
+  ASSERT_EQ(overlap_hbm_after.size(), 1u);
+  ASSERT_EQ(overlap_host_after.size(), 1u);
+  EXPECT_EQ(overlap_hbm_after.back(), overlap_hbm_next);
+  EXPECT_EQ(overlap_host_after.back(), overlap_host_next);
+  EXPECT_NE(overlap_hbm_after.back(), overlap_hbm_live);
+  EXPECT_EQ(overlap_on.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
+            1u);
+  EXPECT_EQ(overlap_on.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+            1u);
+  EXPECT_EQ(
+      overlap_on.host_kv_state().blocks(BlockType::LINEAR).front().ref_count(),
+      1u);
+  EXPECT_EQ(
+      overlap_on.host_kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+      1u);
+  {
+    const std::shared_ptr<OffloadBlockPair> pair =
+        HierarchyPoolTestPeer::take_linear_offload_pair(overlap_pool);
+    ASSERT_NE(pair, nullptr);
+    EXPECT_EQ(pair->block_type, BlockType::LINEAR);
+    EXPECT_EQ(pair->src.id(), overlap_hbm_live);
+    EXPECT_EQ(pair->dst.id(), overlap_host_live);
+    EXPECT_NE(pair->src.id(), overlap_hbm_after.back());
+    HierarchyPoolTestPeer::enqueue_offload_pair(overlap_pool, pair);
+  }
+  HierarchyPoolTestPeer::release_pending_offload_pairs(overlap_pool);
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     OverlapDecodeRetiresInvalidPrefillHostFront) {
+  constexpr int32_t kKvBlockSize = 4;
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const auto restore_stride = folly::makeGuard([original_chunk_stride] {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kKvBlockSize;
+
+  for (const bool host_has_capacity : {false, true}) {
+    SCOPED_TRACE(host_has_capacity);
+    BlockManagerPool::Options options = make_flat_kv_options();
+    options.enable_linear_state(true)
+        .block_size(kKvBlockSize)
+        .linear_state_num_slots(16)
+        .host_num_blocks_by_type(
+            {{BlockType::KV, 128}, {BlockType::LINEAR, 16}})
+        .enable_prefix_cache(false)
+        .enable_disagg_pd(true)
+        .instance_is_decode(true)
+        .enable_kvcache_store(true)
+        .num_embedding_blocks(64)
+        .num_speculative_tokens(1)
+        .enable_schedule_overlap(true);
+    HierarchyBlockManagerPool pool(options, /*engine=*/nullptr, /*dp_size=*/1);
+    BlockManager* host_leaf = HierarchyPoolTestPeer::host_leaves(pool)
+                                  .at(BlockType::LINEAR)
+                                  .leaf.get();
+    const size_t host_free_before = host_leaf->num_free_blocks();
+    Sequence sequence = make_test_sequence(
+        /*index=*/0,
+        std::vector<int32_t>(9, 103),
+        /*enable_schedule_overlap=*/true);
+    auto cleanup = folly::makeGuard([&pool, &sequence] {
+      pool.deallocate(&sequence);
+      HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+    });
+    ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/9));
+    sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+    auto append_generated_token = [&sequence](int32_t token_id) {
+      sequence.append_token(/*fake placeholder=*/-1);
+      sequence.update_last_step_token(Token(token_id), /*token_offset=*/0);
+    };
+    append_generated_token(104);
+    append_generated_token(105);
+    append_generated_token(106);
+    sequence.set_accepted_length(0);
+    ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+    ASSERT_EQ(sequence.host_kv_state().num_blocks(BlockType::LINEAR), 2u);
+    const int32_t host_read_id =
+        sequence.host_kv_state().blocks(BlockType::LINEAR).back().id();
+
+    // Actual prefill collect removes the host front, leaving [-1, live];
+    // simulate its in-flight ownership.
+    Block prefill_destination =
+        HierarchyPoolTestPeer::take_host_linear_front(sequence);
+    ASSERT_TRUE(prefill_destination.is_valid());
+    ASSERT_FALSE(
+        sequence.host_kv_state().blocks(BlockType::LINEAR).front().is_valid());
+    ASSERT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).front().id(),
+              -1);
+    std::vector<Block> host_held;
+    if (!host_has_capacity) {
+      host_held = exhaust_free_blocks(host_leaf, /*keep_free=*/0);
+      ASSERT_EQ(host_leaf->num_free_blocks(), 0u);
+    }
+    append_generated_token(107);
+    sequence.set_accepted_length(1);
+    ASSERT_EQ(sequence.kv_state().kv_cache_tokens_num(), 12u);
+    ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+    const Slice<Block> repaired =
+        sequence.host_kv_state().blocks(BlockType::LINEAR);
+    // Overlap keeps the invalid front for collect. The live slot stays.
+    ASSERT_EQ(repaired.size(), 2u);
+    EXPECT_FALSE(repaired.front().is_valid());
+    EXPECT_TRUE(repaired.back().is_valid());
+    EXPECT_EQ(repaired.back().id(), host_read_id);
+    EXPECT_NE(repaired.back().id(), prefill_destination.id());
+    EXPECT_EQ(repaired.back().ref_count(), 1u);
+    std::shared_ptr<OffloadBlockPair> pair =
+        HierarchyPoolTestPeer::take_linear_offload_pair(pool);
+    // The front is invalid, so collect does not queue a LINEAR pair.
+    EXPECT_EQ(pair, nullptr);
+    pair.reset();
+    host_held.clear();
+    prefill_destination = Block();
+    pool.deallocate(&sequence);
+    HierarchyPoolTestPeer::release_pending_offload_pairs(pool);
+    cleanup.dismiss();
+    host_leaf->reset_prefix_cache();
+    EXPECT_EQ(host_leaf->num_free_blocks(), host_free_before);
+  }
+}
+
 TEST(HierarchyBlockManagerPoolTest,
      DecodeLinearCheckpointRowTracksBoundaryOvershoot) {
   constexpr size_t kCheckpointStride = 8;
@@ -2550,9 +3489,9 @@ TEST(HierarchyBlockManagerPoolTest,
   const int32_t host_live_id = host_before.back().id();
 
   // One more generated token lands the cursor on 12. accepted_length 1 makes
-  // the completed span [10, 12), which crosses that boundary. Overlap is off,
-  // so the saved block is the back slot. allocate swaps it to the front, and
-  // collect moves it.
+  // the completed span [10, 12), which crosses that boundary. Host offload
+  // keeps the completed checkpoint at the front and appends the next write.
+  // collect moves that front.
   sequence.append_token(107);
   ASSERT_EQ(sequence.kv_state().kv_cache_tokens_num(), 12u);
   sequence.set_accepted_length(kAcceptedLength);
@@ -2579,6 +3518,76 @@ TEST(HierarchyBlockManagerPoolTest,
 
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       original_chunk_stride;
+}
+
+TEST(HierarchyBlockManagerPoolTest, DecodeOffloadsKvWithExtraHbmReference) {
+  constexpr int32_t kBlockSize = 4;
+  constexpr size_t kPreviousBoundary = 8;
+  constexpr size_t kCheckpoint = 12;
+  BlockManagerPool::Options options = make_flat_kv_options();
+  options.block_size(kBlockSize)
+      .enable_linear_state(true)
+      .linear_state_num_slots(16)
+      .host_num_blocks_by_type({{BlockType::KV, 128}, {BlockType::LINEAR, 16}})
+      .hasher_type(BlockHasherType::MTP_TEXT)
+      .enable_disagg_pd(true)
+      .instance_is_decode(true)
+      .enable_kvcache_store(true)
+      .num_embedding_blocks(16)
+      .num_speculative_tokens(1);
+  const int32_t original_chunk_stride =
+      SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill();
+  const auto restore_stride = folly::makeGuard([original_chunk_stride] {
+    SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+        original_chunk_stride;
+  });
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
+      kBlockSize;
+
+  FakePrefetchEngine engine(2);
+  HierarchyBlockManagerPool pool(options, &engine, /*dp_size=*/1);
+  const auto shutdown =
+      folly::makeGuard([&pool, &engine] { shutdown_pool(pool, engine); });
+  Sequence sequence =
+      make_test_sequence(/*index=*/0, std::vector<int32_t>(9, 103));
+  const auto cleanup = folly::makeGuard([&pool, &sequence] {
+    pool.deallocate(&sequence);
+    pool.transfer_blocks();
+  });
+  ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  sequence.host_kv_state().set_kv_cache_tokens_num(kPreviousBoundary);
+  sequence.append_token(104);
+  sequence.append_token(105);
+  sequence.append_token(106);
+  ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+  sequence.append_token(107);
+  sequence.set_accepted_length(1);
+  ASSERT_EQ(sequence.kv_cache_tokens_num(), kCheckpoint);
+  const Block& kv_block = sequence.kv_state().blocks(BlockType::KV)[2];
+  const int32_t kv_id = kv_block.id();
+  {
+    const Block keepalive = kv_block;
+    ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+    EXPECT_EQ(keepalive.ref_count(), 4u);
+    pool.transfer_blocks();
+    EXPECT_EQ(transfer_count(engine, BlockType::LINEAR), 1u);
+    ASSERT_EQ(transfer_count(engine, BlockType::KV), 1u);
+    ASSERT_FALSE(engine.offloads_.empty());
+    const auto& infos = engine.offloads_.back().infos;
+    const auto kv = std::find_if(
+        infos.begin(), infos.end(), [](const BlockTransferInfo& info) {
+          return info.block_type == BlockType::KV;
+        });
+    ASSERT_NE(kv, infos.end());
+    EXPECT_EQ(kv->src_block_id, kv_id);
+    EXPECT_EQ(XXH3Key(kv->hash_key), sequence.block_hashes(kBlockSize)[2]);
+    EXPECT_EQ(sequence.host_kv_state().kv_cache_tokens_num(), kCheckpoint);
+  }
+  HierarchyPoolTestPeer::collect_offload_pairs(pool, &sequence);
+  pool.transfer_blocks();
+  EXPECT_EQ(transfer_count(engine, BlockType::KV), 1u);
+  EXPECT_EQ(transfer_count(engine, BlockType::LINEAR), 1u);
 }
 
 TEST(HierarchyBlockManagerPoolTest, V41DecodeOffloadsCommittedTokenUnit) {

@@ -3132,7 +3132,7 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   options.num_blocks(2048)
       .block_size(2)
       .enable_linear_state(true)
-      .linear_state_num_slots(3)
+      .linear_state_num_slots(4)
       .num_speculative_tokens(3)
       .enable_prefix_cache(false);
   CompositeBlockManager manager(build_composite_leaves(options), options);
@@ -3164,6 +3164,8 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   prefill.process_sample_output(first_token, true);
   EXPECT_TRUE(timing->has_generated_token());
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 2046u);
+  // Retire the completed prefill batch before scheduling further decode steps.
+  prefill = Batch();
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   Batch first;
   first.add(&sequence, 1);
@@ -3191,6 +3193,7 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   }
   accepted.outputs.emplace_back(std::move(accepted_row));
   first.process_sample_output(accepted, true);
+  first = Batch();
   EXPECT_EQ(sequence.kv_cache_tokens_num(), 2051u);
   // Four committed tokens (offset 0..3) each advance the HBM cursor once
   // from the placeholder cursor of 2047.
@@ -3206,18 +3209,18 @@ TEST(BatchTest, OverlapRawAcceptanceRollsLinearStateAtCheckpoint) {
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(third_input.input_params.embedding.linear_state_read_ids.front(),
             source_id);
-  EXPECT_EQ(third_input.input_params.embedding.linear_state_ids.front(),
-            source_id);
+  const int32_t third_output_id =
+      third_input.input_params.embedding.linear_state_ids.front();
+  EXPECT_EQ(third_output_id, source_id);
   third.process_sample_output(fake, false);
   accepted.outputs.front().tokens.resize(2);
   second.process_sample_output(accepted, true);
+  second = Batch();
   // The resized row commits two tokens from the post-placeholder cursor 2051.
   EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 2053u);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
-  EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
-  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
-            source_id);
+  EXPECT_EQ(sequence.get_linear_state_slot_id(), third_output_id);
   manager.deallocate_for_sequence(&sequence);
 }
 
@@ -3365,10 +3368,12 @@ TEST(BatchTest, OverlapDecodeProtectsPrefillTailNearCheckpoint) {
       ASSERT_TRUE(
           manager.allocate_sequence(&sequence, sequence.num_tokens() + 6));
       ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
+      // The prefill batch still retains its source. Decode must read the latest
+      // output and write a separate slot instead of reusing the prefill tail.
       EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
                 decode_slot_id);
-      EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
-      EXPECT_NE(decode_slot_id, source_id);
+      EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
+      EXPECT_NE(sequence.get_linear_state_slot_id(), decode_slot_id);
       manager.deallocate_for_sequence(&sequence);
     }
   }

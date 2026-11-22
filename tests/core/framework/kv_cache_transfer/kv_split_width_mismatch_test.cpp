@@ -358,6 +358,33 @@ TEST(KvSplitWidthMismatchTest, EqualWidthPairKeepsRankLocalMapping) {
                "KV remote id coverage shortage");
 }
 
+// Prefill and Decode each hold one LINEAR write. The step mapping copies
+// that write onto the one remote id.
+TEST(KvSplitWidthMismatchTest, LinearSingleLocalMapsOntoRemoteWrite) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(128);
+  BlockManagerImpl manager(options);
+  Sequence sequence = make_sequence(manager.allocate(1), /*prompt_token_count=*/8);
+  std::vector<Block> linear = manager.allocate(1);
+  ASSERT_EQ(linear.size(), 1u);
+  const int32_t local_write = linear.front().id();
+  sequence.kv_state().add_blocks(BlockType::LINEAR, std::move(linear));
+
+  TransferKVInfo info;
+  info.request_id = "linear-write-only";
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::LINEAR);
+  mapping.remote_ids = {502};
+  info.mappings.emplace_back(std::move(mapping));
+
+  const TransferKVInfo step = build_transfer_step(
+      info, &sequence, /*seq_len=*/8, /*kv_split_size=*/1);
+  ASSERT_EQ(step.mappings.size(), 1u);
+  EXPECT_EQ(step.mappings[0].local_ids,
+            std::vector<uint64_t>{static_cast<uint64_t>(local_write)});
+  EXPECT_EQ(step.mappings[0].remote_ids, std::vector<uint64_t>{502});
+}
+
 // The classifier's own contract, including the fail-closed half: only equal
 // declared widths and an unsplit destination are expressible, every other pair
 // is refused with both widths named, and the settled pair is expressible

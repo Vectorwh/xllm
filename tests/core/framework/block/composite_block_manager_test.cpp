@@ -23,7 +23,6 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/common/metrics.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/block/block_manager_impl.h"
 #include "core/framework/block/block_manager_pool.h"
@@ -1614,38 +1613,6 @@ BlockManager::Options linear_options(uint32_t num_slots,
   return options;
 }
 
-class LinearAllocationFailureMetrics final {
- public:
-  void expect_delta(double prefill = 0,
-                    double decode = 0,
-                    double swap = 0,
-                    double shared_write = 0) const {
-    EXPECT_EQ(COUNTER_linear_prefill_private_write_alloc_failures.get_value() -
-                  prefill_,
-              prefill);
-    EXPECT_EQ(COUNTER_linear_decode_private_write_alloc_failures.get_value() -
-                  decode_,
-              decode);
-    EXPECT_EQ(
-        COUNTER_linear_decode_swap_private_write_alloc_failures.get_value() -
-            swap_,
-        swap);
-    EXPECT_EQ(COUNTER_linear_decode_shared_write_slot_failures.get_value() -
-                  shared_write_,
-              shared_write);
-  }
-
- private:
-  const double prefill_ =
-      COUNTER_linear_prefill_private_write_alloc_failures.get_value();
-  const double decode_ =
-      COUNTER_linear_decode_private_write_alloc_failures.get_value();
-  const double swap_ =
-      COUNTER_linear_decode_swap_private_write_alloc_failures.get_value();
-  const double shared_write_ =
-      COUNTER_linear_decode_shared_write_slot_failures.get_value();
-};
-
 class LinearStateWindowTest : public ::testing::TestWithParam<bool> {
  protected:
   void SetUp() override {
@@ -1665,7 +1632,8 @@ class LinearStateWindowTest : public ::testing::TestWithParam<bool> {
       uint32_t kv_blocks = 32,
       uint32_t speculative_tokens = 0,
       bool concurrent = false,
-      uint32_t block_size = 2) {
+      uint32_t block_size = 2,
+      bool enable_schedule_overlap = false) {
     BlockManager::Options options;
     options.num_blocks(kv_blocks)
         .block_size(block_size)
@@ -1673,6 +1641,7 @@ class LinearStateWindowTest : public ::testing::TestWithParam<bool> {
         .linear_state_num_slots(slots)
         .num_speculative_tokens(speculative_tokens)
         .enable_disagg_pd(concurrent)
+        .enable_schedule_overlap(enable_schedule_overlap)
         .enable_prefix_cache(GetParam());
     return std::make_unique<CompositeBlockManager>(
         build_composite_leaves(options), options);
@@ -1707,6 +1676,13 @@ class LinearStateWindowTest : public ::testing::TestWithParam<bool> {
   RequestSamplingParam sampling_param_;
   StoppingChecker stopping_checker_;
 };
+
+void expect_last_linear_ref_count(const KVCacheState& kv_state,
+                                  uint32_t expected) {
+  const Slice<Block> blocks = kv_state.blocks(BlockType::LINEAR);
+  ASSERT_FALSE(blocks.empty());
+  EXPECT_EQ(blocks.back().ref_count(), expected);
+}
 
 }  // namespace
 
@@ -1805,8 +1781,6 @@ TEST_P(LinearStateWindowTest,
   sequence.append_token(8);
   sequence.host_kv_state().add_blocks(BlockType::LINEAR,
                                       host_manager.allocate(2));
-  const int32_t checkpoint_id =
-      sequence.host_kv_state().blocks(BlockType::LINEAR).front().id();
   const int32_t live_id =
       sequence.host_kv_state().blocks(BlockType::LINEAR).back().id();
 
@@ -1817,14 +1791,18 @@ TEST_P(LinearStateWindowTest,
   ASSERT_TRUE(allocated.has_value());
   EXPECT_TRUE(allocated->empty());
   EXPECT_TRUE(sequence.block_hashes(4).empty());
-  // The step has not confirmed a checkpoint, so the two slots swap. The
-  // previous live slot is the read source and the checkpoint slot is live.
+  // Both slots are exclusive and this step does not predict a checkpoint,
+  // so the window swaps. The previous write becomes the read source.
   ASSERT_EQ(sequence.host_kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).front().id(),
             live_id);
-  EXPECT_EQ(sequence.host_kv_state().blocks(BlockType::LINEAR).back().id(),
-            checkpoint_id);
+  EXPECT_NE(sequence.host_kv_state().blocks(BlockType::LINEAR).back().id(),
+            live_id);
+  EXPECT_EQ(
+      sequence.host_kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+      1u);
 
+  allocated.reset();
   (void)sequence.host_kv_state().take_blocks(BlockType::LINEAR);
   sequence.host_kv_state().reset();
   EXPECT_EQ(host_manager.num_used_blocks(), 0u);
@@ -1977,10 +1955,17 @@ TEST_P(LinearStateWindowTest,
   sequence.append_token(8);
   ASSERT_TRUE(manager->allocate_sequence(&sequence, sequence.num_tokens()));
   const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
-  // Decode keeps the two-slot window. The previous write slot stays in front.
+  // The first decode step does not predict a checkpoint. Prefix cache on
+  // publishes the previous write, so that slot is shared. Decode keeps it
+  // as the read source and appends a private write. Prefix cache off swaps
+  // the exclusive window so the previous write becomes the read source.
   ASSERT_EQ(blocks.size(), 2u);
+  EXPECT_EQ(blocks.back().ref_count(), 1u);
+  EXPECT_FALSE(blocks.back().is_shared());
   EXPECT_EQ(blocks.front().id(), previous_id);
-  EXPECT_TRUE(blocks.front().is_valid());
+  EXPECT_NE(blocks.back().id(), previous_id);
+  EXPECT_EQ(blocks.front().ref_count(), 1u);
+  EXPECT_TRUE(blocks.back().is_valid());
   manager->deallocate_for_sequence(&sequence);
   EXPECT_EQ(
       manager->leaf_entries().at(BlockType::LINEAR).leaf->num_used_blocks(),
@@ -1988,7 +1973,6 @@ TEST_P(LinearStateWindowTest,
 }
 
 TEST_P(LinearStateWindowTest, ExhaustionPreservesSourceAndRollsBackKvGrowth) {
-  const LinearAllocationFailureMetrics metrics;
   auto manager = make_manager(3);
   Sequence sequence = make_sequence(0, std::vector<int32_t>(13, 7));
   ASSERT_TRUE(manager->allocate_sequence(&sequence, 4));
@@ -2000,23 +1984,27 @@ TEST_P(LinearStateWindowTest, ExhaustionPreservesSourceAndRollsBackKvGrowth) {
       sequence.kv_state().blocks(BlockType::LINEAR).front();
   const size_t kv_used =
       manager->leaf_entries().at(BlockType::KV).leaf->num_used_blocks();
-  metrics.expect_delta();
-  for (size_t retry = 0; retry < 2; ++retry) {
-    // The retained read slot leaves no private LINEAR write slot. Do not admit
-    // the prefill with the shared source as its write destination.
+  {
+    const Block retained_source =
+        sequence.kv_state().blocks(BlockType::LINEAR).back();
     EXPECT_FALSE(manager->allocate_sequence(&sequence, 12));
-    metrics.expect_delta(/*prefill=*/static_cast<double>(retry + 1));
+    EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+    EXPECT_EQ(manager->leaf_entries().at(BlockType::KV).leaf->num_used_blocks(),
+              kv_used);
+  }
+  for (size_t retry = 0; retry < 2; ++retry) {
+    // Prefill drops the old front and reuses the remaining exclusive slot
+    // when no spare slot is free.
+    EXPECT_TRUE(manager->allocate_sequence(&sequence, 12));
     EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
     EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
     EXPECT_EQ(sequence.kv_cache_tokens_num(), 8u);
     EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::LINEAR), 0u);
     EXPECT_EQ(manager->leaf_entries().at(BlockType::KV).leaf->num_used_blocks(),
-              kv_used);
+              kv_used + 2);
   }
   retained_old_read = Block();
-  const LinearAllocationFailureMetrics retry_metrics;
   ASSERT_TRUE(manager->allocate_sequence(&sequence, 12));
-  retry_metrics.expect_delta();
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
             source_id);
@@ -2026,123 +2014,13 @@ TEST_P(LinearStateWindowTest, ExhaustionPreservesSourceAndRollsBackKvGrowth) {
       0u);
 }
 
-TEST_P(LinearStateWindowTest, SharedDecodeReadSlotBecomesPrivateBeforeSwap) {
-  if (!GetParam()) {
-    GTEST_SKIP() << "Shared prefix state requires prefix caching.";
-  }
-  for (const uint32_t slots : {5u, 6u}) {
-    SCOPED_TRACE(slots);
-    BlockManager::Options options = linear_options(slots, 8, true);
-    options.enable_schedule_overlap(true);
-    LinearStateBlockManager manager(options);
-    Sequence first = make_sequence(0, std::vector<int32_t>(5, 7), true);
-    Sequence second = make_sequence(1, std::vector<int32_t>(5, 7), true);
-    std::vector<Block> shared = manager.allocate(1);
-    std::vector<Block> first_write = manager.allocate(1);
-    std::vector<Block> second_write = manager.allocate(1);
-    ASSERT_EQ(shared.size(), 1u);
-    ASSERT_EQ(first_write.size(), 1u);
-    ASSERT_EQ(second_write.size(), 1u);
-    const int32_t shared_id = shared.front().id();
-    for (Sequence* sequence : {&first, &second}) {
-      std::vector<Block> window;
-      window.emplace_back(shared.front());
-      if (sequence == &first) {
-        window.emplace_back(std::move(first_write.front()));
-      } else {
-        window.emplace_back(std::move(second_write.front()));
-      }
-      sequence->kv_state().add_blocks(BlockType::LINEAR, std::move(window));
-      sequence->kv_state().set_kv_cache_tokens_num(5);
-      sequence->append_token(8);
-      ASSERT_FALSE(sequence->is_prefill_stage());
-    }
-    first_write.clear();
-    second_write.clear();
-    const int32_t first_old_write = first.get_linear_state_slot_id();
-    const LinearAllocationFailureMetrics metrics;
-    auto first_result = manager.allocate_for_sequence(
-        &first, first.kv_state(), first.num_tokens());
-    ASSERT_TRUE(first_result.has_value());
-    metrics.expect_delta();
-    EXPECT_TRUE(first_result->empty());
-    const int32_t first_slot = first.get_linear_state_slot_id();
-    EXPECT_NE(first_slot, shared_id);
-    EXPECT_EQ(first.kv_state().blocks(BlockType::LINEAR).front().id(),
-              first_old_write);
-
-    const int32_t second_old_write = second.get_linear_state_slot_id();
-    auto second_result = manager.allocate_for_sequence(
-        &second, second.kv_state(), second.num_tokens());
-    metrics.expect_delta(
-        /*prefill=*/0, /*decode=*/0, /*swap=*/slots == 5 ? 1 : 0);
-    if (slots == 5) {
-      EXPECT_FALSE(second_result.has_value());
-      EXPECT_EQ(second.get_linear_state_slot_id(), second_old_write);
-      EXPECT_EQ(second.kv_state().blocks(BlockType::LINEAR).front().id(),
-                shared_id);
-    } else {
-      ASSERT_TRUE(second_result.has_value());
-      EXPECT_NE(second.get_linear_state_slot_id(), shared_id);
-      EXPECT_NE(second.get_linear_state_slot_id(), first_slot);
-    }
-    (void)first.kv_state().take_blocks(BlockType::LINEAR);
-    (void)second.kv_state().take_blocks(BlockType::LINEAR);
-    first.reset();
-    second.reset();
-    shared.clear();
-    EXPECT_EQ(manager.num_used_blocks(), 0u);
-  }
-}
-
-TEST_P(LinearStateWindowTest, SharedSingleDecodeSlotRequiresPrivateWrite) {
-  if (!GetParam()) {
-    GTEST_SKIP() << "Shared prefix state requires prefix caching.";
-  }
-  for (const uint32_t slots : {2u, 3u}) {
-    SCOPED_TRACE(slots);
-    LinearStateBlockManager manager(linear_options(slots, 8, true));
-    Sequence sequence = make_sequence(0, std::vector<int32_t>(5, 7));
-    std::vector<Block> shared = manager.allocate(1);
-    ASSERT_EQ(shared.size(), 1u);
-    sequence.kv_state().add_blocks(BlockType::LINEAR, {shared.front()});
-    sequence.kv_state().set_kv_cache_tokens_num(5);
-    sequence.append_token(8);
-    const int32_t shared_id = shared.front().id();
-    const LinearAllocationFailureMetrics metrics;
-    auto allocated = manager.allocate_for_sequence(
-        &sequence, sequence.kv_state(), sequence.num_tokens());
-    metrics.expect_delta(/*prefill=*/0, /*decode=*/slots == 2 ? 1 : 0);
-    if (slots == 2) {
-      EXPECT_FALSE(allocated.has_value());
-      EXPECT_EQ(sequence.get_linear_state_slot_id(), shared_id);
-    } else {
-      ASSERT_TRUE(allocated.has_value());
-      ASSERT_EQ(allocated->size(), 1u);
-      EXPECT_NE(allocated->front().id(), shared_id);
-      sequence.kv_state().add_blocks(BlockType::LINEAR, std::move(*allocated));
-      const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
-      EXPECT_EQ(blocks.front().id(), shared_id);
-      EXPECT_NE(blocks.back().id(), shared_id);
-    }
-    (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
-    sequence.reset();
-    shared.clear();
-    EXPECT_EQ(manager.num_used_blocks(), 0u);
-  }
-}
-
-TEST_P(LinearStateWindowTest,
-       SharedCheckpointReadIsPrivateBeforeNonOverlapSwap) {
-  if (!GetParam()) {
-    GTEST_SKIP() << "Shared prefix state requires prefix caching.";
-  }
+TEST_P(LinearStateWindowTest, NonOverlapDoesNotWriteInflightCheckpointFront) {
   for (const uint32_t slots : {3u, 4u}) {
     SCOPED_TRACE(slots);
     LinearStateBlockManager manager(
         linear_options(slots,
                        8,
-                       true,
+                       GetParam(),
                        /*instance_is_decode=*/false,
                        /*num_speculative_tokens=*/0,
                        /*preserve_decode_checkpoint=*/true));
@@ -2158,27 +2036,23 @@ TEST_P(LinearStateWindowTest,
     window.emplace_back(std::move(current_write.front()));
     current_write.clear();
     sequence.kv_state().add_blocks(BlockType::LINEAR, std::move(window));
-    sequence.kv_state().set_kv_cache_tokens_num(9);
-    sequence.set_accepted_length(1);
+    sequence.kv_state().set_kv_cache_tokens_num(5);
     sequence.append_token(8);
+    sequence.set_accepted_length(1);
+    sequence.kv_state().set_kv_cache_tokens_num(9);
     ASSERT_FALSE(sequence.is_prefill_stage());
-    const LinearAllocationFailureMetrics metrics;
+    ASSERT_TRUE(last_decode_step_crosses_checkpoint(sequence, 8));
     auto allocated = manager.allocate_for_sequence(
         &sequence, sequence.kv_state(), sequence.num_tokens());
-    metrics.expect_delta(
-        /*prefill=*/0, /*decode=*/0, /*swap=*/slots == 3 ? 1 : 0);
-    if (slots == 3) {
-      EXPECT_FALSE(allocated.has_value());
-      EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
-                shared_id);
-      EXPECT_EQ(sequence.get_linear_state_slot_id(), current_write_id);
-    } else {
-      ASSERT_TRUE(allocated.has_value());
-      EXPECT_TRUE(allocated->empty());
-      EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
-                current_write_id);
-      EXPECT_NE(sequence.get_linear_state_slot_id(), shared_id);
-    }
+    ASSERT_TRUE(allocated.has_value());
+    EXPECT_EQ(allocated->size(), slots - 3u);
+    sequence.kv_state().add_blocks(BlockType::LINEAR, std::move(*allocated));
+    const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
+    ASSERT_EQ(blocks.size(), slots - 2u);
+    EXPECT_EQ(blocks.front().id(), current_write_id);
+    EXPECT_NE(blocks.back().id(), shared_id);
+    EXPECT_EQ(blocks.back().ref_count(), 1u);
+    EXPECT_EQ(shared.front().ref_count(), 1u);
     (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
     sequence.reset();
     shared.clear();
@@ -2186,8 +2060,7 @@ TEST_P(LinearStateWindowTest,
   }
 }
 
-TEST_P(LinearStateWindowTest,
-       SharedCurrentDecodeWriteIsRejectedWithoutAllocation) {
+TEST_P(LinearStateWindowTest, PreviousWriteBecomesReadSourceAfterRotation) {
   LinearStateBlockManager manager(
       linear_options(/*num_slots=*/4,
                      /*block_size=*/8,
@@ -2195,49 +2068,243 @@ TEST_P(LinearStateWindowTest,
   Sequence sequence = make_sequence(/*index=*/0, std::vector<int32_t>(5, 7));
   std::vector<Block> window = manager.allocate(/*num_blocks=*/2);
   ASSERT_EQ(window.size(), 2u);
-  const int32_t read_id = window.front().id();
   const int32_t write_id = window.back().id();
   Block retained_write = window.back();
   sequence.kv_state().add_blocks(BlockType::LINEAR, std::move(window));
   sequence.kv_state().set_kv_cache_tokens_num(5);
   sequence.append_token(8);
   ASSERT_FALSE(sequence.is_prefill_stage());
-  // Capacity is available: only the shared current-write state rejects decode.
-  ASSERT_EQ(manager.num_free_blocks(), 1u);
-  const LinearAllocationFailureMetrics metrics;
-  for (size_t retry = 0; retry < 2; ++retry) {
-    auto allocated = manager.allocate_for_sequence(
-        &sequence, sequence.kv_state(), sequence.num_tokens());
-    EXPECT_FALSE(allocated.has_value());
-    metrics.expect_delta(/*prefill=*/0,
-                         /*decode=*/0,
-                         /*swap=*/0,
-                         /*shared_write=*/static_cast<double>(retry + 1));
-    ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
-    EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
-              read_id);
-    EXPECT_EQ(sequence.get_linear_state_slot_id(), write_id);
-    EXPECT_EQ(manager.num_free_blocks(), 1u);
-  }
-
-  retained_write = Block();
-  const LinearAllocationFailureMetrics retry_metrics;
+  const int32_t previous_read_id =
+      sequence.kv_state().blocks(BlockType::LINEAR).front().id();
   auto allocated = manager.allocate_for_sequence(
       &sequence, sequence.kv_state(), sequence.num_tokens());
   ASSERT_TRUE(allocated.has_value());
   EXPECT_TRUE(allocated->empty());
-  retry_metrics.expect_delta();
-  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
-            write_id);
-  EXPECT_EQ(sequence.get_linear_state_slot_id(), read_id);
+  const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(blocks.size(), 2u);
+  EXPECT_EQ(blocks.front().id(), write_id);
+  EXPECT_EQ(blocks.back().id(), previous_read_id);
+  EXPECT_EQ(retained_write.ref_count(), 2u);
   EXPECT_EQ(manager.num_free_blocks(), 1u);
   (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
+  sequence.reset();
+  retained_write = Block();
+  EXPECT_EQ(manager.num_used_blocks(), 0u);
+}
+
+TEST_P(LinearStateWindowTest, InflightSingleDecodeSlotIsReusedWithinBoundary) {
+  LinearStateBlockManager manager(linear_options(3, 8, GetParam()));
+  Sequence sequence = make_sequence(0, std::vector<int32_t>(5, 7));
+  sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(1));
+  Block inflight = sequence.kv_state().blocks(BlockType::LINEAR).back();
+  const int32_t source_id = inflight.id();
+  std::vector<Block> held = manager.allocate(1);
+  ASSERT_EQ(held.size(), 1u);
+  sequence.kv_state().set_kv_cache_tokens_num(5);
+  sequence.append_token(8);
+
+  for (const bool spare_available : {false, true}) {
+    SCOPED_TRACE(spare_available);
+    if (spare_available) {
+      held.clear();
+    }
+    auto allocated = manager.allocate_for_sequence(
+        &sequence, sequence.kv_state(), sequence.num_tokens());
+    ASSERT_TRUE(allocated.has_value());
+    EXPECT_TRUE(allocated->empty());
+    ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+    EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+    EXPECT_EQ(inflight.ref_count(), 2u);
+  }
+  (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
+  inflight = Block();
   sequence.reset();
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 }
 
+TEST_P(LinearStateWindowTest, InflightFrontIsNotReusedAsWriteWithoutSpare) {
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    BlockManager::Options options = linear_options(4, 8, GetParam());
+    options.enable_schedule_overlap(overlap);
+    LinearStateBlockManager manager(options);
+    Sequence sequence = make_sequence(0, std::vector<int32_t>(5, 7), overlap);
+    sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(2));
+    Block inflight = sequence.kv_state().blocks(BlockType::LINEAR).front();
+    const int32_t source_id = sequence.get_linear_state_slot_id();
+    std::vector<Block> held = manager.allocate(1);
+    ASSERT_EQ(held.size(), 1u);
+    sequence.kv_state().set_kv_cache_tokens_num(5);
+    sequence.append_token(8);
+
+    auto allocated = manager.allocate_for_sequence(
+        &sequence, sequence.kv_state(), sequence.num_tokens());
+    ASSERT_TRUE(allocated.has_value());
+    EXPECT_TRUE(allocated->empty());
+    const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
+    ASSERT_EQ(blocks.size(), 1u);
+    EXPECT_EQ(blocks.front().id(), source_id);
+    EXPECT_EQ(inflight.ref_count(), 1u);
+    EXPECT_EQ(manager.num_free_blocks(), 0u);
+    (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
+    held.clear();
+    inflight = Block();
+    sequence.reset();
+    EXPECT_EQ(manager.num_used_blocks(), 0u);
+  }
+}
+
+TEST_P(LinearStateWindowTest, SpeculativeAcceptanceSelectsRetireOrRotate) {
+  for (const bool overlap : {false, true}) {
+    for (const bool checkpoint_hit : {false, true}) {
+      SCOPED_TRACE(overlap);
+      SCOPED_TRACE(checkpoint_hit);
+      BlockManager::Options options =
+          linear_options(4,
+                         8,
+                         GetParam(),
+                         /*instance_is_decode=*/false,
+                         /*num_speculative_tokens=*/3);
+      options.enable_schedule_overlap(overlap);
+      LinearStateBlockManager manager(options);
+      Sequence sequence = make_sequence(0, std::vector<int32_t>(6, 7), overlap);
+      sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(2));
+      Block inflight = sequence.kv_state().blocks(BlockType::LINEAR).back();
+      const int32_t source_id = inflight.id();
+      std::vector<Block> held = manager.allocate(1);
+      ASSERT_EQ(held.size(), 1u);
+      sequence.kv_state().set_kv_cache_tokens_num(6);
+      sequence.append_token(8);
+      sequence.set_accepted_length(checkpoint_hit ? 1 : 0);
+      sequence.kv_state().set_kv_cache_tokens_num(checkpoint_hit ? 8 : 7);
+      EXPECT_EQ(last_decode_step_crosses_checkpoint(sequence, 8),
+                checkpoint_hit);
+      auto allocated = manager.allocate_for_sequence(
+          &sequence, sequence.kv_state(), sequence.num_tokens());
+      ASSERT_TRUE(allocated.has_value());
+      EXPECT_TRUE(allocated->empty());
+      const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
+      ASSERT_EQ(blocks.size(), checkpoint_hit ? 1u : 2u);
+      EXPECT_EQ(blocks.front().id(), source_id);
+      EXPECT_EQ(blocks.back().id() == source_id, checkpoint_hit);
+      EXPECT_EQ(inflight.ref_count(), 2u);
+      (void)sequence.kv_state().take_blocks(BlockType::LINEAR);
+      held.clear();
+      inflight = Block();
+      sequence.reset();
+      EXPECT_EQ(manager.num_used_blocks(), 0u);
+    }
+  }
+}
+
+TEST_P(LinearStateWindowTest,
+       ExclusiveSingleSlotSkipsPredictedCheckpointWhenCapacityIsExhausted) {
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    BlockManager::Options options = linear_options(
+        /*num_slots=*/2,
+        /*block_size=*/8,
+        /*enable_prefix_cache=*/GetParam(),
+        /*instance_is_decode=*/false,
+        /*num_speculative_tokens=*/3,
+        /*preserve_decode_checkpoint=*/true);
+    options.enable_schedule_overlap(overlap);
+    LinearStateBlockManager manager(options);
+    Sequence sequence = make_sequence(0, std::vector<int32_t>(6, 7), overlap);
+    sequence.kv_state().add_blocks(BlockType::LINEAR, manager.allocate(1));
+    const int32_t source_id = sequence.get_linear_state_slot_id();
+    sequence.kv_state().set_kv_cache_tokens_num(6);
+    sequence.append_token(8);
+    sequence.kv_state().set_kv_cache_tokens_num(7);
+    ASSERT_EQ(sequence.kv_cache_tokens_num(), 7u);
+    ASSERT_FALSE(last_decode_step_crosses_checkpoint(sequence, 8));
+    ASSERT_EQ(manager.num_free_blocks(), 0u);
+    auto allocated = manager.allocate_for_sequence(
+        &sequence, sequence.kv_state(), sequence.num_tokens());
+    ASSERT_TRUE(allocated.has_value());
+    EXPECT_TRUE(allocated->empty());
+    EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+    EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+    sequence.reset();
+    EXPECT_EQ(manager.num_used_blocks(), 0u);
+  }
+}
+
+TEST_P(LinearStateWindowTest,
+       CompletedBoundaryDoesNotReserveNextSlotBeforePrediction) {
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    BlockManager::Options options = linear_options(
+        /*num_slots=*/3,
+        /*block_size=*/8,
+        /*enable_prefix_cache=*/GetParam(),
+        /*instance_is_decode=*/false,
+        /*num_speculative_tokens=*/3,
+        /*preserve_decode_checkpoint=*/true);
+    options.enable_schedule_overlap(overlap);
+    LinearStateBlockManager manager(options);
+    Sequence sequence = make_sequence(0, std::vector<int32_t>(6, 7), overlap);
+    std::vector<Block> source = manager.allocate(1);
+    ASSERT_EQ(source.size(), 1u);
+    const int32_t source_id = source.front().id();
+    sequence.kv_state().add_blocks(BlockType::LINEAR, std::move(source));
+    std::vector<Block> held = manager.allocate(1);
+    ASSERT_EQ(held.size(), 1u);
+    sequence.kv_state().set_kv_cache_tokens_num(6);
+    sequence.append_token(8);
+    sequence.set_accepted_length(1);
+    sequence.kv_state().set_kv_cache_tokens_num(8);
+    ASSERT_TRUE(last_decode_step_crosses_checkpoint(sequence, 8));
+    for (const bool spare_available : {false, true}) {
+      SCOPED_TRACE(spare_available);
+      if (spare_available) {
+        held.clear();
+      }
+      auto allocated = manager.allocate_for_sequence(
+          &sequence, sequence.kv_state(), sequence.num_tokens());
+      ASSERT_TRUE(allocated.has_value());
+      EXPECT_TRUE(allocated->empty());
+      ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
+      EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+    }
+    sequence.reset();
+    EXPECT_EQ(manager.num_used_blocks(), 0u);
+  }
+}
+
+TEST_P(LinearStateWindowTest,
+       DecodeReusesLiveSlotAfterCompletedPrefillBoundary) {
+  auto manager = make_manager(/*slots=*/8);
+  Sequence sequence = make_sequence(/*index=*/0, std::vector<int32_t>(12, 7));
+
+  ASSERT_TRUE(manager->allocate_sequence(&sequence, /*num_tokens=*/4));
+  expect_last_linear_ref_count(sequence.kv_state(), 1u);
+  finish_input(sequence, 4);
+  manager->cache_for_sequence(&sequence);
+
+  ASSERT_TRUE(manager->allocate_sequence(&sequence, /*num_tokens=*/8));
+  expect_last_linear_ref_count(sequence.kv_state(), 1u);
+  finish_input(sequence, 8);
+  manager->cache_for_sequence(&sequence);
+
+  ASSERT_TRUE(manager->allocate_sequence(&sequence, sequence.num_tokens()));
+  expect_last_linear_ref_count(sequence.kv_state(), 1u);
+  finish_input(sequence, sequence.num_prompt_tokens());
+  manager->cache_for_sequence(&sequence);
+
+  sequence.append_token(8);
+  ASSERT_FALSE(sequence.is_prefill_stage());
+  const int32_t prefill_result_id = sequence.get_linear_state_slot_id();
+  ASSERT_TRUE(manager->allocate_sequence(&sequence, sequence.num_tokens()));
+  expect_last_linear_ref_count(sequence.kv_state(), 1u);
+  const Slice<Block> decode_blocks =
+      sequence.kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(decode_blocks.size(), 1u);
+  EXPECT_EQ(decode_blocks.back().id(), prefill_result_id);
+  manager->deallocate_for_sequence(&sequence);
+}
+
 TEST_P(LinearStateWindowTest, DecodeRollingExhaustionFallsBackToCurrentSource) {
-  const LinearAllocationFailureMetrics metrics;
   auto manager = make_manager(3, 32);
   Sequence sequence = make_sequence(0, {7, 7, 7});
   ASSERT_TRUE(manager->allocate_sequence(&sequence, 3));
@@ -2251,14 +2318,12 @@ TEST_P(LinearStateWindowTest, DecodeRollingExhaustionFallsBackToCurrentSource) {
 
   for (size_t retry = 0; retry < 2; ++retry) {
     EXPECT_TRUE(manager->allocate_sequence(&sequence, 4));
-    metrics.expect_delta();
     ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
     EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
   }
 
   held.clear();
   ASSERT_TRUE(manager->allocate_sequence(&sequence, 4));
-  metrics.expect_delta();
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
             source_id);
@@ -2312,24 +2377,52 @@ TEST_P(LinearStateWindowTest, IncompleteKvGrowthRollsBackLinearAllocation) {
   sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
   sequence.append_token(8);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, 4));
-  const int32_t source_id = sequence.get_linear_state_slot_id();
-
-  // Empty KV growth does not open another linear slot. The mounted source
-  // stays, and the sequence is not admitted.
-  EXPECT_FALSE(manager.allocate_sequence(&sequence, 5));
-  // The linear leaf still opens the write slot. KV growth stays empty, so
-  // admission fails, and the new slot is the live id.
+  const int32_t write_id = sequence.get_linear_state_slot_id();
+  sequence.append_token(9);
+  sequence.append_token(10);
+  sequence.append_token(11);
+  sequence.append_token(12);
+  ASSERT_EQ(sequence.kv_cache_tokens_num(), 7u);
+  ASSERT_FALSE(last_decode_step_crosses_checkpoint(sequence, 4));
+  // block_size is 2, so 7 cached tokens plus the next decode token predict a
+  // checkpoint. The leaf stages a fresh write before the KV leaf fails, and
+  // that in-place release of the stale front is not rolled back.
+  EXPECT_FALSE(manager.allocate_sequence(&sequence, 8));
+  // The exclusive window swaps before the predicted replacement is staged.
+  // The KV leaf fails and that staged slot is dropped, so the swap stays.
+  // The previous write is the read source. The other exclusive slot is last.
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
-  EXPECT_NE(sequence.get_linear_state_slot_id(), source_id);
+  EXPECT_NE(sequence.get_linear_state_slot_id(), write_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+            write_id);
+  EXPECT_NE(sequence.kv_state().blocks(BlockType::LINEAR).back().id(),
+            write_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+            1u);
   EXPECT_EQ(
       manager.leaf_entries().at(BlockType::LINEAR).leaf->num_used_blocks(), 2u);
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 2u);
   sequence.kv_state().add_blocks(
       BlockType::KV,
-      manager.leaf_entries().at(BlockType::KV).leaf->allocate(1));
-  ASSERT_TRUE(manager.allocate_sequence(&sequence, 5));
+      manager.leaf_entries().at(BlockType::KV).leaf->allocate(2));
+  ASSERT_TRUE(manager.allocate_sequence(&sequence, 8));
+  // The retry still predicts the checkpoint. The failed window has the
+  // previous write at the front. Host offload is off, so that front is
+  // dropped and a fresh write is appended, then the exclusive window swaps.
+  // The previous write is last again. The new slot is the read source.
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
-  EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
+  EXPECT_NE(sequence.kv_state().blocks(BlockType::LINEAR).front().id(),
+            write_id);
+  EXPECT_EQ(sequence.get_linear_state_slot_id(), write_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().id(),
+            write_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
+            1u);
+  EXPECT_EQ(
+      manager.leaf_entries().at(BlockType::LINEAR).leaf->num_used_blocks(), 2u);
   manager.deallocate_for_sequence(&sequence);
+  EXPECT_EQ(
+      manager.leaf_entries().at(BlockType::LINEAR).leaf->num_used_blocks(), 0u);
 }
 
 TEST_P(LinearStateWindowTest, PrefillCapacityIsIndependentOfCheckpointStride) {
@@ -2386,12 +2479,12 @@ TEST_P(LinearStateWindowTest, ColdPrefillRequiresPrivateWriteSlot) {
   const size_t kv_used =
       manager->leaf_entries().at(BlockType::KV).leaf->num_used_blocks();
   finish_input(sequence, 4);
-  // Only a read-only state slot remains; prefill needs a private write slot.
-  EXPECT_FALSE(manager->allocate_sequence(&sequence, 8));
+  // No spare slot is free, so prefill keeps the remaining exclusive slot.
+  EXPECT_TRUE(manager->allocate_sequence(&sequence, 8));
   EXPECT_EQ(sequence.get_linear_state_slot_id(), source_id);
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
   EXPECT_EQ(manager->leaf_entries().at(BlockType::KV).leaf->num_used_blocks(),
-            kv_used);
+            kv_used + 2);
   Sequence consumer = make_sequence(1, std::vector<int32_t>(9, 7));
   manager->allocate_shared_for_sequence(&consumer);
   // The producer has not published a checkpoint yet, so the consumer misses.
@@ -2471,6 +2564,51 @@ TEST_P(LinearStateWindowTest, OverlapDecodePredictsAndResolvesCheckpoint) {
           2u);
     }
     manager->deallocate_for_sequence(&sequence);
+  }
+}
+
+TEST_P(LinearStateWindowTest, FusedDecodeDoesNotSwapSharedPrefillFront) {
+  SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() = 8;
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap);
+    for (const size_t decode_cursor : {12u, 14u}) {
+      SCOPED_TRACE(decode_cursor);
+      auto manager = make_manager(8, 32, 2, false, 8, overlap);
+      Sequence sequence =
+          make_sequence(0, std::vector<int32_t>(decode_cursor, 7), overlap);
+      ASSERT_TRUE(manager->allocate_sequence(&sequence, 8));
+      finish_input(sequence, 8);
+      ASSERT_TRUE(manager->allocate_sequence(&sequence, decode_cursor));
+      const Slice<Block> prefill =
+          sequence.kv_state().blocks(BlockType::LINEAR);
+      ASSERT_EQ(prefill.size(), 2u);
+      const int32_t prefill_checkpoint_id = prefill.front().id();
+      const int32_t prefill_live_id = prefill.back().id();
+      const Block inflight_read = prefill.front();
+      const BlockManager* leaf =
+          manager->leaf_entries().at(BlockType::LINEAR).leaf.get();
+      EXPECT_EQ(leaf->num_blocks_in_prefix_cache(), GetParam() ? 1u : 0u);
+
+      finish_input(sequence, decode_cursor);
+      sequence.set_accepted_length(overlap ? 1 : 0);
+      ASSERT_FALSE(sequence.is_prefill_stage());
+      ASSERT_FALSE(last_decode_step_crosses_checkpoint(sequence, 8));
+      ASSERT_TRUE(manager->allocate_sequence(&sequence, decode_cursor + 3));
+
+      const Slice<Block> decode = sequence.kv_state().blocks(BlockType::LINEAR);
+      ASSERT_EQ(decode.size(), decode_cursor == 12 ? 1u : 2u);
+      EXPECT_EQ(decode.front().id(), prefill_live_id);
+      EXPECT_NE(decode.back().id(), prefill_checkpoint_id);
+      if (GetParam()) {
+        Sequence consumer =
+            make_sequence(1, std::vector<int32_t>(decode_cursor, 7));
+        manager->allocate_shared_for_sequence(&consumer);
+        ASSERT_EQ(consumer.kv_state().num_blocks(BlockType::LINEAR), 1u);
+        EXPECT_EQ(consumer.get_linear_state_slot_id(), prefill_checkpoint_id);
+        manager->deallocate_for_sequence(&consumer);
+      }
+      manager->deallocate_for_sequence(&sequence);
+    }
   }
 }
 
@@ -2629,9 +2767,7 @@ TEST_P(LinearStateWindowTest,
   EXPECT_EQ(sequence.get_linear_state_slot_id(), third_id);
   if (!GetParam()) {
     for (const Block& block : sequence.kv_state().blocks(BlockType::LINEAR)) {
-      EXPECT_EQ(block.owner_count(), 1u);
-      EXPECT_TRUE(block.is_shared());
-      EXPECT_FALSE(block.has_multiple_owners());
+      EXPECT_GT(block.ref_count(), 1u);
     }
   }
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);

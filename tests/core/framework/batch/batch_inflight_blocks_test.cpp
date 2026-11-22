@@ -122,7 +122,7 @@ TEST_F(BatchInflightBlocksTest, CopiesAndMovesKeepBlocksUntilLastBatchRetires) {
   }
 }
 
-TEST_F(BatchInflightBlocksTest, LinearKeepaliveDoesNotCreateLogicalSharing) {
+TEST_F(BatchInflightBlocksTest, LinearKeepaliveParticipatesInSharing) {
   BlockManager::Options options;
   options.num_blocks(6).block_size(4).enable_prefix_cache(false);
   BlockManagerImpl manager(options);
@@ -135,15 +135,15 @@ TEST_F(BatchInflightBlocksTest, LinearKeepaliveDoesNotCreateLogicalSharing) {
   const Slice<Block> blocks = sequence.kv_state().blocks(BlockType::LINEAR);
   for (const Block& block : blocks) {
     EXPECT_EQ(block.ref_count(), 3u);
-    EXPECT_EQ(block.owner_count(), 1u);
-    EXPECT_FALSE(block.has_multiple_owners());
+    EXPECT_TRUE(block.is_shared());
   }
 
   Block shared_source = blocks.front();
-  EXPECT_TRUE(blocks.front().has_multiple_owners());
-  EXPECT_FALSE(blocks.back().has_multiple_owners());
+  EXPECT_EQ(blocks.front().ref_count(), 4u);
+  EXPECT_EQ(blocks.back().ref_count(), 3u);
   shared_source = Block();
-  EXPECT_FALSE(blocks.front().has_multiple_owners());
+  EXPECT_EQ(blocks.front().ref_count(), 3u);
+  EXPECT_TRUE(blocks.front().is_shared());
 
   sequence.reset();
   EXPECT_EQ(manager.num_used_blocks(), 4u);

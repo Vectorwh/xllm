@@ -1667,7 +1667,8 @@ TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
 
   KVTransferMapping source_mapping;
   source_mapping.group_id = cache_group_id(BlockType::LINEAR);
-  source_mapping.remote_ids = {101};
+  // Prefill sends the one filled write. Decode admit holds that one slot.
+  source_mapping.remote_ids = {102};
   torch::Tensor bootstrap_embedding = torch::tensor({1.0f, 2.0f});
   ASSERT_TRUE(scheduler.decode_recv_first_generation(
       "req",
@@ -1690,10 +1691,14 @@ TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
   ASSERT_EQ(engine.pulled_mappings.size(), 1u);
   EXPECT_EQ(engine.pulled_mappings[0].group_id,
             cache_group_id(BlockType::LINEAR));
-  EXPECT_EQ(engine.pulled_mappings[0].remote_ids, std::vector<uint64_t>({101}));
-  EXPECT_EQ(
-      engine.pulled_mappings[0].local_ids,
-      std::vector<uint64_t>({static_cast<uint64_t>(local_linear_state_id)}));
+  EXPECT_EQ(engine.pulled_mappings[0].remote_ids, (std::vector<uint64_t>{102}));
+  const Slice<Block> linear_blocks =
+      sequence->kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(linear_blocks.size(), 1u);
+  EXPECT_EQ(linear_blocks.back().ref_count(), 1u);
+  const int32_t transferred_id = linear_blocks.back().id();
+  EXPECT_EQ(engine.pulled_mappings[0].local_ids,
+            (std::vector<uint64_t>{static_cast<uint64_t>(transferred_id)}));
 
   std::vector<Batch> batches = scheduler.prepare();
   ASSERT_EQ(batches.size(), 1u);
@@ -1702,10 +1707,19 @@ TEST(DisaggPDSchedulerTest, LinearStatePullFeedsFrameworkDecodeSlot) {
       /*num_decoding_tokens=*/2,
       /*min_decoding_bach_size=*/0,
       engine.model_args());
-  EXPECT_EQ(input.input_params.embedding.linear_state_ids,
-            std::vector<int32_t>({local_linear_state_id}));
+  const Slice<Block> decode_blocks =
+      sequence->kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(decode_blocks.size(), 1u);
+  EXPECT_EQ(decode_blocks.back().id(), transferred_id);
+  batches.clear();
+  const Slice<Block> released = sequence->kv_state().blocks(BlockType::LINEAR);
+  ASSERT_EQ(released.size(), 1u);
+  EXPECT_EQ(released.back().id(), transferred_id);
+  EXPECT_EQ(released.back().ref_count(), 1u);
   EXPECT_EQ(input.input_params.embedding.linear_state_read_ids,
-            std::vector<int32_t>({local_linear_state_id}));
+            std::vector<int32_t>({transferred_id}));
+  EXPECT_EQ(input.input_params.embedding.linear_state_ids,
+            std::vector<int32_t>({transferred_id}));
   ASSERT_EQ(input.input_params.attention.host.kv_cache_tokens_nums.size(), 1u);
   EXPECT_GT(input.input_params.attention.host.kv_cache_tokens_nums[0], 0);
 }

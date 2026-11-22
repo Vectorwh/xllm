@@ -188,17 +188,6 @@ DEFINE_COUNTER(store_prefetch_worker_probed_present_units_total,
 
 DEFINE_COUNTER(allocate_blocks_latency_seconds,
                "Latency of blocks allocation in seconds");
-DEFINE_COUNTER(linear_prefill_private_write_alloc_failures,
-               "Failed LINEAR prefill private-write allocation attempts");
-DEFINE_COUNTER(
-    linear_decode_private_write_alloc_failures,
-    "Failed LINEAR shared-source decode private-write allocation attempts");
-DEFINE_COUNTER(
-    linear_decode_swap_private_write_alloc_failures,
-    "Failed LINEAR private-write allocation attempts before slot swap");
-DEFINE_COUNTER(linear_decode_shared_write_slot_failures,
-               "LINEAR decode attempts rejected for shared current-write state "
-               "rather than insufficient capacity");
 
 namespace {
 
