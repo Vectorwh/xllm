@@ -24,6 +24,7 @@ limitations under the License.
 #include "core/common/macros.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/option_category.h"
+#include "core/framework/model/model_args.h"
 #include "core/framework/sampling/draft_sampling_mode.h"
 
 namespace xllm {
@@ -70,6 +71,10 @@ class SpeculativeConfig final {
 
   static bool is_dflash2_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, kDFlash2Algorithm);
+  }
+
+  static bool is_dflash_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, "DFlash");
   }
 
   // The glm5_next + DFlash2 pairing this whitelist admits is proven correct
@@ -123,6 +128,22 @@ class SpeculativeConfig final {
                                         std::string_view algorithm) {
     return model_type == "qwen3_5" &&
            (is_mtp_algorithm(algorithm) || is_dflash2_algorithm(algorithm));
+  }
+
+  static bool is_qwen3_5_dspark(std::string_view model_type,
+                                std::string_view algorithm) {
+    return is_qwen3_5_target_model_type(model_type) &&
+           is_dspark_algorithm(algorithm);
+  }
+
+  // DFlashDraftModel is ATB-only; the dense qwen3_5 VLM target is TORCH-only.
+  // Admit the combination only on the Python executor, whose qwen3_dflash
+  // implementation runs on TORCH.
+  static bool is_qwen3_5_python_dflash(std::string_view model_type,
+                                       std::string_view algorithm,
+                                       std::string_view model_impl) {
+    return model_type == "qwen3_5" && is_dflash_algorithm(algorithm) &&
+           ModelConfig::is_python_model_impl(model_impl);
   }
 
   static bool is_qwen3_vl_eagle3(std::string_view model_type,

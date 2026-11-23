@@ -86,7 +86,9 @@ class Qwen3_5ForConditionalGeneration(PyModelBase):
         # Share the Qwen3.5 execution policy: the EPLv2 checks and the resolved
         # sequence-parallel flag have to match the text host, because the same
         # metadata builders consume `sequence_parallel_enabled` from `config`.
-        text_cfg = Qwen3_5Config.prepare_execution_config(config, device)
+        # Mirror the text host's speculative opt-in; the underlying Qwen3.5
+        # model owns AuxHiddenCapture and the executor forwards aux states.
+        text_cfg = Qwen3_5Config.prepare_execution_config(config, device, allow_speculative_decoding=True)
         if config.get("rope_scaling_mrope_interleaved") is None:
             # The VLM arg loader defaults the interleaved mRoPE layout to true
             # (the text-only loader defaults it to false).

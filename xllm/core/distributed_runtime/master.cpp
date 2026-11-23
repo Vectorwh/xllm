@@ -828,18 +828,24 @@ Master::Master(const Options& options, EngineType type)
               vlm_spec_model_type, options_.speculative_algorithm()) ||
           SpeculativeConfig::is_qwen3_5_mtp_or_dflash2(
               vlm_spec_model_type, options_.speculative_algorithm()) ||
+          SpeculativeConfig::is_qwen3_5_dspark(
+              vlm_spec_model_type, options_.speculative_algorithm()) ||
+          SpeculativeConfig::is_qwen3_5_python_dflash(
+              vlm_spec_model_type,
+              options_.speculative_algorithm(),
+              ModelConfig::get_instance().model_impl()) ||
           SpeculativeConfig::is_qwen3_vl_eagle3(
               vlm_spec_model_type, options_.speculative_algorithm());
       CHECK(!options_.enable_disagg_pd() || supports_pd)
           << "VLM speculative decoding with disaggregated PD requires "
              "glm5_next + DFlash2, deepseek_v41 + DSpark, qwen3_5 + "
-             "MTP/DFlash2, or qwen3_vl + Eagle3";
+             "MTP/DFlash2/DSpark/DFlash(Python), or qwen3_vl + Eagle3";
       CHECK(!options_.enable_pd_ooc())
           << "VLM speculative decoding does not support PD OOC";
       CHECK(!options_.enable_service_routing() || supports_pd)
           << "VLM speculative decoding with service routing requires "
              "glm5_next + DFlash2, deepseek_v41 + DSpark, qwen3_5 + "
-             "MTP/DFlash2, or qwen3_vl + Eagle3";
+             "MTP/DFlash2/DSpark/DFlash(Python), or qwen3_vl + Eagle3";
       CHECK(!options_.enable_adaptive_speculative_decode())
           << "VLM speculative decoding does not support adaptive speculative "
              "decode";

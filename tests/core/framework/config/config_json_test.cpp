@@ -549,6 +549,29 @@ TEST(SpeculativeConfigTest, AdmitsOnlyQwen35MtpOrDFlash2ForVlmPd) {
       SpeculativeConfig::is_qwen3_5_mtp_or_dflash2("qwen3_vl", "DFlash2"));
 }
 
+TEST(SpeculativeConfigTest, MatchesQwen35DsparkPairing) {
+  for (const std::string& model_type : {"qwen3_5", "qwen3_5_moe"}) {
+    SCOPED_TRACE(model_type);
+    EXPECT_TRUE(SpeculativeConfig::is_qwen3_5_dspark(model_type, "DSpark"));
+    EXPECT_TRUE(SpeculativeConfig::is_qwen3_5_dspark(model_type, "dspark"));
+    EXPECT_FALSE(SpeculativeConfig::is_qwen3_5_dspark(model_type, "MTP"));
+  }
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_5_dspark("qwen3_vl", "DSpark"));
+}
+
+TEST(SpeculativeConfigTest, MatchesQwen35PythonDflashPairing) {
+  EXPECT_TRUE(SpeculativeConfig::is_qwen3_5_python_dflash(
+      "qwen3_5", "DFlash", "python"));
+  EXPECT_TRUE(
+      SpeculativeConfig::is_qwen3_5_python_dflash("qwen3_5", "dflash", "py"));
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_5_python_dflash(
+      "qwen3_5", "DFlash", "native"));
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_5_python_dflash(
+      "qwen3_5_moe", "DFlash", "python"));
+  EXPECT_FALSE(SpeculativeConfig::is_qwen3_5_python_dflash(
+      "qwen3_5", "DFlash2", "python"));
+}
+
 TEST(SpeculativeConfigTest, MatchesQwen3VlEagle3Pairing) {
   EXPECT_TRUE(SpeculativeConfig::is_qwen3_vl_eagle3("qwen3_vl", "Eagle3"));
   EXPECT_FALSE(SpeculativeConfig::is_qwen3_vl_eagle3("qwen3_vl", "eagle3"));
