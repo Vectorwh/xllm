@@ -40,6 +40,16 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _write_mooncake_inputs(base_dir: str, extdir: str, cmake_dir: str, system_lib_dir: str) -> None:
+    pyproject = os.path.join(base_dir, "third_party", "Mooncake", "mooncake-wheel", "pyproject.toml")
+    _write(pyproject, 'name = "mooncake-transfer-engine"\nversion = "0.3.12"\n')
+    for name in ("mooncake_master", "mooncake_client", "libetcd_wrapper.so", "liburing.so.2"):
+        _write(os.path.join(extdir, name), name)
+    _write(os.path.join(cmake_dir, "mooncake-common", "libasio.so"), "asio")
+    for name in ("libxxhash.so.0", "libzstd.so.1"):
+        _write(os.path.join(system_lib_dir, name), name)
+
+
 class ReleasePackTest(unittest.TestCase):
     def setUp(self) -> None:
         self.pack = release_pack
@@ -63,8 +73,7 @@ class ReleasePackTest(unittest.TestCase):
                 "load_priority=glm_next_transformer,custom_transformer,custom_xllm_math\n",
             )
 
-            mooncake_pyproject = os.path.join(base_dir, "third_party", "Mooncake", "mooncake-wheel", "pyproject.toml")
-            _write(mooncake_pyproject, 'name = "mooncake-transfer-engine"\nversion = "0.3.12"\n')
+            _write_mooncake_inputs(base_dir, extdir, cmake_dir, root)
             flash_wheel = os.path.join(
                 base_dir,
                 "third_party",
@@ -84,16 +93,6 @@ class ReleasePackTest(unittest.TestCase):
             xllm_wheel = os.path.join(dist_dir, "xllm_npu_torch2.9.0-0.11.0-cp311-cp311-linux_aarch64.whl")
             _write(xllm_wheel, "xllm-wheel")
 
-            for name, content in {
-                "mooncake_master": "master",
-                "mooncake_client": "client",
-                "libetcd_wrapper.so": "etcd-wrapper",
-                "liburing.so.2": "uring",
-            }.items():
-                _write(os.path.join(extdir, name), content)
-            _write(os.path.join(cmake_dir, "mooncake-common", "libasio.so"), "asio")
-            _write(os.path.join(root, "libxxhash.so.0"), "xxhash")
-            _write(os.path.join(root, "libzstd.so.1"), "zstd")
             stale_pack = os.path.join(base_dir, "xllm_pack")
             os.makedirs(stale_pack)
             _write(os.path.join(stale_pack, "stale.txt"), "stale")
@@ -170,6 +169,42 @@ class ReleasePackTest(unittest.TestCase):
             self.assertIn("xllm_pack/mooncake-runtime-v0.3.12.tar.gz.sha256", packed_names)
             self.assertNotIn("xllm_pack/xllm_pack.tar.gz.sha256", packed_names)
 
+    def test_mlu_release_pack_contains_matching_wheel_and_mooncake_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            extdir = os.path.join(root, "ext")
+            cmake_dir = os.path.join(root, "cmake")
+            dist_dir = os.path.join(root, "dist")
+            wheel_name = "xllm_mlu_torch2_10_0-0.12.0-cp312-cp312-linux_x86_64.whl"
+            wheel_path = os.path.join(dist_dir, wheel_name)
+            _write(wheel_path, "MLU wheel")
+            _write_mooncake_inputs(root, extdir, cmake_dir, root)
+            _write(os.path.join(root, "xllm_pack", "vendors-old.tar.gz"), "old NPU archive")
+
+            with (
+                mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": root}),
+                mock.patch.object(self.pack, "_git_branch", return_value="mlu-release"),
+                mock.patch.object(self.pack, "_git_recent_log", side_effect=["xllm history", "Mooncake history"]),
+                mock.patch.object(self.pack, "_git_short_hash", return_value="abc12345"),
+            ):
+                pack_dir = self.pack.collect_xllm_release_pack(root, extdir, cmake_dir, "mlu", dist_dir, wheel_path)
+
+            runtime = "mooncake-runtime-v0.3.12.tar.gz"
+            names = {wheel_name, runtime, runtime + ".sha256", "xllm_version.txt"}
+            self.assertEqual(set(os.listdir(pack_dir)), names)
+            self._assert_sha256_sidecar(pack_dir, runtime)
+            self._assert_sha256_sidecar(root, "xllm_pack.tar.gz")
+            with tarfile.open(pack_dir + ".tar.gz") as archive:
+                self.assertEqual(set(archive.getnames()), {"xllm_pack"} | {f"xllm_pack/{name}" for name in names})
+                with archive.extractfile(f"xllm_pack/{wheel_name}") as wheel:
+                    self.assertEqual(hashlib.sha256(wheel.read()).hexdigest(), _sha256(wheel_path))
+                with archive.extractfile("xllm_pack/xllm_version.txt") as version_file:
+                    version = version_file.read().decode()
+            self.assertIn(f"device=mlu\nwheel: {wheel_name}", version)
+            self.assertIn("===== xllm =====\nbranch: mlu-release\n\nxllm history", version)
+            self.assertIn("===== mooncake =====\nMooncake history", version)
+            self.assertNotIn("xllm_ops", version)
+            self.assertNotIn("flash-linear-attention", version)
+
     def test_release_strip_removes_debug_sections_from_shipped_binaries(self) -> None:
         with tempfile.TemporaryDirectory() as package_dir:
             sources = {
@@ -243,11 +278,13 @@ class ReleasePackTest(unittest.TestCase):
                 flash_wheel = os.path.join(root, "flash_linear_attention_npu_a3-26.9.1.whl")
                 _write(flash_wheel, "flash-wheel")
                 flash_digest = _sha256(flash_wheel)
-                path = self.pack._write_pack_version_file(root, root, flash_wheel)
+                xllm_wheel = os.path.join(root, "xllm_npu.whl")
+                path = self.pack._write_pack_version_file(root, root, "npu", xllm_wheel, flash_wheel)
 
             with open(path, encoding="utf-8") as version_file:
                 content = version_file.read()
 
+        self.assertIn("device=npu\nwheel: xllm_npu.whl\n", content)
         self.assertIn("===== xllm =====\nbranch: feature/pack\n", content)
         self.assertIn(
             "===== flash-linear-attention-npu =====\nwheel: flash_linear_attention_npu_a3-26.9.1.whl\n", content
@@ -429,7 +466,7 @@ class ReleasePackTest(unittest.TestCase):
                 self.assertEqual(self.pack._git_short_hash(root), "unknown")
                 self.assertEqual(self.pack._git_branch(root), "unknown")
                 self.assertEqual(self.pack._git_recent_log(root), "unknown")
-                path = self.pack._write_pack_version_file(root, root)
+                path = self.pack._write_pack_version_file(root, root, "npu", "xllm_npu.whl")
             self.assertGreaterEqual(log_exception.call_count, 1)
 
             with open(path, encoding="utf-8") as version_file:
@@ -543,13 +580,9 @@ class ReleasePackTest(unittest.TestCase):
             self.pack._chip_tag("npu")
         self.assertEqual(self.pack._chip_tag("mlu"), "mlu")
 
-    def test_release_pack_skips_non_npu_builds(self) -> None:
-        for device in ("mlu", "cuda"):
-            with self.subTest(device=device):
-                self.assertEqual(
-                    self.pack.collect_xllm_release_pack("/tmp", "/tmp", "/tmp", device, "/tmp", "/tmp/x.whl"),
-                    "",
-                )
+    def test_release_pack_skips_cuda_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(self.pack.collect_xllm_release_pack(root, root, root, "cuda", root, "x.whl"), "")
 
 
 if __name__ == "__main__":

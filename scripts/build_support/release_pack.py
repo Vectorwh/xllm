@@ -13,9 +13,9 @@
 
 """Assemble the xllm release directory consumed as xllm_pack/.
 
-The pack keeps the deployment layout: the xllm wheel, the full CANN
-``opp/vendors`` archive and flash-linear-attention wheel, and the Mooncake
-runtime built by this xllm compile. etcd is intentionally left out.
+Both MLU and NPU packs contain the xllm wheel and its matching Mooncake
+runtime. The NPU pack also includes the CANN ``opp/vendors`` archive and
+the flash-linear-attention wheel.
 """
 
 import datetime
@@ -132,14 +132,13 @@ def _git_branch(repo_dir: str) -> str:
     return branch or "HEAD"
 
 
-def _write_pack_version_file(base_dir: str, pack_dir: str, flash_wheel: str = "") -> str:
-    """Record the xllm branch, recent history, and the packed flash-linear-attention wheel."""
-    sections = [
-        ("xllm", base_dir, True),
-        ("xllm_ops", os.path.join(base_dir, "third_party", "xllm_ops"), False),
-        ("mooncake", os.path.join(base_dir, "third_party", "Mooncake"), False),
-    ]
-    parts: list[str] = []
+def _write_pack_version_file(base_dir: str, pack_dir: str, device: str, xllm_wheel: str, flash_wheel: str = "") -> str:
+    """Record the sources and wheels used for this device's release pack."""
+    sections = [("xllm", base_dir, True)]
+    parts: list[str] = [f"device={device}\nwheel: {os.path.basename(xllm_wheel)}"]
+    if device == "npu":
+        sections.append(("xllm_ops", os.path.join(base_dir, "third_party", "xllm_ops"), False))
+    sections.append(("mooncake", os.path.join(base_dir, "third_party", "Mooncake"), False))
     for name, repo_dir, include_branch in sections:
         lines = [f"===== {name} ====="]
         if include_branch:
@@ -530,13 +529,9 @@ def collect_xllm_release_pack(
     dist_dir: str,
     wheel_path: str,
 ) -> str:
-    """Assemble the NPU release directory next to the source tree.
-
-    MLU and the other device builds still produce their wheel. The release
-    directory and archive are NPU-only until those platforms have a pack layout.
-    """
-    if device != "npu":
-        logger.info(f"Skip xllm release pack for device={device}. The release pack is NPU-only.")
+    """Assemble the NPU or MLU release pack from the completed wheel build."""
+    if device not in ("npu", "mlu"):
+        logger.info(f"Skip xllm release pack for device={device}.")
         return ""
 
     pack_dir = os.path.join(base_dir, "xllm_pack")
@@ -548,17 +543,19 @@ def collect_xllm_release_pack(
         wheel_destination = os.path.join(pack_dir, os.path.basename(wheel_path))
         shutil.copy2(wheel_path, wheel_destination)
 
-        ops_dir = os.path.join(base_dir, "third_party", "xllm_ops")
-        flash_wheel = _select_newest_file(
-            os.path.join(
-                ops_dir, "third_party", "flash-linear-attention-npu", "dist", "flash_linear_attention_npu_*.whl"
-            ),
-            "flash-linear-attention-npu wheel",
-        )
-        shutil.copy2(flash_wheel, os.path.join(pack_dir, os.path.basename(flash_wheel)))
-        _stage_vendors_archive(base_dir, pack_dir, device)
+        flash_wheel = ""
+        if device == "npu":
+            ops_dir = os.path.join(base_dir, "third_party", "xllm_ops")
+            flash_wheel = _select_newest_file(
+                os.path.join(
+                    ops_dir, "third_party", "flash-linear-attention-npu", "dist", "flash_linear_attention_npu_*.whl"
+                ),
+                "flash-linear-attention-npu wheel",
+            )
+            shutil.copy2(flash_wheel, os.path.join(pack_dir, os.path.basename(flash_wheel)))
+            _stage_vendors_archive(base_dir, pack_dir, device)
         _build_mooncake_runtime_archive(base_dir, extdir, cmake_dir, pack_dir, wheel_destination)
-        _write_pack_version_file(base_dir, pack_dir, flash_wheel)
+        _write_pack_version_file(base_dir, pack_dir, device, wheel_destination, flash_wheel)
 
         with tarfile.open(archive_path, "w:gz") as archive:
             archive.add(pack_dir, arcname=os.path.basename(pack_dir))
