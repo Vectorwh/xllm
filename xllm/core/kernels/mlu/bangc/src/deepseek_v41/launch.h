@@ -28,6 +28,7 @@ void deepseek_v41_gather_launch(cnrtQueue_t queue,
                                 int64_t position,
                                 int32_t window,
                                 int32_t swa_columns,
+                                int32_t comp_physical_dim,
                                 void* output,
                                 int32_t* length);
 

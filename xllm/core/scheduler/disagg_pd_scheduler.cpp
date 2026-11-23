@@ -890,10 +890,10 @@ void DisaggPDScheduler::dispatch_requests() {
         pending.push(requests[i]);
 
       } else {
+        const auto& resp = resps.resps()[i];
         for (auto& sequence : requests[i]->sequences()) {
           TransferKVInfo info;
           info.request_id = requests[i]->request_id();
-          const auto& resp = resps.resps()[i];
           // Re-resolve with the allocation response now at hand: the plan is
           // unchanged (same declared widths and write mode) while the
           // response's group layout decides whether the rank-local mapping

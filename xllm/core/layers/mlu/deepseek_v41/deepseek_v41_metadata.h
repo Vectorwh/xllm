@@ -40,7 +40,8 @@ struct Csa2Context {
   // A selection with no keys keeps the two-dimensional shape {query_rows, 0}.
   std::vector<torch::Tensor> topk;
   std::vector<torch::Tensor> candidates;
-  // Device INT32 tables shared by eager and captured attention kernels.
+  // Device INT32 logical [SWA, KV] tables shared by eager and captured kernels.
+  // Window-only drafts have only SWA. All compression ratios use the KV table.
   std::vector<torch::Tensor> block_tables;
   // The logical SWA ring view retains the input width even when block_tables
   // stores an expanded absolute-page mapping for captured compression.

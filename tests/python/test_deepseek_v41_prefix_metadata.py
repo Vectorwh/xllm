@@ -37,7 +37,7 @@ from xllm.python.attention.dsa_metadata import (
 
 class V41PrefixMetadataTest(unittest.TestCase):
     def _builder(self, block_size: int = 128) -> DsaMetadataBuilder:
-        caches, groups = build_cache_specs_v41([0, 2, 1], [1, 2], [1, 2], block_size, block_size)
+        caches, groups = build_cache_specs_v41([0, 2, 1], [1, 2], [1, 2], block_size, 3)
         return DsaMetadataBuilder(caches, groups, read_table_layout=READ_TABLE_LAYOUT_RING)
 
     def _backend(self, window_size: int) -> Csa2AttentionBackend:
@@ -75,7 +75,6 @@ class V41PrefixMetadataTest(unittest.TestCase):
                         multi_block_tables=[
                             torch.tensor([[9, 10, 11]], dtype=torch.int32),
                             torch.tensor([[20, 21]], dtype=torch.int32),
-                            torch.tensor([[30, 31, 32]], dtype=torch.int32),
                         ],
                         kv_seq_lens=[129],
                         q_seq_lens=[1],
@@ -90,35 +89,33 @@ class V41PrefixMetadataTest(unittest.TestCase):
                 _check_builder_slots(backend, 128)
                 self.assertEqual(backend.window_size, window)
                 self.assertEqual(backend._swa_ring_blocks, window // 128)
-                for original, bound in zip(groups, backend.group_infos, strict=True):
-                    self.assertEqual(bound.block_size, 128)
-                    self.assertEqual(bound.cache_type, original.cache_type)
-                    self.assertEqual(bound.ratio, original.ratio)
-                    if original.cache_type != DSA_CACHE_SLIDING_WINDOW or window == 128:
-                        self.assertEqual(bound, original)
-                    else:
-                        self.assertEqual(original.block_size, window)
-                for original_layer, bound_layer in zip(specs, backend.caches_info, strict=True):
-                    for original, bound in zip(original_layer, bound_layer, strict=True):
-                        self.assertEqual(bound.block_size, 128)
-                        self.assertEqual(bound.group_id, original.group_id)
-                        self.assertEqual(bound.cache_type, original.cache_type)
-                        self.assertEqual(bound.ratio, original.ratio)
-                        if original.cache_type != DSA_CACHE_SLIDING_WINDOW or window == 128:
-                            self.assertEqual(bound, original)
-                        else:
-                            self.assertEqual(original.block_size, window)
+                self.assertEqual(backend.group_infos, groups)
+                self.assertEqual(backend.caches_info, specs)
+                for group in groups:
+                    self.assertEqual(
+                        group.physical_dim,
+                        128 if group.cache_type == DSA_CACHE_SLIDING_WINDOW else 128 // group.ratio,
+                    )
+                for layer in specs:
+                    for cache in layer:
+                        self.assertEqual(
+                            cache.physical_dim,
+                            128 if cache.cache_type == DSA_CACHE_SLIDING_WINDOW else 128 // cache.ratio,
+                        )
 
                 # Rebinding must derive the page width again, not hardcode 128.
                 backend.bind_kv_caches([LayerCache(key=None, value=None, swa=torch.zeros(12, 64, 8))])
                 _check_builder_slots(backend, 64)
                 self.assertEqual(backend._swa_ring_blocks, window // 64)
                 for group in backend.group_infos:
-                    self.assertEqual(group.block_size, 64 if group.cache_type == DSA_CACHE_SLIDING_WINDOW else 128)
+                    self.assertEqual(
+                        group.physical_dim,
+                        64 if group.cache_type == DSA_CACHE_SLIDING_WINDOW else 128 // group.ratio,
+                    )
                 for original_layer, bound_layer in zip(specs, backend.caches_info, strict=True):
                     for original, bound in zip(original_layer, bound_layer, strict=True):
                         if original.cache_type == DSA_CACHE_SLIDING_WINDOW:
-                            self.assertEqual(bound.block_size, 64)
+                            self.assertEqual(bound.physical_dim, 64)
                         else:
                             self.assertEqual(bound, original)
 
@@ -155,7 +152,6 @@ class V41PrefixMetadataTest(unittest.TestCase):
                             dsa = backend._builder.build(
                                 multi_block_tables=[
                                     raw,
-                                    torch.arange(1, 1 + (total + 255) // 256, dtype=torch.int32).view(1, -1),
                                     torch.arange(1, 1 + count, dtype=torch.int32).view(1, -1),
                                 ],
                                 kv_seq_lens=[total],
@@ -258,20 +254,21 @@ class V41PrefixMetadataTest(unittest.TestCase):
 
     def test_graph_c2_parity_keeps_uncommitted_slot_invalid(self) -> None:
         raw = torch.tensor([[20, 21, 22]], dtype=torch.int32)
+        physical_dim = 64
         for total in (257, 258, 259, 260):
             with self.subTest(total=total):
-                _, slots = self._builder()._process_token_group(raw, 2, 128, [total], [1], 1, 1, 8)
+                _, slots = self._builder()._process_token_group(raw, 2, physical_dim, [total], [1], 1, 1, 8)
                 if total % 2:
                     self.assertEqual(slots.tolist(), [-1])
                 else:
                     row = total // 2 - 1
-                    self.assertEqual(slots.tolist(), [int(raw[0, row // 128]) * 128 + row % 128])
+                    block, offset = divmod(row, physical_dim)
+                    self.assertEqual(slots.tolist(), [int(raw[0, block]) * physical_dim + offset])
 
     def test_layer_caches_share_correct_restored_group_tables(self) -> None:
         builder = self._builder()
         tables = [
             torch.tensor([[-1, 9, 10]], dtype=torch.int32),
-            torch.tensor([[20, 21]], dtype=torch.int32),
             torch.tensor([[30, 31, 32]], dtype=torch.int32),
         ]
         dsa = builder.build(
@@ -283,14 +280,14 @@ class V41PrefixMetadataTest(unittest.TestCase):
             is_prefill=True,
             is_chunked_prefill=True,
         )
-        self.assertEqual(dsa.slot_mappings[1][0].tolist(), [21 * 128])
+        self.assertEqual(dsa.slot_mappings[1][0].tolist(), [32 * 64])
         self.assertEqual(dsa.slot_mappings[2][0].tolist(), [32 * 128, 32 * 128 + 1])
         self.assertEqual(dsa.slot_mappings[1][2].tolist(), [10 * 128, 10 * 128 + 1])
         for idx in (2, 3, 4):
-            torch.testing.assert_close(dsa.block_tables[1][idx], tables[0], rtol=0, atol=0)
-        for idx in (0, 1):
-            torch.testing.assert_close(dsa.block_tables[1][idx], tables[1], rtol=0, atol=0)
-        torch.testing.assert_close(dsa.block_tables[2][0], tables[2], rtol=0, atol=0)
+            torch.testing.assert_close(dsa.block_tables[1][idx], dsa.block_tables[0][0], rtol=0, atol=0)
+        torch.testing.assert_close(dsa.block_tables[1][0], dsa.block_tables[1][1], rtol=0, atol=0)
+        torch.testing.assert_close(dsa.block_tables[1][0], dsa.block_tables[2][0], rtol=0, atol=0)
+        torch.testing.assert_close(dsa.block_tables[1][0], tables[1], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -355,8 +355,8 @@ void Request::record_token_output(const RequestOutput& output, bool submitted) {
   const uint64_t delta = request_tokens_.commit(token_progress_buf_);
   COUNTER_ADD(request_output_tokens_total, delta);
   if (delta > 0) {
-    VLOG(1) << "record_type: request_tokens, request_id: " << request_id_
-            << ", event: submission, input_delta: 0, output_delta: " << delta;
+    VLOG(10) << "record_type: request_tokens, request_id: " << request_id_
+             << ", event: submission, input_delta: 0, output_delta: " << delta;
   }
 }
 

@@ -24,15 +24,13 @@ class KVShardLayout final {
  public:
   static constexpr int64_t kInvalidSlot = -1;
 
-  KVShardLayout(int32_t physical_block_size,
-                int32_t dcp_size,
-                int32_t dcp_rank);
+  KVShardLayout(int32_t physical_dim, int32_t dcp_size, int32_t dcp_rank);
 
-  int32_t physical_block_size() const { return physical_block_size_; }
+  int32_t physical_dim() const { return physical_dim_; }
   int32_t dcp_size() const { return dcp_size_; }
   int32_t dcp_rank() const { return dcp_rank_; }
-  int64_t logical_block_size() const {
-    return static_cast<int64_t>(physical_block_size_) * dcp_size_;
+  int64_t block_size() const {
+    return static_cast<int64_t>(physical_dim_) * dcp_size_;
   }
 
   int32_t owner_of(int64_t global_slot) const;
@@ -40,16 +38,15 @@ class KVShardLayout final {
   int64_t localize(int64_t global_slot) const;
   int64_t globalize(int64_t local_slot) const;
   int64_t local_token_count(int64_t global_token_count) const {
-    return global_token_count / logical_block_size() * physical_block_size_ +
-           std::clamp(
-               global_token_count % logical_block_size() -
-                   static_cast<int64_t>(dcp_rank_) * physical_block_size_,
-               int64_t{0},
-               static_cast<int64_t>(physical_block_size_));
+    return global_token_count / block_size() * physical_dim_ +
+           std::clamp(global_token_count % block_size() -
+                          static_cast<int64_t>(dcp_rank_) * physical_dim_,
+                      int64_t{0},
+                      static_cast<int64_t>(physical_dim_));
   }
 
  private:
-  int32_t physical_block_size_ = 1;
+  int32_t physical_dim_ = 1;
   int32_t dcp_size_ = 1;
   int32_t dcp_rank_ = 0;
 };

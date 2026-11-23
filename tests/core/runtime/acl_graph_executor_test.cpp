@@ -133,22 +133,22 @@ TEST(DeepseekV4MetadataInputTest, KeepsOnlyDraftRegisteredBlockTables) {
   ModelInputParams target_input_params;
   target_input_params.multi_block_tables = {
       torch::tensor({{10}}, torch::kInt32),
-      torch::tensor({{20}}, torch::kInt32),
-      torch::tensor({{30}}, torch::kInt32)};
+      torch::tensor({{20}}, torch::kInt32)};
 
   ModelInputParams draft_input_params = target_input_params;
-  deepseek_v4_clamp_multi_block_tables(draft_input_params,
-                                       /*registered_group_count=*/1);
+  deepseek_v4_clamp_multi_block_tables(
+      draft_input_params, {{DSACacheType::SLIDING_WINDOW, 1, 128}});
 
-  ASSERT_EQ(target_input_params.multi_block_tables.size(), 3);
+  ASSERT_EQ(target_input_params.multi_block_tables.size(), 2);
   ASSERT_EQ(draft_input_params.multi_block_tables.size(), 1);
   EXPECT_TRUE(torch::equal(draft_input_params.multi_block_tables.front(),
                            target_input_params.multi_block_tables.front()));
   deepseek_v4_clamp_multi_block_tables(target_input_params,
-                                       /*registered_group_count=*/3);
+                                       {{DSACacheType::SLIDING_WINDOW, 1, 128},
+                                        {DSACacheType::TOKEN, 4, 512},
+                                        {DSACacheType::TOKEN, 128, 16}});
   EXPECT_EQ(target_input_params.multi_block_tables[0].item<int32_t>(), 10);
   EXPECT_EQ(target_input_params.multi_block_tables[1].item<int32_t>(), 20);
-  EXPECT_EQ(target_input_params.multi_block_tables[2].item<int32_t>(), 30);
 }
 
 TEST(QwenDcpAttentionMergeTest, IgnoresNonFiniteLseBeforeMax) {

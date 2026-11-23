@@ -18,8 +18,10 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -109,6 +111,17 @@ class TestHierarchyWorker final : public LLMWorkerImpl {
     return transfer;
   }
 
+  torch::Tensor key_cache() const { return kv_caches_.front().get_k_cache(); }
+
+  void queue_blocked_step(std::promise<void> started,
+                          std::future<void> release) {
+    threadpool_.schedule(
+        [started = std::move(started), release = std::move(release)]() mutable {
+          started.set_value();
+          release.wait();
+        });
+  }
+
   bool owns_npu_parallel_input_prepare() const override { return false; }
 };
 
@@ -150,6 +163,52 @@ TEST_F(WorkerHierarchyKVCacheTransferTest,
   Slice<BlockTransferInfo> transfer_slice(transfer_info);
   EXPECT_EQ(worker.prefetch_kv_blocks(transfer_slice, /*stats=*/nullptr),
             std::vector<uint8_t>({0}));
+}
+
+TEST_F(WorkerHierarchyKVCacheTransferTest,
+       OverlapOffloadsCompletedBlockWithoutWaitingForNextStep) {
+  constexpr int32_t kCompletedValue = 37;
+  const ModelArgs model_args = make_model_args();
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options = make_runtime_options(/*host_blocks_factor=*/2.0);
+  options.enable_schedule_overlap(true);
+  TestHierarchyWorker worker(
+      parallel_args, device_->unwrap(), options, model_args);
+  worker.initialize_hierarchy_cache(make_cache_shape(model_args),
+                                    make_create_options(device_->unwrap()));
+  torch::Tensor key_cache = worker.key_cache();
+  key_cache.zero_();
+  key_cache[0].fill_(kCompletedValue);
+  ASSERT_EQ(device_->synchronize_default_stream(), 0);
+
+  std::promise<void> next_step_started;
+  std::promise<void> release_next_step;
+  std::future<void> started = next_step_started.get_future();
+  worker.queue_blocked_step(std::move(next_step_started),
+                            release_next_step.get_future());
+  started.get();
+
+  std::future<uint32_t> offload = std::async(std::launch::async, [&worker] {
+    BlockTransferInfo info(/*src_block_id=*/0, /*dst_block_id=*/0);
+    info.transfer_type = TransferType::D2H2G;
+    return worker.transfer_kv_blocks(/*batch_id=*/1, {info});
+  });
+  const auto offload_status = offload.wait_for(std::chrono::seconds(5));
+  release_next_step.set_value();
+  EXPECT_EQ(offload_status, std::future_status::ready);
+  ASSERT_EQ(offload.get(), 1U);
+
+  BlockTransferInfo load(/*src_block_id=*/0, /*dst_block_id=*/1);
+  load.transfer_type = TransferType::H2D;
+  ASSERT_EQ(worker.transfer_kv_blocks(/*batch_id=*/2, {load}), 1U);
+  ModelInputParams params;
+  params.meta.batch_id = 2;
+  params.meta.requires_host_restore = true;
+  worker.get_hierarchy_kv_cache_transfer()->set_layer_synchronizer(params);
+  ASSERT_TRUE(params.synchronize_layer(/*layer_idx=*/0));
+  EXPECT_TRUE(torch::equal(key_cache[1],
+                           torch::full_like(key_cache[1], kCompletedValue)));
 }
 
 TEST_F(WorkerHierarchyKVCacheTransferTest,

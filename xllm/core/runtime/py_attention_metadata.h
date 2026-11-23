@@ -66,10 +66,8 @@ class PyAttentionMetadataView final {
   pybind11::object engram_lookback_token_ids() const;
   pybind11::object engram_lookback_positions() const;
   pybind11::object local_slot_mapping() const;
-  // Tokens covered by one block-table column: block_size * kv_split_size.
-  // With kv_split a block-table column is a logical block, so Python-side
-  // metadata validation must not use the physical block size.
-  int32_t logical_block_size() const;
+  // Tokens covered by one block-table column, including all kv_split pages.
+  int32_t block_size() const;
 
   int32_t kv_split_size() const;
   int32_t kv_split_rank() const;

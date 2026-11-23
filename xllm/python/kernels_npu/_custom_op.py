@@ -1408,13 +1408,13 @@ def _sparse_flash_attention_lse_fake(
 
 def _sfa_dcp_remap_out_fake(
     topk_indices: torch.Tensor,
-    physical_block_size: int,
+    physical_dim: int,
     shard_size: int,
     shard_rank: int,
     out: torch.Tensor,
     idx_scratch: torch.Tensor,
 ) -> torch.Tensor:
-    del physical_block_size, shard_size, shard_rank, topk_indices, idx_scratch
+    del physical_dim, shard_size, shard_rank, topk_indices, idx_scratch
     return out
 
 

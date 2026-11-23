@@ -1599,6 +1599,7 @@ TEST(CacheLayoutTest, ManifestProtoRoundTripPreservesLayoutIdentityAndSpans) {
   ASSERT_EQ(decoded.tensors.size(), 1U);
   const CacheTensorManifest& tensor = decoded.tensors[0];
   EXPECT_EQ(tensor.storage_offset_bytes, 7U);
+  EXPECT_EQ(tensor.block_token_capacity, kTokenCount);
   EXPECT_TRUE(tensor.contiguous);
   EXPECT_TRUE(tensor.explicit_resource_offsets);
   EXPECT_EQ(tensor.physical_rows_per_resource, 1U);
@@ -1607,6 +1608,15 @@ TEST(CacheLayoutTest, ManifestProtoRoundTripPreservesLayoutIdentityAndSpans) {
   ASSERT_EQ(tensor.shard.spans.size(), 1U);
   EXPECT_EQ(tensor.shard.spans[0].logical_tensor, "key");
   EXPECT_EQ(tensor.shard.spans[0].repeat_count, kTokenCount);
+}
+
+TEST(CacheLayoutTest, RejectsLegacySchema) {
+  WorkerCacheLayoutManifest source = make_head_manifest(0, 1, 1, 3, "source");
+  proto::WorkerCacheLayoutManifest wire;
+  cache_layout_to_proto(source, &wire);
+  wire.set_schema_version(1);
+  WorkerCacheLayoutManifest decoded;
+  EXPECT_FALSE(cache_layout_from_proto(wire, &decoded).ok());
 }
 
 TEST(CacheLayoutTest, ManifestProtoRoundTripPreservesSsmResourceGeometry) {

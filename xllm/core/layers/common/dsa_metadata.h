@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,25 +26,34 @@ namespace xllm {
 
 // DSA cache type enum for DeepSeek V4 multi-cache management
 enum class DSACacheType : int32_t {
-  TOKEN = 0,           // block allocated by token count / ratio
-  SEQUENCE = 1,        // one block per sequence
-  SLIDING_WINDOW = 2,  // sliding window, fixed number of blocks per seq
+  SLIDING_WINDOW = 0,  // sliding window, fixed number of blocks per seq
+  TOKEN = 1,           // block allocated by token count / ratio
 };
 
 // Per-cache metadata within a layer
 struct DSACacheInfo {
-  int32_t group_id;    // which block manager group this cache belongs to
-  DSACacheType type;   // cache type
-  int32_t ratio;       // compression ratio
-  int32_t block_size;  // block size for this cache
+  int32_t group_id;   // model-private execution group for this cache
+  DSACacheType type;  // cache type
+  int32_t ratio;      // compression ratio
+  int32_t physical_dim;
 };
 
-// Group-level info
+// Execution group geometry and its source logical block table. Multiple
+// physical groups can read one scheduler table without sharing their geometry.
 struct DSAGroupInfo {
   DSACacheType type;
   int32_t ratio;
-  int32_t block_size;
+  int32_t physical_dim;
 };
+
+inline int32_t dsa_block_table_count(
+    const std::vector<DSAGroupInfo>& group_infos) {
+  int32_t count = 0;
+  for (const DSAGroupInfo& group : group_infos) {
+    count = std::max(count, static_cast<int32_t>(group.type) + 1);
+  }
+  return count;
+}
 
 namespace layer {
 
@@ -115,7 +125,7 @@ struct DSAMetadata {
   torch::Tensor c128_input_sin;
   torch::Tensor start_pos;
 
-  // Multi-manager block tables and slot mappings
+  // Physical execution-group block tables and slot mappings
   // Indexed as [layer_id][cache_idx] after expansion by build_forward_context.
   // Same-group caches share the same underlying tensor (no copy).
   std::vector<std::vector<torch::Tensor>> block_tables;

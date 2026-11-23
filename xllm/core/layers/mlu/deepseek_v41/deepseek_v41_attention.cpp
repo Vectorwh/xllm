@@ -310,7 +310,8 @@ torch::Tensor DeepseekV41AttentionImpl::forward(
       metadata.query_start_loc = shared.query_prefix;
       metadata.chunk_begins = shared.chunk_begins;
       metadata.compressed_start_loc = out.prefix;
-      metadata.compressed_block_table = tables[pooled ? 1 : 2];
+      CHECK_EQ(tables.size(), 2u);
+      metadata.compressed_block_table = tables[1];
       metadata.input_row_map = std::move(row_map);
       std::optional<kernel::mlu::bangc::CompressKvPoolingInputs> pooling;
       if (pooled) {
@@ -330,7 +331,8 @@ torch::Tensor DeepseekV41AttentionImpl::forward(
           rope,
           metadata,
           pooling,
-          cache.get_k_cache().view({-1, 128, 512}),
+          cache.get_k_cache().view(
+              {-1, kDeepseekV41MluKVBlockSize / ratio_, 512}),
           out.outputs,
           options);
       latent = out.outputs.latent;
@@ -493,8 +495,8 @@ void DeepseekV41AttentionImpl::forward_cached_attention(
     torch::Tensor main, keys;
     if (ratio_ > 0) {
       CHECK_GE(source_, 0);
-      const int64_t group = ratio_ == 2 ? 1 : 2;
-      CHECK_LT(group, tables.size());
+      CHECK_EQ(tables.size(), 2u);
+      const torch::Tensor& kv_table = tables[1];
       torch::Tensor main_cache = flat_cache(caches[source_].get_k_cache());
       torch::Tensor index_cache = flat_cache(caches[source_].get_index_cache());
       torch::Tensor all_slots;
@@ -503,8 +505,9 @@ void DeepseekV41AttentionImpl::forward_cached_attention(
                                 layer_id_ != args_.candidate_source_layer_id();
       if (!single_decode ||
           (index_source_ && !paged_decode && !candidate_decode)) {
-        all_slots =
-            slots(tables[group], seq, 0, end / ratio_, block, false, options_);
+        const int64_t physical_dim = block / ratio_;
+        all_slots = slots(
+            kv_table, seq, 0, end / ratio_, physical_dim, false, options_);
       }
       if (!decode) {
         main = main_cache.index_select(0, all_slots);
@@ -513,7 +516,7 @@ void DeepseekV41AttentionImpl::forward_cached_attention(
         indexer_->select_decode_indices(iq[offset],
                                         iw[offset],
                                         caches[source_].get_index_cache(),
-                                        tables[group][seq],
+                                        kv_table[seq],
                                         end / ratio_,
                                         seq,
                                         shared);
@@ -521,7 +524,7 @@ void DeepseekV41AttentionImpl::forward_cached_attention(
         indexer_->select_candidate_indices(iq[offset],
                                            iw[offset],
                                            index_cache,
-                                           tables[group][seq],
+                                           kv_table[seq],
                                            end / ratio_,
                                            seq,
                                            shared);
@@ -584,7 +587,7 @@ void DeepseekV41AttentionImpl::forward_cached_attention(
       const int64_t capacity = selected.size(0) / q.size(0);
       auto main_cache =
           ratio_ > 0 ? flat_cache(caches[source_].get_k_cache()) : swa;
-      auto comp_table = tables[ratio_ == 2 ? 1 : (ratio_ == 1 ? 2 : 0)][seq];
+      auto comp_table = tables[ratio_ > 0 ? 1 : 0][seq];
       for (int64_t row = 0; row < count; ++row) {
         auto topk = ratio_ > 0
                         ? shared.topk.at(seq)[row].flatten()
@@ -599,6 +602,7 @@ void DeepseekV41AttentionImpl::forward_cached_attention(
             topk,
             begin + row,
             args_.window_size(),
+            static_cast<int32_t>(ratio_ > 0 ? block / ratio_ : block),
             selected.slice(0, query * capacity, (query + 1) * capacity),
             lengths.slice(0, query, query + 1));
       }

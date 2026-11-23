@@ -26,10 +26,9 @@ limitations under the License.
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
-#include "framework/config/kv_cache_config.h"
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
-#include "framework/kv_cache/deepseek_v4_cache_policy.h"
+#include "framework/kv_cache/deepseek_v4_cache_layout.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
@@ -383,21 +382,16 @@ int64_t resolve_max_linear_state_cache_slots(
   return (options.max_seqs_per_batch * 3 + 1) / 2;
 }
 
-int64_t dsv4_common_unit_bytes(const Dsv4KVCacheEstimateCost& cache_cost,
-                               int64_t common_blocks_per_unit) {
-  CHECK_GT(cache_cost.manager_blocks_per_unit, 0);
-  CHECK_EQ(common_blocks_per_unit % cache_cost.manager_blocks_per_unit, 0);
-  const int64_t compressed_units =
-      common_blocks_per_unit / cache_cost.manager_blocks_per_unit;
-  return compressed_units * cache_cost.token_unit_bytes;
-}
-
 // SWA ring sizing shared by every DSV4-family estimator: per-sequence window
 // blocks, one prefill burst, one per-sequence tail block, and two guard
 // blocks.
 int64_t dsv4_swa_block_count(const ModelArgs& model_args,
-                             const KVCacheEstimateOptions& options) {
-  const int64_t block_size = options.block_size;
+                             const KVCacheEstimateOptions& options,
+                             bool has_kv_cache) {
+  const bool npu_dsv4 =
+      !util::is_deepseek_v41_model_type(model_args.model_type()) &&
+      Platform::is_npu();
+  const int64_t block_size = dsv4_swa_block_size();
   const int64_t swa_blocks_per_seq =
       get_swa_blocks_per_seq(model_args.window_size(), block_size);
   const int64_t max_seqs =
@@ -428,227 +422,72 @@ int64_t dsv4_swa_block_count(const ModelArgs& model_args,
   // The SWA ring backs two independent demands and has to be sized for both:
   //   (a) the live prefill burst, which the per-DP fair budget above bounds;
   //   (b) the rows of a published prefix-cache checkpoint, because the
-  //       composite publishes prefix entries in C128-sized units and a unit is
+  //       composite publishes prefix entries in logical KV blocks and a unit is
   //       only restorable while the SWA rows at that checkpoint are still
-  //       resident (trim_swa_compressed discards a checkpoint whose rows were
+  //       resident (trim_swa_kv discards a checkpoint whose rows were
   //       recycled).
   // Sizing for (a) alone starves (b) as soon as the per-DP share drops below
   // one publish unit: the ring then recycles checkpoint rows before the next
   // request probes them, every cross-request prefix hit degrades to a miss,
   // and the request silently re-prefills its whole prompt. Keep at least one
   // publish unit worth of SWA rows alive whenever one can be published. The
-  // unit is the largest compress ratio, i.e. the number of base blocks the
-  // composite stages per published C128 checkpoint.
-  const std::vector<int32_t>& compress_ratios = model_args.compress_ratios();
+  // unit is the number of SWA blocks covered by one logical KV checkpoint.
   int64_t publish_unit_blocks = 0;
-  if (shrunk_to_per_group_share && options.enable_prefix_cache) {
-    for (const int32_t ratio : compress_ratios) {
-      if (ratio > 1) {
-        publish_unit_blocks =
-            std::max(publish_unit_blocks, static_cast<int64_t>(ratio));
-      }
-    }
+  if (shrunk_to_per_group_share && options.enable_prefix_cache &&
+      has_kv_cache) {
+    const int64_t kv_block_size = dsv4_kv_block_size(npu_dsv4);
+    CHECK_EQ(kv_block_size % block_size, 0);
+    publish_unit_blocks = kv_block_size / block_size;
   }
   const int64_t burst_blocks =
       std::max(util::ceil_div(burst_budget, block_size), publish_unit_blocks);
   return swa_blocks_per_seq * max_seqs + burst_blocks + max_seqs + 2;
 }
 
-void set_dsv4_compressed_counts(const Dsv4KVCacheEstimateCost& cache_cost,
-                                int64_t token_unit_count,
-                                KVCacheCapacity* kv_cache_cap) {
-  CHECK(kv_cache_cap != nullptr);
-  if (cache_cost.n_c2_layers > 0 || cache_cost.n_c1_layers > 0) {
-    // V4.1: one allocation unit spans manager_blocks_per_unit engine blocks;
-    // each group consumes manager_blocks_per_unit / ratio blocks per unit
-    // (ratio 2 -> 1 c2 block, ratio 1 -> 2 c1 blocks).
-    if (cache_cost.n_c2_layers > 0) {
-      kv_cache_cap->c2_count(token_unit_count *
-                             cache_cost.manager_blocks_per_unit / 2);
-    }
-    if (cache_cost.n_c1_layers > 0) {
-      kv_cache_cap->c1_count(token_unit_count *
-                             cache_cost.manager_blocks_per_unit / 1);
-    }
-    return;
-  }
-  if (cache_cost.n_c4_layers > 0) {
-    kv_cache_cap->c4_count(token_unit_count);
-  }
-  if (cache_cost.n_c128_layers > 0) {
-    kv_cache_cap->c128_count(token_unit_count);
-  }
-}
-
-Dsv4KVCacheEstimateCost estimate_dsv4_kv_cache_cost(
-    const ModelArgs& model_args,
-    const KVCacheEstimateOptions& options) {
-  const int64_t block_size = options.block_size;
-  const int64_t head_dim = model_args.head_dim();
-  const int64_t index_head_dim =
-      std::max<int64_t>(model_args.index_head_dim(), 1);
-  const std::vector<int32_t>& compress_ratios = model_args.compress_ratios();
-  const int64_t float32_size = 4;
-  const int64_t dtype_size =
-      static_cast<int64_t>(torch::elementSize(options.dtype));
-  const Dsv4CacheGeometry& geometry =
-      KVCacheConfig::get_instance().dsv4_cache_geometry();
-  const int64_t compressed_block_token_size =
-      geometry.compressed_block_token_size();
-  const int64_t c4_physical_dim = geometry.c4_physical_dim();
-  const int64_t c128_physical_dim = geometry.c128_physical_dim();
-
-  Dsv4KVCacheEstimateCost cache_cost;
-  cache_cost.swa_count = dsv4_swa_block_count(model_args, options);
-
-  for (int64_t i = 0; i < model_args.n_layers(); ++i) {
-    const int32_t ratio = i < static_cast<int64_t>(compress_ratios.size())
-                              ? compress_ratios[static_cast<size_t>(i)]
-                              : 1;
-    if (ratio == 4) {
-      ++cache_cost.n_c4_layers;
-    } else if (ratio == 128) {
-      ++cache_cost.n_c128_layers;
-    }
-  }
-  const int64_t n_c1_layers =
-      model_args.n_layers() - cache_cost.n_c4_layers - cache_cost.n_c128_layers;
-
-  const int64_t swa_bytes_per_c1_block = block_size * head_dim * dtype_size;
-  const int64_t swa_bytes_per_c4_block =
-      block_size * head_dim * dtype_size +
-      block_size * (2 * head_dim * float32_size) * 2 +
-      block_size * (2 * index_head_dim * float32_size) * 2;
-  const int64_t swa_bytes_per_c128_block =
-      block_size * head_dim * dtype_size +
-      block_size * head_dim * float32_size * 2;
-
-  cache_cost.swa_bytes_per_block =
-      n_c1_layers * swa_bytes_per_c1_block +
-      cache_cost.n_c4_layers * swa_bytes_per_c4_block +
-      cache_cost.n_c128_layers * swa_bytes_per_c128_block;
-  cache_cost.constant_swa_bytes =
-      cache_cost.swa_count * cache_cost.swa_bytes_per_block;
-
-  const DeepSeekV4CachePolicy cache_policy =
-      get_dsv4_cache_policy(options.dtype);
-  const int64_t scale_bytes =
-      cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
-  const int64_t bytes_per_c4_block =
-      c4_physical_dim *
-      (head_dim * dtype_size + index_head_dim * cache_policy.index_dtype_size +
-       scale_bytes);
-  const int64_t bytes_per_c128_block =
-      c128_physical_dim * head_dim * dtype_size;
-  const int64_t manager_blocks_per_compressed_block =
-      compressed_block_token_size / block_size;
-
-  if (cache_cost.n_c4_layers > 0 && cache_cost.n_c128_layers > 0) {
-    cache_cost.token_unit_bytes =
-        cache_cost.n_c4_layers * bytes_per_c4_block +
-        cache_cost.n_c128_layers * bytes_per_c128_block;
-    cache_cost.manager_blocks_per_unit = manager_blocks_per_compressed_block;
-  } else if (cache_cost.n_c4_layers > 0) {
-    cache_cost.token_unit_bytes = cache_cost.n_c4_layers * bytes_per_c4_block;
-    cache_cost.manager_blocks_per_unit = manager_blocks_per_compressed_block;
-  } else if (cache_cost.n_c128_layers > 0) {
-    cache_cost.token_unit_bytes =
-        cache_cost.n_c128_layers * bytes_per_c128_block;
-    cache_cost.manager_blocks_per_unit = manager_blocks_per_compressed_block;
-  }
-  return cache_cost;
-}
-
-// DeepSeek V4.1 cost model (contract §2). Only kv-source layers allocate
-// TOKEN group tensors; reuse/reindex layers read them, so the compressed
-// budget is driven solely by the kv-source layers.
-//
-// Derivation of the per-block byte costs (bs = engine block_size tokens):
-// - Every layer stores its own SWA window KV: bs * head_dim * dtype_size.
-// - A ratio-2 kv source additionally parks the trailing partial group in
-//   compress_kv_state / compress_score_state, each [swa_count, bs, head_dim]
-//   fp32 (ring slot = pos % bs), adding 2 * bs * head_dim * 4 bytes to the
-//   SWA-group per-block cost.
-// - A TOKEN block stores bs compressed rows of key [head_dim] in the MODEL
-//   dtype plus index [index_head_dim] in the platform policy's index dtype
-//   (NPU: int8 with an fp16 per-token scale; MLU: the model dtype, no scale),
-//   so bytes_per_token_block = bs * (head_dim * dtype_size
-//   + index_head_dim * index_dtype_size + scale_bytes) for both ratios.
-//
-// Allocation unit: one c2 block spans bs*2 tokens = 2 engine blocks, one c1
-// block spans bs*1 tokens = 1 engine block, so the common unit is
-// manager_blocks_per_unit = 2 engine blocks (bs*2 tokens): per unit a ratio-2
-// source consumes 1 c2 block and a ratio-1 source consumes 2 c1 blocks.
-// This keeps c2_count : c1_count at the token-proportional 1 : 2 and makes
-// n_blocks = max(c2_count * 2, c1_count) land on both managers evenly.
-Dsv4KVCacheEstimateCost estimate_dsv41_kv_cache_cost(
-    const ModelArgs& model_args,
-    const KVCacheEstimateOptions& options) {
-  const int64_t block_size = options.block_size;
-  const int64_t head_dim = model_args.head_dim();
-  const int64_t index_head_dim =
-      std::max<int64_t>(model_args.index_head_dim(), 1);
-  const int64_t float32_size = 4;
-  const int64_t dtype_size =
-      static_cast<int64_t>(torch::elementSize(options.dtype));
-
-  Dsv4KVCacheEstimateCost cache_cost;
-  cache_cost.swa_count = dsv4_swa_block_count(model_args, options);
-
-  const std::vector<int32_t>& compress_ratios = model_args.compress_ratios();
-  for (const int32_t layer_id : model_args.kv_source_layer_ids()) {
-    if (layer_id < 0 ||
-        layer_id >= static_cast<int64_t>(compress_ratios.size())) {
-      continue;
-    }
-    const int32_t ratio = compress_ratios[static_cast<size_t>(layer_id)];
-    if (ratio == 2) {
-      ++cache_cost.n_c2_layers;
-    } else if (ratio == 1) {
-      ++cache_cost.n_c1_layers;
-    }
-  }
-
-  const int64_t swa_bytes_per_plain_block = block_size * head_dim * dtype_size;
-  // The ratio-2 compressor parks at most the trailing partial group, so its
-  // fp32 kv/score ring is fixed to kDsv41CompressStateRows rows per block
-  // (matching va's STATE_RING_ROWS), independent of the engine block
-  // size. Keep this in lockstep with the V4.1 allocation in
-  // deepseek_v4_kv_cache_impl.cpp.
-  const int64_t swa_bytes_per_c2_block =
-      swa_bytes_per_plain_block +
-      2 * kDsv41CompressStateRows * head_dim * float32_size;
-  cache_cost.swa_bytes_per_block =
-      (model_args.n_layers() - cache_cost.n_c2_layers) *
-          swa_bytes_per_plain_block +
-      cache_cost.n_c2_layers * swa_bytes_per_c2_block;
-  cache_cost.constant_swa_bytes =
-      cache_cost.swa_count * cache_cost.swa_bytes_per_block;
-
-  const DeepSeekV4CachePolicy cache_policy =
-      get_dsv4_cache_policy(options.dtype);
-  const int64_t index_scale_bytes =
-      cache_policy.has_indexer_cache_scale ? cache_policy.scale_dtype_size : 0;
-  const int64_t bytes_per_token_block =
-      block_size *
-      (head_dim * dtype_size + index_head_dim * cache_policy.index_dtype_size +
-       index_scale_bytes);
-  cache_cost.manager_blocks_per_unit = 2;
-  cache_cost.token_unit_bytes =
-      cache_cost.n_c2_layers * (cache_cost.manager_blocks_per_unit / 2) *
-          bytes_per_token_block +
-      cache_cost.n_c1_layers * (cache_cost.manager_blocks_per_unit / 1) *
-          bytes_per_token_block;
-  return cache_cost;
-}
-
 Dsv4KVCacheEstimateCost estimate_dsv4_family_kv_cache_cost(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options) {
-  if (util::is_deepseek_v41_model_type(model_args.model_type())) {
-    return estimate_dsv41_kv_cache_cost(model_args, options);
+  Dsv4CacheLayoutOptions layout_options;
+  layout_options.head_dim = model_args.head_dim();
+  layout_options.index_head_dim = model_args.index_head_dim();
+  layout_options.dtype = options.dtype;
+  layout_options.is_v41 =
+      util::is_deepseek_v41_model_type(model_args.model_type());
+  Dsv4KVCacheEstimateCost cache_cost;
+  cache_cost.block_size =
+      build_dsv4_layer_cache_layout(layout_options).block_size;
+  const std::vector<int32_t>& ratios = model_args.compress_ratios();
+  const std::vector<int32_t>& sources = model_args.kv_source_layer_ids();
+  for (int64_t layer = 0; layer < model_args.n_layers(); ++layer) {
+    const int32_t ratio = layer < static_cast<int64_t>(ratios.size())
+                              ? ratios[static_cast<size_t>(layer)]
+                              : 1;
+    layout_options.compress_ratio = ratio;
+    layout_options.is_kv_source_layer =
+        std::find(sources.begin(), sources.end(), layer) != sources.end();
+    const Dsv4LayerCacheLayout layout =
+        build_dsv4_layer_cache_layout(layout_options);
+    for (const CacheTensorAllocationSpec& spec : layout.tensors) {
+      int64_t block_bytes =
+          static_cast<int64_t>(torch::elementSize(spec.dtype));
+      for (const int64_t dim : spec.block_shape) {
+        CHECK_GT(dim, 0);
+        CHECK_LE(block_bytes, std::numeric_limits<int64_t>::max() / dim);
+        block_bytes *= dim;
+      }
+      if (spec.block_type == BlockType::KV) {
+        cache_cost.token_unit_bytes += block_bytes;
+      } else {
+        CHECK(spec.block_type == BlockType::SWA);
+        cache_cost.swa_bytes_per_block += block_bytes;
+      }
+    }
   }
-  return estimate_dsv4_kv_cache_cost(model_args, options);
+  cache_cost.swa_count = dsv4_swa_block_count(
+      model_args, options, cache_cost.token_unit_bytes > 0);
+  cache_cost.constant_swa_bytes =
+      cache_cost.swa_count * cache_cost.swa_bytes_per_block;
+  return cache_cost;
 }
 
 void init_dsv4_counts(const ModelArgs& model_args,
@@ -657,6 +496,8 @@ void init_dsv4_counts(const ModelArgs& model_args,
   CHECK(kv_cache_cap != nullptr);
   const Dsv4KVCacheEstimateCost cache_cost =
       estimate_dsv4_family_kv_cache_cost(model_args, options);
+  kv_cache_cap->block_size(cache_cost.block_size)
+      .swa_block_size(dsv4_swa_block_size());
   CHECK_GE(kv_cache_cap->cache_size_in_bytes(), cache_cost.constant_swa_bytes)
       << "no memory for the minimum DSV4 SWA cache, required="
       << readable_size(cache_cost.constant_swa_bytes)
@@ -679,12 +520,12 @@ void init_dsv4_counts(const ModelArgs& model_args,
         << "no memory left for speculative target/draft fixed kv cache "
            "allocation";
 
-    const int64_t common_blocks_per_unit = std::max(
-        cache_cost.manager_blocks_per_unit, draft_cost.manager_blocks_per_unit);
-    const int64_t target_common_unit_bytes =
-        dsv4_common_unit_bytes(cache_cost, common_blocks_per_unit);
-    const int64_t draft_common_unit_bytes =
-        dsv4_common_unit_bytes(draft_cost, common_blocks_per_unit);
+    if (cache_cost.token_unit_bytes > 0 && draft_cost.token_unit_bytes > 0) {
+      CHECK_EQ(cache_cost.block_size, draft_cost.block_size)
+          << "Target/draft KV must share the block size.";
+    }
+    const int64_t target_common_unit_bytes = cache_cost.token_unit_bytes;
+    const int64_t draft_common_unit_bytes = draft_cost.token_unit_bytes;
     const int64_t combined_unit_bytes =
         target_common_unit_bytes + draft_common_unit_bytes;
     const int64_t remaining_bytes =
@@ -705,7 +546,7 @@ void init_dsv4_counts(const ModelArgs& model_args,
         cache_cost.constant_swa_bytes +
         token_unit_count * target_common_unit_bytes;
     CHECK_GT(adjusted_cache_size_in_bytes, 0)
-        << "no memory left for speculative target/draft kv cache allocation";
+        << "no memory left for speculative target/draft KV cache allocation";
     LOG(INFO) << "speculative kv cache capacity adjusted from "
               << readable_size(kv_cache_cap->cache_size_in_bytes()) << " to "
               << readable_size(adjusted_cache_size_in_bytes)
@@ -713,7 +554,6 @@ void init_dsv4_counts(const ModelArgs& model_args,
               << ", draft_constant_bytes=" << draft_cost.constant_swa_bytes
               << ", target_common_unit_bytes=" << target_common_unit_bytes
               << ", draft_common_unit_bytes=" << draft_common_unit_bytes
-              << ", common_blocks_per_unit=" << common_blocks_per_unit
               << ", token_unit_count=" << token_unit_count;
     kv_cache_cap->cache_size_in_bytes(adjusted_cache_size_in_bytes);
     token_mem = token_unit_count * target_common_unit_bytes;
@@ -731,60 +571,19 @@ void init_dsv4_counts(const ModelArgs& model_args,
     }
   }
 
-  kv_cache_cap->swa_count(cache_cost.swa_count);
-  kv_cache_cap->c4_count(0);
-  kv_cache_cap->c128_count(0);
-  kv_cache_cap->c2_count(0);
-  kv_cache_cap->c1_count(0);
-  // Keep SWA at the operational minimum calculated above. Prefix-cache entries
-  // share this pool; any remaining memory is reserved for compressed history.
-  if (cache_cost.token_unit_bytes > 0 && token_mem > 0) {
-    const int64_t token_unit_count = token_mem / cache_cost.token_unit_bytes;
-    set_dsv4_compressed_counts(cache_cost, token_unit_count, kv_cache_cap);
-  }
-
+  kv_cache_cap->swa_count(cache_cost.swa_count)
+      .has_kv_cache(cache_cost.token_unit_bytes > 0);
+  const int64_t kv_block_count = cache_cost.token_unit_bytes > 0
+                                     ? token_mem / cache_cost.token_unit_bytes
+                                     : 0;
   CHECK_GT(kv_cache_cap->swa_count(), 0) << "DSV4 swa_count must be > 0";
-  if (cache_cost.n_c4_layers > 0) {
-    CHECK_GT(kv_cache_cap->c4_count(), 0)
-        << "DSV4 c4_count must be > 0 when compress_ratio=4 layers exist";
+  if (cache_cost.token_unit_bytes > 0) {
+    CHECK_GT(kv_block_count, 0)
+        << "Declared KV tensors require a positive logical block count";
   }
-  if (cache_cost.n_c128_layers > 0) {
-    CHECK_GT(kv_cache_cap->c128_count(), 0)
-        << "DSV4 c128_count must be > 0 when compress_ratio=128 layers "
-           "exist";
-  }
-  if (cache_cost.n_c2_layers > 0) {
-    CHECK_GT(kv_cache_cap->c2_count(), 0)
-        << "DSV4.1 c2_count must be > 0 when ratio-2 kv-source layers exist";
-  }
-  if (cache_cost.n_c1_layers > 0) {
-    CHECK_GT(kv_cache_cap->c1_count(), 0)
-        << "DSV4.1 c1_count must be > 0 when ratio-1 kv-source layers exist";
-  }
-
-  int64_t manager_base_blocks = 0;
-  if (cache_cost.n_c4_layers > 0) {
-    manager_base_blocks =
-        std::max(manager_base_blocks,
-                 kv_cache_cap->c4_count() * cache_cost.manager_blocks_per_unit);
-  }
-  if (cache_cost.n_c128_layers > 0) {
-    manager_base_blocks = std::max(
-        manager_base_blocks,
-        kv_cache_cap->c128_count() * cache_cost.manager_blocks_per_unit);
-  }
-  // V4.1 TOKEN groups: a c2 block spans 2 engine blocks (bs*2 tokens), a c1
-  // block spans 1 (bs tokens). n_blocks is in engine-block units, matching
-  // the V4 managers above; the composite leaf divides by its ratio.
-  if (cache_cost.n_c2_layers > 0) {
-    manager_base_blocks =
-        std::max(manager_base_blocks, kv_cache_cap->c2_count() * 2);
-  }
-  if (cache_cost.n_c1_layers > 0) {
-    manager_base_blocks =
-        std::max(manager_base_blocks, kv_cache_cap->c1_count() * 1);
-  }
-  kv_cache_cap->n_blocks(std::max<int64_t>(manager_base_blocks, 1));
+  // Preserve the window-only estimator sentinel; speculative allocation
+  // subsequently adopts the target count without creating KV tensors.
+  kv_cache_cap->n_blocks(std::max<int64_t>(kv_block_count, 1));
 }
 
 void init_standard_counts(const ModelArgs& model_args,

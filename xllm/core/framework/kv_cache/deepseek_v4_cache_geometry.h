@@ -21,34 +21,28 @@ namespace xllm {
 
 constexpr int32_t kDsv4C4CompressRatio = 4;
 constexpr int32_t kDsv4C128CompressRatio = 128;
-#if defined(USE_MLU)
-constexpr int64_t kDsv4CompressedBlockTokenSize = 128;
-#else
-constexpr int64_t kDsv4CompressedBlockTokenSize = 2048;
-#endif
+// Fixed token spans. SWA is 128 on every DSV4 and DSV4.1 device. KV is 2048
+// only for DSV4 on NPU; DSV4 on MLU and DSV4.1 on NPU or MLU use 128.
+// Physical dim is the KV span divided by the compress ratio.
+constexpr int64_t kDsv4NpuBlockSize = 2048;
+constexpr int64_t kDsv4FixedBlockSize = 128;
+constexpr int64_t kDsv4SwaBlockSize = 128;
 
-class Dsv4CacheGeometry final {
- public:
-  [[nodiscard]] constexpr int64_t compressed_block_token_size() const {
-    return kDsv4CompressedBlockTokenSize;
-  }
+// Tokens in one logical KV block. npu_dsv4 is true only for DSV4 on NPU.
+[[nodiscard]] inline constexpr int64_t dsv4_kv_block_size(bool npu_dsv4) {
+  return npu_dsv4 ? kDsv4NpuBlockSize : kDsv4FixedBlockSize;
+}
 
-  [[nodiscard]] constexpr int64_t compressed_physical_dim(
-      int32_t compress_ratio) const {
-    if ((compress_ratio != kDsv4C4CompressRatio &&
-         compress_ratio != kDsv4C128CompressRatio)) {
-      return 0;
-    }
-    return kDsv4CompressedBlockTokenSize / compress_ratio;
-  }
+// Tokens in one SWA block. Every DSV4 and DSV4.1 device uses 128.
+[[nodiscard]] inline constexpr int64_t dsv4_swa_block_size() {
+  return kDsv4SwaBlockSize;
+}
 
-  [[nodiscard]] constexpr int64_t c4_physical_dim() const {
-    return compressed_physical_dim(kDsv4C4CompressRatio);
-  }
-
-  [[nodiscard]] constexpr int64_t c128_physical_dim() const {
-    return compressed_physical_dim(kDsv4C128CompressRatio);
-  }
-};
+// Physical tensor dim of one logical block: block_size / compress_ratio.
+[[nodiscard]] inline constexpr int64_t dsv4_physical_dim(
+    int64_t block_size,
+    int32_t compress_ratio) {
+  return compress_ratio > 0 ? block_size / compress_ratio : 0;
+}
 
 }  // namespace xllm

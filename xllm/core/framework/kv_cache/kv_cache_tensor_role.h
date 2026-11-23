@@ -31,7 +31,7 @@ class KVCacheTensorRole {
     INDEX_SCALE = 5,
     KEY_SCALE = 6,
     VALUE_SCALE = 7,
-    WINDOW = 8,
+    // 8 is reserved. It was WINDOW; the sliding-window plane is SWA.
     CACHE_SCALE = 9,
     KV_STATE = 10,
     SCORE_STATE = 11,
@@ -64,8 +64,8 @@ class KVCacheTensorRole {
       value_ = KEY_SCALE;
     } else if (str == "VALUE_SCALE" || str == "value_scale") {
       value_ = VALUE_SCALE;
-    } else if (str == "WINDOW" || str == "window") {
-      value_ = WINDOW;
+    } else if (str == "SWA" || str == "swa") {
+      value_ = SWA;
     } else if (str == "CACHE_SCALE" || str == "cache_scale") {
       value_ = CACHE_SCALE;
     } else if (str == "KV_STATE" || str == "kv_state") {
@@ -76,8 +76,6 @@ class KVCacheTensorRole {
       value_ = INDEX_KV_STATE;
     } else if (str == "INDEX_SCORE_STATE" || str == "index_score_state") {
       value_ = INDEX_SCORE_STATE;
-    } else if (str == "SWA" || str == "swa") {
-      value_ = SWA;
     } else if (str == "COMPRESS_STATE" || str == "compress_state") {
       value_ = COMPRESS_STATE;
     } else if (str == "COMPRESS_INDEX_STATE" || str == "compress_index_state") {
@@ -116,8 +114,6 @@ class KVCacheTensorRole {
       return "key_scale";
     } else if (this->value_ == VALUE_SCALE) {
       return "value_scale";
-    } else if (this->value_ == WINDOW) {
-      return "window";
     } else if (this->value_ == CACHE_SCALE) {
       return "cache_scale";
     } else if (this->value_ == KV_STATE) {

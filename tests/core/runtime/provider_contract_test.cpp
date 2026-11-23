@@ -30,10 +30,18 @@ namespace {
 
 class DescriptorEngine final : public Engine {
  public:
-  DescriptorEngine() {
-    args_.dtype("bfloat16").n_heads(8).n_kv_heads(8).head_dim(64);
+  explicit DescriptorEngine(const std::string& model_type,
+                            int32_t compress_ratio = 1) {
+    args_.model_type(model_type)
+        .dtype("bfloat16")
+        .n_layers(2)
+        .n_heads(8)
+        .n_kv_heads(8)
+        .head_dim(64)
+        .compress_ratios({compress_ratio, compress_ratio});
     tokenizer_args_.chat_template("{{ messages }}");
   }
+
   ForwardOutput step(std::vector<Batch>&) override { return {}; }
   void update_last_step_result(std::vector<Batch>&) override {}
   std::vector<int64_t> get_active_activation_memory() const override {
@@ -57,35 +65,31 @@ TEST(ProviderContractTest, RegistersActualCacheGroupsForFlatAndGroupedPools) {
   parallel.tp_size(1).dp_size(1).cp_size(1).ep_size(1).kv_split_size(1);
   disagg.enable_disagg_pd(true).kv_cache_transfer_mode("PUSH");
 
-  const DescriptorEngine engine;
   InstanceInfo instance;
   instance.name = "127.0.0.1:7442";
   instance.incarnation_id = "test-incarnation";
   instance.type = "PREFILL";
   instance.cluster_ids = {1};
 
-  const std::vector<std::vector<uint32_t>> ratios = {
-      {}, {0, 4, 128}, {0, 2, 1}};
+  const std::vector<std::string> model_types = {
+      "", "deepseek_v4", "deepseek_v41"};
   const std::vector<std::vector<std::string>> expected = {
-      {"group:0"},
-      {"group:1", "group:2", "group:3"},
-      {"group:1", "group:6", "group:7"}};
-  for (size_t index = 0; index < ratios.size(); ++index) {
+      {"group:0"}, {"group:0", "group:1"}, {"group:0", "group:1"}};
+  for (size_t index = 0; index < model_types.size(); ++index) {
     SCOPED_TRACE(index);
+    const DescriptorEngine engine(model_types[index]);
     BlockManagerPool::Options options;
-    options.num_blocks(128)
-        .block_size(128)
+    options.num_blocks(4)
+        .swa_block_size(128)
         .enable_prefix_cache(false)
         .sliding_window_size(128)
         .swa_blocks_per_seq(2)
         .swa_num_blocks(8)
-        .c4_num_blocks(4)
-        .c128_num_blocks(4)
+        .block_size(128)
         .max_seqs_per_batch(1)
         .max_tokens_per_batch(128);
-    if (!ratios[index].empty()) {
-      options.manager_types({1, 0, 0}).compress_ratios(ratios[index]);
-      options.model_type(index == 1 ? "deepseek_v4" : "deepseek_v41");
+    if (!model_types[index].empty()) {
+      options.manager_types({1, 0});
     }
     const BlockManagerPool pool(options);
     std::string error;
@@ -97,7 +101,29 @@ TEST(ProviderContractTest, RegistersActualCacheGroupsForFlatAndGroupedPools) {
     }
     EXPECT_EQ(config->cache_groups, expected[index]);
     const auto descriptor = build_native_provider_descriptor(*config, &error);
-    EXPECT_TRUE(descriptor.has_value()) << error;
+    ASSERT_TRUE(descriptor.has_value()) << error;
+    EXPECT_EQ(descriptor->contract_version(), 1u);
+    EXPECT_EQ(descriptor->identity().protocol_version(), 1u);
+    EXPECT_FALSE(config->kv_layout_contract.empty());
+    EXPECT_TRUE(config->kv_transfer_layout_contract.empty());
+    EXPECT_EQ(descriptor->kv().kv_layout_digest().size(), 64u);
+    EXPECT_TRUE(descriptor->kv().transfer_compatibility_digest().empty());
+
+    const DescriptorEngine different_layout(model_types[index],
+                                            /*compress_ratio=*/2);
+    const auto different_config = collect_native_provider_descriptor_config(
+        instance, different_layout, pool, &error);
+    ASSERT_TRUE(different_config.has_value()) << error;
+    EXPECT_EQ(different_config->cache_groups, config->cache_groups);
+    EXPECT_NE(different_config->kv_layout_contract, config->kv_layout_contract);
+    EXPECT_TRUE(different_config->kv_transfer_layout_contract.empty());
+    const auto different_descriptor =
+        build_native_provider_descriptor(*different_config, &error);
+    ASSERT_TRUE(different_descriptor.has_value()) << error;
+    EXPECT_NE(different_descriptor->kv().kv_layout_digest(),
+              descriptor->kv().kv_layout_digest());
+    EXPECT_TRUE(
+        different_descriptor->kv().transfer_compatibility_digest().empty());
   }
 }
 

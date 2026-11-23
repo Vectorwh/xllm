@@ -194,7 +194,7 @@ torch::Tensor causal_conv1d(torch::Tensor& conv_state,
 // compact owned entries to the front. ``out`` and ``idx_scratch`` must be
 // caller-owned, contiguous NPU storage so ACL graph replay can reuse them.
 void sfa_dcp_remap_out(const torch::Tensor& topk_indices,
-                       int64_t physical_block_size,
+                       int64_t physical_dim,
                        int64_t shard_size,
                        int64_t shard_rank,
                        torch::Tensor& out,

@@ -22,13 +22,32 @@ limitations under the License.
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "core/framework/config/execution_config.h"
 #include "core/runtime/forward_shared_memory_manager.h"
+#include "core/runtime/params_utils.h"
 #include "core/scheduler/disagg_pd_scheduler.h"
 
 namespace xllm {
 namespace {
+
+// The RPC receive adapter allocates NPU-pinned memory even for a CPU device.
+// Exercise its descriptor payload using ordinary CPU storage so these codec
+// regressions do not require device initialization.
+ForwardInput stage_packed_input_on_cpu(
+    const proto::PackedForwardInput& packed) {
+  ForwardInput input;
+  input.input_host_buffer = torch::empty(
+      {static_cast<int64_t>(packed.payload().size())},
+      torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  std::memcpy(input.input_host_buffer.data_ptr(),
+              packed.payload().data(),
+              packed.payload().size());
+  input.input_host_buffer_has_layout = true;
+  return input;
+}
 
 class ConstraintSnapshotTransportTest : public ::testing::Test {
  protected:
@@ -174,6 +193,89 @@ TEST_F(ConstraintSnapshotTransportTest,
         reader.input_read(output, torch::Device(torch::kCPU));
       },
       "grammar source exceeds descriptor");
+}
+
+TEST_F(ConstraintSnapshotTransportTest,
+       TransferMappingsKeepSharedPrefixAndCursorAcrossPackedAndSharedInput) {
+  ForwardInput input;
+  TransferKVInfo info;
+  info.request_id = "shared-prefix-and-cursor";
+  KVTransferMapping mapping;
+  mapping.local_ids = {7, 8};
+  mapping.remote_ids = {17, 18};
+  mapping.remote_shared_num = 815;
+  mapping.local_block_start = 203;
+  info.mappings.emplace_back(std::move(mapping));
+  input.transfer_kv_infos.emplace_back(std::move(info));
+  input.sample_sequence_ids = {"descriptor-after-transfer-mappings"};
+  auto expect_mapping = [&](const ForwardInput& restored) {
+    ASSERT_EQ(restored.transfer_kv_infos.size(), 1u);
+    const TransferKVInfo& out = restored.transfer_kv_infos.front();
+    EXPECT_EQ(out.request_id, "shared-prefix-and-cursor");
+    ASSERT_EQ(out.mappings.size(), 1u);
+    const KVTransferMapping& actual = out.mappings.front();
+    EXPECT_EQ(actual.local_ids, (std::vector<uint64_t>{7, 8}));
+    EXPECT_EQ(actual.remote_ids, (std::vector<uint64_t>{17, 18}));
+    EXPECT_EQ(actual.remote_shared_num, 815u);
+    EXPECT_EQ(actual.local_block_start, 203u);
+    EXPECT_EQ(restored.sample_sequence_ids, input.sample_sequence_ids);
+  };
+
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed));
+  uint64_t tag = 0;
+  ASSERT_GE(packed.payload().size(), sizeof(tag));
+  std::memcpy(&tag, packed.payload().data(), sizeof(tag));
+  EXPECT_EQ(tag, 0x584C4C4D0000000BULL);
+  ForwardInput lazy = stage_packed_input_on_cpu(packed);
+  ForwardInput unpacked;
+  ASSERT_TRUE(detail::unpack_from_input_host_buffer(
+      lazy,
+      torch::Device(torch::kCPU),
+      torch::kFloat32,
+      unpacked,
+      /*materialize_device_buffer=*/false));
+  expect_mapping(unpacked);
+
+  bool creator = false;
+  const std::string name =
+      ForwardSharedMemoryManager::create_unique_name("transfer_mapping_origin",
+                                                     /*dp_group=*/0,
+                                                     ForwardType::RAW_INPUT,
+                                                     /*rank=*/0);
+  ForwardSharedMemoryManager writer(
+      name, 1 << 20, creator, ForwardType::RAW_INPUT);
+  ForwardSharedMemoryManager reader(
+      name, 1 << 20, creator, ForwardType::RAW_INPUT);
+  ASSERT_TRUE(writer.input_write(input));
+  ForwardInput restored;
+  // Read directly with contiguous buffering disabled by the fixture. The
+  // deferred worker path also allocates NPU-pinned payload storage.
+  ASSERT_TRUE(reader.input_read(restored, torch::Device(torch::kCPU)));
+  expect_mapping(restored);
+}
+
+TEST_F(ConstraintSnapshotTransportTest,
+       RawInputWithoutDestinationOriginsIsRejected) {
+  ForwardInput input;
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(forward_input_to_packed_proto(input, &packed));
+  const uint64_t legacy_tag = 0x584C4C4D00000009ULL;
+  ASSERT_GE(packed.payload().size(), sizeof(legacy_tag));
+  std::memcpy(
+      packed.mutable_payload()->data(), &legacy_tag, sizeof(legacy_tag));
+  ForwardInput lazy = stage_packed_input_on_cpu(packed);
+  EXPECT_DEATH(
+      {
+        ForwardInput restored;
+        detail::unpack_from_input_host_buffer(
+            lazy,
+            torch::Device(torch::kCPU),
+            torch::kFloat32,
+            restored,
+            /*materialize_device_buffer=*/false);
+      },
+      "incompatible raw input format");
 }
 
 TEST_F(ConstraintSnapshotTransportTest,

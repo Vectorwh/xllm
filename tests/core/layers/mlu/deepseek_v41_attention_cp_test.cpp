@@ -150,8 +150,6 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
       input.multi_block_tables = {
           torch::tensor({1, 0}, torch::kInt32).view({2, 1}),
           torch::tensor({6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5}, torch::kInt32)
-              .view({2, 6}),
-          torch::tensor({6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5}, torch::kInt32)
               .view({2, 6})};
       Csa2Context cp_shared, reference_shared;
       deepseek_v41::prepare_metadata(

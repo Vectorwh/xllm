@@ -21,8 +21,6 @@ limitations under the License.
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
-#include "core/framework/kv_cache/deepseek_v4_cache_geometry.h"
-
 namespace xllm {
 
 class JsonReader;
@@ -61,10 +59,6 @@ class KVCacheConfig final {
 
   PROPERTY(int32_t, block_size) = 128;
 
-  [[nodiscard]] const Dsv4CacheGeometry& dsv4_cache_geometry() const {
-    return dsv4_cache_geometry_;
-  }
-
   PROPERTY(int64_t, max_cache_size) = 0;
 
   PROPERTY(double, max_memory_utilization) = 0.8;
@@ -94,9 +88,6 @@ class KVCacheConfig final {
   PROPERTY(bool, enable_xtensor) = false;
 
   PROPERTY(int64_t, phy_page_granularity_size) = 2 * 1024 * 1024;
-
- private:
-  Dsv4CacheGeometry dsv4_cache_geometry_;
 };
 
 }  // namespace xllm

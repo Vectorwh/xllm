@@ -1326,7 +1326,7 @@ class TestModelExecutorConstruction:
             q_cu_seq_lens=torch.tensor([0, 1], dtype=torch.int32),
             q_cu_seq_lens_host_values=[0, 1],
             kv_seq_lens_host_values=[1],
-            logical_block_size=128,
+            block_size=128,
         )
         backend.prepare(metadata)
         assert backend._metadata is metadata

@@ -125,23 +125,16 @@ TEST(KVCacheStateTest, HasAnyBlocksIgnoresEmbedding) {
   }
 
   // Each cache-bearing type alone counts.
-  for (const BlockType type : {BlockType::KV,
-                               BlockType::SWA,
-                               BlockType::C1,
-                               BlockType::C2,
-                               BlockType::C4,
-                               BlockType::C128}) {
+  for (const BlockType type : {BlockType::KV, BlockType::SWA}) {
     KVCacheState state;
     state.add_blocks(type, make_block(2));
     EXPECT_TRUE(state.has_any_blocks()) << "type=" << static_cast<int>(type);
   }
 
-  // DSV4-like: SWA/C4/C128 present, no KV -> still true.
+  // A window-only model still owns cache blocks.
   {
     KVCacheState state;
     state.add_blocks(BlockType::SWA, make_block(3));
-    state.add_blocks(BlockType::C4, make_block(4));
-    state.add_blocks(BlockType::C128, make_block(5));
     state.add_blocks(BlockType::EMBEDDING, make_block(6));
     EXPECT_TRUE(state.has_any_blocks());
   }

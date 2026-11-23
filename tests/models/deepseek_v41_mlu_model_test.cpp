@@ -1221,7 +1221,6 @@ TEST_F(DeepseekV41MluModelTest, CpuBlockTablesSupportEagerPrefillAndDecode) {
                   : std::vector<int32_t>{0, 4, 6};
       host_input.multi_block_tables = {
           torch::tensor({1, 0}, torch::kInt32).view({2, 1}),
-          torch::tensor({3, 2}, torch::kInt32).view({2, 1}),
           torch::tensor({3, 2}, torch::kInt32).view({2, 1})};
       const auto input = host_input.to(options_.device());
       for (const auto& table : input.multi_block_tables) {

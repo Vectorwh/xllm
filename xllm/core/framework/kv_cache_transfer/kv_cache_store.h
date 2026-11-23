@@ -31,15 +31,31 @@ limitations under the License.
 
 namespace xllm {
 
+// Physical Host buffers for one logical resource. Payload/schema use absolute
+// source-layer and role order, independently of local copy-group packing.
+struct HostCacheStoreGroup {
+  std::vector<int64_t> layer_ids;
+  BlockTypeTensorMap tensors;
+};
+
 struct HostCacheStoreEntry {
   uint32_t cache_handle = 0;
   std::string key_component;
-  KVCache* cache = nullptr;
   std::optional<bool> enable_mla;
   // Cache registration supplies the role. Key component names do not.
   // Draft KV omits the split rank from its Store key; target KV keeps it.
-  bool is_target;
+  bool is_target = false;
+  std::vector<HostCacheStoreGroup> groups;
+  int64_t block_size = 0;
 };
+
+inline HostCacheStoreGroup host_cache_store_group(
+    const KVCache& cache,
+    BlockType block_type,
+    std::vector<int64_t> layer_ids = {}) {
+  return HostCacheStoreGroup{std::move(layer_ids),
+                             cache.get_block_type_tensors(block_type)};
+}
 
 enum class StoreTpLayout : uint8_t {
   TP_REPLICATED,
@@ -109,14 +125,21 @@ class KVCacheStore final {
       Slice<BlockTransferInfo>& block_transfer_info);
 
  private:
+  struct StorePlane {
+    int64_t source_layer_id = -1;
+    KVCacheTensorRole::Value role = KVCacheTensorRole::KEY;
+    torch::Tensor tensor;
+  };
+
   struct StoreEntry {
     uint32_t cache_handle = 0;
     std::string key_component;
     std::string schema_hash;
-    KVCache* cache = nullptr;
     BlockType block_type = BlockType::KV;
     std::string key_prefix;
     std::vector<torch::Tensor> block_tensors;
+    // Complete contiguous allocations backing possibly strided layer views.
+    std::vector<torch::Tensor> registration_tensors;
     bool is_put_owner = true;
   };
 
@@ -143,8 +166,9 @@ class KVCacheStore final {
   StoreTpLayout resolve_tp_layout(BlockType block_type, bool enable_mla) const;
   bool is_put_owner(StoreTpLayout tp_layout, bool is_split_cache) const;
   std::string build_schema_hash(BlockType block_type,
-                                const KVCache& cache,
-                                StoreTpLayout tp_layout) const;
+                                const std::vector<StorePlane>& planes,
+                                StoreTpLayout tp_layout,
+                                int64_t block_size) const;
   std::string build_key_prefix(const std::string& key_component,
                                BlockType block_type,
                                const std::string& schema_hash,

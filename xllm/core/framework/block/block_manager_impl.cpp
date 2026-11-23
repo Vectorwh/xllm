@@ -56,7 +56,7 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
   CHECK_GT(options.block_size(), 0) << "Block size must be positive";
   if (options_.enable_prefix_cache()) {
     PrefixCache::Options prefix_cache_options;
-    prefix_cache_options.block_size(options.block_size())
+    prefix_cache_options.block_size(block_size())
         .hasher_type(options.hasher_type())
         .block_type(options.block_type());
     prefix_cache_ = create_prefix_cache(prefix_cache_options);
@@ -64,7 +64,7 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
   }
 
   size_t total_blocks = options_.num_blocks();
-  block_size_ = options_.block_size();
+  block_size_ = block_size();
   num_free_blocks_.store(total_blocks, std::memory_order_relaxed);
   usage_accounted_ids_.assign(total_blocks, 0);
   free_blocks_.reserve(total_blocks);

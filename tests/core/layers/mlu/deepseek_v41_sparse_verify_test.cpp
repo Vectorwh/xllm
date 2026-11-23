@@ -117,6 +117,7 @@ TEST(DeepseekV41GraphTest, SparseVerificationIgnoresCausallyMaskedSelections) {
         shared.topk[0][row].flatten(),
         /*position=*/row,
         /*window=*/4,
+        /*compressed_physical_dim=*/128,
         selected.slice(0, row * kCapacity, (row + 1) * kCapacity),
         lengths.slice(0, row, row + 1));
   }
@@ -323,19 +324,21 @@ TEST_P(DeepseekV41MaskedGatherTest, ReplayCompactsLiveIndicesAndUpdatesLength) {
   auto output = torch::empty({4 + count, 512}, options);
   auto length = torch::full({1}, -1, swa_table.options());
   const auto gather = [&]() {
-    kernel::mlu::bangc::deepseek_v41_decode_gather(swa,
-                                                   compressed,
-                                                   current,
-                                                   swa_table,
-                                                   compressed_table,
-                                                   topk,
-                                                   /*position=*/129,
-                                                   /*window=*/4,
-                                                   output,
-                                                   length);
+    kernel::mlu::bangc::deepseek_v41_decode_gather(
+        swa,
+        compressed,
+        current,
+        swa_table,
+        compressed_table,
+        topk,
+        /*position=*/129,
+        /*window=*/4,
+        /*compressed_physical_dim=*/128,
+        output,
+        length);
   };
 
-  // Position 129 wraps the SWA ring: physical rows 254, 255, 0, then current.
+  // Position 129 wraps the SWA ring: physical slots 254, 255, 0, then current.
   auto expected_window = torch::cat(
       {swa.cpu().index_select(0, torch::tensor({254, 255, 0}, torch::kInt64)),
        current.cpu().unsqueeze(0)},

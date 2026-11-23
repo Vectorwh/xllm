@@ -26,12 +26,20 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config.h"
+#include "core/util/scope_guard.h"
 #include "framework/kv_cache/deepseek_v4_cache_geometry.h"
+#include "framework/kv_cache/host_cache_plan.h"
+#include "framework/kv_cache/kv_cache_estimation.h"
+#include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_shard_layout.h"
 #include "framework/kv_cache/prefill_layerwise_kv_cache.h"
+#include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/parallel_state/process_group.h"
 #include "layers/common/kv_shard_batch_metadata.h"
+#include "worker.pb.h"
 
 namespace xllm {
 
@@ -333,6 +341,363 @@ TEST(CacheLayoutBuilderTest,
   }
 }
 
+}  // namespace
+
+TEST(CacheLayoutBuilderTest, Dsv4OwnedTensorAllocationsMatchPlannedBudget) {
+  for (const bool is_v41 : {false, true}) {
+    SCOPED_TRACE(is_v41);
+    ModelArgs args;
+    args.model_type(is_v41 ? "deepseek_v41" : "deepseek_v4")
+        .n_layers(4)
+        .head_dim(16)
+        .index_head_dim(8)
+        .window_size(256)
+        .compress_ratios(is_v41 ? std::vector<int32_t>{2, 1, 2, 1}
+                                : std::vector<int32_t>{1, 4, 128, 4});
+    if (is_v41) {
+      // Reuse layers keep their window but do not own shared kv/state.
+      args.kv_source_layer_ids({0, 3});
+    }
+    KVCacheEstimateOptions estimate;
+    estimate.block_size = 512;
+    estimate.dtype = torch::kBFloat16;
+    estimate.cache_size_in_bytes = 4 * 1024 * 1024;
+    estimate.max_seqs_per_batch = 2;
+    estimate.max_tokens_per_batch = 256;
+    const KVCacheCapacity capacity = estimate_kv_cache_capacity(args, estimate);
+    EXPECT_EQ(capacity.block_size(),
+              dsv4_kv_block_size(!is_v41 && Platform::is_npu()));
+    const KVCacheShape shape(capacity, args, /*world_size=*/1);
+    proto::KVCacheShape serialized;
+    shape.to_proto(&serialized);
+    const KVCacheShape worker_shape = KVCacheShape::from_proto(serialized);
+    EXPECT_TRUE(worker_shape.has_grouped_cache_layout());
+    EXPECT_EQ(
+        worker_shape.key_cache_shape(),
+        (std::vector<int64_t>{capacity.swa_count(), capacity.n_blocks()}));
+    if (!is_v41) {
+      proto::KVCacheShape legacy = serialized;
+      legacy.add_key_cache_shape(capacity.n_blocks());
+      EXPECT_DEATH(KVCacheShape::from_proto(legacy), "Grouped cache requires ");
+    }
+    KVCacheCreateOptions create;
+    create.device(torch::Device(torch::kCPU))
+        .dtype(estimate.dtype)
+        .model_type(args.model_type())
+        .num_layers(args.n_layers())
+        .block_size(estimate.block_size)
+        .head_dim(args.head_dim())
+        .index_head_dim(args.index_head_dim())
+        .window_size(args.window_size())
+        .compress_ratios(args.compress_ratios())
+        .kv_source_layer_ids(args.kv_source_layer_ids());
+    std::vector<KVCache> caches;
+    allocate_kv_caches(caches, worker_shape, create);
+    const HostCachePlan host_plan =
+        build_host_cache_plan(caches,
+                              shape,
+                              create,
+                              /*host_blocks_factor=*/2.0,
+                              InstanceRole::PREFILL,
+                              /*enable_mla=*/true);
+    EXPECT_EQ(host_plan.block_size, capacity.block_size());
+    EXPECT_EQ(host_plan.window_size, args.window_size());
+    EXPECT_EQ(host_plan.window_block_size, dsv4_swa_block_size());
+    EXPECT_FALSE(host_plan.kv_tp_replicated);
+    EXPECT_EQ(host_plan.block_counts.at(BlockType::KV),
+              capacity.n_blocks() * 2);
+    EXPECT_EQ(host_plan.block_counts.at(BlockType::SWA),
+              dsv4_host_swa_block_count(capacity.n_blocks(),
+                                        2.0,
+                                        args.window_size(),
+                                        dsv4_swa_block_size(),
+                                        capacity.block_size()));
+    int64_t allocated_bytes = 0;
+    int64_t kv_block_bytes = 0;
+    for (const KVCache& cache : caches) {
+      const BlockTypeTensorMap window_roles =
+          cache.get_block_type_tensors(BlockType::SWA);
+      const BlockTypeTensorMap kv_roles =
+          cache.get_block_type_tensors(BlockType::KV);
+      ASSERT_EQ(window_roles.size(), 1u);
+      EXPECT_EQ(window_roles.at(KVCacheTensorRole::SWA).data_ptr(),
+                cache.get_swa_cache().data_ptr());
+      size_t expected_kv_planes = cache.get_k_cache().defined() ? 1 : 0;
+      expected_kv_planes += cache.get_index_cache().defined() ? 1 : 0;
+      expected_kv_planes += cache.get_indexer_cache_scale().has_value() ? 1 : 0;
+      ASSERT_EQ(kv_roles.size(), expected_kv_planes);
+      for (const auto& [role, tensor] : kv_roles) {
+        EXPECT_TRUE(tensor.defined());
+        EXPECT_TRUE(role == KVCacheTensorRole::KEY ||
+                    role == KVCacheTensorRole::INDEX ||
+                    role == KVCacheTensorRole::INDEX_SCALE);
+      }
+      for (const KVCacheTensor& owner : cache.get_cache_tensors()) {
+        const int64_t bytes = owner.tensor.numel() *
+                              static_cast<int64_t>(owner.tensor.element_size());
+        allocated_bytes += bytes;
+        if (owner.group_id != cache_group_id(BlockType::SWA)) {
+          ASSERT_EQ(owner.tensor.size(0), capacity.n_blocks());
+          kv_block_bytes += bytes / owner.tensor.size(0);
+        }
+      }
+    }
+    ASSERT_GT(kv_block_bytes, 0);
+    const int64_t unused_bytes = estimate.cache_size_in_bytes - allocated_bytes;
+    EXPECT_GE(unused_bytes, 0);
+    EXPECT_LT(unused_bytes, kv_block_bytes);
+    if (is_v41) {
+      EXPECT_FALSE(caches[1].get_k_cache().defined());
+      EXPECT_FALSE(caches[2].get_k_cache().defined());
+    }
+  }
+}
+
+TEST(CacheLayoutBuilderTest, SharedKvCountMatchesActualDraftAllocation) {
+  for (const bool draft_has_kv : {false, true}) {
+    SCOPED_TRACE(draft_has_kv);
+    ModelArgs target_args;
+    target_args.model_type("deepseek_v4")
+        .n_layers(2)
+        .head_dim(16)
+        .index_head_dim(8)
+        .window_size(256)
+        .compress_ratios({4, 128});
+    ModelArgs draft_args;
+    draft_args.model_type("deepseek_v4_mtp")
+        .n_layers(1)
+        .head_dim(8)
+        .index_head_dim(4)
+        .window_size(128)
+        .compress_ratios({draft_has_kv ? 4 : 1});
+    KVCacheEstimateOptions estimate;
+    estimate.block_size = 128;
+    estimate.dtype = torch::kBFloat16;
+    estimate.cache_size_in_bytes = 4 * 1024 * 1024;
+    estimate.max_seqs_per_batch = 2;
+    estimate.max_tokens_per_batch = 256;
+    const KVCacheEstimateOptions draft_estimate = estimate;
+    estimate.draft_model_args = &draft_args;
+    estimate.draft_options = &draft_estimate;
+    const KVCacheCapacity target =
+        estimate_kv_cache_capacity(target_args, estimate);
+    const KVCacheCapacity original_draft =
+        estimate_kv_cache_capacity(draft_args, draft_estimate);
+    KVCacheCapacity draft = original_draft;
+    draft.n_blocks() = target.n_blocks();
+    ASSERT_GT(target.n_blocks(), 1);
+    EXPECT_EQ(draft.n_blocks(), target.n_blocks());
+    EXPECT_EQ(draft.has_kv_cache(), draft_has_kv);
+    EXPECT_EQ(draft.swa_count(), original_draft.swa_count());
+    EXPECT_NE(target.swa_count(), draft.swa_count());
+    int64_t allocated_bytes = 0;
+    int64_t block_bytes = 0;
+    auto allocate = [&](const KVCacheCapacity& capacity,
+                        const ModelArgs& args) {
+      const KVCacheShape shape(capacity, args, /*world_size=*/1);
+      proto::KVCacheShape serialized;
+      shape.to_proto(&serialized);
+      KVCacheCreateOptions create;
+      create.device(torch::Device(torch::kCPU))
+          .dtype(estimate.dtype)
+          .model_type(args.model_type())
+          .num_layers(args.n_layers())
+          .block_size(estimate.block_size)
+          .head_dim(args.head_dim())
+          .index_head_dim(args.index_head_dim())
+          .window_size(args.window_size())
+          .compress_ratios(args.compress_ratios());
+      std::vector<KVCache> caches;
+      allocate_kv_caches(caches, KVCacheShape::from_proto(serialized), create);
+      bool found_kv = false;
+      for (const KVCache& cache : caches) {
+        for (const KVCacheTensor& owner : cache.get_cache_tensors()) {
+          const int64_t bytes =
+              owner.tensor.numel() *
+              static_cast<int64_t>(owner.tensor.element_size());
+          allocated_bytes += bytes;
+          if (owner.group_id != cache_group_id(BlockType::KV)) {
+            EXPECT_EQ(owner.tensor.size(0), capacity.swa_count());
+            continue;
+          }
+          found_kv = true;
+          ASSERT_EQ(owner.tensor.size(0), target.n_blocks());
+          block_bytes += bytes / owner.tensor.size(0);
+        }
+      }
+      EXPECT_EQ(found_kv, capacity.has_kv_cache());
+    };
+    allocate(target, target_args);
+    allocate(draft, draft_args);
+    ASSERT_GT(block_bytes, 0);
+    const int64_t unused_bytes = estimate.cache_size_in_bytes - allocated_bytes;
+    EXPECT_GE(unused_bytes, 0);
+    EXPECT_LT(unused_bytes, block_bytes);
+  }
+}
+
+TEST(CacheLayoutBuilderTest, DraftSwaFollowsTargetSwaOrKvCount) {
+  auto make_dsv4_cache = [](int64_t kv_blocks, int64_t swa_blocks) {
+    DeepSeekV4KVCacheTensors tensors;
+    tensors.key_cache = torch::zeros({kv_blocks, 2, 1, 8});
+    tensors.swa_cache = torch::zeros({swa_blocks, 2, 1, 8});
+    return KVCache(tensors);
+  };
+  KVCacheCreateOptions options;
+  options.block_size(128).window_size(256);
+  std::vector<KVCache> target_caches;
+  target_caches.emplace_back(
+      make_dsv4_cache(/*kv_blocks=*/4, /*swa_blocks=*/6));
+  const HostCachePlan target = build_host_cache_plan(target_caches,
+                                                     KVCacheShape{},
+                                                     options,
+                                                     /*host_blocks_factor=*/1.0,
+                                                     InstanceRole::PREFILL,
+                                                     /*enable_mla=*/false);
+  ASSERT_EQ(target.block_counts.at(BlockType::SWA), 6);
+  ASSERT_EQ(target.block_counts.at(BlockType::KV), 4);
+
+  std::vector<KVCache> draft_caches;
+  draft_caches.emplace_back(make_dsv4_cache(/*kv_blocks=*/8, /*swa_blocks=*/3));
+  const HostCachePlan draft_with_target_swa =
+      build_host_cache_plan(draft_caches,
+                            KVCacheShape{},
+                            options,
+                            /*host_blocks_factor=*/1.0,
+                            InstanceRole::PREFILL,
+                            /*enable_mla=*/false,
+                            &target);
+  EXPECT_EQ(draft_with_target_swa.block_counts.at(BlockType::SWA),
+            target.block_counts.at(BlockType::SWA));
+  EXPECT_EQ(draft_with_target_swa.block_counts.at(BlockType::KV), 8);
+
+  std::vector<KVCache> kv_only_caches;
+  kv_only_caches.emplace_back(
+      KVCacheTensors{torch::zeros({5, 2, 4}), torch::zeros({5, 2, 4})});
+  const HostCachePlan kv_only_target =
+      build_host_cache_plan(kv_only_caches,
+                            KVCacheShape{},
+                            options,
+                            /*host_blocks_factor=*/1.0,
+                            InstanceRole::PREFILL,
+                            /*enable_mla=*/false);
+  ASSERT_EQ(kv_only_target.block_counts.count(BlockType::SWA), 0u);
+  ASSERT_EQ(kv_only_target.block_counts.at(BlockType::KV), 5);
+  const HostCachePlan draft_without_target_swa =
+      build_host_cache_plan(draft_caches,
+                            KVCacheShape{},
+                            options,
+                            /*host_blocks_factor=*/1.0,
+                            InstanceRole::PREFILL,
+                            /*enable_mla=*/false,
+                            &kv_only_target);
+  EXPECT_EQ(draft_without_target_swa.block_counts.at(BlockType::SWA),
+            kv_only_target.block_counts.at(BlockType::KV));
+}
+
+TEST(CacheLayoutBuilderTest, DraftKvRequiresCompatibleLogicalBlocks) {
+  std::vector<KVCache> caches;
+  caches.reserve(1);
+  caches.emplace_back(KVCacheTensors{torch::zeros({3, 2, 4}), {}});
+  KVCacheCreateOptions options;
+  options.block_size(128);
+  const HostCachePlan target = build_host_cache_plan(caches,
+                                                     KVCacheShape{},
+                                                     options,
+                                                     /*host_blocks_factor=*/2.0,
+                                                     InstanceRole::PREFILL,
+                                                     /*enable_mla=*/false);
+  const HostCachePlan draft = build_host_cache_plan(caches,
+                                                    KVCacheShape{},
+                                                    options,
+                                                    /*host_blocks_factor=*/2.0,
+                                                    InstanceRole::PREFILL,
+                                                    /*enable_mla=*/false,
+                                                    &target);
+  EXPECT_EQ(target.block_counts, draft.block_counts);
+  options.block_size(64);
+  EXPECT_DEATH(build_host_cache_plan(caches,
+                                     KVCacheShape{},
+                                     options,
+                                     /*host_blocks_factor=*/2.0,
+                                     InstanceRole::PREFILL,
+                                     /*enable_mla=*/false,
+                                     &target),
+               "share the block size");
+  options.block_size(128);
+  caches[0] = KVCache(KVCacheTensors{torch::zeros({2, 2, 4}), {}});
+  EXPECT_DEATH(build_host_cache_plan(caches,
+                                     KVCacheShape{},
+                                     options,
+                                     /*host_blocks_factor=*/2.0,
+                                     InstanceRole::PREFILL,
+                                     /*enable_mla=*/false,
+                                     &target),
+               "every target logical block ID");
+}
+
+TEST(CacheLayoutBuilderTest, HostCheckpointKeepsScalesAndOmitsKPoolTail) {
+  IndexedKVCacheTensors tensors;
+  tensors.kv_cache_tensors.key_cache = torch::ones({2, 4, 1, 8});
+  tensors.index_cache = torch::ones({2, 4, 1, 4}, torch::kInt8);
+  tensors.index_cache_scale = torch::ones({2, 4, 1}, torch::kFloat16);
+  tensors.kpool_tail = torch::ones({3, 2, 4, 8});
+  tensors.key_cache_scale = torch::ones({2, 4, 1}, torch::kFloat32);
+  tensors.value_cache_scale = torch::ones({2, 4, 1}, torch::kFloat32);
+  KVCache cache(tensors);
+  const BlockTypeTensorMap persistent =
+      cache.get_block_type_tensors(BlockType::KV, /*checkpoint_row=*/0);
+  ASSERT_EQ(persistent.size(), 5U);
+  EXPECT_EQ(persistent.at(KVCacheTensorRole::INDEX_SCALE).data_ptr(),
+            tensors.index_cache_scale->data_ptr());
+  EXPECT_EQ(persistent.at(KVCacheTensorRole::KEY_SCALE).data_ptr(),
+            tensors.key_cache_scale->data_ptr());
+  EXPECT_EQ(persistent.at(KVCacheTensorRole::VALUE_SCALE).data_ptr(),
+            tensors.value_cache_scale->data_ptr());
+  EXPECT_TRUE(cache
+                  .get_block_type_tensors(BlockType::LINEAR,
+                                          /*checkpoint_row=*/0)
+                  .empty());
+  const auto pd_tensors = cache.get_cache_tensors();
+  ASSERT_EQ(pd_tensors.size(), 6U);
+  const auto tail = std::find_if(
+      pd_tensors.begin(), pd_tensors.end(), [](const KVCacheTensor& tensor) {
+        return tensor.role == KVCacheTensorRole::KPOOL_TAIL;
+      });
+  ASSERT_NE(tail, pd_tensors.end());
+  EXPECT_TRUE(tail->sequence_scoped);
+  EXPECT_EQ(tail->tensor.data_ptr(), tensors.kpool_tail.data_ptr());
+}
+
+TEST(CacheLayoutBuilderTest, PersistentCheckpointViewsRetainLogicalSlots) {
+  LinearAttentionKVCacheTensors tensors;
+  std::vector<int64_t> conv_shape = {2, 5, 4};
+  if (KVCacheShape::kConvHistoryAxis == 2) {
+    conv_shape = {2, 4, 5};
+  }
+  tensors.conv_cache = torch::arange(40, torch::kFloat32).reshape(conv_shape);
+  tensors.ssm_cache = torch::arange(48, torch::kFloat32).reshape({6, 2, 2, 2});
+  KVCache cache(tensors);
+  const BlockTypeTensorMap persistent =
+      cache.get_block_type_tensors(BlockType::LINEAR, /*checkpoint_row=*/1);
+  ASSERT_EQ(persistent.size(), 2U);
+  for (const auto& [role, tensor] : persistent) {
+    EXPECT_EQ(tensor.size(0), 2);
+    if (role == KVCacheTensorRole::CONV) {
+      EXPECT_TRUE(torch::equal(
+          tensor,
+          tensors.conv_cache.narrow(KVCacheShape::kConvHistoryAxis, 1, 3)));
+    } else {
+      EXPECT_EQ(role, KVCacheTensorRole::SSM);
+      EXPECT_EQ(tensor.size(1), 1);
+      EXPECT_TRUE(torch::equal(tensor[1][0], tensors.ssm_cache[4]));
+      EXPECT_FALSE(tensor.is_contiguous());
+    }
+  }
+}
+
+namespace {
+
 TEST(CacheLayoutBuilderTest, DescribesTokenMajorGqaHeads) {
   CacheTensorLayoutContext context;
   context.tp_rank = 1;
@@ -426,7 +791,7 @@ TEST(CacheLayoutBuilderTest, DescribesSharedIndexerKeyAsReplica) {
   context.index_head_count = 64;
   KVCacheTensor tensor{KVCacheTensorRole::INDEX,
                        torch::zeros({2, 3, 1, 4}),
-                       cache_group_id(BlockType::C4)};
+                       cache_group_id(BlockType::KV)};
   std::string error;
 
   ASSERT_TRUE(describe_cache_tensor(context, &tensor, &error)) << error;
@@ -447,7 +812,7 @@ TEST(CacheLayoutBuilderTest, DescribesSharedIndexerScaleAsReplica) {
   context.index_head_count = 64;
   KVCacheTensor tensor{KVCacheTensorRole::INDEX_SCALE,
                        torch::zeros({2, 3, 1}),
-                       cache_group_id(BlockType::C4)};
+                       cache_group_id(BlockType::KV)};
   std::string error;
 
   ASSERT_TRUE(describe_cache_tensor(context, &tensor, &error)) << error;
@@ -580,198 +945,95 @@ TEST(KVShardLayoutTest, MapsTokensAndSlots) {
           .defined());
 }
 
-TEST(CacheLayoutBuilderTest, RecordsPerPoolSpansFromTensors) {
-  const Dsv4CacheGeometry geometry;
+TEST(CacheLayoutBuilderTest, DescribesHeterogeneousKvShapes) {
   CacheTensorLayoutContext context;
-  context.tp_rank = 0;
-  context.tp_size = 1;
+  proto::KVCacheShape serialized;
+  serialized.set_grouped_cache_layout(true);
+  serialized.add_key_cache_shape(4);
+  serialized.add_key_cache_shape(4);
+  apply_cache_shape_layout(KVCacheShape::from_proto(serialized), &context);
   context.block_token_capacity = 128;
   context.kv_head_count = 1;
-
-  std::vector<KVCache> caches;
-  DeepSeekV4KVCacheTensors swa_tensors;
-  swa_tensors.swa_cache = torch::zeros({2, 128, 1, 8}, torch::kBFloat16);
-  caches.emplace_back(swa_tensors);
-  DeepSeekV4KVCacheTensors c4_tensors;
-  c4_tensors.compressed_block_type = BlockType::C4;
-  c4_tensors.key_cache =
-      torch::zeros({4, geometry.c4_physical_dim(), 1, 8}, torch::kBFloat16);
-  // INDEX gets a narrower token axis on purpose: compressed KPool layouts
-  // shape it differently from the pool's K/V tensors, so recording it into
-  // the per-pool span map would abort with a span conflict.
-  c4_tensors.index_cache = torch::zeros({4, 128, 1, 8}, torch::kInt8);
-  c4_tensors.swa_cache = torch::zeros({2, 128, 1, 8}, torch::kBFloat16);
-  caches.emplace_back(c4_tensors);
-  DeepSeekV4KVCacheTensors c128_tensors;
-  c128_tensors.compressed_block_type = BlockType::C128;
-  c128_tensors.key_cache =
-      torch::zeros({8, geometry.c128_physical_dim(), 1, 8}, torch::kBFloat16);
-  c128_tensors.swa_cache = torch::zeros({2, 128, 1, 8}, torch::kBFloat16);
-  caches.emplace_back(c128_tensors);
-
-  record_group_block_capacities(caches, &context);
-
-  // Only the compressed K/V pools record a span: WINDOW, INDEX and the state
-  // tensors do not define their pool's token axis, so the SWA group keeps the
-  // global block_token_capacity fallback.
-  ASSERT_EQ(context.group_block_capacities.size(), 2U);
-  EXPECT_EQ(context.group_block_capacities.at(cache_group_id(BlockType::C4)),
-            geometry.c4_physical_dim());
-  EXPECT_EQ(context.group_block_capacities.at(cache_group_id(BlockType::C128)),
-            geometry.c128_physical_dim());
-  EXPECT_EQ(
-      context.group_block_capacities.count(cache_group_id(BlockType::SWA)), 0U);
-}
-
-TEST(CacheLayoutBuilderTest, DescribesTypedPoolAgainstRecordedSpan) {
-  const Dsv4CacheGeometry geometry;
-  CacheTensorLayoutContext context;
-  context.tp_rank = 0;
-  context.tp_size = 1;
-  context.block_token_capacity = 128;
-  context.kv_head_count = 1;
-
-  std::vector<KVCache> caches;
-  DeepSeekV4KVCacheTensors c4_tensors;
-  c4_tensors.compressed_block_type = BlockType::C4;
-  c4_tensors.key_cache =
-      torch::zeros({4, geometry.c4_physical_dim(), 1, 8}, torch::kBFloat16);
-  DeepSeekV4KVCacheTensors c128_tensors;
-  c128_tensors.compressed_block_type = BlockType::C128;
-  c128_tensors.key_cache =
-      torch::zeros({8, geometry.c128_physical_dim(), 1, 8}, torch::kBFloat16);
-  caches.emplace_back(c4_tensors);
-  caches.emplace_back(c128_tensors);
-  record_group_block_capacities(caches, &context);
-
-  // Each typed pool validates against its own recorded span instead of the
-  // uniform scheduler block size.
-  KVCacheTensor c4_key{
-      KVCacheTensorRole::KEY,
-      torch::zeros({4, geometry.c4_physical_dim(), 1, 8}, torch::kBFloat16),
-      cache_group_id(BlockType::C4)};
+  context.index_block_capacity = 4;
+  for (const int64_t rows : {256, 8}) {
+    KVCacheTensor tensor{KVCacheTensorRole::KEY,
+                         torch::zeros({4, rows, 1, 8}),
+                         cache_group_id(BlockType::KV)};
+    std::string error;
+    ASSERT_TRUE(describe_cache_tensor(context, &tensor, &error)) << error;
+    EXPECT_EQ(effective_block_token_capacity(context, tensor), rows);
+    ASSERT_TRUE(tensor.shard_descriptor.has_value());
+    ASSERT_EQ(tensor.shard_descriptor->spans.size(), 1U);
+    EXPECT_EQ(tensor.shard_descriptor->spans[0].repeat_count,
+              static_cast<uint64_t>(rows));
+  }
+  KVCacheTensor index{KVCacheTensorRole::INDEX,
+                      torch::zeros({4, 32, 1, 8}),
+                      cache_group_id(BlockType::KV)};
   std::string error;
-  ASSERT_TRUE(describe_cache_tensor(context, &c4_key, &error)) << error;
+  ASSERT_TRUE(describe_cache_tensor(context, &index, &error)) << error;
+  EXPECT_EQ(effective_block_token_capacity(context, index), 32);
+  EXPECT_EQ(index.shard_descriptor->spans[0].repeat_count, 32U);
+  KVCacheTensor window{KVCacheTensorRole::SWA,
+                       torch::zeros({4, 64, 1, 8}),
+                       cache_group_id(BlockType::SWA)};
+  EXPECT_EQ(effective_block_token_capacity(context, window), 64);
+}
 
-  KVCacheTensor c128_key{
-      KVCacheTensorRole::KEY,
-      torch::zeros({4, geometry.c128_physical_dim(), 1, 8}, torch::kBFloat16),
-      cache_group_id(BlockType::C128)};
-  error.clear();
-  ASSERT_TRUE(describe_cache_tensor(context, &c128_key, &error)) << error;
+TEST(CacheLayoutBuilderTest, DescribesHeadMajorGroupedShapes) {
+  CacheTensorLayoutContext context;
+  context.has_grouped_cache_layout = true;
+  context.head_major_layout = true;
+  context.block_token_capacity = 128;
+  context.kv_head_count = 1;
+  KVCacheTensor tensor{KVCacheTensorRole::KEY,
+                       torch::zeros({4, 1, 32, 8}),
+                       cache_group_id(BlockType::KV)};
+  std::string error;
+  ASSERT_TRUE(describe_cache_tensor(context, &tensor, &error)) << error;
+  EXPECT_EQ(effective_block_token_capacity(context, tensor), 32);
+  ASSERT_TRUE(tensor.shard_descriptor.has_value());
+  EXPECT_EQ(tensor.shard_descriptor->spans[0].repeat_count, 32U);
+  KVCacheTensor scale{KVCacheTensorRole::INDEX_SCALE,
+                      torch::zeros({4, 32, 1}),
+                      cache_group_id(BlockType::KV)};
+  EXPECT_EQ(effective_block_token_capacity(context, scale), 32);
+}
 
-  // Pools without a recorded span keep the global capacity.
-  KVCacheTensor uniform_key{KVCacheTensorRole::KEY,
-                            torch::zeros({4, 128, 1, 8}, torch::kBFloat16),
-                            cache_group_id(BlockType::KV)};
-  error.clear();
-  EXPECT_TRUE(describe_cache_tensor(context, &uniform_key, &error)) << error;
-
-  // A C4 tensor with the uniform capacity is rejected: the pool's recorded
-  // span is the authority.
-  KVCacheTensor mismatched_key{KVCacheTensorRole::KEY,
-                               torch::zeros({4, 128, 1, 8}, torch::kBFloat16),
-                               cache_group_id(BlockType::C4)};
-  error.clear();
-  EXPECT_FALSE(describe_cache_tensor(context, &mismatched_key, &error));
+TEST(CacheLayoutBuilderTest, PreservesUniformProducerValidation) {
+  CacheTensorLayoutContext context;
+  context.block_token_capacity = 16;
+  context.kv_head_count = 1;
+  KVCacheTensor uniform{KVCacheTensorRole::KEY,
+                        torch::zeros({4, 16, 1, 8}),
+                        cache_group_id(BlockType::KV)};
+  std::string error;
+  ASSERT_TRUE(describe_cache_tensor(context, &uniform, &error)) << error;
+  KVCacheTensor diverging{KVCacheTensorRole::KEY,
+                          torch::zeros({4, 32, 1, 8}),
+                          cache_group_id(BlockType::KV)};
+  EXPECT_FALSE(describe_cache_tensor(context, &diverging, &error));
   EXPECT_NE(error.find("token capacity differs"), std::string::npos);
+  KVCacheTensor malformed{
+      KVCacheTensorRole::KEY, torch::zeros({4}), cache_group_id(BlockType::KV)};
+  EXPECT_FALSE(describe_cache_tensor(context, &malformed, &error));
 }
 
-TEST(CacheLayoutBuilderTest, FailsWhenPoolSpansConflict) {
+TEST(CacheLayoutBuilderTest, PreservesMlaPhysicalLayout) {
   CacheTensorLayoutContext context;
-  context.tp_rank = 0;
-  context.tp_size = 1;
   context.block_token_capacity = 16;
-  context.kv_head_count = 1;
-
-  // Both spans deviate from the uniform capacity: pools running at the
-  // uniform capacity record nothing, so a conflict needs two distinct
-  // deviating spans inside one pool.
-  KVCacheTensors tensors;
-  tensors.key_cache = torch::zeros({4, 32, 1, 8}, torch::kBFloat16);
-  tensors.value_cache = torch::zeros({4, 64, 1, 8}, torch::kBFloat16);
-  std::vector<KVCache> caches;
-  caches.emplace_back(tensors);
-
-  EXPECT_DEATH(record_group_block_capacities(caches, &context),
-               "Cache tensors of one pool must share the token-axis span");
-}
-
-TEST(CacheLayoutBuilderTest, SkipsSpanRecordingForMlaLayouts) {
-  CacheTensorLayoutContext context;
-  context.tp_rank = 0;
-  context.tp_size = 1;
-  context.block_token_capacity = 16;
-  context.kv_head_count = 1;
   context.enable_mla = true;
-
-  // MLA pools legitimately mix K/V token-axis spans: the NPU NZ layout
-  // shapes the KEY axis after kv_lora_rank and the VALUE axis after
-  // qk_rope_head_dim, and describe routes MLA tensors through the
-  // replicated-tensor contract, which never reads a pool span.
-  KVCacheTensors tensors;
-  tensors.key_cache = torch::zeros({4, 32, 16, 16}, torch::kBFloat16);
-  tensors.value_cache = torch::zeros({4, 4, 16, 16}, torch::kBFloat16);
-  std::vector<KVCache> caches;
-  caches.emplace_back(tensors);
-
-  record_group_block_capacities(caches, &context);
-  EXPECT_EQ(context.group_block_capacities.size(), 0U);
-}
-
-TEST(CacheLayoutBuilderTest, SkipsSpanRecordingForUniformPools) {
-  CacheTensorLayoutContext context;
-  context.tp_rank = 0;
-  context.tp_size = 1;
-  context.block_token_capacity = 16;
-  context.kv_head_count = 1;
-
-  // Uniform pools run at the declared block capacity: recording their span
-  // would make describe validate the tensor against its own size and mute
-  // the producer-capacity check. They stay on the global fallback.
-  KVCacheTensors tensors;
-  tensors.key_cache = torch::zeros({4, 16, 1, 8}, torch::kBFloat16);
-  tensors.value_cache = torch::zeros({4, 16, 1, 8}, torch::kBFloat16);
-  std::vector<KVCache> caches;
-  caches.emplace_back(tensors);
-
-  record_group_block_capacities(caches, &context);
-  EXPECT_EQ(context.group_block_capacities.size(), 0U);
-
-  // The producer-declared capacity stays the authority: a uniform-pool
-  // tensor whose token axis diverges from it is rejected at describe
-  // instead of silently redefining the pool's published span.
-  KVCacheTensor diverging_key{KVCacheTensorRole::KEY,
-                              torch::zeros({4, 32, 1, 8}, torch::kBFloat16),
-                              cache_group_id(BlockType::KV)};
-  std::string error;
-  EXPECT_FALSE(describe_cache_tensor(context, &diverging_key, &error));
-  EXPECT_NE(error.find("token capacity differs"), std::string::npos);
-}
-
-TEST(CacheLayoutBuilderTest, SkipsSpanRecordingForTensorsWithoutTokenAxis) {
-  CacheTensorLayoutContext context;
-  context.tp_rank = 0;
-  context.tp_size = 1;
-  context.block_token_capacity = 16;
-  context.kv_head_count = 1;
-
-  // A tensor without the token axis defines no pool span: recording it
-  // would read a nonexistent axis. It is skipped here and left to
-  // describe_cache_tensor, which rejects it with a precise error. The
-  // value cache runs at a deviating span so recording still happens for
-  // the well-formed tensor.
-  KVCacheTensors tensors;
-  tensors.key_cache = torch::zeros({4}, torch::kBFloat16);
-  tensors.value_cache = torch::zeros({4, 32, 1, 8}, torch::kBFloat16);
-  std::vector<KVCache> caches;
-  caches.emplace_back(tensors);
-
-  record_group_block_capacities(caches, &context);
-
-  ASSERT_EQ(context.group_block_capacities.size(), 1U);
-  EXPECT_EQ(context.group_block_capacities.at(cache_group_id(BlockType::KV)),
-            32);
+  for (const int64_t width : {32, 4}) {
+    KVCacheTensor tensor{KVCacheTensorRole::KEY,
+                         torch::zeros({4, width, 16, 16}),
+                         cache_group_id(BlockType::KV)};
+    std::string error;
+    ASSERT_TRUE(describe_cache_tensor(context, &tensor, &error)) << error;
+    ASSERT_TRUE(tensor.shard_descriptor.has_value());
+    EXPECT_EQ(tensor.shard_descriptor->kind, LogicalShardKind::REPLICATED);
+    EXPECT_EQ(tensor.shard_descriptor->spans[0].bytes_per_region,
+              static_cast<uint64_t>(tensor.tensor[0].nbytes()));
+  }
 }
 
 }  // namespace

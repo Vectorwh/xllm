@@ -49,14 +49,14 @@ namespace {
 constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
 constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
 constexpr uint32_t kMaxTokensPerBatch = 1280;
-constexpr uint32_t kCompressedBlockTokenSize = kDsv4CompressedBlockTokenSize;
+constexpr uint32_t kCompressedBlockTokenSize = kDsv4FixedBlockSize;
 
-// C4 and C128 cover the same number of original tokens per logical block, so
-// a base token capacity maps to equal typed block counts.
-BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
-                                           uint32_t block_size,
-                                           uint32_t window_size,
-                                           uint32_t max_seqs_per_batch) {
+BlockManager::Options MakeCompositeOptions(
+    uint32_t base_num_blocks,
+    uint32_t block_size,
+    uint32_t window_size,
+    uint32_t max_seqs_per_batch,
+    uint32_t kv_block_size = kCompressedBlockTokenSize) {
   const uint32_t swa_blocks_per_seq =
       static_cast<uint32_t>(get_swa_blocks_per_seq(window_size, block_size));
   const uint32_t burst_blocks =
@@ -64,21 +64,18 @@ BlockManager::Options MakeCompositeOptions(uint32_t base_num_blocks,
   const uint32_t swa_num_blocks = swa_blocks_per_seq * max_seqs_per_batch +
                                   burst_blocks + max_seqs_per_batch + 2;
   const uint32_t compressed_num_blocks =
-      base_num_blocks * block_size / kCompressedBlockTokenSize;
+      base_num_blocks * block_size / kv_block_size;
   BlockManager::Options opts;
-  opts.num_blocks(base_num_blocks)
-      .block_size(block_size)
+  opts.num_blocks(compressed_num_blocks)
+      .swa_block_size(block_size)
       .sliding_window_size(window_size)
       .swa_blocks_per_seq(swa_blocks_per_seq)
       .swa_num_blocks(swa_num_blocks)
-      .c4_num_blocks(compressed_num_blocks)
-      .c128_num_blocks(compressed_num_blocks)
+      .block_size(kv_block_size)
       .max_tokens_per_batch(kMaxTokensPerBatch)
       .max_seqs_per_batch(max_seqs_per_batch)
       .manager_types({kManagerTypeSlidingWindowBlockManager,
-                      kManagerTypeBlockManagerImpl,
-                      kManagerTypeBlockManagerImpl})
-      .compress_ratios({0, 4, 128});
+                      kManagerTypeBlockManagerImpl});
   return opts;
 }
 
@@ -93,33 +90,44 @@ TEST(CompositeBlockManagerTest, BlockUtilizationUsesIndividualLeafCapacity) {
 
   const std::unordered_map<BlockType, double> initial =
       manager.block_utilization_by_type();
-  EXPECT_EQ(initial.size(), 3u);
+  EXPECT_EQ(initial.size(), 2u);
   EXPECT_DOUBLE_EQ(initial.at(BlockType::SWA), 0.0);
-  EXPECT_DOUBLE_EQ(initial.at(BlockType::C4), 0.0);
-  EXPECT_DOUBLE_EQ(initial.at(BlockType::C128), 0.0);
+  EXPECT_DOUBLE_EQ(initial.at(BlockType::KV), 0.0);
 
   std::vector<Block> allocated =
-      manager.allocate_blocks(BlockType::C4, /*num_blocks=*/1);
+      manager.allocate_blocks(BlockType::KV, /*num_blocks=*/1);
   ASSERT_EQ(allocated.size(), 1u);
   const std::unordered_map<BlockType, double> utilization =
       manager.block_utilization_by_type();
-  EXPECT_GT(utilization.at(BlockType::C4), 0.0);
+  EXPECT_GT(utilization.at(BlockType::KV), 0.0);
   EXPECT_DOUBLE_EQ(utilization.at(BlockType::SWA), 0.0);
-  EXPECT_DOUBLE_EQ(utilization.at(BlockType::C128), 0.0);
   allocated.clear();
 
-  options.model_type("deepseek_v41");
-  options.compress_ratios({0, 2, 1});
+  options.block_size(128);
   CompositeBlockManager v41_manager(build_composite_leaves(options), options);
-  allocated = v41_manager.allocate_blocks(BlockType::C2, /*num_blocks=*/1);
+  allocated = v41_manager.allocate_blocks(BlockType::KV, /*num_blocks=*/1);
   ASSERT_EQ(allocated.size(), 1u);
   const std::unordered_map<BlockType, double> v41_utilization =
       v41_manager.block_utilization_by_type();
-  EXPECT_EQ(v41_utilization.size(), 3u);
+  EXPECT_EQ(v41_utilization.size(), 2u);
   EXPECT_DOUBLE_EQ(v41_utilization.at(BlockType::SWA), 0.0);
-  EXPECT_GT(v41_utilization.at(BlockType::C2), 0.0);
-  EXPECT_DOUBLE_EQ(v41_utilization.at(BlockType::C1), 0.0);
+  EXPECT_GT(v41_utilization.at(BlockType::KV), 0.0);
   allocated.clear();
+}
+
+TEST(CompositeBlockManagerTest,
+     HistoryLeafUsesDeclaredSpanWithoutModelIdentity) {
+  BlockManager::Options options = MakeCompositeOptions(
+      /*base_num_blocks=*/4096,
+      /*block_size=*/128,
+      /*window_size=*/128,
+      /*max_seqs_per_batch=*/1);
+  constexpr int32_t kHistoryBlockSize = 384;
+  options.block_size(kHistoryBlockSize);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  EXPECT_EQ(manager.leaf_entries().at(BlockType::KV).leaf->block_size(),
+            kHistoryBlockSize);
+  EXPECT_EQ(manager.leaf_entries().at(BlockType::SWA).leaf->block_size(), 128u);
 }
 
 TEST(CompositeBlockManagerTest, ZeroCapacityLeafStillReportsItsType) {
@@ -130,26 +138,27 @@ TEST(CompositeBlockManagerTest, ZeroCapacityLeafStillReportsItsType) {
       /*max_seqs_per_batch=*/2);
   options.enable_prefix_cache(false);
   auto leaves = build_composite_leaves(options);
-  BlockManager::Options c4_options = leaves.at(BlockType::C4).leaf->options();
+  BlockManager::Options compressed_options =
+      leaves.at(BlockType::KV).leaf->options();
   // Block 0 is reserved for padding; one physical block has zero capacity.
-  c4_options.num_blocks(1);
-  auto empty_c4 = std::make_unique<BlockManagerImpl>(c4_options);
-  ASSERT_EQ(empty_c4->num_total_blocks(), 0u);
-  leaves.at(BlockType::C4).leaf = std::move(empty_c4);
+  compressed_options.num_blocks(1);
+  auto empty_compressed =
+      std::make_unique<BlockManagerImpl>(compressed_options);
+  ASSERT_EQ(empty_compressed->num_total_blocks(), 0u);
+  leaves.at(BlockType::KV).leaf = std::move(empty_compressed);
 
   CompositeBlockManager manager(std::move(leaves), options);
   const std::unordered_map<BlockType, double> utilization =
       manager.block_utilization_by_type();
-  ASSERT_EQ(utilization.size(), 3u);
-  EXPECT_DOUBLE_EQ(utilization.at(BlockType::C4), 0.0);
+  ASSERT_EQ(utilization.size(), 2u);
+  EXPECT_DOUBLE_EQ(utilization.at(BlockType::KV), 0.0);
   EXPECT_DOUBLE_EQ(utilization.at(BlockType::SWA), 0.0);
-  EXPECT_DOUBLE_EQ(utilization.at(BlockType::C128), 0.0);
 }
 
 void set_swa_capacity_for_token_budget(BlockManager::Options* options,
                                        uint32_t max_tokens_per_batch) {
   ASSERT_NE(options, nullptr);
-  const uint32_t block_size = options->block_size();
+  const uint32_t block_size = options->swa_block_size();
   ASSERT_GT(block_size, 0u);
   const uint32_t burst_blocks =
       (max_tokens_per_batch + block_size - 1) / block_size;
@@ -280,9 +289,7 @@ TEST(CompositeBlockManagerTest, SampleSelectorsRetainRequiredHiddenPositions) {
         source_position / kCompressedBlockTokenSize * kCompressedBlockTokenSize;
     EXPECT_EQ(selected.kv_cache_tokens_num(), expected);
     EXPECT_LE(selected.kv_cache_tokens_num(), source_position);
-    EXPECT_EQ(selected.kv_state().shared_blocks_num(BlockType::C128),
-              expected / kCompressedBlockTokenSize);
-    EXPECT_EQ(selected.kv_state().shared_blocks_num(BlockType::C4),
+    EXPECT_EQ(selected.kv_state().shared_blocks_num(BlockType::KV),
               expected / kCompressedBlockTokenSize);
     manager.deallocate_for_sequence(&selected);
 
@@ -294,18 +301,15 @@ TEST(CompositeBlockManagerTest, SampleSelectorsRetainRequiredHiddenPositions) {
 }
 
 // Blocks are keyed by BlockType in the sequence KVCacheState, not by
-// sub-manager index. These helpers read the three DSV4 groups by type so the
-// tests stay independent of compress_ratios ordering.
+// sub-manager index. These helpers read the logical DSV4 groups by type.
 std::vector<Block> SwaBlocks(Sequence& seq) {
   const Slice<Block> s = seq.kv_state().blocks(BlockType::SWA);
   return std::vector<Block>(s.begin(), s.end());
 }
-std::vector<Block> C4Blocks(Sequence& seq) {
-  const Slice<Block> s = seq.kv_state().blocks(BlockType::C4);
-  return std::vector<Block>(s.begin(), s.end());
-}
-std::vector<Block> C128Blocks(Sequence& seq) {
-  const Slice<Block> s = seq.kv_state().blocks(BlockType::C128);
+// C4 and C128 share one logical KV table. Physical dim differs by ratio, but
+// the sequence stores a single BlockType::KV list for both.
+std::vector<Block> KvBlocks(Sequence& seq) {
+  const Slice<Block> s = seq.kv_state().blocks(BlockType::KV);
   return std::vector<Block>(s.begin(), s.end());
 }
 
@@ -386,12 +390,13 @@ TEST(CompositeBlockManagerTest, ExplicitPublicationEnablesHostOnlySharedMatch) {
   }
 
   Sequence hit = MakeTestSequence(1, std::vector<int32_t>(9, 7));
+  hit.kv_state().set_prefix_cache_matched();
   host.allocate_shared_for_sequence(&hit, hit.host_kv_state());
   EXPECT_EQ(hit.host_kv_state().kv_cache_tokens_num(), 8u);
   EXPECT_EQ(hit.host_kv_state().num_cached_blocks(BlockType::KV), 2u);
   EXPECT_TRUE(hit.host_kv_state().prefix_cache_matched());
   EXPECT_FALSE(hit.kv_state().has_any_blocks());
-  EXPECT_FALSE(hit.kv_state().prefix_cache_matched());
+  EXPECT_TRUE(hit.kv_state().prefix_cache_matched());
   host.deallocate_for_sequence(&hit, hit.host_kv_state());
   hit.host_kv_state().reset();
 
@@ -416,8 +421,8 @@ TEST(CompositeBlockManagerTest, FailedHostGrowthRollsBackAllStagedLeaves) {
       CompositeBlockManager::PrefixCachePublishMode::EXPLICIT);
   Sequence sequence = MakeTestSequence(0, std::vector<int32_t>(129, 7));
   ASSERT_TRUE(device.allocate_sequence(&sequence, 128));
-  const int32_t device_id = sequence.kv_state().blocks(BlockType::C4)[0].id();
-  BlockManager* c128 = host.leaf_entries().at(BlockType::C128).leaf.get();
+  const int32_t device_id = sequence.kv_state().blocks(BlockType::KV)[0].id();
+  BlockManager* c128 = host.leaf_entries().at(BlockType::KV).leaf.get();
   auto held_blocks = c128->allocate(c128->num_free_blocks());
   std::map<BlockType, size_t> used_before;
   for (const auto& [type, entry] : host.leaf_entries()) {
@@ -427,7 +432,7 @@ TEST(CompositeBlockManagerTest, FailedHostGrowthRollsBackAllStagedLeaves) {
   EXPECT_FALSE(
       host.allocate_sequence(&sequence, sequence.host_kv_state(), 128));
   EXPECT_FALSE(sequence.host_kv_state().has_any_blocks());
-  EXPECT_EQ(sequence.kv_state().blocks(BlockType::C4)[0].id(), device_id);
+  EXPECT_EQ(sequence.kv_state().blocks(BlockType::KV)[0].id(), device_id);
   for (const auto& [type, entry] : host.leaf_entries()) {
     EXPECT_EQ(entry.leaf->num_used_blocks(), used_before.at(type));
   }
@@ -540,7 +545,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
 
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
   EXPECT_TRUE(manager.is_composite());
-  EXPECT_EQ(manager.num_sub_managers(), 3u);
+  EXPECT_EQ(manager.num_sub_managers(), 2u);
 
   Sequence seq = MakeTestSequence(0, std::vector<int32_t>(1024, 1));
   const size_t num_tokens = 1024;
@@ -548,8 +553,7 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
   EXPECT_TRUE(manager.allocate_sequence(&seq, num_tokens));
 
   const std::vector<Block> swa = SwaBlocks(seq);
-  const std::vector<Block> c4 = C4Blocks(seq);
-  const std::vector<Block> c128 = C128Blocks(seq);
+  const std::vector<Block> kv = KvBlocks(seq);
 
   // SlidingWindow group: logical block count follows sequence length.
   EXPECT_EQ(swa.size(), ExpectedSwaLogicalBlocks(num_tokens));
@@ -558,20 +562,11 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_SingleSeq) {
     EXPECT_EQ(b.size(), base_block_size);
   }
 
-  // C4 logical block size is 2048 original tokens.
-  const size_t expected_blocks_1 =
-      CeilBlocks(num_tokens, kCompressedUnitTokens);
-  EXPECT_EQ(c4.size(), expected_blocks_1);
-  for (const auto& b : c4) {
-    EXPECT_TRUE(b.is_valid());
-    EXPECT_EQ(b.size(), kCompressedUnitTokens);
-  }
-
-  // C128 logical block size is also 2048 original tokens.
-  const size_t expected_blocks_2 =
-      CeilBlocks(num_tokens, kCompressedUnitTokens);
-  EXPECT_EQ(c128.size(), expected_blocks_2);
-  for (const auto& b : c128) {
+  // Compressed KV uses one logical table. C4 and C128 share that table, so
+  // one block count covers both ratios.
+  const size_t expected_blocks = CeilBlocks(num_tokens, kCompressedUnitTokens);
+  EXPECT_EQ(kv.size(), expected_blocks);
+  for (const auto& b : kv) {
     EXPECT_TRUE(b.is_valid());
     EXPECT_EQ(b.size(), kCompressedUnitTokens);
   }
@@ -594,11 +589,9 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   Sequence seq1 = MakeTestSequence(0, std::vector<int32_t>(1024, 1));
   EXPECT_TRUE(manager.allocate_sequence(&seq1, 1024));
   const std::vector<Block> s1_swa = SwaBlocks(seq1);
-  const std::vector<Block> s1_c4 = C4Blocks(seq1);
-  const std::vector<Block> s1_c128 = C128Blocks(seq1);
+  const std::vector<Block> s1_kv = KvBlocks(seq1);
   EXPECT_EQ(s1_swa.size(), ExpectedSwaLogicalBlocks(1024));
-  EXPECT_EQ(s1_c4.size(), CeilBlocks(1024, kCompressedUnitTokens));
-  EXPECT_EQ(s1_c128.size(), CeilBlocks(1024, kCompressedUnitTokens));
+  EXPECT_EQ(s1_kv.size(), CeilBlocks(1024, kCompressedUnitTokens));
 
   // Seq2: 1400 tokens. Both compressed groups need one 2048-token logical
   // block. Keep total SWA logical blocks within the dynamic pool budget
@@ -606,28 +599,23 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_DifferentBatchSeqs) {
   Sequence seq2 = MakeTestSequence(1, std::vector<int32_t>(1400, 1));
   EXPECT_TRUE(manager.allocate_sequence(&seq2, 1400));
   const std::vector<Block> s2_swa = SwaBlocks(seq2);
-  const std::vector<Block> s2_c4 = C4Blocks(seq2);
-  const std::vector<Block> s2_c128 = C128Blocks(seq2);
+  const std::vector<Block> s2_kv = KvBlocks(seq2);
   EXPECT_EQ(s2_swa.size(), ExpectedSwaLogicalBlocks(1400));
-  EXPECT_EQ(s2_c4.size(), CeilBlocks(1400, kCompressedUnitTokens));
-  EXPECT_EQ(s2_c128.size(), CeilBlocks(1400, kCompressedUnitTokens));
+  EXPECT_EQ(s2_kv.size(), CeilBlocks(1400, kCompressedUnitTokens));
 
   // Blocks allocated to different seqs must not overlap (distinct block ids).
-  std::set<int32_t> ids1_0, ids1_1, ids1_2, ids2_0, ids2_1, ids2_2;
-  for (const auto& b : s1_swa) ids1_0.insert(b.id());
-  for (const auto& b : s1_c4) ids1_1.insert(b.id());
-  for (const auto& b : s1_c128) ids1_2.insert(b.id());
-  for (const auto& b : s2_swa) ids2_0.insert(b.id());
-  for (const auto& b : s2_c4) ids2_1.insert(b.id());
-  for (const auto& b : s2_c128) ids2_2.insert(b.id());
-  for (int32_t id : ids1_0) EXPECT_EQ(ids2_0.count(id), 0u);
-  for (int32_t id : ids1_1) EXPECT_EQ(ids2_1.count(id), 0u);
-  for (int32_t id : ids1_2) EXPECT_EQ(ids2_2.count(id), 0u);
+  std::set<int32_t> ids1_swa, ids1_kv, ids2_swa, ids2_kv;
+  for (const auto& b : s1_swa) ids1_swa.insert(b.id());
+  for (const auto& b : s1_kv) ids1_kv.insert(b.id());
+  for (const auto& b : s2_swa) ids2_swa.insert(b.id());
+  for (const auto& b : s2_kv) ids2_kv.insert(b.id());
+  for (int32_t id : ids1_swa) EXPECT_EQ(ids2_swa.count(id), 0u);
+  for (int32_t id : ids1_kv) EXPECT_EQ(ids2_kv.count(id), 0u);
   const int32_t max_swa_block_id =
       sliding_window_blocks_per_sequence * max_seqs_per_batch +
       CeilBlocks(kMaxTokensPerBatch, kBaseBlockSize) + max_seqs_per_batch + 1;
-  for (int32_t id : ids1_0) EXPECT_LE(id, max_swa_block_id);
-  for (int32_t id : ids2_0) EXPECT_LE(id, max_swa_block_id);
+  for (int32_t id : ids1_swa) EXPECT_LE(id, max_swa_block_id);
+  for (int32_t id : ids2_swa) EXPECT_LE(id, max_swa_block_id);
 
   manager.deallocate_for_sequence(&seq1);
   manager.deallocate_for_sequence(&seq2);
@@ -646,19 +634,16 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_GrowSameSeq) {
   // Both compressed leaves use one common 2048-token logical unit.
   EXPECT_TRUE(manager.allocate_sequence(&seq, 600));
   EXPECT_EQ(SwaBlocks(seq).size(), ExpectedSwaLogicalBlocks(600));
-  EXPECT_EQ(C4Blocks(seq).size(), CeilBlocks(600, kCompressedUnitTokens));
-  EXPECT_EQ(C128Blocks(seq).size(), CeilBlocks(600, kCompressedUnitTokens));
+  EXPECT_EQ(KvBlocks(seq).size(), CeilBlocks(600, kCompressedUnitTokens));
 
   // Growing within the same compressed unit must not allocate another block.
   EXPECT_TRUE(manager.allocate_sequence(&seq, 1200));
   EXPECT_EQ(SwaBlocks(seq).size(), ExpectedSwaLogicalBlocks(1200));
-  EXPECT_EQ(C4Blocks(seq).size(), CeilBlocks(1200, kCompressedUnitTokens));
-  EXPECT_EQ(C128Blocks(seq).size(), CeilBlocks(1200, kCompressedUnitTokens));
+  EXPECT_EQ(KvBlocks(seq).size(), CeilBlocks(1200, kCompressedUnitTokens));
 
   // No growth: still 1200 tokens, block counts unchanged.
   EXPECT_TRUE(manager.allocate_sequence(&seq, 1200));
-  EXPECT_EQ(C4Blocks(seq).size(), CeilBlocks(1200, kCompressedUnitTokens));
-  EXPECT_EQ(C128Blocks(seq).size(), CeilBlocks(1200, kCompressedUnitTokens));
+  EXPECT_EQ(KvBlocks(seq).size(), CeilBlocks(1200, kCompressedUnitTokens));
 
   manager.deallocate_for_sequence(&seq);
 }
@@ -666,17 +651,16 @@ TEST(CompositeBlockManagerTest, AllocateForSequence_GrowSameSeq) {
 TEST(CompositeBlockManagerTest, AllocateContinuesAfterSatisfiedTokenManager) {
   BlockManager::Options opts =
       MakeCompositeOptions(4096, kBaseBlockSize, 128, 4);
-  opts.compress_ratios({0, 128, 4});
+  opts.manager_types(
+      {kManagerTypeBlockManagerImpl, kManagerTypeSlidingWindowBlockManager});
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
   Sequence seq = MakeTestSequence(0, {1});
   EXPECT_TRUE(manager.allocate_sequence(&seq, 1024));
-  EXPECT_EQ(C128Blocks(seq).size(), CeilBlocks(1024, kCompressedUnitTokens));
-  EXPECT_EQ(C4Blocks(seq).size(), CeilBlocks(1024, kCompressedUnitTokens));
+  EXPECT_EQ(KvBlocks(seq).size(), CeilBlocks(1024, kCompressedUnitTokens));
 
   EXPECT_TRUE(manager.allocate_sequence(&seq, 1500));
-  EXPECT_EQ(C128Blocks(seq).size(), CeilBlocks(1500, kCompressedUnitTokens));
-  EXPECT_EQ(C4Blocks(seq).size(), CeilBlocks(1500, kCompressedUnitTokens));
+  EXPECT_EQ(KvBlocks(seq).size(), CeilBlocks(1500, kCompressedUnitTokens));
 
   manager.deallocate_for_sequence(&seq);
 }
@@ -691,8 +675,7 @@ TEST(CompositeBlockManagerTest, FailedGrowthKeepsCommittedBlocks) {
   Sequence seq = MakeTestSequence(0, {1});
   ASSERT_TRUE(manager.allocate_sequence(&seq, 1024));
   const std::vector<Block> before_swa = SwaBlocks(seq);
-  const size_t c4_blocks_before = C4Blocks(seq).size();
-  const size_t c128_blocks_before = C128Blocks(seq).size();
+  const size_t kv_blocks_before = KvBlocks(seq).size();
   std::vector<int32_t> swa_ids_before;
   swa_ids_before.reserve(before_swa.size());
   for (const auto& block : before_swa) {
@@ -709,8 +692,7 @@ TEST(CompositeBlockManagerTest, FailedGrowthKeepsCommittedBlocks) {
   ASSERT_GT(before_swa.size(), released_blocks);
 
   EXPECT_FALSE(manager.allocate_sequence(&seq, 4096));
-  EXPECT_EQ(C4Blocks(seq).size(), c4_blocks_before);
-  EXPECT_EQ(C128Blocks(seq).size(), c128_blocks_before);
+  EXPECT_EQ(KvBlocks(seq).size(), kv_blocks_before);
 
   const std::vector<Block> after_swa = SwaBlocks(seq);
   ASSERT_EQ(after_swa.size(), before_swa.size());
@@ -736,7 +718,9 @@ TEST(CompositeBlockManagerTest, DeallocateToleratesRolledBackEmptySequence) {
 
   EXPECT_FALSE(manager.allocate_sequence(&seq, 4096));
   EXPECT_NO_FATAL_FAILURE(manager.deallocate_for_sequence(&seq));
+  EXPECT_FALSE(seq.kv_state().has_any_blocks());
   EXPECT_FALSE(seq.kv_state().has_multi_block_export());
+  EXPECT_TRUE(seq.kv_state().multi_block_export_view().empty());
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 }
 
@@ -754,35 +738,24 @@ TEST(CompositeBlockManagerTest, TokenIncrease_AddsBlocksIncrementally) {
   Sequence seq = MakeTestSequence(0, {1});
   std::vector<size_t> token_steps = {100, 600, 1200, 2000, 2400};
 
-  std::vector<std::set<int32_t>> prev_ids_1;
-  std::vector<std::set<int32_t>> prev_ids_2;
+  std::vector<std::set<int32_t>> prev_ids;
 
   for (size_t num_tokens : token_steps) {
     EXPECT_TRUE(manager.allocate_sequence(&seq, num_tokens));
 
-    const std::vector<Block> c4 = C4Blocks(seq);
-    const std::vector<Block> c128 = C128Blocks(seq);
+    const std::vector<Block> kv = KvBlocks(seq);
 
-    const size_t expect_1 = CeilBlocks(num_tokens, kCompressedUnitTokens);
-    const size_t expect_2 = CeilBlocks(num_tokens, kCompressedUnitTokens);
-    EXPECT_EQ(c4.size(), expect_1)
-        << "num_tokens=" << num_tokens << " C4 block count";
-    EXPECT_EQ(c128.size(), expect_2)
-        << "num_tokens=" << num_tokens << " C128 block count";
+    const size_t expected = CeilBlocks(num_tokens, kCompressedUnitTokens);
+    EXPECT_EQ(kv.size(), expected) << "num_tokens=" << num_tokens;
 
     // Check that previously allocated block ids are still present (only
     // append).
-    std::set<int32_t> ids_1, ids_2;
-    for (const auto& b : c4) ids_1.insert(b.id());
-    for (const auto& b : c128) ids_2.insert(b.id());
-    for (const auto& prev : prev_ids_1) {
-      for (int32_t id : prev) EXPECT_GT(ids_1.count(id), 0u);
+    std::set<int32_t> ids;
+    for (const auto& b : kv) ids.insert(b.id());
+    for (const auto& prev : prev_ids) {
+      for (int32_t id : prev) EXPECT_GT(ids.count(id), 0u);
     }
-    for (const auto& prev : prev_ids_2) {
-      for (int32_t id : prev) EXPECT_GT(ids_2.count(id), 0u);
-    }
-    prev_ids_1.push_back(ids_1);
-    prev_ids_2.push_back(ids_2);
+    prev_ids.push_back(ids);
   }
 
   manager.deallocate_for_sequence(&seq);
@@ -802,8 +775,7 @@ TEST(CompositeBlockManagerTest, Dsv4CompressedAllocationUsesPlatformUnits) {
                                               {kCompressedUnitTokens + 1, 2}}) {
     SCOPED_TRACE(num_tokens);
     ASSERT_TRUE(manager.allocate_sequence(&seq, num_tokens));
-    EXPECT_EQ(C4Blocks(seq).size(), expected_blocks);
-    EXPECT_EQ(C128Blocks(seq).size(), expected_blocks);
+    EXPECT_EQ(KvBlocks(seq).size(), expected_blocks);
   }
 
   manager.deallocate_for_sequence(&seq);
@@ -864,25 +836,29 @@ TEST(CompositeBlockManagerTest, SlidingWindowReleasesSkippedPhysicalBlocks) {
   manager.deallocate_for_sequence(&seq);
 }
 
-TEST(CompositeBlockManagerTest, SlidingWindowV4PrefetchKeepsGeometryUnit) {
+TEST(CompositeBlockManagerTest, SlidingWindowPrefetchUsesConfiguredBlockSizes) {
+  constexpr uint32_t kKvBlockSize = 3 * kBaseBlockSize;
   BlockManager::Options options;
-  options.model_type("deepseek_v4")
-      .num_blocks(8)
-      .block_size(kBaseBlockSize)
+  options.num_blocks(8)
+      .block_size(kKvBlockSize)
+      .swa_block_size(kBaseBlockSize)
       .block_type(BlockType::SWA)
       .sliding_window_size(kBaseBlockSize)
       .swa_blocks_per_seq(1)
-      .compress_ratios({0})
       .enable_prefix_cache(false);
   SlidingWindowBlockManager manager(options);
   Sequence sequence = MakeTestSequence(
-      /*index=*/0, std::vector<int32_t>(kCompressedBlockTokenSize + 1, 7));
-  ASSERT_TRUE(
-      manager.allocate_for_prefetch(&sequence, kCompressedBlockTokenSize));
+      /*index=*/0, std::vector<int32_t>(kKvBlockSize + 1, 7));
+  EXPECT_EQ(manager.options().block_size(), kKvBlockSize);
+  EXPECT_EQ(manager.block_size(), kBaseBlockSize);
+  ASSERT_TRUE(manager.allocate_for_prefetch(&sequence, kKvBlockSize));
   const Slice<Block> blocks = sequence.host_kv_state().blocks(BlockType::SWA);
-  ASSERT_EQ(blocks.size(), kCompressedBlockTokenSize / kBaseBlockSize);
+  ASSERT_EQ(blocks.size(), kKvBlockSize / kBaseBlockSize);
   for (size_t index = 0; index < blocks.size(); ++index) {
     EXPECT_EQ(blocks[index].is_valid(), index + 1 == blocks.size());
+    if (blocks[index].is_valid()) {
+      EXPECT_EQ(blocks[index].size(), kBaseBlockSize);
+    }
   }
   sequence.host_kv_state().erase_blocks(BlockType::SWA);
 }
@@ -974,23 +950,19 @@ TEST(CompositeBlockManagerTest, CapacityStatsUseBaseBlockUnits) {
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
   const size_t total = manager.num_total_blocks();
-  const size_t base_blocks_per_compressed_unit =
-      kCompressedUnitTokens / kBaseBlockSize;
-  EXPECT_EQ(total,
-            (opts.c4_num_blocks() - 1u) * base_blocks_per_compressed_unit);
+  EXPECT_EQ(total, opts.num_blocks() - 1u);
+  EXPECT_EQ(manager.block_size(), kCompressedUnitTokens);
 
   // Free (no sequence yet) equals total; used is 0.
   EXPECT_EQ(manager.num_free_blocks(), total);
   EXPECT_EQ(manager.num_used_blocks(), 0u);
 
-  // After allocating one sequence, used remains normalized to base blocks.
+  // After allocation, aggregate counts stay in logical history blocks.
   Sequence seq = MakeTestSequence(0, std::vector<int32_t>(1024, 1));
   ASSERT_TRUE(manager.allocate_sequence(&seq, 1024));
-  const size_t c4_used = C4Blocks(seq).size();  // capacity leaf's used count
-  EXPECT_EQ(manager.num_used_blocks(),
-            c4_used * base_blocks_per_compressed_unit);
-  EXPECT_EQ(manager.num_free_blocks(),
-            total - c4_used * base_blocks_per_compressed_unit);
+  const size_t kv_used = KvBlocks(seq).size();
+  EXPECT_EQ(manager.num_used_blocks(), kv_used);
+  EXPECT_EQ(manager.num_free_blocks(), total - kv_used);
 
   manager.deallocate_for_sequence(&seq);
 }
@@ -1031,11 +1003,7 @@ TEST(CompositeBlockManagerTest,
     // The cold sequence processes prompt_tokens plus one extra token.
     const size_t published_units = (prompt_tokens + 1) / unit_tokens;
     EXPECT_EQ(manager.leaf_entries()
-                  .at(BlockType::C4)
-                  .leaf->num_blocks_in_prefix_cache(),
-              published_units);
-    EXPECT_EQ(manager.leaf_entries()
-                  .at(BlockType::C128)
+                  .at(BlockType::KV)
                   .leaf->num_blocks_in_prefix_cache(),
               published_units);
 
@@ -1046,9 +1014,7 @@ TEST(CompositeBlockManagerTest,
     manager.allocate_shared_for_sequence(&hot);
     EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
     EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), expected_hit_tokens);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C4),
-              expected_hit_tokens / unit_tokens);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C128),
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV),
               expected_hit_tokens / unit_tokens);
     manager.deallocate_for_sequence(&hot);
   }
@@ -1081,8 +1047,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheMissCleanly) {
   Sequence seq_b = MakeTestSequence(1, prompt_b);
   manager.allocate_shared_for_sequence(&seq_b);
   EXPECT_EQ(seq_b.kv_state().shared_blocks_num(BlockType::SWA), 0u);
-  EXPECT_EQ(seq_b.kv_state().shared_blocks_num(BlockType::C4), 0u);
-  EXPECT_EQ(seq_b.kv_state().shared_blocks_num(BlockType::C128), 0u);
+  EXPECT_EQ(seq_b.kv_state().shared_blocks_num(BlockType::KV), 0u);
   EXPECT_EQ(seq_b.kv_state().kv_cache_tokens_num(), 0u);
 
   manager.deallocate_for_sequence(&seq_b);
@@ -1111,8 +1076,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheEvictsAtC128Capacity) {
 
   Sequence first = MakeTestSequence(99, std::vector<int32_t>(num_tokens, 11));
   manager.allocate_shared_for_sequence(&first);
-  EXPECT_EQ(first.kv_state().shared_blocks_num(BlockType::C4), 0u);
-  EXPECT_EQ(first.kv_state().shared_blocks_num(BlockType::C128), 0u);
+  EXPECT_EQ(first.kv_state().shared_blocks_num(BlockType::KV), 0u);
   EXPECT_EQ(first.kv_state().kv_cache_tokens_num(), 0u);
   manager.deallocate_for_sequence(&first);
 }
@@ -1158,23 +1122,19 @@ TEST(CompositeBlockManagerTest, SlidingWindowSlidOutBlocksEnterPrefixCache) {
   manager.allocate_shared_for_sequence(&seq_hit);
   EXPECT_EQ(forecast, seq_hit.kv_state().kv_cache_tokens_num());
   EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::SWA), 0u);
-  EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::C4), 0u);
-  EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::C128), 0u);
+  EXPECT_GT(seq_hit.kv_state().shared_blocks_num(BlockType::KV), 0u);
 
   manager.deallocate_for_sequence(&seq_hit);
 }
 
 TEST(CompositeBlockManagerTest,
      SlidingWindowReclaimsUncachedBlockBeforeFullCacheUnit) {
-#if defined(USE_MLU)
-  GTEST_SKIP() << "Requires a compressed unit larger than the base block";
-#endif
   const uint32_t window_size = 2 * kBaseBlockSize;
-  BlockManager::Options opts = MakeCompositeOptions(
-      /*base_num_blocks=*/4096,
-      kBaseBlockSize,
-      window_size,
-      /*max_seqs_per_batch=*/1);
+  BlockManager::Options opts = MakeCompositeOptions(/*base_num_blocks=*/4096,
+                                                    kBaseBlockSize,
+                                                    window_size,
+                                                    /*max_seqs_per_batch=*/1,
+                                                    kDsv4NpuBlockSize);
   opts.enable_prefix_cache(true).swa_num_blocks(
       /*three live blocks plus padding=*/4);
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
@@ -1225,8 +1185,7 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCachePostGrowCursorAdvances) {
   ASSERT_TRUE(manager.allocate_sequence(&seq, chunk));
   EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::SWA), 0u)
       << "post-grow hook has nothing to cache on the first allocate: kv=0";
-  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::C4), 0u);
-  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::C128), 0u);
+  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::KV), 0u);
   seq.kv_state().incr_kv_cache_tokens_num(chunk);
 
   // Chunk 2 allocation triggers the post-grow hook, which now sees kv=chunk
@@ -1234,20 +1193,14 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCachePostGrowCursorAdvances) {
   ASSERT_TRUE(manager.allocate_sequence(&seq, total));
   EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::SWA),
             chunk / kBaseBlockSize);
-  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::C4),
-            chunk / kCompressedUnitTokens);
-  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::C128),
+  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::KV),
             chunk / kCompressedUnitTokens);
   EXPECT_EQ(manager.leaf_entries()
                 .at(BlockType::SWA)
                 .leaf->num_blocks_in_prefix_cache(),
             std::min<size_t>(window_size, chunk) / kBaseBlockSize);
   EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C4)
-                .leaf->num_blocks_in_prefix_cache(),
-            1u);
-  EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C128)
+                .at(BlockType::KV)
                 .leaf->num_blocks_in_prefix_cache(),
             1u);
 
@@ -1255,18 +1208,18 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCachePostGrowCursorAdvances) {
 }
 
 TEST(CompositeBlockManagerTest, Dsv4PrefixCacheSkipsPartialCacheUnitTail) {
-#if defined(USE_MLU)
-  GTEST_SKIP() << "Requires a compressed unit larger than the base block";
-#endif
   const uint32_t base_num_blocks = 4096;
   const uint32_t window_size = kBaseBlockSize;
   const uint32_t max_seqs_per_batch = 4;
-  BlockManager::Options opts = MakeCompositeOptions(
-      base_num_blocks, kBaseBlockSize, window_size, max_seqs_per_batch);
-  set_swa_capacity_for_token_budget(&opts, 2 * kCompressedUnitTokens);
+  BlockManager::Options opts = MakeCompositeOptions(base_num_blocks,
+                                                    kBaseBlockSize,
+                                                    window_size,
+                                                    max_seqs_per_batch,
+                                                    kDsv4NpuBlockSize);
+  set_swa_capacity_for_token_budget(&opts, 2 * kDsv4NpuBlockSize);
   CompositeBlockManager manager(build_composite_leaves(opts), opts);
 
-  const size_t completed_tokens = kCompressedUnitTokens + kBaseBlockSize;
+  const size_t completed_tokens = kDsv4NpuBlockSize + kBaseBlockSize;
   Sequence seq =
       MakeTestSequence(0, std::vector<int32_t>(completed_tokens, 17));
   ASSERT_TRUE(manager.allocate_sequence(&seq, completed_tokens));
@@ -1278,19 +1231,19 @@ TEST(CompositeBlockManagerTest, Dsv4PrefixCacheSkipsPartialCacheUnitTail) {
                 .leaf->num_blocks_in_prefix_cache(),
             1u);
   EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C4)
-                .leaf->num_blocks_in_prefix_cache(),
-            1u);
-  EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C128)
+                .at(BlockType::KV)
                 .leaf->num_blocks_in_prefix_cache(),
             1u);
   EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::SWA),
-            kCompressedUnitTokens / kBaseBlockSize);
-  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::C4),
-            kCompressedUnitTokens / kCompressedUnitTokens);
-  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::C128), 1u);
+            kDsv4NpuBlockSize / kBaseBlockSize);
+  EXPECT_EQ(seq.kv_state().num_cached_blocks(BlockType::KV), 1u);
 
+  Sequence replay = MakeTestSequence(
+      /*index=*/1, std::vector<int32_t>(completed_tokens, 17));
+  EXPECT_EQ(manager.prefix_hit_tokens(replay), kDsv4NpuBlockSize);
+  manager.allocate_shared_for_sequence(&replay);
+  EXPECT_EQ(replay.kv_state().kv_cache_tokens_num(), kDsv4NpuBlockSize);
+  manager.deallocate_for_sequence(&replay);
   manager.deallocate_for_sequence(&seq);
 }
 
@@ -1359,7 +1312,12 @@ TEST(CompositeBlockManagerTest,
 
   Sequence probe = MakeTestSequence(/*index=*/2, prompt_a);
   manager.allocate_shared_for_sequence(&probe);
-  EXPECT_EQ(probe.kv_state().kv_cache_tokens_num(), 0u);
+  // One logical unit covers the whole SWA window, so the previous unit's
+  // window is the only restorable prefix. A larger unit can leave that
+  // window evicted while the newer checkpoint remains.
+  const size_t expected_hit =
+      kCompressedUnitTokens > window_size ? 0u : kCompressedUnitTokens;
+  EXPECT_EQ(probe.kv_state().kv_cache_tokens_num(), expected_hit);
 
   manager.deallocate_for_sequence(&probe);
   manager.deallocate_for_sequence(&pressure);
@@ -1397,8 +1355,7 @@ TEST(CompositeBlockManagerTest, DecodeRoleSkipsSwaPrefixCache) {
     Sequence seq_p_hit = MakeTestSequence(1, prompt);
     prefill_manager.allocate_shared_for_sequence(&seq_p_hit);
     EXPECT_GT(seq_p_hit.kv_state().shared_blocks_num(BlockType::SWA), 0u);
-    EXPECT_GT(seq_p_hit.kv_state().shared_blocks_num(BlockType::C4), 0u);
-    EXPECT_GT(seq_p_hit.kv_state().shared_blocks_num(BlockType::C128), 0u);
+    EXPECT_GT(seq_p_hit.kv_state().shared_blocks_num(BlockType::KV), 0u);
     prefill_manager.deallocate_for_sequence(&seq_p_hit);
   }
 
@@ -1406,7 +1363,7 @@ TEST(CompositeBlockManagerTest, DecodeRoleSkipsSwaPrefixCache) {
   // fresh prompt lookup must return zero SWA / zero C4 / zero C128. The
   // point of this test is that CONSTRUCTION does not FATAL and the SWA leaf
   // is skipped at classify + probe time; the composite still classifies as
-  // SWA_COMPRESSED (C4+C128 remain prefix-cache-on).
+  // SWA_KV (C4+C128 remain prefix-cache-on).
   BlockManager::Options decode_opts = opts;
   decode_opts.instance_is_decode(true);
   CompositeBlockManager decode_manager(build_composite_leaves(decode_opts),
@@ -1418,8 +1375,7 @@ TEST(CompositeBlockManagerTest, DecodeRoleSkipsSwaPrefixCache) {
   EXPECT_EQ(seq_d.kv_state().shared_blocks_num(BlockType::SWA), 0u);
   // C4/C128 caches are fresh (per-manager) so also zero here, but the intent
   // is: the participate predicate keeps them enabled so future hits work.
-  EXPECT_EQ(seq_d.kv_state().shared_blocks_num(BlockType::C4), 0u);
-  EXPECT_EQ(seq_d.kv_state().shared_blocks_num(BlockType::C128), 0u);
+  EXPECT_EQ(seq_d.kv_state().shared_blocks_num(BlockType::KV), 0u);
   // No safe_hit_tokens change either (nothing mounted).
   EXPECT_EQ(seq_d.kv_state().kv_cache_tokens_num(), 0u);
 
@@ -2627,6 +2583,12 @@ TEST_P(LinearStateWindowTest, FlatPrefixMountRestoresCachedTokens) {
   manager.allocate_shared_for_sequence(&consumer);
   EXPECT_EQ(forecast, consumer.kv_cache_tokens_num());
   EXPECT_EQ(consumer.kv_cache_tokens_num(), GetParam() ? 6u : 0u);
+  ASSERT_TRUE(manager.allocate_sequence(&consumer, 8));
+  finish_input(consumer, 8);
+  const int32_t tail_id = consumer.kv_state().blocks(BlockType::KV).back().id();
+  manager.allocate_shared_for_sequence(&consumer);
+  EXPECT_EQ(consumer.kv_cache_tokens_num(), 8u);
+  EXPECT_EQ(consumer.kv_state().blocks(BlockType::KV).back().id(), tail_id);
   manager.deallocate_for_sequence(&consumer);
 }
 
@@ -2820,7 +2782,7 @@ BlockManager::Options make_v41_prefix_options(uint32_t window_size = 128) {
       /*block_size=*/kBaseBlockSize,
       window_size,
       /*max_seqs_per_batch=*/4);
-  options.model_type("deepseek_v41").compress_ratios({0, 2, 1});
+  options.block_size(128).num_blocks(128);
   return options;
 }
 
@@ -2831,14 +2793,13 @@ BlockManagerPool::Options make_v41_prefix_pool_options() {
   BlockManagerPool::Options options;
   options.num_blocks(source.num_blocks())
       .block_size(static_cast<int32_t>(source.block_size()))
-      .model_type(source.model_type())
       .sliding_window_size(source.sliding_window_size())
       .swa_blocks_per_seq(source.swa_blocks_per_seq())
       .swa_num_blocks(source.swa_num_blocks())
+      .swa_block_size(source.swa_block_size())
       .max_tokens_per_batch(source.max_tokens_per_batch())
       .max_seqs_per_batch(source.max_seqs_per_batch())
-      .manager_types(source.manager_types())
-      .compress_ratios(source.compress_ratios());
+      .manager_types(source.manager_types());
   return options;
 }
 
@@ -2862,8 +2823,8 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheDefaultsOnLikeV4) {
   ASSERT_TRUE(options.enable_prefix_cache());
   CompositeBlockManager manager(build_composite_leaves(options), options);
   EXPECT_EQ(manager.leaf_combination(),
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+            CompositeBlockManager::LeafCombination::SWA_KV);
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
     EXPECT_TRUE(manager.leaf_entries().at(type).supports_prefix_cache);
     EXPECT_TRUE(
         manager.leaf_entries().at(type).leaf->options().enable_prefix_cache());
@@ -2886,21 +2847,11 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheFollowsV4EnableSwitch) {
     BlockManager::Options options = make_v41_prefix_options();
     options.enable_prefix_cache(enabled);
     CompositeBlockManager manager(build_composite_leaves(options), options);
-    for (const BlockType type :
-         {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+    for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
       EXPECT_EQ(manager.leaf_entries().at(type).supports_prefix_cache, enabled);
       EXPECT_EQ(
           manager.leaf_entries().at(type).leaf->options().enable_prefix_cache(),
           enabled);
-    }
-
-    options.model_type("deepseek_v4").compress_ratios({0, 4, 128});
-    CompositeBlockManager v4_manager(build_composite_leaves(options), options);
-    EXPECT_EQ(manager.leaf_combination(), v4_manager.leaf_combination());
-    for (const BlockType type :
-         {BlockType::SWA, BlockType::C4, BlockType::C128}) {
-      EXPECT_EQ(v4_manager.leaf_entries().at(type).supports_prefix_cache,
-                enabled);
     }
   }
 }
@@ -2911,75 +2862,67 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheKeepsDeviceOnlyRolePolicy) {
     SCOPED_TRACE(is_decode);
     options.instance_is_decode(is_decode);
     CompositeBlockManager manager(build_composite_leaves(options), options);
-    for (const BlockType type :
-         {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+    for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
       const BlockManager* leaf = block_test::leaf_of(manager, type);
       ASSERT_NE(leaf, nullptr);
       EXPECT_EQ(leaf->options().enable_prefix_cache(),
                 type != BlockType::SWA || !is_decode);
     }
     EXPECT_EQ(manager.leaf_combination(),
-              CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
+              CompositeBlockManager::LeafCombination::SWA_KV);
   }
 }
 
-TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsMissingSwaWindow) {
+TEST_F(V41PrefixCacheTest, PrefixCacheUsesKvOnlyWithoutSwa) {
   const BlockManager::Options options = make_v41_prefix_options();
   CompositeBlockManager::LeafMap leaves = build_composite_leaves(options);
   ASSERT_EQ(leaves.erase(BlockType::SWA), 1u);
-  EXPECT_DEATH(
-      { CompositeBlockManager manager(std::move(leaves), options); },
-      "Grouped history prefix requires physical SWA storage");
+  CompositeBlockManager manager(std::move(leaves), options);
+  EXPECT_EQ(manager.leaf_combination(),
+            CompositeBlockManager::LeafCombination::FLAT_KV);
 }
 
 TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsMissingHistoryLeaves) {
   const BlockManager::Options options = make_v41_prefix_options();
   CompositeBlockManager::LeafMap leaves = build_composite_leaves(options);
-  ASSERT_EQ(leaves.erase(BlockType::C1), 1u);
-  ASSERT_EQ(leaves.erase(BlockType::C2), 1u);
+  ASSERT_EQ(leaves.erase(BlockType::KV), 1u);
   EXPECT_DEATH(
       { CompositeBlockManager manager(std::move(leaves), options); },
-      "SWA prefix cache requires a full-history TOKEN \\(C1/C2\\) or "
-      "compressed \\(C4/C128\\) leaf, but none were found");
+      "SWA prefix cache requires a KV leaf");
 }
 
 TEST_F(V41PrefixCacheTest, V41SingleTokenGroupUsesItsOwnRestoreUnit) {
-  for (const uint32_t ratio : {1u, 2u}) {
-    SCOPED_TRACE(ratio);
-    BlockManager::Options options = make_v41_prefix_options();
-    options
-        .manager_types({kManagerTypeSlidingWindowBlockManager,
-                        kManagerTypeBlockManagerImpl})
-        .compress_ratios({0u, ratio});
-    CompositeBlockManager manager(build_composite_leaves(options), options);
-    ASSERT_EQ(manager.leaf_combination(),
-              CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-    const BlockType type = ratio == 1u ? BlockType::C1 : BlockType::C2;
-    const size_t unit = kBaseBlockSize * ratio;
-    const size_t prompt_tokens = 4 * unit;
-    const std::vector<int32_t> tokens(prompt_tokens, /*value=*/7);
-    publish_v41_prompt(manager, tokens);
+  BlockManager::Options options = make_v41_prefix_options();
+  options.manager_types(
+      {kManagerTypeSlidingWindowBlockManager, kManagerTypeBlockManagerImpl});
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  ASSERT_EQ(manager.leaf_combination(),
+            CompositeBlockManager::LeafCombination::SWA_KV);
+  const BlockType type = BlockType::KV;
+  const size_t unit = kBaseBlockSize;
+  const size_t prompt_tokens = 4 * unit;
+  const std::vector<int32_t> tokens(prompt_tokens, /*value=*/7);
+  publish_v41_prompt(manager, tokens);
 
-    Sequence repeat = MakeTestSequence(/*index=*/1, tokens);
-    const size_t repeat_forecast = manager.prefix_hit_tokens(repeat);
-    manager.allocate_shared_for_sequence(&repeat);
-    EXPECT_EQ(repeat_forecast, repeat.kv_cache_tokens_num());
-    EXPECT_EQ(repeat.kv_cache_tokens_num(), prompt_tokens - unit);
-    EXPECT_EQ(repeat.kv_state().shared_blocks_num(type), 3u);
-    EXPECT_EQ(repeat.kv_state().shared_blocks_num(BlockType::SWA),
-              (prompt_tokens - unit) / kBaseBlockSize);
-    manager.deallocate_for_sequence(&repeat);
+  Sequence repeat = MakeTestSequence(/*index=*/1, tokens);
+  const size_t repeat_forecast = manager.prefix_hit_tokens(repeat);
+  manager.allocate_shared_for_sequence(&repeat);
+  EXPECT_EQ(repeat_forecast, repeat.kv_cache_tokens_num());
+  EXPECT_EQ(repeat.kv_cache_tokens_num(), prompt_tokens - unit);
+  EXPECT_EQ(repeat.kv_state().shared_blocks_num(type), 3u);
+  EXPECT_EQ(repeat.kv_state().shared_blocks_num(BlockType::SWA),
+            (prompt_tokens - unit) / kBaseBlockSize);
+  manager.deallocate_for_sequence(&repeat);
 
-    std::vector<int32_t> extended = tokens;
-    extended.emplace_back(11);
-    Sequence suffix = MakeTestSequence(/*index=*/2, std::move(extended));
-    const size_t suffix_forecast = manager.prefix_hit_tokens(suffix);
-    manager.allocate_shared_for_sequence(&suffix);
-    EXPECT_EQ(suffix_forecast, suffix.kv_cache_tokens_num());
-    EXPECT_EQ(suffix.kv_cache_tokens_num(), prompt_tokens);
-    EXPECT_EQ(suffix.kv_state().shared_blocks_num(type), 4u);
-    manager.deallocate_for_sequence(&suffix);
-  }
+  std::vector<int32_t> extended = tokens;
+  extended.emplace_back(11);
+  Sequence suffix = MakeTestSequence(/*index=*/2, std::move(extended));
+  const size_t suffix_forecast = manager.prefix_hit_tokens(suffix);
+  manager.allocate_shared_for_sequence(&suffix);
+  EXPECT_EQ(suffix_forecast, suffix.kv_cache_tokens_num());
+  EXPECT_EQ(suffix.kv_cache_tokens_num(), prompt_tokens);
+  EXPECT_EQ(suffix.kv_state().shared_blocks_num(type), 4u);
+  manager.deallocate_for_sequence(&suffix);
 }
 
 TEST_F(V41PrefixCacheTest, V41SampleSelectorsRetainRequiredHiddenPositions) {
@@ -2994,13 +2937,11 @@ TEST_F(V41PrefixCacheTest, V41SampleSelectorsRetainRequiredHiddenPositions) {
     Sequence selected = MakeTestSequence(/*index=*/1, prompt, &slots);
     manager.allocate_shared_for_sequence(&selected);
     const size_t source_position = position == 0 ? 0 : position - 1;
-    const size_t expected = source_position / 256 * 256;
+    const size_t expected = source_position / 128 * 128;
     EXPECT_EQ(selected.kv_cache_tokens_num(), expected);
     EXPECT_LE(selected.kv_cache_tokens_num(), source_position);
-    EXPECT_EQ(selected.kv_state().shared_blocks_num(BlockType::C2),
-              expected / 256);
-    EXPECT_EQ(selected.kv_state().shared_blocks_num(BlockType::C1),
-              expected / kBaseBlockSize);
+    EXPECT_EQ(selected.kv_state().shared_blocks_num(BlockType::KV),
+              expected / 128);
     manager.deallocate_for_sequence(&selected);
 
     Sequence normal = MakeTestSequence(/*index=*/2, prompt);
@@ -3029,13 +2970,13 @@ TEST_F(V41PrefixCacheTest, V41DisabledPrefixCacheDoesNotPublishOrMount) {
 TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesCommonTokenBoundary) {
   const std::vector<std::pair<size_t, size_t>> cases = {{127, 0},
                                                         {128, 0},
-                                                        {255, 0},
-                                                        {256, 0},
+                                                        {255, 128},
+                                                        {256, 128},
                                                         {257, 256},
-                                                        {511, 256},
-                                                        {512, 256},
+                                                        {511, 384},
+                                                        {512, 384},
                                                         {513, 512},
-                                                        {768, 512},
+                                                        {768, 640},
                                                         {769, 768}};
   for (const auto& [prompt_tokens, expected_hit] : cases) {
     SCOPED_TRACE(prompt_tokens);
@@ -3051,10 +2992,8 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesCommonTokenBoundary) {
     manager.allocate_shared_for_sequence(&hot);
     EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
     EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), expected_hit);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1),
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV),
               expected_hit / kBaseBlockSize);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2),
-              expected_hit / (2 * kBaseBlockSize));
     EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::SWA),
               expected_hit / kBaseBlockSize);
     manager.deallocate_for_sequence(&hot);
@@ -3066,17 +3005,16 @@ TEST_F(V41PrefixCacheTest, V41PrefixCachePublishesOnlyCompletedUnits) {
   CompositeBlockManager manager(build_composite_leaves(options), options);
   Sequence cold = MakeTestSequence(/*index=*/0, std::vector<int32_t>(769, 7));
   ASSERT_TRUE(manager.allocate_sequence(&cold, /*num_tokens=*/769));
-  cold.kv_state().incr_kv_cache_tokens_num(/*size=*/255);
+  cold.kv_state().incr_kv_cache_tokens_num(/*size=*/127);
   manager.cache_full_blocks_for_sequence(&cold);
-  EXPECT_EQ(manager.num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(manager.leaf_entries()
+                .at(BlockType::KV)
+                .leaf->num_blocks_in_prefix_cache(),
+            0u);
   cold.kv_state().incr_kv_cache_tokens_num(/*size=*/1);
   manager.cache_full_blocks_for_sequence(&cold);
   EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C1)
-                .leaf->num_blocks_in_prefix_cache(),
-            2u);
-  EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C2)
+                .at(BlockType::KV)
                 .leaf->num_blocks_in_prefix_cache(),
             1u);
   Sequence hot = MakeTestSequence(/*index=*/1, std::vector<int32_t>(769, 7));
@@ -3085,7 +3023,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCachePublishesOnlyCompletedUnits) {
   EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
   manager.allocate_shared_for_sequence(&hot);
   EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
-  EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 256u);
+  EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 128u);
   manager.deallocate_for_sequence(&hot);
   manager.deallocate_for_sequence(&cold);
 }
@@ -3106,11 +3044,9 @@ TEST_F(V41PrefixCacheTest, V41ChunkedPrefillSharesPrefixWithStandardSwitch) {
           const size_t target =
               std::min(completed + chunk_tokens, tokens.size());
           ASSERT_TRUE(manager.allocate_sequence(&cold, target));
-          const size_t published_tokens = enabled ? completed / 256 * 256 : 0;
-          EXPECT_EQ(cold.kv_state().num_cached_blocks(BlockType::C1),
+          const size_t published_tokens = enabled ? completed / 128 * 128 : 0;
+          EXPECT_EQ(cold.kv_state().num_cached_blocks(BlockType::KV),
                     published_tokens / 128);
-          EXPECT_EQ(cold.kv_state().num_cached_blocks(BlockType::C2),
-                    published_tokens / 256);
           cold.kv_state().set_kv_cache_tokens_num(target);
           completed = target;
         }
@@ -3126,18 +3062,14 @@ TEST_F(V41PrefixCacheTest, V41ChunkedPrefillSharesPrefixWithStandardSwitch) {
         EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
         const size_t expected_hit = enabled ? 1024 : 0;
         ASSERT_EQ(hot.kv_cache_tokens_num(), expected_hit);
-        EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1),
+        EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV),
                   expected_hit / 128);
-        EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2),
-                  expected_hit / 256);
         for (size_t completed = expected_hit; completed < extended.size();) {
           const size_t target =
               std::min(completed + chunk_tokens, extended.size());
           ASSERT_TRUE(manager.allocate_sequence(&hot, target));
-          EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1),
+          EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV),
                     expected_hit / 128);
-          EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2),
-                    expected_hit / 256);
           hot.kv_state().set_kv_cache_tokens_num(target);
           completed = target;
         }
@@ -3147,15 +3079,13 @@ TEST_F(V41PrefixCacheTest, V41ChunkedPrefillSharesPrefixWithStandardSwitch) {
   }
 }
 
-TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesLargestParticipatingBlock) {
+TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesOneLogicalCompressedTable) {
   const BlockManager::Options options = make_v41_prefix_options();
-  CompositeBlockManager::LeafMap leaves = build_composite_leaves(options);
-  const size_t unit_tokens = 4 * kBaseBlockSize;
-  BlockManager::Options c1_options = leaves.at(BlockType::C1).leaf->options();
-  c1_options.block_size(static_cast<uint32_t>(unit_tokens));
-  leaves.at(BlockType::C1).leaf =
-      std::make_unique<BlockManagerImpl>(c1_options);
-  CompositeBlockManager manager(std::move(leaves), options);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  const size_t unit_tokens = 128;
+  ASSERT_EQ(manager.leaf_entries().size(), 2u);
+  ASSERT_EQ(manager.leaf_entries().at(BlockType::KV).leaf->block_size(),
+            unit_tokens);
   const std::vector<int32_t> tokens(2 * unit_tokens + 1, /*value=*/7);
   Sequence cold = MakeTestSequence(/*index=*/0, tokens);
   ASSERT_TRUE(manager.allocate_sequence(&cold, tokens.size()));
@@ -3166,13 +3096,9 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesLargestParticipatingBlock) {
   cold.kv_state().incr_kv_cache_tokens_num(/*size=*/1);
   manager.cache_full_blocks_for_sequence(&cold);
   EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C1)
+                .at(BlockType::KV)
                 .leaf->num_blocks_in_prefix_cache(),
             1u);
-  EXPECT_EQ(manager.leaf_entries()
-                .at(BlockType::C2)
-                .leaf->num_blocks_in_prefix_cache(),
-            2u);
 
   Sequence hot = MakeTestSequence(/*index=*/1, tokens);
   const size_t forecast = manager.prefix_hit_tokens(hot);
@@ -3181,8 +3107,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesLargestParticipatingBlock) {
   manager.allocate_shared_for_sequence(&hot);
   EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
   EXPECT_EQ(hot.kv_cache_tokens_num(), unit_tokens);
-  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1), 1u);
-  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 2u);
+  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV), 1u);
   EXPECT_EQ(hot.kv_state().num_blocks(BlockType::SWA),
             unit_tokens / kBaseBlockSize);
   EXPECT_TRUE(hot.kv_state().blocks(BlockType::SWA).back().is_valid());
@@ -3191,8 +3116,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheUsesLargestParticipatingBlock) {
 }
 
 TEST_F(V41PrefixCacheTest, V41PrefixCacheMissesIfAnyRequiredGroupIsGone) {
-  for (const BlockType missing :
-       {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+  for (const BlockType missing : {BlockType::SWA, BlockType::KV}) {
     SCOPED_TRACE(static_cast<int32_t>(missing));
     const BlockManager::Options options = make_v41_prefix_options();
     CompositeBlockManager manager(build_composite_leaves(options), options);
@@ -3205,8 +3129,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheMissesIfAnyRequiredGroupIsGone) {
     manager.allocate_shared_for_sequence(&hot);
     EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
     EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
-    for (const BlockType type :
-         {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+    for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
       EXPECT_EQ(hot.kv_state().shared_blocks_num(type), 0u);
     }
     manager.deallocate_for_sequence(&hot);
@@ -3234,7 +3157,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCachePreservesSharedBlocksOnContinuation) {
             shared_swa_id);
   EXPECT_NE(first.kv_state().blocks(BlockType::SWA).back().id(),
             second.kv_state().blocks(BlockType::SWA).back().id());
-  for (const BlockType type : {BlockType::C1, BlockType::C2}) {
+  for (const BlockType type : {BlockType::KV}) {
     const Slice<Block> a = first.kv_state().blocks(type);
     const Slice<Block> b = second.kv_state().blocks(type);
     const size_t shared = first.kv_state().shared_blocks_num(type);
@@ -3276,40 +3199,28 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheRequiresCompleteSwaWindow) {
 }
 
 TEST_F(V41PrefixCacheTest, V41ShortPrefixRestoresAvailableSwaHistory) {
-  for (const bool c1_only : {false, true}) {
-    SCOPED_TRACE(c1_only);
-    const uint32_t window_size = c1_only ? 256u : 512u;
-    const size_t prefix_tokens = c1_only ? 128u : 256u;
-    BlockManager::Options options = make_v41_prefix_options(window_size);
-    if (c1_only) {
-      options
-          .manager_types({kManagerTypeSlidingWindowBlockManager,
-                          kManagerTypeBlockManagerImpl})
-          .compress_ratios({0u, 1u});
-    }
-    CompositeBlockManager manager(build_composite_leaves(options), options);
-    publish_v41_prompt(manager, std::vector<int32_t>(prefix_tokens, 7));
-    Sequence hot = MakeTestSequence(
-        /*index=*/1, std::vector<int32_t>(prefix_tokens + 1, 7));
-    const size_t forecast = manager.prefix_hit_tokens(hot);
-    EXPECT_FALSE(hot.has_any_blocks());
-    EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
-    manager.allocate_shared_for_sequence(&hot);
-    EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
-    EXPECT_EQ(hot.kv_cache_tokens_num(), prefix_tokens);
-    const Slice<Block> swa = hot.kv_state().blocks(BlockType::SWA);
-    ASSERT_EQ(swa.size(), prefix_tokens / kBaseBlockSize);
-    for (const Block& block : swa) {
-      EXPECT_TRUE(block.is_valid());
-    }
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1),
-              prefix_tokens / kBaseBlockSize);
-    if (!c1_only) {
-      EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 1u);
-    }
-    ASSERT_TRUE(manager.allocate_sequence(&hot, prefix_tokens + 1));
-    manager.deallocate_for_sequence(&hot);
+  const uint32_t window_size = 512u;
+  const size_t prefix_tokens = 128;
+  BlockManager::Options options = make_v41_prefix_options(window_size);
+  CompositeBlockManager manager(build_composite_leaves(options), options);
+  publish_v41_prompt(manager, std::vector<int32_t>(prefix_tokens, 7));
+  Sequence hot = MakeTestSequence(
+      /*index=*/1, std::vector<int32_t>(prefix_tokens + 1, 7));
+  const size_t forecast = manager.prefix_hit_tokens(hot);
+  EXPECT_FALSE(hot.has_any_blocks());
+  EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
+  manager.allocate_shared_for_sequence(&hot);
+  EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
+  EXPECT_EQ(hot.kv_cache_tokens_num(), prefix_tokens);
+  const Slice<Block> swa = hot.kv_state().blocks(BlockType::SWA);
+  ASSERT_EQ(swa.size(), prefix_tokens / kBaseBlockSize);
+  for (const Block& block : swa) {
+    EXPECT_TRUE(block.is_valid());
   }
+  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV),
+            prefix_tokens / kBaseBlockSize);
+  ASSERT_TRUE(manager.allocate_sequence(&hot, prefix_tokens + 1));
+  manager.deallocate_for_sequence(&hot);
 }
 
 TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsHoleInsideRequiredSwaTail) {
@@ -3339,12 +3250,11 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheRejectsHoleInsideRequiredSwaTail) {
   EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
   manager.allocate_shared_for_sequence(&hot);
   EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
-  // Both the 768- and 512-token windows need the missing fourth SWA block.
-  // The first 256 tokens have complete history and remain recoverable.
-  EXPECT_EQ(hot.kv_cache_tokens_num(), 256u);
-  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::SWA), 2u);
-  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1), 2u);
-  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 1u);
+  // The missing fourth SWA block prevents restoring the 512-token window.
+  // The first three compressed units still have complete history.
+  EXPECT_EQ(hot.kv_cache_tokens_num(), 384u);
+  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::SWA), 3u);
+  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV), 3u);
   manager.deallocate_for_sequence(&hot);
 }
 
@@ -3356,7 +3266,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheMissesForDifferentTokenPrefix) {
       /*index=*/1, std::vector<int32_t>(769, /*value=*/11));
   manager.allocate_shared_for_sequence(&unrelated);
   EXPECT_EQ(unrelated.kv_state().kv_cache_tokens_num(), 0u);
-  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
     EXPECT_EQ(unrelated.kv_state().shared_blocks_num(type), 0u);
   }
   manager.deallocate_for_sequence(&unrelated);
@@ -3372,8 +3282,7 @@ TEST_F(V41PrefixCacheTest, V41PrefixCacheRecomputesDivergentSuffix) {
   manager.allocate_shared_for_sequence(&branch);
   EXPECT_EQ(branch.kv_state().kv_cache_tokens_num(), 512u);
   ASSERT_TRUE(manager.allocate_sequence(&branch, tokens.size()));
-  EXPECT_EQ(branch.kv_state().shared_blocks_num(BlockType::C1), 4u);
-  EXPECT_EQ(branch.kv_state().shared_blocks_num(BlockType::C2), 2u);
+  EXPECT_EQ(branch.kv_state().shared_blocks_num(BlockType::KV), 4u);
   manager.deallocate_for_sequence(&branch);
 }
 
@@ -3386,8 +3295,7 @@ TEST_F(V41PrefixCacheTest, V41CancelledSharedAliasReleasesAllLeafUsage) {
                                             /*dp_size=*/1);
       const auto leaf_usage = [&pool]() {
         std::vector<size_t> usage;
-        for (const BlockType type :
-             {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+        for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
           usage.push_back(block_test::leaf_of(pool, /*dp_rank=*/0, type)
                               ->num_used_blocks());
         }
@@ -3408,8 +3316,7 @@ TEST_F(V41PrefixCacheTest, V41CancelledSharedAliasReleasesAllLeafUsage) {
       ASSERT_EQ(first.kv_cache_tokens_num(), 768u);
       ASSERT_EQ(second.kv_cache_tokens_num(), 768u);
       std::vector<int32_t> shared_ids;
-      for (const BlockType type :
-           {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+      for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
         const Slice<Block> a = first.kv_state().blocks(type);
         const Slice<Block> b = second.kv_state().blocks(type);
         const size_t shared = first.kv_state().shared_blocks_num(type);
@@ -3433,8 +3340,7 @@ TEST_F(V41PrefixCacheTest, V41CancelledSharedAliasReleasesAllLeafUsage) {
       Sequence* survivor = reverse_order ? &first : &second;
       release(released);
       size_t group = 0;
-      for (const BlockType type :
-           {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+      for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
         const Slice<Block> blocks = survivor->kv_state().blocks(type);
         const size_t shared = survivor->kv_state().shared_blocks_num(type);
         ASSERT_GT(shared, 0u);
@@ -3473,8 +3379,7 @@ TEST_F(V41PrefixCacheTest,
   Sequence revisit = MakeTestSequence(/*index=*/1, tokens);
   pool.allocate_shared(&revisit);
   EXPECT_EQ(revisit.kv_cache_tokens_num(), 256u);
-  EXPECT_EQ(revisit.kv_state().shared_blocks_num(BlockType::C1), 2u);
-  EXPECT_EQ(revisit.kv_state().shared_blocks_num(BlockType::C2), 1u);
+  EXPECT_EQ(revisit.kv_state().shared_blocks_num(BlockType::KV), 2u);
   pool.deallocate(&revisit);
   pool.reset_prefix_cache();
   EXPECT_EQ(pool.num_used_blocks(), initial_usage);
@@ -3565,8 +3470,7 @@ TEST_F(V41PrefixCacheTest, V41MMPrefixCacheHitsSameImageAndTextOnly) {
     manager.allocate_shared_for_sequence(&hot);
     EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
     EXPECT_EQ(hot.kv_cache_tokens_num(), 768u);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C1), 6u);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 3u);
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV), 6u);
     EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::SWA), 6u);
     manager.deallocate_for_sequence(&hot);
   }
@@ -3578,8 +3482,10 @@ TEST_F(V41PrefixCacheTest, V41MMPrefixCacheUsesImageIdentityAtBlockBoundary) {
     int32_t length;
     size_t expected_hit;
   };
-  for (const Case test :
-       {Case{0, 512, 0}, Case{300, 400, 256}, Case{512, 128, 512}}) {
+  for (const Case test : {Case{0, 512, 0},
+                          Case{200, 400, 128},
+                          Case{300, 400, 256},
+                          Case{512, 128, 512}}) {
     SCOPED_TRACE(test.offset);
     BlockManager::Options options = make_v41_prefix_options();
     options.hasher_type(BlockHasherType::MM);
@@ -3599,8 +3505,8 @@ TEST_F(V41PrefixCacheTest, V41MMPrefixCacheUsesImageIdentityAtBlockBoundary) {
     manager.allocate_shared_for_sequence(&hot);
     EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
     EXPECT_EQ(hot.kv_cache_tokens_num(), test.expected_hit);
-    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2),
-              test.expected_hit / (2 * kBaseBlockSize));
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV),
+              test.expected_hit / 128);
     manager.deallocate_for_sequence(&hot);
   }
 }
@@ -3612,29 +3518,40 @@ TEST_F(V41PrefixCacheTest, V41MMPrefixCacheStillHashesTextSuffix) {
   const std::vector<int32_t> tokens(769, /*value=*/7);
   const MMData mm_data = make_image_mm_data(/*offset=*/0, /*length=*/512, 3);
   publish_v41_prompt(manager, tokens, mm_data);
-  std::vector<int32_t> divergent = tokens;
-  divergent[600] = 11;
-  Sequence hot = MakeTestSequence(
-      /*index=*/1, divergent, /*sample_slots=*/nullptr, &mm_data);
-  const size_t forecast = manager.prefix_hit_tokens(hot);
-  EXPECT_FALSE(hot.has_any_blocks());
-  EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
-  manager.allocate_shared_for_sequence(&hot);
-  EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
-  EXPECT_EQ(hot.kv_cache_tokens_num(), 512u);
-  EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::C2), 2u);
-  manager.deallocate_for_sequence(&hot);
+  for (const size_t text_offset : {600u, 700u}) {
+    SCOPED_TRACE(text_offset);
+    std::vector<int32_t> divergent = tokens;
+    divergent[text_offset] = 11;
+    Sequence hot = MakeTestSequence(
+        /*index=*/1, divergent, /*sample_slots=*/nullptr, &mm_data);
+    const size_t forecast = manager.prefix_hit_tokens(hot);
+    EXPECT_FALSE(hot.has_any_blocks());
+    EXPECT_EQ(hot.kv_state().kv_cache_tokens_num(), 0u);
+    manager.allocate_shared_for_sequence(&hot);
+    EXPECT_EQ(forecast, hot.kv_state().kv_cache_tokens_num());
+    const size_t expected_blocks = text_offset / 128;
+    EXPECT_EQ(hot.kv_cache_tokens_num(), expected_blocks * 128);
+    EXPECT_EQ(hot.kv_state().shared_blocks_num(BlockType::KV), expected_blocks);
+    manager.deallocate_for_sequence(&hot);
+  }
 }
 
-TEST_F(V41PrefixCacheTest, TokenRatiosDoNotImplyV41Identity) {
+TEST_F(V41PrefixCacheTest, ShortPrefixRestoresAvailableSwaWindow) {
   BlockManager::Options options = make_v41_prefix_options();
-  options.model_type("other_token_model");
+  options.sliding_window_size(512).swa_blocks_per_seq(5);
   CompositeBlockManager manager(build_composite_leaves(options), options);
   EXPECT_EQ(manager.leaf_combination(),
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+            CompositeBlockManager::LeafCombination::SWA_KV);
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
     EXPECT_TRUE(manager.leaf_entries().at(type).supports_prefix_cache);
   }
+  const std::vector<int32_t> tokens(257, 7);
+  publish_v41_prompt(manager, tokens);
+  Sequence hot = MakeTestSequence(1, tokens);
+  EXPECT_EQ(manager.prefix_hit_tokens(hot), 256u);
+  manager.allocate_shared_for_sequence(&hot);
+  EXPECT_EQ(hot.kv_cache_tokens_num(), 256u);
+  manager.deallocate_for_sequence(&hot);
 }
 
 namespace {
@@ -3648,8 +3565,8 @@ TEST_F(V41SpecPrefixCacheTest, SpecKeepsAllPrefixLeavesEnabled) {
   options.num_speculative_tokens(5);
   CompositeBlockManager manager(build_composite_leaves(options), options);
   EXPECT_EQ(manager.leaf_combination(),
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+            CompositeBlockManager::LeafCombination::SWA_KV);
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
     EXPECT_TRUE(
         block_test::leaf_of(manager, type)->options().enable_prefix_cache());
   }
@@ -3660,19 +3577,14 @@ TEST_F(V41SpecPrefixCacheTest, SpecAllowsMMWithoutLookahead) {
   options.num_speculative_tokens(5).hasher_type(BlockHasherType::MM);
   CompositeBlockManager manager(build_composite_leaves(options), options);
   EXPECT_EQ(manager.leaf_combination(),
-            CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-  for (const BlockType type : {BlockType::SWA, BlockType::C1, BlockType::C2}) {
-    EXPECT_TRUE(
-        block_test::leaf_of(manager, type)->options().enable_prefix_cache());
+            CompositeBlockManager::LeafCombination::SWA_KV);
+  ASSERT_EQ(manager.leaf_entries().size(), 2u);
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
+    const BlockManager* leaf = block_test::leaf_of(manager, type);
+    ASSERT_NE(leaf, nullptr);
+    EXPECT_TRUE(leaf->options().enable_prefix_cache());
+    EXPECT_EQ(leaf->options().hasher_type(), BlockHasherType::MM);
   }
-}
-
-TEST_F(V41SpecPrefixCacheTest, SpecRejectsMtpLookaheadHashers) {
-  BlockManager::Options options = make_v41_prefix_options();
-  options.num_speculative_tokens(5).hasher_type(BlockHasherType::MTP_TEXT);
-  EXPECT_DEATH(build_composite_leaves(options), "TEXT/MM hashers only");
-  options.hasher_type(BlockHasherType::MTP_MM);
-  EXPECT_DEATH(build_composite_leaves(options), "TEXT/MM hashers only");
 }
 
 TEST_F(V41SpecPrefixCacheTest, SpecSupportsHostOffloadAndStore) {
@@ -3683,9 +3595,8 @@ TEST_F(V41SpecPrefixCacheTest, SpecSupportsHostOffloadAndStore) {
         .enable_kvcache_store(use_store);
     CompositeBlockManager manager(build_composite_leaves(options), options);
     EXPECT_EQ(manager.leaf_combination(),
-              CompositeBlockManager::LeafCombination::SWA_COMPRESSED);
-    for (const BlockType type :
-         {BlockType::SWA, BlockType::C1, BlockType::C2}) {
+              CompositeBlockManager::LeafCombination::SWA_KV);
+    for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
       EXPECT_TRUE(
           block_test::leaf_of(manager, type)->options().enable_prefix_cache());
     }
@@ -3711,32 +3622,29 @@ TEST_F(V41SpecPrefixCacheTest, VerifyAllocationPublishesOnlyAcceptedUnits) {
     publish_v41_prompt(manager, prompt);
     Sequence sequence = MakeTestSequence(1, prompt);
     manager.allocate_shared_for_sequence(&sequence);
-    ASSERT_EQ(sequence.kv_cache_tokens_num(), 768u);
+    ASSERT_EQ(sequence.kv_cache_tokens_num(), 896u);
     ASSERT_TRUE(manager.allocate_sequence(&sequence, prompt.size()));
     sequence.kv_state().set_kv_cache_tokens_num(prompt.size());
     sequence.append_token(11);  // Anchor at 1021 is not yet computed.
     std::vector<int32_t> shared_ids;
-    for (const BlockType type : {BlockType::C1, BlockType::C2}) {
+    for (const BlockType type : {BlockType::KV}) {
       shared_ids.push_back(sequence.kv_state().blocks(type).front().id());
     }
     // V4's admission already reserves anchor + drafts. Merely allocating
     // across 1024 must not publish the rejected/uncomputed final C2 unit.
     ASSERT_TRUE(manager.allocate_sequence(&sequence, 1027));
-    EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C1), 6u);
-    EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C2), 3u);
+    EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::KV), 7u);
     for (size_t index = 0; index < accepted; ++index) {
       sequence.append_token(static_cast<int64_t>(20 + index));
     }
     // append_token advances the committed cursor, as the shared V4
     // acceptance path does; none of the rejected proposal IDs enter tokens().
     manager.cache_for_sequence(&sequence);
-    const size_t safe_tokens = (sequence.kv_cache_tokens_num() / 256) * 256;
-    EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C1),
+    const size_t safe_tokens = (sequence.kv_cache_tokens_num() / 128) * 128;
+    EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::KV),
               safe_tokens / 128);
-    EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C2),
-              safe_tokens / 256);
     size_t leaf_index = 0;
-    for (const BlockType type : {BlockType::C1, BlockType::C2}) {
+    for (const BlockType type : {BlockType::KV}) {
       EXPECT_EQ(sequence.kv_state().blocks(type).front().id(),
                 shared_ids[leaf_index++]);
     }
@@ -3766,7 +3674,7 @@ TEST_F(V41SpecPrefixCacheTest,
     pool.deallocate(&source);
     Sequence cancelled = MakeTestSequence(1, std::vector<int32_t>(1021, 7));
     ASSERT_TRUE(pool.allocate(&cancelled, 1021));
-    ASSERT_EQ(cancelled.kv_cache_tokens_num(), 768u);
+    ASSERT_EQ(cancelled.kv_cache_tokens_num(), 896u);
     cancelled.kv_state().set_kv_cache_tokens_num(1021);
     cancelled.append_token(11);
     ASSERT_TRUE(pool.allocate(&cancelled, 1027));
@@ -3780,7 +3688,7 @@ TEST_F(V41SpecPrefixCacheTest,
     EXPECT_FALSE(cancelled.has_any_blocks());
     Sequence repeat = MakeTestSequence(2, std::vector<int32_t>(1027, 7));
     ASSERT_TRUE(pool.allocate(&repeat, 1027));
-    EXPECT_EQ(repeat.kv_cache_tokens_num(), 768u);
+    EXPECT_EQ(repeat.kv_cache_tokens_num(), 896u);
     repeat.reset();
   }
 }
@@ -3802,7 +3710,7 @@ TEST_F(V41SpecPrefixCacheTest, SharedSpecRequestsKeepIndependentEmbeddingRows) {
   ASSERT_EQ(second.kv_cache_tokens_num(), 768u);
   EXPECT_NE(first.kv_state().blocks(BlockType::EMBEDDING)[0].id(),
             second.kv_state().blocks(BlockType::EMBEDDING)[0].id());
-  for (const BlockType type : {BlockType::C1, BlockType::C2}) {
+  for (const BlockType type : {BlockType::KV}) {
     EXPECT_EQ(first.kv_state().blocks(type)[0].id(),
               second.kv_state().blocks(type)[0].id());
     EXPECT_NE(first.kv_state().blocks(type).back().id(),
@@ -3832,7 +3740,7 @@ TEST(CompositeBlockManagerTest, V4DefaultPrefixCacheKeepsRolePolicy) {
     const BlockManager* swa = block_test::leaf_of(manager, BlockType::SWA);
     ASSERT_NE(swa, nullptr);
     EXPECT_EQ(swa->options().enable_prefix_cache(), !is_decode);
-    for (const BlockType type : {BlockType::C4, BlockType::C128}) {
+    for (const BlockType type : {BlockType::KV}) {
       const BlockManager* leaf = block_test::leaf_of(manager, type);
       ASSERT_NE(leaf, nullptr);
       EXPECT_TRUE(leaf->options().enable_prefix_cache());

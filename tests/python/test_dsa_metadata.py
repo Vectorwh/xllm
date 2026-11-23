@@ -34,13 +34,59 @@ from xllm.python.attention.dsa_metadata import (
     DsaMetadataBuilder,
     build_cache_specs,
     build_cache_specs_v41,
+    dsa_block_table_groups,
 )
+
+
+@pytest.mark.parametrize("ratios", [[4, 128], [128, 4], [1, 2], [2, 1], [1], [2]])
+@pytest.mark.parametrize("enable_graph", [False, True])
+def test_logical_compressed_table_populates_all_physical_groups(ratios: list[int], enable_graph: bool) -> None:
+    if max(ratios) <= 2:
+        caches_info, groups = build_cache_specs_v41(ratios, list(range(len(ratios))), [], 128, len(ratios))
+        token_span = 128
+    else:
+        caches_info, groups = build_cache_specs(ratios, 128, len(ratios))
+        token_span = 2048
+    # Physical group order must not select the logical source table.
+    for layer in caches_info:
+        for cache in layer:
+            cache.group_id = len(groups) - cache.group_id - 1
+    groups = list(reversed(groups))
+    builder = DsaMetadataBuilder(caches_info, groups)
+    swa = torch.arange(32, dtype=torch.int32).view(1, -1)
+    compressed = torch.tensor([[7, 2, 9]], dtype=torch.int32)
+    length = token_span + 128
+    kwargs = dict(
+        kv_seq_lens=[length],
+        q_seq_lens=[128],
+        positions=torch.arange(length - 128, length, dtype=torch.int64),
+        dsa_cos_sin=None,
+        is_prefill=False,
+        is_chunked_prefill=True,
+        enable_graph=enable_graph,
+        graph_block_table_capacity_cols=32 if enable_graph else 0,
+    )
+    logical = builder.build(multi_block_tables=[swa, compressed], **kwargs)
+    assert len(dsa_block_table_groups(groups)) == 2
+    for layer_id, ratio in enumerate(ratios):
+        slots = logical.slot_mappings[layer_id][0]
+        physical_dim = next(
+            group.physical_dim for group in groups if group.cache_type == DSA_CACHE_TOKEN and group.ratio == ratio
+        )
+        committed_row = token_span // ratio
+        assert slots[0].item() == 2 * physical_dim + committed_row % physical_dim
+
+
+def test_v41_kv_source_rejects_ratio_4() -> None:
+    """V4.1 history planes exist only for ratios 1 and 2."""
+    with pytest.raises(ValueError, match="compress ratio 1 or 2"):
+        build_cache_specs_v41([4], [0], [], 128, 1)
 
 
 def test_build_cache_specs_groups() -> None:
     """Group 0 is always SWA; TOKEN groups register in first-seen order."""
     compress_ratios = [0, 0, 128, 4, 128, 4, 128, 0]
-    caches_info, group_infos = build_cache_specs(compress_ratios, window_size=128, n_layers=8)
+    caches_info, group_infos = build_cache_specs(compress_ratios, swa_block_size=128, n_layers=8)
 
     # Non-sorted first occurrence matters: SWA, C128, then C4.
     assert len(group_infos) == 3
@@ -48,10 +94,10 @@ def test_build_cache_specs_groups() -> None:
     assert group_infos[0].ratio == 1
     assert group_infos[1].cache_type == DSA_CACHE_TOKEN
     assert group_infos[1].ratio == 128
-    assert group_infos[1].block_size == 16
+    assert group_infos[1].physical_dim == 16
     assert group_infos[2].cache_type == DSA_CACHE_TOKEN
     assert group_infos[2].ratio == 4
-    assert group_infos[2].block_size == 512
+    assert group_infos[2].physical_dim == 512
 
 
 def test_build_cache_specs_per_layer_cache_counts() -> None:
@@ -373,16 +419,15 @@ def test_build_block_tables_shared_within_group() -> None:
 
 def _make_swa_only_builder() -> tuple[DsaMetadataBuilder, list, list]:
     """A pure-SWA model (the DSpark draft): exactly one deduplicated group."""
-    caches_info, group_infos = build_cache_specs_v41([0] * 3, [], [], window_size=128, n_layers=3)
+    caches_info, group_infos = build_cache_specs_v41([0] * 3, [], [], swa_block_size=128, n_layers=3)
     return DsaMetadataBuilder(caches_info, group_infos), caches_info, group_infos
 
 
 def _v41_tables() -> list[torch.Tensor]:
-    """The request's tables in the fixed export order [SWA, C2, C1]."""
+    """Logical SWA/KV tables, shared by every physical history geometry."""
     return [
         torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
         torch.tensor([[20, 21]], dtype=torch.int32),
-        torch.tensor([[30, 31]], dtype=torch.int32),
     ]
 
 
@@ -403,7 +448,7 @@ def _build_v41(builder: DsaMetadataBuilder, group_limit: int | None = None) -> D
 def test_manager_count_beyond_the_model_groups_is_rejected() -> None:
     """Managers must fit the initialized builder cache groups."""
     builder, _, _ = _make_swa_only_builder()
-    with pytest.raises(ValueError, match="manager count 3 exceeds group count 1"):
+    with pytest.raises(ValueError, match="logical table count 2 does not match model bindings 1"):
         _build_v41(builder)
 
 
@@ -489,10 +534,9 @@ def test_build_c128_slot_at_compression_boundary() -> None:
     builder, _, _ = _make_builder()
     swa_bt = torch.tensor([[10, 11]], dtype=torch.int32)
     token4_bt = torch.tensor([[20, 21]], dtype=torch.int32)
-    token128_bt = torch.tensor([[30, 31]], dtype=torch.int32)
     dsa = builder.build(
-        multi_block_tables=[swa_bt, token4_bt, token128_bt],
-        kv_seq_lens=[256],
+        multi_block_tables=[swa_bt, token4_bt],
+        kv_seq_lens=[128],
         q_seq_lens=[1],
         positions=torch.tensor([255], dtype=torch.int64),
         dsa_cos_sin=None,
@@ -501,8 +545,8 @@ def test_build_c128_slot_at_compression_boundary() -> None:
     )
 
     # Layer 2 uses TOKEN(128) for cache 0. The first compressed row is offset 0.
-    assert dsa.slot_mappings[2][0].tolist() == [30 * 16 + 1]
-    assert dsa.c128_pad_positions.tolist() == [128]
+    assert dsa.slot_mappings[2][0].tolist() == [20 * 16]
+    assert dsa.c128_pad_positions.tolist() == [0]
 
 
 def test_multi_batch_slots_are_concatenated_by_sequence() -> None:
@@ -523,22 +567,18 @@ def test_multi_batch_slots_are_concatenated_by_sequence() -> None:
     assert dsa.slot_mappings[1][0].tolist() == [20 * 512, 22 * 512 + 1]
 
 
-def test_packed_manager_block_table_is_unpacked() -> None:
+def test_packed_physical_groups_are_rejected() -> None:
     builder, _, _ = _make_builder()
-    packed = torch.tensor([[10, 11], [20, 21], [30, 31]], dtype=torch.int32)
-    dsa = builder.build(
-        multi_block_tables=[packed],
-        kv_seq_lens=[128],
-        q_seq_lens=[1],
-        positions=torch.tensor([127], dtype=torch.int64),
-        dsa_cos_sin=None,
-        is_prefill=False,
-        is_chunked_prefill=False,
-    )
-
-    assert dsa.block_tables[0][0].tolist() == [[10, -1]]
-    assert dsa.block_tables[1][0].tolist() == [[20, 21]]
-    assert dsa.block_tables[2][0].tolist() == [[30, 31]]
+    with pytest.raises(ValueError, match="logical table count 1 does not match model bindings 2"):
+        builder.build(
+            multi_block_tables=[torch.tensor([[10, 11], [20, 21], [30, 31]], dtype=torch.int32)],
+            kv_seq_lens=[128],
+            q_seq_lens=[1],
+            positions=torch.tensor([127], dtype=torch.int64),
+            dsa_cos_sin=None,
+            is_prefill=False,
+            is_chunked_prefill=False,
+        )
 
 
 def test_graph_slots_and_block_tables_use_bucket_capacity() -> None:
@@ -606,7 +646,7 @@ def test_graph_rejects_block_table_larger_than_bucket_capacity() -> None:
 
     with pytest.raises(ValueError, match="exceeds bucket capacity"):
         builder.build(
-            multi_block_tables=[block_table],
+            multi_block_tables=[block_table, block_table],
             kv_seq_lens=[8],
             q_seq_lens=[1],
             positions=torch.tensor([7], dtype=torch.int64),

@@ -50,7 +50,8 @@ class FusedCompressKvCachePlacementTest
 TEST_P(FusedCompressKvCachePlacementTest, WritesEveryRowToItsPhysicalSlot) {
   const auto [length, reversed_pages, ratio, split_requests] = GetParam();
   constexpr int32_t kHeadDim = 512;
-  constexpr int32_t kPageSize = 128;
+  // Physical dim of one logical block: block size 128 divided by the ratio.
+  const int32_t physical_dim = 128 / ratio;
   constexpr int32_t kPadding = 3;
   // A request ending at 1493 makes the rollover window end off the usual
   // tile boundary, with short tiles among the pending stores.
@@ -58,7 +59,7 @@ TEST_P(FusedCompressKvCachePlacementTest, WritesEveryRowToItsPhysicalSlot) {
       split_requests ? std::vector<int32_t>{1493, length - 1493}
                      : std::vector<int32_t>{length};
   const int32_t batch = static_cast<int32_t>(lengths.size());
-  const int32_t columns = (length + kPageSize - 1) / kPageSize;
+  const int32_t columns = (length + physical_dim - 1) / physical_dim;
   const int32_t pages = batch * columns;
   const torch::Device device(torch::kPrivateUse1, 0);
   const torch::DeviceGuard guard(device);
@@ -119,18 +120,19 @@ TEST_P(FusedCompressKvCachePlacementTest, WritesEveryRowToItsPhysicalSlot) {
     expected_slots.narrow(0, offsets[seq], lengths[seq])
         .copy_(page_ids[seq].index_select(
                    0,
-                   torch::floor_divide(logical_rows, kPageSize)
+                   torch::floor_divide(logical_rows, physical_dim)
                        .to(torch::kInt64)) *
-                   kPageSize +
-               logical_rows.remainder(kPageSize));
+                   physical_dim +
+               logical_rows.remainder(physical_dim));
   }
 
   // Keep guard pages both inside and outside the cache view. Also check
   // unused rows in a partial last page, not only the requested destinations.
   auto cache_storage =
-      torch::full({pages + 4, kPageSize, kHeadDim}, -7, bf16.device(device));
+      torch::full({pages + 4, physical_dim, kHeadDim}, -7, bf16.device(device));
   const auto cache = cache_storage.slice(0, 1, pages + 3);
-  auto expected_cache = torch::full({pages + 4, kPageSize, kHeadDim}, -7, bf16);
+  auto expected_cache =
+      torch::full({pages + 4, physical_dim, kHeadDim}, -7, bf16);
   expected_cache.slice(0, 1, pages + 3)
       .view({-1, kHeadDim})
       .index_copy_(0, expected_slots.to(torch::kInt64), expected_rows);

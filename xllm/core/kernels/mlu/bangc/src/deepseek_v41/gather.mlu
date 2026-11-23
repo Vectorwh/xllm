@@ -32,6 +32,7 @@ __mlu_global__ void gather(int16_t* swa,
                            int64_t position,
                            int32_t window,
                            int32_t swa_columns,
+                           int32_t comp_physical_dim,
                            int16_t* output,
                            int32_t* length) {
   const int32_t win = position + 1 < window ? position + 1 : window;
@@ -66,11 +67,12 @@ __mlu_global__ void gather(int16_t* swa,
       if (col % taskDim != taskId) {
         continue;
       }
+      // `logical` is a compressed row. Its page holds comp_physical_dim,
+      // which is block_size / compress_ratio.
       const int64_t physical =
-          static_cast<int64_t>(
-              comp_table[logical / kDeepseekV41MluKVBlockSize]) *
-              kDeepseekV41MluKVBlockSize +
-          logical % kDeepseekV41MluKVBlockSize;
+          static_cast<int64_t>(comp_table[logical / comp_physical_dim]) *
+              comp_physical_dim +
+          logical % comp_physical_dim;
       __memcpy(
           row, compressed + physical * 512, 512 * sizeof(int16_t), GDRAM2NRAM);
       __memcpy(output + col * 512, row, 512 * sizeof(int16_t), NRAM2GDRAM);
@@ -99,6 +101,7 @@ void deepseek_v41_gather_launch(cnrtQueue_t queue,
                                 int64_t position,
                                 int32_t window,
                                 int32_t swa_columns,
+                                int32_t comp_physical_dim,
                                 void* output,
                                 int32_t* length) {
   cnrtDim3_t grid = {32, 1, 1};
@@ -113,6 +116,7 @@ void deepseek_v41_gather_launch(cnrtQueue_t queue,
       position,
       window,
       swa_columns,
+      comp_physical_dim,
       static_cast<int16_t*>(output),
       length);
 }

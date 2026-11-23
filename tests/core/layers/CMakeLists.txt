@@ -40,6 +40,25 @@ cc_test(
     glog::glog
 )
 
+# Model-declared logical tables are expanded using CPU tensors only.
+cc_test(
+  NAME
+    dsa_metadata_builder_test
+  CPU_ONLY
+  SRCS
+    dsa_metadata_builder_test.cpp
+  DEPS
+    :common_layers
+    GTest::gtest_main
+)
+target_link_libraries(dsa_metadata_builder_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+
 cc_test(
   NAME
     attention_metadata_builder_test

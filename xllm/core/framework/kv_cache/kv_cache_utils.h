@@ -212,7 +212,6 @@ struct DeepSeekV4KVCacheTensors {
   // Packed KV and score states, populated only on MLU.
   torch::Tensor compress_state;
   torch::Tensor compress_index_state;
-  BlockType compressed_block_type = BlockType::KV;
 };
 
 // for qwen3.5
@@ -290,23 +289,7 @@ int64_t dsv4_host_swa_block_count(int64_t checkpoint_block_count,
                                   double host_blocks_factor,
                                   int64_t window_size,
                                   int64_t block_size,
-                                  int64_t cache_unit_size = 0);
-
-// Return the largest registered V4.1 TOKEN span on the base block grid. V4
-// returns zero so callers keep using dsv4_cache_geometry().
-template <typename Ratio>
-int64_t dsv41_cache_unit_tokens(bool is_v41,
-                                size_t block_size,
-                                const std::vector<Ratio>& compress_ratios) {
-  if (!is_v41) {
-    return 0;
-  }
-  CHECK_GT(block_size, 0u);
-  CHECK(!compress_ratios.empty());
-  const int64_t max_ratio =
-      *std::max_element(compress_ratios.begin(), compress_ratios.end());
-  return static_cast<int64_t>(block_size) * std::max<int64_t>(max_ratio, 1);
-}
+                                  int64_t cache_unit_size);
 
 // Return an actionable error for an unsupported host prefix-cache
 // configuration, or std::nullopt when the configuration is valid.

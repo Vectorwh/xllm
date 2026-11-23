@@ -332,9 +332,9 @@ class Sequence final {
 
   // Extend the per-stride chain for `block_size` to cover any newly completed
   // full blocks. Cheap (no-op) when no new full block is available, so it is
-  // safe to call before every match()/cache(). DSV4 admission probes SWA / C4 /
-  // C128 back-to-back with different strides (base / 4*base / 128*base); each
-  // stride keeps its own chain so switching strides no longer discards and
+  // safe to call before every match()/cache(). KV and SWA may use different
+  // block sizes; each stride keeps its own chain so switching no longer
+  // discards and
   // rebuilds the whole chain. LINEAR checkpoints use this same table.
   void update_block_hashes(uint32_t block_size, BlockHasherType hasher_type);
 

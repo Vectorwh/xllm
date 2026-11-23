@@ -64,6 +64,7 @@ class KVCache final {
   torch::Tensor get_conv_cache() const;
   torch::Tensor get_ssm_cache() const;
   std::vector<KVCacheTensor> get_cache_tensors() const;
+
   torch::Tensor get_swa_cache() const;
   torch::Tensor get_compress_kv_state() const;
   torch::Tensor get_compress_score_state() const;

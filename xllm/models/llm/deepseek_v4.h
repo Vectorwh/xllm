@@ -45,6 +45,7 @@ limitations under the License.
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
+#include "core/platform/platform.h"
 #include "core/util/tensor_helper.h"
 #include "core/util/utils.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
@@ -98,12 +99,13 @@ inline bool deepseek_v4_uses_acl_graph(
 
 inline void deepseek_v4_clamp_multi_block_tables(
     ModelInputParams& input_params,
-    size_t registered_group_count) {
-  // multi_block_tables follows SWA/C4/C128 export order. The DSpark draft
-  // registers only the SWA prefix, while its input is copied from the
-  // three-group target, so discard groups this model cannot consume.
-  if (input_params.multi_block_tables.size() > registered_group_count) {
-    input_params.multi_block_tables.resize(registered_group_count);
+    const std::vector<DSAGroupInfo>& group_infos) {
+  // A SWA-only draft inherits the target input but consumes only its declared
+  // logical resources, independently of the target physical group count.
+  const size_t table_count =
+      static_cast<size_t>(dsa_block_table_count(group_infos));
+  if (input_params.multi_block_tables.size() > table_count) {
+    input_params.multi_block_tables.resize(table_count);
   }
 }
 
@@ -318,15 +320,15 @@ struct DeepseekV4GraphMetadataState : ModelGraphMetadataState {
   DSAMetadataPersistent dsa_metadata_persistent;
 };
 
-// Group key: (ratio, type, block_size) -> group_id
+// Group key: (ratio, type, physical_dim) -> group_id
 class DSAGroupKey {
  public:
   int32_t ratio;
   DSACacheType type;
-  int32_t block_size;
+  int32_t physical_dim;
 
   bool operator==(const DSAGroupKey& o) const {
-    return ratio == o.ratio && type == o.type && block_size == o.block_size;
+    return ratio == o.ratio && type == o.type && physical_dim == o.physical_dim;
   }
 };
 
@@ -335,7 +337,7 @@ class DSAGroupKeyHash {
   size_t operator()(const DSAGroupKey& k) const {
     size_t h = std::hash<int32_t>()(k.ratio);
     h ^= std::hash<int32_t>()(static_cast<int32_t>(k.type)) << 16;
-    h ^= std::hash<int32_t>()(k.block_size) << 8;
+    h ^= std::hash<int32_t>()(k.physical_dim) << 8;
     return h;
   }
 };
@@ -345,32 +347,28 @@ inline void deepseek_v4_build_cache_specs(
     std::vector<std::vector<DSACacheInfo>>& caches_info,
     std::vector<DSAGroupInfo>& group_infos) {
   const auto& compress_ratios = model_args.compress_ratios();
-  const int32_t window_size = model_args.window_size();
-  const int32_t base_block_size = 128;
-  const Dsv4CacheGeometry& geometry =
-      KVCacheConfig::get_instance().dsv4_cache_geometry();
-  const int32_t c4_physical_dim =
-      static_cast<int32_t>(geometry.c4_physical_dim());
-  const int32_t c128_physical_dim =
-      static_cast<int32_t>(geometry.c128_physical_dim());
-  CHECK_EQ(KVCacheConfig::get_instance().block_size(), base_block_size)
-      << "DeepSeek V4 currently only supports block_size=128.";
+  const int32_t swa_block_size = static_cast<int32_t>(dsv4_swa_block_size());
+  const int64_t kv_block_size = dsv4_kv_block_size(Platform::is_npu());
+  const int32_t c4_physical_dim = static_cast<int32_t>(
+      dsv4_physical_dim(kv_block_size, kDsv4C4CompressRatio));
+  const int32_t c128_physical_dim = static_cast<int32_t>(
+      dsv4_physical_dim(kv_block_size, kDsv4C128CompressRatio));
 
   std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
   auto register_group =
-      [&](DSACacheType type, int32_t ratio, int32_t block_size) -> int32_t {
-    DSAGroupKey key{ratio, type, block_size};
+      [&](DSACacheType type, int32_t ratio, int32_t physical_dim) -> int32_t {
+    DSAGroupKey key{ratio, type, physical_dim};
     auto it = group_key_map.find(key);
     if (it != group_key_map.end()) {
       return it->second;
     }
     const int32_t gid = static_cast<int32_t>(group_infos.size());
     group_key_map.emplace(key, gid);
-    group_infos.push_back({type, ratio, block_size});
+    group_infos.push_back({type, ratio, physical_dim});
     return gid;
   };
 
-  register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
+  register_group(DSACacheType::SLIDING_WINDOW, 1, swa_block_size);
   for (const int32_t ratio : compress_ratios) {
     const int32_t cr = util::deepseek_v4_normalize_compress_ratio(ratio);
     if (cr == 4 || cr == 128) {
@@ -391,31 +389,25 @@ inline void deepseek_v4_build_cache_specs(
     struct CacheEntry {
       DSACacheType type;
       int32_t ratio;
-      int32_t block_size;
+      int32_t physical_dim;
     };
     std::vector<CacheEntry> layer_caches;
+    const CacheEntry swa{DSACacheType::SLIDING_WINDOW, 1, swa_block_size};
 
     if (cr == 1) {
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
+      layer_caches = {swa};
     } else if (cr == 4) {
-      layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
-      layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
+      const CacheEntry kv{DSACacheType::TOKEN, 4, c4_physical_dim};
+      layer_caches = {kv, kv, swa, swa, swa, swa, swa, kv};
     } else if (cr == 128) {
-      layer_caches.push_back({DSACacheType::TOKEN, 128, c128_physical_dim});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
+      layer_caches = {
+          {DSACacheType::TOKEN, 128, c128_physical_dim}, swa, swa, swa};
     }
 
     for (const auto& ce : layer_caches) {
-      const int32_t gid = register_group(ce.type, ce.ratio, ce.block_size);
-      caches_info[layer_id].push_back({gid, ce.type, ce.ratio, ce.block_size});
+      const int32_t gid = register_group(ce.type, ce.ratio, ce.physical_dim);
+      caches_info[layer_id].push_back(
+          {gid, ce.type, ce.ratio, ce.physical_dim});
     }
   }
 }
@@ -527,95 +519,7 @@ class DeepseekV4ModelImpl
       layers_.push_back(layer);
     }
 
-    // Build DSA caches_info from compress_ratios
-    const auto& compress_ratios = model_args.compress_ratios();
-    const int32_t window_size = model_args.window_size();
-    const int32_t base_block_size = 128;  // default block size
-    const Dsv4CacheGeometry& geometry =
-        KVCacheConfig::get_instance().dsv4_cache_geometry();
-    const int32_t c4_physical_dim =
-        static_cast<int32_t>(geometry.c4_physical_dim());
-    const int32_t c128_physical_dim =
-        static_cast<int32_t>(geometry.c128_physical_dim());
-    CHECK_EQ(KVCacheConfig::get_instance().block_size(), base_block_size)
-        << "DeepSeek V4 currently only supports block_size=128.";
-
-    std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
-    auto register_group =
-        [&](DSACacheType type, int32_t ratio, int32_t block_size) -> int32_t {
-      DSAGroupKey key{ratio, type, block_size};
-      auto it = group_key_map.find(key);
-      if (it != group_key_map.end()) {
-        return it->second;
-      }
-      const int32_t gid = static_cast<int32_t>(group_infos_.size());
-      group_key_map.emplace(key, gid);
-      group_infos_.push_back({type, ratio, block_size});
-      return gid;
-    };
-
-    // Keep DSA group ids consistent with BlockManagerPool manager order:
-    // 1) sliding-window manager first
-    // 2) token managers in first-seen compress_ratio order
-    register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
-    for (const auto ratio : compress_ratios) {
-      const int32_t cr = util::deepseek_v4_normalize_compress_ratio(ratio);
-      if (cr == 4 || cr == 128) {
-        register_group(
-            DSACacheType::TOKEN,
-            cr,
-            cr == kDsv4C4CompressRatio ? c4_physical_dim : c128_physical_dim);
-      }
-    }
-
-    caches_info_.resize(model_args.n_layers());
-
-    for (int32_t layer_id = 0; layer_id < model_args.n_layers(); ++layer_id) {
-      int32_t cr = (layer_id < static_cast<int32_t>(compress_ratios.size()))
-                       ? compress_ratios[layer_id]
-                       : 1;
-      cr = util::deepseek_v4_normalize_compress_ratio(cr);
-      // Build per-layer cache specs based on compress_ratio
-      struct CacheEntry {
-        DSACacheType type;
-        int32_t ratio;
-        int32_t block_size;
-      };
-      std::vector<CacheEntry> layer_caches;
-
-      if (cr == 1) {
-        // C1: 1 cache (swa)
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      } else if (cr == 4) {
-        // C4: 8 caches
-        // compress_kv(TOKEN,4), compress_index(TOKEN,4),
-        // swa(SW,1,window), kv_state(SW,1,window), score_state(SW,1,window),
-        // idx_kv_state(SW,1,window), idx_score_state(SW,1,window),
-        // indexer_scale(TOKEN,4)
-        layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
-        layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::TOKEN, 4, c4_physical_dim});
-      } else if (cr == 128) {
-        // C128: 4 caches
-        // compress_kv(TOKEN,128), swa(SW,1,window),
-        // kv_state(SW,1,window), score_state(SW,1,window)
-        layer_caches.push_back({DSACacheType::TOKEN, 128, c128_physical_dim});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-        layer_caches.push_back({DSACacheType::SLIDING_WINDOW, 1, window_size});
-      }
-
-      for (const auto& ce : layer_caches) {
-        const int32_t gid = register_group(ce.type, ce.ratio, ce.block_size);
-        caches_info_[layer_id].push_back(
-            {gid, ce.type, ce.ratio, ce.block_size});
-      }
-    }
+    deepseek_v4_build_cache_specs(model_args, caches_info_, group_infos_);
 
     // Locate the first SWA cache so build_dspark_swa_metadata doesn't rescan
     // caches_info_ on every model forward.
@@ -629,7 +533,7 @@ class DeepseekV4ModelImpl
         dspark_swa_layer_ = static_cast<int32_t>(layer_id);
         dspark_swa_cache_ =
             static_cast<int32_t>(std::distance(layer_caches.begin(), it));
-        dspark_swa_block_size_ = it->block_size;
+        dspark_swa_block_size_ = it->physical_dim;
         break;
       }
     }
@@ -707,8 +611,7 @@ class DeepseekV4ModelImpl
     CHECK(deepseek_v4_state != nullptr)
         << "DeepSeek V4 received incompatible graph metadata state";
     auto modified_input_params = input_params;
-    deepseek_v4_clamp_multi_block_tables(modified_input_params,
-                                         group_infos_.size());
+    deepseek_v4_clamp_multi_block_tables(modified_input_params, group_infos_);
     if (modified_input_params.meta.actual_num_sequences == 0) {
       // Graph metadata must keep the bucket-shaped sequence count used during
       // capture/replay. The normal empty-DP fallback intentionally shrinks the
@@ -1242,8 +1145,7 @@ class DeepseekV4ModelImpl
   build_attention_metadata_for_forward(const torch::Tensor& positions,
                                        const ModelInputParams& input_params) {
     auto modified_input_params = input_params;
-    deepseek_v4_clamp_multi_block_tables(modified_input_params,
-                                         group_infos_.size());
+    deepseek_v4_clamp_multi_block_tables(modified_input_params, group_infos_);
     auto& dp_token_nums = modified_input_params.parallel.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
 
@@ -1321,17 +1223,22 @@ class DeepseekV4ModelImpl
       return;
     }
 
-    const int32_t manager_num = static_cast<int32_t>(group_infos_.size());
-    params.multi_block_tables.reserve(manager_num);
-    for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
-      int64_t block_num = 1;
-      if (kv_caches != nullptr && !kv_caches->empty()) {
-        block_num = empty_dp_rank_cache_blocks_for_group(manager_id,
-                                                         kv_caches->front());
+    const int32_t table_count = dsa_block_table_count(group_infos_);
+    std::vector<int64_t> table_columns(table_count, 1);
+    if (kv_caches != nullptr && !kv_caches->empty()) {
+      for (size_t group_id = 0; group_id < group_infos_.size(); ++group_id) {
+        const int32_t table_index =
+            static_cast<int32_t>(group_infos_[group_id].type);
+        table_columns[table_index] =
+            std::max(table_columns[table_index],
+                     empty_dp_rank_cache_blocks_for_group(
+                         static_cast<int32_t>(group_id), kv_caches->front()));
       }
-      block_num = std::max<int64_t>(block_num, 1);
+    }
+    params.multi_block_tables.reserve(table_count);
+    for (const int64_t columns : table_columns) {
       params.multi_block_tables.emplace_back(
-          torch::zeros({1, block_num}, cpu_int_options));
+          torch::zeros({1, columns}, cpu_int_options));
     }
   }
 
@@ -1361,7 +1268,7 @@ class DeepseekV4ModelImpl
     pad_lens_vec(params.attention.host.kv_seq_lens, dummy_kv_len);
     pad_lens_vec(params.attention.host.q_seq_lens, 1);
 
-    const int32_t manager_num = static_cast<int32_t>(group_infos_.size());
+    const int32_t manager_num = dsa_block_table_count(group_infos_);
     bool has_full_multi_block_tables =
         static_cast<int32_t>(params.multi_block_tables.size()) == manager_num;
     if (has_full_multi_block_tables) {
@@ -1395,7 +1302,7 @@ class DeepseekV4ModelImpl
       return 1;
     }
     const auto& group_info = group_infos_[group_id];
-    const int64_t block_size = std::max<int64_t>(group_info.block_size, 1);
+    const int64_t physical_dim = std::max<int64_t>(group_info.physical_dim, 1);
     torch::Tensor cache;
     if (group_info.type == DSACacheType::SLIDING_WINDOW) {
       cache = kv_cache.get_swa_cache();
@@ -1405,7 +1312,8 @@ class DeepseekV4ModelImpl
     if (!cache.defined() || cache.dim() == 0) {
       return 1;
     }
-    return std::max<int64_t>((cache.size(0) + block_size - 1) / block_size, 1);
+    return std::max<int64_t>((cache.size(0) + physical_dim - 1) / physical_dim,
+                             1);
   }
   void build_dsa_rope_metadata(
       layer::DSAMetadata& dsa,

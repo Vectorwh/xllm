@@ -87,15 +87,15 @@ TEST_F(SequenceInflightBlocksTest, MixedTypesRetainTheirOwnRangesAndSlots) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4).enable_prefix_cache(false);
   BlockManagerImpl kv(options);
-  options.block_size(16).block_type(BlockType::C4);
-  BlockManagerImpl compressed(options);
+  options.block_size(16).swa_block_size(16).block_type(BlockType::SWA);
+  BlockManagerImpl swa(options);
   options.block_size(1).block_type(BlockType::LINEAR);
   BlockManagerImpl linear(options);
   options.block_type(BlockType::EMBEDDING);
   BlockManagerImpl embedding(options);
   Sequence sequence = make_sequence(64);
   sequence.kv_state().add_blocks(BlockType::EMBEDDING, embedding.allocate(1));
-  sequence.kv_state().add_blocks(BlockType::C4, compressed.allocate(4));
+  sequence.kv_state().add_blocks(BlockType::SWA, swa.allocate(4));
   sequence.kv_state().add_blocks(BlockType::LINEAR, linear.allocate(2));
   sequence.kv_state().add_blocks(BlockType::KV, kv.allocate(6));
   sequence.kv_state().set_kv_cache_tokens_num(18);
@@ -106,10 +106,9 @@ TEST_F(SequenceInflightBlocksTest, MixedTypesRetainTheirOwnRangesAndSlots) {
   for (size_t index = 0; index < kv_blocks.size(); ++index) {
     EXPECT_EQ(kv_blocks[index].ref_count(), index >= 4 ? 2u : 1u);
   }
-  const Slice<Block> compressed_blocks =
-      sequence.kv_state().blocks(BlockType::C4);
-  for (size_t index = 0; index < compressed_blocks.size(); ++index) {
-    EXPECT_EQ(compressed_blocks[index].ref_count(), index >= 1 ? 2u : 1u);
+  const Slice<Block> swa_blocks = sequence.kv_state().blocks(BlockType::SWA);
+  for (size_t index = 0; index < swa_blocks.size(); ++index) {
+    EXPECT_EQ(swa_blocks[index].ref_count(), index >= 1 ? 2u : 1u);
   }
   for (const Block& block : sequence.kv_state().blocks(BlockType::LINEAR)) {
     EXPECT_EQ(block.ref_count(), 2u);
@@ -119,12 +118,12 @@ TEST_F(SequenceInflightBlocksTest, MixedTypesRetainTheirOwnRangesAndSlots) {
 
   sequence.reset();
   EXPECT_EQ(kv.num_used_blocks(), 2u);
-  EXPECT_EQ(compressed.num_used_blocks(), 3u);
+  EXPECT_EQ(swa.num_used_blocks(), 3u);
   EXPECT_EQ(linear.num_used_blocks(), 2u);
   EXPECT_EQ(embedding.num_used_blocks(), 1u);
   retained.clear();
   EXPECT_EQ(kv.num_used_blocks(), 0u);
-  EXPECT_EQ(compressed.num_used_blocks(), 0u);
+  EXPECT_EQ(swa.num_used_blocks(), 0u);
   EXPECT_EQ(linear.num_used_blocks(), 0u);
   EXPECT_EQ(embedding.num_used_blocks(), 0u);
 }
@@ -137,16 +136,13 @@ TEST_F(SequenceInflightBlocksTest, PrefillRetainsTailFromCachedTokens) {
     size_t ratio;
   };
   const std::vector<CacheType> types = {{BlockType::KV, 1},
-                                        {BlockType::SWA, 1},
-                                        {BlockType::C1, 1},
-                                        {BlockType::C2, 2},
-                                        {BlockType::C4, 4},
-                                        {BlockType::C128, 128}};
+                                        {BlockType::SWA, 1}};
   for (const CacheType& cache : types) {
     const size_t block_size = 4 * cache.ratio;
     BlockManager::Options options;
     options.num_blocks(8)
         .block_size(static_cast<int32_t>(block_size))
+        .swa_block_size(static_cast<int32_t>(block_size))
         .block_type(cache.type)
         .enable_prefix_cache(false);
     BlockManagerImpl manager(options);
@@ -258,6 +254,7 @@ TEST_F(SequenceInflightBlocksTest, SwaSelectsTailUsingAbsoluteBlockIndices) {
   BlockManager::Options options;
   options.num_blocks(8)
       .block_size(4)
+      .swa_block_size(4)
       .block_type(BlockType::SWA)
       .enable_prefix_cache(false);
   BlockManagerImpl manager(options);

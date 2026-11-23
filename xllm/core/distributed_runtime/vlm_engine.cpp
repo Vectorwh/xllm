@@ -63,21 +63,17 @@ namespace xllm {
 
 std::unique_ptr<KVCacheManager> VLMEngine::make_kv_cache_manager(
     BlockManagerPool::Options& block_options,
-    const ModelArgs& args,
     const runtime::Options& runtime_options,
     const KVCacheCapacity& kv_cache_cap,
     bool has_gdn_state,
     Engine* engine,
     uint32_t dp_size) {
-  return create_kv_cache_manager(
-      block_options,
-      args,
-      runtime_options,
-      kv_cache_cap,
-      has_gdn_state,
-      engine,
-      dp_size,
-      static_cast<int32_t>(kv_cache_cap.block_size()));
+  return create_kv_cache_manager(block_options,
+                                 runtime_options,
+                                 kv_cache_cap,
+                                 has_gdn_state,
+                                 engine,
+                                 dp_size);
 }
 
 VLMEngine::VLMEngine(const runtime::Options& options,
@@ -438,16 +434,12 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_speculative_tokens(options_.num_speculative_tokens())
       .model_id(options_.model_id())
       .server_idx(options_.server_idx())
-      .model_type(args_.model_type())
       .num_embedding_blocks(
           static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
       .instance_is_decode(options_.instance_role() == InstanceRole::DECODE)
       .enable_schedule_overlap(options_.enable_schedule_overlap());
-  configure_dsv4_block_manager_options(args_,
-                                       options,
-                                       kv_cache_cap,
-                                       block_size,
-                                       options_.max_tokens_per_batch());
+  configure_dsv4_block_manager_options(
+      args_, options, kv_cache_cap, options_.max_tokens_per_batch());
   if (enable_state_cache) {
     // The unified state slot pool spans all physical slots [0, N); it can
     // contain GDN state and KPool tail state.
@@ -455,7 +447,7 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
         static_cast<int32_t>(kv_cache_cap.num_linear_state_blocks()));
   }
   kv_cache_manager_ = make_kv_cache_manager(
-      options, args_, options_, kv_cache_cap, has_gdn_state, this, dp_size_);
+      options, options_, kv_cache_cap, has_gdn_state, this, dp_size_);
 
   // A role flag without a PD deployment still runs ordinary local batches.
   // Pass the complete modern shape unchanged to either allocation path.

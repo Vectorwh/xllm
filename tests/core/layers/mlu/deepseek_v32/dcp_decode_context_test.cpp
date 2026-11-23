@@ -29,7 +29,7 @@ namespace {
 
 TEST(DcpDecodeContextTest, LocalizesOnlyOwnedCacheWriteSlots) {
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/1),
+      KVShardLayout(/*physical_dim=*/4, /*dcp_size=*/2, /*dcp_rank=*/1),
       /*dcp_group=*/nullptr);
   torch::Tensor global_slots = torch::tensor({-1, 0, 3, 4, 7, 8, 12});
 
@@ -55,7 +55,7 @@ TEST(DcpDecodeContextTest, PacksTopkAcrossTopologiesAndEmptyRows) {
         torch::TensorOptions().dtype(torch::kInt32).device(device);
     const DcpDecodeContext context(
         KVShardLayout(
-            /*physical_block_size=*/4, /*dcp_size=*/2, /*dcp_rank=*/0),
+            /*physical_dim=*/4, /*dcp_size=*/2, /*dcp_rank=*/0),
         /*dcp_group=*/nullptr);
     DsaTopkState global_state(
         torch::tensor({{4, 0, 8, 1, 12}, {5, 6, 7, 2, 3}}, options),
@@ -78,7 +78,7 @@ TEST(DcpDecodeContextTest, PacksTopkAcrossTopologiesAndEmptyRows) {
         torch::TensorOptions().dtype(torch::kInt32).device(device);
     const DcpDecodeContext context(
         KVShardLayout(
-            /*physical_block_size=*/4, /*dcp_size=*/1, /*dcp_rank=*/0),
+            /*physical_dim=*/4, /*dcp_size=*/1, /*dcp_rank=*/0),
         /*dcp_group=*/nullptr);
     DsaTopkState global_state(torch::tensor({{7, 3, 9, 11}}, options),
                               torch::tensor({2}, options));

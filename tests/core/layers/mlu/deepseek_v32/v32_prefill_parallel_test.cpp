@@ -1878,7 +1878,7 @@ void run_packed_chain(int32_t rank, int32_t port) {
                                     "127.0.0.1",
                                     device.unwrap());
   const int32_t shard_rank = groups.cp->rank();
-  DcpDecodeContext dcp(KVShardLayout(/*physical_block_size=*/16,
+  DcpDecodeContext dcp(KVShardLayout(/*physical_dim=*/16,
                                      /*dcp_size=*/4,
                                      shard_rank),
                        groups.cp.get());

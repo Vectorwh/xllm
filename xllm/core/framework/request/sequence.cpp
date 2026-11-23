@@ -1094,26 +1094,15 @@ std::vector<Block> Sequence::get_inflight_blocks() const {
   retained.reserve(kv_state_.blocks().size());
   for (const auto& [type, blocks] : kv_state_.blocks()) {
     size_t first_block = 0;
-    switch (type) {
-      case BlockType::KV:
-      case BlockType::SWA:
-      case BlockType::C1:
-      case BlockType::C2:
-      case BlockType::C4:
-      case BlockType::C128: {
-        const auto owned_block =
-            std::find_if(blocks.begin(), blocks.end(), [](const Block& block) {
-              return block.is_valid() && block.manager() != nullptr;
-            });
-        if (owned_block == blocks.end()) {
-          continue;
-        }
-        first_block = token_begin / owned_block->size();
-        break;
+    if (type == BlockType::KV || type == BlockType::SWA) {
+      const auto owned_block =
+          std::find_if(blocks.begin(), blocks.end(), [](const Block& block) {
+            return block.is_valid() && block.manager() != nullptr;
+          });
+      if (owned_block == blocks.end()) {
+        continue;
       }
-      case BlockType::LINEAR:
-      case BlockType::EMBEDDING:
-        break;
+      first_block = token_begin / owned_block->size();
     }
     for (size_t block_index = first_block; block_index < blocks.size();
          ++block_index) {
@@ -1204,8 +1193,8 @@ void Sequence::update_block_hashes(uint32_t block_size,
     block_hashes_by_stride_.clear();
     hash_type_ = hasher_type;
   }
-  // DSV4 admission probes SWA / C4 / C128 back-to-back with different strides
-  // (base / 4*base / 128*base). Each stride keeps its own chain in
+  // Admission can probe KV and SWA with different block sizes.
+  // Each stride keeps its own chain in
   // `block_hashes_by_stride_`, so switching strides extends that stride's chain
   // incrementally instead of discarding and rebuilding the whole prompt chain
   // every probe.

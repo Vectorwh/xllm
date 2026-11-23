@@ -35,41 +35,41 @@ class KVShardLayout:
 
     def __init__(
         self,
-        physical_block_size: int,
+        physical_dim: int,
         dcp_size: int,
         dcp_rank: int,
     ) -> None:
-        if physical_block_size <= 0:
-            raise ValueError(f"physical_block_size must be positive, got {physical_block_size}")
+        if physical_dim <= 0:
+            raise ValueError(f"physical_dim must be positive, got {physical_dim}")
         if dcp_size <= 0:
             raise ValueError(f"dcp_size must be positive, got {dcp_size}")
         if dcp_rank < 0 or dcp_rank >= dcp_size:
             raise ValueError(
                 f"dcp_rank must satisfy 0 <= dcp_rank < dcp_size, got dcp_rank={dcp_rank}, dcp_size={dcp_size}"
             )
-        self.physical_block_size = physical_block_size
+        self.physical_dim = physical_dim
         self.dcp_size = dcp_size
         self.dcp_rank = dcp_rank
 
     @property
-    def logical_block_size(self) -> int:
-        return self.physical_block_size * self.dcp_size
+    def block_size(self) -> int:
+        return self.physical_dim * self.dcp_size
 
     def local_token_count(self, global_token_count: int) -> int:
         """Return the tokens owned by this rank in one logical sequence."""
         token_count = max(int(global_token_count), 0)
-        full_blocks, remainder = divmod(token_count, self.logical_block_size)
-        rank_start = self.dcp_rank * self.physical_block_size
+        full_blocks, remainder = divmod(token_count, self.block_size)
+        rank_start = self.dcp_rank * self.physical_dim
         owned_remainder = min(
             max(remainder - rank_start, 0),
-            self.physical_block_size,
+            self.physical_dim,
         )
-        return full_blocks * self.physical_block_size + owned_remainder
+        return full_blocks * self.physical_dim + owned_remainder
 
     def local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         seq_lens = seq_lens.clamp_min(0)
-        logical = self.logical_block_size
-        physical = self.physical_block_size
+        logical = self.block_size
+        physical = self.physical_dim
         full_blocks = torch.div(seq_lens, logical, rounding_mode="floor")
         remainder = torch.remainder(seq_lens, logical)
         rank_start = self.dcp_rank * physical
@@ -79,20 +79,20 @@ class KVShardLayout:
     def localize_slots(self, logical_slots: torch.Tensor) -> torch.Tensor:
         valid_slots = logical_slots >= 0
         safe_slots = logical_slots.clamp_min(0)
-        logical_offsets = torch.remainder(safe_slots, self.logical_block_size)
+        logical_offsets = torch.remainder(safe_slots, self.block_size)
         owner_ranks = torch.div(
             logical_offsets,
-            self.physical_block_size,
+            self.physical_dim,
             rounding_mode="floor",
         )
         owned_slots = valid_slots & (owner_ranks == self.dcp_rank)
         logical_block_ids = torch.div(
             safe_slots,
-            self.logical_block_size,
+            self.block_size,
             rounding_mode="floor",
         )
-        local_offsets = torch.remainder(logical_offsets, self.physical_block_size)
-        local_slots = logical_block_ids * self.physical_block_size + local_offsets
+        local_offsets = torch.remainder(logical_offsets, self.physical_dim)
+        local_slots = logical_block_ids * self.physical_dim + local_offsets
         return torch.where(
             owned_slots,
             local_slots,
@@ -211,7 +211,7 @@ def replicate_pool_write_block_table(
     # -1 matches expand_indexer_block_table's fill). Reuse the authority
     # implementation that _materialized_block_table already consumes
     # instead of keeping a second copy of the group-layout invariant.
-    return KVShardLayout(physical_block_size=1, dcp_size=dcp_size, dcp_rank=0).expand_indexer_block_table(block_table)
+    return KVShardLayout(physical_dim=1, dcp_size=dcp_size, dcp_rank=0).expand_indexer_block_table(block_table)
 
 
 def localize_index_write_slots(

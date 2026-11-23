@@ -1238,6 +1238,33 @@ def test_fill_entry_refreshes_mega_moe_mask_in_place(dp_size: int) -> None:
             assert entry.static_metadata.mega_moe_token_mask.data_ptr() == data_ptr
 
 
+@pytest.mark.parametrize("ratios", [[4, 128], [1, 2], [2, 1]])
+def test_dsa_graph_normalizes_logical_compressed_table(ratios: list[int]) -> None:
+    if max(ratios) > 2:
+        _, groups = build_cache_specs(ratios, 128, 2)
+    else:
+        _, groups = build_cache_specs_v41(ratios, [0, 1], [], 128, 2)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        SimpleNamespace(page_size=128, is_mla=False, group_infos=groups),
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=32768,
+    )
+    metadata = _metadata(torch.arange(1, dtype=torch.int32))
+    swa = torch.tensor([[3, 4]], dtype=torch.int32)
+    compressed = torch.tensor([[7, 2, 9]], dtype=torch.int32)
+    metadata.multi_block_tables = (swa, compressed)
+    normalized = runner._normalize_dsa_metadata(metadata)
+    assert len(normalized.multi_block_tables) == 2
+    assert normalized.multi_block_tables[1] is compressed
+    static = SimpleNamespace(
+        multi_block_tables=tuple(torch.zeros_like(table) for table in normalized.multi_block_tables)
+    )
+    runner._fill_dsa_block_tables(static, normalized, swa, 1)
+    assert torch.equal(static.multi_block_tables[1], compressed)
+
+
 def test_dsa_graph_tables_use_compressed_block_counts() -> None:
     _, group_infos = build_cache_specs([1, 4, 128], 128, 3)
     attention_backend = SimpleNamespace(
@@ -1256,7 +1283,7 @@ def test_dsa_graph_tables_use_compressed_block_counts() -> None:
 
     tables = runner._build_static_multi_block_tables(4, torch.device("cpu"))
 
-    assert [tuple(table.shape) for table in tables] == [(4, 256), (4, 16), (4, 16)]
+    assert [tuple(table.shape) for table in tables] == [(4, 256), (4, 16)]
     assert all(torch.all(table == 0) for table in tables)
 
     block_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
@@ -1302,14 +1329,12 @@ def test_dsa_graph_refreshes_every_manager_and_clears_tails(async_graph_inputs: 
         multi_block_tables=(
             torch.full((4, 4), 99, dtype=torch.int32),
             torch.full((4, 2), 99, dtype=torch.int32),
-            torch.full((4, 1), 99, dtype=torch.int32),
         )
     )
     metadata = SimpleNamespace(
         multi_block_tables=(
             torch.tensor([[10, 11], [12, 13]], dtype=torch.int32),
             torch.tensor([[20], [21]], dtype=torch.int32),
-            torch.tensor([[30], [31]], dtype=torch.int32),
         )
     )
 
@@ -1332,7 +1357,6 @@ def test_dsa_graph_refreshes_every_manager_and_clears_tails(async_graph_inputs: 
         [0, 0],
         [0, 0],
     ]
-    assert static_metadata.multi_block_tables[2].tolist() == [[30], [31], [0], [0]]
     if async_graph_inputs:
         for host, device in zip(
             static_metadata.multi_block_tables_host, static_metadata.multi_block_tables, strict=True
@@ -1344,7 +1368,6 @@ def test_dsa_graph_refreshes_every_manager_and_clears_tails(async_graph_inputs: 
     metadata.multi_block_tables = (
         torch.tensor([[40]], dtype=torch.int32),
         torch.tensor([[50]], dtype=torch.int32),
-        torch.tensor([[60]], dtype=torch.int32),
     )
     runner._fill_dsa_block_tables(
         static_metadata,
@@ -1365,7 +1388,6 @@ def test_dsa_graph_refreshes_every_manager_and_clears_tails(async_graph_inputs: 
         [0, 0],
         [0, 0],
     ]
-    assert static_metadata.multi_block_tables[2].tolist() == [[60], [0], [0], [0]]
     if async_graph_inputs:
         for host, device in zip(
             static_metadata.multi_block_tables_host, static_metadata.multi_block_tables, strict=True
@@ -1389,7 +1411,6 @@ def test_dsa_graph_clamps_target_tables_to_draft_groups() -> None:
         multi_block_tables=(
             torch.tensor([[10], [11]], dtype=torch.int32),
             torch.tensor([[20], [21]], dtype=torch.int32),
-            torch.tensor([[30], [31]], dtype=torch.int32),
         )
     )
 
@@ -1474,7 +1495,6 @@ def test_dsa_graph_padding_preserves_scheduler_resolved_swa_slots() -> None:
                 ],
                 dtype=torch.int32,
             ),
-            torch.zeros((4, 4), dtype=torch.int32),
             torch.zeros((4, 4), dtype=torch.int32),
         ],
         kv_seq_lens=[257, 257, 257, 1],
@@ -3333,7 +3353,7 @@ def test_acl_runner_execute_recaptures_after_engram_staging_recovers(
 def test_dsa_graph_swa_capacity_padding_preserves_ring_addresses(ring_blocks: int) -> None:
     """Graph capacity must not turn positions after the ring into block zero."""
     caches_info, group_infos = build_cache_specs_v41(
-        compress_ratios=[0], kv_source_layer_ids=[], index_source_layer_ids=[], window_size=128, n_layers=1
+        compress_ratios=[0], kv_source_layer_ids=[], index_source_layer_ids=[], swa_block_size=128, n_layers=1
     )
     runner = DecodeAclGraphRunner(
         nn.Identity(),
@@ -3384,7 +3404,7 @@ def test_v41_compressor_admits_capacity_wide_graph_swa_table() -> None:
         compress_ratios=[0, 2],
         kv_source_layer_ids=[1],
         index_source_layer_ids=[1],
-        window_size=128,
+        swa_block_size=128,
         n_layers=2,
     )
     runner = DecodeAclGraphRunner(
@@ -3655,8 +3675,8 @@ def test_dsa_derived_tables_skip_intermediate_device_uploads(dummy: bool) -> Non
         supports_draft_to_target_overlap=True,
     )
     runner = DecodeAclGraphRunner(nn.Identity(), backend, torch.device("cpu"), max_batch=4, max_model_len=512)
-    static = SimpleNamespace(multi_block_tables=tuple(torch.full((4, 4), 99, dtype=torch.int32) for _ in groups))
-    tables = tuple(torch.tensor([[10 + idx, 20 + idx]], dtype=torch.int32) for idx in range(len(groups)))
+    static = SimpleNamespace(multi_block_tables=tuple(torch.full((4, 4), 99, dtype=torch.int32) for _ in range(2)))
+    tables = tuple(torch.tensor([[10 + idx, 20 + idx]], dtype=torch.int32) for idx in range(2))
     metadata = SimpleNamespace(multi_block_tables=() if dummy else tables, is_dummy=dummy)
     runner._stage_block_table = lambda *args: pytest.fail("intermediate table was uploaded")
     runner._fill_dsa_block_tables(static, metadata, torch.empty(0, dtype=torch.int32), batch_size=2)

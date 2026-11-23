@@ -438,7 +438,7 @@ TEST(DeepseekV32CPUtilsTest, BuildCPContextDerivesSegmentRowsForDcpMetadata) {
       &fixture_group,
       /*curr_rank=*/0,
       /*world_size=*/2,
-      KVShardLayout(/*physical_block_size=*/2,
+      KVShardLayout(/*physical_dim=*/2,
                     /*dcp_size=*/4,
                     /*dcp_rank=*/0));
 

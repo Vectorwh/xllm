@@ -315,21 +315,6 @@ def _assert_compressor_index_rows(cache: LayerCache, block: int, first: int, row
     torch.testing.assert_close(cache.indexer_scale[block, first:end, 0], scales, atol=0, rtol=0)
 
 
-def _with_ring32_compressor_states(caches: list[LayerCache]) -> list[LayerCache]:
-    """Adapt the shared SWA-sized fixture locally, including device/dtype users."""
-    adapted = []
-    for cache in caches:
-        if cache.compress_kv_state is not None:
-            state_shape = (cache.swa.size(0), _COMPRESSOR_STATE_ROWS, cache.swa.size(-1))
-            cache = replace(
-                cache,
-                compress_kv_state=torch.zeros(state_shape, dtype=torch.float32, device=cache.swa.device),
-                compress_score_state=torch.zeros(state_shape, dtype=torch.float32, device=cache.swa.device),
-            )
-        adapted.append(cache)
-    return adapted
-
-
 @pytest.mark.parametrize("device_name", ["cpu", "npu"])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("prefixes,chunks", [([1, 7], [2, 17]), ([15, 31], [33, 17]), ([31, 1], [1, 2])])
@@ -360,14 +345,12 @@ def test_compressed_cp_chunk_and_decode_match_unsharded(
     q = [torch.randn(n, cfg.n_heads, cfg.head_dim, device=device) for n in ends]
     tables = [torch.arange(1, 1 + batch * 2, dtype=torch.int32, device=device).view(batch, 2)]
     token_table = torch.arange(1, 1 + batch, dtype=torch.int32, device=device).view(batch, 1)
-    tables.extend([token_table, token_table])
+    tables.append(token_table)
     steps = [prefixes, chunks, [1] * batch, [1] * batch, [1] * batch]
     baseline_outputs, baseline_picks, baseline_caches = [], [], []
     for rank in range(-1, cp_size):
         backend = _make_csa2_backend(cfg, device)
-        caches = _with_ring32_compressor_states(
-            _allocate_v41_layer_caches(cfg, batch, torch.float32, device, reserve_token_sink=True)
-        )
+        caches = _allocate_v41_layer_caches(cfg, batch, torch.float32, device, reserve_token_sink=True)
         cache = caches[layer_id]
         for name in ("swa", "key", "indexer_scale", "compress_kv_state", "compress_score_state"):
             getattr(cache, name).fill_(float("nan"))
@@ -453,13 +436,8 @@ class _CompressorHarness:
     ) -> None:
         self.cfg = lm.cfg if ratio is None else replace(lm.cfg, compress_ratios=[0, 0, ratio, ratio, 1, 1])
         self.backend = _make_csa2_backend(self.cfg)
-        caches = _allocate_v41_layer_caches(self.cfg, batch, dtype)
-        self.cache = caches[layer_id]
-        if ring_blocks is not None:
-            swa = torch.zeros(ring_blocks * batch, self.cfg.window_size, self.cfg.head_dim, dtype=dtype)
-            caches[layer_id] = replace(self.cache, swa=swa)
-        # Keep the #503 fixture adaptation in this suite's write set.
-        caches = _with_ring32_compressor_states(caches)
+        swa_options = {} if ring_blocks is None else {"swa_blocks_per_seq": ring_blocks}
+        caches = _allocate_v41_layer_caches(self.cfg, batch, dtype, **swa_options)
         self.cache = caches[layer_id]
         self.backend.bind_kv_caches(caches)
         self.layer = lm.model.layers[layer_id].self_attn
@@ -518,7 +496,7 @@ def test_ratio2_compressor_reads_parked_prefix_before_wrapping(
     positions = torch.arange(prefix, prefix + chunk)
     token_table = torch.tensor([[0]], dtype=torch.int32)
     ctx = Csa2LayerContext(x[1:], torch.randn(chunk, cfg.q_lora_rank).to(dtype), positions, cos_sin)
-    harness.run(ctx, [table, token_table, token_table], [prefix + chunk], [chunk])
+    harness.run(ctx, [table, token_table], [prefix + chunk], [chunk])
     committed = (prefix + chunk) // 2 - prefix // 2
     member_count = committed * 2
     members = kv[:member_count].float().view(committed, 2, cfg.head_dim)
@@ -560,16 +538,11 @@ def test_chunked_model_logits_and_following_decode_match_token_replay(
     torch.manual_seed(101)
     lm = DeepseekV41ForCausalLM(config)
     _random_init_v41(lm)
-    reference = _V41ForwardHarness(lm, config, 2, dtype, device=device)
-    chunked = _V41ForwardHarness(lm, config, 2, dtype, device=device)
-    full = _V41ForwardHarness(lm, config, 2, dtype, device=device)
+    kv_blocks = (prompt_len + 4 + 127) // 128
+    reference = _V41ForwardHarness(lm, config, 2, dtype, device=device, kv_blocks_per_seq=kv_blocks)
+    chunked = _V41ForwardHarness(lm, config, 2, dtype, device=device, kv_blocks_per_seq=kv_blocks)
+    full = _V41ForwardHarness(lm, config, 2, dtype, device=device, kv_blocks_per_seq=kv_blocks)
     for harness in (reference, chunked, full):
-        harness.layer_caches = _with_ring32_compressor_states(harness.layer_caches)
-        # The shared constructor already bound the old fixture. Before any
-        # forward/capture, reopen binding so backend and runners use ring32;
-        # otherwise the executor silently ignores this second bind.
-        harness.executor._kv_bound = False
-        harness.executor.bind_kv_caches(harness.layer_caches)
         for bound, cache in zip(harness.backend._kv_caches, harness.layer_caches):
             assert bound.compress_kv_state is cache.compress_kv_state
             assert bound.compress_score_state is cache.compress_score_state
@@ -862,9 +835,7 @@ def test_dummy_model_forward_keeps_positions_safe_and_caches_inert(
     device = _active_device()
     lm = _make_forward_lm(torch.float32, seed=101, device=device)
     backend = _make_csa2_backend(lm.cfg, device=device, max_model_len=64)
-    caches = _with_ring32_compressor_states(
-        _allocate_v41_layer_caches(lm.cfg, 1, torch.float32, device=device, reserve_token_sink=True)
-    )
+    caches = _allocate_v41_layer_caches(lm.cfg, 1, torch.float32, device=device, reserve_token_sink=True)
     for cache in caches:
         for name in ("swa", "key", "index", "indexer_scale", "compress_kv_state", "compress_score_state"):
             tensor = getattr(cache, name)
@@ -928,9 +899,7 @@ def test_dummy_model_triton_compressor_keeps_ring_states_inert(
     device = _active_device()
     lm = _make_forward_lm(dtype, seed=101, device=device)
     backend = _make_csa2_backend(lm.cfg, device=device, max_model_len=64)
-    caches = _with_ring32_compressor_states(
-        _allocate_v41_layer_caches(lm.cfg, 1, dtype, device=device, reserve_token_sink=True)
-    )
+    caches = _allocate_v41_layer_caches(lm.cfg, 1, dtype, device=device, reserve_token_sink=True)
     before = []
     for cache in caches:
         if cache.compress_kv_state is not None:
@@ -1151,7 +1120,7 @@ def test_compressor_preserves_every_unfinished_tail_member(chunk: int, dtype: to
         end = min(end + chunk, values.size(0))
         positions = torch.arange(start, end)
         ctx = Csa2LayerContext(values[start:end], values[start:end, : cfg.q_lora_rank], positions, harness.cos_sin)
-        harness.run(ctx, [table, token_table, token_table], [end], [end - start], is_prefill=start == 0)
+        harness.run(ctx, [table, token_table], [end], [end - start], is_prefill=start == 0)
         pending = torch.arange(end // ratio * ratio, end)
         if pending.numel():
             slots = _reference_compressor_state_slots(table[0], pending, cfg.window_size)
@@ -1179,8 +1148,8 @@ def test_compressor_skips_zero_query_sequences(layer_id: int, empty_first: bool)
     token_table = torch.tensor([[0], [1]], dtype=torch.int32)
     ctx = Csa2LayerContext(values, values[:, : cfg.q_lora_rank], positions, harness.cos_sin)
     with torch.no_grad():
-        harness.run(ctx, [swa_table, token_table, token_table], q_lens, q_lens, is_prefill=True)
-        reference.run(ctx, [swa_table[:1], token_table[:1], token_table[:1]], [3], [3], is_prefill=True)
+        harness.run(ctx, [swa_table, token_table], q_lens, q_lens, is_prefill=True)
+        reference.run(ctx, [swa_table[:1], token_table[:1]], [3], [3], is_prefill=True)
     for name in ("key", "index", "indexer_scale", "compress_kv_state", "compress_score_state"):
         actual = getattr(cache, name)
         expected = getattr(reference.cache, name)
@@ -1253,9 +1222,10 @@ def test_decode_compressor_batching_preserves_cache_and_ring_order(
     layer_id = 4 if ratio == 1 else 2
     reference = _CompressorHarness(lm, batch=batch, layer_id=layer_id, dtype=dtype)
     captured = _CompressorHarness(lm, batch=batch, layer_id=layer_id, dtype=dtype)
-    tables = [torch.arange(batch * 2, dtype=torch.int32).view(batch, 2)]
-    tables += [torch.arange(batch, dtype=torch.int32).view(batch, 1)] * 2
-    tables = tables[: len(reference.backend._builder.group_infos)]
+    tables = [
+        torch.arange(batch * 2, dtype=torch.int32).view(batch, 2),
+        torch.arange(batch, dtype=torch.int32).view(batch, 1),
+    ]
     if layout in ("verify", "wrap"):
         tables = [table[:1].expand_as(table).contiguous() for table in tables]
     elif layout == "interleaved":
@@ -1318,14 +1288,11 @@ def test_batched_decode_matches_npu_compressor_ring(shared_rows: bool, dtype: to
     layer = lm.model.layers[2].self_attn
     backends = [_make_csa2_backend(lm.cfg, device=device) for _ in range(2)]
     caches = [
-        _with_ring32_compressor_states(
-            _allocate_v41_layer_caches(lm.cfg, batch, dtype, device=device, reserve_token_sink=True)
-        )
-        for _ in backends
+        _allocate_v41_layer_caches(lm.cfg, batch, dtype, device=device, reserve_token_sink=True) for _ in backends
     ]
     for backend, planes in zip(backends, caches, strict=True):
         backend.bind_kv_caches(planes)
-    tables = [torch.arange(1, batch + 1, device=device, dtype=torch.int32).unsqueeze(1)] * 3
+    tables = [torch.arange(1, batch + 1, device=device, dtype=torch.int32).unsqueeze(1)] * 2
     if shared_rows:
         tables = [table[:1].expand_as(table).contiguous() for table in tables]
     for step in range(3):

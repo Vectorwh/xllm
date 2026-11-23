@@ -42,6 +42,8 @@ class BlockManagerPool : public KVCacheManager {
     // legacy flat-KV behavior and uses host_num_blocks for BlockType::KV.
     PROPERTY(HostBlockCounts, host_num_blocks_by_type) = {};
     PROPERTY(int32_t, block_size) = 0;
+    // SWA has an independent block size.
+    PROPERTY(int32_t, swa_block_size) = 0;
     PROPERTY(bool, enable_linear_state) = false;
     // Total physical state slots [0, N) for the unified GDN/KPool slot pool
     // (= num_linear_state_blocks). Only used when enable_linear_state is true.
@@ -63,10 +65,6 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(std::string, model_id);    // Model ID for multi-model support
     PROPERTY(int64_t, server_idx) = 0;
     PROPERTY(bool, is_draft_engine) = false;
-    // Model type of the owning engine (e.g. "deepseek_v41"), forwarded to
-    // BlockManager::Options so build_composite_leaves can pick composite
-    // behavior by explicit identity rather than inferring it from ratios.
-    PROPERTY(std::string, model_type);
     // Token-level sliding window size for CompositeBlockManager.
     PROPERTY(uint32_t, sliding_window_size) = 0;
     // Base SWA/cache-state block rows retained per sequence.
@@ -74,13 +72,10 @@ class BlockManagerPool : public KVCacheManager {
     // Total physical SWA rows. This is computed by the KV cache estimator and
     // shared with the device tensor shape to keep both id spaces identical.
     PROPERTY(uint32_t, swa_num_blocks) = 0;
-    PROPERTY(uint32_t, c4_num_blocks) = 0;
-    PROPERTY(uint32_t, c128_num_blocks) = 0;
     // Scheduler token budget used to size the shared SWA burst pool.
     PROPERTY(uint32_t, max_tokens_per_batch) = 0;
     // For CompositeBlockManager.
     PROPERTY(std::vector<uint32_t>, manager_types) = {};
-    PROPERTY(std::vector<uint32_t>, compress_ratios) = {};
     PROPERTY(uint32_t, max_seqs_per_batch) = 0;
     // Hasher type bound to the engine (TEXT for LLM, MM for VLM).
     PROPERTY(BlockHasherType, hasher_type) = BlockHasherType::TEXT;

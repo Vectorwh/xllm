@@ -50,10 +50,10 @@ runtime::DecodeGraphWarmupConfig build_decode_graph_warmup_config(
     const runtime::Options& options);
 
 // Configures `options` for the DeepSeek-V4 family (V4 and V4.1): DeepSeek-V4
-// serves its compressed KV through a composite block manager (SWA + one TOKEN
-// manager per kv-source compress ratio) plus the sliding-window pool sizing
+// serves its compressed KV through a composite block manager (SWA + one unified
+// KV manager) plus the sliding-window pool sizing
 // derived from `kv_cache_cap`. Without this, a plain single-KV pool is built,
-// the sequence never owns composite (C1/C2/C4/C128) blocks,
+// the sequence never owns composite (SWA/KV) blocks,
 // `multi_block_tables` stays empty, and the DSA attention loses its block
 // tables -> garbage output even for pure-text requests.
 //
@@ -63,7 +63,6 @@ runtime::DecodeGraphWarmupConfig build_decode_graph_warmup_config(
 void configure_dsv4_block_manager_options(const ModelArgs& args,
                                           BlockManagerPool::Options& options,
                                           const KVCacheCapacity& kv_cache_cap,
-                                          int32_t block_size,
                                           int32_t max_tokens_per_batch);
 
 // Full DP-local worker group, checked against the actual client count.
@@ -94,17 +93,13 @@ HostCacheValidationOptions build_host_cache_validation_options(
     const KVCacheCapacity& kv_cache_cap,
     int32_t kv_split_size_eff);
 
-// Keeps caller-prepared flat capacities and the LLM MTP-draft policy.
-// grouped_block_size is the physical worker tensor width for both engines.
-// It must not use block_options.block_size(), which can be kv-split folded.
+// Keeps caller-prepared flat capacities and the MTP-draft policy.
 std::unique_ptr<KVCacheManager> create_kv_cache_manager(
     BlockManagerPool::Options& block_options,
-    const ModelArgs& args,
     const runtime::Options& runtime_options,
     const KVCacheCapacity& kv_cache_cap,
     bool has_gdn_state,
     Engine* engine,
-    uint32_t dp_size,
-    int32_t grouped_block_size);
+    uint32_t dp_size);
 
 }  // namespace xllm

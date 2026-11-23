@@ -29,7 +29,7 @@ from xllm.python.attention.kv_shard_layout import (
 
 def test_localize_slots_does_not_rewrite_worker_logical_slots() -> None:
     layout = KVShardLayout(
-        physical_block_size=4,
+        physical_dim=4,
         dcp_size=2,
         dcp_rank=1,
     )
@@ -44,7 +44,7 @@ def test_localize_slots_does_not_rewrite_worker_logical_slots() -> None:
 
 def test_local_seq_lens_are_derived_from_global_kv_seq_lens() -> None:
     layout = KVShardLayout(
-        physical_block_size=4,
+        physical_dim=4,
         dcp_size=2,
         dcp_rank=1,
     )
@@ -58,7 +58,7 @@ def test_local_seq_lens_are_derived_from_global_kv_seq_lens() -> None:
 
 def test_indexer_reads_expanded_logical_block_table() -> None:
     layout = KVShardLayout(
-        physical_block_size=4,
+        physical_dim=4,
         dcp_size=2,
         dcp_rank=0,
     )
@@ -72,7 +72,7 @@ def test_indexer_reads_expanded_logical_block_table() -> None:
 
 def test_pack_owned_slots_drops_foreign_and_invalid_slots() -> None:
     layout = KVShardLayout(
-        physical_block_size=4,
+        physical_dim=4,
         dcp_size=2,
         dcp_rank=1,
     )
@@ -96,7 +96,7 @@ def test_pack_owned_slots_keeps_kpool_tail_inside_the_valid_run() -> None:
     would be dropped.
     """
     layout = KVShardLayout(
-        physical_block_size=128,
+        physical_dim=128,
         dcp_size=4,
         dcp_rank=0,
     )
@@ -117,7 +117,7 @@ def test_pack_owned_slots_keeps_kpool_tail_inside_the_valid_run() -> None:
 
 def test_graph_padded_zero_block_expands_to_valid_indexer_pages() -> None:
     layout = KVShardLayout(
-        physical_block_size=128,
+        physical_dim=128,
         dcp_size=4,
         dcp_rank=0,
     )
@@ -133,7 +133,7 @@ def test_graph_padded_zero_block_expands_to_valid_indexer_pages() -> None:
 
 @pytest.mark.parametrize("split", [1, 2, 4])
 def test_indexer_page_bounds(split: int) -> None:
-    layout = KVShardLayout(physical_block_size=4, dcp_size=split, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=4, dcp_size=split, dcp_rank=0)
     logical_blocks = torch.arange(16, dtype=torch.int32).reshape(1, -1)
     pages = layout.expand_indexer_block_table(logical_blocks)
     assert torch.equal(pages, torch.arange(16 * split, dtype=torch.int32).reshape(1, -1))

@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/types.h"
 #include "framework/block/block.h"
+#include "framework/kv_cache/host_cache_plan.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/host_transfer/transfer.h"
@@ -41,8 +42,6 @@ class KVCacheStore;
 
 class HierarchyKVCacheTransfer final {
  public:
-  using GroupedCaches = std::map<BlockType, std::vector<KVCache*>>;
-  using HostGroupedCaches = std::map<BlockType, std::unique_ptr<KVCache>>;
   using CacheHandle = uint32_t;
 
   enum class CacheRole : uint8_t {
@@ -121,18 +120,16 @@ class HierarchyKVCacheTransfer final {
     std::vector<KVCache>* device_kv_caches = nullptr;
     KVCacheShape kv_cache_shape;
     KVCacheCreateOptions create_options;
-    GroupedCaches device_caches_by_type;
-    std::map<BlockType, std::vector<int64_t>> layer_ids_by_type;
-    HostGroupedCaches host_caches_by_type;
+    HostCachePlan host_plan;
+    std::map<int32_t, BlockType> group_resources;
+    std::vector<HostPageAlignedRegion> host_regions;
     std::unique_ptr<HostKVLayout> host_layout;
     const Stream* producer_stream = nullptr;
     std::string store_key_component;
   };
 
-  static int32_t domain_group_id(CacheHandle handle, BlockType block_type);
-  GroupedCaches build_device_groups(CacheDomain* domain) const;
-  void create_host_cache(CacheDomain* domain);
-  HostKVLayout create_host_kv_layout(const CacheDomain& domain) const;
+  HostKVLayout create_host_kv_layout(CacheDomain* domain,
+                                     int32_t* next_group_id) const;
   HostKVRequest make_request(
       const std::vector<BlockTransferInfo>& block_transfer_info,
       TransferType transfer_type) const;

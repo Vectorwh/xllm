@@ -127,9 +127,11 @@ BlockTypeTensorMap LinearAttentionKVCacheImpl::get_block_type_tensors(
   BlockTypeTensorMap tensor_map = get_block_type_tensors(type);
   auto conv_it = tensor_map.find(KVCacheTensorRole::CONV);
   auto ssm_it = tensor_map.find(KVCacheTensorRole::SSM);
-  if (conv_it == tensor_map.end() || ssm_it == tensor_map.end()) {
+  if (tensor_map.empty()) {
     return tensor_map;
   }
+  CHECK(conv_it != tensor_map.end() && ssm_it != tensor_map.end())
+      << "LINEAR Host transfer requires both Conv and SSM cache tensors.";
 
   constexpr int64_t kCommittedConvRows = 3;
   CHECK_GT(conv_it->second.dim(), KVCacheShape::kConvHistoryAxis);

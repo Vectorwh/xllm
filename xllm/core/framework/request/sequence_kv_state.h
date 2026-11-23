@@ -52,11 +52,10 @@ class KVCacheState {
   // Number of blocks held under `type`.
   size_t num_blocks(BlockType type) const;
   // True if the sequence holds any cache-bearing blocks. Flat attention models
-  // hold KV; grouped-cache models hold KV plus one grouped triple each -- V4's
-  // SWA / C4 / C128 or V4.1's SWA / C2 / C1. Excludes EMBEDDING, which is a
-  // per-sequence resource, not token cache. Used to decide whether an
-  // allocation that started from an empty sequence should be fully rolled back
-  // on failure (vs. a grow on an already-populated seq).
+  // hold KV; grouped-cache models hold SWA / KV. Excludes EMBEDDING,
+  // which is a per-sequence resource, not token cache. Used to decide whether
+  // an allocation that started from an empty sequence should be fully rolled
+  // back on failure (vs. a grow on an already-populated seq).
   bool has_any_blocks() const;
 
   // True after this cache tier has completed its prefix-cache probe.  This is
@@ -139,13 +138,11 @@ class KVCacheState {
 
   bool need_swap() const { return need_swap_; }
 
-  // Groups exported to the worker's multi_block_tables, in the fixed
-  // kMultiBlockExportOrder. Each pair is (type, &blocks); only types currently
-  // present in the map are returned. Empty for the flat KV path.
+  // Nonempty token-cache tables exported in fixed SWA/KV order. Empty for
+  // the flat KV path.
   std::vector<std::pair<BlockType, const std::vector<Block>*>>
   multi_block_export_view() const;
-  // True when this sequence holds any multi_block_tables-exported group
-  // (V4: SWA / C4 / C128; V4.1: SWA / C2 / C1).
+  // True when the sequence holds SWA blocks and uses multi-table export.
   bool has_multi_block_export() const;
 
   // Per-sequence embedding-row block (BlockType::EMBEDDING): returns the
@@ -186,15 +183,14 @@ class KVCacheState {
   bool prefix_cache_matched_ = false;
 
   // KV cache blocks keyed by cache role. The flat attention KV lives under
-  // BlockType::KV; the grouped-cache models keep their triples here -- V4 under
-  // SWA / C4 / C128 and V4.1 under SWA / C2 / C1; the per-sequence
-  // embedding-row slot lives under BlockType::EMBEDDING and the GDN recurrent
-  // slot under BlockType::LINEAR. std::map
-  // keeps deterministic iteration for reset / dealloc / debugging, but worker
-  // export order is governed by kMultiBlockExportOrder, not by map order.
+  // BlockType::KV; grouped-cache models use SWA / KV; the
+  // per-sequence embedding-row slot lives under BlockType::EMBEDDING and the
+  // GDN recurrent slot under BlockType::LINEAR. std::map keeps deterministic
+  // iteration for reset / dealloc / debugging, but worker export order is
+  // governed by the initialization binding, not by map order.
   std::map<BlockType, std::vector<Block>> composite_blocks_;
 
-  // Logical block size is layout metadata, not Block ownership state. Host
+  // Block size is layout metadata, not Block ownership state. Host
   // offload moves physical Block handles into an asynchronous queue and leaves
   // invalid placeholders behind, so capacity calculations cannot read size()
   // from the first current handle.

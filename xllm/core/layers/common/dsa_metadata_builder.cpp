@@ -178,7 +178,7 @@ void DSAMetadataBuilder::build_dsa_fields(
         active_multi_block_tables[0].dim() == 2 &&
         active_multi_block_tables[0].size(0) > 1 &&
         static_cast<size_t>(active_multi_block_tables[0].size(0)) <=
-            group_infos.size()) {
+            static_cast<size_t>(dsa_block_table_count(group_infos))) {
       const auto packed = active_multi_block_tables[0].contiguous();
       std::vector<torch::Tensor> unpacked_tables;
       unpacked_tables.reserve(packed.size(0));
@@ -194,13 +194,27 @@ void DSAMetadataBuilder::build_dsa_fields(
           << manager_num;
     }
 
+    CHECK_EQ(active_multi_block_tables.size(),
+             static_cast<size_t>(dsa_block_table_count(group_infos)))
+        << "DSA logical block table count does not match model bindings";
+    for (const torch::Tensor& table : active_multi_block_tables) {
+      CHECK(table.defined() && table.dim() == 2)
+          << "DSA logical block tables must be two-dimensional";
+      const int64_t required_rows =
+          is_acl_graph ? params.meta.actual_num_sequences : batch_size;
+      CHECK_GE(table.size(0), required_rows)
+          << "DSA logical block table has fewer rows than the request batch";
+      for (int64_t row = table.size(0); row < batch_size; ++row) {
+        CHECK_EQ(params.attention.host.kv_seq_lens[row], 0)
+            << "Missing DSA block table rows must be graph padding";
+        CHECK_EQ(q_lens_vec[row], 0)
+            << "Missing DSA block table rows must not produce cache writes";
+      }
+    }
     CHECK_EQ(batch_size,
              static_cast<int32_t>(params.attention.host.kv_seq_lens.size()))
         << "DSAMetadataBuilder: batch_size mismatch with kv_seq_lens_vec size.";
-    CHECK_LE(manager_num, static_cast<int32_t>(group_infos.size()))
-        << "DSAMetadataBuilder: manager_num(" << manager_num
-        << ") exceeds group_infos size(" << group_infos.size()
-        << "), cannot align manager/group mapping.";
+    const int32_t group_count = static_cast<int32_t>(group_infos.size());
     int32_t graph_block_table_capacity_cols = 0;
     if (is_acl_graph && params.attention.device.block_tables.defined() &&
         params.attention.device.block_tables.dim() == 2) {
@@ -208,7 +222,7 @@ void DSAMetadataBuilder::build_dsa_fields(
           static_cast<int32_t>(params.attention.device.block_tables.size(1));
     }
     if (is_acl_graph && graph_block_table_capacity_cols > 0) {
-      for (int32_t m = 0; m < manager_num; ++m) {
+      for (size_t m = 0; m < active_multi_block_tables.size(); ++m) {
         const auto& block_table = active_multi_block_tables[m];
         CHECK(block_table.defined() && block_table.dim() == 2)
             << "DSAMetadataBuilder: ACL graph multi_block_tables manager " << m
@@ -229,20 +243,21 @@ void DSAMetadataBuilder::build_dsa_fields(
       total_tokens += len;
     }
 
-    std::vector<torch::Tensor> proc_slots(manager_num);
-    std::vector<torch::Tensor> proc_bt(manager_num);
-    for (int32_t m = 0; m < manager_num; ++m) {
-      process_group(active_multi_block_tables[m],
-                    group_infos[m],
-                    ctx_lens,
-                    q_lens_vec,
-                    params.attention.host.new_cache_slots,
-                    batch_size,
-                    total_tokens,
-                    graph_slot_capacity,
-                    graph_block_table_capacity_cols,
-                    proc_bt[m],
-                    proc_slots[m]);
+    std::vector<torch::Tensor> proc_slots(group_count);
+    std::vector<torch::Tensor> proc_bt(group_count);
+    for (int32_t m = 0; m < group_count; ++m) {
+      process_group(
+          active_multi_block_tables[static_cast<int32_t>(group_infos[m].type)],
+          group_infos[m],
+          ctx_lens,
+          q_lens_vec,
+          params.attention.host.new_cache_slots,
+          batch_size,
+          total_tokens,
+          graph_slot_capacity,
+          graph_block_table_capacity_cols,
+          proc_bt[m],
+          proc_slots[m]);
     }
 
     // Keep expanded metadata on host. DeepSeek V4 packs these small tensors
@@ -257,7 +272,7 @@ void DSAMetadataBuilder::build_dsa_fields(
       dsa.slot_mappings[lid].resize(lci.size());
       for (size_t ci = 0; ci < lci.size(); ++ci) {
         int32_t gid = lci[ci].group_id;
-        if (gid < manager_num) {
+        if (gid < group_count) {
           dsa.block_tables[lid][ci] = proc_bt[gid];
           dsa.slot_mappings[lid][ci] = proc_slots[gid];
         }
@@ -275,7 +290,7 @@ torch::Tensor DSAMetadataBuilder::expand_blocks_to_slots(
     const std::vector<int32_t>& ctx_lens,
     int32_t batch_size,
     int64_t total_tokens) {
-  const int32_t bs = gi.block_size;
+  const int32_t physical_dim = gi.physical_dim;
   auto slots = torch::full({total_tokens}, -1, torch::kInt32);
   auto slots_acc = slots.accessor<int32_t, 1>();
   auto bt_acc = block_table.accessor<int32_t, 2>();
@@ -297,9 +312,9 @@ torch::Tensor DSAMetadataBuilder::expand_blocks_to_slots(
     for (int32_t blk = 0; blk < max_blocks && filled < slot_num; ++blk) {
       int32_t block_id = bt_acc[seq][blk];
       if (block_id < 0) break;
-      for (int32_t off = 0; off < bs && filled < slot_num; ++off) {
-        slots_acc[start_idx + filled] =
-            static_cast<int32_t>(static_cast<int64_t>(block_id) * bs + off);
+      for (int32_t off = 0; off < physical_dim && filled < slot_num; ++off) {
+        slots_acc[start_idx + filled] = static_cast<int32_t>(
+            static_cast<int64_t>(block_id) * physical_dim + off);
         ++filled;
       }
     }
@@ -314,12 +329,12 @@ int64_t DSAMetadataBuilder::compute_slot_num(const DSAGroupInfo& gi,
     return token_len / gi.ratio;
   }
   // SLIDING_WINDOW
-  const int32_t bs = gi.block_size;
-  if (token_len > bs) {
-    return token_len % bs + bs;
+  const int32_t block_size = gi.physical_dim;
+  if (token_len > block_size) {
+    return token_len % block_size + block_size;
   }
-  int64_t n = token_len % bs;
-  return (n == 0 && token_len > 0) ? bs : n;
+  int64_t n = token_len % block_size;
+  return (n == 0 && token_len > 0) ? block_size : n;
 }
 
 void DSAMetadataBuilder::process_group(
@@ -337,7 +352,7 @@ void DSAMetadataBuilder::process_group(
   if (gi.type == DSACacheType::TOKEN) {
     process_token_group(raw_bt,
                         gi.ratio,
-                        gi.block_size,
+                        gi.physical_dim,
                         ctx_lens,
                         q_lens,
                         batch_size,
@@ -348,7 +363,7 @@ void DSAMetadataBuilder::process_group(
                         out_slots);
   } else if (gi.type == DSACacheType::SLIDING_WINDOW) {
     process_swa_group(raw_bt,
-                      gi.block_size,
+                      gi.physical_dim,
                       ctx_lens,
                       q_lens,
                       new_cache_slots,
@@ -369,7 +384,7 @@ void DSAMetadataBuilder::process_group(
 void DSAMetadataBuilder::process_token_group(
     const torch::Tensor& raw_bt,
     int32_t ratio,
-    int32_t block_size,
+    int32_t physical_dim,
     const std::vector<int32_t>& ctx_lens,
     const std::vector<int32_t>& q_lens,
     int32_t batch_size,
@@ -385,8 +400,8 @@ void DSAMetadataBuilder::process_token_group(
       << "process_token_group requires q_lens.size == batch_size, got "
       << q_lens.size() << " vs " << batch_size;
   CHECK_GT(ratio, 0) << "process_token_group requires ratio > 0, got " << ratio;
-  CHECK_GT(block_size, 0) << "process_token_group requires block_size > 0, got "
-                          << block_size;
+  CHECK_GT(physical_dim, 0)
+      << "process_token_group requires physical_dim > 0, got " << physical_dim;
   CHECK_EQ(raw_bt.dim(), 2)
       << "process_token_group requires raw_bt dim == 2, got " << raw_bt.dim();
 
@@ -417,14 +432,14 @@ void DSAMetadataBuilder::process_token_group(
   auto out_slots_acc = out_slots_tensor.accessor<int32_t, 1>();
   auto raw_bt_acc = raw_bt.accessor<int32_t, 2>();
   const int64_t semantic_cols = raw_bt.size(1);
-  const int64_t block_size_i64 = static_cast<int64_t>(block_size);
+  const int64_t physical_dim_i64 = static_cast<int64_t>(physical_dim);
 
   auto slot_for_compressed_index = [&](int32_t seq,
                                        int64_t compressed_idx) -> int32_t {
     if (seq >= raw_bt.size(0) || semantic_cols <= 0) {
       return -1;
     }
-    const int64_t block_idx = compressed_idx / block_size_i64;
+    const int64_t block_idx = compressed_idx / physical_dim_i64;
     if (block_idx >= semantic_cols) {
       return -1;
     }
@@ -432,9 +447,9 @@ void DSAMetadataBuilder::process_token_group(
     if (block_id < 0) {
       return -1;
     }
-    const int64_t block_offset = compressed_idx % block_size_i64;
+    const int64_t block_offset = compressed_idx % physical_dim_i64;
     return static_cast<int32_t>(
-        static_cast<int64_t>(block_id) * block_size_i64 + block_offset);
+        static_cast<int64_t>(block_id) * physical_dim_i64 + block_offset);
   };
 
   int64_t write_idx = 0;

@@ -361,7 +361,7 @@ TEST(DeepseekV41GraphTest, FusedIndexerMatchesIndependentRequests) {
         input.meta.num_sequences = 3;
         input.attention.host.q_seq_lens = {
             0, counts[0], counts[0], counts[0] + counts[2]};
-        input.multi_block_tables = {table, table, table};
+        input.multi_block_tables = {table, table};
         Csa2Context shared;
         shared.topk.resize(3);
         shared.candidates.resize(3);
@@ -388,7 +388,6 @@ TEST(DeepseekV41GraphTest, FusedIndexerMatchesIndependentRequests) {
           single.meta.batch_forward_type = input.meta.batch_forward_type;
           single.attention.host.q_seq_lens = {0, counts[seq]};
           single.multi_block_tables = {table.slice(0, seq, seq + 1),
-                                       table.slice(0, seq, seq + 1),
                                        table.slice(0, seq, seq + 1)};
           Csa2Context reference_shared;
           reference_shared.topk.resize(1);
@@ -871,16 +870,18 @@ TEST(DeepseekV41GatherDeathTest, RejectsCpuBuffersBeforeKernelLaunch) {
                torch::empty({2, 512}, options),
                torch::zeros({1}, options.dtype(torch::kInt32))});
           arguments[index] = arguments[index].cpu();
-          kernel::mlu::bangc::deepseek_v41_decode_gather(arguments[0],
-                                                         arguments[1],
-                                                         arguments[2],
-                                                         arguments[3],
-                                                         arguments[4],
-                                                         arguments[5],
-                                                         /*position=*/0,
-                                                         /*window=*/1,
-                                                         arguments[6],
-                                                         arguments[7]);
+          kernel::mlu::bangc::deepseek_v41_decode_gather(
+              arguments[0],
+              arguments[1],
+              arguments[2],
+              arguments[3],
+              arguments[4],
+              arguments[5],
+              /*position=*/0,
+              /*window=*/1,
+              /*compressed_physical_dim=*/128,
+              arguments[6],
+              arguments[7]);
         },
         "same device as swa");
   }
@@ -908,7 +909,7 @@ TEST(DeepseekV41GraphTest, SparseGatherCompactsMaskedCompressedIndices) {
   auto compressed_page = torch::tensor({2, 1}, page.options());
   struct Selection {
     std::vector<int64_t> indices;
-    std::vector<int64_t> physical_rows;
+    std::vector<int64_t> physical_slots;
   };
   std::vector<int64_t> tiled(259, -1);
   tiled[0] = 2;
@@ -925,21 +926,23 @@ TEST(DeepseekV41GraphTest, SparseGatherCompactsMaskedCompressedIndices) {
                               std::numeric_limits<float>::quiet_NaN(),
                               options);
     auto length = torch::zeros({1}, page.options());
-    kernel::mlu::bangc::deepseek_v41_decode_gather(swa,
-                                                   compressed,
-                                                   current,
-                                                   page,
-                                                   compressed_page,
-                                                   topk,
-                                                   /*position=*/129,
-                                                   /*window=*/4,
-                                                   output,
-                                                   length);
+    kernel::mlu::bangc::deepseek_v41_decode_gather(
+        swa,
+        compressed,
+        current,
+        page,
+        compressed_page,
+        topk,
+        /*position=*/129,
+        /*window=*/4,
+        /*compressed_physical_dim=*/128,
+        output,
+        length);
     auto expected =
         torch::cat({swa.index_select(0, torch::tensor({254, 255, 0}, integers)),
                     current.unsqueeze(0),
                     compressed.index_select(
-                        0, torch::tensor(selection.physical_rows, integers))},
+                        0, torch::tensor(selection.physical_slots, integers))},
                    0);
     torch_mlu::synchronize();
     ASSERT_EQ(length.cpu().item<int32_t>(), expected.size(0));
@@ -967,26 +970,30 @@ TEST(DeepseekV41GraphTest, SparseGatherAndSinkAttentionReplayUseLiveLengths) {
   auto lengths = torch::zeros({2}, page.options());
   auto cache = torch::full(
       {16, 1, 1, 512}, std::numeric_limits<float>::quiet_NaN(), options);
-  kernel::mlu::bangc::deepseek_v41_decode_gather(swa,
-                                                 comp,
-                                                 current,
-                                                 page,
-                                                 comp_page,
-                                                 topk,
-                                                 129,
-                                                 4,
-                                                 cache.slice(0, 0, 8),
-                                                 lengths.slice(0, 0, 1));
-  kernel::mlu::bangc::deepseek_v41_decode_gather(swa,
-                                                 comp,
-                                                 current,
-                                                 page,
-                                                 comp_page,
-                                                 topk.slice(0, 0, 0),
-                                                 0,
-                                                 4,
-                                                 cache.slice(0, 8, 16),
-                                                 lengths.slice(0, 1, 2));
+  kernel::mlu::bangc::deepseek_v41_decode_gather(
+      swa,
+      comp,
+      current,
+      page,
+      comp_page,
+      topk,
+      129,
+      4,
+      /*compressed_physical_dim=*/128,
+      cache.slice(0, 0, 8),
+      lengths.slice(0, 0, 1));
+  kernel::mlu::bangc::deepseek_v41_decode_gather(
+      swa,
+      comp,
+      current,
+      page,
+      comp_page,
+      topk.slice(0, 0, 0),
+      0,
+      4,
+      /*compressed_physical_dim=*/128,
+      cache.slice(0, 8, 16),
+      lengths.slice(0, 1, 2));
   auto q = torch::randn({2, 1, 8, 512}, options);
   auto sink = torch::randn({8}, options.dtype(torch::kFloat32));
   auto table = torch::arange(16, lengths.options()).view({2, 1, 8});
@@ -1049,16 +1056,18 @@ TEST(DeepseekV41GraphTest, SparseGatherAndSinkAttentionReplayUseLiveLengths) {
     graph.capture_end();
   }
   lengths.copy_(torch::tensor({1, 0}, lengths.options()));
-  kernel::mlu::bangc::deepseek_v41_decode_gather(swa,
-                                                 comp,
-                                                 current,
-                                                 page,
-                                                 comp_page,
-                                                 topk.slice(0, 0, 0),
-                                                 0,
-                                                 4,
-                                                 cache.slice(0, 0, 8),
-                                                 lengths.slice(0, 0, 1));
+  kernel::mlu::bangc::deepseek_v41_decode_gather(
+      swa,
+      comp,
+      current,
+      page,
+      comp_page,
+      topk.slice(0, 0, 0),
+      0,
+      4,
+      /*compressed_physical_dim=*/128,
+      cache.slice(0, 0, 8),
+      lengths.slice(0, 0, 1));
   output.fill_(std::numeric_limits<float>::quiet_NaN());
   graph.replay();
   torch_mlu::synchronize();
@@ -1153,7 +1162,7 @@ TEST(DeepseekV41GraphTest, CaptureUsesOneGatherBufferAcrossLayers) {
   Csa2Context shared;
   const auto table =
       torch::arange(batch, options.dtype(torch::kInt32)).view({batch, 1});
-  shared.block_tables = {table, table, table};
+  shared.block_tables = {table, table};
   shared.topk.resize(batch);
   for (auto& topk : shared.topk) {
     topk =
@@ -1275,7 +1284,7 @@ TEST(DeepseekV41GraphTest, SharedGatherReplayMatchesIndependentLayerBuffers) {
     trial->shared.topk.resize(batch);
     auto table =
         torch::arange(batch, options.dtype(torch::kInt32)).view({batch, 1});
-    trial->shared.block_tables = {table, table, table};
+    trial->shared.block_tables = {table, table};
     trial->hidden = torch::randn({batch, args.hidden_size()}, options);
     trial->positions = torch::zeros({batch}, options.dtype(torch::kInt64));
     trial->rope =

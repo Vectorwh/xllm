@@ -130,6 +130,11 @@ void prepare_block_tables(Csa2Context& shared,
                           int64_t kv_seq_len_capacity) {
   const int64_t batch = input.meta.num_sequences;
   CHECK_GE(kv_seq_len_capacity, 0);
+  // Window-only drafts export SWA alone; history-bearing models share one KV
+  // table across all compression ratios.
+  CHECK(!input.multi_block_tables.empty() &&
+        input.multi_block_tables.size() <= 2)
+      << "V4.1 expects logical [SWA, KV] block tables (SWA only for drafts).";
   for (const auto& table : input.multi_block_tables) {
     CHECK_EQ(table.dim(), 2);
     CHECK_GE(table.size(0), shared.num_sequences);
@@ -149,11 +154,10 @@ void prepare_block_tables(Csa2Context& shared,
   if (tables.empty()) {
     tables.reserve(input.multi_block_tables.size());
     for (size_t group = 0; group < input.multi_block_tables.size(); ++group) {
-      const int64_t ratio = group == 1 ? 2 : 1;
       const int64_t columns = std::max<int64_t>(
           input.multi_block_tables[group].size(1),
-          (kv_seq_len_capacity + ratio * kDeepseekV41MluKVBlockSize - 1) /
-              (ratio * kDeepseekV41MluKVBlockSize));
+          (kv_seq_len_capacity + kDeepseekV41MluKVBlockSize - 1) /
+              kDeepseekV41MluKVBlockSize);
       tables.emplace_back(torch::zeros(
           {batch, columns},
           torch::TensorOptions().device(device).dtype(torch::kInt32)));

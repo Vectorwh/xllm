@@ -189,6 +189,14 @@ BlockTypeTensorMap KVCacheImpl::get_block_type_tensors(BlockType type) const {
   if (value_cache_.defined() && value_cache_.numel() > 0) {
     tensor_map.emplace(KVCacheTensorRole::VALUE, value_cache_);
   }
+  const auto key_scale = get_k_cache_scale();
+  if (key_scale.has_value()) {
+    tensor_map.emplace(KVCacheTensorRole::KEY_SCALE, *key_scale);
+  }
+  const auto value_scale = get_v_cache_scale();
+  if (value_scale.has_value()) {
+    tensor_map.emplace(KVCacheTensorRole::VALUE_SCALE, *value_scale);
+  }
   return tensor_map;
 }
 

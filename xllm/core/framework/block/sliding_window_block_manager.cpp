@@ -19,9 +19,7 @@ limitations under the License.
 #include <iterator>
 
 #include "core/framework/block/block_utils.h"
-#include "framework/config/kv_cache_config.h"
 #include "framework/prefix_cache/prefix_cache.h"
-#include "util/utils.h"
 
 namespace xllm {
 
@@ -49,7 +47,7 @@ SlidingWindowBlockManager::allocate_for_sequence(Sequence* seq,
 
   release_out_of_window(seq, kv_state);
 
-  const size_t block_size = options_.block_size();
+  const size_t block_size = this->block_size();
   CHECK_GT(block_size, 0u);
   const size_t needed = (num_tokens + block_size - 1) / block_size;
 
@@ -103,28 +101,21 @@ bool SlidingWindowBlockManager::allocate_for_prefetch(Sequence* seq,
   if (seq == nullptr) {
     return false;
   }
-  const size_t block_size = options_.block_size();
+  const size_t block_size = this->block_size();
   CHECK_GT(block_size, 0u);
   const size_t target_blocks = num_tokens / block_size;
   const size_t cached_blocks =
       seq->host_kv_state().num_cached_blocks(BlockType::SWA);
   CHECK_LT(cached_blocks, target_blocks);
 
-  const bool is_v41 = util::is_deepseek_v41_model_type(options_.model_type());
-  const int64_t compressed_unit_tokens =
-      is_v41 ? dsv41_cache_unit_tokens(
-                   is_v41, block_size, options_.compress_ratios())
-             : KVCacheConfig::get_instance()
-                   .dsv4_cache_geometry()
-                   .compressed_block_token_size();
-  CHECK_GT(compressed_unit_tokens, 0);
-  CHECK_EQ(compressed_unit_tokens % block_size, 0);
-  const size_t blocks_per_unit =
-      static_cast<size_t>(compressed_unit_tokens / block_size);
+  CHECK_GT(options_.block_size(), 0);
+  const size_t kv_block_size = static_cast<size_t>(options_.block_size());
+  CHECK_EQ(kv_block_size % block_size, 0u);
+  const size_t blocks_per_unit = kv_block_size / block_size;
   const size_t valid_per_unit =
       swa_tail_blocks(blocks_per_unit, options_.swa_blocks_per_seq());
   const size_t placeholders_per_unit = blocks_per_unit - valid_per_unit;
-  // Host admission ends on a compressed-unit boundary, and the prefetch target
+  // Host admission ends on a KV checkpoint boundary, and the prefetch target
   // does too, so the tail is a whole number of units.
   CHECK_EQ(cached_blocks % blocks_per_unit, 0u);
   CHECK_EQ(target_blocks % blocks_per_unit, 0u);
@@ -239,7 +230,7 @@ void SlidingWindowBlockManager::release_out_of_window(Sequence* seq,
 size_t SlidingWindowBlockManager::num_out_of_window_blocks(
     const KVCacheState& kv_state,
     size_t cached_tokens) const {
-  const size_t block_size = options_.block_size();
+  const size_t block_size = this->block_size();
   const size_t held = kv_state.num_blocks(block_type());
   if (block_size == 0 || held == 0) {
     return 0;

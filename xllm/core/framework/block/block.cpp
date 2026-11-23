@@ -30,18 +30,10 @@ const char* block_type_label(BlockType type) {
       return "kv";
     case BlockType::SWA:
       return "swa";
-    case BlockType::C4:
-      return "c4";
-    case BlockType::C128:
-      return "c128";
     case BlockType::EMBEDDING:
       return "embedding";
     case BlockType::LINEAR:
       return "linear";
-    case BlockType::C1:
-      return "c1";
-    case BlockType::C2:
-      return "c2";
   }
   LOG(FATAL) << "Unhandled block type " << static_cast<int32_t>(type);
   return "";

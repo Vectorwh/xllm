@@ -207,10 +207,8 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
            draft_engine_->allocate_kv_cache(draft_kv_cache_cap);
   }
 
-  if (target_kv_cache_cap.c4_count() > 0 ||
-      target_kv_cache_cap.c128_count() > 0 ||
-      target_kv_cache_cap.c2_count() > 0 ||
-      target_kv_cache_cap.c1_count() > 0) {
+  if (target_kv_cache_cap.swa_count() > 0 ||
+      draft_kv_cache_cap.swa_count() > 0) {
     draft_kv_cache_cap.n_blocks() = target_kv_cache_cap.n_blocks();
     return engine_->allocate_kv_cache(target_kv_cache_cap) &&
            draft_engine_->allocate_kv_cache(draft_kv_cache_cap);

@@ -783,17 +783,13 @@ build_cp_context_npu(const std::vector<int64_t>& q_seq_lens,
 }  // namespace
 
 torch::Tensor sfa_dcp_remap_out_npu(const torch::Tensor& topk_indices,
-                                    int64_t physical_block_size,
+                                    int64_t physical_dim,
                                     int64_t shard_size,
                                     int64_t shard_rank,
                                     torch::Tensor& out,
                                     torch::Tensor& idx_scratch) {
-  xllm::kernel::npu::tilelang::sfa_dcp_remap_out(topk_indices,
-                                                 physical_block_size,
-                                                 shard_size,
-                                                 shard_rank,
-                                                 out,
-                                                 idx_scratch);
+  xllm::kernel::npu::tilelang::sfa_dcp_remap_out(
+      topk_indices, physical_dim, shard_size, shard_rank, out, idx_scratch);
   return out;
 }
 
@@ -1185,7 +1181,7 @@ TORCH_LIBRARY(xllm_ops, m) {
       "ori_win_left, int ori_win_right, str layout_q, str layout_kv, bool "
       "has_ori_kv, bool has_cmp_kv) -> Tensor");
   m.def(
-      "sfa_dcp_remap_out(Tensor topk_indices, int physical_block_size, int "
+      "sfa_dcp_remap_out(Tensor topk_indices, int physical_dim, int "
       "shard_size, int shard_rank, Tensor(a!) out, Tensor(b!) idx_scratch) -> "
       "Tensor(a!)");
   // Engram host-offload int8 lookup: a pure host CPU kernel whose four

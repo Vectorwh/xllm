@@ -626,14 +626,10 @@ TEST(NpuCpPlanTest, CacheSlotsPreserveShortCpFourUnsplitOrder) {
 
 TEST(NpuCpPlanTest, CacheSlotsUseLogicalOffsetsAcrossSequences) {
   const CpPlanInput input = make_plan_input({200, 8}, {0, 0});
-  const int32_t logical_block_size = 256;
-  torch::Tensor global_slots =
-      torch::cat({torch::arange(10 * logical_block_size,
-                                10 * logical_block_size + 200,
-                                torch::kInt32),
-                  torch::arange(20 * logical_block_size,
-                                20 * logical_block_size + 8,
-                                torch::kInt32)});
+  const int32_t block_size = 256;
+  torch::Tensor global_slots = torch::cat(
+      {torch::arange(10 * block_size, 10 * block_size + 200, torch::kInt32),
+       torch::arange(20 * block_size, 20 * block_size + 8, torch::kInt32)});
 
   CpPlanConfig rank0_config = cp2_rank0_config();
   const NpuCpPlan rank0_plan = NpuCpPlan::build(input, rank0_config);
@@ -662,10 +658,9 @@ TEST(NpuCpPlanTest, CacheSlotsUseLogicalOffsetsAcrossSequences) {
 
 TEST(NpuCpPlanTest, CacheSlotsUseLogicalOffsetsForSingleSequenceChunk) {
   const CpPlanInput input = make_plan_input({8}, {128});
-  const int32_t logical_block_size = 256;
-  torch::Tensor global_slots = torch::arange(30 * logical_block_size + 128,
-                                             30 * logical_block_size + 136,
-                                             torch::kInt32);
+  const int32_t block_size = 256;
+  torch::Tensor global_slots = torch::arange(
+      30 * block_size + 128, 30 * block_size + 136, torch::kInt32);
 
   CpPlanConfig rank0_config = cp2_rank0_config();
   const NpuCpPlan rank0_plan = NpuCpPlan::build(input, rank0_config);

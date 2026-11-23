@@ -24,8 +24,10 @@ limitations under the License.
 #include "core/distributed_runtime/engine_utils.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "framework/block/block_utils.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_cache_capacity.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -45,173 +47,113 @@ namespace {
 BlockManagerPool::HostBlockCounts make_grouped_host_cache_capacities(
     const ModelArgs& args,
     const KVCacheCapacity& capacity,
-    double host_blocks_factor,
-    uint32_t sliding_window_size,
-    int32_t block_size,
-    std::vector<uint32_t> manager_compress_ratios) {
+    double host_blocks_factor) {
   runtime::Options runtime_options;
   runtime_options.host_blocks_factor(host_blocks_factor);
   BlockManagerPool::Options block_options;
-  const bool is_v41 = args.model_type() == "deepseek_v41";
-  block_options.num_blocks(static_cast<uint32_t>(capacity.n_blocks()))
-      .block_size(block_size)
-      .enable_prefix_cache(true)
-      .model_type(args.model_type())
-      .sliding_window_size(sliding_window_size)
-      .swa_blocks_per_seq(block_size > 0
-                              ? static_cast<uint32_t>(get_swa_blocks_per_seq(
-                                    sliding_window_size, block_size))
-                              : 0)
-      .swa_num_blocks(static_cast<uint32_t>(capacity.swa_count()))
-      .c4_num_blocks(static_cast<uint32_t>(is_v41 ? capacity.c2_count()
-                                                  : capacity.c4_count()))
-      .c128_num_blocks(static_cast<uint32_t>(is_v41 ? capacity.c1_count()
-                                                    : capacity.c128_count()))
-      .manager_types({1u, 0u, 0u})
-      .compress_ratios(std::move(manager_compress_ratios));
+  block_options.enable_prefix_cache(true);
+  configure_dsv4_block_manager_options(
+      args, block_options, capacity, /*max_tokens_per_batch=*/512);
   auto pool = create_kv_cache_manager(block_options,
-                                      args,
                                       runtime_options,
                                       capacity,
                                       /*has_gdn_state=*/false,
                                       /*engine=*/nullptr,
-                                      /*dp_size=*/1,
-                                      block_size);
+                                      /*dp_size=*/1);
   return block_options.host_num_blocks_by_type();
 }
 
 TEST(VLMEngineTest, BuildsTypedV4HostCacheCapacities) {
   ModelArgs args;
-  args.model_type("deepseek_v4").compress_ratios({0, 4, 128});
-  // C4 and C128 share admission capacity; both must use the same unit count.
+  args.model_type("deepseek_v4").window_size(512);
   KVCacheCapacity capacity;
-  capacity.n_blocks(16).swa_count(4).c4_count(8).c128_count(8);
+  capacity.n_blocks(8)
+      .block_size(dsv4_kv_block_size(Platform::is_npu()))
+      .swa_count(4)
+      .swa_block_size(kDsv4SwaBlockSize);
 
   const BlockManagerPool::HostBlockCounts host_capacities =
-      make_grouped_host_cache_capacities(args,
-                                         capacity,
-                                         /*host_blocks_factor=*/2.0,
-                                         /*sliding_window_size=*/512,
-                                         /*block_size=*/128,
-                                         /*manager_compress_ratios=*/
-                                         std::vector<uint32_t>{0, 4, 128});
+      make_grouped_host_cache_capacities(args, capacity, 2.0);
 
-  ASSERT_EQ(host_capacities.size(), 3u);
-  EXPECT_EQ(host_capacities.at(BlockType::C4), 16u);
-  EXPECT_EQ(host_capacities.at(BlockType::C128), 16u);
-#if defined(USE_MLU)
-  EXPECT_EQ(host_capacities.at(BlockType::SWA), 16u);
-#else
-  EXPECT_EQ(host_capacities.at(BlockType::SWA), 64u);
-#endif
+  ASSERT_EQ(host_capacities.size(), 2u);
+  EXPECT_EQ(host_capacities.at(BlockType::KV), 16u);
+  EXPECT_EQ(host_capacities.at(BlockType::SWA), Platform::is_npu() ? 64u : 16u);
 }
 
 TEST(VLMEngineTest, BuildsTypedV41HostCacheCapacities) {
   ModelArgs args;
-  // The full layer plan contains ratio 128, while the V4.1 TOKEN managers
-  // only consume the registered 2/1 groups. Host SWA sizing must use the
-  // manager ratio list, matching the original LLMEngine path.
-  args.model_type("deepseek_v41").compress_ratios({0, 4, 128});
+  args.model_type("deepseek_v41").window_size(512);
   KVCacheCapacity capacity;
-  capacity.n_blocks(16).swa_count(4).c2_count(3).c1_count(8);
+  capacity.n_blocks(8)
+      .block_size(kDsv4FixedBlockSize)
+      .swa_count(4)
+      .swa_block_size(kDsv4SwaBlockSize);
 
   const BlockManagerPool::HostBlockCounts host_capacities =
-      make_grouped_host_cache_capacities(args,
-                                         capacity,
-                                         /*host_blocks_factor=*/2.0,
-                                         /*sliding_window_size=*/512,
-                                         /*block_size=*/128,
-                                         /*manager_compress_ratios=*/
-                                         std::vector<uint32_t>{0, 2, 1});
+      make_grouped_host_cache_capacities(args, capacity, 2.0);
 
-  ASSERT_EQ(host_capacities.size(), 3u);
-  EXPECT_EQ(host_capacities.at(BlockType::SWA), 12u);
-  EXPECT_EQ(host_capacities.at(BlockType::C2), 6u);
-  EXPECT_EQ(host_capacities.at(BlockType::C1), 16u);
+  ASSERT_EQ(host_capacities.size(), 2u);
+  EXPECT_EQ(host_capacities.at(BlockType::SWA), 16u);
+  EXPECT_EQ(host_capacities.at(BlockType::KV), 16u);
 }
 
 TEST(VLMEngineTest, RejectsInvalidTypedHostCapacityArguments) {
   ModelArgs args;
-  args.model_type("deepseek_v4").compress_ratios({0, 4, 128});
+  args.model_type("deepseek_v4").window_size(512);
   KVCacheCapacity capacity;
-  capacity.n_blocks(16).swa_count(4).c4_count(8).c128_count(8);
-  const std::vector<uint32_t> ratios{0, 4, 128};
-
-  // Host-disabled grouped caches must keep the ordinary device pool; the
-  // internal capacity sizing is not a public entry point anymore.
-  EXPECT_TRUE(make_grouped_host_cache_capacities(args,
-                                                 capacity,
-                                                 /*host_blocks_factor=*/1.0,
-                                                 /*sliding_window_size=*/512,
-                                                 /*block_size=*/128,
-                                                 ratios)
-                  .empty());
-  EXPECT_DEATH(make_grouped_host_cache_capacities(args,
-                                                  capacity,
-                                                  /*host_blocks_factor=*/2.0,
-                                                  /*sliding_window_size=*/512,
-                                                  /*block_size=*/0,
-                                                  ratios),
-               "Check failed: block_size > 0");
-  args.model_type("qwen3_vl");
-  EXPECT_DEATH(
-      make_grouped_host_cache_capacities(args,
-                                         capacity,
-                                         /*host_blocks_factor=*/2.0,
-                                         /*sliding_window_size=*/512,
-                                         /*block_size=*/128,
-                                         ratios),
-      "Typed Host cache capacities require a DeepSeek-V4 grouped cache");
+  capacity.n_blocks(8)
+      .block_size(dsv4_kv_block_size(Platform::is_npu()))
+      .swa_count(4)
+      .swa_block_size(kDsv4SwaBlockSize);
+  EXPECT_TRUE(make_grouped_host_cache_capacities(args, capacity, 1.0).empty());
+  capacity.block_size(0);
+  EXPECT_DEATH(make_grouped_host_cache_capacities(args, capacity, 2.0),
+               "kv_cache_cap.block_size\\(\\) > 0");
+  capacity.block_size(dsv4_kv_block_size(Platform::is_npu()))
+      .n_blocks(0)
+      .has_kv_cache(false);
+  EXPECT_DEATH(make_grouped_host_cache_capacities(args, capacity, 2.0),
+               "Standalone window-only cache does not support Host offload");
 }
 
-TEST(VLMEngineTest, GroupedHostCapacityUsesPhysicalWorkerBlockSize) {
+TEST(VLMEngineTest, GroupedHostCapacityUsesLogicalKvAndSwaSpans) {
   ModelArgs args;
-  args.model_type("deepseek_v4")
-      .compress_ratios({0, 4, 128})
-      .window_size(512)
-      .max_seq_len(1024);
+  args.model_type("deepseek_v4").window_size(512).max_seq_len(1024);
   KVCacheCapacity capacity;
-  capacity.n_blocks(16).block_size(128).swa_count(4).c4_count(8).c128_count(8);
+  capacity.n_blocks(8)
+      .block_size(dsv4_kv_block_size(Platform::is_npu()))
+      .swa_count(4)
+      .swa_block_size(kDsv4SwaBlockSize);
   runtime::Options runtime_options;
   runtime_options.block_size(128).host_blocks_factor(2.0);
   BlockManagerPool::Options block_options;
   block_options.num_blocks(16)
       .block_size(
           fold_kv_cache_block_size(/*block_size=*/128, /*kv_split_size=*/2))
-      .enable_prefix_cache(true)
-      .model_type(args.model_type());
+      .enable_prefix_cache(true);
   configure_dsv4_block_manager_options(args,
                                        block_options,
                                        capacity,
-                                       runtime_options.block_size(),
                                        /*max_tokens_per_batch=*/512);
   EXPECT_EQ(block_options.swa_blocks_per_seq(), 4u);
   auto pool =
       VLMEngineCacheTestPeer::make_kv_cache_manager(block_options,
-                                                    args,
                                                     runtime_options,
                                                     capacity,
                                                     /*has_gdn_state=*/false,
                                                     /*engine=*/nullptr,
                                                     /*dp_size=*/1);
   ASSERT_NE(pool, nullptr);
-  // WorkerImpl uses runtime_options.block_size() for Host tensor allocation.
-  const int64_t worker_host_swa_count = dsv4_host_swa_block_count(
-      capacity.c128_count(),
-      runtime_options.host_blocks_factor(),
-      block_options.sliding_window_size(),
-      runtime_options.block_size(),
-      dsv41_cache_unit_tokens(/*is_v41=*/false,
-                              runtime_options.block_size(),
-                              block_options.compress_ratios()));
+  const int64_t worker_host_swa_count =
+      dsv4_host_swa_block_count(capacity.n_blocks(),
+                                runtime_options.host_blocks_factor(),
+                                block_options.sliding_window_size(),
+                                capacity.swa_block_size(),
+                                capacity.block_size());
   EXPECT_EQ(block_options.host_num_blocks_by_type().at(BlockType::SWA),
             worker_host_swa_count);
-  EXPECT_EQ(block_options.block_size(), 256);
-#if defined(USE_MLU)
-  EXPECT_EQ(worker_host_swa_count, 16);
-#else
-  EXPECT_EQ(worker_host_swa_count, 64);
-#endif
+  EXPECT_EQ(block_options.block_size(), capacity.block_size());
+  EXPECT_EQ(worker_host_swa_count, Platform::is_npu() ? 64 : 16);
   EXPECT_EQ(prefill_host_linear_block_count(
                 /*host_kv_block_count=*/16,
                 /*worker_block_size=*/128,
@@ -225,8 +167,6 @@ TEST(VLMEngineTest, GroupedHostCapacityUsesPhysicalWorkerBlockSize) {
 }
 
 TEST(VLMEngineTest, SelectsFlatHostPoolOnlyWhenEnabled) {
-  ModelArgs args;
-  args.model_type("qwen3_vl");
   KVCacheCapacity capacity;
   capacity.n_blocks(16).block_size(128);
   runtime::Options runtime_options;
@@ -235,7 +175,6 @@ TEST(VLMEngineTest, SelectsFlatHostPoolOnlyWhenEnabled) {
   block_options.num_blocks(16).block_size(128).enable_prefix_cache(true);
   auto device_pool =
       VLMEngineCacheTestPeer::make_kv_cache_manager(block_options,
-                                                    args,
                                                     runtime_options,
                                                     capacity,
                                                     /*has_gdn_state=*/false,
@@ -248,7 +187,6 @@ TEST(VLMEngineTest, SelectsFlatHostPoolOnlyWhenEnabled) {
   runtime_options.host_blocks_factor(2.0);
   auto host_pool =
       VLMEngineCacheTestPeer::make_kv_cache_manager(block_options,
-                                                    args,
                                                     runtime_options,
                                                     capacity,
                                                     /*has_gdn_state=*/false,
@@ -271,8 +209,6 @@ TEST(VLMEngineTest, VlmHostLinearCapacityUsesPhysicalWorkerBlockSize) {
   });
   scheduler_config.max_tokens_per_chunk_for_prefill(512);
 
-  ModelArgs args;
-  args.model_type("qwen3_5");
   KVCacheCapacity capacity;
   capacity.n_blocks(8).block_size(128).num_linear_state_blocks(16);
   runtime::Options runtime_options;
@@ -286,7 +222,6 @@ TEST(VLMEngineTest, VlmHostLinearCapacityUsesPhysicalWorkerBlockSize) {
       .linear_state_num_slots(16);
   auto pool =
       VLMEngineCacheTestPeer::make_kv_cache_manager(block_options,
-                                                    args,
                                                     runtime_options,
                                                     capacity,
                                                     /*has_gdn_state=*/true,
@@ -304,7 +239,6 @@ TEST(VLMEngineTest, VlmHostLinearCapacityUsesPhysicalWorkerBlockSize) {
   capacity.block_size(256);
   EXPECT_DEATH(
       VLMEngineCacheTestPeer::make_kv_cache_manager(block_options,
-                                                    args,
                                                     runtime_options,
                                                     capacity,
                                                     /*has_gdn_state=*/true,
@@ -314,19 +248,15 @@ TEST(VLMEngineTest, VlmHostLinearCapacityUsesPhysicalWorkerBlockSize) {
   // LLM and direct callers must reject the same mismatch without relying on
   // the VLM wrapper to validate the worker's physical block width.
   EXPECT_DEATH(create_kv_cache_manager(block_options,
-                                       args,
                                        runtime_options,
                                        capacity,
                                        /*has_gdn_state=*/true,
                                        /*engine=*/nullptr,
-                                       /*dp_size=*/1,
-                                       /*grouped_block_size=*/128),
+                                       /*dp_size=*/1),
                "Host LINEAR physical block size must match worker allocation");
 }
 
 TEST(EngineUtilsTest, PreservesPreparedFlatHostCapacity) {
-  ModelArgs args;
-  args.model_type("qwen3");
   KVCacheCapacity capacity;
   capacity.n_blocks(16).block_size(128);
   runtime::Options runtime_options;
@@ -337,13 +267,11 @@ TEST(EngineUtilsTest, PreservesPreparedFlatHostCapacity) {
       .host_num_blocks(32)
       .enable_prefix_cache(true);
   auto pool = create_kv_cache_manager(block_options,
-                                      args,
                                       runtime_options,
                                       capacity,
                                       /*has_gdn_state=*/false,
                                       /*engine=*/nullptr,
-                                      /*dp_size=*/1,
-                                      /*grouped_block_size=*/128);
+                                      /*dp_size=*/1);
   ASSERT_NE(pool, nullptr);
   EXPECT_TRUE(block_options.enable_host_offload());
   EXPECT_EQ(block_options.host_num_blocks(), 32u);
@@ -352,8 +280,6 @@ TEST(EngineUtilsTest, PreservesPreparedFlatHostCapacity) {
 }
 
 TEST(EngineUtilsTest, MtpDraftRetainsExistingDevicePoolPolicy) {
-  ModelArgs args;
-  args.model_type("deepseek_v41");
   KVCacheCapacity capacity;
   capacity.n_blocks(16).block_size(128);
   runtime::Options runtime_options;
@@ -367,13 +293,11 @@ TEST(EngineUtilsTest, MtpDraftRetainsExistingDevicePoolPolicy) {
       .host_num_blocks(32)
       .enable_prefix_cache(true);
   auto pool = create_kv_cache_manager(block_options,
-                                      args,
                                       runtime_options,
                                       capacity,
                                       /*has_gdn_state=*/false,
                                       /*engine=*/nullptr,
-                                      /*dp_size=*/1,
-                                      /*grouped_block_size=*/128);
+                                      /*dp_size=*/1);
   ASSERT_NE(pool, nullptr);
   EXPECT_FALSE(block_options.enable_prefix_cache());
   EXPECT_FALSE(block_options.enable_host_offload());

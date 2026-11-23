@@ -19,8 +19,9 @@ limitations under the License.
 
 namespace xllm::kernel::mlu::bangc {
 
-// MLU V4.1 SWA, compressed KV, and index caches share this page width.
-// Candidate-selection blocks have an independent width from ModelArgs.
+// Tokens in one logical V4.1 KV/SWA block. Physical dim is this span divided
+// by the compress ratio. Candidate-selection blocks have an independent width
+// from ModelArgs.
 inline constexpr int32_t kDeepseekV41MluKVBlockSize = 128;
 
 inline constexpr bool supports_dsa_qb_width(int64_t width) {

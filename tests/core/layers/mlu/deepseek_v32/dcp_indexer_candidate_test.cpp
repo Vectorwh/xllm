@@ -33,7 +33,7 @@ namespace {
 
 TEST(DcpIndexerCandidateTest, PreservesInterleavedSlotsForFourRankTopology) {
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/4, /*dcp_rank=*/2);
+      /*physical_dim=*/2, /*dcp_size=*/4, /*dcp_rank=*/2);
   const torch::Tensor global_slots =
       torch::tensor({0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15}, torch::kInt32);
 
@@ -48,7 +48,7 @@ TEST(DcpIndexerCandidateTest, PreservesInterleavedSlotsForFourRankTopology) {
 
 TEST(DcpIndexerCandidateTest, CountsPartialPrefixesForEightRankTopology) {
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/8, /*dcp_rank=*/6);
+      /*physical_dim=*/2, /*dcp_size=*/8, /*dcp_rank=*/6);
   const torch::Tensor global_context_lens =
       torch::tensor({0, 12, 13, 14, 15, 16, 30, 31, 32}, torch::kInt32);
 
@@ -62,7 +62,7 @@ TEST(DcpIndexerCandidateTest, CountsPartialPrefixesForEightRankTopology) {
 
 TEST(DcpIndexerCandidateTest, KeepsRequestPagesAndGlobalCausalPositions) {
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
+      /*physical_dim=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   AttentionMetadata metadata{};
   metadata.q_cu_seq_lens = torch::tensor({0, 3, 5}, torch::kInt32);
   metadata.kv_cu_seq_lens = torch::tensor({0, 3, 9}, torch::kInt32);
@@ -82,7 +82,7 @@ TEST(DcpIndexerCandidateTest, KeepsRequestPagesAndGlobalCausalPositions) {
 
 TEST(DcpIndexerCandidateTest, BuildsGlobalDecodeIndexerMetadata) {
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
+      /*physical_dim=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   AttentionMetadata metadata{};
   metadata.q_cu_seq_lens = torch::tensor({0, 1, 2}, torch::kInt32);
   metadata.kv_cu_seq_lens = torch::tensor({0, 9, 18}, torch::kInt32);
@@ -104,7 +104,7 @@ TEST(DcpIndexerCandidateTest, BuildsGlobalDecodeIndexerMetadata) {
 
 TEST(DcpIndexerCandidateTest, BuildsRequestedPrefillIndexerMetadata) {
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
+      /*physical_dim=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   AttentionMetadata metadata{};
   metadata.q_cu_seq_lens = torch::tensor({0, 3}, torch::kInt32);
   metadata.kv_cu_seq_lens = torch::tensor({0, 3}, torch::kInt32);
@@ -123,7 +123,7 @@ TEST(DcpIndexerCandidateTest, BuildsRequestedPrefillIndexerMetadata) {
 TEST(DcpIndexerCandidateTest,
      PreservesShardMetadataWithInt64CumulativeLengths) {
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
+      /*physical_dim=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   for (const bool is_prefill : {true, false}) {
     SCOPED_TRACE(is_prefill);
     AttentionMetadata metadata{};
@@ -156,7 +156,7 @@ TEST(DcpIndexerCandidateTest, SharedBuilderAcceptsRepeatedValidPrefillSlots) {
   metadata.is_prefill = true;
   metadata.slot_mapping = torch::tensor({2, 2, -1, -1}, torch::kInt32);
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
+      /*physical_dim=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   const auto shared = build_kv_shard_batch_metadata(metadata, layout);
   EXPECT_TRUE(torch::equal(shared->local_slot_mapping,
                            torch::tensor({0, 0, -1, -1}, torch::kInt32)));
@@ -169,7 +169,7 @@ TEST(DcpIndexerCandidateTest, MluPrefillSortAllowsRepeatedPadding) {
   metadata.is_prefill = true;
   metadata.slot_mapping = torch::tensor({3, -1, 2, -1}, torch::kInt32);
   const KVShardLayout layout(
-      /*physical_block_size=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
+      /*physical_dim=*/2, /*dcp_size=*/2, /*dcp_rank=*/1);
   const auto mlu = build_mlu_shard_metadata(metadata, layout);
   EXPECT_TRUE(torch::equal(mlu->prefill_sorted_slots,
                            torch::tensor({-1, -1, 2, 3}, torch::kInt64)));
@@ -196,7 +196,7 @@ TEST(DcpIndexerCandidateTest, DecodeGraphRefreshesSlotsAndLengthsOnReplay) {
   metadata.kv_seq_lens = torch::tensor({3, 4, 0, 0}, options);
   metadata.q_cu_seq_lens = torch::arange(5, options);
   metadata.block_table = torch::zeros({4, 2}, options);
-  const KVShardLayout layout(/*physical_block_size=*/2,
+  const KVShardLayout layout(/*physical_dim=*/2,
                              /*dcp_size=*/2,
                              /*dcp_rank=*/1);
   build_mlu_shard_metadata(metadata, layout);

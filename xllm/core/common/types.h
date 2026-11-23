@@ -356,6 +356,7 @@ struct KVTransferMapping {
   // Number of leading blocks D already has from its own device-side prefix
   // cache under this group. P uses this to compress its per-group transfer
   // cursor to the first block D actually needs (no shared -> zero, no-op).
+  // Decode only shares KV prefix blocks and omits them from its response IDs.
   uint32_t remote_shared_num = 0;
   // Source logical block index of local_ids[0] in a per-step mapping. The
   // step builder emits only the blocks from the transfer cursor onward and

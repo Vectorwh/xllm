@@ -37,6 +37,15 @@ limitations under the License.
 #include "runtime/worker_client.h"
 
 namespace xllm {
+namespace {
+
+bool uses_shared_window_cache(const runtime::Options& options,
+                              const KVCacheCapacity& capacity) {
+  return options.is_draft_engine() && !capacity.has_kv_cache() &&
+         capacity.swa_count() > 0;
+}
+
+}  // namespace
 
 runtime::Options build_draft_engine_options(const runtime::Options& options,
                                             int64_t world_size) {
@@ -87,63 +96,20 @@ runtime::DecodeGraphWarmupConfig build_decode_graph_warmup_config(
 void configure_dsv4_block_manager_options(const ModelArgs& args,
                                           BlockManagerPool::Options& options,
                                           const KVCacheCapacity& kv_cache_cap,
-                                          int32_t block_size,
                                           int32_t max_tokens_per_batch) {
   if (!util::is_deepseek_v4_model_type(args.model_type())) {
     return;
   }
 
-  // Integer codes stored in `Options::manager_types()`, mirroring the values
-  // the composite manager dispatches on (see composite_block_manager.cpp): 0
-  // builds a plain BlockManagerImpl leaf (KV / compressed TOKEN groups); 1
-  // builds a SlidingWindowBlockManager leaf. Moved here with the option
-  // builder itself so the engine no longer redeclares them inline.
   constexpr uint32_t kManagerTypeBlockManagerImpl = 0;
   constexpr uint32_t kManagerTypeSlidingWindowBlockManager = 1;
 
   std::vector<uint32_t> manager_types{kManagerTypeSlidingWindowBlockManager};
-  std::vector<uint32_t> manager_compress_ratios{
-      0};  // unused for sliding window manager
-  std::vector<uint32_t> token_manager_ratios;
-  token_manager_ratios.reserve(2);
-  if (util::is_deepseek_v41_model_type(args.model_type())) {
-    // V4.1: one TOKEN manager per distinct kv-source compress ratio, in
-    // first-kv-source-appearance order (contract §2: group order
-    // [SWA, TOKEN(2), TOKEN(1)] for the standard layer plan). Reuse layers
-    // read the source layer's tensors and the TOKEN group's block table,
-    // so only the kv-source ratios get managers.
-    const std::vector<int32_t>& compress_ratios = args.compress_ratios();
-    for (const int32_t layer_id : args.kv_source_layer_ids()) {
-      if (layer_id < 0 ||
-          layer_id >= static_cast<int64_t>(compress_ratios.size())) {
-        continue;
-      }
-      const int32_t ratio = compress_ratios[static_cast<size_t>(layer_id)];
-      if (ratio != 2 && ratio != 1) {
-        continue;
-      }
-      const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
-      if (std::find(token_manager_ratios.begin(),
-                    token_manager_ratios.end(),
-                    ratio_u32) == token_manager_ratios.end()) {
-        token_manager_ratios.push_back(ratio_u32);
-      }
-    }
-  } else {
-    for (const int32_t ratio : args.compress_ratios()) {
-      if (ratio == 4 || ratio == 128) {
-        const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
-        if (std::find(token_manager_ratios.begin(),
-                      token_manager_ratios.end(),
-                      ratio_u32) == token_manager_ratios.end()) {
-          token_manager_ratios.push_back(ratio_u32);
-        }
-      }
-    }
-  }
-  for (const uint32_t ratio : token_manager_ratios) {
+  if (kv_cache_cap.has_kv_cache()) {
     manager_types.push_back(kManagerTypeBlockManagerImpl);
-    manager_compress_ratios.push_back(ratio);
+  } else {
+    // A standalone SWA ring has no history checkpoint to share as a prefix.
+    options.enable_prefix_cache(false);
   }
 
   const int64_t semantic_window = std::max(args.window_size(), 1);
@@ -156,8 +122,11 @@ void configure_dsv4_block_manager_options(const ModelArgs& args,
   CHECK_LE(effective_window,
            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
       << "DSV4 effective_window exceeds uint32_t range: " << effective_window;
+  CHECK_GT(kv_cache_cap.swa_block_size(), 0);
+  CHECK_LE(kv_cache_cap.swa_block_size(),
+           static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
   const int64_t swa_blocks_per_seq =
-      get_swa_blocks_per_seq(effective_window, block_size);
+      get_swa_blocks_per_seq(effective_window, kv_cache_cap.swa_block_size());
   CHECK_LE(swa_blocks_per_seq,
            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
       << "DSV4 swa_blocks_per_seq exceeds uint32_t range: "
@@ -167,26 +136,25 @@ void configure_dsv4_block_manager_options(const ModelArgs& args,
   CHECK_LE(kv_cache_cap.swa_count(),
            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
       << "DSV4 swa_count exceeds uint32_t range: " << kv_cache_cap.swa_count();
-  CHECK_LE(kv_cache_cap.c4_count(),
+  CHECK_LE(kv_cache_cap.n_blocks(),
            static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-      << "DSV4 c4_count exceeds uint32_t range: " << kv_cache_cap.c4_count();
-  CHECK_LE(kv_cache_cap.c128_count(),
-           static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
-      << "DSV4 c128_count exceeds uint32_t range: "
-      << kv_cache_cap.c128_count();
+      << "DSV4 n_blocks exceeds uint32_t range: " << kv_cache_cap.n_blocks();
   // The pool exposes this as uint32_t; a negative value would wrap to a huge
   // capacity, so reject it up front like the block-count checks above.
   CHECK_GE(max_tokens_per_batch, 0)
       << "DSV4 max_tokens_per_batch must be >= 0, got " << max_tokens_per_batch;
+  CHECK_GT(kv_cache_cap.block_size(), 0);
+  CHECK_LE(kv_cache_cap.block_size(),
+           static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
 
-  options.sliding_window_size(static_cast<uint32_t>(effective_window))
+  options.swa_block_size(static_cast<int32_t>(kv_cache_cap.swa_block_size()))
+      .sliding_window_size(static_cast<uint32_t>(effective_window))
+      .block_size(static_cast<int32_t>(kv_cache_cap.block_size()))
       .swa_blocks_per_seq(swa_blocks_per_seq_u32)
       .swa_num_blocks(static_cast<uint32_t>(kv_cache_cap.swa_count()))
-      .c4_num_blocks(static_cast<uint32_t>(kv_cache_cap.c4_count()))
-      .c128_num_blocks(static_cast<uint32_t>(kv_cache_cap.c128_count()))
+      .num_blocks(static_cast<uint32_t>(kv_cache_cap.n_blocks()))
       .max_tokens_per_batch(static_cast<uint32_t>(max_tokens_per_batch))
-      .manager_types(std::move(manager_types))
-      .compress_ratios(std::move(manager_compress_ratios));
+      .manager_types(std::move(manager_types));
 }
 
 std::vector<uint32_t> dp_group_worker_indices(uint32_t dp_rank,
@@ -261,7 +229,9 @@ HostCacheValidationOptions build_host_cache_validation_options(
       (SpeculativeConfig::draft_replicated_block_pages(
            options.speculative_algorithm(), kv_split_size_eff) > 1);
   return {
-      .host_blocks_factor = options.host_blocks_factor(),
+      .host_blocks_factor = uses_shared_window_cache(options, kv_cache_cap)
+                                ? 0.0
+                                : options.host_blocks_factor(),
       .device_block_count = kv_cache_cap.n_blocks(),
       .supports_host_kv_offload = Platform::supports_host_kv_offload(),
       .enable_prefix_cache = options.enable_prefix_cache(),
@@ -286,13 +256,11 @@ HostCacheValidationOptions build_host_cache_validation_options(
 
 std::unique_ptr<KVCacheManager> create_kv_cache_manager(
     BlockManagerPool::Options& block_options,
-    const ModelArgs& args,
     const runtime::Options& runtime_options,
     const KVCacheCapacity& kv_cache_cap,
     bool has_gdn_state,
     Engine* engine,
-    uint32_t dp_size,
-    int32_t grouped_block_size) {
+    uint32_t dp_size) {
   if (runtime_options.enable_kvcache_store()) {
     CHECK_GT(runtime_options.host_blocks_factor(), 1.0)
         << "KV cache Store requires Host cache blocks.";
@@ -303,9 +271,13 @@ std::unique_ptr<KVCacheManager> create_kv_cache_manager(
   if (is_mtp_draft_engine) {
     block_options.enable_prefix_cache(false);
   }
-  if (runtime_options.host_blocks_factor() <= 1.0 || is_mtp_draft_engine) {
+  if (runtime_options.host_blocks_factor() <= 1.0 || is_mtp_draft_engine ||
+      uses_shared_window_cache(runtime_options, kv_cache_cap)) {
     return std::make_unique<BlockManagerPool>(block_options, dp_size);
   }
+  CHECK(kv_cache_cap.has_kv_cache())
+      << "Standalone window-only cache does not support Host offload: "
+         "restoration requires a KV checkpoint.";
 
   BlockManagerPool::HostBlockCounts host_capacities;
   const int64_t host_kv_block_count = scale_host_block_count(
@@ -313,8 +285,8 @@ std::unique_ptr<KVCacheManager> create_kv_cache_manager(
   // Preserve scalar capacity only for flat KV without LINEAR state. Hybrid
   // LINEAR layouts always install typed KV capacity from host_kv_block_count;
   // their LINEAR count below must use that same installed KV capacity.
-  if (block_options.manager_types().empty() &&
-      (has_gdn_state || block_options.host_num_blocks() == 0)) {
+  if (!block_options.manager_types().empty() || has_gdn_state ||
+      block_options.host_num_blocks() == 0) {
     CHECK_LE(host_kv_block_count,
              static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
         << "Host KV block count exceeds uint32_t range: "
@@ -346,55 +318,19 @@ std::unique_ptr<KVCacheManager> create_kv_cache_manager(
     host_capacities.emplace(BlockType::LINEAR,
                             static_cast<uint32_t>(host_linear_blocks));
   }
-  if (!block_options.manager_types().empty()) {
-    const int32_t block_size = grouped_block_size;
-    CHECK(util::is_deepseek_v4_model_type(args.model_type()))
-        << "Typed Host cache capacities require a DeepSeek-V4 grouped cache.";
-    CHECK_GT(runtime_options.host_blocks_factor(), 1.0)
-        << "Typed Host cache capacities require host offload.";
-    CHECK_GT(block_size, 0);
-
-    const bool is_v41 = util::is_deepseek_v41_model_type(args.model_type());
-    const int64_t indexed_group_count =
-        is_v41 ? kv_cache_cap.c2_count() : kv_cache_cap.c4_count();
-    const int64_t history_group_count =
-        is_v41 ? kv_cache_cap.c1_count() : kv_cache_cap.c128_count();
-    const int64_t swa_source_count = is_v41 && indexed_group_count > 0
-                                         ? indexed_group_count
-                                         : history_group_count;
-    if (history_group_count > 0) {
-      const int64_t host_history_count = scale_host_block_count(
-          history_group_count, runtime_options.host_blocks_factor());
-      CHECK_LE(host_history_count,
-               static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
-      host_capacities.emplace(is_v41 ? BlockType::C1 : BlockType::C128,
-                              static_cast<uint32_t>(host_history_count));
-    }
-    if (kv_cache_cap.swa_count() > 0) {
-      CHECK_GT(swa_source_count, 0)
-          << "DeepSeek-V4 Host SWA capacity requires a positive checkpoint "
-             "group count.";
-      const int64_t host_swa_count = dsv4_host_swa_block_count(
-          swa_source_count,
-          runtime_options.host_blocks_factor(),
-          block_options.sliding_window_size(),
-          block_size,
-          dsv41_cache_unit_tokens(is_v41,
-                                  static_cast<size_t>(block_size),
-                                  block_options.compress_ratios()));
-      CHECK_LE(host_swa_count,
-               static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
-      host_capacities.emplace(BlockType::SWA,
-                              static_cast<uint32_t>(host_swa_count));
-    }
-    if (indexed_group_count > 0) {
-      const int64_t host_indexed_count = scale_host_block_count(
-          indexed_group_count, runtime_options.host_blocks_factor());
-      CHECK_LE(host_indexed_count,
-               static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
-      host_capacities.emplace(is_v41 ? BlockType::C2 : BlockType::C4,
-                              static_cast<uint32_t>(host_indexed_count));
-    }
+  if (kv_cache_cap.swa_count() > 0) {
+    CHECK_GT(host_kv_block_count, 0)
+        << "Host SWA checkpoints require positive KV capacity.";
+    const int64_t host_swa_count =
+        dsv4_host_swa_block_count(kv_cache_cap.n_blocks(),
+                                  runtime_options.host_blocks_factor(),
+                                  block_options.sliding_window_size(),
+                                  kv_cache_cap.swa_block_size(),
+                                  kv_cache_cap.block_size());
+    CHECK_LE(host_swa_count,
+             static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
+    host_capacities.emplace(BlockType::SWA,
+                            static_cast<uint32_t>(host_swa_count));
   }
 
   block_options.host_num_blocks_by_type(std::move(host_capacities));

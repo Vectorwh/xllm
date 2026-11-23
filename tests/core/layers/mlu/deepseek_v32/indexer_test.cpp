@@ -1092,7 +1092,7 @@ void idx_expect_entry_scores(ParallelArgs& parallel_args_,
   parallel_args_.world_size() = 2;
   parallel_args_.kv_split_size() = 2;
   const KVShardLayout layout(
-      /*physical_block_size=*/16, /*dcp_size=*/2, /*dcp_rank=*/0);
+      /*physical_dim=*/16, /*dcp_size=*/2, /*dcp_rank=*/0);
   // Fixed projections produce opposite query heads and signed head weights.
   inputs.x.fill_(1);
   inputs.q_norm.fill_(1);
@@ -1313,7 +1313,7 @@ TEST_F(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
     SCOPED_TRACE(rank);
     parallel_args_.rank() = rank;
     const KVShardLayout layout(
-        /*physical_block_size=*/16, /*dcp_size=*/4, rank);
+        /*physical_dim=*/16, /*dcp_size=*/4, rank);
     TestInputs inputs;
     DeepseekV32Indexer indexer = idx_create_indexer(parallel_args_,
                                                     test_config_,
@@ -1345,7 +1345,7 @@ TEST_F(DcpIndexerScoreTest, CpCandidatesPreserveGlobalTopk) {
   gathered.gathered_scores = torch::stack(rank_scores);
   gathered.gathered_global_slots = torch::stack(rank_slots);
   const DcpDecodeContext context(
-      KVShardLayout(/*physical_block_size=*/16, /*dcp_size=*/4, /*dcp_rank=*/0),
+      KVShardLayout(/*physical_dim=*/16, /*dcp_size=*/4, /*dcp_rank=*/0),
       /*dcp_group=*/nullptr);
   const DsaTopkState merged = context.finish_indexer_candidate_merge(
       std::move(gathered), /*topk=*/2048, torch::zeros({2}, int_option_));

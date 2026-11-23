@@ -58,8 +58,8 @@ struct PrefixCacheSnapshot {
 // holders and is updated when those events are dequeued: a STORED is reported
 // only when the hash is inserted, and a REMOVED only when the holder count
 // reaches zero. Snapshot copies the hashes that still have a holder. RPC stays
-// outside this object. KV, C1, and C4 never coexist, so one hash map is the
-// whole published cache.
+// outside this object. All history tensors share one logical resource, so
+// one hash map represents the whole published cache.
 class PrefixCacheJournal final {
  public:
   static PrefixCacheJournal* instance();
@@ -97,8 +97,8 @@ class PrefixCacheJournal final {
   std::atomic<size_t> pending_events_{0};
   moodycamel::BlockingConcurrentQueue<PrefixCacheEvent> pending_;
   // Holder count per published hash. Updated only while draining, in the same
-  // critical section that advances commit_version_. KV, C1, and C4 never share
-  // a process, so one map is enough.
+  // critical section that advances commit_version_. Physical tensor views
+  // share the logical history identity.
   ResidentMap resident_;
 };
 

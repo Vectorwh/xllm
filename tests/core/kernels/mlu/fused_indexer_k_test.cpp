@@ -359,7 +359,7 @@ TEST(FusedIndexerKTest, PreservesStridedInputsOffsetsAndBothGammaTypes) {
       data.gamma = data.gamma.to(dtype);
       data.cache.fill_(kSentinel);
       const torch::Tensor before = data.cache.cpu();
-      // Framework storage uses [blocks,128,1,128], with the same physical rows.
+      // Framework storage uses [blocks,128,1,128], with the same physical dim.
       data.cache = data.cache.view({data.cache.size(0), 128, 1, 128});
       run(data);
       check_result(data, mx, mk, before);

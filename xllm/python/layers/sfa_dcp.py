@@ -67,7 +67,7 @@ def _can_use_fused_remap(
     topk_indices: torch.Tensor,
     *,
     index_topk: int,
-    physical_block_size: int,
+    physical_dim: int,
     dcp_size: int,
 ) -> bool:
     last_dim = int(topk_indices.shape[-1]) if topk_indices.ndim > 0 else 0
@@ -76,7 +76,7 @@ def _can_use_fused_remap(
         index_topk == _REMAP_TOPK
         and last_dim == _REMAP_TOPK
         and 0 < num_tokens <= _REMAP_MAX_TOKENS
-        and _is_power_of_two(physical_block_size)
+        and _is_power_of_two(physical_dim)
         and _is_power_of_two(dcp_size)
         and topk_indices.dtype == torch.int32
         and topk_indices.is_contiguous()
@@ -336,7 +336,7 @@ class AscendSFADCPImpl:
         if not _can_use_fused_remap(
             prefix,
             index_topk=index_topk,
-            physical_block_size=int(self.layout.physical_block_size),
+            physical_dim=int(self.layout.physical_dim),
             dcp_size=int(self.layout.dcp_size),
         ):
             out = get_execution_buffer(
@@ -364,7 +364,7 @@ class AscendSFADCPImpl:
         )
         fused = torch.ops.xllm_ops.sfa_dcp_remap_out(
             prefix,
-            int(self.layout.physical_block_size),
+            int(self.layout.physical_dim),
             int(self.layout.dcp_size),
             int(self.layout.dcp_rank),
             prefix_out,

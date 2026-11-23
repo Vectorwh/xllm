@@ -34,24 +34,19 @@ class BlockManager;
 
 // Identity of a KV block's cache role inside a sequence's KVCacheState. Used as
 // the key of the per-sequence block map: the legacy flat attention KV lives
-// under KV; the grouped-cache models use one triple each -- V4 under
-// SWA/C4/C128 and V4.1 under SWA/C2/C1. EMBEDDING and LINEAR are
-// per-sequence single-resource slots (one block per sequence): EMBEDDING backs
-// the spec-decode embedding-row id, LINEAR backs the GDN recurrent state (its
-// slot id also indexes the conv/ssm KV tensors, which are tagged as the LINEAR
-// cache group). A block carries no type identity itself; the owning
+// under KV; models with a window also use SWA. EMBEDDING and LINEAR
+// are per-sequence single-resource slots (one block per sequence): EMBEDDING
+// backs the spec-decode embedding-row id, LINEAR backs the GDN recurrent state
+// (its slot id also indexes the conv/ssm KV tensors, which are tagged as the
+// LINEAR cache group). A block carries no type identity itself; the owning
 // BlockManager decides which key to store it under when it fills the state.
-// APPEND-ONLY: never renumber or remove an existing enumerator. This type is
-// serialized by number -- as proto BlockType over RPC (worker.proto) and as the
-// cache-group id in persisted Mooncake Store keys -- so a renumber is silently
-// misread by a rolling/mixed-version peer and cold-invalidates store keys. C1
-// and C2 are appended values; both names are new and carry no historical wire
-// or persistence meaning.
+// Serialized numeric identities are stable across RPC and persisted Store
+// keys. Never renumber or reuse retired values. Legacy C* identities remain
+// in worker.proto for schema compatibility, not as local storage roles.
+// Retired: 2 (C4), 3 (C128), 6 (C1), 7 (C2), 8 (COMPRESSED_KV).
 enum class BlockType : int8_t {
-  KV = 0,         // normal/Qwen flat attention KV, exported to block_tables
-  SWA = 1,        // DSV4 sliding window, exported to multi_block_tables[0]
-  C4 = 2,         // DSV4 compressed, exported to multi_block_tables[1]
-  C128 = 3,       // DSV4 compressed, exported to multi_block_tables[2]
+  KV = 0,         // token cache; model tensors share this resource
+  SWA = 1,        // sliding-window token cache
   EMBEDDING = 4,  // per-sequence spec-decode embedding-row slot, exported via
                   // get_embedding_block_id() (embedding_ids). Value kept at 4
                   // for proto BlockType wire compatibility.
@@ -59,27 +54,13 @@ enum class BlockType : int8_t {
                   // from LinearStateBlockManager; exported via
                   // get_linear_block_id() (linear_state_ids). Also the cache
                   // group for the conv/ssm recurrent-state KV tensors.
-  C1 = 6,         // appended: DSV4.1 compressed TOKEN group (kv-source layers,
-                  // ratio 1), exported to multi_block_tables[2] on V4.1 models
-  C2 = 7,         // appended: DSV4.1 compressed TOKEN group (kv-source layers,
-                  // ratio 2), exported to multi_block_tables[1] on V4.1 models
 };
 
-// Fixed column order of worker multi_block_tables. The exported tables must
-// follow this order so they line up with the worker-side DSA group_infos; it
-// must never depend on std::map iteration order or config traversal order.
-// A model only ever populates its own triple: V4 exports [SWA, C4, C128] and
-// V4.1 exports [SWA, C2, C1], so each model's tables stay contiguous and line
-// up with its block-manager registration order. The order below is the
-// registration order, NOT the enum order: build_cache_specs_v41 registers the
-// V4.1 TOKEN groups as [C2 (ratio 2), C1 (ratio 1)] (first kv-source
-// appearance for the standard layer plan), while V4 registers [C4, C128].
-inline constexpr std::array<BlockType, 5> kMultiBlockExportOrder = {
+// Fixed order for nonempty token-cache tables exported to the worker.
+// Ordinary KV retains its single-table path.
+inline constexpr std::array<BlockType, 2> kMultiBlockExportOrder = {
     BlockType::SWA,
-    BlockType::C4,
-    BlockType::C128,
-    BlockType::C2,
-    BlockType::C1};
+    BlockType::KV};
 
 // Stable cache-group identity used by PD transfer. BlockType remains a local
 // storage key; the serialized group id is intentionally opaque to transfer
@@ -95,10 +76,6 @@ inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
   switch (type) {
     case BlockType::KV:
     case BlockType::SWA:
-    case BlockType::C1:
-    case BlockType::C2:
-    case BlockType::C4:
-    case BlockType::C128:
       return true;
     case BlockType::EMBEDDING:
     case BlockType::LINEAR:
@@ -110,10 +87,6 @@ inline constexpr bool is_kv_split_cache_block_type(BlockType type) {
 inline constexpr bool is_prefetch_gate_block_type(BlockType type) {
   switch (type) {
     case BlockType::KV:
-    case BlockType::C4:
-    case BlockType::C128:
-    case BlockType::C1:
-    case BlockType::C2:
       return true;
     case BlockType::SWA:
     case BlockType::EMBEDDING:
@@ -134,14 +107,6 @@ inline constexpr std::optional<BlockType> block_type_from_cache_group_id(
       return BlockType::KV;
     case cache_group_id(BlockType::SWA):
       return BlockType::SWA;
-    case cache_group_id(BlockType::C1):
-      return BlockType::C1;
-    case cache_group_id(BlockType::C2):
-      return BlockType::C2;
-    case cache_group_id(BlockType::C4):
-      return BlockType::C4;
-    case cache_group_id(BlockType::C128):
-      return BlockType::C128;
     case cache_group_id(BlockType::EMBEDDING):
       return BlockType::EMBEDDING;
     case cache_group_id(BlockType::LINEAR):

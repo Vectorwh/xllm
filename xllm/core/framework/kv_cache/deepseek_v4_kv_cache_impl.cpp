@@ -31,9 +31,7 @@ limitations under the License.
 #endif
 #endif
 
-#include "framework/config/kv_cache_config.h"
-#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
-#include "framework/kv_cache/deepseek_v4_cache_policy.h"
+#include "framework/kv_cache/deepseek_v4_cache_layout.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "platform/platform.h"
@@ -66,16 +64,6 @@ torch::Tensor cast_to_nd_format(const torch::Tensor& tensor) {
 #else
   return tensor;
 #endif
-}
-
-std::vector<int64_t> dsv4_block_shape(int64_t block_count,
-                                      int64_t block_size,
-                                      int64_t n_heads,
-                                      int64_t head_dim) {
-  if (Platform::is_mlu()) {
-    return {block_count, n_heads, block_size, head_dim};
-  }
-  return {block_count, block_size, n_heads, head_dim};
 }
 
 Dsv4StateCache make_dsv4_state_cache(torch::Tensor packed,
@@ -150,156 +138,19 @@ void Dsv4StateCache::swap_blocks(const torch::Tensor& src,
   score_ = swap_tensor_blocks(score_, src, dst);
 }
 
-DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
-    const DeepSeekV4KVCacheTensors& tensors)
-    : key_cache_(tensors.key_cache),
-      index_cache_(tensors.index_cache),
-      indexer_cache_scale_(tensors.indexer_cache_scale),
-      swa_cache_(tensors.swa_cache),
-      compress_state_(make_dsv4_state_cache(tensors.compress_state,
-                                            tensors.compress_kv_state,
-                                            tensors.compress_score_state)),
-      index_state_(make_dsv4_state_cache(tensors.compress_index_state,
-                                         tensors.compress_index_kv_state,
-                                         tensors.compress_index_score_state)),
-      compressed_block_type_(tensors.compressed_block_type) {}
-
-DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(
-    const KVCacheShape& kv_cache_shape,
-    const KVCacheCreateOptions& create_options,
-    BlockType type,
-    int64_t layer_count)
-    : compressed_block_type_(type) {
-  // HierarchyKVCacheTransfer creates one Host cache per BlockType; C1/C2
-  // use separate instances, so this identity must not match another group.
-  CHECK(kv_cache_shape.has_key_cache_shape())
-      << "DeepSeek V4 host kv cache shape must contain pool counts.";
-  // Shape contract: V4 [SWA, C4, C128]; V4.1 [SWA, C2, C1].
-  const std::vector<int64_t>& pool_counts = kv_cache_shape.key_cache_shape();
-  CHECK_GE(pool_counts.size(), 3) << "DeepSeek V4 host kv cache shape must be "
-                                  << "[swa_count, c4_count, c128_count].";
-  CHECK_GT(create_options.block_size(), 0)
-      << "DeepSeek V4 block_size must be positive.";
-  CHECK_GT(create_options.head_dim(), 0)
-      << "DeepSeek V4 head_dim must be positive.";
-  CHECK_GT(layer_count, 0)
-      << "DeepSeek V4 host prefix cache layer count must be positive.";
-
-  const bool is_v41 =
-      util::is_deepseek_v41_model_type(create_options.model_type());
-  const double factor = create_options.host_blocks_factor();
-  const int64_t block_size = create_options.block_size();
-  const int64_t head_dim = create_options.head_dim();
-  const int64_t index_head_dim =
-      std::max<int64_t>(create_options.index_head_dim(), 1);
-  const Dsv4CacheGeometry& geometry =
-      KVCacheConfig::get_instance().dsv4_cache_geometry();
-  // V4.1 C1/C2 each store block_size entries. C2 covers twice as many
-  // source tokens, not a larger physical tensor. Both reuse the C4 branch
-  // below; V4 keeps its geometry-defined physical dimension.
-  const int64_t indexed_physical_dim =
-      is_v41 ? block_size : geometry.c4_physical_dim();
-  const int64_t c128_physical_dim = geometry.c128_physical_dim();
-  const int64_t n_heads = 1;
-  const int64_t index_n_heads = 1;
-  const DeepSeekV4CachePolicy cache_policy =
-      get_dsv4_cache_policy(create_options.dtype());
-
-  // Host tensor shape: device per-block dims with a layer dimension inserted at
-  // index 1, i.e. [host_block_count, layer_count, ...per_block_dims].
-  auto host_group_shape = [&](int64_t block_count,
-                              int64_t group_block_size,
-                              int64_t heads,
-                              int64_t dim) {
-    std::vector<int64_t> shape =
-        dsv4_block_shape(block_count, group_block_size, heads, dim);
-    shape.insert(shape.begin() + 1, layer_count);
-    return shape;
-  };
-
-  // Host H2D resumes only at a complete compressed-cache boundary.
-  // Compressor/index state represents partial compression within the current
-  // C4/C128 group and is regenerated after such a boundary, so the SWA host
-  // group stores the persistent window for every DSV4 layer but no compressor
-  // scratch tensors.
-  switch (type) {
-    case BlockType::SWA: {
-      // Host restore resumes at a C128 boundary, so every stored C128 unit
-      // needs exactly one corresponding persistent SWA window. MTP drafts
-      // without compressed layers still offload their standalone SWA cache.
-      // V4.1 checkpoints use the largest registered TOKEN span (C2/C1).
-      const int64_t swa_source_count =
-          is_v41 && pool_counts[1] > 0 ? pool_counts[1] : pool_counts[2];
-      int64_t host_swa_count = create_options.host_swa_block_count();
-      if (host_swa_count <= 0) {
-        host_swa_count =
-            swa_source_count > 0
-                ? dsv4_host_swa_block_count(
-                      swa_source_count,
-                      factor,
-                      create_options.window_size(),
-                      block_size,
-                      dsv41_cache_unit_tokens(
-                          is_v41, block_size, create_options.compress_ratios()))
-                : scale_host_block_count(pool_counts[0], factor);
-      }
-      host_page_aligned_regions_.reserve(1);
-      create_host_tensor(
-          host_group_shape(host_swa_count, block_size, n_heads, head_dim),
-          create_options.dtype(),
-          &swa_cache_,
-          nullptr);
-      break;
-    }
-    case BlockType::C1:
-    case BlockType::C2:
-    case BlockType::C4: {
-      const int64_t host_indexed_count = scale_host_block_count(
-          pool_counts[type == BlockType::C1 ? 2 : 1], factor);
-      host_page_aligned_regions_.reserve(3);
-      create_host_tensor(
-          host_group_shape(
-              host_indexed_count, indexed_physical_dim, n_heads, head_dim),
-          create_options.dtype(),
-          &key_cache_,
-          nullptr);
-      create_host_tensor(host_group_shape(host_indexed_count,
-                                          indexed_physical_dim,
-                                          index_n_heads,
-                                          index_head_dim),
-                         cache_policy.index_dtype,
-                         &index_cache_,
-                         nullptr);
-      // Quantized index values and their per-token scale must travel together
-      // for correct dequantization on H2D restore.
-      if (cache_policy.has_indexer_cache_scale) {
-        std::vector<int64_t> scale_shape = {
-            host_indexed_count, indexed_physical_dim, 1};
-        scale_shape.insert(scale_shape.begin() + 1, layer_count);
-        create_host_tensor(scale_shape,
-                           cache_policy.scale_dtype,
-                           &indexer_cache_scale_,
-                           nullptr);
-      }
-      break;
-    }
-    case BlockType::C128: {
-      const int64_t host_c128_count =
-          scale_host_block_count(pool_counts[2], factor);
-      host_page_aligned_regions_.reserve(1);
-      create_host_tensor(
-          host_group_shape(
-              host_c128_count, c128_physical_dim, n_heads, head_dim),
-          create_options.dtype(),
-          &key_cache_,
-          nullptr);
-      break;
-    }
-    default:
-      LOG(FATAL) << "Unsupported DeepSeek V4 host block type: "
-                 << static_cast<int32_t>(type);
-  }
-}
+DeepSeekV4KVCacheImpl::DeepSeekV4KVCacheImpl(DeepSeekV4KVCacheTensors tensors)
+    : key_cache_(std::move(tensors.key_cache)),
+      index_cache_(std::move(tensors.index_cache)),
+      indexer_cache_scale_(std::move(tensors.indexer_cache_scale)),
+      swa_cache_(std::move(tensors.swa_cache)),
+      compress_state_(
+          make_dsv4_state_cache(std::move(tensors.compress_state),
+                                std::move(tensors.compress_kv_state),
+                                std::move(tensors.compress_score_state))),
+      index_state_(make_dsv4_state_cache(
+          std::move(tensors.compress_index_state),
+          std::move(tensors.compress_index_kv_state),
+          std::move(tensors.compress_index_score_state))) {}
 
 torch::Tensor DeepSeekV4KVCacheImpl::get_k_cache() const { return key_cache_; }
 
@@ -355,12 +206,11 @@ std::vector<KVCacheTensor> DeepSeekV4KVCacheImpl::get_cache_tensors() const {
     }
   };
 
-  add_tensor(KVCacheTensorRole::WINDOW, swa_cache_, BlockType::SWA);
-  add_tensor(KVCacheTensorRole::KEY, key_cache_, compressed_block_type_);
-  add_tensor(KVCacheTensorRole::INDEX, index_cache_, compressed_block_type_);
-  add_tensor(KVCacheTensorRole::INDEX_SCALE,
-             indexer_cache_scale_,
-             compressed_block_type_);
+  add_tensor(KVCacheTensorRole::SWA, swa_cache_, BlockType::SWA);
+  add_tensor(KVCacheTensorRole::KEY, key_cache_, BlockType::KV);
+  add_tensor(KVCacheTensorRole::INDEX, index_cache_, BlockType::KV);
+  add_tensor(
+      KVCacheTensorRole::INDEX_SCALE, indexer_cache_scale_, BlockType::KV);
   if (Platform::is_mlu()) {
     add_tensor(KVCacheTensorRole::COMPRESS_STATE,
                compress_state_.packed(),
@@ -385,39 +235,21 @@ std::vector<KVCacheTensor> DeepSeekV4KVCacheImpl::get_cache_tensors() const {
 
 BlockTypeTensorMap DeepSeekV4KVCacheImpl::get_block_type_tensors(
     BlockType type) const {
-  BlockTypeTensorMap tensor_map;
-  switch (type) {
-    case BlockType::SWA:
-      if (swa_cache_.defined() && swa_cache_.numel() > 0) {
-        tensor_map.emplace(KVCacheTensorRole::SWA, swa_cache_);
-      }
-      break;
-    case BlockType::C1:
-    case BlockType::C2:
-    case BlockType::C4:
-      if (type == compressed_block_type_ && key_cache_.defined() &&
-          key_cache_.numel() > 0 && index_cache_.defined() &&
-          index_cache_.numel() > 0) {
-        tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
-        tensor_map.emplace(KVCacheTensorRole::INDEX, index_cache_);
-        if (indexer_cache_scale_.defined() &&
-            indexer_cache_scale_.numel() > 0) {
-          tensor_map.emplace(KVCacheTensorRole::INDEX_SCALE,
-                             indexer_cache_scale_);
-        }
-      }
-      break;
-    case BlockType::C128:
-      if (type == compressed_block_type_ && key_cache_.defined() &&
-          key_cache_.numel() > 0 &&
-          (!index_cache_.defined() || index_cache_.numel() == 0)) {
-        tensor_map.emplace(KVCacheTensorRole::KEY, key_cache_);
-      }
-      break;
-    default:
-      break;
+  BlockTypeTensorMap tensors;
+  auto add_tensor = [&tensors](KVCacheTensorRole role,
+                               const torch::Tensor& tensor) {
+    if (tensor.defined() && tensor.numel() > 0) {
+      tensors.emplace(role, tensor);
+    }
+  };
+  if (type == BlockType::SWA) {
+    add_tensor(KVCacheTensorRole::SWA, swa_cache_);
+  } else if (type == BlockType::KV) {
+    add_tensor(KVCacheTensorRole::KEY, key_cache_);
+    add_tensor(KVCacheTensorRole::INDEX, index_cache_);
+    add_tensor(KVCacheTensorRole::INDEX_SCALE, indexer_cache_scale_);
   }
-  return tensor_map;
+  return tensors;
 }
 
 bool DeepSeekV4KVCacheImpl::empty() const { return !swa_cache_.defined(); }
@@ -455,310 +287,130 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
   CHECK(kv_cache_shape.has_key_cache_shape())
       << "DeepSeek V4 cache shape must contain cache pool counts.";
   const std::vector<int64_t>& pool_counts = kv_cache_shape.key_cache_shape();
-  CHECK_GE(pool_counts.size(), 3)
-      << "DeepSeek V4/V4.1 cache shape must be [swa_count, c4_count, "
-         "c128_count] (V4) or [swa_count, c2_count, c1_count] (V4.1).";
-  CHECK_GT(create_options.block_size(), 0)
-      << "DeepSeek V4 block_size must be positive.";
-  CHECK_GT(create_options.head_dim(), 0)
-      << "DeepSeek V4 head_dim must be positive.";
-  CHECK_GT(create_options.window_size(), 0)
-      << "DeepSeek V4 window_size must be positive.";
-
-  const int64_t swa_count = pool_counts[0];
-  const int64_t block_size = create_options.block_size();
-  const int64_t head_dim = create_options.head_dim();
-  const int64_t index_head_dim =
-      std::max<int64_t>(create_options.index_head_dim(), 1);
-  const int64_t n_heads = 1;
-  const int64_t index_n_heads = 1;
-  const std::vector<int32_t>& compress_ratios =
-      create_options.compress_ratios();
-  const int32_t compress_ratio =
-      layer_idx < static_cast<int64_t>(compress_ratios.size())
-          ? compress_ratios[static_cast<size_t>(layer_idx)]
-          : 1;
-
-  const DeepSeekV4CachePolicy cache_policy =
-      get_dsv4_cache_policy(create_options.dtype());
-  const std::shared_ptr<KVCacheTensorAllocator> tensor_allocator =
+  CHECK_EQ(pool_counts.size(), 2u)
+      << "DeepSeek V4/V4.1 cache shape must contain window and KV counts.";
+  CHECK_GE(layer_idx, 0);
+  CHECK_GT(create_options.window_size(), 0);
+  const std::vector<int32_t>& ratios = create_options.compress_ratios();
+  const int32_t ratio = layer_idx < static_cast<int64_t>(ratios.size())
+                            ? ratios[static_cast<size_t>(layer_idx)]
+                            : 1;
+  const std::vector<int32_t>& sources = create_options.kv_source_layer_ids();
+  Dsv4CacheLayoutOptions layout_options;
+  layout_options.head_dim = create_options.head_dim();
+  layout_options.index_head_dim = create_options.index_head_dim();
+  layout_options.compress_ratio = ratio;
+  layout_options.dtype = create_options.dtype();
+  layout_options.is_v41 =
+      util::is_deepseek_v41_model_type(create_options.model_type());
+  layout_options.is_kv_source_layer =
+      std::find(sources.begin(), sources.end(), layer_idx) != sources.end();
+  const Dsv4LayerCacheLayout layout =
+      build_dsv4_layer_cache_layout(layout_options);
+  const int64_t kv_block_count = pool_counts[1];
+  const std::shared_ptr<KVCacheTensorAllocator> allocator =
       create_options.tensor_allocator();
-
+  auto allocate_raw = [&](const CacheTensorAllocationSpec& spec,
+                          const std::vector<int64_t>& shape) {
 #if defined(USE_NPU)
-  const bool use_huge_page_allocator =
-      create_options.enable_kv_cache_huge_page_allocator();
-#endif
-  auto allocate_raw = [&](KVCacheTensorRole role,
-                          const std::vector<int64_t>& dims,
-                          torch::ScalarType dtype) {
-#if defined(USE_NPU)
-    if (use_huge_page_allocator) {
-      return alloc_npu_huge_page_tensor(dims, dtype, ACL_FORMAT_ND);
+    if (create_options.enable_kv_cache_huge_page_allocator()) {
+      return alloc_npu_huge_page_tensor(shape, spec.dtype, ACL_FORMAT_ND);
     }
 #endif
-    if (tensor_allocator != nullptr) {
-      return cast_to_nd_format(tensor_allocator->allocate(
-          role, dims, dtype, create_options.device()));
+    if (allocator != nullptr) {
+      return cast_to_nd_format(allocator->allocate(
+          spec.role, shape, spec.dtype, create_options.device()));
     }
     return cast_to_nd_format(torch::empty(
-        dims, torch::dtype(dtype).device(create_options.device())));
+        shape, torch::dtype(spec.dtype).device(create_options.device())));
   };
-
-  // Zero-initialize every KV group tensor.  A slot that a sequence never wrote
-  // must read as 0: an empty/padded DP shard carries a context length but no
-  // SWA history, so without this its ring gather reads uninitialized HBM and
-  // feeds NaN/Inf (or huge finite garbage) into the softmax, which then
-  // poisons the DP-gathered MoE and the decode logits.  Real slots are written
-  // before use, so zeroing only affects never-written rows.
-  auto allocate_tensor = [&](KVCacheTensorRole role,
-                             const std::vector<int64_t>& dims,
-                             torch::ScalarType dtype) {
-    torch::Tensor tensor = allocate_raw(role, dims, dtype);
+  auto allocate_tensor = [&](const CacheTensorAllocationSpec& spec) {
+    std::vector<int64_t> shape = spec.block_shape;
+    shape.insert(
+        shape.begin(),
+        spec.block_type == BlockType::SWA ? pool_counts[0] : kv_block_count);
+    torch::Tensor tensor = allocate_raw(spec, shape);
+    // Empty/padded DP shards can read never-written slots. Preserve the
+    // existing zero initialization for every owned plane, including states.
     tensor.zero_();
     return tensor;
   };
 
-  auto allocate_state = [&](KVCacheTensorRole packed_role,
-                            KVCacheTensorRole kv_role,
-                            KVCacheTensorRole score_role,
-                            int64_t rows,
-                            int64_t state_width) {
-    if (Platform::is_mlu()) {
-      // The packed owner is transferred by PD and passed to fused compression
-      // kernels; kv() and score() expose writable views of the same allocation.
-      return Dsv4StateCache::from_packed(
-          allocate_tensor(
-              packed_role, {swa_count, rows, 2 * state_width}, torch::kFloat32),
-          /*fallback_kv=*/torch::Tensor(),
-          /*fallback_score=*/torch::Tensor());
-    }
-    torch::Tensor kv = allocate_tensor(
-        kv_role, {swa_count, rows, state_width}, torch::kFloat32);
-    torch::Tensor score = allocate_tensor(
-        score_role, {swa_count, rows, state_width}, torch::kFloat32);
-    return Dsv4StateCache::from_split(std::move(kv), std::move(score));
-  };
-
-  // DeepSeek V4.1 (contract §2): the pool vector is positional
-  // [swa_count, c2_count, c1_count]; only kv-source layers allocate TOKEN
-  // group tensors (key + index), all other layers are SWA only. The key plane
-  // stays in the model dtype; the index plane and its optional per-token scale
-  // come from the platform policy (cache_policy), NOT from the DSA-side
-  // --indexer_cache_dtype switch: on NPU the index plane is int8 plus an fp16
-  // INDEX_SCALE, on MLU it stays the model dtype with no scale. Ratio-2 kv
-  // sources additionally own the fp32 compressor states, which live in the SWA
-  // group (ring slot = pos % block_size).
-  if (util::is_deepseek_v41_model_type(create_options.model_type())) {
-    const int64_t c2_count = pool_counts[1];
-    const int64_t c1_count = pool_counts[2];
-    const std::vector<int32_t>& kv_source_layer_ids =
-        create_options.kv_source_layer_ids();
-    const bool is_kv_source_layer =
-        std::find(kv_source_layer_ids.begin(),
-                  kv_source_layer_ids.end(),
-                  static_cast<int32_t>(layer_idx)) != kv_source_layer_ids.end();
-
-    DeepSeekV4KVCacheTensors tensors;
-    if (is_kv_source_layer && compress_ratio == 2) {
-      tensors.compressed_block_type = BlockType::C2;
-      tensors.key_cache = allocate_tensor(
-          KVCacheTensorRole::KEY,
-          dsv4_block_shape(c2_count, block_size, n_heads, head_dim),
-          create_options.dtype());
-      tensors.index_cache = allocate_tensor(
-          KVCacheTensorRole::INDEX,
-          dsv4_block_shape(c2_count, block_size, index_n_heads, index_head_dim),
-          cache_policy.index_dtype);
-      if (cache_policy.has_indexer_cache_scale) {
-        tensors.indexer_cache_scale =
-            allocate_tensor(KVCacheTensorRole::INDEX_SCALE,
-                            {c2_count, block_size, 1},
-                            cache_policy.scale_dtype);
-      }
-      tensors.swa_cache = allocate_tensor(
-          KVCacheTensorRole::WINDOW,
-          dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-          create_options.dtype());
-      // V4.1 compressor state ring is fixed to kDsv41CompressStateRows rows
-      // (vllm-ascend STATE_RING_ROWS / Triton CACHE_SIZE), not the engine
-      // block size: only the trailing partial group can be re-read. Keep the
-      // byte model in estimate_dsv41_kv_cache_cost in lockstep.
-      Dsv4StateCache compress_state =
-          allocate_state(KVCacheTensorRole::COMPRESS_STATE,
-                         KVCacheTensorRole::KV_STATE,
-                         KVCacheTensorRole::SCORE_STATE,
-                         kDsv41CompressStateRows,
-                         head_dim);
-      tensors.compress_state = compress_state.packed();
-      tensors.compress_kv_state = compress_state.kv();
-      tensors.compress_score_state = compress_state.score();
-    } else if (is_kv_source_layer && compress_ratio == 1) {
-      tensors.compressed_block_type = BlockType::C1;
-      tensors.key_cache = allocate_tensor(
-          KVCacheTensorRole::KEY,
-          dsv4_block_shape(c1_count, block_size, n_heads, head_dim),
-          create_options.dtype());
-      tensors.index_cache = allocate_tensor(
-          KVCacheTensorRole::INDEX,
-          dsv4_block_shape(c1_count, block_size, index_n_heads, index_head_dim),
-          cache_policy.index_dtype);
-      if (cache_policy.has_indexer_cache_scale) {
-        tensors.indexer_cache_scale =
-            allocate_tensor(KVCacheTensorRole::INDEX_SCALE,
-                            {c1_count, block_size, 1},
-                            cache_policy.scale_dtype);
-      }
-      tensors.swa_cache = allocate_tensor(
-          KVCacheTensorRole::WINDOW,
-          dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-          create_options.dtype());
-    } else {
-      tensors.swa_cache = allocate_tensor(
-          KVCacheTensorRole::WINDOW,
-          dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-          create_options.dtype());
-    }
-    return tensors;
-  }
-
-  const int64_t c4_count = pool_counts[1];
-  const int64_t c128_count = pool_counts[2];
-
   DeepSeekV4KVCacheTensors tensors;
-  if (compress_ratio == 0 || compress_ratio == 1) {
-    tensors.swa_cache = allocate_tensor(
-        KVCacheTensorRole::WINDOW,
-        dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-        create_options.dtype());
-  } else if (compress_ratio == 4) {
-    const int64_t compressed_physical_dim =
-        KVCacheConfig::get_instance()
-            .dsv4_cache_geometry()
-            .compressed_physical_dim(compress_ratio);
-    tensors.compressed_block_type = BlockType::C4;
-    tensors.key_cache = allocate_tensor(
-        KVCacheTensorRole::KEY,
-        dsv4_block_shape(c4_count, compressed_physical_dim, n_heads, head_dim),
-        create_options.dtype());
-    tensors.index_cache = allocate_tensor(
-        KVCacheTensorRole::INDEX,
-        dsv4_block_shape(
-            c4_count, compressed_physical_dim, index_n_heads, index_head_dim),
-        cache_policy.index_dtype);
-    if (cache_policy.has_indexer_cache_scale) {
-      tensors.indexer_cache_scale =
-          allocate_tensor(KVCacheTensorRole::INDEX_SCALE,
-                          {c4_count, compressed_physical_dim, 1},
-                          cache_policy.scale_dtype);
+  for (const CacheTensorAllocationSpec& spec : layout.tensors) {
+    torch::Tensor tensor = allocate_tensor(spec);
+    switch (spec.role) {
+      case KVCacheTensorRole::KEY:
+        tensors.key_cache = std::move(tensor);
+        break;
+      case KVCacheTensorRole::INDEX:
+        tensors.index_cache = std::move(tensor);
+        break;
+      case KVCacheTensorRole::INDEX_SCALE:
+        tensors.indexer_cache_scale = std::move(tensor);
+        break;
+      case KVCacheTensorRole::SWA:
+        tensors.swa_cache = std::move(tensor);
+        break;
+      case KVCacheTensorRole::KV_STATE:
+        tensors.compress_kv_state = std::move(tensor);
+        break;
+      case KVCacheTensorRole::SCORE_STATE:
+        tensors.compress_score_state = std::move(tensor);
+        break;
+      case KVCacheTensorRole::INDEX_KV_STATE:
+        tensors.compress_index_kv_state = std::move(tensor);
+        break;
+      case KVCacheTensorRole::INDEX_SCORE_STATE:
+        tensors.compress_index_score_state = std::move(tensor);
+        break;
+      case KVCacheTensorRole::COMPRESS_STATE: {
+        tensors.compress_state = std::move(tensor);
+        const int64_t width = tensors.compress_state.size(2) / 2;
+        tensors.compress_kv_state =
+            tensors.compress_state.narrow(/*dim=*/2, /*start=*/0, width);
+        tensors.compress_score_state =
+            tensors.compress_state.narrow(/*dim=*/2, width, width);
+        break;
+      }
+      case KVCacheTensorRole::COMPRESS_INDEX_STATE: {
+        tensors.compress_index_state = std::move(tensor);
+        const int64_t width = tensors.compress_index_state.size(2) / 2;
+        tensors.compress_index_kv_state =
+            tensors.compress_index_state.narrow(/*dim=*/2, /*start=*/0, width);
+        tensors.compress_index_score_state =
+            tensors.compress_index_state.narrow(/*dim=*/2, width, width);
+        break;
+      }
+      default:
+        LOG(FATAL) << "Unsupported DSV4 allocation role: "
+                   << spec.role.to_string();
     }
-    tensors.swa_cache = allocate_tensor(
-        KVCacheTensorRole::WINDOW,
-        dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-        create_options.dtype());
-    Dsv4StateCache compress_state =
-        allocate_state(KVCacheTensorRole::COMPRESS_STATE,
-                       KVCacheTensorRole::KV_STATE,
-                       KVCacheTensorRole::SCORE_STATE,
-                       block_size,
-                       /*state_width=*/2 * head_dim);
-    tensors.compress_state = compress_state.packed();
-    tensors.compress_kv_state = compress_state.kv();
-    tensors.compress_score_state = compress_state.score();
-    Dsv4StateCache index_state =
-        allocate_state(KVCacheTensorRole::COMPRESS_INDEX_STATE,
-                       KVCacheTensorRole::INDEX_KV_STATE,
-                       KVCacheTensorRole::INDEX_SCORE_STATE,
-                       block_size,
-                       /*state_width=*/2 * index_head_dim);
-    tensors.compress_index_state = index_state.packed();
-    tensors.compress_index_kv_state = index_state.kv();
-    tensors.compress_index_score_state = index_state.score();
-  } else if (compress_ratio == 128) {
-    const int64_t compressed_physical_dim =
-        KVCacheConfig::get_instance()
-            .dsv4_cache_geometry()
-            .compressed_physical_dim(compress_ratio);
-    tensors.compressed_block_type = BlockType::C128;
-    tensors.key_cache = allocate_tensor(
-        KVCacheTensorRole::KEY,
-        dsv4_block_shape(
-            c128_count, compressed_physical_dim, n_heads, head_dim),
-        create_options.dtype());
-    tensors.swa_cache = allocate_tensor(
-        KVCacheTensorRole::WINDOW,
-        dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-        create_options.dtype());
-    Dsv4StateCache compress_state =
-        allocate_state(KVCacheTensorRole::COMPRESS_STATE,
-                       KVCacheTensorRole::KV_STATE,
-                       KVCacheTensorRole::SCORE_STATE,
-                       block_size,
-                       head_dim);
-    tensors.compress_state = compress_state.packed();
-    tensors.compress_kv_state = compress_state.kv();
-    tensors.compress_score_state = compress_state.score();
-  } else {
-    tensors.swa_cache = allocate_tensor(
-        KVCacheTensorRole::WINDOW,
-        dsv4_block_shape(swa_count, block_size, n_heads, head_dim),
-        create_options.dtype());
   }
-
   return tensors;
 }
 
-std::string dsv4_shape_summary(const DeepSeekV4KVCacheTensors& tensors,
-                               int32_t compress_ratio) {
+std::string dsv4_shape_summary(const DeepSeekV4KVCacheTensors& tensors) {
   std::ostringstream summary;
-  // V4.1: the compressed_block_type tag (C1/C2) identifies a kv-source
-  // layer's TOKEN-group tensors; the compress ratio alone cannot distinguish
-  // kv-source from reuse layers.
-  if (tensors.compressed_block_type == BlockType::C2) {
-    summary << "key_cache=" << tensor_shape_string(tensors.key_cache)
-            << ", index_cache=" << tensor_shape_string(tensors.index_cache)
-            << ", indexer_cache_scale="
-            << tensor_shape_string(tensors.indexer_cache_scale)
-            << ", swa_cache=" << tensor_shape_string(tensors.swa_cache)
-            << ", compress_kv_state="
-            << tensor_shape_string(tensors.compress_kv_state)
-            << ", compress_score_state="
-            << tensor_shape_string(tensors.compress_score_state);
-    return summary.str();
-  }
-  if (tensors.compressed_block_type == BlockType::C1) {
-    summary << "key_cache=" << tensor_shape_string(tensors.key_cache)
-            << ", index_cache=" << tensor_shape_string(tensors.index_cache)
-            << ", indexer_cache_scale="
-            << tensor_shape_string(tensors.indexer_cache_scale)
-            << ", swa_cache=" << tensor_shape_string(tensors.swa_cache);
-    return summary.str();
-  }
-  if (compress_ratio == 0 || compress_ratio == 1) {
-    summary << "swa_cache=" << tensor_shape_string(tensors.swa_cache);
-  } else if (compress_ratio == 4) {
-    summary << "key_cache=" << tensor_shape_string(tensors.key_cache)
-            << ", index_cache=" << tensor_shape_string(tensors.index_cache)
-            << ", indexer_cache_scale="
-            << tensor_shape_string(tensors.indexer_cache_scale)
-            << ", swa_cache=" << tensor_shape_string(tensors.swa_cache)
-            << ", compress_kv_state="
-            << tensor_shape_string(tensors.compress_kv_state)
-            << ", compress_score_state="
-            << tensor_shape_string(tensors.compress_score_state)
-            << ", compress_index_kv_state="
-            << tensor_shape_string(tensors.compress_index_kv_state)
-            << ", compress_index_score_state="
-            << tensor_shape_string(tensors.compress_index_score_state);
-  } else if (compress_ratio == 128) {
-    summary << "key_cache=" << tensor_shape_string(tensors.key_cache)
-            << ", swa_cache=" << tensor_shape_string(tensors.swa_cache)
-            << ", compress_kv_state="
-            << tensor_shape_string(tensors.compress_kv_state)
-            << ", compress_score_state="
-            << tensor_shape_string(tensors.compress_score_state);
-  } else {
-    summary << "swa_cache=" << tensor_shape_string(tensors.swa_cache);
-  }
+  bool first = true;
+  auto append = [&](const char* name, const torch::Tensor& tensor) {
+    if (!tensor.defined()) {
+      return;
+    }
+    if (!first) {
+      summary << ", ";
+    }
+    summary << name << "=" << tensor_shape_string(tensor);
+    first = false;
+  };
+  append("key_cache", tensors.key_cache);
+  append("index_cache", tensors.index_cache);
+  append("indexer_cache_scale", tensors.indexer_cache_scale);
+  append("swa_cache", tensors.swa_cache);
+  append("compress_kv_state", tensors.compress_kv_state);
+  append("compress_score_state", tensors.compress_score_state);
+  append("compress_index_kv_state", tensors.compress_index_kv_state);
+  append("compress_index_score_state", tensors.compress_index_score_state);
   return summary.str();
 }
 

@@ -151,7 +151,6 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     }
 
     deepseek_v4_build_cache_specs(model_args_, caches_info_, group_infos_);
-    align_cache_specs_to_dsv4_managers();
 
     mtp_layers_.reserve(mtp_n_layers);
     for (int32_t i = 0; i < mtp_n_layers; ++i) {
@@ -451,51 +450,6 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   }
 
  private:
-  void align_cache_specs_to_dsv4_managers() {
-    // TODO: Remove this hardcoded DSV4 group_infos once the draft can
-    // share editable model args with the target through a standard path.
-    const int32_t window_size = static_cast<int32_t>(window_size_);
-    if (group_infos_.size() >= 3) {
-      return;
-    }
-    const Dsv4CacheGeometry& geometry =
-        KVCacheConfig::get_instance().dsv4_cache_geometry();
-    const int32_t c4_physical_dim =
-        static_cast<int32_t>(geometry.c4_physical_dim());
-    const int32_t c128_physical_dim =
-        static_cast<int32_t>(geometry.c128_physical_dim());
-    group_infos_ = {{DSACacheType::SLIDING_WINDOW, 1, window_size},
-                    {DSACacheType::TOKEN, 4, c4_physical_dim},
-                    {DSACacheType::TOKEN, 128, c128_physical_dim}};
-    caches_info_.assign(static_cast<size_t>(model_args_.n_layers()), {});
-    for (int32_t layer_id = 0; layer_id < model_args_.n_layers(); ++layer_id) {
-      const int32_t cr = util::deepseek_v4_normalize_compress_ratio(
-          layer_id < static_cast<int32_t>(model_args_.compress_ratios().size())
-              ? model_args_.compress_ratios()[static_cast<size_t>(layer_id)]
-              : 1);
-      if (cr == 4) {
-        caches_info_[static_cast<size_t>(layer_id)] = {
-            {1, DSACacheType::TOKEN, 4, c4_physical_dim},
-            {1, DSACacheType::TOKEN, 4, c4_physical_dim},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {1, DSACacheType::TOKEN, 4, c4_physical_dim}};
-      } else if (cr == 128) {
-        caches_info_[static_cast<size_t>(layer_id)] = {
-            {2, DSACacheType::TOKEN, 128, c128_physical_dim},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size},
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size}};
-      } else {
-        caches_info_[static_cast<size_t>(layer_id)] = {
-            {0, DSACacheType::SLIDING_WINDOW, 1, window_size}};
-      }
-    }
-  }
-
   static std::optional<torch::Tensor> as_optional_tensor(
       const torch::Tensor& tensor) {
     if (tensor.defined() && tensor.numel() > 0) {
@@ -540,7 +494,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     pad_lens_vec(params.attention.host.kv_seq_lens);
     pad_lens_vec(params.attention.host.q_seq_lens);
 
-    const int32_t manager_num = static_cast<int32_t>(group_infos_.size());
+    const int32_t manager_num = dsa_block_table_count(group_infos_);
     bool has_full_multi_block_tables =
         static_cast<int32_t>(params.multi_block_tables.size()) == manager_num;
     if (has_full_multi_block_tables) {
@@ -650,7 +604,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
       return;
     }
 
-    const int32_t manager_num = static_cast<int32_t>(group_infos_.size());
+    const int32_t manager_num = dsa_block_table_count(group_infos_);
     params.multi_block_tables.reserve(manager_num);
     for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
       params.multi_block_tables.emplace_back(

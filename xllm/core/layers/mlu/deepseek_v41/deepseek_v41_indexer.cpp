@@ -149,12 +149,12 @@ void DeepseekV41IndexerImpl::select_candidate_indices(
        torch::arange(candidate_block, options_.dtype(torch::kInt64)))
           .flatten();
   auto safe = logical.clamp(0, length - 1);
+  const int64_t physical_dim = kDeepseekV41MluKVBlockSize / std::max(ratio_, 1);
   auto physical =
       table.to(torch::kInt64)
-              .index_select(
-                  0, torch::floor_divide(safe, kDeepseekV41MluKVBlockSize)) *
-          kDeepseekV41MluKVBlockSize +
-      safe.remainder(kDeepseekV41MluKVBlockSize);
+              .index_select(0, torch::floor_divide(safe, physical_dim)) *
+          physical_dim +
+      safe.remainder(physical_dim);
   auto keys = cache.index_select(0, physical).to(torch::kFloat32);
   auto scores = (torch::matmul(iq, keys.t()).relu() * iw.unsqueeze(1)).sum(0);
   const double neg_inf = -std::numeric_limits<double>::infinity();
@@ -188,7 +188,10 @@ void DeepseekV41IndexerImpl::select_decode_indices(const torch::Tensor& iq,
   kernel::mlu::masked_indexer_select_paged_kv(
       iq.to(options_.dtype())
           .view({1, 1, args_.index_n_heads(), args_.index_head_dim()}),
-      cache.view({-1, 1, kDeepseekV41MluKVBlockSize, args_.index_head_dim()}),
+      cache.view({-1,
+                  1,
+                  kDeepseekV41MluKVBlockSize / std::max(ratio_, 1),
+                  args_.index_head_dim()}),
       iw.view({1, 1, -1}),
       logical_pages,
       std::nullopt,
@@ -197,7 +200,7 @@ void DeepseekV41IndexerImpl::select_decode_indices(const torch::Tensor& iq,
       table.view({1, -1}),
       false,
       args_.index_topk(),
-      kDeepseekV41MluKVBlockSize,
+      kDeepseekV41MluKVBlockSize / std::max(ratio_, 1),
       1.0,
       std::nullopt,
       std::nullopt,

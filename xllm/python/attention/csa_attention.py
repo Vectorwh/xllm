@@ -44,9 +44,11 @@ from xllm.python.attention.backend import (
 from xllm.python.attention.dsa_metadata import (
     DSA_CACHE_SLIDING_WINDOW,
     DSA_CACHE_TOKEN,
+    DSV4_SWA_BLOCK_SIZE,
     DsaMetadata,
     DsaMetadataBuilder,
     build_cache_specs,
+    dsa_block_table_groups,
 )
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
@@ -332,8 +334,8 @@ class DsaAttentionBackend(AttentionBackend):
     ) -> None:
         self.caches_info, self.group_infos = build_cache_specs(
             compress_ratios,
-            window_size,
-            n_layers,
+            swa_block_size=DSV4_SWA_BLOCK_SIZE,
+            n_layers=n_layers,
         )
         self._builder = DsaMetadataBuilder(self.caches_info, self.group_infos)
         self.window_size = window_size
@@ -352,7 +354,7 @@ class DsaAttentionBackend(AttentionBackend):
         for layer_id, layer_caches in enumerate(self.caches_info):
             for cache_id, cache_info in enumerate(layer_caches):
                 if cache_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
-                    self._dspark_swa_location = (layer_id, cache_id, cache_info.block_size)
+                    self._dspark_swa_location = (layer_id, cache_id, cache_info.physical_dim)
                     break
             if self._dspark_swa_location is not None:
                 break
@@ -456,12 +458,9 @@ class DsaAttentionBackend(AttentionBackend):
             and host_tables is not None
         ):
             multi_block_tables = list(host_tables)
-        # Speculative draft inputs inherit the target model's SWA/C4/C128
-        # manager tables.  A draft model can register only the SWA group, so
-        # keep the prefix consumed by this backend, matching the C++ model's
-        # deepseek_v4_clamp_multi_block_tables behavior.
-        if len(multi_block_tables) > len(self.group_infos):
-            multi_block_tables = multi_block_tables[: len(self.group_infos)]
+        table_count = len(dsa_block_table_groups(self.group_infos))
+        if len(multi_block_tables) > table_count:
+            multi_block_tables = multi_block_tables[:table_count]
         # The raw host tensor stays available for the dummy-row fallback below;
         # the sequence lengths themselves are resolved after ``positions`` so
         # the expanded spec-verify view and the dummy row can be consulted.
@@ -577,16 +576,19 @@ class DsaAttentionBackend(AttentionBackend):
         TOKEN groups retain their captured semantic capacity, while SWA keeps
         one ring-buffer column and lets the builder pad its graph storage.
         """
-        normalized: list[torch.Tensor] = []
-        for group_id, group_info in enumerate(self.group_infos):
+        table_groups = dsa_block_table_groups(self.group_infos)
+        table_columns = [1] * len(table_groups)
+        table_devices = [fallback_device] * len(table_groups)
+        for group_info in self.group_infos:
+            group_id = group_info.cache_type
             if group_info.cache_type == DSA_CACHE_TOKEN:
                 cache_slot_count = dummy_kv_len // group_info.ratio
             elif group_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
-                cache_slot_count = group_info.block_size
+                cache_slot_count = group_info.physical_dim
             else:
                 cache_slot_count = dummy_kv_len
             required_columns = max(
-                (cache_slot_count + group_info.block_size - 1) // group_info.block_size,
+                (cache_slot_count + group_info.physical_dim - 1) // group_info.physical_dim,
                 1,
             )
 
@@ -598,7 +600,7 @@ class DsaAttentionBackend(AttentionBackend):
                 captured_columns = int(table.size(1))
             if group_info.cache_type == DSA_CACHE_SLIDING_WINDOW:
                 required_storage_columns = max(
-                    (dummy_kv_len + group_info.block_size - 1) // group_info.block_size,
+                    (dummy_kv_len + group_info.physical_dim - 1) // group_info.physical_dim,
                     1,
                 )
                 if graph_mode and graph_block_table_capacity_cols < required_storage_columns:
@@ -610,14 +612,12 @@ class DsaAttentionBackend(AttentionBackend):
                 block_count = required_columns
             else:
                 block_count = max(required_columns, captured_columns)
-            normalized.append(
-                torch.zeros(
-                    (batch_size, block_count),
-                    dtype=torch.int32,
-                    device=device,
-                )
-            )
-        return normalized
+            table_columns[group_id] = max(table_columns[group_id], block_count)
+            table_devices[group_id] = device
+        return [
+            torch.zeros((batch_size, columns), dtype=torch.int32, device=device)
+            for columns, device in zip(table_columns, table_devices, strict=True)
+        ]
 
     def refresh_dsa_metadata_for_graph_replay(
         self,
@@ -1343,7 +1343,7 @@ class DsaAttentionBackend(AttentionBackend):
     def page_size(self) -> int:
         if self._kv_caches and self._kv_caches[0].swa is not None and self._kv_caches[0].swa.dim() > 1:
             return self._kv_caches[0].swa.size(1)
-        return self.window_size
+        return DSV4_SWA_BLOCK_SIZE
 
     # -- model-attached state ----------------------------------------------
     # The DeepseekV4 model owns the RoPE tables, Hadamard matrix, and the

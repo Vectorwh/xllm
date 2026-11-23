@@ -86,7 +86,7 @@ def build_remap_topk_kernel(
         idx_scratch: T.Tensor((max_elems,), "int32"),
         idx_scratch_u: T.Tensor((max_elems,), "uint32"),
         num_tokens: T.int32,
-        physical_block_size: T.int32,
+        physical_dim: T.int32,
         shard_size: T.int32,
         shard_rank: T.int32,
     ):
@@ -109,8 +109,8 @@ def build_remap_topk_kernel(
                 full_ge_mask = T.alloc_ub((full_mask_len,), "uint8")
                 full_owner_mask = T.alloc_ub((full_mask_len,), "uint8")
                 work0_fp_ub = T.alloc_ub((topk,), "float32")
-                logical_fp = T.Cast("float32", physical_block_size * shard_size)
-                physical_fp = T.Cast("float32", physical_block_size)
+                logical_fp = T.Cast("float32", physical_dim * shard_size)
+                physical_fp = T.Cast("float32", physical_dim)
                 v_notify_mte2(REMAP_EVT_SRC0)
                 mte2_wait_v(REMAP_EVT_SRC0)
                 for local_token in T.serial(token_count):
@@ -217,7 +217,7 @@ def remap_topk_kernel_jit(
 
 def fused_remap_sparse_indices(
     topk_indices: torch.Tensor,
-    physical_block_size: int,
+    physical_dim: int,
     shard_size: int,
     shard_rank: int,
     out: torch.Tensor,
@@ -235,7 +235,7 @@ def fused_remap_sparse_indices(
         idx_scratch,
         idx_scratch.view(torch.uint32),
         num_tokens,
-        int(physical_block_size),
+        int(physical_dim),
         int(shard_size),
         int(shard_rank),
     )

@@ -192,7 +192,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
   // A replicated draft pool stores kv_split physical pages per logical block,
   // so the draft's own block table has to be expanded to address them. The
   // logical slot arithmetic in specBuilder is unchanged: run against the
-  // expanded table with the physical block size it still resolves to the
+  // expanded table with the physical dim it still resolves to the
   // draft's flat cache index (logical_block * kv_split + page_in_block).
   // No-op when the draft follows the target's kv_split sharding.
   void expand_draft_block_tables(ModelInputParams& input_params) const;

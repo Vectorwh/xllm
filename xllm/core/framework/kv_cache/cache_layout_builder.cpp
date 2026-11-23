@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "framework/kv_cache/kv_cache_shape.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -462,61 +463,31 @@ int64_t physical_rows_per_resource(KVCacheTensorRole role,
     return indexer_pages_per_block();
   }
   if (role == KVCacheTensorRole::KEY || role == KVCacheTensorRole::VALUE ||
-      role == KVCacheTensorRole::WINDOW) {
+      role == KVCacheTensorRole::SWA) {
     return std::max<int64_t>(replicated_block_pages, 1);
   }
   return 1;
 }
 
-void record_group_block_capacities(const std::vector<KVCache>& kv_caches,
-                                   CacheTensorLayoutContext* tensor_layout) {
-  CHECK(tensor_layout != nullptr);
-  // MLA contexts describe every tensor through the replicated-tensor
-  // contract, which never reads a pool span, and their K/V tensors (NPU NZ
-  // layout) legitimately carry different token-axis spans within one pool.
-  // Recording would only trip the pool-span consistency check.
-  if (tensor_layout->enable_mla) {
-    return;
-  }
-  const int64_t token_axis = tensor_layout->head_major_layout ? 2 : 1;
-  for (const KVCache& cache : kv_caches) {
-    for (const KVCacheTensor& cache_tensor : cache.get_cache_tensors()) {
-      // Only the K/V roles define their pool's token-axis span: compressed
-      // KPool gives INDEX and INDEX_SCALE a narrower span than the K/V
-      // tensors sharing their group, and their geometry is already covered
-      // by index_block_capacity and the group's K/V span.
-      if (!is_kv_head_role(cache_tensor.role)) {
-        continue;
-      }
-      const torch::Tensor& tensor = cache_tensor.tensor;
-      // Tensors without the token axis define no pool span; leave them to
-      // describe_cache_tensor, which rejects them with a precise error.
-      if (!tensor.defined() || tensor.dim() <= token_axis) {
-        continue;
-      }
-      const int64_t span = tensor.size(token_axis);
-      // Uniform pools run at the declared block capacity: recording their
-      // span would make describe validate the tensor against its own size,
-      // muting the producer-capacity check for every untyped model. Only
-      // pools deviating from the uniform capacity define an override.
-      if (span == tensor_layout->block_token_capacity) {
-        continue;
-      }
-      const auto [entry, inserted] =
-          tensor_layout->group_block_capacities.emplace(cache_tensor.group_id,
-                                                        span);
-      CHECK(inserted || entry->second == span)
-          << "Cache tensors of one pool must share the token-axis span, "
-          << "group_id=" << cache_tensor.group_id;
+int64_t effective_block_token_capacity(const CacheTensorLayoutContext& context,
+                                       const KVCacheTensor& cache_tensor) {
+  if (context.has_grouped_cache_layout &&
+      (is_kv_head_role(cache_tensor.role) ||
+       cache_tensor.role == KVCacheTensorRole::SWA ||
+       cache_tensor.role == KVCacheTensorRole::INDEX ||
+       cache_tensor.role == KVCacheTensorRole::INDEX_SCALE)) {
+    const int64_t token_axis =
+        cache_tensor.role == KVCacheTensorRole::INDEX_SCALE ? 1
+        : context.head_major_layout                         ? 2
+                                                            : 1;
+    if (cache_tensor.tensor.dim() > token_axis) {
+      return cache_tensor.tensor.size(token_axis);
     }
   }
-}
-
-int64_t effective_block_token_capacity(const CacheTensorLayoutContext& context,
-                                       int32_t group_id) {
-  const auto it = context.group_block_capacities.find(group_id);
-  if (it != context.group_block_capacities.end()) {
-    return it->second;
+  if ((cache_tensor.role == KVCacheTensorRole::INDEX ||
+       cache_tensor.role == KVCacheTensorRole::INDEX_SCALE) &&
+      context.index_block_capacity > 0) {
+    return context.index_block_capacity;
   }
   return context.block_token_capacity;
 }
@@ -541,12 +512,11 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
     return describe_replicated_index_pages(index_pages, cache_tensor, error);
   }
 
-  // Typed-block pools cover a pool-specific token span per resource; resolve
-  // it once so every describe path below validates against the tensor's own
-  // pool geometry instead of the uniform scheduler block size.
+  // Grouped cache tensors sharing a scheduling resource can have different
+  // physical token-axis lengths.
   CacheTensorLayoutContext effective_context = context;
   effective_context.block_token_capacity =
-      effective_block_token_capacity(context, cache_tensor->group_id);
+      effective_block_token_capacity(context, *cache_tensor);
 
 #if !defined(USE_NPU) && !defined(USE_MLU)
   // Preserve the existing MLA transfer contract on other backends.
@@ -592,10 +562,6 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
     // grouped cache both allocate INDEX/INDEX_SCALE with a physical head
     // dimension of one on every TP rank.
     CacheTensorLayoutContext index_context = effective_context;
-    if (effective_context.index_block_capacity > 0) {
-      index_context.block_token_capacity =
-          effective_context.index_block_capacity;
-    }
     return describe_attention_heads(index_context,
                                     /*global_head_count=*/1,
                                     /*replicated_block_pages=*/1,
@@ -607,6 +573,54 @@ bool describe_cache_tensor(const CacheTensorLayoutContext& context,
   // replicas. This covers grouped state tensors and preserves their independent
   // logical identities instead of treating them as KEY-shaped bytes.
   return describe_replicated_tensor(cache_tensor, error);
+}
+
+CacheTensorLayoutContext make_cache_tensor_layout_context(
+    const ParallelArgs& parallel_args,
+    const ModelArgs& model_args,
+    int64_t block_token_capacity,
+    const LinearAttentionPolicy& linear_policy) {
+  CHECK_GT(parallel_args.dp_size(), 0);
+  CHECK_GT(parallel_args.cp_size(), 0);
+  CHECK_GT(block_token_capacity, 0);
+  CacheTensorLayoutContext context;
+  const int32_t tp_size = parallel_args.world_size() / parallel_args.dp_size() /
+                          parallel_args.cp_size();
+  CHECK_GT(tp_size, 0);
+  const int32_t rank_in_dp =
+      parallel_args.rank() % (parallel_args.cp_size() * tp_size);
+  context.tp_rank = rank_in_dp % tp_size;
+  context.tp_size = tp_size;
+  context.block_token_capacity = block_token_capacity;
+  context.kv_head_count =
+      model_args.n_kv_heads().value_or(model_args.n_heads());
+  context.index_head_count = model_args.index_n_heads();
+  context.linear_head_tp_size = static_cast<int32_t>(
+      linear_head_tp_size(linear_policy, tp_size, parallel_args.cp_size()));
+  context.linear_head_tp_rank = rank_in_dp % context.linear_head_tp_size;
+  context.linear_key_head_count = model_args.linear_num_key_heads();
+  context.linear_value_head_count = model_args.linear_num_value_heads();
+  context.linear_key_head_dim = model_args.linear_key_head_dim();
+  context.enable_mla = model_args.enable_mla();
+#if defined(USE_MLU) || defined(USE_ILU)
+  context.head_major_layout = true;
+#endif
+  return context;
+}
+
+void apply_cache_shape_layout(const KVCacheShape& shape,
+                              CacheTensorLayoutContext* context) {
+  CHECK(context != nullptr);
+  context->has_grouped_cache_layout = shape.has_grouped_cache_layout();
+  context->linear_ssm_checkpoint_stride = shape.linear_ssm_checkpoint_stride();
+  context->replicated_block_pages =
+      std::max<int64_t>(shape.replicated_block_pages(), 1);
+  context->index_block_capacity = 0;
+  if (shape.kpool_layout() == KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
+      shape.has_index_cache_shape()) {
+    context->index_block_capacity =
+        shape.index_cache_shape().at(context->head_major_layout ? 2 : 1);
+  }
 }
 
 }  // namespace xllm

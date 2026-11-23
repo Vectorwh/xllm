@@ -391,7 +391,7 @@ TEST(EmbeddingCacheTest, BuildsDraftReplayInputPlanWithoutRuntimeState) {
       mtp_async::build_draft_replay_input_plan(input,
                                                states,
                                                torch::zeros({2}),
-                                               /*logical_block_size=*/4,
+                                               /*block_size=*/4,
                                                /*uniform_width=*/3,
                                                /*graph_warmup=*/false,
                                                /*pad_cache_slot=*/-1);

@@ -267,7 +267,6 @@ bool RecEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .model_id(options_.model_id())
       .server_idx(options_.server_idx())
-      .model_type(args_.model_type())
       .enable_schedule_overlap(options_.enable_schedule_overlap());
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 

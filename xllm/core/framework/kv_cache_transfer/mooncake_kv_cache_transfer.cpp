@@ -26,8 +26,8 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
-#include "core/framework/config/kv_cache_config.h"
 #include "framework/kv_cache/cache_layout_builder.h"
+#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/push_route.h"
 #include "framework/parallel_state/linear_attention_parallel.h"
@@ -201,28 +201,11 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
   context.coordinates.kv_split_rank = parallel_args.kv_split_rank();
   context.coordinates.kv_split_size = parallel_args.kv_split_size_effective();
 
-  CacheTensorLayoutContext& tensor_layout = context.tensor_layout;
-  tensor_layout.tp_rank = context.coordinates.tp_rank;
-  tensor_layout.tp_size = context.coordinates.tp_size;
-  tensor_layout.block_token_capacity = block_token_capacity;
-  tensor_layout.kv_head_count =
-      model_args.n_kv_heads().value_or(model_args.n_heads());
-  tensor_layout.index_head_count = model_args.index_n_heads();
-  tensor_layout.linear_head_tp_size = static_cast<int32_t>(
-      linear_head_tp_size(linear_policy, tp_size, parallel_args.cp_size()));
-  tensor_layout.linear_head_tp_rank =
-      rank_in_dp % tensor_layout.linear_head_tp_size;
-  tensor_layout.linear_key_head_count = model_args.linear_num_key_heads();
-  tensor_layout.linear_value_head_count = model_args.linear_num_value_heads();
-  tensor_layout.linear_key_head_dim = model_args.linear_key_head_dim();
-  tensor_layout.enable_mla = model_args.enable_mla();
-#if defined(USE_MLU) || defined(USE_ILU)
-  tensor_layout.head_major_layout = true;
-  context.layout_family = "head_token_dim";
-#else
-  tensor_layout.head_major_layout = false;
-  context.layout_family = "token_head_dim";
-#endif
+  context.tensor_layout = make_cache_tensor_layout_context(
+      parallel_args, model_args, block_token_capacity, linear_policy);
+  const CacheTensorLayoutContext& tensor_layout = context.tensor_layout;
+  context.layout_family =
+      tensor_layout.head_major_layout ? "head_token_dim" : "token_head_dim";
 
   context.backend = Platform::type_str();
   std::ostringstream fingerprint;
@@ -230,20 +213,21 @@ void MooncakeKVCacheTransferBase::configure_cache_layout(
               << tensor_layout.kv_head_count << ":" << model_args.head_dim()
               << ":" << tensor_layout.index_head_count;
   if (util::is_deepseek_v4_model_type(model_args.model_type())) {
-    const Dsv4CacheGeometry& geometry =
-        KVCacheConfig::get_instance().dsv4_cache_geometry();
-    fingerprint << "|dsv4_compressed_geometry:"
-                << geometry.compressed_block_token_size() << ":"
-                << geometry.c4_physical_dim() << ":"
-                << geometry.c128_physical_dim();
+    const bool npu_dsv4 =
+        !util::is_deepseek_v41_family_model_type(model_args.model_type()) &&
+        Platform::is_npu();
+    const int64_t kv_block_size = dsv4_kv_block_size(npu_dsv4);
+    fingerprint << "|dsv4_compressed_geometry:" << kv_block_size << ":"
+                << dsv4_physical_dim(kv_block_size, kDsv4C4CompressRatio) << ":"
+                << dsv4_physical_dim(kv_block_size, kDsv4C128CompressRatio);
   }
   if (util::is_deepseek_v41_model_type(model_args.model_type())) {
     // V4.1 grouped pools: the kv-source layer list and the per-kv-source
-    // compress ratios decide which layers export C2/C1 groups and the fp32
-    // compressor state ring (KV_STATE/SCORE_STATE under SWA). Like the V4
-    // physical dims above they are model-config derived, so peers built from
-    // the same weights agree; a peer running a different V4.1 layer plan now
-    // fails pairing here with an explicit fingerprint mismatch instead of a
+    // compress ratios decide which layers own history and the fp32 compressor
+    // state ring (KV_STATE/SCORE_STATE under SWA). Like the V4 physical dims
+    // above they are model-config derived, so peers built from the same
+    // weights agree; a peer running a different V4.1 layer plan now fails
+    // pairing here with an explicit fingerprint mismatch instead of a
     // resource-semantics error at the first transfer.
     auto append_list = [&fingerprint](const char* name, const auto& values) {
       fingerprint << "|" << name << ":" << absl::StrJoin(values, ",");
@@ -351,47 +335,7 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
   if (pending_registration_context_.has_value()) {
     CacheTensorLayoutContext& tensor_layout =
         pending_registration_context_->tensor_layout;
-    tensor_layout.linear_ssm_checkpoint_stride = ssm_checkpoint_stride;
-    // The shape carries the actual producer layout, including compressed KPool
-    // and replicated draft caches. K/V blocks still cover the original token
-    // capacity.
-    tensor_layout.replicated_block_pages =
-        std::max<int64_t>(kv_cache_shape.replicated_block_pages(), 1);
-    tensor_layout.index_block_capacity = 0;
-    if (kv_cache_shape.kpool_layout() ==
-            KPoolCacheLayout::COMPRESSED_WITH_TAIL &&
-        kv_cache_shape.has_index_cache_shape()) {
-      const int64_t token_axis = tensor_layout.head_major_layout ? 2 : 1;
-      tensor_layout.index_block_capacity =
-          kv_cache_shape.index_cache_shape().at(token_axis);
-    }
-    // Typed-block pools (e.g. DSV4 compressed caches) allocate each pool at
-    // its own physical token span; record the spans from the actual tensors
-    // so descriptors and manifests validate against pool geometry.
-    record_group_block_capacities(kv_caches, &tensor_layout);
-    // Typed-pool spans change the manifest capacities published on the wire.
-    // Fold them into the layout fingerprint so a peer built without
-    // per-pool spans fails pairing with an explicit fingerprint mismatch
-    // instead of a per-tensor resource-semantics error. Recorded spans
-    // always deviate from the uniform block capacity, so every entry joins;
-    // uniform registrations keep a byte-identical fingerprint and
-    // mixed-version peers of untyped models still pair.
-    std::vector<std::pair<int32_t, int64_t>> pool_spans;
-    pool_spans.reserve(tensor_layout.group_block_capacities.size());
-    for (const auto& entry : tensor_layout.group_block_capacities) {
-      pool_spans.emplace_back(entry.first, entry.second);
-    }
-    if (!pool_spans.empty()) {
-      std::sort(pool_spans.begin(), pool_spans.end());
-      std::string& fingerprint = pending_registration_context_->fingerprint;
-      fingerprint += "|pool_token_spans:";
-      for (const auto& [group_id, span] : pool_spans) {
-        fingerprint += std::to_string(group_id);
-        fingerprint += ":";
-        fingerprint += std::to_string(span);
-        fingerprint += ";";
-      }
-    }
+    apply_cache_shape_layout(kv_cache_shape, &tensor_layout);
   }
 
   BufLayout layout;
@@ -482,11 +426,11 @@ void MooncakeKVCacheTransferDefault::register_kv_cache(
             static_cast<uint64_t>(tensor.stride(0)) * tensor.element_size() *
             static_cast<uint64_t>(rows_per_resource);
         tensor_manifest.buffer_bytes = static_cast<uint64_t>(tensor.nbytes());
-        tensor_manifest.block_token_capacity = static_cast<uint64_t>(
-            std::max<int64_t>(effective_block_token_capacity(
-                                  pending_registration_context_->tensor_layout,
-                                  cache_tensor.group_id),
-                              0));
+        tensor_manifest.block_token_capacity =
+            static_cast<uint64_t>(std::max<int64_t>(
+                effective_block_token_capacity(
+                    pending_registration_context_->tensor_layout, cache_tensor),
+                0));
         tensor_manifest.explicit_resource_offsets = false;
         tensor_manifest.shard =
             std::move(described_tensor.shard_descriptor.value());
@@ -730,9 +674,6 @@ bool MooncakeKVCacheTransferDefault::prepare_draft_transfer_infos(
     return false;
   }
   for (TransferKVInfo& info : transfer_kv_infos) {
-    std::erase_if(info.mappings, [this](const KVTransferMapping& mapping) {
-      return !spec_layout_.group_ids.contains(mapping.group_id);
-    });
     for (const int32_t group_id : spec_layout_.group_ids) {
       const bool has_mapping =
           std::any_of(info.mappings.begin(),
@@ -746,6 +687,15 @@ bool MooncakeKVCacheTransferDefault::prepare_draft_transfer_infos(
         return false;
       }
     }
+    std::vector<KVTransferMapping> retained;
+    retained.reserve(info.mappings.size());
+    for (KVTransferMapping& mapping : info.mappings) {
+      if (!spec_layout_.group_ids.contains(mapping.group_id)) {
+        continue;
+      }
+      retained.emplace_back(std::move(mapping));
+    }
+    info.mappings = std::move(retained);
   }
   return true;
 }

@@ -187,9 +187,6 @@ std::optional<torch::Tensor> IndexedKVCacheImpl::get_indexer_cache_scale()
 BlockTypeTensorMap IndexedKVCacheImpl::get_block_type_tensors(
     BlockType type) const {
   BlockTypeTensorMap tensor_map = KVCacheImpl::get_block_type_tensors(type);
-  if (type == BlockType::LINEAR && has_data(kpool_tail_)) {
-    tensor_map.emplace(KVCacheTensorRole::KPOOL_TAIL, kpool_tail_);
-  }
   if (type != BlockType::KV) {
     return tensor_map;
   }

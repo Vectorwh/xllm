@@ -21,22 +21,28 @@ limitations under the License.
 #include <vector>
 
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache/kv_cache_utils.h"
+#include "framework/parallel_state/linear_attention_parallel.h"
+#include "framework/parallel_state/parallel_args.h"
 #include "platform/platform.h"
 #include "util/utils.h"
 
 namespace xllm {
 
-// Records each cache pool's physical token-axis span from the tensors that
-// carry a token axis, so later describe and manifest steps validate a tensor
-// against its own pool geometry instead of the uniform scheduler block size.
-void record_group_block_capacities(const std::vector<KVCache>& kv_caches,
-                                   CacheTensorLayoutContext* tensor_layout);
+CacheTensorLayoutContext make_cache_tensor_layout_context(
+    const ParallelArgs& parallel_args,
+    const ModelArgs& model_args,
+    int64_t block_token_capacity,
+    const LinearAttentionPolicy& linear_policy);
 
-// Returns the physical token-axis span a pool's resources cover: the pool's
-// recorded span when present, block_token_capacity otherwise.
+void apply_cache_shape_layout(const KVCacheShape& shape,
+                              CacheTensorLayoutContext* context);
+
+// Grouped caches use each tensor's physical token-axis length. Ordinary caches
+// retain the configured capacity for producer-capacity validation.
 int64_t effective_block_token_capacity(const CacheTensorLayoutContext& context,
-                                       int32_t group_id);
+                                       const KVCacheTensor& cache_tensor);
 
 // Adds an explicit logical descriptor to a cache tensor produced by KVCache.
 // Returns false with an actionable error when the tensor cannot be represented

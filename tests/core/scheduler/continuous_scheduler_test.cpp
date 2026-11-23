@@ -1347,9 +1347,9 @@ TEST(ContinuousSchedulerTest, GroupedLayoutDisablesLinearAdmission) {
   BlockManagerPool::Options cache_options =
       engine.block_manager_pool()->options();
   cache_options.manager_types({1})
-      .compress_ratios({1})
       .swa_num_blocks(16)
       .swa_blocks_per_seq(2)
+      .swa_block_size(cache_options.block_size())
       .sliding_window_size(4);
   engine.set_block_manager_options(cache_options);
   ContinuousScheduler::Options options =

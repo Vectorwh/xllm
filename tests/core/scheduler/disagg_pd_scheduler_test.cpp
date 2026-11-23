@@ -585,7 +585,8 @@ class RetryingAllocationChannel final : public google::protobuf::RpcChannel {
       finish_retry_.get_future().wait();
     }
     auto* responses = static_cast<proto::DisaggResponses*>(response);
-    responses->add_resps()->set_status_code(attempt == 1 ? 503 : retry_status_);
+    auto* allocation = responses->add_resps();
+    allocation->set_status_code(attempt == 1 ? 503 : retry_status_);
     if (done != nullptr) {
       done->Run();
     }
@@ -1486,7 +1487,7 @@ TEST(DisaggPDSchedulerTest, MtpFirstGenerationStoresBootstrapThenQueues) {
 }
 
 TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
-  const BlockType evicted = BlockType::C2;
+  const BlockType evicted = BlockType::KV;
   for (const auto& [mode, pull_succeeds] :
        {std::pair<std::string, bool>{"PUSH", true},
         {"PULL", true},
@@ -1495,16 +1496,15 @@ TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
     SCOPED_TRACE(mode);
     SCOPED_TRACE(pull_succeeds);
     BlockManagerPool::Options cache_options;
-    cache_options.model_type("deepseek_v41")
-        .num_blocks(128)
+    cache_options.num_blocks(128)
         .block_size(128)
         .sliding_window_size(512)
         .swa_blocks_per_seq(5)
         .swa_num_blocks(64)
         .max_tokens_per_batch(2048)
         .max_seqs_per_batch(4)
-        .manager_types({1, 0, 0})
-        .compress_ratios({0, 2, 1})
+        .swa_block_size(128)
+        .manager_types({1, 0})
         .enable_prefix_cache(true)
         .enable_disagg_pd(true)
         .instance_is_decode(true);
@@ -1519,9 +1519,9 @@ TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
     seed->sequences()[0]->kv_state().set_kv_cache_tokens_num(tokens.size());
     pool->deallocate(seed.get());
     block_test::leaf_of(*pool, /*dp_rank=*/0, evicted)->reset_prefix_cache();
-    auto shorter = make_request(std::vector<int32_t>(641, 7), "shorter");
-    ASSERT_TRUE(pool->allocate(shorter->sequences()[0].get(), 641));
-    shorter->sequences()[0]->kv_state().set_kv_cache_tokens_num(641);
+    auto shorter = make_request(std::vector<int32_t>(513, 7), "shorter");
+    ASSERT_TRUE(pool->allocate(shorter->sequences()[0].get(), 513));
+    shorter->sequences()[0]->kv_state().set_kv_cache_tokens_num(513);
     pool->deallocate(shorter.get());
 
     auto options = make_decode_options();
@@ -1531,8 +1531,7 @@ TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
     Sequence* sequence = request->sequences()[0].get();
     ASSERT_EQ(pool->prefix_hit_tokens(*sequence, /*rank=*/0), 512u);
     pool->allocate_shared(sequence);
-    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::C1), 4u);
-    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::C2), 2u);
+    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::KV), 4u);
     ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::SWA), 0u);
     // Use Decode admission, which reserves the full prompt but does not
     // certify that P has filled these destination blocks.
@@ -1874,9 +1873,9 @@ TEST(DisaggPDSchedulerTest, DetectsRankPreservingFlatKvGroups) {
   EXPECT_TRUE(has_rank_preserving_kv_groups(response));
 }
 
-TEST(DisaggPDSchedulerTest, KeepsExpandedGroupedCacheMappings) {
+TEST(DisaggPDSchedulerTest, KeepsExpandedWindowCacheMappings) {
   proto::DisaggResponse response;
-  response.add_groups()->set_group_id(cache_group_id(BlockType::C4));
+  response.add_groups()->set_group_id(cache_group_id(BlockType::SWA));
 
   EXPECT_FALSE(has_rank_preserving_kv_groups(response));
 }
@@ -1947,7 +1946,7 @@ TEST(DisaggPDSchedulerTest,
   // mapping even at equal widths: the strided filter remaps each rank's own
   // slice instead.
   proto::DisaggResponse expanded = make_rank_preserving_response();
-  expanded.add_groups()->set_group_id(cache_group_id(BlockType::C4));
+  expanded.add_groups()->set_group_id(cache_group_id(BlockType::SWA));
   const KvSplitDispatchPlan expanded_plan =
       resolve_kv_split_plan(kTestSrcKvSplitSize,
                             kCpIndexWriteModeReplicated,
@@ -3427,7 +3426,7 @@ TEST(PDOOCSchedulerTest, BlockedResponseDoesNotDelayAnotherReadyHandoff) {
   server.Join();
 }
 TEST(DisaggPDSchedulerTest,
-     NativeDescriptorUsesDistinctGroupedCacheIdentities) {
+     NativeDescriptorUsesCanonicalGroupedCacheIdentities) {
   auto& disagg = DisaggPDConfig::get_instance();
   auto& parallel = ParallelConfig::get_instance();
   auto& model = ModelConfig::get_instance();
@@ -3451,9 +3450,8 @@ TEST(DisaggPDSchedulerTest,
   BlockManagerPool::Options options;
   options.num_blocks(128)
       .block_size(128)
-      .model_type("deepseek_v41")
-      .manager_types({1, 0, 0})
-      .compress_ratios({0, 2, 1})
+      .manager_types({1, 0})
+      .swa_block_size(128)
       .sliding_window_size(128)
       .swa_blocks_per_seq(2)
       .swa_num_blocks(128)
@@ -3472,7 +3470,7 @@ TEST(DisaggPDSchedulerTest,
       collect_native_provider_descriptor_config(info, engine, pool, &error);
   ASSERT_TRUE(config.has_value()) << error;
   EXPECT_EQ(config->cache_groups,
-            (std::vector<std::string>{"group:1", "group:6", "group:7"}));
+            (std::vector<std::string>{"group:0", "group:1"}));
   EXPECT_TRUE(build_native_provider_descriptor(*config, &error).has_value())
       << error;
 }

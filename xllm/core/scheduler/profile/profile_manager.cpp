@@ -444,7 +444,7 @@ void ProfileManager::profile_speculative_validate_time() {
       time_profiling_data;
   const int32_t total_blocks =
       static_cast<int32_t>(block_manager_pool_->num_blocks());
-  const auto block_size = block_manager_pool_->options().block_size();
+  const int32_t block_size = block_manager_pool_->block_size();
   for (const int32_t prefix_len : prefix_lens) {
     for (const int32_t query_len : query_lens) {
       for (const int32_t batch_size : batch_sizes) {

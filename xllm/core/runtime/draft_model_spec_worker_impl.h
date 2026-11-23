@@ -102,8 +102,8 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl {
   // count against that table has to use this value; the draft's own table is
   // expanded to physical pages instead (DFlashWorkerImpl::
   // expand_draft_block_tables). SuffixWorkerImpl has no draft and derives from
-  // SpeculativeWorkerImpl directly, so it keeps the physical block size.
-  int32_t logical_block_size() const override {
+  // SpeculativeWorkerImpl directly, so it uses the unsplit block size.
+  int32_t block_size() const override {
     return static_cast<int32_t>(options_.block_size()) *
            parallel_args_.kv_split_size_effective();
   }

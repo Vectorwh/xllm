@@ -192,7 +192,7 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
 
   // Fill `token_hash_key` with the chained hash of block `block_idx`, reusing
   // the precomputed hash when it covers all blocks, otherwise computing it.
-  // The KV / C4 / C128 prefix is solid (no placeholders), so the compute path
+  // The history KV prefix is solid (no placeholders), so the compute path
   // seeds the chain in O(1) from the previous block's stamped hash. SWA's
   // slid-out placeholders are handled by LinearStatePrefixCache::insert, which
   // overrides this.

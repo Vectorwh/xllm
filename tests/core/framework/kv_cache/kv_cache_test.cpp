@@ -279,35 +279,43 @@ class HostKVCacheConfigTest : public ::testing::Test {
   void SetUp() override { GTEST_FLAG_SET(death_test_style, "threadsafe"); }
 };
 
-TEST(KVCacheTest, DeepSeekV4CacheGeometryUsesPlatformConstant) {
-  const Dsv4CacheGeometry geometry;
+TEST(KVCacheTest, DeepSeekV4CacheGeometryUsesFixedSpans) {
 #if defined(USE_MLU)
-  EXPECT_EQ(geometry.compressed_block_token_size(), 128);
-  EXPECT_EQ(geometry.c4_physical_dim(), 32);
-  EXPECT_EQ(geometry.c128_physical_dim(), 1);
+  constexpr int64_t kKvBlockSize = kDsv4FixedBlockSize;
 #else
-  EXPECT_EQ(geometry.compressed_block_token_size(), 2048);
-  EXPECT_EQ(geometry.c4_physical_dim(), 512);
-  EXPECT_EQ(geometry.c128_physical_dim(), 16);
+  constexpr int64_t kKvBlockSize = kDsv4NpuBlockSize;
 #endif
+  EXPECT_EQ(dsv4_kv_block_size(/*npu_dsv4=*/false), kDsv4FixedBlockSize);
+  EXPECT_EQ(dsv4_kv_block_size(/*npu_dsv4=*/true), kDsv4NpuBlockSize);
+  EXPECT_EQ(dsv4_swa_block_size(), kDsv4SwaBlockSize);
+  EXPECT_EQ(dsv4_physical_dim(kKvBlockSize, kDsv4C4CompressRatio),
+            kKvBlockSize / kDsv4C4CompressRatio);
+  EXPECT_EQ(dsv4_physical_dim(kKvBlockSize, kDsv4C128CompressRatio),
+            kKvBlockSize / kDsv4C128CompressRatio);
+  EXPECT_EQ(dsv4_physical_dim(kDsv4FixedBlockSize, 1), kDsv4FixedBlockSize);
+  EXPECT_EQ(dsv4_physical_dim(kDsv4FixedBlockSize, 2), kDsv4FixedBlockSize / 2);
 }
 
 TEST(KVCacheTest, DeepSeekV4FourDimCachesUseDeviceLayout) {
   constexpr int64_t kSwaCount = 10;
   constexpr int64_t kC4Count = 1;
   constexpr int64_t kC128Count = 1;
-  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kBlockSize = kDsv4SwaBlockSize;
+  constexpr int64_t kConfiguredBlockSize = 256;
   constexpr int64_t kHeadDim = 16;
   constexpr int64_t kIndexHeadDim = 8;
-  const Dsv4CacheGeometry geometry;
-  const int64_t c4_physical_dim = geometry.c4_physical_dim();
-  const int64_t c128_physical_dim = geometry.c128_physical_dim();
+#if defined(USE_MLU)
+  constexpr int64_t kKvBlockSize = kDsv4FixedBlockSize;
+#else
+  constexpr int64_t kKvBlockSize = kDsv4NpuBlockSize;
+#endif
+  const int64_t c4_physical_dim =
+      dsv4_physical_dim(kKvBlockSize, kDsv4C4CompressRatio);
+  const int64_t c128_physical_dim =
+      dsv4_physical_dim(kKvBlockSize, kDsv4C128CompressRatio);
 
   KVCacheCapacity capacity;
-  capacity.block_size(kBlockSize)
-      .swa_count(kSwaCount)
-      .c4_count(kC4Count)
-      .c128_count(kC128Count);
+  capacity.block_size(kBlockSize).swa_count(kSwaCount).n_blocks(kC4Count);
 
   ModelArgs model_args;
   model_args.model_type("deepseek_v4");
@@ -318,7 +326,7 @@ TEST(KVCacheTest, DeepSeekV4FourDimCachesUseDeviceLayout) {
       .dtype(torch::kFloat32)
       .num_layers(3)
       .model_type("deepseek_v4")
-      .block_size(kBlockSize)
+      .block_size(kConfiguredBlockSize)
       .head_dim(kHeadDim)
       .index_head_dim(kIndexHeadDim)
       .window_size(/*window_size=*/512)
@@ -362,10 +370,10 @@ TEST(KVCacheTest, DeepSeekV4FourDimCachesUseDeviceLayout) {
   EXPECT_EQ(shape_vec(caches[2].get_compress_score_state()),
             (std::vector<int64_t>{kSwaCount, kBlockSize, kHeadDim}));
 
-  ExpectTensorGroup(caches[0], KVCacheTensorRole::WINDOW, BlockType::SWA);
-  ExpectTensorGroup(caches[1], KVCacheTensorRole::KEY, BlockType::C4);
-  ExpectTensorGroup(caches[1], KVCacheTensorRole::INDEX, BlockType::C4);
-  ExpectTensorGroup(caches[2], KVCacheTensorRole::KEY, BlockType::C128);
+  ExpectTensorGroup(caches[0], KVCacheTensorRole::SWA, BlockType::SWA);
+  ExpectTensorGroup(caches[1], KVCacheTensorRole::KEY, BlockType::KV);
+  ExpectTensorGroup(caches[1], KVCacheTensorRole::INDEX, BlockType::KV);
+  ExpectTensorGroup(caches[2], KVCacheTensorRole::KEY, BlockType::KV);
 #if defined(USE_MLU)
   // Platform-specific merged compressed-state layout lives in the helper.
   ExpectMluCompressedStateLayout(
@@ -382,10 +390,7 @@ TEST(KVCacheTest, DeepSeekV4DSparkUsesGroupedSwaCaches) {
   constexpr int64_t kHeadDim = 16;
 
   KVCacheCapacity capacity;
-  capacity.block_size(kBlockSize)
-      .swa_count(kSwaCount)
-      .c4_count(32)
-      .c128_count(1);
+  capacity.block_size(kBlockSize).swa_count(kSwaCount).n_blocks(1);
 
   ModelArgs dspark_args;
   dspark_args.model_type("deepseek_v4_dspark");
@@ -419,25 +424,22 @@ TEST(KVCacheTest, DeepSeekV4DSparkUsesGroupedSwaCaches) {
 
 TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
   constexpr int64_t kSwaCount = 10;
-  constexpr int64_t kC2Count = 4;
+  constexpr int64_t kC2Count = 8;
   constexpr int64_t kC1Count = 8;
   constexpr int64_t kBlockSize = 128;
   constexpr int64_t kHeadDim = 16;
   constexpr int64_t kIndexHeadDim = 8;
 
   KVCacheCapacity capacity;
-  capacity.block_size(kBlockSize)
-      .swa_count(kSwaCount)
-      .c2_count(kC2Count)
-      .c1_count(kC1Count);
+  capacity.block_size(kBlockSize).swa_count(kSwaCount).n_blocks(kC2Count);
 
   ModelArgs model_args;
   model_args.model_type("deepseek_v41");
   const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
   ASSERT_TRUE(shape.has_grouped_cache_layout());
-  // V4.1 pool vector is positional [swa_count, c2_count, c1_count].
+  // All physical history views consume the same logical KV capacity.
   EXPECT_EQ(shape.key_cache_shape(),
-            (std::vector<int64_t>{kSwaCount, kC2Count, kC1Count}));
+            (std::vector<int64_t>{kSwaCount, kC2Count}));
 
   KVCacheCreateOptions options;
   options.device(torch::Device(torch::kCPU))
@@ -469,9 +471,9 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
 
   // Ratio-2 kv-source layer (2): TOKEN(2) tensors + fp32 compressor states.
   EXPECT_EQ(shape_vec(caches[2].get_k_cache()),
-            dsv4_block_shape(kC2Count, kBlockSize, 1, kHeadDim));
+            dsv4_block_shape(kC2Count, kBlockSize / 2, 1, kHeadDim));
   EXPECT_EQ(shape_vec(caches[2].get_index_cache()),
-            dsv4_block_shape(kC2Count, kBlockSize, 1, kIndexHeadDim));
+            dsv4_block_shape(kC2Count, kBlockSize / 2, 1, kIndexHeadDim));
   EXPECT_EQ(shape_vec(caches[2].get_swa_cache()),
             dsv4_block_shape(kSwaCount, kBlockSize, 1, kHeadDim));
   EXPECT_EQ(shape_vec(caches[2].get_compress_kv_state()),
@@ -523,7 +525,7 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
       caches[2].get_indexer_cache_scale();
   if (c2_indexer_scale.has_value()) {
     EXPECT_EQ(shape_vec(c2_indexer_scale.value()),
-              (std::vector<int64_t>{kC2Count, kBlockSize, 1}));
+              (std::vector<int64_t>{kC2Count, kBlockSize / 2, 1}));
     EXPECT_EQ(c2_indexer_scale->dtype(),
               get_dsv4_cache_policy(options.dtype()).scale_dtype);
   }
@@ -548,34 +550,34 @@ TEST(KVCacheTest, DeepSeekV41TokenGroupsUseModelDtypeIndexCache) {
               get_dsv4_cache_policy(options.dtype()).scale_dtype);
   }
 
-  ExpectTensorGroup(caches[2], KVCacheTensorRole::WINDOW, BlockType::SWA);
-  ExpectTensorGroup(caches[2], KVCacheTensorRole::KEY, BlockType::C2);
-  ExpectTensorGroup(caches[2], KVCacheTensorRole::INDEX, BlockType::C2);
+  ExpectTensorGroup(caches[2], KVCacheTensorRole::SWA, BlockType::SWA);
+  ExpectTensorGroup(caches[2], KVCacheTensorRole::KEY, BlockType::KV);
+  ExpectTensorGroup(caches[2], KVCacheTensorRole::INDEX, BlockType::KV);
 #if !defined(USE_MLU)
   // MLU exports only the packed compressor state, which V4.1 never allocates.
   ExpectTensorGroup(caches[2], KVCacheTensorRole::KV_STATE, BlockType::SWA);
   ExpectTensorGroup(caches[2], KVCacheTensorRole::SCORE_STATE, BlockType::SWA);
 #endif
-  ExpectTensorGroup(caches[4], KVCacheTensorRole::KEY, BlockType::C1);
-  ExpectTensorGroup(caches[4], KVCacheTensorRole::INDEX, BlockType::C1);
+  ExpectTensorGroup(caches[4], KVCacheTensorRole::KEY, BlockType::KV);
+  ExpectTensorGroup(caches[4], KVCacheTensorRole::INDEX, BlockType::KV);
 }
 
 TEST(KVCacheTest, DeepSeekV4MtpKeepsGroupedCacheClassification) {
   KVCacheCapacity capacity;
-  capacity.block_size(128).swa_count(10).c4_count(1).c128_count(1);
+  capacity.block_size(128).swa_count(10).n_blocks(1);
 
   ModelArgs mtp_args;
   mtp_args.model_type("deepseek_v4_mtp");
   const KVCacheShape mtp_shape(capacity, mtp_args, /*world_size=*/1);
 
   EXPECT_TRUE(mtp_shape.has_grouped_cache_layout());
-  EXPECT_EQ(mtp_shape.key_cache_shape(), (std::vector<int64_t>{10, 1, 1}));
+  EXPECT_EQ(mtp_shape.key_cache_shape(), (std::vector<int64_t>{10, 1}));
   EXPECT_FALSE(mtp_shape.has_index_cache_shape());
 }
 
 TEST(KVCacheTest, GroupedCacheCapabilitySurvivesProtoRoundTrip) {
   KVCacheCapacity capacity;
-  capacity.block_size(128).swa_count(10).c4_count(1).c128_count(1);
+  capacity.block_size(128).swa_count(10).n_blocks(1);
 
   ModelArgs model_args;
   model_args.model_type("deepseek_v4");
@@ -607,7 +609,7 @@ TEST(KVCacheTest, DeepSeekV4KVCacheExposesIndexerScaleThroughSharedContract) {
 
   const std::vector<KVCacheTensor> cache_tensors = cache.get_cache_tensors();
   ASSERT_EQ(cache_tensors.size(), 4U);
-  EXPECT_EQ(cache_tensors[0].role, KVCacheTensorRole::WINDOW);
+  EXPECT_EQ(cache_tensors[0].role, KVCacheTensorRole::SWA);
   EXPECT_EQ(cache_tensors[1].role, KVCacheTensorRole::KEY);
   EXPECT_EQ(cache_tensors[2].role, KVCacheTensorRole::INDEX);
   EXPECT_EQ(cache_tensors[3].role, KVCacheTensorRole::INDEX_SCALE);
@@ -729,7 +731,7 @@ TEST(KVCacheTest, IndexedKVCacheExposesQuantizedKvScaleTensors) {
 #if defined(USE_MLU)
 TEST(KVCacheTest, DeepSeekV4UsesInjectedAllocatorForTransferableOwners) {
   KVCacheCapacity capacity;
-  capacity.block_size(2).swa_count(3).c4_count(4).c128_count(1);
+  capacity.block_size(2).swa_count(3).n_blocks(4);
 
   ModelArgs model_args;
   model_args.model_type("deepseek_v4");
@@ -753,14 +755,14 @@ TEST(KVCacheTest, DeepSeekV4UsesInjectedAllocatorForTransferableOwners) {
   allocate_kv_caches(caches, shape, options);
 
   const std::vector<KVCacheTensorRole> expected_roles = {
-      KVCacheTensorRole::WINDOW,
+      KVCacheTensorRole::SWA,
       KVCacheTensorRole::KEY,
       KVCacheTensorRole::INDEX,
-      KVCacheTensorRole::WINDOW,
+      KVCacheTensorRole::SWA,
       KVCacheTensorRole::COMPRESS_STATE,
       KVCacheTensorRole::COMPRESS_INDEX_STATE,
       KVCacheTensorRole::KEY,
-      KVCacheTensorRole::WINDOW,
+      KVCacheTensorRole::SWA,
       KVCacheTensorRole::COMPRESS_STATE};
   ASSERT_EQ(allocator->requests.size(), expected_roles.size());
   for (size_t i = 0; i < expected_roles.size(); ++i) {
@@ -1101,224 +1103,19 @@ TEST_F(HostKVCacheTest, HostKVCacheNormalLayoutAddsLayerDim) {
   }
 }
 
-TEST_F(HostKVCacheTest, HostKVCacheDeepSeekV4PerBlockType) {
-  constexpr int64_t kSwaCount = 10;
-  constexpr int64_t kC4Count = 32;
-  constexpr int64_t kC128Count = 4;
-  constexpr int64_t kBlockSize = 128;
-  constexpr int64_t kHeadDim = 16;
-  constexpr int64_t kIndexHeadDim = 8;
-  constexpr double kHostFactor = 3.0;
-  const Dsv4CacheGeometry geometry;
-  const int64_t c4_physical_dim = geometry.c4_physical_dim();
-  const int64_t c128_physical_dim = geometry.c128_physical_dim();
-  // Host tensors insert the layer dim at index 1 of the device block shape.
-#if defined(USE_MLU)
-  constexpr int64_t kHostTokenDim = 3;
-#else
-  constexpr int64_t kHostTokenDim = 2;
-#endif
-
-  KVCacheCapacity capacity;
-  capacity.block_size(kBlockSize)
-      .swa_count(kSwaCount)
-      .c4_count(kC4Count)
-      .c128_count(kC128Count);
-
-  ModelArgs model_args;
-  model_args.model_type("deepseek_v4");
-  KVCacheShape shape(capacity, model_args, /*world_size=*/1);
-
-  KVCacheCreateOptions options;
-  options.device(torch::Device(torch::kCPU))
-      .dtype(torch::kFloat32)
-      .num_layers(3)
-      .model_type("deepseek_v4")
-      .block_size(kBlockSize)
-      .head_dim(kHeadDim)
-      .index_head_dim(kIndexHeadDim)
-      .window_size(/*window_size=*/2048)
-      .compress_ratios({1, 4, 128})
-      .host_blocks_factor(kHostFactor);
-
-  // SWA host cache: 1 layer in this 3-layer config (compress_ratio == 1).
-  KVCache swa_host(shape, options, BlockType::SWA, /*layer_count=*/1);
-  const BlockTypeTensorMap swa_tensors =
-      swa_host.get_block_type_tensors(BlockType::SWA);
-  ASSERT_TRUE(swa_tensors.count(KVCacheTensorRole::SWA) > 0);
-  const torch::Tensor& swa = swa_tensors.at(KVCacheTensorRole::SWA);
-  EXPECT_TRUE(swa.is_contiguous());
-  EXPECT_EQ(swa.size(0),
-            dsv4_host_swa_block_count(
-                kC128Count, kHostFactor, options.window_size(), kBlockSize));
-  EXPECT_EQ(swa.size(1), 1);
-
-  // C4 host cache: key + index, index uses the DSV4 index dtype.
-  KVCache c4_host(shape, options, BlockType::C4, /*layer_count=*/1);
-  const BlockTypeTensorMap c4_tensors =
-      c4_host.get_block_type_tensors(BlockType::C4);
-  ASSERT_TRUE(c4_tensors.count(KVCacheTensorRole::KEY) > 0);
-  ASSERT_TRUE(c4_tensors.count(KVCacheTensorRole::INDEX) > 0);
-  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::KEY).size(0),
-            scale_host_block_count(kC4Count, kHostFactor));
-  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::KEY).size(kHostTokenDim),
-            c4_physical_dim);
-  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::INDEX).size(kHostTokenDim),
-            c4_physical_dim);
-  EXPECT_EQ(c4_tensors.at(KVCacheTensorRole::INDEX).scalar_type(),
-            get_dsv4_cache_policy(options.dtype()).index_dtype);
-  const std::optional<torch::Tensor> c4_scale =
-      c4_host.get_indexer_cache_scale();
-  if (c4_scale.has_value()) {
-    EXPECT_EQ(c4_scale->size(2), c4_physical_dim);
-  }
-
-  // C128 host cache: key only (no index).
-  KVCache c128_host(shape, options, BlockType::C128, /*layer_count=*/1);
-  const BlockTypeTensorMap c128_tensors =
-      c128_host.get_block_type_tensors(BlockType::C128);
-  ASSERT_TRUE(c128_tensors.count(KVCacheTensorRole::KEY) > 0);
-  EXPECT_TRUE(c128_tensors.count(KVCacheTensorRole::INDEX) == 0);
-  EXPECT_EQ(c128_tensors.at(KVCacheTensorRole::KEY).size(0),
-            scale_host_block_count(kC128Count, kHostFactor));
-  EXPECT_EQ(c128_tensors.at(KVCacheTensorRole::KEY).size(kHostTokenDim),
-            c128_physical_dim);
-}
-
-TEST_F(HostKVCacheTest, HostKVCacheV41UsesTokenSpansAndIndexScale) {
-  KVCacheCapacity capacity;
-  capacity.block_size(128).swa_count(10).c2_count(4).c1_count(8);
-  ModelArgs args;
-  args.model_type("deepseek_v41");
-  const KVCacheShape shape(capacity, args, /*world_size=*/1);
-  KVCacheCreateOptions options;
-  options.model_type("deepseek_v41")
-      .compress_ratios({0, 0, 2, 2, 1, 1})
-      .dtype(torch::kBFloat16)
-      .block_size(128)
-      .head_dim(16)
-      .index_head_dim(8)
-      .window_size(512)
-      .host_blocks_factor(3.0);
-  KVCache swa(shape, options, BlockType::SWA, /*layer_count=*/6);
-  EXPECT_EQ(swa.get_swa_cache().size(0), 24);
-  EXPECT_EQ(swa.get_swa_cache().size(1), 6);
-  EXPECT_FALSE(swa.get_compress_kv_state().defined());
-  // The engine clamps its window to max_model_len; Host tensors use the
-  // semantic model window. Extra rows are safe, but the pool must fit.
-  for (const int64_t effective_window : {128, 256, 512}) {
-    const int64_t host_blocks =
-        dsv4_host_swa_block_count(capacity.c2_count(),
-                                  options.host_blocks_factor(),
-                                  effective_window,
-                                  options.block_size(),
-                                  /*cache_unit_size=*/256);
-    EXPECT_LE(host_blocks, swa.get_swa_cache().size(0));
-    EXPECT_EQ(host_blocks, effective_window == 128 ? 12 : 24);
-  }
-  for (const BlockType type : {BlockType::C1, BlockType::C2}) {
-    KVCache cache(shape, options, type, /*layer_count=*/1);
-    const auto roles = cache.get_block_type_tensors(type);
-    ASSERT_EQ(roles.count(KVCacheTensorRole::KEY), 1u);
-    ASSERT_EQ(roles.count(KVCacheTensorRole::INDEX), 1u);
-    const int64_t count = type == BlockType::C1 ? 24 : 12;
-    auto expected_key = dsv4_block_shape(count, 128, 1, 16);
-    expected_key.insert(expected_key.begin() + 1, 1);
-    EXPECT_EQ(shape_vec(cache.get_k_cache()), expected_key);
-    EXPECT_EQ(cache.get_index_cache().scalar_type(),
-              get_dsv4_cache_policy(options.dtype()).index_dtype);
-    if (get_dsv4_cache_policy(options.dtype()).has_indexer_cache_scale) {
-      ASSERT_EQ(roles.count(KVCacheTensorRole::INDEX_SCALE), 1u);
-      EXPECT_EQ(shape_vec(roles.at(KVCacheTensorRole::INDEX_SCALE)),
-                (std::vector<int64_t>{count, 1, 128, 1}));
-      EXPECT_EQ(roles.at(KVCacheTensorRole::INDEX_SCALE).scalar_type(),
-                torch::kFloat16);
-    }
-    EXPECT_TRUE(cache.get_block_type_tensors(BlockType::C4).empty());
-    EXPECT_TRUE(cache
-                    .get_block_type_tensors(
-                        type == BlockType::C1 ? BlockType::C2 : BlockType::C1)
-                    .empty());
-  }
-}
-
-TEST_F(HostKVCacheConfigTest,
-       V41HostSwaCapacityClampedWindowFitsSemanticWindow) {
-  for (const int64_t checkpoint_span : {128, 256}) {
-    const int64_t tensor_rows = dsv4_host_swa_block_count(
-        /*checkpoint_block_count=*/4,
-        /*host_blocks_factor=*/3.0,
-        /*window_size=*/512,
-        /*block_size=*/128,
-        checkpoint_span);
-    for (const int64_t effective_window : {128, 256, 512}) {
-      const int64_t pool_blocks = dsv4_host_swa_block_count(
-          /*checkpoint_block_count=*/4,
-          /*host_blocks_factor=*/3.0,
-          effective_window,
-          /*block_size=*/128,
-          checkpoint_span);
-      EXPECT_LE(pool_blocks, tensor_rows);
-      EXPECT_EQ(pool_blocks,
-                checkpoint_span == 128 || effective_window == 128 ? 12 : 24);
-    }
-  }
-}
-
-TEST(KVCacheUtilsTest, DeepSeekV41CacheUnitUsesLargestCompressionRatio) {
-  const std::vector<int32_t> layer_ratios{0, 1, 3};
-  const std::vector<uint32_t> manager_ratios{0, 3, 1};
-  EXPECT_EQ(dsv41_cache_unit_tokens(
-                /*is_v41=*/false, /*block_size=*/128, layer_ratios),
-            0);
-  EXPECT_EQ(dsv41_cache_unit_tokens(
-                /*is_v41=*/true, /*block_size=*/128, layer_ratios),
-            384);
-  EXPECT_EQ(dsv41_cache_unit_tokens(
-                /*is_v41=*/true, /*block_size=*/128, manager_ratios),
-            384);
-  EXPECT_EQ(
-      dsv41_cache_unit_tokens(
-          /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0, 2, 1}),
-      256);
-  EXPECT_EQ(
-      dsv41_cache_unit_tokens(
-          /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0, 2}),
-      256);
-  EXPECT_EQ(
-      dsv41_cache_unit_tokens(
-          /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0, 1}),
-      128);
-  EXPECT_EQ(dsv41_cache_unit_tokens(
-                /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{0}),
-            128);
-  EXPECT_EQ(dsv41_cache_unit_tokens(
-                /*is_v41=*/false, /*block_size=*/0, std::vector<int32_t>{}),
-            0);
-}
-
-TEST(KVCacheUtilsTest, DeepSeekV41CacheUnitRejectsMissingGeometry) {
-  EXPECT_DEATH(dsv41_cache_unit_tokens(
-                   /*is_v41=*/true, /*block_size=*/128, std::vector<int32_t>{}),
-               "compress_ratios.empty");
-  EXPECT_DEATH(dsv41_cache_unit_tokens(
-                   /*is_v41=*/true, /*block_size=*/0, std::vector<int32_t>{1}),
-               "block_size");
-}
-
 TEST_F(HostKVCacheTest, DeepSeekV4HostSwaCapacityTracksCheckpointWindow) {
   constexpr int64_t kBlockSize = 128;
   constexpr int64_t kC128Blocks = 4;
   constexpr double kHostFactor = 3.0;
   const int64_t host_c128_blocks =
       scale_host_block_count(kC128Blocks, kHostFactor);
+  EXPECT_EQ(dsv4_host_swa_block_count(
+                kC128Blocks, kHostFactor, 128, kBlockSize, kBlockSize),
+            host_c128_blocks);
   EXPECT_EQ(
-      dsv4_host_swa_block_count(kC128Blocks, kHostFactor, 128, kBlockSize),
-      host_c128_blocks);
-  EXPECT_EQ(
-      dsv4_host_swa_block_count(kC128Blocks, kHostFactor, 2048, kBlockSize),
-      host_c128_blocks *
-          std::min<int64_t>(kDsv4CompressedBlockTokenSize / kBlockSize, 16));
+      dsv4_host_swa_block_count(
+          kC128Blocks, kHostFactor, 2048, kBlockSize, kDsv4NpuBlockSize),
+      host_c128_blocks * std::min<int64_t>(kDsv4NpuBlockSize / kBlockSize, 16));
 }
 
 TEST_F(HostKVCacheConfigTest, MluPlatformAdvertisesHostOffloadSupport) {
@@ -1813,7 +1610,7 @@ TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
   EXPECT_EQ(cache.get_index_cache().numel(), capacity.n_blocks() * 4 * 16);
   ExpectTensorGroup(cache, KVCacheTensorRole::INDEX, BlockType::KV);
   ExpectTensorGroup(cache, KVCacheTensorRole::KPOOL_TAIL, BlockType::LINEAR);
-  EXPECT_EQ(cache.get_block_type_tensors(BlockType::LINEAR).size(), 1);
+  EXPECT_TRUE(cache.get_block_type_tensors(BlockType::LINEAR).empty());
   int64_t allocated_bytes = 0;
   for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
     allocated_bytes += tensor.tensor.numel() * tensor.tensor.element_size();

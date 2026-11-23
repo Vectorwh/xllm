@@ -432,9 +432,9 @@ TEST(BatchInputBuilderTest, FlatRemoteSharedPrefixUsesTrimmedRemoteMapping) {
             (std::vector<uint64_t>{2002, 2003, 2004}));
 }
 
-TEST(BatchInputBuilderTest, GroupRemoteSharedPrefixKeepsFullRemoteMapping) {
+TEST(BatchInputBuilderTest, GroupedKvRemoteSharedPrefixUsesFullMapping) {
   BlockManager::Options options;
-  options.num_blocks(8).block_size(16).block_type(BlockType::C4);
+  options.num_blocks(8).block_size(16).block_type(BlockType::KV);
   BlockManagerImpl manager(options);
   std::vector<Block> blocks = manager.allocate(5);
   const std::vector<uint64_t> ids = block_ids(blocks);
@@ -442,31 +442,31 @@ TEST(BatchInputBuilderTest, GroupRemoteSharedPrefixKeepsFullRemoteMapping) {
                                           /*index=*/0,
                                           /*timing=*/nullptr,
                                           /*request_id=*/"req_0");
-  sequence.kv_state().add_blocks(BlockType::C4, std::move(blocks));
-  sequence.kv_state().advance_group_transfer_block_idx(BlockType::C4, 2);
+  sequence.kv_state().add_blocks(BlockType::KV, std::move(blocks));
+  sequence.kv_state().advance_transfer_block_idx(2);
 
-  TransferKVInfo full_info =
-      make_info({100, 101, 102, 103, 104}, BlockType::C4);
+  TransferKVInfo full_info = make_info({100, 101, 102, 103, 104});
   full_info.mappings[0].remote_shared_num = 2;
+  full_info.mappings.emplace_back(make_mapping(BlockType::SWA, {200, 201}));
 
   const TransferKVInfo info =
       build_transfer_input(full_info, &sequence, /*num_tokens=*/80);
 
   const std::vector<uint64_t> expected_local(ids.begin() + 2, ids.end());
-  expect_mapping(info, BlockType::C4, expected_local, {102, 103, 104});
-  EXPECT_EQ(find_mapping(info, BlockType::C4).remote_shared_num, 2u);
-  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
-            5u);
+  expect_mapping(info, BlockType::KV, expected_local, {102, 103, 104});
+  EXPECT_EQ(find_mapping(info, BlockType::KV).remote_shared_num, 2u);
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 5u);
 }
 
 TEST(BatchInputBuilderTest, RemoteSWASentinelsAreNotTransferred) {
   BlockManager::Options options;
-  options.num_blocks(8).block_size(16).block_type(BlockType::SWA);
+  options.num_blocks(8).block_size(16).swa_block_size(16).block_type(
+      BlockType::SWA);
   BlockManagerImpl manager(options);
   // SWA does not define token capacity. Keep an incremental group's owner
   // alive until after the Sequence is destroyed.
   BlockManager::Options incremental_options;
-  incremental_options.num_blocks(8).block_size(16).block_type(BlockType::C4);
+  incremental_options.num_blocks(8).block_size(16).block_type(BlockType::KV);
   BlockManagerImpl incremental_manager(incremental_options);
   std::vector<Block> blocks = manager.allocate(4);
   const std::vector<uint64_t> ids = block_ids(blocks);
@@ -474,7 +474,7 @@ TEST(BatchInputBuilderTest, RemoteSWASentinelsAreNotTransferred) {
                                           /*index=*/0,
                                           /*timing=*/nullptr,
                                           /*request_id=*/"req_0");
-  sequence.kv_state().add_blocks(BlockType::C4,
+  sequence.kv_state().add_blocks(BlockType::KV,
                                  incremental_manager.allocate(4));
   sequence.kv_state().add_blocks(BlockType::SWA, std::move(blocks));
 
@@ -590,7 +590,8 @@ TEST(BatchInputBuilderTest, RemoteCoverageShortageDies) {
 
 TEST(BatchInputBuilderTest, DSV4FirstChunkSlicesFullRemoteAllocation) {
   BlockManager::Options options;
-  options.num_blocks(8).block_size(16).block_type(BlockType::C4);
+  options.num_blocks(8).block_size(16).swa_block_size(16).block_type(
+      BlockType::SWA);
   BlockManagerImpl manager(options);
   std::vector<Block> blocks = manager.allocate(2);
   const std::vector<uint64_t> ids = block_ids(blocks);
@@ -598,21 +599,22 @@ TEST(BatchInputBuilderTest, DSV4FirstChunkSlicesFullRemoteAllocation) {
                                           /*index=*/0,
                                           /*timing=*/nullptr,
                                           /*request_id=*/"req_0");
-  sequence.kv_state().add_blocks(BlockType::C4, std::move(blocks));
+  sequence.kv_state().add_blocks(BlockType::SWA, std::move(blocks));
   const TransferKVInfo full_info =
-      make_info({100, 101, 102, 103}, BlockType::C4);
+      make_info({100, 101, 102, 103}, BlockType::SWA);
 
   const TransferKVInfo info =
       build_transfer_input(full_info, &sequence, /*num_tokens=*/32);
 
-  expect_mapping(info, BlockType::C4, ids, {100, 101});
-  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
+  expect_mapping(info, BlockType::SWA, ids, {100, 101});
+  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::SWA),
             2u);
 }
 
 TEST(BatchInputBuilderTest, DSV4KvSplitMapsOneSourceBlockToTwoDecodeBlocks) {
   BlockManager::Options options;
-  options.num_blocks(8).block_size(32).block_type(BlockType::C4);
+  options.num_blocks(8).block_size(32).swa_block_size(32).block_type(
+      BlockType::SWA);
   BlockManagerImpl manager(options);
   std::vector<Block> blocks = manager.allocate(2);
   const std::vector<uint64_t> ids = block_ids(blocks);
@@ -620,21 +622,21 @@ TEST(BatchInputBuilderTest, DSV4KvSplitMapsOneSourceBlockToTwoDecodeBlocks) {
                                           /*index=*/0,
                                           /*timing=*/nullptr,
                                           /*request_id=*/"req_0");
-  sequence.kv_state().add_blocks(BlockType::C4, std::move(blocks));
+  sequence.kv_state().add_blocks(BlockType::SWA, std::move(blocks));
   const TransferKVInfo full_info =
-      make_info({100, 101, 102, 103}, BlockType::C4);
+      make_info({100, 101, 102, 103}, BlockType::SWA);
 
   const TransferKVInfo info = build_transfer_input(
       full_info, &sequence, /*num_tokens=*/64, /*kv_split_size=*/2);
 
-  expect_mapping(info, BlockType::C4, ids, {100, 101, 102, 103});
-  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
+  expect_mapping(info, BlockType::SWA, ids, {100, 101, 102, 103});
+  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::SWA),
             2u);
 }
 
 TEST(BatchInputBuilderTest, DSV4LaterChunkSkipsExpiredSWABlocks) {
   BlockManager::Options incremental_options;
-  incremental_options.num_blocks(8).block_size(16).block_type(BlockType::C4);
+  incremental_options.num_blocks(8).block_size(16).block_type(BlockType::KV);
   BlockManagerImpl incremental_manager(incremental_options);
   BlockManager::Options swa_options;
   swa_options.num_blocks(8)
@@ -648,7 +650,7 @@ TEST(BatchInputBuilderTest, DSV4LaterChunkSkipsExpiredSWABlocks) {
                                           /*index=*/0,
                                           /*timing=*/nullptr,
                                           /*request_id=*/"req_0");
-  sequence.kv_state().add_blocks(BlockType::C4,
+  sequence.kv_state().add_blocks(BlockType::KV,
                                  incremental_manager.allocate(4));
   auto prior =
       swa_manager.allocate_for_sequence(&sequence, sequence.kv_state(), 48);
@@ -682,7 +684,8 @@ TEST(BatchInputBuilderTest, DSV4LaterChunkSkipsExpiredSWABlocks) {
 
 TEST(BatchInputBuilderTest, DSV4PartialBlockIsRepeatedOnNextChunk) {
   BlockManager::Options options;
-  options.num_blocks(8).block_size(16).block_type(BlockType::C4);
+  options.num_blocks(8).block_size(16).swa_block_size(16).block_type(
+      BlockType::SWA);
   BlockManagerImpl manager(options);
   std::vector<Block> blocks = manager.allocate(3);
   const std::vector<uint64_t> ids = block_ids(blocks);
@@ -690,19 +693,19 @@ TEST(BatchInputBuilderTest, DSV4PartialBlockIsRepeatedOnNextChunk) {
                                           /*index=*/0,
                                           /*timing=*/nullptr,
                                           /*request_id=*/"req_0");
-  sequence.kv_state().add_blocks(BlockType::C4, std::move(blocks));
-  const TransferKVInfo full_info = make_info({100, 101, 102}, BlockType::C4);
+  sequence.kv_state().add_blocks(BlockType::SWA, std::move(blocks));
+  const TransferKVInfo full_info = make_info({100, 101, 102}, BlockType::SWA);
 
   const TransferKVInfo info =
       build_transfer_input(full_info, &sequence, /*num_tokens=*/33);
 
-  expect_mapping(info, BlockType::C4, ids, {100, 101, 102});
-  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
+  expect_mapping(info, BlockType::SWA, ids, {100, 101, 102});
+  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::SWA),
             2u);
   const TransferKVInfo next =
       build_transfer_input(full_info, &sequence, /*num_tokens=*/15);
-  expect_mapping(next, BlockType::C4, {ids[2]}, {102});
-  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
+  expect_mapping(next, BlockType::SWA, {ids[2]}, {102});
+  EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::SWA),
             3u);
 }
 
@@ -3620,7 +3623,7 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateMetadata) {
   transfer_info.request_id = "dsv4-round-trip";
   transfer_info.rank_local_mapping = true;
   KVTransferMapping transfer_mapping;
-  transfer_mapping.group_id = cache_group_id(BlockType::C128);
+  transfer_mapping.group_id = cache_group_id(BlockType::KV);
   transfer_mapping.local_ids = {11, 12};
   transfer_mapping.remote_ids = {101, 102};
   transfer_info.mappings.emplace_back(std::move(transfer_mapping));
@@ -3649,7 +3652,7 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateMetadata) {
   ASSERT_EQ(from_shm.transfer_kv_infos[0].mappings.size(), 1u);
   const KVTransferMapping& from_shm_mapping =
       from_shm.transfer_kv_infos[0].mappings[0];
-  EXPECT_EQ(from_shm_mapping.group_id, cache_group_id(BlockType::C128));
+  EXPECT_EQ(from_shm_mapping.group_id, cache_group_id(BlockType::KV));
   EXPECT_EQ(from_shm_mapping.local_ids, (std::vector<uint64_t>{11, 12}));
   EXPECT_EQ(from_shm_mapping.remote_ids, (std::vector<uint64_t>{101, 102}));
 
@@ -4202,12 +4205,10 @@ TEST(BatchTest, OverlapMTPReplacementKeepsCompositeKvBlocks) {
       .swa_blocks_per_seq(static_cast<uint32_t>(
           get_swa_blocks_per_seq(window_size, base_block_size)))
       .swa_num_blocks(20)
-      .c4_num_blocks(256)
-      .c128_num_blocks(256)
       .max_tokens_per_batch(1280)
       .max_seqs_per_batch(max_seqs_per_batch)
-      .manager_types({1, 0, 0})
-      .compress_ratios({0, 4, 128});
+      .manager_types({1, 0})
+      .swa_block_size(base_block_size);
   CompositeBlockManager manager(build_composite_leaves(options), options);
 
   RequestSamplingParam sampling_param;
@@ -4217,7 +4218,7 @@ TEST(BatchTest, OverlapMTPReplacementKeepsCompositeKvBlocks) {
   Sequence seq = make_overlap_sequence(
       {1, 10, 11}, /*seq_capacity=*/128, &sampling_param, &stopping_checker);
   ASSERT_TRUE(manager.allocate_sequence(&seq, seq.num_prompt_tokens()));
-  ASSERT_EQ(seq.kv_state().num_blocks(BlockType::KV), 0u);
+  ASSERT_GT(seq.kv_state().num_blocks(BlockType::KV), 0u);
   ASSERT_GT(seq.kv_state().current_max_tokens_capacity(), 0u);
   seq.kv_state().incr_kv_cache_tokens_num(seq.num_prompt_tokens() - 1);
 

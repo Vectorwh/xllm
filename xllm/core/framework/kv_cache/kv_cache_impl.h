@@ -59,14 +59,11 @@ class KVCacheImpl {
   virtual torch::Tensor get_compress_index_state() const;
   virtual std::vector<KVCacheTensor> get_cache_tensors() const;
 
-  // Host prefix cache extraction by block type. Unlike the device-side
-  // build_block_type_tensor_map in the transfer layer, this carries no
-  // device-pool discriminator guards: a per-type host cache holds exactly the
-  // tensors for that block type.
+  // Unsliced offload tensors, excluding PD-only state such as KPool tail.
   virtual BlockTypeTensorMap get_block_type_tensors(BlockType type) const;
 
-  // Return the tensors used for a transfer at the requested LINEAR
-  // checkpoint row. Non-LINEAR caches ignore checkpoint_row.
+  // Host checkpoint tensors. LINEAR only supports Conv/SSM restoration;
+  // resources other than LINEAR ignore checkpoint_row.
   virtual BlockTypeTensorMap get_block_type_tensors(
       BlockType type,
       size_t checkpoint_row) const;

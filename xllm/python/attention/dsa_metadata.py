@@ -19,7 +19,7 @@ This is the Python-path counterpart of the C++ ``build_dsa_fields`` step: it
 turns the framework-allocated ``multi_block_tables`` (per-manager block tables,
 exposed through ``AttentionMetadataView``) plus the per-layer
 ``caches_info`` / ``group_infos`` (rebuilt from ``compress_ratios`` +
-``window_size``) into the per-layer ``block_tables`` / ``slot_mappings`` the
+``swa_block_size``) into the per-layer ``block_tables`` / ``slot_mappings`` the
 DSA attention kernel consumes, along with the c4/c128 compressed positions,
 sequence-length metadata, and RoPE tables.
 
@@ -40,10 +40,14 @@ from xllm.python.platform import current_platform
 # ---------------------------------------------------------------------------
 # Cache-type enum (mirrors ``DSACacheType`` in dsa_metadata.h).
 # ---------------------------------------------------------------------------
-DSA_CACHE_TOKEN = 0
-DSA_CACHE_SEQUENCE = 1
-DSA_CACHE_SLIDING_WINDOW = 2
-DSV4_COMPRESSED_BLOCK_TOKEN_SIZE = 128 if current_platform.is_mlu() else 2048
+DSA_CACHE_SLIDING_WINDOW = 0
+DSA_CACHE_TOKEN = 1
+# Fixed spans. SWA is 128 on every device. KV is 2048 only for DSV4 on NPU;
+# DSV4 on MLU and DSV4.1 on NPU or MLU use 128. Physical dim is the KV span
+# divided by the compress ratio.
+DSV4_NPU_BLOCK_SIZE = 2048
+DSV4_FIXED_BLOCK_SIZE = 128
+DSV4_SWA_BLOCK_SIZE = 128
 
 # ---------------------------------------------------------------------------
 # Read-side SWA block-table layout.
@@ -62,16 +66,25 @@ class DSACacheInfo:
     group_id: int
     cache_type: int
     ratio: int
-    block_size: int
+    physical_dim: int
 
 
 @dataclass
 class DSAGroupInfo:
-    """Per-group descriptor: one block-manager pool."""
+    """Physical execution geometry and its source logical block table."""
 
     cache_type: int
     ratio: int
-    block_size: int
+    physical_dim: int
+
+
+def dsa_block_table_groups(group_infos: Sequence[DSAGroupInfo]) -> list[list[DSAGroupInfo]]:
+    """Group model-private physical views by their declared logical source."""
+    table_count = max((group.cache_type + 1 for group in group_infos), default=0)
+    tables: list[list[DSAGroupInfo]] = [[] for _ in range(table_count)]
+    for group in group_infos:
+        tables[group.cache_type].append(group)
+    return tables
 
 
 @dataclass
@@ -188,35 +201,38 @@ def _normalize_compress_ratio(ratio: int) -> int:
 
 def build_cache_specs(
     compress_ratios: Sequence[int],
-    window_size: int,
+    swa_block_size: int,
     n_layers: int,
 ) -> tuple[list[list[DSACacheInfo]], list[DSAGroupInfo]]:
     """Python port of ``deepseek_v4_build_cache_specs`` (deepseek_v4.h:332).
 
     Builds the per-layer ``caches_info`` and the deduplicated ``group_infos``
-    from ``compress_ratios`` + ``window_size``. Group 0 is always the SWA
+    from ``compress_ratios`` + ``swa_block_size``. Group 0 is always the SWA
     (sliding-window) group; TOKEN groups for ratios {4, 128} are registered in
     the order they first appear.
     """
-    compressed_block_sizes = {ratio: DSV4_COMPRESSED_BLOCK_TOKEN_SIZE // ratio for ratio in (4, 128)}
+    # Physical dim is the fixed KV span divided by compress_ratio. NPU DSV4
+    # uses 2048; MLU uses 128.
+    resolved_block_size = DSV4_FIXED_BLOCK_SIZE if current_platform.is_mlu() else DSV4_NPU_BLOCK_SIZE
+    physical_dims = {ratio: resolved_block_size // ratio for ratio in (4, 128)}
     group_infos: list[DSAGroupInfo] = []
     group_key_map: dict[tuple[int, int, int], int] = {}
 
-    def register_group(cache_type: int, ratio: int, block_size: int) -> int:
-        key = (ratio, cache_type, block_size)
+    def register_group(cache_type: int, ratio: int, physical_dim: int) -> int:
+        key = (ratio, cache_type, physical_dim)
         gid = group_key_map.get(key)
         if gid is not None:
             return gid
         gid = len(group_infos)
         group_key_map[key] = gid
-        group_infos.append(DSAGroupInfo(cache_type, ratio, block_size))
+        group_infos.append(DSAGroupInfo(cache_type, ratio, physical_dim))
         return gid
 
-    register_group(DSA_CACHE_SLIDING_WINDOW, 1, window_size)
+    register_group(DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size)
     for ratio in compress_ratios:
         cr = _normalize_compress_ratio(ratio)
         if cr in (4, 128):
-            register_group(DSA_CACHE_TOKEN, cr, compressed_block_sizes[cr])
+            register_group(DSA_CACHE_TOKEN, cr, physical_dims[cr])
 
     caches_info: list[list[DSACacheInfo]] = [[] for _ in range(n_layers)]
     for layer_id in range(n_layers):
@@ -224,33 +240,33 @@ def build_cache_specs(
         cr = _normalize_compress_ratio(cr)
 
         if cr == 1:
-            entries = [(DSA_CACHE_SLIDING_WINDOW, 1, window_size)]
+            entries = [(DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size)]
         elif cr == 4:
             # cmp_kv, cmp_index, swa, kv_state, score_state, idx_kv,
             # idx_score, indexer_scale.
             entries = [
-                (DSA_CACHE_TOKEN, 4, compressed_block_sizes[4]),
-                (DSA_CACHE_TOKEN, 4, compressed_block_sizes[4]),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_TOKEN, 4, compressed_block_sizes[4]),
+                (DSA_CACHE_TOKEN, 4, physical_dims[4]),
+                (DSA_CACHE_TOKEN, 4, physical_dims[4]),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_TOKEN, 4, physical_dims[4]),
             ]
         elif cr == 128:
             entries = [
-                (DSA_CACHE_TOKEN, 128, compressed_block_sizes[128]),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
+                (DSA_CACHE_TOKEN, 128, physical_dims[128]),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
             ]
         else:
             entries = []
 
-        for cache_type, ratio, block_size in entries:
-            gid = register_group(cache_type, ratio, block_size)
-            caches_info[layer_id].append(DSACacheInfo(gid, cache_type, ratio, block_size))
+        for cache_type, ratio, physical_dim in entries:
+            gid = register_group(cache_type, ratio, physical_dim)
+            caches_info[layer_id].append(DSACacheInfo(gid, cache_type, ratio, physical_dim))
 
     return caches_info, group_infos
 
@@ -272,15 +288,15 @@ def build_cache_specs_v41(
     compress_ratios: Sequence[int],
     kv_source_layer_ids: Sequence[int],
     index_source_layer_ids: Sequence[int],
-    window_size: int,
+    swa_block_size: int,
     n_layers: int,
 ) -> tuple[list[list[DSACacheInfo]], list[DSAGroupInfo]]:
     """Cache-spec construction for DeepSeek-V4.1 (adaptation contract section 2).
 
     Group registration order is exact: group 0 is the SWA ring (block size =
-    window), followed by one TOKEN group per distinct kv-source compress ratio
-    in first-appearance (ascending kv-source layer id) order -- with the
-    standard V4.1 plan always ``[SWA, TOKEN(2), TOKEN(1)]``.
+    ``swa_block_size``), followed by one TOKEN group per distinct kv-source
+    compress ratio in first-appearance (ascending kv-source layer id) order --
+    with the standard V4.1 plan always ``[SWA, TOKEN(2), TOKEN(1)]``.
 
     Per-layer entries (positional order matches the C++ allocation and the
     ``LayerCache`` slots): a kv-source layer with ratio ``r`` owns
@@ -289,49 +305,35 @@ def build_cache_specs_v41(
     ``swa`` entry. Reuse and Reindex layers read the source layer's caches
     cross-layer (read-side only).
     """
-    base_block_size = 128
+    # V4.1 KV is the fixed 128-token block on NPU and MLU. The registered
+    # group size is the physical dim, block_size // ratio.
+    resolved_block_size = DSV4_FIXED_BLOCK_SIZE
+    physical_dims = {
+        1: resolved_block_size // 1,
+        2: resolved_block_size // 2,
+    }
     group_infos: list[DSAGroupInfo] = []
     group_key_map: dict[tuple[int, int, int], int] = {}
 
-    def register_group(cache_type: int, ratio: int, block_size: int) -> int:
-        key = (ratio, cache_type, block_size)
+    def register_group(cache_type: int, ratio: int, physical_dim: int) -> int:
+        key = (ratio, cache_type, physical_dim)
         gid = group_key_map.get(key)
         if gid is not None:
             return gid
         gid = len(group_infos)
         group_key_map[key] = gid
-        group_infos.append(DSAGroupInfo(cache_type, ratio, block_size))
+        group_infos.append(DSAGroupInfo(cache_type, ratio, physical_dim))
         return gid
 
-    swa_gid = register_group(DSA_CACHE_SLIDING_WINDOW, 1, window_size)
+    swa_gid = register_group(DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size)
     kv_sources = sorted({int(source) for source in kv_source_layer_ids})
     for source in kv_sources:
         if not 0 <= source < n_layers:
             raise ValueError(f"kv source layer {source} is outside the model's {n_layers} layers")
         ratio = int(compress_ratios[source]) if source < len(compress_ratios) else 0
-        if ratio <= 0:
-            raise ValueError(f"kv source layer {source} must have a positive compress ratio")
-        register_group(DSA_CACHE_TOKEN, ratio, base_block_size)
-
-    # The DSA metadata builder pairs multi_block_tables[m] with group_infos[m]
-    # by index, and the worker exports multi_block_tables in the fixed
-    # kMultiBlockExportOrder (core/framework/block/block.h): [SWA, C4, C128, C2,
-    # C1], i.e. TOKEN groups in ratio order [4, 128, 2, 1]. The registration
-    # order above follows ascending kv-source layer id, so a config whose first
-    # kv-source carries ratio 1 (before any ratio-2 source) would register
-    # [SWA, TOKEN(1), TOKEN(2)] and silently mis-pair every TOKEN block table
-    # with the wrong group. Fail loud instead of miscomputing slots.
-    export_token_ratios = [4, 128, 2, 1]  # TOKEN groups of kMultiBlockExportOrder, in order.
-    actual_token_ratios = [gi.ratio for gi in group_infos if gi.cache_type == DSA_CACHE_TOKEN]
-    expected_token_ratios = [ratio for ratio in export_token_ratios if ratio in actual_token_ratios]
-    if actual_token_ratios != expected_token_ratios:
-        raise ValueError(
-            f"V4.1 TOKEN group registration order {actual_token_ratios} does not match the "
-            f"worker multi_block_tables export order {expected_token_ratios} "
-            "(kMultiBlockExportOrder [SWA, C4, C128, C2, C1]); multi_block_tables[m] would pair "
-            "with the wrong group_infos[m]. Ensure a kv-source layer with compress ratio 2 "
-            "precedes any kv-source layer with ratio 1 in kv_source_layer_ids."
-        )
+        if ratio not in physical_dims:
+            raise ValueError(f"kv source layer {source} must have compress ratio 1 or 2")
+        register_group(DSA_CACHE_TOKEN, ratio, physical_dims[ratio])
 
     caches_info: list[list[DSACacheInfo]] = [[] for _ in range(n_layers)]
     kv_source_set = set(kv_sources)
@@ -342,18 +344,18 @@ def build_cache_specs_v41(
             # LayerCache slots: key(0), index(2), swa(5), kv_state(6),
             # score_state(7) -- the states exist only for pooling ratios > 1.
             entries = [
-                (DSA_CACHE_TOKEN, ratio, base_block_size),
-                (DSA_CACHE_TOKEN, ratio, base_block_size),
-                (DSA_CACHE_SLIDING_WINDOW, 1, window_size),
+                (DSA_CACHE_TOKEN, ratio, physical_dims[ratio]),
+                (DSA_CACHE_TOKEN, ratio, physical_dims[ratio]),
+                (DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size),
             ]
             if ratio > 1:
-                entries.append((DSA_CACHE_SLIDING_WINDOW, 1, window_size))
-                entries.append((DSA_CACHE_SLIDING_WINDOW, 1, window_size))
+                entries.append((DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size))
+                entries.append((DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size))
         else:
-            entries = [(DSA_CACHE_SLIDING_WINDOW, 1, window_size)]
-        for cache_type, entry_ratio, block_size in entries:
-            gid = register_group(cache_type, entry_ratio, block_size)
-            caches_info[layer_id].append(DSACacheInfo(gid, cache_type, entry_ratio, block_size))
+            entries = [(DSA_CACHE_SLIDING_WINDOW, 1, swa_block_size)]
+        for cache_type, entry_ratio, physical_dim in entries:
+            gid = register_group(cache_type, entry_ratio, physical_dim)
+            caches_info[layer_id].append(DSACacheInfo(gid, cache_type, entry_ratio, physical_dim))
         if layer_id not in kv_source_set:
             # Every layer's first entry addresses the SWA group; assert the
             # registration invariant so a regression cannot silently reorder
@@ -711,40 +713,37 @@ class DsaMetadataBuilder:
         swa_device_ctx_lens: torch.Tensor | None = None,
         dst: DsaMetadata | None = None,
     ) -> None:
-        """Expand the request's per-group block tables into per-layer metadata.
+        """Expand the request's logical block tables into per-layer metadata.
 
         ``group_limit`` is for a model that shares this request's metadata but
-        owns fewer cache groups than its owner (the DSpark draft reads the
-        target's metadata): the request's tables follow the fixed export order
-        (SWA first), so a model's own deduplicated groups are its leading
-        entries. ``None`` (the owning model) consumes every table.
+        owns fewer physical groups than its owner. The selected groups still
+        read their declared logical tables; selecting two TOKEN geometries
+        does not allocate two independent scheduler resources. ``None``
+        consumes all model groups.
 
         ``dst`` (in-place refresh) supplies the graph-captured per-group tensor
-        that each manager's table is written into directly.
+        that each physical view is written into directly.
         """
         if not multi_block_tables or not self.caches_info:
             return
 
+        if group_limit is not None and group_limit < 0:
+            raise ValueError(f"group_limit must be non-negative, got {group_limit}")
+        groups = self.group_infos if group_limit is None else self.group_infos[:group_limit]
+        table_count = len(dsa_block_table_groups(groups))
         active = list(multi_block_tables)
         if group_limit is not None:
-            if group_limit < 0:
-                raise ValueError(f"group_limit must be non-negative, got {group_limit}")
-            active = active[:group_limit]
-        manager_num = len(active)
-        # Packed [manager, blocks] auto-unpack when batch_size == 1.
-        if (
-            manager_num == 1
-            and batch_size == 1
-            and active[0].dim() == 2
-            and active[0].size(0) > 1
-            and active[0].size(0) <= len(self.group_infos)
-        ):
+            active = active[:table_count]
+        # Preserve the single-request packed-table input form.
+        if len(active) == 1 and batch_size == 1 and active[0].dim() == 2 and 1 < active[0].size(0) <= table_count:
             packed = active[0].contiguous()
             active = [packed[m].unsqueeze(0).contiguous() for m in range(packed.size(0))]
-            manager_num = len(active)
-
-        if manager_num > len(self.group_infos):
-            raise ValueError(f"manager count {manager_num} exceeds group count {len(self.group_infos)}")
+        if len(active) != table_count:
+            raise ValueError(f"logical table count {len(active)} does not match model bindings {table_count}")
+        for table in active:
+            if table.dim() != 2 or table.size(0) < batch_size:
+                raise ValueError("DSA logical block tables must be 2-D with one row per request")
+        manager_num = len(groups)
         if enable_graph and graph_block_table_capacity_cols > 0:
             for manager_id, block_table in enumerate(active):
                 if block_table.dim() != 2:
@@ -770,9 +769,9 @@ class DsaMetadataBuilder:
         proc_bt: list[torch.Tensor] = [torch.empty(0)] * manager_num
         proc_slots: list[torch.Tensor] = [torch.empty(0)] * manager_num
         for m in range(manager_num):
-            gi = self.group_infos[m]
+            gi = groups[m]
             proc_bt[m], proc_slots[m] = self._process_group(
-                active[m],
+                active[gi.cache_type],
                 gi,
                 ctx_lens,
                 q_lens,
@@ -875,7 +874,7 @@ class DsaMetadataBuilder:
             return self._process_token_group(
                 raw_bt,
                 gi.ratio,
-                gi.block_size,
+                gi.physical_dim,
                 ctx_lens,
                 q_lens,
                 batch_size,
@@ -887,7 +886,7 @@ class DsaMetadataBuilder:
         if gi.cache_type == DSA_CACHE_SLIDING_WINDOW:
             return self._process_swa_group(
                 raw_bt,
-                gi.block_size,
+                gi.physical_dim,
                 ctx_lens,
                 q_lens,
                 batch_size,
@@ -908,7 +907,7 @@ class DsaMetadataBuilder:
         self,
         raw_bt: torch.Tensor,
         ratio: int,
-        block_size: int,
+        physical_dim: int,
         ctx_lens: Sequence[int],
         q_lens: Sequence[int],
         batch_size: int,
@@ -935,14 +934,14 @@ class DsaMetadataBuilder:
         def slot_for_compressed_index(seq: int, compressed_idx: int) -> int:
             if seq >= len(block_ids) or semantic_cols <= 0:
                 return -1
-            block_idx = compressed_idx // block_size
+            block_idx = compressed_idx // physical_dim
             if block_idx >= semantic_cols:
                 return -1
             block_id = int(block_ids[seq][block_idx])
             if block_id < 0:
                 return -1
-            block_offset = compressed_idx % block_size
-            return block_id * block_size + block_offset
+            block_offset = compressed_idx % physical_dim
+            return block_id * physical_dim + block_offset
 
         write_idx = 0
         for seq in range(batch_size):
@@ -1193,7 +1192,7 @@ class DsaMetadataBuilder:
         batch_size: int,
         total_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        block_size = gi.block_size
+        physical_dim = gi.physical_dim
         slots = torch.full((total_tokens,), -1, dtype=torch.int32, device=raw_bt.device)
         max_blocks = int(raw_bt.size(1))
         start_idx = 0
@@ -1210,10 +1209,10 @@ class DsaMetadataBuilder:
                 block_id = int(raw_bt[seq, blk].item())
                 if block_id < 0:
                     break
-                for off in range(block_size):
+                for off in range(physical_dim):
                     if filled >= slot_num:
                         break
-                    slots[start_idx + filled] = block_id * block_size + off
+                    slots[start_idx + filled] = block_id * physical_dim + off
                     filled += 1
             start_idx += token_len
         # Replace -1 padding with 0 (C++ does torch::where(eq(-1), 0, raw)).
@@ -1225,7 +1224,7 @@ class DsaMetadataBuilder:
         if gi.cache_type == DSA_CACHE_TOKEN:
             return token_len // gi.ratio
         # SLIDING_WINDOW
-        block_size = gi.block_size
+        block_size = gi.physical_dim
         if token_len > block_size:
             return token_len % block_size + block_size
         remainder = token_len % block_size

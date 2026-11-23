@@ -95,7 +95,7 @@ KVCacheShape::KVCacheShape(const KVCacheCapacity& kv_cache_cap,
   }
 
   if (util::is_deepseek_v4_model_type(model_args.model_type())) {
-    init_dsv4_pool_shape(kv_cache_cap, model_args);
+    init_dsv4_pool_shape(kv_cache_cap);
     return;
   }
 
@@ -278,40 +278,21 @@ void KVCacheShape::print_shapes() const {
   }
 }
 
-void KVCacheShape::init_dsv4_pool_shape(const KVCacheCapacity& kv_cache_cap,
-                                        const ModelArgs& model_args) {
+void KVCacheShape::init_dsv4_pool_shape(const KVCacheCapacity& kv_cache_cap) {
   shape_kind_ = ShapeKind::GROUPED_POOL;
-  // V4 pool is positional [swa_count, c4_count, c128_count]; V4.1 reuses the
-  // slots as [swa_count, c2_count, c1_count] (contract §2), disambiguated by
-  // model_type.
-  dsv41_pool_ = util::is_deepseek_v41_model_type(model_args.model_type());
-  if (dsv41_pool_) {
-    key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.swa_count(),
-                                            kv_cache_cap.c2_count(),
-                                            kv_cache_cap.c1_count()};
-    return;
-  }
-  key_cache_shape_ = std::vector<int64_t>{kv_cache_cap.swa_count(),
-                                          kv_cache_cap.c4_count(),
-                                          kv_cache_cap.c128_count()};
+  // Model geometry determines which physical tensors consume these resources.
+  key_cache_shape_ =
+      std::vector<int64_t>{kv_cache_cap.swa_count(), kv_cache_cap.n_blocks()};
 }
 
 void KVCacheShape::print_dsv4_pool_shape() const {
   CHECK(has_key_cache_shape())
       << "DeepSeek V4 cache shape must contain cache pool counts.";
   const std::vector<int64_t>& pool_counts = key_cache_shape();
-  CHECK_GE(pool_counts.size(), 3)
-      << "DeepSeek V4/V4.1 cache shape must be [swa_count, c4_count, "
-         "c128_count] (V4) or [swa_count, c2_count, c1_count] (V4.1).";
-  if (dsv41_pool_) {
-    LOG(INFO) << "Initializing DSV4.1 kv cache with shape: [swa_count="
-              << pool_counts[0] << ", c2_count=" << pool_counts[1]
-              << ", c1_count=" << pool_counts[2] << "]";
-    return;
-  }
-  LOG(INFO) << "Initializing DSV4 kv cache with shape: [swa_count="
-            << pool_counts[0] << ", c4_count=" << pool_counts[1]
-            << ", c128_count=" << pool_counts[2] << "]";
+  CHECK_EQ(pool_counts.size(), 2u)
+      << "DeepSeek V4 cache shape must contain window and KV capacities.";
+  LOG(INFO) << "Initializing model cache with logical capacities: [swa="
+            << pool_counts[0] << ", kv=" << pool_counts[1] << "]";
 }
 
 void KVCacheShape::to_proto(proto::KVCacheShape* proto_shape) const {
@@ -358,6 +339,8 @@ KVCacheShape KVCacheShape::from_proto(const proto::KVCacheShape& proto_shape) {
         repeated_field_to_vector(proto_shape.kpool_tail_shape());
   }
   if (proto_shape.grouped_cache_layout()) {
+    CHECK_EQ(proto_shape.key_cache_shape_size(), 2)
+        << "Grouped cache requires [swa_count, kv_count].";
     kv_cache_shape.shape_kind_ = ShapeKind::GROUPED_POOL;
   }
   kv_cache_shape.key_cache_shape_ =

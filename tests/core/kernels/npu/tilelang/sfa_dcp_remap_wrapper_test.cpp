@@ -35,13 +35,13 @@ class SfaDcpRemapWrapperTest : public ::testing::Test {
 };
 
 torch::Tensor remap_reference(const torch::Tensor& slots,
-                              int64_t physical_block_size,
+                              int64_t physical_dim,
                               int64_t shard_size,
                               int64_t shard_rank) {
   const auto cpu = slots.to(torch::kCPU).contiguous();
   const int64_t num_tokens = cpu.size(0);
   const int64_t topk = cpu.size(1);
-  const int64_t logical_block_size = physical_block_size * shard_size;
+  const int64_t block_size = physical_dim * shard_size;
   auto out = torch::empty_like(cpu);
   auto out_a = out.accessor<int32_t, 2>();
   const auto in_a = cpu.accessor<int32_t, 2>();
@@ -51,12 +51,12 @@ torch::Tensor remap_reference(const torch::Tensor& slots,
       const int32_t slot = in_a[token][k];
       int32_t local = kInvalidSlot;
       if (slot >= 0) {
-        const int64_t block = static_cast<int64_t>(slot) / logical_block_size;
-        const int64_t off = static_cast<int64_t>(slot) % logical_block_size;
-        const int64_t owner = off / physical_block_size;
-        const int64_t local_off = off % physical_block_size;
+        const int64_t block = static_cast<int64_t>(slot) / block_size;
+        const int64_t off = static_cast<int64_t>(slot) % block_size;
+        const int64_t owner = off / physical_dim;
+        const int64_t local_off = off % physical_dim;
         if (owner == shard_rank) {
-          local = static_cast<int32_t>(block * physical_block_size + local_off);
+          local = static_cast<int32_t>(block * physical_dim + local_off);
         }
       }
       if (local >= 0) {
@@ -81,13 +81,13 @@ TEST_F(SfaDcpRemapWrapperTest, MatchesNaiveCompact) {
       {128, 32, 7},
   }};
   for (const auto& spec : cases) {
-    const int64_t physical_block_size = spec[0];
+    const int64_t physical_dim = spec[0];
     const int64_t shard_size = spec[1];
     const int64_t shard_rank = spec[2];
-    torch::manual_seed(physical_block_size + shard_size);
+    torch::manual_seed(physical_dim + shard_size);
     auto slots =
         torch::randint(0,
-                       8 * physical_block_size * shard_size,
+                       8 * physical_dim * shard_size,
                        {num_tokens, topk},
                        torch::TensorOptions().dtype(torch::kInt32).device(npu));
     auto mask = torch::rand({num_tokens, topk}, npu) < 0.25;
@@ -98,11 +98,10 @@ TEST_F(SfaDcpRemapWrapperTest, MatchesNaiveCompact) {
         torch::empty({num_tokens * topk},
                      torch::TensorOptions().dtype(torch::kInt32).device(npu));
     sfa_dcp_remap_out(
-        slots, physical_block_size, shard_size, shard_rank, out, scratch);
-    auto ref =
-        remap_reference(slots, physical_block_size, shard_size, shard_rank);
+        slots, physical_dim, shard_size, shard_rank, out, scratch);
+    auto ref = remap_reference(slots, physical_dim, shard_size, shard_rank);
     EXPECT_TRUE(torch::equal(out, ref))
-        << "pb=" << physical_block_size << " dcp=" << shard_size;
+        << "pb=" << physical_dim << " dcp=" << shard_size;
   }
 }
 

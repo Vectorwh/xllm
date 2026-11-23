@@ -39,7 +39,7 @@ constexpr int64_t kRemapTopk = 2048;
 }  // namespace
 
 void sfa_dcp_remap_out(const torch::Tensor& topk_indices,
-                       int64_t physical_block_size,
+                       int64_t physical_dim,
                        int64_t shard_size,
                        int64_t shard_rank,
                        torch::Tensor& out,
@@ -57,7 +57,7 @@ void sfa_dcp_remap_out(const torch::Tensor& topk_indices,
 
   const int64_t topk = topk_indices.size(-1);
   CHECK_EQ(topk, kRemapTopk);
-  CHECK_GT(physical_block_size, 0);
+  CHECK_GT(physical_dim, 0);
   CHECK_GT(shard_size, 0);
   const int64_t num_tokens = topk_indices.numel() / topk;
   CHECK_GT(num_tokens, 0);
@@ -82,7 +82,7 @@ void sfa_dcp_remap_out(const torch::Tensor& topk_indices,
       scratch_ptr,
       scratch_ptr,
       static_cast<int32_t>(num_tokens),
-      static_cast<int32_t>(physical_block_size),
+      static_cast<int32_t>(physical_dim),
       static_cast<int32_t>(shard_size),
       static_cast<int32_t>(shard_rank),
       stream);

@@ -349,6 +349,7 @@ class RestorePriorityBlockManagerPool final : public BlockManagerPool {
 class TestUnifiedPolicy final : public UnifiedPolicy {
  public:
   using SchedulerPolicy::allocate_for_prefill;
+  using SchedulerPolicy::allocate_shared_blocks_for;
   using UnifiedPolicy::UnifiedPolicy;
 };
 
@@ -1432,9 +1433,9 @@ TEST(SchedulerPolicyTest, LinearSchedulingPreservesReadSourceAcrossPolicies) {
 }
 
 TEST(SchedulerPolicyTest, LinearTailPrefillPreservesKvSplitBoundaries) {
-  constexpr int32_t kPhysicalBlockSize = 128;
+  constexpr int32_t kPhysicalDim = 128;
   constexpr int32_t kKvSplitSize = 2;
-  constexpr int32_t kEffectiveBlockSize = kPhysicalBlockSize * kKvSplitSize;
+  constexpr int32_t kEffectiveBlockSize = kPhysicalDim * kKvSplitSize;
   constexpr int32_t kChunkSize = 8192;
   ScopedConfigValue<bool> chunked_guard(
       SchedulerConfig::get_instance().enable_chunked_prefill(), true);
@@ -1458,7 +1459,7 @@ TEST(SchedulerPolicyTest, LinearTailPrefillPreservesKvSplitBoundaries) {
       SCOPED_TRACE(prompt_tokens);
       ContinuousScheduler::Options options =
           create_scheduler_options(kChunkSize, 16, 0, kChunkSize, 1, strategy);
-      // LLM initialization passes a logical block size that already includes
+      // LLM initialization passes a block size that already includes
       // KV split. The tail cap and LINEAR hash chain must use that same size.
       FakeEngine engine(/*num_blocks=*/128,
                         /*block_size=*/kEffectiveBlockSize,
@@ -1494,7 +1495,7 @@ TEST(SchedulerPolicyTest, LinearTailPrefillPreservesKvSplitBoundaries) {
         cached_tokens += expected_tokens;
         if (cached_tokens < static_cast<size_t>(prompt_tokens)) {
           EXPECT_EQ(cached_tokens % kEffectiveBlockSize, 0u);
-          EXPECT_EQ((cached_tokens / kKvSplitSize) % kPhysicalBlockSize, 0u);
+          EXPECT_EQ((cached_tokens / kKvSplitSize) % kPhysicalDim, 0u);
         }
         sequence->kv_state().set_kv_cache_tokens_num(cached_tokens);
       }
@@ -1620,9 +1621,9 @@ TEST(SchedulerPolicyTest, HotFrontStopsAfterPartialTokenBudgets) {
 }
 
 TEST(SchedulerPolicyTest, HotFrontStopsAtLogicalCheckpointWithKvSplit) {
-  constexpr int32_t kPhysicalBlockSize = 128;
+  constexpr int32_t kPhysicalDim = 128;
   constexpr int32_t kKvSplitSize = 2;
-  constexpr int32_t kBlockSize = kPhysicalBlockSize * kKvSplitSize;
+  constexpr int32_t kBlockSize = kPhysicalDim * kKvSplitSize;
   constexpr int32_t kChunkSize = 2048;
   constexpr size_t kPromptTokens = 4096;
   constexpr int32_t kMaxContextTokens =
@@ -2153,6 +2154,68 @@ TEST(SchedulerPolicyTest, LinearLatencySchedulingRespectsRemainingTokenBudget) {
       }
     }
   }
+}
+
+TEST(SchedulerPolicyTest, KvlessCompositeReprobesAfterPartialAllocation) {
+  ContinuousScheduler::Options options = create_scheduler_options(
+      /*max_tokens_per_batch=*/16384,
+      /*max_seqs_per_batch=*/16,
+      /*num_speculative_tokens=*/0,
+      /*max_tokens_per_chunk_for_prefill=*/16384,
+      /*dp_size=*/1,
+      /*priority_strategy=*/"multi_slo_and_prio");
+  BatchMode mode{
+      .enable_mix_batch = true,
+      .enable_chunked_prefill = true,
+      .priority_strategy = "multi_slo_and_prio",
+  };
+  TestUnifiedPolicy policy(mode, options);
+  RetryRestoreBlockManagerPool block_manager_pool;
+
+  std::vector<std::shared_ptr<Request>> requests = generate_request(
+      {32769}, {1}, std::nullopt, std::nullopt, /*max_context_len=*/40000);
+  Sequence* sequence = requests.front()->sequences().front().get();
+  // Cache blocks without a KV table: the re-probe must see a KV-less sequence.
+  sequence->kv_state().add_blocks(BlockType::SWA, std::vector<Block>(1));
+  sequence->kv_state().set_prefix_cache_matched();
+  ASSERT_TRUE(sequence->kv_state().has_any_blocks());
+  ASSERT_EQ(sequence->kv_state().num_blocks(BlockType::KV), 0u);
+
+  DequeQueue prefill_queue;
+  DequeQueue chunk_queue;
+  DequeQueue decode_queue;
+  std::list<std::shared_ptr<Request>> unified_queue;
+  std::deque<DecodeRestoreEntry> decode_restore_waiting;
+  std::vector<std::shared_ptr<Request>> running_requests;
+  std::vector<Sequence*> running_sequences;
+  std::vector<size_t> running_sequence_budgets;
+  bool last_step_prefill = false;
+  ModelArgs model_args;
+  DecodeAdmission decode_admission(&block_manager_pool,
+                                   DecodeAdmission::Options{});
+  SchedulerState state{
+      .prefill_queue = prefill_queue,
+      .chunk_queue = chunk_queue,
+      .decode_queue = decode_queue,
+      .unified_queue = unified_queue,
+      .decode_restore_waiting = decode_restore_waiting,
+      .running_requests = running_requests,
+      .running_sequences = running_sequences,
+      .running_sequences_budgets = running_sequence_budgets,
+      .kv_cache_manager = &block_manager_pool,
+      .profile_manager = nullptr,
+      .response_processor = nullptr,
+      .model_args = model_args,
+      .last_step_prefill = last_step_prefill,
+      .options = options,
+      .min_speculative_tokens_required = 0,
+      .enable_prefix_cache = true,
+      .decode_admission = &decode_admission,
+  };
+
+  policy.allocate_shared_blocks_for(sequence, state);
+
+  EXPECT_EQ(block_manager_pool.allocate_shared_calls(), 1);
 }
 
 TEST(SchedulerPolicyTest, UnifiedRetryRefreshesHostRestoreBeforeChunkSizing) {

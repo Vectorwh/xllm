@@ -321,6 +321,12 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
   info.remote_instance_info = full_info.remote_instance_info;
   info.dst_xtensor_layer_offsets.clear();
 
+  const bool grouped =
+      std::any_of(full_info.mappings.begin(),
+                  full_info.mappings.end(),
+                  [](const KVTransferMapping& mapping) {
+                    return mapping.group_id == cache_group_id(BlockType::SWA);
+                  });
   for (const KVTransferMapping& full_mapping : full_info.mappings) {
     const std::optional<BlockType> block_type =
         block_type_from_cache_group_id(full_mapping.group_id);
@@ -370,11 +376,11 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
       continue;
     }
 
-    const bool is_flat_kv = block_type.value() == BlockType::KV;
+    const bool is_kv = block_type.value() == BlockType::KV;
     const size_t next_transfer_idx =
-        is_flat_kv ? sequence->kv_state().next_transfer_block_idx()
-                   : sequence->kv_state().next_group_transfer_block_idx(
-                         block_type.value());
+        is_kv ? sequence->kv_state().next_transfer_block_idx()
+              : sequence->kv_state().next_group_transfer_block_idx(
+                    block_type.value());
     const size_t win_end =
         static_cast<size_t>(util::ceil_div(seq_len, block_size));
     const size_t map_end = std::min(win_end, local_ids.size());
@@ -399,13 +405,10 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
         << ", remote_stride=" << remote_stride
         << ", remote_shared_num=" << remote_shared_num;
 
-    // Flat KV responses omit D-side shared blocks, while grouped responses
-    // preserve their full logical tables (including SWA placeholders).
-    const size_t remote_origin = is_flat_kv ? remote_shared_num : 0;
-    // Destination-block span this mapping covers. The remote list starts at
-    // the first block D does not already hold, and each source block spans
-    // `remote_stride` entries, so the prefix must be subtracted in
-    // destination-block units rather than in source-block units.
+    // Flat KV omits shared IDs; grouped responses keep their full tables.
+    const size_t remote_origin = is_kv && !grouped ? remote_shared_num : 0;
+    // Each source block spans remote_stride destination entries. Subtract
+    // the shared prefix in destination units to locate its slice.
     const size_t remote_span = map_end * remote_stride;
     const size_t remote_end =
         remote_span > remote_origin ? remote_span - remote_origin : 0;
@@ -424,8 +427,8 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t stable_end = static_cast<size_t>(seq_len / block_size);
     const size_t advanced_transfer_idx =
         std::max(next_transfer_idx, std::min(stable_end, map_end));
-    auto update = [sequence, is_flat_kv, block_type, advanced_transfer_idx] {
-      if (is_flat_kv) {
+    auto update = [sequence, is_kv, block_type, advanced_transfer_idx] {
+      if (is_kv) {
         sequence->kv_state().advance_transfer_block_idx(advanced_transfer_idx);
       } else {
         sequence->kv_state().advance_group_transfer_block_idx(
@@ -437,12 +440,12 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     } else if (sequence_updates != nullptr) {
       sequence_updates->emplace_back(std::move(update));
     }
-    // `remote_origin` counts destination blocks, so "the destination already
-    // holds everything this step would push" is a destination-block test.
-    // Comparing it against map_end (source blocks) would claim a full hit as
-    // soon as the prefix reached a quarter of the prompt and silently drop the
-    // remaining stripes.
-    if (next_transfer_idx >= map_end || remote_span <= remote_origin) {
+    // `remote_shared_num` counts destination blocks, so "the destination
+    // already holds everything this step would push" is a destination-block
+    // test. Comparing it against map_end (source blocks) would claim a full hit
+    // as soon as the prefix reached a quarter of the prompt and silently drop
+    // the remaining stripes.
+    if (next_transfer_idx >= map_end || remote_span <= remote_shared_num) {
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
@@ -469,7 +472,7 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
         // the prefix is non-zero, so subtract in destination-block units and
         // skip the stripes D already holds.
         const size_t remote_block = local_idx * remote_stride + offset;
-        if (remote_block < remote_origin) {
+        if (remote_block < remote_shared_num) {
           continue;
         }
         const size_t remote_idx = remote_block - remote_origin;
@@ -512,7 +515,7 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
-    if (is_flat_kv) {
+    if (is_kv && !grouped) {
       append_xtensor_offsets(
           &info, full_info, full_mapping.remote_ids.size(), remote_idxs);
     }

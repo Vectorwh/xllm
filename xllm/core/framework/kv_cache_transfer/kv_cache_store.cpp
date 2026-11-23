@@ -21,6 +21,7 @@ limitations under the License.
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -38,6 +39,22 @@ void append_key_field(std::string& key, const std::string& value) {
   key.push_back(':');
   key.append(value);
   key.push_back(':');
+}
+
+std::string store_block_type_name(BlockType type) {
+  switch (type) {
+    case BlockType::KV:
+      return "kv";
+    case BlockType::SWA:
+      return "swa";
+    case BlockType::LINEAR:
+      return "linear";
+    case BlockType::EMBEDDING:
+      return "embedding";
+    default:
+      LOG(FATAL) << "Physical cache groups cannot name Store objects.";
+      return {};
+  }
 }
 
 }  // namespace
@@ -127,7 +144,8 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
     store_entries.reserve(entries.size());
     max_entries_per_type_ = std::max(max_entries_per_type_, entries.size());
     for (HostCacheStoreEntry& entry : entries) {
-      CHECK(entry.cache != nullptr) << "KVCacheStore cache must not be null.";
+      CHECK(!entry.groups.empty())
+          << "KVCacheStore entry requires Host tensor groups.";
       CHECK(!entry.key_component.empty())
           << "KVCacheStore key component must not be empty.";
       CHECK(cache_handles.emplace(entry.cache_handle).second)
@@ -142,27 +160,72 @@ void KVCacheStore::initialize_store_index(HostCacheStoreIndex store_index) {
       const bool is_split_cache =
           entry.is_target && block_type != BlockType::LINEAR;
       const bool put_owner = is_put_owner(tp_layout, is_split_cache);
+      std::vector<StorePlane> planes;
+      std::vector<torch::Tensor> registration_tensors;
+      int64_t host_blocks = -1;
+      for (const HostCacheStoreGroup& group : entry.groups) {
+        const BlockTypeTensorMap& tensors = group.tensors;
+        CHECK(!tensors.empty()) << "Host Store group has no tensors.";
+        planes.reserve(planes.size() +
+                       tensors.size() *
+                           std::max<size_t>(group.layer_ids.size(), 1));
+        registration_tensors.reserve(registration_tensors.size() +
+                                     tensors.size());
+        for (const auto& [role, tensor] : tensors) {
+          CHECK(tensor.defined() && tensor.is_cpu() && tensor.dim() > 1 &&
+                tensor.is_contiguous());
+          CHECK_GT(tensor.size(0), 0);
+          if (host_blocks < 0) {
+            host_blocks = tensor.size(0);
+          } else {
+            CHECK_EQ(host_blocks, tensor.size(0));
+          }
+          registration_tensors.emplace_back(tensor);
+          if (group.layer_ids.empty()) {
+            planes.emplace_back(StorePlane{-1, role, tensor});
+            continue;
+          }
+          CHECK_GT(tensor.dim(), 2);
+          CHECK_EQ(tensor.size(1),
+                   static_cast<int64_t>(group.layer_ids.size()));
+          for (size_t slot = 0; slot < group.layer_ids.size(); ++slot) {
+            CHECK_GE(group.layer_ids[slot], 0);
+            planes.emplace_back(StorePlane{
+                group.layer_ids[slot], role, tensor.select(1, slot)});
+          }
+        }
+      }
+      std::sort(planes.begin(),
+                planes.end(),
+                [](const StorePlane& lhs, const StorePlane& rhs) {
+                  return std::tie(lhs.source_layer_id, lhs.role) <
+                         std::tie(rhs.source_layer_id, rhs.role);
+                });
+      for (size_t index = 1; index < planes.size(); ++index) {
+        CHECK(planes[index - 1].source_layer_id !=
+                  planes[index].source_layer_id ||
+              planes[index - 1].role != planes[index].role)
+            << "Duplicate Store source-layer/role plane.";
+      }
       std::string schema_hash =
-          build_schema_hash(block_type, *entry.cache, tp_layout);
+          build_schema_hash(block_type, planes, tp_layout, entry.block_size);
       std::string key_prefix = build_key_prefix(entry.key_component,
                                                 block_type,
                                                 schema_hash,
                                                 tp_layout,
                                                 is_split_cache);
-      const BlockTypeTensorMap tensors =
-          entry.cache->get_block_type_tensors(block_type);
       std::vector<torch::Tensor> block_tensors;
-      block_tensors.reserve(tensors.size());
-      for (const auto& tensor_entry : tensors) {
-        block_tensors.emplace_back(tensor_entry.second);
+      block_tensors.reserve(planes.size());
+      for (StorePlane& plane : planes) {
+        block_tensors.emplace_back(std::move(plane.tensor));
       }
       store_entries.emplace_back(StoreEntry{entry.cache_handle,
                                             std::move(entry.key_component),
                                             std::move(schema_hash),
-                                            entry.cache,
                                             block_type,
                                             std::move(key_prefix),
                                             std::move(block_tensors),
+                                            std::move(registration_tensors),
                                             put_owner});
     }
   }
@@ -203,18 +266,16 @@ bool KVCacheStore::is_put_owner(StoreTpLayout tp_layout,
   return rank % ranks_per_split < owner_count;
 }
 
-std::string KVCacheStore::build_schema_hash(BlockType block_type,
-                                            const KVCache& cache,
-                                            StoreTpLayout tp_layout) const {
-  const BlockTypeTensorMap tensors = cache.get_block_type_tensors(block_type);
-  CHECK(!tensors.empty()) << "Host cache has no tensors for BlockType "
-                          << static_cast<int32_t>(block_type);
-
+std::string KVCacheStore::build_schema_hash(
+    BlockType block_type,
+    const std::vector<StorePlane>& planes,
+    StoreTpLayout tp_layout,
+    int64_t block_size) const {
   std::string cache_schema = tp_layout == StoreTpLayout::TP_REPLICATED
                                  ? "parallel=mla"
                                  : "tp=" + std::to_string(config_.tp_size);
   cache_schema.append("|type=");
-  cache_schema.append(std::to_string(static_cast<int32_t>(block_type)));
+  cache_schema.append(store_block_type_name(block_type));
   // The CP index write mode decides which physical pages of an INDEX
   // resource hold valid data (replicated persists every natural row;
   // sharded keeps only page 0 of each page group), so objects written
@@ -223,18 +284,17 @@ std::string KVCacheStore::build_schema_hash(BlockType block_type,
   // reading replicated would score a sharded writer's stale peer pages as
   // valid with no error signal. The constructor wires the process's
   // declared mode (see hierarchy_kv_cache_transfer) into this config.
+  cache_schema.append("|block_size=");
+  cache_schema.append(std::to_string(block_size));
   cache_schema.append("|cp_index_write_mode=");
   cache_schema.append(std::to_string(config_.cp_index_write_mode));
-  int64_t host_blocks = -1;
-  for (const auto& [role, tensor] : tensors) {
-    CHECK(tensor.defined() && tensor.dim() > 0 && tensor.is_contiguous());
-    if (host_blocks < 0) {
-      host_blocks = tensor.size(0);
-    } else {
-      CHECK_EQ(host_blocks, tensor.size(0));
-    }
+  for (const StorePlane& plane : planes) {
+    const torch::Tensor& tensor = plane.tensor;
+    CHECK(tensor[0].is_contiguous());
+    cache_schema.append("|layer=");
+    cache_schema.append(std::to_string(plane.source_layer_id));
     cache_schema.append(",role=");
-    cache_schema.append(std::to_string(static_cast<int32_t>(role)));
+    cache_schema.append(std::to_string(static_cast<int32_t>(plane.role)));
     cache_schema.append(",dtype=");
     cache_schema.append(
         std::to_string(static_cast<int32_t>(tensor.scalar_type())));
@@ -254,7 +314,7 @@ std::string KVCacheStore::build_key_prefix(const std::string& key_component,
                                            const std::string& schema_hash,
                                            StoreTpLayout tp_layout,
                                            bool is_split_cache) const {
-  std::string prefix = "xllm-kv-v3:";
+  std::string prefix = "xllm-kv-v5:";
   append_key_field(prefix, config_.model_id);
   append_key_field(prefix, key_component);
   if (tp_layout == StoreTpLayout::TP_REPLICATED) {
@@ -271,7 +331,7 @@ std::string KVCacheStore::build_key_prefix(const std::string& key_component,
   // rank addresses the canonical split-0 object for its TP shard.
   prefix.append(std::to_string(is_split_cache ? config_.kv_split_rank : 0));
   prefix.push_back(':');
-  prefix.append(std::to_string(static_cast<int32_t>(block_type)));
+  prefix.append(store_block_type_name(block_type));
   prefix.push_back(':');
   prefix.append(schema_hash);
   return prefix;
@@ -595,11 +655,9 @@ std::optional<std::vector<StoreRegisteredRange>> KVCacheStore::collect_ranges()
   std::vector<StoreRegisteredRange> ranges;
   for (const auto& [block_type, entries] : store_index_) {
     for (const StoreEntry& entry : entries) {
-      const BlockTypeTensorMap tensors =
-          entry.cache->get_block_type_tensors(block_type);
-      for (const auto& tensor_entry : tensors) {
-        const torch::Tensor& tensor = tensor_entry.second;
-        if (!tensor.defined() || tensor.numel() <= 0 ||
+      for (const torch::Tensor& tensor : entry.registration_tensors) {
+        if (!tensor.defined() || !tensor.is_contiguous() ||
+            tensor.numel() <= 0 ||
             static_cast<uint64_t>(tensor.numel()) >
                 std::numeric_limits<size_t>::max() /
                     static_cast<size_t>(tensor.element_size())) {

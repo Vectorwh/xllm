@@ -33,8 +33,8 @@ namespace xllm {
 class CompositeBlockManager : public BlockManager {
  public:
   // The admission / prefix roles live on the composite, not on the leaf: the
-  // same BlockManagerImpl is prefix-capable under KV but non-prefix under
-  // C4/C128.
+  // same leaf implementation can be prefix-capable or private according to
+  // its declared resource role.
   struct LeafEntry {
     std::unique_ptr<BlockManager> leaf;
     bool participates_in_admission = true;
@@ -57,14 +57,14 @@ class CompositeBlockManager : public BlockManager {
   //   FLAT_KV        Plain KV. No cross-leaf trim.
   //   FLAT_KV_LINEAR KV + LINEAR restore. Clamp KV to LINEAR's recoverable
   //                  budget and select its deepest checkpoint.
-  //   SWA_COMPRESSED SWA + C4/C128 (V4) or C1/C2 (V4.1). Cross-leaf min,
+  //   SWA_KV         SWA + KV. Cross-leaf min,
   //                  largest-block clamp, SWA tail-continuity, exact-repeat
   //                  pop.
   //   UNSUPPORTED    Prefix cache off (xtensor / --enable_prefix_cache=false).
   enum class LeafCombination : int8_t {
     FLAT_KV,
     FLAT_KV_LINEAR,
-    SWA_COMPRESSED,
+    SWA_KV,
     UNSUPPORTED,
   };
 
@@ -166,7 +166,7 @@ class CompositeBlockManager : public BlockManager {
 };
 
 // Build the leaf map for one DP rank. Base cache-bearing layouts are flat KV,
-// compressed SWA/C4/C128, and xtensor-backed KV.
+// SWA + KV, and xtensor-backed KV.
 // A LINEAR leaf is added when enable_linear_state (GDN recurrent models).
 // Leaves are wrapped in ConcurrentBlockManagerImpl for disagg-PD / kvcache
 // store. The EMBEDDING leaf is appended by the pool caller only when spec

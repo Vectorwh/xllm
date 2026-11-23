@@ -31,23 +31,6 @@ namespace {
 // Floor for one drain. The effective capacity is max(this, resident_.size()).
 constexpr size_t kDefaultDrainCapacity = 8192;
 
-// KV, C1, and C4 never coexist, so the journal keeps one resident hash map.
-bool publishes_prefix_cache(BlockType type) {
-  switch (type) {
-    case BlockType::KV:
-    case BlockType::C1:
-    case BlockType::C4:
-      return true;
-    case BlockType::SWA:
-    case BlockType::C128:
-    case BlockType::C2:
-    case BlockType::EMBEDDING:
-    case BlockType::LINEAR:
-      return false;
-  }
-  return false;
-}
-
 // Steady occupancy is 60% of the queue. Each further 10% occupied, rounded
 // up, adds another 10% of capacity on top of max_events. One drain then
 // leaves the queue near 60%. A capacity under 10 still adds one event per
@@ -79,14 +62,15 @@ void PrefixCacheJournal::set_publishing_enabled(bool enabled) {
 }
 
 void PrefixCacheJournal::publish_stored(const XXH3Key& hash, BlockType type) {
-  if (!publishes_prefix_cache(type)) {
+  // Only the logical history resource publishes prefix progress.
+  if (type != BlockType::KV) {
     return;
   }
   enqueue_event(PrefixCacheEventKind::STORED, hash);
 }
 
 void PrefixCacheJournal::publish_removed(const XXH3Key& hash, BlockType type) {
-  if (!publishes_prefix_cache(type)) {
+  if (type != BlockType::KV) {
     return;
   }
   enqueue_event(PrefixCacheEventKind::REMOVED, hash);

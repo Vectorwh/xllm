@@ -32,17 +32,17 @@ torch::Tensor localize_kv_shard_slots(const torch::Tensor& logical_slots,
   torch::Tensor valid_slots = logical_slots >= 0;
   torch::Tensor safe_slots = torch::clamp_min(logical_slots, 0);
   torch::Tensor logical_offsets =
-      torch::remainder(safe_slots, layout.logical_block_size());
+      torch::remainder(safe_slots, layout.block_size());
   torch::Tensor owner_ranks =
-      torch::floor_divide(logical_offsets, layout.physical_block_size());
+      torch::floor_divide(logical_offsets, layout.physical_dim());
   torch::Tensor owned_slots =
       torch::logical_and(valid_slots, owner_ranks == layout.dcp_rank());
   torch::Tensor logical_block_ids =
-      torch::floor_divide(safe_slots, layout.logical_block_size());
+      torch::floor_divide(safe_slots, layout.block_size());
   torch::Tensor local_offsets =
-      torch::remainder(logical_offsets, layout.physical_block_size());
+      torch::remainder(logical_offsets, layout.physical_dim());
   torch::Tensor local_slots =
-      logical_block_ids * layout.physical_block_size() + local_offsets;
+      logical_block_ids * layout.physical_dim() + local_offsets;
   return torch::where(
       owned_slots,
       local_slots,
@@ -56,19 +56,19 @@ torch::Tensor localize_kv_shard_context_lens(
         global_context_lens.scalar_type() == torch::kInt64)
       << "cache-shard context lengths must use int32 or int64";
   torch::Tensor nonnegative_lens = torch::clamp_min(global_context_lens, 0);
-  const int64_t logical_block_size = layout.logical_block_size();
-  const int64_t physical_block_size = layout.physical_block_size();
+  const int64_t block_size = layout.block_size();
+  const int64_t physical_dim = layout.physical_dim();
   const int64_t rank_start =
-      static_cast<int64_t>(layout.dcp_rank()) * physical_block_size;
+      static_cast<int64_t>(layout.dcp_rank()) * physical_dim;
   torch::Tensor full_logical_blocks =
-      torch::floor_divide(nonnegative_lens, logical_block_size);
+      torch::floor_divide(nonnegative_lens, block_size);
   torch::Tensor logical_block_remainder =
-      torch::remainder(nonnegative_lens, logical_block_size);
+      torch::remainder(nonnegative_lens, block_size);
   torch::Tensor owned_remainder =
       torch::clamp(logical_block_remainder - rank_start,
                    /*min=*/0,
-                   /*max=*/physical_block_size);
-  return full_logical_blocks * physical_block_size + owned_remainder;
+                   /*max=*/physical_dim);
+  return full_logical_blocks * physical_dim + owned_remainder;
 }
 
 torch::Tensor expand_replicated_block_table(

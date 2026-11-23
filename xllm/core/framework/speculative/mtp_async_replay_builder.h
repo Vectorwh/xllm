@@ -44,7 +44,7 @@ DraftReplayInputPlan build_draft_replay_input_plan(
     const ForwardInput& base_input,
     const std::vector<EmbeddingCache::DecodeState>& states,
     const torch::Tensor& embedding_placeholder,
-    int32_t logical_block_size,
+    int32_t block_size,
     int32_t uniform_width,
     bool graph_warmup,
     int32_t pad_cache_slot = 0);

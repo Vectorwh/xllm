@@ -44,9 +44,13 @@ class KVCacheCapacity final {
     return index_block_size_;
   }
 
+  // Logical KV capacity; a draft can inherit it without owning KV tensors.
+  PROPERTY(bool, has_kv_cache) = true;
   PROPERTY(int64_t, n_blocks) = 0;
   PROPERTY(int64_t, cache_size_in_bytes) = 0;
   PROPERTY(int64_t, block_size) = 0;
+  // Window resources retain their own original-token span.
+  PROPERTY(int64_t, swa_block_size) = 0;
   PROPERTY(int64_t, slot_size) = 0;
 
   // Physical pages one logical block owns in this pool. 1 means the pool
@@ -82,17 +86,8 @@ class KVCacheCapacity final {
   PROPERTY(int64_t, num_full_attention_layers) = 0;
   PROPERTY(int64_t, num_linear_attention_layers) = 0;
 
-  // DeepSeek V4 uses separate block pools for sliding-window and compressed
-  // caches. These fields are only meaningful for deepseek_v4.
+  // Model-declared window pool capacity, independent of incremental KV.
   PROPERTY(int64_t, swa_count) = 0;
-  PROPERTY(int64_t, c4_count) = 0;
-  PROPERTY(int64_t, c128_count) = 0;
-
-  // DeepSeek V4.1 TOKEN-group pool counts (kv-source layers, compress ratios
-  // 2 and 1). Only meaningful for deepseek_v41, whose positional pool vector
-  // is [swa_count, c2_count, c1_count].
-  PROPERTY(int64_t, c2_count) = 0;
-  PROPERTY(int64_t, c1_count) = 0;
 
  private:
   int64_t index_slot_size_ = 0;

@@ -27,7 +27,6 @@ limitations under the License.
 #include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/kv_cache_transfer/kv_cache_store.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
-#include "util/utils.h"
 
 namespace xllm {
 namespace {
@@ -75,87 +74,21 @@ std::string make_store_local_hostname(const std::string& configured,
   return host + ":" + std::to_string(port + worker_id);
 }
 
-bool has_tensor(const torch::Tensor& tensor) {
-  return tensor.defined() && tensor.numel() > 0;
-}
-
-BlockTypeTensorMap build_block_type_tensor_map(const KVCache& kv_cache,
-                                               BlockType type,
-                                               int64_t replicated_block_pages) {
-  BlockTypeTensorMap tensors;
-
-  const torch::Tensor key_cache = kv_cache.get_k_cache();
-  const torch::Tensor value_cache = kv_cache.get_v_cache();
-  const torch::Tensor index_cache = kv_cache.get_index_cache();
-  const torch::Tensor conv_cache = kv_cache.get_conv_cache();
-  const torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
-  const torch::Tensor swa_cache = kv_cache.get_swa_cache();
-  const std::optional<torch::Tensor> index_cache_scale =
-      kv_cache.get_indexer_cache_scale();
-
-  switch (type) {
-    case BlockType::KV:
-      if (has_tensor(conv_cache) || has_tensor(ssm_cache) ||
-          has_tensor(swa_cache)) {
-        return {};
-      }
-      // Fold every replicated role into one dim0 row per logical block so the
-      // host transfer's "block id == dim0 row" contract holds under kv_split:
-      // K/V follow the pool's replicated_block_pages (a standalone drafter
-      // replicates), INDEX/INDEX_SCALE follow the NPU indexer replication.
-      if (has_tensor(key_cache)) {
-        tensors.emplace(
-            KVCacheTensorRole::KEY,
-            fold_tensor_rows_for_transfer(
-                key_cache, KVCacheTensorRole::KEY, replicated_block_pages));
-      }
-      if (has_tensor(value_cache)) {
-        tensors.emplace(
-            KVCacheTensorRole::VALUE,
-            fold_tensor_rows_for_transfer(
-                value_cache, KVCacheTensorRole::VALUE, replicated_block_pages));
-      }
-      if (has_tensor(index_cache)) {
-        tensors.emplace(
-            KVCacheTensorRole::INDEX,
-            fold_tensor_rows_for_transfer(
-                index_cache, KVCacheTensorRole::INDEX, replicated_block_pages));
-      }
-      // Quantized index state and scale must move together.
-      if (index_cache_scale.has_value() &&
-          has_tensor(index_cache_scale.value())) {
-        tensors.emplace(
-            KVCacheTensorRole::INDEX_SCALE,
-            fold_tensor_rows_for_transfer(index_cache_scale.value(),
-                                          KVCacheTensorRole::INDEX_SCALE,
-                                          replicated_block_pages));
-      }
-      return tensors;
-    case BlockType::LINEAR: {
-      if (!has_tensor(conv_cache) && !has_tensor(ssm_cache)) {
-        return {};
-      }
-      CHECK(has_tensor(conv_cache) && has_tensor(ssm_cache))
-          << "LINEAR transfer requires both Conv and SSM cache tensors.";
-      return kv_cache.get_block_type_tensors(type, /*checkpoint_row=*/0);
-    }
-    case BlockType::SWA:
-      // The persistent SWA window is restored for every DSV4 layer.
-      if (has_tensor(swa_cache)) {
-        tensors.emplace(KVCacheTensorRole::SWA, swa_cache);
-      }
-      return tensors;
-    case BlockType::C1:
-    case BlockType::C2:
-    case BlockType::C4:
-    case BlockType::C128:
-      if (!has_tensor(swa_cache) || has_tensor(value_cache)) {
-        return {};
-      }
-      return kv_cache.get_block_type_tensors(type);
-    default:
-      return {};
+bool same_copy_layout(const BlockTypeTensorMap& lhs,
+                      const BlockTypeTensorMap& rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
   }
+  auto left = lhs.begin();
+  auto right = rhs.begin();
+  for (; left != lhs.end(); ++left, ++right) {
+    if (left->first != right->first ||
+        left->second.scalar_type() != right->second.scalar_type() ||
+        left->second.sizes() != right->second.sizes()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -245,19 +178,28 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
   if (options_.host_blocks_factor() > 1.0) {
     int64_t max_layer_count = 0;
     std::vector<HostKVGroupLayout> combined_groups;
-    for (CacheDomain& domain : cache_domains_) {
-      domain.device_caches_by_type = build_device_groups(&domain);
-    }
+    const HostCachePlan* target_plan = nullptr;
     for (CacheRole role : {CacheRole::TARGET, CacheRole::DRAFT}) {
       for (CacheDomain& domain : cache_domains_) {
-        if (domain.role == role) {
-          create_host_cache(&domain);
+        if (domain.role != role) {
+          continue;
+        }
+        domain.host_plan = build_host_cache_plan(*domain.device_kv_caches,
+                                                 domain.kv_cache_shape,
+                                                 domain.create_options,
+                                                 options_.host_blocks_factor(),
+                                                 options_.instance_role(),
+                                                 domain.enable_mla,
+                                                 target_plan);
+        if (role == CacheRole::TARGET) {
+          target_plan = &domain.host_plan;
         }
       }
     }
+    int32_t next_group_id = 0;
     for (CacheDomain& domain : cache_domains_) {
-      domain.host_layout =
-          std::make_unique<HostKVLayout>(create_host_kv_layout(domain));
+      domain.host_layout = std::make_unique<HostKVLayout>(
+          create_host_kv_layout(&domain, &next_group_id));
       max_layer_count = std::max<int64_t>(
           max_layer_count,
           static_cast<int64_t>(domain.device_kv_caches->size()));
@@ -284,15 +226,34 @@ bool HierarchyKVCacheTransfer::finalize_registration() {
     for (CacheDomain& domain : cache_domains_) {
       CHECK(!domain.store_key_component.empty())
           << "Mooncake Store requires a cache key component.";
-      for (auto& [block_type, host_cache] : domain.host_caches_by_type) {
-        store_index[block_type].emplace_back(
-            HostCacheStoreEntry{domain.handle,
-                                domain.store_key_component,
-                                host_cache.get(),
-                                domain.enable_mla,
-                                domain.role == CacheRole::TARGET});
+      std::map<BlockType, std::vector<HostCacheStoreGroup>> resource_groups;
+      for (const HostKVGroupLayout& group : domain.host_layout->groups()) {
+        std::vector<int64_t> layer_ids;
+        layer_ids.reserve(group.layers.size());
+        for (const HostKVLayerLayout& layer : group.layers) {
+          CHECK_EQ(layer.group_layer_slot,
+                   static_cast<int64_t>(layer_ids.size()));
+          layer_ids.emplace_back(layer.absolute_layer_id);
+        }
+        const BlockType resource = domain.group_resources.at(group.group_id);
+        resource_groups[resource].emplace_back(
+            HostCacheStoreGroup{std::move(layer_ids), group.host_roles});
+      }
+      for (auto& [resource, groups] : resource_groups) {
+        const bool replicated =
+            resource == BlockType::KV && domain.host_plan.kv_tp_replicated;
+        store_index[resource].emplace_back(HostCacheStoreEntry{
+            domain.handle,
+            domain.store_key_component,
+            replicated,
+            domain.role == CacheRole::TARGET,
+            std::move(groups),
+            resource == BlockType::KV    ? domain.host_plan.block_size
+            : resource == BlockType::SWA ? domain.host_plan.window_block_size
+                                         : 0});
       }
     }
+
     KVCacheStoreInitConfig store_config;
     const std::string store_local_hostname = make_store_local_hostname(
         options_.store_local_hostname(), options_.store_worker_id());
@@ -363,140 +324,84 @@ void HierarchyKVCacheTransfer::shutdown() {
   kv_cache_store_.reset();
   for (CacheDomain& domain : cache_domains_) {
     domain.host_layout.reset();
-    domain.host_caches_by_type.clear();
+    domain.host_regions.clear();
   }
   std::lock_guard<std::mutex> lock(mutex_);
   load_handles_.clear();
 }
 
-int32_t HierarchyKVCacheTransfer::domain_group_id(CacheHandle handle,
-                                                  BlockType block_type) {
-  // The enum is append-only, so the largest cache_group_id may belong to an
-  // appended enumerator (C2) rather than to LINEAR. Derive the packing modulus
-  // from the true maximum so (handle, block_type) stays collision-free.
-  constexpr int32_t kBlockTypeCount =
-      std::max({cache_group_id(BlockType::KV),
-                cache_group_id(BlockType::SWA),
-                cache_group_id(BlockType::C4),
-                cache_group_id(BlockType::C128),
-                cache_group_id(BlockType::EMBEDDING),
-                cache_group_id(BlockType::LINEAR),
-                cache_group_id(BlockType::C1),
-                cache_group_id(BlockType::C2)}) +
-      1;
-  CHECK_LE(handle,
-           static_cast<CacheHandle>(
-               (std::numeric_limits<int32_t>::max() - kBlockTypeCount + 1) /
-               kBlockTypeCount));
-  return static_cast<int32_t>(handle) * kBlockTypeCount +
-         cache_group_id(block_type);
-}
-
-HierarchyKVCacheTransfer::GroupedCaches
-HierarchyKVCacheTransfer::build_device_groups(CacheDomain* domain) const {
-  CHECK(domain != nullptr);
-  CHECK(domain->device_kv_caches != nullptr);
-  GroupedCaches device_groups;
-  const std::vector<BlockType> block_types = {BlockType::KV,
-                                              BlockType::LINEAR,
-                                              BlockType::SWA,
-                                              BlockType::C4,
-                                              BlockType::C128,
-                                              BlockType::C1,
-                                              BlockType::C2};
-  for (int64_t layer_id = 0;
-       layer_id < static_cast<int64_t>(domain->device_kv_caches->size());
-       ++layer_id) {
-    KVCache& kv_cache =
-        domain->device_kv_caches->at(static_cast<size_t>(layer_id));
-    for (BlockType type : block_types) {
-      if (!build_block_type_tensor_map(
-               kv_cache, type, domain->kv_cache_shape.replicated_block_pages())
-               .empty()) {
-        device_groups[type].emplace_back(&kv_cache);
-        domain->layer_ids_by_type[type].emplace_back(layer_id);
-      }
-    }
-  }
-  return device_groups;
-}
-
-void HierarchyKVCacheTransfer::create_host_cache(CacheDomain* domain) {
-  CHECK(domain != nullptr);
-  CHECK(!domain->device_caches_by_type.empty())
-      << "Device cache groups must not be empty.";
-  for (const auto& [block_type, group_caches] : domain->device_caches_by_type) {
-    if (group_caches.empty()) {
-      continue;
-    }
-    KVCacheCreateOptions host_options = domain->create_options;
-    host_options.device(torch::Device(torch::kCPU))
-        .enable_xtensor(false)
-        .tensor_allocator(nullptr)
-        .host_blocks_factor(options_.host_blocks_factor())
-        .is_decode(options_.instance_role() == InstanceRole::DECODE);
-#if defined(USE_NPU)
-    host_options.enable_kv_cache_huge_page_allocator(false);
-#endif
-    if (domain->role == CacheRole::DRAFT && block_type == BlockType::SWA &&
-        util::is_deepseek_v41_dspark_model_type(host_options.model_type())) {
-      const auto target = std::find_if(
-          cache_domains_.begin(), cache_domains_.end(), [](const auto& entry) {
-            return entry.role == CacheRole::TARGET;
-          });
-      CHECK(target != cache_domains_.end())
-          << "V4.1 DSpark Host cache requires a registered target";
-      CHECK_EQ(host_options.block_size(), target->create_options.block_size());
-      CHECK_LE(host_options.window_size(), target->create_options.window_size())
-          << "V4.1 DSpark Host restore requires a draft window no wider than "
-             "the target window";
-      const auto target_swa = target->host_caches_by_type.find(BlockType::SWA);
-      CHECK(target_swa != target->host_caches_by_type.end())
-          << "V4.1 DSpark Host cache requires target SWA storage";
-      host_options.host_swa_block_count(
-          target_swa->second->get_swa_cache().size(0));
-    }
-    domain->host_caches_by_type[block_type] =
-        std::make_unique<KVCache>(domain->kv_cache_shape,
-                                  host_options,
-                                  block_type,
-                                  static_cast<int64_t>(group_caches.size()));
-  }
-}
-
 HostKVLayout HierarchyKVCacheTransfer::create_host_kv_layout(
-    const CacheDomain& domain) const {
+    CacheDomain* domain,
+    int32_t* next_group_id) const {
+  CHECK(domain != nullptr);
+  CHECK(next_group_id != nullptr);
   std::vector<HostKVGroupLayout> groups;
-  groups.reserve(domain.device_caches_by_type.size());
-  for (const auto& [block_type, group_caches] : domain.device_caches_by_type) {
-    auto host_it = domain.host_caches_by_type.find(block_type);
-    auto layer_ids_it = domain.layer_ids_by_type.find(block_type);
-    CHECK(host_it != domain.host_caches_by_type.end());
-    CHECK(layer_ids_it != domain.layer_ids_by_type.end());
-    CHECK_EQ(group_caches.size(), layer_ids_it->second.size());
-
-    HostKVGroupLayout group;
-    group.group_id = domain_group_id(domain.handle, block_type);
-    group.host_roles = host_it->second->get_block_type_tensors(block_type);
-    group.layers.reserve(group_caches.size());
-    for (size_t layer_slot = 0; layer_slot < group_caches.size();
-         ++layer_slot) {
-      HostKVLayerLayout layer;
-      layer.absolute_layer_id = layer_ids_it->second[layer_slot];
-      layer.group_layer_slot = static_cast<int64_t>(layer_slot);
-      layer.device_roles = build_block_type_tensor_map(
-          *group_caches[layer_slot],
-          block_type,
-          domain.kv_cache_shape.replicated_block_pages());
-      layer.device_cache = group_caches[layer_slot];
-      layer.block_type = block_type;
-      group.layers.emplace_back(std::move(layer));
+  std::map<BlockType, std::vector<size_t>> resource_groups;
+  const int64_t num_layers =
+      static_cast<int64_t>(domain->device_kv_caches->size());
+  groups.reserve(static_cast<size_t>(num_layers));
+  for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    KVCache& cache = domain->device_kv_caches->at(layer_id);
+    for (const BlockType resource :
+         {BlockType::KV, BlockType::SWA, BlockType::LINEAR}) {
+      BlockTypeTensorMap tensors =
+          cache.get_block_type_tensors(resource, /*checkpoint_row=*/0);
+      if (tensors.empty()) {
+        continue;
+      }
+      if (!domain->kv_cache_shape.has_grouped_cache_layout()) {
+        for (auto& [role, tensor] : tensors) {
+          tensor = fold_tensor_rows_for_transfer(
+              tensor, role, domain->kv_cache_shape.replicated_block_pages());
+        }
+      }
+      std::vector<size_t>& candidates = resource_groups[resource];
+      const auto compatible =
+          std::find_if(candidates.begin(), candidates.end(), [&](size_t index) {
+            return same_copy_layout(groups[index].layers.front().device_roles,
+                                    tensors);
+          });
+      size_t index = 0;
+      if (compatible == candidates.end()) {
+        CHECK_LT(*next_group_id, std::numeric_limits<int32_t>::max());
+        index = groups.size();
+        groups.emplace_back(HostKVGroupLayout{(*next_group_id)++});
+        candidates.emplace_back(index);
+        domain->group_resources.emplace(groups.back().group_id, resource);
+      } else {
+        index = *compatible;
+      }
+      HostKVGroupLayout& group = groups[index];
+      group.layers.emplace_back(
+          HostKVLayerLayout{layer_id,
+                            static_cast<int64_t>(group.layers.size()),
+                            std::move(tensors),
+                            &cache,
+                            resource});
     }
-    groups.emplace_back(std::move(group));
   }
-  return HostKVLayout(static_cast<int64_t>(domain.device_kv_caches->size()),
-                      std::move(groups),
-                      device_);
+  size_t allocation_count = 0;
+  for (const HostKVGroupLayout& group : groups) {
+    allocation_count += group.layers.front().device_roles.size();
+  }
+  domain->host_regions.reserve(allocation_count);
+  for (HostKVGroupLayout& group : groups) {
+    const BlockType resource = domain->group_resources.at(group.group_id);
+    for (const auto& [role, tensor] : group.layers.front().device_roles) {
+      std::vector<int64_t> shape = tensor.sizes().vec();
+      shape[0] = domain->host_plan.block_counts.at(resource);
+      shape.insert(shape.begin() + 1,
+                   static_cast<int64_t>(group.layers.size()));
+      torch::Tensor host_tensor;
+      domain->host_regions.emplace_back();
+      create_host_page_aligned_tensor(shape,
+                                      tensor.scalar_type(),
+                                      &host_tensor,
+                                      &domain->host_regions.back());
+      group.host_roles.emplace(role, std::move(host_tensor));
+    }
+  }
+  return HostKVLayout(num_layers, std::move(groups), device_);
 }
 
 HostKVRequest HierarchyKVCacheTransfer::make_request(
@@ -511,19 +416,20 @@ HostKVRequest HierarchyKVCacheTransfer::make_request(
     const bool is_load = transfer_type == TransferType::H2D;
     bool has_participating_domain = false;
     for (const CacheDomain& domain : cache_domains_) {
-      if (domain.host_caches_by_type.find(info.block_type) ==
-          domain.host_caches_by_type.end()) {
-        continue;
+      for (const auto& [group_id, resource] : domain.group_resources) {
+        if (info.block_type != resource) {
+          continue;
+        }
+        has_participating_domain = true;
+        std::vector<HostKVMapping>& mappings = domain.role == CacheRole::DRAFT
+                                                   ? request.draft_mappings
+                                                   : request.target_mappings;
+        mappings.emplace_back(
+            HostKVMapping{group_id,
+                          is_load ? info.src_block_id : info.dst_block_id,
+                          is_load ? info.dst_block_id : info.src_block_id,
+                          info.checkpoint_row});
       }
-      has_participating_domain = true;
-      std::vector<HostKVMapping>& mappings = domain.role == CacheRole::DRAFT
-                                                 ? request.draft_mappings
-                                                 : request.target_mappings;
-      mappings.emplace_back(
-          HostKVMapping{domain_group_id(domain.handle, info.block_type),
-                        is_load ? info.src_block_id : info.dst_block_id,
-                        is_load ? info.dst_block_id : info.src_block_id,
-                        info.checkpoint_row});
     }
     CHECK(has_participating_domain)
         << "No KV cache domain supports block type "
@@ -619,8 +525,11 @@ bool HierarchyKVCacheTransfer::supports_block_type(BlockType block_type) const {
   return std::any_of(cache_domains_.begin(),
                      cache_domains_.end(),
                      [block_type](const CacheDomain& domain) {
-                       return domain.host_caches_by_type.find(block_type) !=
-                              domain.host_caches_by_type.end();
+                       return std::any_of(domain.group_resources.begin(),
+                                          domain.group_resources.end(),
+                                          [block_type](const auto& entry) {
+                                            return block_type == entry.second;
+                                          });
                      });
 }
 
@@ -631,8 +540,11 @@ bool HierarchyKVCacheTransfer::supports_block_type(CacheRole role,
       cache_domains_.end(),
       [role](const CacheDomain& candidate) { return candidate.role == role; });
   return domain != cache_domains_.end() &&
-         domain->host_caches_by_type.find(block_type) !=
-             domain->host_caches_by_type.end();
+         std::any_of(domain->group_resources.begin(),
+                     domain->group_resources.end(),
+                     [block_type](const auto& entry) {
+                       return block_type == entry.second;
+                     });
 }
 
 uint32_t HierarchyKVCacheTransfer::offload(

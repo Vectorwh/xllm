@@ -197,7 +197,7 @@ TEST_P(EngineHostTransferTest, TransfersEveryShardInOnlyTheRequestedDpGroup) {
   EXPECT_EQ(engine.host_transfer_worker_count(), topology.expected_.size());
   BlockTransferInfo info(/*src_block_id=*/3, /*dst_block_id=*/7);
   info.transfer_type = TransferType::D2H2G;
-  info.block_type = BlockType::C4;
+  info.block_type = BlockType::KV;
   std::fill(std::begin(info.hash_key), std::end(info.hash_key), 42);
   auto futures = engine.transfer_kv_blocks(topology.rank_, {info});
   EXPECT_EQ(futures.size(), topology.expected_.size());
@@ -229,7 +229,7 @@ TEST_P(EngineHostTransferTest, TransfersEveryShardInOnlyTheRequestedDpGroup) {
     ASSERT_EQ(worker.load_infos_.size(), 1U);
     EXPECT_EQ(worker.load_infos_[0].src_block_id, 3);
     EXPECT_EQ(worker.load_infos_[0].dst_block_id, 7);
-    EXPECT_EQ(worker.load_infos_[0].block_type, BlockType::C4);
+    EXPECT_EQ(worker.load_infos_[0].block_type, BlockType::KV);
     EXPECT_EQ(worker.load_infos_[0].transfer_type, TransferType::H2D);
     EXPECT_TRUE(std::equal(std::begin(info.hash_key),
                            std::end(info.hash_key),

@@ -1524,7 +1524,7 @@ int32_t run_sparse_prefill_child(int32_t rank,
           }
           std::optional<v32_cp::DeepseekV32CPContext> cp;
           const KVShardLayout layout(
-              /*physical_block_size=*/16, world_size, rank);
+              /*physical_dim=*/16, world_size, rank);
           if (sharded && duplicate_slot) {
             batch.slot_mapping = batch.slot_mapping.clone();
             batch.slot_mapping[1] = batch.slot_mapping[0];

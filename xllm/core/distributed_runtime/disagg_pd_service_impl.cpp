@@ -292,7 +292,6 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
   for (auto& req : request->reqs()) {
     auto resp = response->add_resps();
     resp->set_req_id(req.req_id());
-
     bool constraint_rejected = false;
     auto new_request = generate_request(req, &constraint_rejected);
     if (new_request == nullptr) {
@@ -340,16 +339,14 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         for (const auto& [block_type, blocks_ptr] : export_view) {
           proto::KVTransferGroup* group = resp->add_groups();
           group->set_group_id(cache_group_id(block_type));
-          // D-side shared count for this group. P advances its per-group
-          // transfer cursor to this value so it starts pushing at the first
-          // block D actually needs. SWA / LINEAR under DECODE role return
-          // 0 (prefix cache off), which is a no-op advance and reproduces
-          // the pre-existing "push everything" behavior. C4 / C128 may
-          // return >0 and let P skip the leading shared blocks.
-          group->set_remote_shared_num(static_cast<uint32_t>(
-              sequence->kv_state().shared_blocks_num(block_type)));
+          const size_t shared_num =
+              block_type == BlockType::KV
+                  ? sequence->kv_state().shared_blocks_num(BlockType::KV)
+                  : 0;
+          CHECK_LE(shared_num, blocks_ptr->size());
+          group->set_remote_shared_num(static_cast<uint32_t>(shared_num));
           group->mutable_ids()->Reserve(blocks_ptr->size());
-          for (const auto& block : *blocks_ptr) {
+          for (const Block& block : *blocks_ptr) {
             // Invalid placeholders are legitimate for SWA: the sliding
             // window release loop leaves moved-from Blocks in place so
             // positional indexing stays stable, and both P and D produce
@@ -358,7 +355,7 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
             // positions where the local block id is negative, so the
             // remote id at those positions is never dereferenced. The
             // CHECK below only refuses invalid blocks under types where
-            // slide-out cannot produce them (C4 / C128), preserving the
+            // slide-out cannot produce them (history KV), preserving the
             // guard for genuine allocation bugs.
             const int64_t block_id = block.is_valid() ? block.id() : -1;
             if (!block.is_valid()) {

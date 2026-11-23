@@ -645,7 +645,7 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
             # (block_size * kv_split_size), not one physical page.  Keep the
             # logical size so graph capture bounds below stay correct when DCP
             # shards the KV cache.
-            self._logical_block_size = int(getattr(metadata, "logical_block_size", 0) or self.page_size)
+            self._block_size = int(getattr(metadata, "block_size", 0) or self.page_size)
 
             real_batch = metadata.block_table.shape[0]
 
@@ -836,7 +836,7 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
                 # the captured tiling metadata remains valid for every replay.
                 self._mla_max_seqlen_k = _mla_graph_max_seqlen_k(
                     self._block_table_i32,
-                    self._logical_block_size,
+                    self._block_size,
                 )
             else:
                 kv_seq_lens_host = getattr(metadata, "kv_seq_lens_host", None)

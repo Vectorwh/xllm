@@ -152,7 +152,7 @@ const char* cp_index_write_mode_label(int32_t cp_index_write_mode);
 
 // In KV-split mode, filters and remaps each block-scoped cache mapping's
 // remote_ids so that every KV-split rank sees only the destination blocks
-// assigned to it. This includes ordinary KV and grouped SWA/C4/C128 caches.
+// assigned to it. This includes ordinary KV and grouped SWA/KV caches.
 // When `kv_split_size == 1` the caller should skip this entirely (every rank
 // holds the full KV replica and remote_ids is 1:1 with local_ids).
 //

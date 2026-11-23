@@ -81,8 +81,7 @@ void register_attention_metadata_views(py::module_& module) {
           &PyAttentionMetadataView::engram_lookback_positions)
       .def_property_readonly("local_slot_mapping",
                              &PyAttentionMetadataView::local_slot_mapping)
-      .def_property_readonly("logical_block_size",
-                             &PyAttentionMetadataView::logical_block_size)
+      .def_property_readonly("block_size", &PyAttentionMetadataView::block_size)
       .def_property_readonly("kv_split_size",
                              &PyAttentionMetadataView::kv_split_size)
       .def_property_readonly("kv_split_rank",
@@ -376,7 +375,7 @@ py::object PyAttentionMetadataView::local_slot_mapping() const {
       metadata_->kv_shard_batch_metadata->local_slot_mapping);
 }
 
-int32_t PyAttentionMetadataView::logical_block_size() const {
+int32_t PyAttentionMetadataView::block_size() const {
   return static_cast<int32_t>(KVCacheConfig::get_instance().block_size()) *
          ParallelConfig::get_instance().kv_split_size_effective();
 }

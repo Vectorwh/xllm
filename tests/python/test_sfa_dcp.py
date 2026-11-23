@@ -49,7 +49,7 @@ def _cpu_context(execution_state: AclGraphExecutionState | None) -> ForwardConte
 
 
 def _builder() -> AscendSFADCPMetadataBuilder:
-    layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=4, dcp_size=2, dcp_rank=0)
     return AscendSFADCPMetadataBuilder(
         layout=layout,
         device=torch.device("cpu"),
@@ -139,7 +139,7 @@ def _dcp_impl() -> AscendSFADCPImpl:
         _IdentityDcpGroup(),
         scale=0.1,
         index_topk=8,
-        layout=KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0),
+        layout=KVShardLayout(physical_dim=4, dcp_size=2, dcp_rank=0),
     )
 
 
@@ -393,7 +393,7 @@ def test_merge_dcp_outputs_derives_local_heads_from_output_shape() -> None:
         _IdentityDcpGroup(),
         scale=0.1,
         index_topk=8,
-        layout=KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0),
+        layout=KVShardLayout(physical_dim=4, dcp_size=2, dcp_rank=0),
     )
     num_tokens = 3
     gathered_heads = 16

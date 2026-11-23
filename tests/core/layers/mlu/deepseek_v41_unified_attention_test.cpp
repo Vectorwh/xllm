@@ -42,9 +42,15 @@ TEST(DeepseekV41MetadataTest,
   // Deliberately use unrelated KV lengths: model positions are authoritative.
   input.attention.host.kv_seq_lens = {0, 999, 999, 1998, 2997};
   input.multi_block_tables = {
-      torch::tensor({2, 0, 1}, torch::kInt32).repeat({4, 1})};
+      torch::tensor({2, 0, 1}, torch::kInt32).repeat({4, 1}),
+      torch::tensor({7, 3}, torch::kInt32).repeat({3, 1})};
   auto positions =
       torch::tensor({383, 1, 2, 3, 0, 0}, ints.dtype(torch::kInt64));
+  Csa2Context eager;
+  deepseek_v41::prepare_metadata(eager, input, positions, /*num_sequences=*/3);
+  ASSERT_EQ(eager.block_tables.size(), 2u);
+  EXPECT_TRUE(
+      torch::equal(eager.block_tables[1].cpu(), input.multi_block_tables[1]));
   Csa2Context shared;
   deepseek_v41::prepare_metadata(shared,
                                  input,
@@ -61,17 +67,26 @@ TEST(DeepseekV41MetadataTest,
   EXPECT_TRUE(torch::equal(shared.compressed[1].prefix.cpu(),
                            torch::tensor({0, 1, 1, 3, 3}, torch::kInt32)));
   EXPECT_EQ(shared.num_valid_input_rows.item<int32_t>(), 4);
+  ASSERT_EQ(shared.block_tables.size(), 2u);
   EXPECT_EQ(shared.block_tables[0].size(1), 4);
+  // KV columns cover original tokens, independently of the layer's ratio.
+  EXPECT_EQ(shared.block_tables[1].size(1), 4);
+  auto expected_kv = torch::zeros({4, 4}, torch::kInt32);
+  expected_kv.slice(0, 0, 3).slice(1, 0, 2).copy_(input.multi_block_tables[1]);
+  EXPECT_TRUE(torch::equal(shared.block_tables[1].cpu(), expected_kv));
   EXPECT_EQ(shared.swa_block_table.size(1), 3);
   EXPECT_TRUE(
       torch::equal(shared.swa_block_table.cpu(), input.multi_block_tables[0]));
   const void* table = shared.block_tables[0].data_ptr();
+  const void* kv_table = shared.block_tables[1].data_ptr();
   const void* latent = shared.compressed[1].outputs.latent.data_ptr();
   const void* prefix = shared.query_prefix.data_ptr();
   // Changing ring width updates the callback view, while captured compression
   // retains a complete absolute-page mapping at the original address.
   input.multi_block_tables[0] =
       torch::tensor({1, 2}, torch::kInt32).repeat({4, 1});
+  input.multi_block_tables[1] =
+      torch::tensor({5, 9, 4, 6}, torch::kInt32).repeat({3, 1});
   input.enable_graph = true;
   deepseek_v41::prepare_metadata(shared,
                                  input,
@@ -84,6 +99,9 @@ TEST(DeepseekV41MetadataTest,
   EXPECT_EQ(shared.num_valid_input_rows.item<int32_t>(), 0);
   EXPECT_EQ(shared.swa_block_table.size(1), 2);
   EXPECT_EQ(shared.block_tables[0].data_ptr(), table);
+  EXPECT_EQ(shared.block_tables[1].data_ptr(), kv_table);
+  expected_kv.slice(0, 0, 3).copy_(input.multi_block_tables[1]);
+  EXPECT_TRUE(torch::equal(shared.block_tables[1].cpu(), expected_kv));
   EXPECT_EQ(shared.compressed[1].outputs.latent.data_ptr(), latent);
   EXPECT_EQ(shared.query_prefix.data_ptr(), prefix);
 }
@@ -250,7 +268,6 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   input.attention.host.q_seq_lens = {0, count, num_valid_input_rows, capacity};
   input.multi_block_tables = {
       torch::tensor({2, 0, 1, 5, 3, 4}, torch::kInt32).view({2, 3}),
-      torch::arange(16, torch::kInt32).view({2, 8}),
       torch::arange(16, torch::kInt32).view({2, 8})};
   Csa2Context graph_shared, eager_shared, prefill_shared;
   const auto prepare = [&](Csa2Context& shared,

@@ -36,6 +36,163 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+BlockTypeTensorMap transfer_tensors(const KVCache& cache, BlockType type) {
+  return cache.get_block_type_tensors(type, /*checkpoint_row=*/0);
+}
+
+class CompressedKVHostTransferTest
+    : public ::testing::TestWithParam<std::vector<int32_t>> {};
+
+TEST_P(CompressedKVHostTransferTest, LogicalRequestRestoresAllPhysicalGroups) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP()
+        << "An accelerator device is required for hierarchy KV transfer.";
+  }
+
+  Device device(0);
+  device.set_device();
+  device.init_device_context();
+  const std::vector<int32_t>& ratios = GetParam();
+  const int64_t layer_count = static_cast<int64_t>(ratios.size());
+  KVCacheCapacity capacity;
+  capacity.block_size(128).swa_count(4).n_blocks(2);
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4").n_layers(layer_count);
+  const KVCacheShape cache_shape(capacity, model_args, 1);
+  KVCacheCreateOptions create_options;
+  create_options.device(device.unwrap())
+      .dtype(torch::kBFloat16)
+      .num_layers(layer_count)
+      .model_type("deepseek_v4")
+      .block_size(128)
+      .head_dim(16)
+      .index_head_dim(8)
+      .window_size(128)
+      .compress_ratios(ratios);
+  std::vector<KVCache> caches;
+  allocate_kv_caches(caches, cache_shape, create_options);
+  for (KVCache& cache : caches) {
+    cache.get_swa_cache()[1].fill_(-7);
+    for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
+      if (tensor.role == KVCacheTensorRole::KEY ||
+          tensor.role == KVCacheTensorRole::INDEX ||
+          tensor.role == KVCacheTensorRole::INDEX_SCALE) {
+        tensor.tensor[0].fill_(3);
+        tensor.tensor[1].zero_();
+      }
+    }
+  }
+  ASSERT_EQ(device.synchronize_default_stream(), 0);
+
+  HierarchyKVCacheTransfer::Options transfer_options;
+  transfer_options.layers(layer_count)
+      .host_blocks_factor(2.0)
+      .layers_wise_copy_batchs(1);
+  std::unique_ptr<Stream> compute_stream = device.current_stream();
+  HierarchyKVCacheTransfer transfer(transfer_options,
+                                    device.unwrap(),
+                                    compute_stream.get(),
+                                    &caches,
+                                    cache_shape,
+                                    create_options);
+  ASSERT_TRUE(transfer.supports_block_type(BlockType::KV));
+  ASSERT_TRUE(transfer.supports_block_type(
+      HierarchyKVCacheTransfer::CacheRole::TARGET, BlockType::KV));
+  EXPECT_FALSE(transfer.supports_block_type(
+      HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::KV));
+
+  BlockTransferInfo offload(0, 0);
+  offload.block_type = BlockType::KV;
+  offload.transfer_type = TransferType::D2H2G;
+  ASSERT_EQ(transfer.transfer_kv_blocks(17, {offload}), 1U);
+  BlockTransferInfo load(0, 1);
+  load.block_type = BlockType::KV;
+  load.transfer_type = TransferType::H2D;
+  ASSERT_EQ(transfer.transfer_kv_blocks(17, {load}), 1U);
+  ModelInputParams input_params;
+  input_params.meta.batch_id = 17;
+  input_params.meta.requires_host_restore = true;
+  transfer.set_layer_synchronizer(input_params);
+  ASSERT_TRUE(input_params.synchronize_all_layers());
+  for (KVCache& cache : caches) {
+    for (const KVCacheTensor& tensor : cache.get_cache_tensors()) {
+      if (tensor.role == KVCacheTensorRole::KEY ||
+          tensor.role == KVCacheTensorRole::INDEX ||
+          tensor.role == KVCacheTensorRole::INDEX_SCALE) {
+        EXPECT_TRUE(torch::equal(tensor.tensor[0], tensor.tensor[1]));
+      }
+    }
+    EXPECT_TRUE(torch::all(cache.get_swa_cache()[1] == -7).item<bool>());
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(PhysicalGroups,
+                         CompressedKVHostTransferTest,
+                         ::testing::Values(std::vector<int32_t>{4},
+                                           std::vector<int32_t>{128},
+                                           std::vector<int32_t>{1, 4, 128, 4}));
+
+TEST(HierarchyKVCacheTransferTest,
+     OneHistoryResourceCopiesHeterogeneousPlanes) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator is required for hierarchy KV transfer.";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device.unwrap());
+  std::vector<KVCache> caches;
+  caches.reserve(3);
+  caches.emplace_back(KVCacheTensors{torch::zeros({3, 8, 1, 4}, options), {}});
+  caches.emplace_back(KVCacheTensors{torch::zeros({3, 4, 1, 4}, options), {}});
+  IndexedKVCacheTensors indexed;
+  indexed.kv_cache_tensors.key_cache = torch::zeros({3, 4, 1, 4}, options);
+  indexed.index_cache = torch::zeros({3, 4, 1, 2}, options.dtype(torch::kInt8));
+  indexed.index_cache_scale =
+      torch::zeros({3, 4, 1}, options.dtype(torch::kFloat16));
+  indexed.kpool_tail = torch::full({3, 2, 4, 4}, 45, options);
+  caches.emplace_back(indexed);
+  for (size_t layer = 0; layer < caches.size(); ++layer) {
+    for (const auto& [role, tensor] :
+         caches[layer].get_block_type_tensors(BlockType::KV)) {
+      tensor[0].fill_(static_cast<int32_t>(role) + layer + 1);
+    }
+  }
+  ASSERT_EQ(device.synchronize_default_stream(), 0);
+  HierarchyKVCacheTransfer::Options transfer_options;
+  transfer_options.layers(3).host_blocks_factor(2.0).layers_wise_copy_batchs(2);
+  KVCacheCreateOptions create_options;
+  create_options.block_size(128);
+  std::unique_ptr<Stream> stream = device.current_stream();
+  HierarchyKVCacheTransfer transfer(transfer_options,
+                                    device.unwrap(),
+                                    stream.get(),
+                                    &caches,
+                                    KVCacheShape{},
+                                    create_options);
+  ASSERT_TRUE(transfer.supports_block_type(BlockType::KV));
+  EXPECT_FALSE(transfer.supports_block_type(BlockType::LINEAR));
+  BlockTransferInfo offload(/*src_id=*/0, /*dst_id=*/0);
+  offload.transfer_type = TransferType::D2H2G;
+  ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/18, {offload}), 1U);
+  BlockTransferInfo load(/*src_id=*/0, /*dst_id=*/1);
+  load.transfer_type = TransferType::H2D;
+  ASSERT_EQ(transfer.transfer_kv_blocks(/*batch_id=*/18, {load}), 1U);
+  ModelInputParams params;
+  params.meta.batch_id = 18;
+  params.meta.requires_host_restore = true;
+  transfer.set_layer_synchronizer(params);
+  ASSERT_TRUE(params.synchronize_all_layers());
+  for (const KVCache& cache : caches) {
+    for (const auto& [role, tensor] :
+         cache.get_block_type_tensors(BlockType::KV)) {
+      EXPECT_TRUE(torch::equal(tensor[0], tensor[1]));
+    }
+  }
+  EXPECT_TRUE(torch::all(caches.back().get_kpool_tail() == 45).item<bool>());
+}
+
 class V41HierarchyTransferTest : public ::testing::TestWithParam<bool> {};
 
 TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
@@ -53,7 +210,7 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
   device.set_device();
   device.init_device_context();
   KVCacheCapacity capacity;
-  capacity.block_size(128).swa_count(4).c2_count(4).c1_count(8);
+  capacity.block_size(128).swa_count(4).n_blocks(4);
   ModelArgs args;
   args.model_type("deepseek_v41");
   const KVCacheShape shape(capacity, args, /*world_size=*/1);
@@ -100,12 +257,11 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
                                                       options);
   };
   auto transfer = make_transfer();
-  ASSERT_TRUE(transfer->supports_block_type(BlockType::C1));
-  ASSERT_TRUE(transfer->supports_block_type(BlockType::C2));
-  EXPECT_FALSE(transfer->supports_block_type(BlockType::C4));
-  for (const BlockType type : {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+  ASSERT_TRUE(transfer->supports_block_type(BlockType::KV));
+  EXPECT_FALSE(transfer->supports_block_type(BlockType::LINEAR));
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
     for (KVCache& cache : caches) {
-      for (const auto& [role, tensor] : cache.get_block_type_tensors(type)) {
+      for (const auto& [role, tensor] : transfer_tensors(cache, type)) {
         tensor[1].fill_(static_cast<int32_t>(role) + 1);
         tensor[2].zero_();
       }
@@ -124,7 +280,7 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
     transfer_options.instance_role(InstanceRole::PREFILL);
     transfer = make_transfer();
   }
-  for (const BlockType type : {BlockType::SWA, BlockType::C2, BlockType::C1}) {
+  for (const BlockType type : {BlockType::SWA, BlockType::KV}) {
     std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> hash{};
     hash.fill(static_cast<uint8_t>(type));
     if (GetParam()) {
@@ -149,7 +305,7 @@ TEST_P(V41HierarchyTransferTest, TokenSourceLayersRoundTripAllRoles) {
       ASSERT_TRUE(params.synchronize_layer(layer));
     }
     for (KVCache& cache : caches) {
-      for (const auto& [role, tensor] : cache.get_block_type_tensors(type)) {
+      for (const auto& [role, tensor] : transfer_tensors(cache, type)) {
         EXPECT_TRUE(torch::equal(tensor[1], tensor[2]))
             << static_cast<int32_t>(role);
       }
@@ -175,8 +331,7 @@ TEST_P(V41HierarchyTransferTest,
       SCOPED_TRACE(window);
       SCOPED_TRACE(has_c1);
       KVCacheCapacity capacity;
-      capacity.block_size(128).swa_count(4).c2_count(4).c1_count(has_c1 ? 8
-                                                                        : 0);
+      capacity.block_size(128).swa_count(4).n_blocks(4);
       ModelArgs args;
       args.model_type("deepseek_v41");
       const KVCacheShape shape(capacity, args, /*world_size=*/1);
@@ -251,36 +406,30 @@ TEST_P(V41HierarchyTransferTest,
       EXPECT_TRUE(transfer->supports_block_type(
           HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::SWA));
       EXPECT_FALSE(transfer->supports_block_type(
-          HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::C2));
-      EXPECT_FALSE(transfer->supports_block_type(
-          HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::C1));
-      std::vector<BlockType> block_types = {BlockType::SWA, BlockType::C2};
-      if (has_c1) {
-        block_types.emplace_back(BlockType::C1);
-      }
+          HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::KV));
+      const std::vector<BlockType> block_types = {BlockType::SWA,
+                                                  BlockType::KV};
       std::vector<BlockTransferInfo> offloads;
       std::vector<BlockTransferInfo> gets;
       std::vector<BlockTransferInfo> loads;
       for (const BlockType type : block_types) {
         for (size_t layer = 0; layer < target_caches.size(); ++layer) {
           for (const auto& [role, tensor] :
-               target_caches[layer].get_block_type_tensors(type)) {
+               transfer_tensors(target_caches[layer], type)) {
             tensor[1].fill_(static_cast<int32_t>(role) + layer + 1);
             tensor[2].zero_();
           }
         }
         for (size_t layer = 0; layer < draft_caches.size(); ++layer) {
           for (const auto& [role, tensor] :
-               draft_caches[layer].get_block_type_tensors(type)) {
+               transfer_tensors(draft_caches[layer], type)) {
             tensor[1].fill_(static_cast<int32_t>(role) + layer + 31);
             tensor[2].zero_();
           }
         }
         std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> hash{};
         hash.fill(static_cast<uint8_t>(type));
-        const int64_t host_row =
-            type == BlockType::SWA ? 8 * std::min<int64_t>(window / 128, 2) - 1
-                                   : 7;
+        const int64_t host_row = 7;
         offloads.emplace_back(
             1, host_row, hash.data(), TransferType::D2H2G, type);
         gets.emplace_back(-1, 0, hash.data(), TransferType::G2H, type);
@@ -316,8 +465,7 @@ TEST_P(V41HierarchyTransferTest,
       for (const BlockType type : block_types) {
         for (const auto* caches : {&target_caches, &draft_caches}) {
           for (const KVCache& cache : *caches) {
-            for (const auto& [role, tensor] :
-                 cache.get_block_type_tensors(type)) {
+            for (const auto& [role, tensor] : transfer_tensors(cache, type)) {
               EXPECT_TRUE(torch::equal(tensor[1], tensor[2]))
                   << static_cast<int32_t>(type) << ":"
                   << static_cast<int32_t>(role);

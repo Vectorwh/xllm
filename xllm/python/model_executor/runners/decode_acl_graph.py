@@ -45,7 +45,7 @@ from xllm.python.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
 )
-from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW, DSA_CACHE_TOKEN
+from xllm.python.attention.dsa_metadata import DSA_CACHE_SLIDING_WINDOW, DSA_CACHE_TOKEN, dsa_block_table_groups
 from xllm.python.attention.expanded_decode_metadata import (
     ExpandedDecodeMetadata,
     resolve_expanded_decode_metadata,
@@ -701,16 +701,18 @@ class DecodeAclGraphRunner(BaseRunner):
         if group_infos is None:
             return metadata
         tables = list(getattr(metadata, "multi_block_tables", ()) or ())
-        if self._is_spec_draft and len(group_infos) == 1 and group_infos[0].cache_type == DSA_CACHE_SLIDING_WINDOW:
-            tables = tables[:1]
+        table_groups = dsa_block_table_groups(group_infos)
+        table_count = len(table_groups)
+        if self._is_spec_draft:
+            tables = tables[:table_count]
         if not tables:
             if not bool(getattr(metadata, "is_dummy", False)):
                 # A busy DSA batch must carry manager tables; a table-less
                 # non-dummy batch is an exporter regression, not an empty shard.
                 return metadata
             row_count = metadata.kv_seq_lens.numel() if metadata.kv_seq_lens is not None else 1
-            tables = [torch.zeros((row_count, 1), dtype=torch.int32) for _ in group_infos]
-        elif len(tables) != len(group_infos) or tables[0].dim() != 2:
+            tables = [torch.zeros((row_count, 1), dtype=torch.int32) for _ in table_groups]
+        elif len(tables) != table_count or any(table.dim() != 2 for table in tables):
             return metadata
         block_table = metadata.block_table
         if block_table is None:
@@ -1303,7 +1305,7 @@ class DecodeAclGraphRunner(BaseRunner):
         group_infos = getattr(self.attention_backend, "group_infos", None)
         if group_infos is not None:
             source_tables = list(getattr(metadata, "multi_block_tables", ()) or ())
-            if not source_tables or len(source_tables) != len(group_infos):
+            if not source_tables or len(source_tables) != len(dsa_block_table_groups(group_infos)):
                 return False
         if getattr(self.attention_backend, "requires_paged_decode_graph", False):
             # A group-wide zero context has no live paged decode rows; keep
@@ -2528,40 +2530,27 @@ class DecodeAclGraphRunner(BaseRunner):
         padded_batch_size: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, ...]:
-        """Build stable SWA/C4/C128 manager block tables for graph capture.
+        """Build stable logical resource tables for graph capture.
 
-        Keep every manager's dimensions (and therefore its packed DSA metadata
-        views) fixed across decodes of the same bucket. The first manager uses
-        the runner-wide maximum block column count; compressed managers use the
-        ``max_model_len``-derived upper bound. Unused entries point at reserved
-        block 0.
+        Keep table dimensions fixed across decodes of the same bucket. SWA
+        uses the runner-wide column count; KV capacity covers every
+        physical geometry bound to that resource. Unused entries point at
+        reserved block 0.
         """
         max_swa_cols = self._max_blocks_per_sequence
         group_infos = getattr(self.attention_backend, "group_infos", None)
-        if group_infos is None:
-            # Test stubs and non-DSA backends only build a sliding-window row.
-            manager_infos = [None]
-        else:
-            manager_infos = list(group_infos)
+        table_groups = [[None]] if group_infos is None else dsa_block_table_groups(group_infos)
         tables: list[torch.Tensor] = []
-        for group_info in manager_infos:
-            if group_info is not None and getattr(group_info, "cache_type", None) == DSA_CACHE_TOKEN:
-                ratio = max(int(getattr(group_info, "ratio", 1)), 1)
-                block_size = max(int(getattr(group_info, "block_size", 1)), 1)
-                compressed_block_size = ratio * block_size
-                max_cols = max(
-                    1,
-                    (self.max_model_len + compressed_block_size - 1) // compressed_block_size,
-                )
-            else:
-                max_cols = max_swa_cols
-            tables.append(
-                torch.zeros(
-                    (padded_batch_size, max_cols),
-                    dtype=torch.int32,
-                    device=device,
-                )
-            )
+        for groups in table_groups:
+            max_cols = 1
+            for group_info in groups:
+                if group_info is not None and group_info.cache_type == DSA_CACHE_TOKEN:
+                    block_size = max(int(group_info.ratio), 1) * max(int(group_info.physical_dim), 1)
+                    group_cols = max(1, (self.max_model_len + block_size - 1) // block_size)
+                else:
+                    group_cols = max_swa_cols
+                max_cols = max(max_cols, group_cols)
+            tables.append(torch.zeros((padded_batch_size, max_cols), dtype=torch.int32, device=device))
         return tuple(tables)
 
     def _fill_entry(
@@ -2886,7 +2875,7 @@ class DecodeAclGraphRunner(BaseRunner):
         if len(source_tables) < len(static_tables):
             raise RuntimeError(f"ACL graph DSA manager count changed: {len(source_tables)} != {len(static_tables)}")
         if len(source_tables) > len(static_tables):
-            # MTP draft inputs inherit the target's SWA/C4/C128 tables, while
+            # MTP draft inputs inherit the target's SWA/KV tables, while
             # the draft graph registers only its own SWA prefix.
             source_tables = source_tables[: len(static_tables)]
 
@@ -2919,7 +2908,10 @@ class DecodeAclGraphRunner(BaseRunner):
                     f"columns, capacity is {target.shape[1]}"
                 )
             group_infos = getattr(self.attention_backend, "group_infos", None)
-            is_swa = group_infos is not None and group_infos[manager_id].cache_type == DSA_CACHE_SLIDING_WINDOW
+            is_swa = group_infos is not None and any(
+                group.cache_type == DSA_CACHE_SLIDING_WINDOW
+                for group in dsa_block_table_groups(group_infos)[manager_id]
+            )
             if host_tables is not None:
                 # The DSA builder reads individual block IDs on the host.
                 # Preserve the scheduler data with exactly the graph's padded

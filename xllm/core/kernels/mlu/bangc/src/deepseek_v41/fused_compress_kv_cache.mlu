@@ -16,6 +16,7 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "kernels/mlu/bangc/include/deepseek_v41_constants.h"
 #include "kernels/mlu/bangc/src/deepseek_v41/compress_params.h"
 
 namespace xllm::kernel::mlu::bangc {
@@ -24,7 +25,10 @@ namespace {
 constexpr int32_t kHeadDim = 512;
 constexpr int32_t kRopeDim = 64;
 constexpr int32_t kNopeDim = kHeadDim - kRopeDim;
-constexpr int32_t kPageSize = 128;
+// Tokens in one logical KV block, the configured block size. A compressed
+// page stores kBlockSize / ratio rows (the physical dim). The state ring is
+// addressed in tokens and keeps the full block size.
+const int32_t kBlockSize = kDeepseekV41MluKVBlockSize;
 constexpr int32_t kStateRows = 32;
 constexpr int32_t kMaxMetaBatch = 512;
 constexpr int32_t kMapWindow = 4096;
@@ -153,8 +157,8 @@ struct Accum {
   int32_t scalar_fill;
 };
 
-// Logical rows [start, end) of the map window known to map to consecutive
-// physical rows (multi-task kernel: one test covers up to kRunSpan rows).
+// Logical rows [start, end) of the map window known to map to a consecutive
+// physical dim (multi-task kernel: one test covers up to kRunSpan rows).
 struct RunSpan {
   int64_t window_start;
   int64_t start;
@@ -188,7 +192,7 @@ static_assert(kAccumRows >= kPendingSlotRows +
               "A rollover must have enough rows to retain both pending tiles");
 
 // Gathers `count` logical rows `logical0 + i * step` into consecutive NRAM
-// rows. Physical rows that stay consecutive under the optional map are merged
+// rows. A physical dim that stays consecutive under the optional map is merged
 // into one strided DMA.
 template <typename T>
 __mlu_func__ void gather_rows(T* dst,
@@ -541,12 +545,13 @@ __mlu_func__ void tile_slots(const FusedCompressKvCacheParams& p,
   int32_t i = 0;
   while (i < count) {
     const int64_t group = tile.group0 + i;
-    const int32_t in_page = static_cast<int32_t>(group % kPageSize);
-    const int32_t seg = min_of(count - i, kPageSize - in_page);
-    const int32_t page = __load_gdram(table + group / kPageSize);
-    // slots[i + k] = page * 128 + in_page + k
+    const int32_t physical_dim = kBlockSize / p.ratio;
+    const int32_t in_page = static_cast<int32_t>(group % physical_dim);
+    const int32_t seg = min_of(count - i, physical_dim - in_page);
+    const int32_t page = __load_gdram(table + group / physical_dim);
+    // slots[i + k] = page * physical_dim + in_page + k
     __bang_add_scalar(
-        accum.scratch, accum.iota, page * kPageSize + in_page, seg);
+        accum.scratch, accum.iota, page * physical_dim + in_page, seg);
     __memcpy(accum.slots + accum.used + i,
              accum.scratch,
              seg * sizeof(int32_t),
@@ -580,8 +585,9 @@ __mlu_func__ void fill_slots(const FusedCompressKvCacheParams& p,
     const int32_t out_stop = min_of(meta.csl(request + 1), live_end);
     const int64_t first_group = meta.begin(request) / p.ratio;
     const int64_t group = first_group + (row - out_start);
-    const int32_t in_page = static_cast<int32_t>(group % kPageSize);
-    const int32_t seg = min_of(out_stop - row, kPageSize - in_page);
+    const int32_t physical_dim = kBlockSize / p.ratio;
+    const int32_t in_page = static_cast<int32_t>(group % physical_dim);
+    const int32_t seg = min_of(out_stop - row, physical_dim - in_page);
     const int32_t* table =
         p.compressed_block_table + request * p.compressed_table_stride;
     if (accum.table != nullptr) {
@@ -591,9 +597,9 @@ __mlu_func__ void fill_slots(const FusedCompressKvCacheParams& p,
     } else if (request != cached_request) {
       // All page-table columns this core needs from the request, in one DMA.
       cached_request = request;
-      cached_col = group / kPageSize;
+      cached_col = group / physical_dim;
       const int64_t last_col =
-          (first_group + (out_stop - 1 - out_start)) / kPageSize;
+          (first_group + (out_stop - 1 - out_start)) / physical_dim;
       cached_cols = static_cast<int32_t>(last_col - cached_col + 1);
       if (cached_cols <= kPageCache) {
         __memcpy(accum.pages,
@@ -602,7 +608,7 @@ __mlu_func__ void fill_slots(const FusedCompressKvCacheParams& p,
                  GDRAM2NRAM);
       }
     }
-    const int64_t col = group / kPageSize;
+    const int64_t col = group / physical_dim;
     int32_t page;
     if (accum.table != nullptr) {
       page = accum.table[request * p.compressed_columns + col];
@@ -617,7 +623,7 @@ __mlu_func__ void fill_slots(const FusedCompressKvCacheParams& p,
       // Short segments (decode): scalar stores beat five dependent vector
       // ops of fixed cost. Readers come after a full __sync.
       const int32_t position = static_cast<int32_t>(group * p.ratio);
-      const int32_t slot = page * kPageSize + in_page;
+      const int32_t slot = page * physical_dim + in_page;
       for (int32_t k = 0; k < seg; ++k) {
         positions[k] = position + k * p.ratio;
         slots[k] = slot + k;
@@ -630,7 +636,7 @@ __mlu_func__ void fill_slots(const FusedCompressKvCacheParams& p,
                         seg);
       __memcpy(positions, accum.scratch, seg * sizeof(int32_t), NRAM2NRAM);
       __bang_add_scalar(
-          accum.scratch, accum.iota, page * kPageSize + in_page, seg);
+          accum.scratch, accum.iota, page * physical_dim + in_page, seg);
       __memcpy(slots, accum.scratch, seg * sizeof(int32_t), NRAM2NRAM);
     }
     row += seg;
@@ -728,12 +734,13 @@ __mlu_func__ void store_tile(const FusedCompressKvCacheParams& p,
   bfloat16_t* latent_out = static_cast<bfloat16_t*>(p.latent_out) +
                            static_cast<int64_t>(tile.out_row) * kHeadDim;
   const int32_t* slots = accum.slots + (tile.out_row - accum.base);
-  // Slots are consecutive within a 128-group page: runs end at page
+  // Slots are consecutive within one physical page: runs end at page
   // boundaries, so only the first slot of each run is read.
   int32_t i = 0;
+  const int32_t physical_dim = kBlockSize / p.ratio;
   while (i < tile.count) {
-    const int32_t in_page = static_cast<int32_t>((tile.group0 + i) % kPageSize);
-    const int32_t j = min_of(tile.count, i + kPageSize - in_page);
+    const int32_t in_page = static_cast<int32_t>((tile.group0 + i) % physical_dim);
+    const int32_t j = min_of(tile.count, i + physical_dim - in_page);
     bfloat16_t* latent_row = latent_out + i * kHeadDim;
     bfloat16_t* main_row = main + static_cast<int64_t>(slots[i]) * kHeadDim;
     const bfloat16_t* rows = slot.latent + i * kHeadDim;
@@ -844,7 +851,7 @@ __mlu_func__ void load_history(IoPlan<Ratio>& io) {
   const int32_t* table =
       p.state_block_table + tile.request * p.state_table_stride;
   const int64_t page =
-      __load_gdram(table + (token / kPageSize) % p.state_columns);
+      __load_gdram(table + (token / kBlockSize) % p.state_columns);
   const int64_t row = token % kStateRows;
   __memcpy_io0_async(slot.raw_a,
                      p.state_raw + page * p.state_raw_page_stride +
@@ -1171,7 +1178,7 @@ __mlu_func__ void run_tiles(const FusedCompressKvCacheParams& p,
 
 // Saves the request tail into the state ring after every history read of the
 // request on this core has completed. Tokens are copied in runs that stay in
-// one ring page and one 32-row cycle and read consecutive physical rows; a
+// one ring page and one 32-row cycle and read a consecutive physical dim; a
 // packed state owner and packed projection copy raw and score together.
 __mlu_func__ void save_state(const FusedCompressKvCacheParams& p,
                              int32_t request,
@@ -1189,10 +1196,10 @@ __mlu_func__ void save_state(const FusedCompressKvCacheParams& p,
   int64_t t = end - parked;
   while (t < end) {
     const int64_t page =
-        __load_gdram(table + (t / kPageSize) % p.state_columns);
+        __load_gdram(table + (t / kBlockSize) % p.state_columns);
     const int64_t row = t % kStateRows;
     int64_t limit = min_of(end, t + kStateRows - row);
-    limit = min_of(limit, (t / kPageSize + 1) * kPageSize);
+    limit = min_of(limit, (t / kBlockSize + 1) * kBlockSize);
     int64_t logical = logical_start + t - begin;
     int64_t n = limit - t;
     if (p.input_row_map != nullptr) {
@@ -1251,8 +1258,8 @@ __mlu_global__ void fused_compress_kv_cache_kernel(
   __nram__ int32_t nram_positions[kAccumRows];
   __nram__ int32_t nram_slot_storage[kPendingSlotRows + kAccumRows];
   int32_t* nram_slots = nram_slot_storage + kPendingSlotRows;
-  __nram__ int32_t nram_iota[kPageSize];
-  __nram__ int32_t nram_slot_scratch[kPageSize];
+  __nram__ int32_t nram_iota[kBlockSize];
+  __nram__ int32_t nram_slot_scratch[kBlockSize];
   __nram__ int32_t nram_pages[kPageCache];
   __nram__ int32_t nram_table[kTableCache];
   __nram__ int32_t nram_qsl[kMaxMetaBatch + 1];

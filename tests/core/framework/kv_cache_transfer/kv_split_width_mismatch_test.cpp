@@ -112,9 +112,9 @@ bool rank_local_mapping_for_test(int32_t src_kv_split_size,
 // The test block manager reports 64-token blocks to BatchInputBuilder. With
 // four source blocks, the prompt has 256 tokens; an unsplit destination needs
 // kSourceKvSplitSize remote block ids for each source block.
-constexpr uint32_t kSourceLogicalBlockSize = 64;
+constexpr uint32_t kSourceBlockSize = 64;
 constexpr uint32_t kSourceLogicalBlockCount = 4;
-constexpr uint32_t kSeqLen = kSourceLogicalBlockSize * kSourceLogicalBlockCount;
+constexpr uint32_t kSeqLen = kSourceBlockSize * kSourceLogicalBlockCount;
 constexpr int32_t kSourceKvSplitSize = 2;
 constexpr uint64_t kFirstDestinationBlockId = 100;
 // A destination that declares kv_split == 1 stores kSourceKvSplitSize times as
@@ -195,7 +195,7 @@ std::vector<uint64_t> source_rank_destination_blocks(int32_t kv_split_rank,
                                                      bool rank_local_mapping,
                                                      uint32_t dst_block_count) {
   BlockManager::Options options;
-  options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+  options.num_blocks(8).block_size(kSourceBlockSize);
   BlockManagerImpl manager(options);
   Sequence sequence = make_sequence(manager.allocate(kSourceLogicalBlockCount));
 
@@ -1128,7 +1128,7 @@ TEST(KvSplitWidthMismatchTest,
     const std::vector<uint64_t> remote_ids =
         destination_block_ids(kDestinationBlockCount - shared);
     BlockManager::Options options;
-    options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+    options.num_blocks(8).block_size(kSourceBlockSize);
     BlockManagerImpl manager(options);
     Sequence sequence =
         make_sequence(manager.allocate(kSourceLogicalBlockCount));
@@ -1208,43 +1208,26 @@ TEST(KvSplitWidthMismatchTest,
 // earlier step already wrote and leaves the tail of the prompt unwritten.
 // Every destination block must be written exactly once across the whole
 // request, no matter how the steps are cut.
-// A grouped cache group (SWA / C4 / C128) keeps its full logical destination
-// table, so the builder emits absolute destination indices (remote_origin = 0)
-// and the step list starts at block_start * stride. The filter has to derive
-// the same base for a grouped group: with the flat-KV base it would shift every
-// read by shared % stride entries and pair each rank's stripe with the wrong
-// destination block (the blocks D is still missing would never be written).
 TEST(KvSplitWidthMismatchTest,
-     SharedDestinationPrefixKeepsGroupedMappingAligned) {
+     SharedDestinationPrefixKeepsLogicalKvMappingAligned) {
   const uint32_t stride = static_cast<uint32_t>(kSourceKvSplitSize);
   for (uint32_t shared : {1U, 2U, 3U, 6U, 7U}) {
     const size_t block_start = source_blocks_in_remote_shared(shared, stride);
-    // Grouped responses preserve every row, including the blocks D already
-    // holds; only a flat KV response omits them.
-    const std::vector<uint64_t> remote_ids =
+    std::vector<uint64_t> remote_ids =
         destination_block_ids(kDestinationBlockCount);
-
+    remote_ids.erase(remote_ids.begin(), remote_ids.begin() + shared);
     BlockManager::Options options;
-    options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+    options.num_blocks(8).block_size(kSourceBlockSize);
     BlockManagerImpl manager(options);
-    // A grouped group carries its own block list and its own cursor. Both
-    // managers outlive the sequence so every block is returned before their
-    // "all blocks freed" check runs.
-    BlockManager::Options group_options;
-    group_options.num_blocks(8).block_size(kSourceLogicalBlockSize);
-    BlockManagerImpl group_manager(group_options);
     Sequence sequence =
         make_sequence(manager.allocate(kSourceLogicalBlockCount));
-    sequence.kv_state().add_blocks(
-        BlockType::C4, group_manager.allocate(kSourceLogicalBlockCount));
-    sequence.kv_state().advance_group_transfer_block_idx(BlockType::C4,
-                                                         block_start);
+    sequence.kv_state().advance_transfer_block_idx(block_start);
 
     TransferKVInfo info;
-    info.request_id = "kv-split-shared-prefix-grouped";
+    info.request_id = "kv-split-shared-prefix-logical-kv";
     info.rank_local_mapping = false;
     KVTransferMapping mapping;
-    mapping.group_id = cache_group_id(BlockType::C4);
+    mapping.group_id = cache_group_id(BlockType::KV);
     mapping.remote_ids = remote_ids;
     mapping.remote_shared_num = shared;
     info.mappings.emplace_back(std::move(mapping));
@@ -1257,9 +1240,8 @@ TEST(KvSplitWidthMismatchTest,
     const KVTransferMapping& step_mapping = step.mappings.front();
     EXPECT_EQ(step_mapping.local_block_start, block_start)
         << "shared=" << shared;
-    EXPECT_EQ(
-        step_mapping.remote_ids.size(),
-        static_cast<size_t>(kDestinationBlockCount) - block_start * stride)
+    EXPECT_EQ(step_mapping.remote_ids.size(),
+              static_cast<size_t>(kDestinationBlockCount) - shared)
         << "shared=" << shared;
 
     std::set<uint64_t> written;
@@ -1274,11 +1256,10 @@ TEST(KvSplitWidthMismatchTest,
       ASSERT_EQ(rank_mapping.local_ids.size(), rank_mapping.remote_ids.size())
           << "shared=" << shared;
       for (size_t i = 0; i < rank_mapping.remote_ids.size(); ++i) {
-        // The kept source block block_start + i must carry the destination
-        // block its stripe writes, read from the absolute list position.
-        const uint64_t expected = kFirstDestinationBlockId +
-                                  (block_start + i) * stride +
-                                  static_cast<uint64_t>(kv_split_rank);
+        const uint64_t rank = static_cast<uint64_t>(kv_split_rank);
+        const uint64_t first_source = (shared + stride - 1 - rank) / stride;
+        const uint64_t expected =
+            kFirstDestinationBlockId + (first_source + i) * stride + rank;
         EXPECT_EQ(rank_mapping.remote_ids[i], expected)
             << "shared=" << shared << ", kv_split_rank=" << kv_split_rank
             << ", entry=" << i;
@@ -1287,11 +1268,10 @@ TEST(KvSplitWidthMismatchTest,
             << rank_mapping.remote_ids[i] << " written twice";
       }
     }
-    EXPECT_EQ(
-        written.size(),
-        static_cast<size_t>(kDestinationBlockCount) - block_start * stride)
+    EXPECT_EQ(written.size(),
+              static_cast<size_t>(kDestinationBlockCount) - shared)
         << "shared=" << shared;
-    EXPECT_EQ(*written.begin(), kFirstDestinationBlockId + block_start * stride)
+    EXPECT_EQ(*written.begin(), kFirstDestinationBlockId + shared)
         << "the first pushed block must be the first block not already shared";
   }
 }
@@ -1302,7 +1282,7 @@ TEST(KvSplitWidthMismatchTest,
   const uint32_t shared = 3;  // 3 % stride == 1: ends inside source block 1
 
   BlockManager::Options options;
-  options.num_blocks(8).block_size(kSourceLogicalBlockSize);
+  options.num_blocks(8).block_size(kSourceBlockSize);
   BlockManagerImpl manager(options);
   Sequence sequence = make_sequence(manager.allocate(kSourceLogicalBlockCount));
   sequence.kv_state().advance_transfer_block_idx(
@@ -1324,7 +1304,7 @@ TEST(KvSplitWidthMismatchTest,
     const TransferKVInfo step =
         build_transfer_step(info,
                             &sequence,
-                            /*seq_len=*/step_blocks * kSourceLogicalBlockSize,
+                            /*seq_len=*/step_blocks * kSourceBlockSize,
                             /*kv_split_size=*/stride);
     ASSERT_FALSE(step.mappings.empty());
     for (int32_t kv_split_rank = 0; kv_split_rank < kSourceKvSplitSize;

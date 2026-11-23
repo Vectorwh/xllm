@@ -913,22 +913,22 @@ CpEpMeta copy_cp_ep_meta_to(const CpEpMeta& meta, const torch::Device& device) {
 
 torch::Tensor map_cache_slots_to_kv_shard(
     const torch::Tensor& recovered_logical_slots,
-    int32_t block_size,
+    int32_t physical_dim,
     int32_t kv_split_size,
     int32_t kv_split_rank) {
-  CHECK_GT(block_size, 0);
+  CHECK_GT(physical_dim, 0);
   CHECK_GT(kv_split_size, 0);
   CHECK_GE(kv_split_rank, 0);
   CHECK_LT(kv_split_rank, kv_split_size);
 
-  const int32_t logical_block_size = block_size * kv_split_size;
+  const int32_t block_size = physical_dim * kv_split_size;
   // Shard ownership is encoded in the per-sequence logical slot, not in the
   // token's flattened batch row.
   torch::Tensor valid_slot_mask = recovered_logical_slots >= 0;
   torch::Tensor logical_block_offsets =
-      torch::remainder(recovered_logical_slots, logical_block_size);
+      torch::remainder(recovered_logical_slots, block_size);
   torch::Tensor slot_kv_split_ranks =
-      torch::floor_divide(logical_block_offsets, block_size);
+      torch::floor_divide(logical_block_offsets, physical_dim);
   torch::Tensor local_row_indices =
       torch::nonzero(torch::logical_and(valid_slot_mask,
                                         slot_kv_split_ranks == kv_split_rank))
@@ -943,10 +943,10 @@ torch::Tensor map_cache_slots_to_kv_shard(
       recovered_logical_slots.index_select(/*dim=*/0, local_row_indices)
           .to(torch::kInt32);
   torch::Tensor logical_block_ids =
-      torch::floor_divide(logical_slots, logical_block_size);
-  torch::Tensor physical_block_offsets = logical_slots % block_size;
+      torch::floor_divide(logical_slots, block_size);
+  torch::Tensor physical_block_offsets = logical_slots % physical_dim;
   torch::Tensor local_physical_slots =
-      logical_block_ids * block_size + physical_block_offsets;
+      logical_block_ids * physical_dim + physical_block_offsets;
   physical_slots.index_put_({local_row_indices},
                             local_physical_slots.to(physical_slots.dtype()));
   return physical_slots;

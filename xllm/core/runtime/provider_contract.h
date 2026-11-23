@@ -52,9 +52,13 @@ struct ProviderDescriptorConfig {
   // Physical Ascend super-pod id. Empty is a wildcard: the engine opts out of
   // cross super-node isolation and stays compatible with every super-node.
   std::string super_node_id;
+  // Physical cache fingerprint hashed into kv.kv_layout_digest. Deployed
+  // Service admission requires that digest to be non-empty; P/D equality is
+  // not required. Empty is only valid for callers that never reach admission.
   std::string kv_layout_contract;
-  // Model/cache semantics before local block granularity or rank sharding.
-  // Empty preserves descriptors produced by older callers during migration.
+  // Optional transfer fingerprint. Empty leaves transfer_compatibility_digest
+  // unset. Publishing it on both P and D makes Service treat it as the
+  // authoritative layout contract, so both sides must publish the same value.
   std::string kv_transfer_layout_contract;
   std::string kv_cache_dtype;
   uint32_t block_size = 0;

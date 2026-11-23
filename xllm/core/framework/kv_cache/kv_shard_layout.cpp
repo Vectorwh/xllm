@@ -19,13 +19,11 @@ limitations under the License.
 
 namespace xllm {
 
-KVShardLayout::KVShardLayout(int32_t physical_block_size,
+KVShardLayout::KVShardLayout(int32_t physical_dim,
                              int32_t dcp_size,
                              int32_t dcp_rank)
-    : physical_block_size_(physical_block_size),
-      dcp_size_(dcp_size),
-      dcp_rank_(dcp_rank) {
-  CHECK_GT(physical_block_size_, 0) << "physical_block_size must be positive";
+    : physical_dim_(physical_dim), dcp_size_(dcp_size), dcp_rank_(dcp_rank) {
+  CHECK_GT(physical_dim_, 0) << "physical_dim must be positive";
   CHECK_GT(dcp_size_, 0) << "dcp_size must be positive";
   CHECK_GE(dcp_rank_, 0) << "dcp_rank must be non-negative";
   CHECK_LT(dcp_rank_, dcp_size_) << "dcp_rank must be smaller than dcp_size";
@@ -33,8 +31,8 @@ KVShardLayout::KVShardLayout(int32_t physical_block_size,
 
 int32_t KVShardLayout::owner_of(int64_t global_slot) const {
   CHECK_GE(global_slot, 0) << "global_slot must be non-negative";
-  const int64_t logical_offset = global_slot % logical_block_size();
-  return static_cast<int32_t>(logical_offset / physical_block_size_);
+  const int64_t logical_offset = global_slot % block_size();
+  return static_cast<int32_t>(logical_offset / physical_dim_);
 }
 
 bool KVShardLayout::owns(int64_t global_slot) const {
@@ -45,16 +43,16 @@ int64_t KVShardLayout::localize(int64_t global_slot) const {
   if (!owns(global_slot)) {
     return kInvalidSlot;
   }
-  const int64_t logical_block_id = global_slot / logical_block_size();
-  const int64_t local_offset = global_slot % physical_block_size_;
-  return logical_block_id * physical_block_size_ + local_offset;
+  const int64_t logical_block_id = global_slot / block_size();
+  const int64_t local_offset = global_slot % physical_dim_;
+  return logical_block_id * physical_dim_ + local_offset;
 }
 
 int64_t KVShardLayout::globalize(int64_t local_slot) const {
   CHECK_GE(local_slot, 0) << "local_slot must be non-negative";
-  const int64_t local_block_id = local_slot / physical_block_size_;
-  const int64_t local_offset = local_slot % physical_block_size_;
-  return (local_block_id * dcp_size_ + dcp_rank_) * physical_block_size_ +
+  const int64_t local_block_id = local_slot / physical_dim_;
+  const int64_t local_offset = local_slot % physical_dim_;
+  return (local_block_id * dcp_size_ + dcp_rank_) * physical_dim_ +
          local_offset;
 }
 

@@ -53,6 +53,7 @@ from xllm.python.attention.csa_attention import (
 from xllm.python.attention.dsa_metadata import (
     DSA_CACHE_SLIDING_WINDOW,
     DSA_CACHE_TOKEN,
+    DSV4_SWA_BLOCK_SIZE,
     READ_TABLE_LAYOUT_RING,
     DsaMetadata,
     DsaMetadataBuilder,
@@ -1272,8 +1273,8 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             compress_ratios,
             kv_source_layer_ids,
             index_source_layer_ids,
-            window_size,
-            n_layers,
+            swa_block_size=DSV4_SWA_BLOCK_SIZE,
+            n_layers=n_layers,
         )
         self._block_query_width = block_query_width
         # Only the target owns DSA refresh and Engram staging for this overlap.
@@ -1394,33 +1395,25 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         ``get_swa_blocks_per_seq(window, block) = (window - 1) // block + 1``
         (block_utils.cpp), the value the scheduler allocates; production
         ``window == block == 128`` yields 1. The SWA page width is the cache's
-        own block size; before the caches are bound fall back to
-        ``window_size``, which yields the same production 1. A plain Python int
-        computed before capture.
+        own block size; before binding caches it comes from the cache spec.
         """
-        swa_block = self.window_size
-        if self._kv_caches:
-            swa = getattr(self._kv_caches[0], "swa", None)
-            if swa is not None and swa.dim() >= 2 and int(swa.size(1)) > 0:
-                swa_block = int(swa.size(1))
-        if swa_block <= 0:
-            return 1
+        swa_block = self.page_size
         return (self.window_size - 1) // swa_block + 1
 
     def bind_kv_caches(self, kv_caches: list[Any]) -> None:
         super().bind_kv_caches(kv_caches)
         if self._kv_caches and self._kv_caches[0].swa is not None:
-            block_size = int(self._kv_caches[0].swa.size(1))
+            physical_dim = int(self._kv_caches[0].swa.size(1))
             # SWA pages use the bound physical width, not the attention window.
             # Replace descriptors in the lists already held by the builder;
             # TOKEN descriptors and matching-width bindings stay unchanged.
             for index, group in enumerate(self.group_infos):
-                if group.cache_type == DSA_CACHE_SLIDING_WINDOW and group.block_size != block_size:
-                    self.group_infos[index] = replace(group, block_size=block_size)
+                if group.cache_type == DSA_CACHE_SLIDING_WINDOW and group.physical_dim != physical_dim:
+                    self.group_infos[index] = replace(group, physical_dim=physical_dim)
             for layer_caches in self.caches_info:
                 for index, cache in enumerate(layer_caches):
-                    if cache.cache_type == DSA_CACHE_SLIDING_WINDOW and cache.block_size != block_size:
-                        layer_caches[index] = replace(cache, block_size=block_size)
+                    if cache.cache_type == DSA_CACHE_SLIDING_WINDOW and cache.physical_dim != physical_dim:
+                        layer_caches[index] = replace(cache, physical_dim=physical_dim)
         self._swa_ring_blocks = self._compute_swa_ring_blocks()
 
     def set_device_only_decode_inputs(self, enabled: bool, query_width: int) -> None:
@@ -2900,7 +2893,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
             token_rows = query_layout is not None and (dsa.is_acl_graph or query_layout.token_rows)
             if token_rows and swa_bt is not None:
                 swa_bt = swa_bt[:: query_layout.query_width]
-        swa_bs = layer_cache.swa.size(1) if layer_cache.swa is not None else win
+        swa_bs = layer_cache.swa.size(1) if layer_cache.swa is not None else self.page_size
         global_q_lens = list(cp_context.global_q_lens) if cp_context is not None else q_lens
         global_ctx_lens = _ensure_seq_lens_tensor(dsa.seq_lens, q.device) if cp_context is not None else ctx_lens
 
@@ -3357,7 +3350,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         # cover every page the bucket can reach. The page is the SWA cache's
         # second extent (``get_swa_blocks_per_seq(window, block_size)``), which
         # equals the window only when the cache is allocated 1:1 with it.
-        page = self.window_size
+        page = DSV4_SWA_BLOCK_SIZE
         for cache in self._kv_caches:
             if cache.swa is not None and cache.swa.dim() >= 2:
                 page = int(cache.swa.size(1))
@@ -3527,7 +3520,7 @@ class Csa2AttentionBackend(DsaAttentionBackend):
         if block_table is None:
             return positions % state_rows
         swa = self._kv_caches[layer_id].swa
-        block_size = swa.size(1) if swa is not None else self.window_size
+        block_size = swa.size(1) if swa is not None else self.page_size
         cols = torch.div(positions, block_size, rounding_mode="floor") % block_table.size(1)
         blocks = block_table[seq, cols].to(torch.int64).clamp_min(0)
         return blocks * state_rows + positions % state_rows

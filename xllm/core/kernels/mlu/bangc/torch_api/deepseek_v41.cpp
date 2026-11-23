@@ -36,7 +36,6 @@ namespace {
 using OptTensor = std::optional<torch::Tensor>;
 
 constexpr int64_t kHeadDim = 512;
-constexpr int64_t kPageSize = 128;
 constexpr int64_t kStateRows = 32;
 constexpr int64_t kRopeColumns = 128;
 // Protect the kernel int32 block-count ceiling division from overflow.
@@ -531,6 +530,7 @@ void deepseek_v41_decode_gather(const torch::Tensor& swa,
                                 const torch::Tensor& topk,
                                 int64_t position,
                                 int32_t window,
+                                int32_t compressed_physical_dim,
                                 torch::Tensor output,
                                 torch::Tensor length) {
   CHECK(detail::check_tensor(swa, torch::kBFloat16))
@@ -553,6 +553,8 @@ void deepseek_v41_decode_gather(const torch::Tensor& swa,
   CHECK_EQ(swa.size(-1), 512);
   CHECK_EQ(current.numel(), 512);
   CHECK_EQ(length.numel(), 1);
+  CHECK_GT(compressed_physical_dim, 0)
+      << "compressed_physical_dim is block_size / compress_ratio";
   CHECK_GE(output.numel(),
            (std::min<int64_t>(position + 1, window) + topk.numel()) * 512);
   deepseek_v41_gather_launch(torch_mlu::getCurMLUStream(),
@@ -566,6 +568,7 @@ void deepseek_v41_decode_gather(const torch::Tensor& swa,
                              position,
                              window,
                              swa_table.numel(),
+                             compressed_physical_dim,
                              output.data_ptr(),
                              length.data_ptr<int32_t>());
   // Check submission errors only: launches remain asynchronous. Device
@@ -625,11 +628,13 @@ void fused_compress_kv_cache(
   CHECK(main_kv_cache.scalar_type() == torch::kBFloat16 &&
         main_kv_cache.is_contiguous())
       << "main_kv_cache must be contiguous bfloat16";
-  CHECK((main_kv_cache.dim() == 3 && main_kv_cache.size(1) == kPageSize &&
+  const int64_t physical_dim = kDeepseekV41MluKVBlockSize / options.ratio;
+  CHECK((main_kv_cache.dim() == 3 && main_kv_cache.size(1) == physical_dim &&
          main_kv_cache.size(2) == kHeadDim) ||
-        (main_kv_cache.dim() == 4 && main_kv_cache.size(1) == kPageSize &&
+        (main_kv_cache.dim() == 4 && main_kv_cache.size(1) == physical_dim &&
          main_kv_cache.size(2) == 1 && main_kv_cache.size(3) == kHeadDim))
-      << "main_kv_cache must be [Nm, 128, 512] or [Nm, 128, 1, 512]";
+      << "main_kv_cache must be [Nm, " << physical_dim << ", 512] or [Nm, "
+      << physical_dim << ", 1, 512]";
 
   check_device(outputs.latent, device, "outputs.latent");
   CHECK(outputs.latent.scalar_type() == torch::kBFloat16 &&

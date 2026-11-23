@@ -91,11 +91,12 @@ class KVCacheStoreIntegrationTest : public ::testing::Test {
                   KVCache& cache,
                   const KVCacheStoreInitConfig& config) {
     HostCacheStoreIndex index;
-    index[BlockType::KV].emplace_back(HostCacheStoreEntry{/*cache_handle=*/0,
-                                                          "main",
-                                                          &cache,
-                                                          std::nullopt,
-                                                          /*is_target=*/true});
+    index[BlockType::KV].emplace_back(
+        HostCacheStoreEntry{/*cache_handle=*/0,
+                            "main",
+                            std::nullopt,
+                            /*is_target=*/true,
+                            {host_cache_store_group(cache, BlockType::KV)}});
     return store.init(config, std::move(index));
   }
 
@@ -223,19 +224,21 @@ TEST_F(KVCacheStoreIntegrationTest, RestoresIndexScaleWithoutAliasing) {
       torch::zeros({3, 1, 128, 1, 8}, options.dtype(torch::kInt8));
   tensors.indexer_cache_scale =
       torch::zeros({3, 1, 128, 1}, options.dtype(torch::kFloat16));
-  tensors.compressed_block_type = BlockType::C1;
   KVCache c1(tensors);
   tensors.key_cache = torch::zeros_like(tensors.key_cache);
   tensors.index_cache = torch::zeros_like(tensors.index_cache);
   tensors.indexer_cache_scale = torch::zeros_like(tensors.indexer_cache_scale);
-  tensors.compressed_block_type = BlockType::C2;
   KVCache c2(tensors);
 
   HostCacheStoreIndex index;
-  index[BlockType::C1].emplace_back(HostCacheStoreEntry{
-      /*cache_handle=*/0, "main", &c1, std::nullopt, /*is_target=*/true});
-  index[BlockType::C2].emplace_back(HostCacheStoreEntry{
-      /*cache_handle=*/0, "main", &c2, std::nullopt, /*is_target=*/true});
+  index[BlockType::KV].emplace_back(
+      HostCacheStoreEntry{/*cache_handle=*/0,
+                          "main",
+                          std::nullopt,
+                          /*is_target=*/true,
+                          {host_cache_store_group(c1, BlockType::KV, {0}),
+                           host_cache_store_group(c2, BlockType::KV, {1})},
+                          128});
   KVCacheStore store;
   KVCacheStoreInitConfig config = make_store_config("deepseek-v41");
   config.model_id +=
@@ -245,17 +248,18 @@ TEST_F(KVCacheStoreIntegrationTest, RestoresIndexScaleWithoutAliasing) {
   config.metadata_server = config_.metadata_server;
   ASSERT_TRUE(store.init(config, std::move(index)));
 
-  const std::map<BlockType, KVCache*> caches = {{BlockType::C1, &c1},
-                                                {BlockType::C2, &c2}};
-  for (const auto& [type, cache] : caches) {
-    const auto roles = cache->get_block_type_tensors(type);
+  const std::vector<KVCache*> caches = {&c1, &c2};
+  for (size_t index = 0; index < caches.size(); ++index) {
+    const auto roles = caches[index]->get_block_type_tensors(BlockType::KV);
     ASSERT_EQ(roles.size(), 3u);
     for (const auto& [role, tensor] : roles) {
-      tensor[0].fill_(static_cast<int32_t>(type) + static_cast<int32_t>(role));
+      tensor[0].fill_(static_cast<int32_t>(index + 1) * 10 +
+                      static_cast<int32_t>(role));
     }
-    ASSERT_EQ(store.batch_put({make_block_info(44, type)}), 1U);
   }
-  for (const auto& [type, cache] : caches) {
+  ASSERT_EQ(store.batch_put({make_block_info(44, BlockType::KV)}), 1U);
+  for (KVCache* cache : caches) {
+    const BlockType type = BlockType::KV;
     const auto roles = cache->get_block_type_tensors(type);
     const std::vector<BlockTransferInfo> infos = {
         make_block_info(44, type, /*destination_block_id=*/2)};

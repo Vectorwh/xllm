@@ -202,6 +202,9 @@ AttentionMetadata build_c128_metadata(BatchForwardType batch_forward_type,
                                       int32_t block_size) {
   ModelInputParams params = make_c128_params(
       batch_forward_type, num_sequences, q_cu_lens, kv_cu_lens, block_table);
+  params.multi_block_tables.insert(
+      params.multi_block_tables.begin(),
+      torch::empty({num_sequences, 0}, torch::kInt32));
   torch::Tensor positions = torch::arange(q_cu_lens.back(), torch::kInt32);
   std::vector<std::vector<DSACacheInfo>> caches_info = {
       {{0, DSACacheType::TOKEN, 128, block_size}}};

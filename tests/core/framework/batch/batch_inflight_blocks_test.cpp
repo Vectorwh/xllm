@@ -185,6 +185,7 @@ TEST_F(BatchInflightBlocksTest, HoldsSwaTailForEachSequence) {
   BlockManager::Options options;
   options.num_blocks(12)
       .block_size(4)
+      .swa_block_size(4)
       .block_type(BlockType::SWA)
       .enable_prefix_cache(false);
   BlockManagerImpl manager(options);

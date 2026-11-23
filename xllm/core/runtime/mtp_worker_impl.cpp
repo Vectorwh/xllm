@@ -1699,7 +1699,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         target_base_kv_seq_lens,
         /*use_chunked_prefill=*/false,
         /*rebuild_expanded_decode_metadata=*/true,
-        logical_block_size());
+        block_size());
   } else {
     // First decode after prefill and batch transitions use the host cache.
     std::vector<EmbeddingCache::DecodeState> last_states =
@@ -1858,14 +1858,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
               accepted_tokens,
               target_base_positions,
               target_base_kv_seq_lens,
-              logical_block_size());
+              block_size());
         } else {
           mtp_async::prepare_target_verify_from_accepted_state(
               validate_input,
               accepted_tokens,
               target_base_positions,
               target_base_kv_seq_lens,
-              logical_block_size());
+              block_size());
         }
         validate_input.retained_device_tensors = {
             accepted_tokens, target_base_positions, target_base_kv_seq_lens};
@@ -1883,7 +1883,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         // publish one event covering both device and paging correction.
         c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
         mtp_async::refresh_expanded_target_verify_metadata(
-            validate_input, accepted_base_kv_seq_lens, logical_block_size());
+            validate_input, accepted_base_kv_seq_lens, block_size());
         record_metadata_ready_event(*prepare_stream_, validate_input);
       }
     }
@@ -1904,7 +1904,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                                       accepted_base_positions,
                                                       accepted_base_kv_seq_lens,
                                                       draft_idx + 1,
-                                                      logical_block_size());
+                                                      block_size());
     } else {
       prepare_draft_inputs(metadata_template, next_step_input, draft_idx + 1);
     }
@@ -3011,7 +3011,7 @@ void MTPWorkerImpl::enqueue_next_first_draft(
       base_kv_seq_lens,
       /*use_chunked_prefill=*/false,
       /*rebuild_expanded_decode_metadata=*/false,
-      logical_block_size());
+      block_size());
 
   submit_pending_first_draft(input, std::move(combined_input));
 }
@@ -3165,7 +3165,7 @@ void MTPWorkerImpl::update_decode_step_input(
       if (block_tables.defined() && block_tables.dim() == 2 &&
           seq_id < block_tables.size(0)) {
         const int32_t allocated_kv_len =
-            static_cast<int32_t>(block_tables.size(1) * logical_block_size());
+            static_cast<int32_t>(block_tables.size(1) * block_size());
         const int32_t validate_width = options_.num_speculative_tokens() + 1;
         const int32_t max_valid_position = allocated_kv_len - validate_width;
         if (current_position > max_valid_position) {
@@ -3406,7 +3406,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
         row.append_kv_len = true;
         row.append_q_len_one = true;
         row.append_block_table = true;
-        specBuilder::append_decode_row(row_ctx, row, logical_block_size(), buf);
+        specBuilder::append_decode_row(row_ctx, row, block_size(), buf);
       }
     }
   } else {
@@ -3419,7 +3419,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
         row.append_kv_len = !use_atb_spec_kernel;
         row.append_q_len_one = !use_atb_spec_kernel;
         row.append_block_table = !use_atb_spec_kernel;
-        specBuilder::append_decode_row(row_ctx, row, logical_block_size(), buf);
+        specBuilder::append_decode_row(row_ctx, row, block_size(), buf);
       }
     }
   }
@@ -3684,7 +3684,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
         input_params.graph.expanded_kv_seq_lens,
         input_params.graph.expanded_block_tables,
         input_params.graph.expanded_kv_seq_lens_vec,
-        logical_block_size());
+        block_size());
     input_params.graph.input_tokens_override = validate_input.token_ids;
     input_params.graph.spec_verify_source_addresses_stable = true;
   } else {
@@ -3697,7 +3697,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.attention.rebuild_device_buffer(device_);
     if (supports_expanded_spec_verify()) {
       build_expanded_spec_verify_graph_input(
-          input_params, device_, logical_block_size(), defer_expanded_paging);
+          input_params, device_, block_size(), defer_expanded_paging);
     }
   }
 #else
@@ -3840,7 +3840,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
       row.append_kv_len = !use_atb_spec_kernel;
       row.append_q_len_one = !use_atb_spec_kernel;
       row.append_block_table = !use_atb_spec_kernel;
-      specBuilder::append_decode_row(row_ctx, row, logical_block_size(), buf);
+      specBuilder::append_decode_row(row_ctx, row, block_size(), buf);
     }
 
     if (use_atb_spec_kernel) {
@@ -3944,8 +3944,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
   input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
   if (supports_expanded_spec_verify()) {
-    build_expanded_spec_verify_graph_input(
-        input_params, device_, logical_block_size());
+    build_expanded_spec_verify_graph_input(input_params, device_, block_size());
   }
 #endif
   validate_input.device_tensors_ready = true;
@@ -4142,7 +4141,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       row.append_kv_len = !use_chunked_prefill;
       row.append_q_len_one = !use_chunked_prefill;
       row.append_block_table = !use_chunked_prefill;
-      specBuilder::append_decode_row(row_ctx, row, logical_block_size(), buf);
+      specBuilder::append_decode_row(row_ctx, row, block_size(), buf);
       if (embedding.defined()) {
         expanded_embeddings.emplace_back(to_worker_device(embedding));
       } else {
@@ -4411,7 +4410,7 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
     row.seq_id = seq_id;
     row.position_offset = position_offset;
     row.append_token = false;
-    specBuilder::append_decode_row(row_ctx, row, logical_block_size(), buf);
+    specBuilder::append_decode_row(row_ctx, row, block_size(), buf);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())

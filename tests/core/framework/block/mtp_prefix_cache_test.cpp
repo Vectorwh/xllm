@@ -152,19 +152,16 @@ BlockManagerPool::Options hierarchy_mtp_options() {
 
 BlockManagerPool::Options typed_hierarchy_options() {
   BlockManagerPool::Options options = hierarchy_mtp_options();
-  options.num_blocks(4096)
-      .manager_types({1u, 0u, 0u})
-      .compress_ratios({0u, 4u, 128u})
+  options.num_blocks(256)
+      .manager_types({1u, 0u})
       .swa_num_blocks(256)
-      .c4_num_blocks(256)
-      .c128_num_blocks(256)
+      .swa_block_size(16)
+      .block_size(kDsv4FixedBlockSize)
       .swa_blocks_per_seq(2)
       .sliding_window_size(16)
       .max_tokens_per_batch(4096)
       .max_seqs_per_batch(1)
-      .host_num_blocks_by_type({{BlockType::SWA, 512},
-                                {BlockType::C4, 512},
-                                {BlockType::C128, 512}});
+      .host_num_blocks_by_type({{BlockType::SWA, 512}, {BlockType::KV, 512}});
   return options;
 }
 
@@ -532,33 +529,33 @@ TEST(HierarchyMtpPrefixCacheTest, StoreDoesNotQueryWithoutNextToken) {
 }
 
 TEST(TypedMtpPrefixCacheTest, CompressedCheckpointRequiresNextToken) {
-  const size_t unit_tokens = kDsv4CompressedBlockTokenSize;
+  const size_t unit_tokens = kDsv4FixedBlockSize;
   BlockManager::Options options = mtp_options();
-  options.num_blocks(4096)
-      .manager_types({1u, 0u, 0u})
-      .compress_ratios({0u, 4u, 128u})
+  options.num_blocks(256)
+      .manager_types({1u, 0u})
       .swa_num_blocks(256)
-      .swa_blocks_per_seq(2)
-      .sliding_window_size(16)
+      .swa_block_size(kDsv4FixedBlockSize)
+      .block_size(kDsv4FixedBlockSize)
+      .swa_blocks_per_seq(1)
+      .sliding_window_size(kDsv4FixedBlockSize)
       .max_tokens_per_batch(4096)
       .max_seqs_per_batch(1)
       .num_speculative_tokens(1);
   CompositeBlockManager manager(build_composite_leaves(options), options);
+  // One completed unit is not hashable until the MTP lookahead token arrives.
   const std::vector<int32_t> tokens(unit_tokens, 7);
   Sequence sequence = make_mtp_sequence(tokens);
   ASSERT_TRUE(manager.allocate_sequence(&sequence, tokens.size()));
   sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
   manager.cache_full_blocks_for_sequence(&sequence);
-  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C128), 0u);
+  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::KV), 0u);
   sequence.append_token(Token(8));
   ASSERT_EQ(sequence.kv_cache_tokens_num(), unit_tokens);
   ASSERT_EQ(sequence.hash_tokens(BlockHasherType::MTP_TEXT).size(),
             unit_tokens + 1);
   manager.cache_full_blocks_for_sequence(&sequence);
-  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C128), 1u);
-  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::C4), 1u);
-  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::SWA),
-            unit_tokens / options.block_size());
+  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::KV), 1u);
+  EXPECT_EQ(sequence.kv_state().num_cached_blocks(BlockType::SWA), 1u);
   std::vector<int32_t> confirmed = tokens;
   confirmed.reserve(tokens.size() + 1);
   confirmed.emplace_back(8);
@@ -574,7 +571,10 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadWaitsForCompletedLookahead) {
   BlockManagerPool::Options options = typed_hierarchy_options();
   options.instance_is_decode(true);
   HierarchyBlockManagerPool pool(options, &engine);
-  const size_t unit_tokens = Dsv4CacheGeometry().compressed_block_token_size();
+  const size_t unit_tokens = static_cast<size_t>(kDsv4FixedBlockSize);
+  EXPECT_EQ(pool.block_size(), unit_tokens);
+  EXPECT_EQ(pool.num_blocks(), 256u);
+  EXPECT_EQ(pool.num_free_blocks().front(), 255u);
   Sequence sequence = make_mtp_sequence(std::vector<int32_t>(unit_tokens, 7));
   sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
   ASSERT_TRUE(pool.allocate(&sequence, unit_tokens));
@@ -589,7 +589,7 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadUsesConfirmedMtpIdentity) {
   BlockManagerPool::Options options = typed_hierarchy_options();
   options.instance_is_decode(true);
   HierarchyBlockManagerPool pool(options, &engine);
-  const size_t unit_tokens = Dsv4CacheGeometry().compressed_block_token_size();
+  const size_t unit_tokens = static_cast<size_t>(kDsv4FixedBlockSize);
   Sequence sequence = make_mtp_sequence(std::vector<int32_t>(unit_tokens, 7));
   sequence.kv_state().set_kv_cache_tokens_num(unit_tokens);
   ASSERT_TRUE(pool.allocate(&sequence, unit_tokens));
@@ -598,17 +598,28 @@ TEST(TypedMtpPrefixCacheTest, DecodeOffloadUsesConfirmedMtpIdentity) {
   ASSERT_EQ(sequence.kv_cache_tokens_num(), unit_tokens);
   ASSERT_EQ(sequence.hash_tokens(BlockHasherType::MTP_TEXT).size(),
             unit_tokens + 1);
-  sequence.update_block_hashes(options.block_size(), BlockHasherType::MTP_TEXT);
-  const size_t swa_blocks = unit_tokens / options.block_size();
-  ASSERT_EQ(sequence.block_hashes(options.block_size()).size(), swa_blocks);
+  sequence.update_block_hashes(static_cast<uint32_t>(unit_tokens),
+                               BlockHasherType::MTP_TEXT);
+  ASSERT_EQ(sequence.block_hashes(static_cast<uint32_t>(unit_tokens)).size(),
+            1u);
   const XXH3Key expected_hash =
-      sequence.block_hashes(options.block_size())[swa_blocks - 1];
+      sequence.block_hashes(static_cast<uint32_t>(unit_tokens))[0];
   pool.deallocate(&sequence);
   pool.transfer_blocks();
-  ASSERT_EQ(engine.offloads().size(), 4u);
-  EXPECT_EQ(engine.offloads()[0].block_type, BlockType::SWA);
-  EXPECT_EQ(engine.offloads()[1].block_type, BlockType::SWA);
-  EXPECT_EQ(XXH3Key(engine.offloads()[1].hash_key), expected_hash);
+  ASSERT_EQ(engine.offloads().size(), 3u);
+  const auto history = std::find_if(engine.offloads().begin(),
+                                    engine.offloads().end(),
+                                    [](const BlockTransferInfo& info) {
+                                      return info.block_type == BlockType::KV;
+                                    });
+  ASSERT_NE(history, engine.offloads().end());
+  EXPECT_EQ(std::count_if(engine.offloads().begin(),
+                          engine.offloads().end(),
+                          [](const BlockTransferInfo& info) {
+                            return info.block_type == BlockType::SWA;
+                          }),
+            2);
+  EXPECT_EQ(XXH3Key(history->hash_key), expected_hash);
 }
 
 TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
@@ -616,7 +627,7 @@ TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
   BlockManagerPool::Options options = typed_hierarchy_options();
   options.instance_is_decode(true).hasher_type(BlockHasherType::TEXT);
   HierarchyBlockManagerPool pool(options, &engine);
-  const size_t unit_tokens = Dsv4CacheGeometry().compressed_block_token_size();
+  const size_t unit_tokens = static_cast<size_t>(kDsv4FixedBlockSize);
   const PrefixHash unstamped_hash{};
   XXH3Key previous_hash(unstamped_hash.data());
   for (int32_t token : {7, 8}) {
@@ -633,16 +644,27 @@ TEST(TypedPrefixCacheTest, DecodeOffloadUsesContentIdentityWithoutDeviceStamp) {
         .mutable_blocks(BlockType::SWA)
         ->back()
         .set_hash_value(unstamped_hash.data());
-    sequence.update_block_hashes(options.block_size(), BlockHasherType::TEXT);
-    const XXH3Key expected_hash = sequence.block_hashes(
-        options.block_size())[unit_tokens / options.block_size() - 1];
+    sequence.update_block_hashes(static_cast<uint32_t>(unit_tokens),
+                                 BlockHasherType::TEXT);
+    const XXH3Key expected_hash =
+        sequence.block_hashes(static_cast<uint32_t>(unit_tokens))[0];
     EXPECT_NE(expected_hash, previous_hash);
     pool.deallocate(&sequence);
     pool.transfer_blocks();
-    ASSERT_EQ(engine.offloads().size(), 4u);
-    EXPECT_EQ(engine.offloads()[0].block_type, BlockType::SWA);
-    EXPECT_EQ(engine.offloads()[1].block_type, BlockType::SWA);
-    EXPECT_EQ(XXH3Key(engine.offloads()[1].hash_key), expected_hash);
+    ASSERT_EQ(engine.offloads().size(), 3u);
+    const auto history = std::find_if(engine.offloads().begin(),
+                                      engine.offloads().end(),
+                                      [](const BlockTransferInfo& info) {
+                                        return info.block_type == BlockType::KV;
+                                      });
+    ASSERT_NE(history, engine.offloads().end());
+    EXPECT_EQ(std::count_if(engine.offloads().begin(),
+                            engine.offloads().end(),
+                            [](const BlockTransferInfo& info) {
+                              return info.block_type == BlockType::SWA;
+                            }),
+              2);
+    EXPECT_EQ(XXH3Key(history->hash_key), expected_hash);
     previous_hash = expected_hash;
   }
 }
@@ -702,7 +724,9 @@ TEST(HierarchyMtpPrefixCacheTest, HostMatchRejectsDifferentNextToken) {
 }
 
 TEST(TypedMtpPrefixCacheTest, StoreQueriesOnlyCompleteDependencyUnits) {
-  const size_t unit_tokens = kDsv4CompressedBlockTokenSize;
+  EXPECT_TRUE(is_prefetch_gate_block_type(BlockType::KV));
+  EXPECT_FALSE(is_prefetch_gate_block_type(BlockType::SWA));
+  const size_t unit_tokens = kDsv4FixedBlockSize;
   const BlockManagerPool::Options options = typed_hierarchy_options();
   CacheTransferEngine engine;
   HierarchyBlockManagerPool pool(options, &engine);
@@ -723,8 +747,14 @@ TEST(TypedMtpPrefixCacheTest, StoreQueriesOnlyCompleteDependencyUnits) {
     ready_done = true;
   });
   const size_t swa_window_blocks = std::min<size_t>(
-      options.swa_blocks_per_seq(), unit_tokens / options.block_size());
-  EXPECT_EQ(engine.queries().size(), 2u + swa_window_blocks);
+      options.swa_blocks_per_seq(), unit_tokens / options.swa_block_size());
+  EXPECT_EQ(engine.queries().size(), 1u + swa_window_blocks);
+  EXPECT_EQ(std::count_if(engine.queries().begin(),
+                          engine.queries().end(),
+                          [](const BlockTransferInfo& info) {
+                            return info.block_type == BlockType::KV;
+                          }),
+            1u);
   EXPECT_EQ(std::count_if(engine.queries().begin(),
                           engine.queries().end(),
                           [](const BlockTransferInfo& info) {

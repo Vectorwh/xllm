@@ -74,7 +74,7 @@ class DSAMetadataBuilderMlu final {
 
   static void process_token_group(const torch::Tensor& raw_bt,
                                   int32_t ratio,
-                                  int32_t block_size,
+                                  int32_t physical_dim,
                                   const std::vector<int32_t>& ctx_lens,
                                   const std::vector<int32_t>& q_lens,
                                   int32_t batch_size,

@@ -491,7 +491,7 @@ TEST(KvRoleAxisTest, KeyValueAndIndexCarryIndependentShardDescriptors) {
       describe_role(KVCacheTensorRole::INDEX,
                     context,
                     torch::zeros({/*resources=*/2, kTokens, 1, kHeadDim * 2}),
-                    cache_group_id(BlockType::C4));
+                    cache_group_id(BlockType::KV));
 
   // KEY and VALUE are TP-sharded: this rank owns its heads, and the two roles
   // carry the same partition but their own descriptors.
@@ -1731,7 +1731,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                             /*world_size=*/1,
                                             /*dp_size=*/1),
                                   model_args,
-                                  /*block_token_capacity=*/0,
+                                  /*block_token_capacity=*/128,
                                   /*is_spec_draft=*/false);
 
   proto::KVCacheShape proto_shape;
@@ -1802,12 +1802,16 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   caches.emplace_back(make_layout_cache(/*local_heads=*/64));
   transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
   const WorkerCacheLayoutManifest manifest = published_layout();
-  const Dsv4CacheGeometry geometry;
+#if defined(USE_MLU)
+  constexpr int64_t kKvBlockSize = kDsv4FixedBlockSize;
+#else
+  constexpr int64_t kKvBlockSize = kDsv4NpuBlockSize;
+#endif
   const std::string expected_geometry =
-      "|dsv4_compressed_geometry:" +
-      std::to_string(geometry.compressed_block_token_size()) + ":" +
-      std::to_string(geometry.c4_physical_dim()) + ":" +
-      std::to_string(geometry.c128_physical_dim());
+      "|dsv4_compressed_geometry:" + std::to_string(kKvBlockSize) + ":" +
+      std::to_string(dsv4_physical_dim(kKvBlockSize, kDsv4C4CompressRatio)) +
+      ":" +
+      std::to_string(dsv4_physical_dim(kKvBlockSize, kDsv4C128CompressRatio));
   EXPECT_NE(manifest.fingerprint.find(expected_geometry), std::string::npos);
 }
 
@@ -1906,7 +1910,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                                   /*block_token_capacity=*/128,
                                   /*is_spec_draft=*/false);
 
-  // One ratio-2 kv-source layer owns the C2 pool and fp32 compressor state
+  // One ratio-2 kv-source layer owns KV history and fp32 compressor state
   // ring; the other two layers reuse it and own only SWA buffers.
   const int64_t block_size = 128;
   const int64_t head_dim = 64;
@@ -1919,12 +1923,11 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 #endif
   };
   KVCacheCapacity capacity;
-  capacity.block_size(block_size).swa_count(4).c2_count(8).c1_count(8);
+  capacity.block_size(block_size).swa_count(4).n_blocks(8);
   const KVCacheShape shape(capacity, model_args, /*world_size=*/1);
   std::vector<KVCache> caches;
   caches.reserve(3);
   DeepSeekV4KVCacheTensors c2_layer;
-  c2_layer.compressed_block_type = BlockType::C2;
   c2_layer.key_cache = make_block_cache(/*block_count=*/8, head_dim);
   c2_layer.index_cache = make_block_cache(/*block_count=*/8, index_head_dim);
   c2_layer.swa_cache = make_block_cache(/*block_count=*/4, head_dim);
@@ -1952,10 +1955,10 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   transfer.register_kv_cache(caches, shape, torch::kBFloat16);
 
-  // C2 kv-source layer: KEY + INDEX under the C2 group; WINDOW and fp32
+  // Ratio-2 kv-source layer: KEY + INDEX under KV; SWA and fp32
   // state-ring buffers under the SWA group. MLU exports one packed state
   // buffer, while other backends export separate KV and score planes.
-  // The reuse layers contribute only their WINDOW.
+  // The reuse layers contribute only their SWA plane.
   const size_t expected_buffer_count = 5u + state_roles.size();
   ASSERT_EQ(engine_observer->registered_block_bytes.size(), 1U);
   ASSERT_EQ(engine_observer->registered_block_bytes[0].size(),
@@ -1979,9 +1982,9 @@ TEST(MooncakeKVCacheTransferDefaultTest,
     EXPECT_EQ(manifest->group_id, cache_group_id(expected_block_type))
         << role.to_string();
   };
-  expect_manifest_group(KVCacheTensorRole::KEY, BlockType::C2);
-  expect_manifest_group(KVCacheTensorRole::INDEX, BlockType::C2);
-  expect_manifest_group(KVCacheTensorRole::WINDOW, BlockType::SWA);
+  expect_manifest_group(KVCacheTensorRole::KEY, BlockType::KV);
+  expect_manifest_group(KVCacheTensorRole::INDEX, BlockType::KV);
+  expect_manifest_group(KVCacheTensorRole::SWA, BlockType::SWA);
   // The state ring is one resource per SWA block row, not per token.
   for (const KVCacheTensorRole role : state_roles) {
     expect_manifest_group(role, BlockType::SWA);
@@ -2006,7 +2009,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   swa_mapping.local_ids = {1};
   swa_mapping.remote_ids = {2};
   KVTransferMapping c2_mapping;
-  c2_mapping.group_id = cache_group_id(BlockType::C2);
+  c2_mapping.group_id = cache_group_id(BlockType::KV);
   c2_mapping.local_ids = {3};
   c2_mapping.remote_ids = {4};
   mappings.emplace_back(swa_mapping);
@@ -2087,15 +2090,8 @@ TEST(MooncakeKVCacheTransferDefaultTest, RegistersCompressedIndexAndKpoolTail) {
                                     /*is_spec_draft=*/false);
     transfer.register_kv_cache(caches, shape, torch::kBFloat16);
 
-    // Uniform pools do not record a span (only deviating pools do), so the
-    // wire manifest is byte-identical to a peer built without per-pool
-    // spans: the fingerprint must stay untouched and mixed-version peers
-    // still pair.
+    // Ordinary caches retain the indexer's declared physical geometry.
     const WorkerCacheLayoutManifest published = published_layout();
-    const std::string& uniform_fingerprint = published.fingerprint;
-    EXPECT_EQ(uniform_fingerprint.find("|pool_token_spans:"),
-              std::string::npos);
-
     const auto& manifests = published.tensors;
     ASSERT_EQ(manifests.size(), 4U);
     const auto index = std::find_if(
@@ -2111,7 +2107,7 @@ TEST(MooncakeKVCacheTransferDefaultTest, RegistersCompressedIndexAndKpoolTail) {
     EXPECT_EQ(index->group_id, cache_group_id(BlockType::KV));
     EXPECT_EQ(index->resource_count, 4U);
     EXPECT_EQ(index->resource_stride_bytes, 16U / pool_size * 8 * 2);
-    EXPECT_EQ(index->block_token_capacity, 16U);
+    EXPECT_EQ(index->block_token_capacity, 16U / pool_size);
     ASSERT_EQ(index->shard.spans.size(), 1U);
     EXPECT_EQ(index->shard.spans[0].repeat_count, 16U / pool_size);
     EXPECT_EQ(tail->group_id, cache_group_id(BlockType::LINEAR));
@@ -2183,32 +2179,33 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   // Layer composition mirrors create_dsv4_cache_tensors on NPU: a SWA layer,
   // a C4 layer with the lightning indexer cache and compress states, and a
   // C128 layer.
-  const Dsv4CacheGeometry geometry;
+#if defined(USE_MLU)
+  constexpr int64_t kKvBlockSize = kDsv4FixedBlockSize;
+#else
+  constexpr int64_t kKvBlockSize = kDsv4NpuBlockSize;
+#endif
+  const int64_t c4_physical_dim =
+      dsv4_physical_dim(kKvBlockSize, kDsv4C4CompressRatio);
+  const int64_t c128_physical_dim =
+      dsv4_physical_dim(kKvBlockSize, kDsv4C128CompressRatio);
   const int64_t block_size = 128;
   const int64_t head_dim = 64;
   const int64_t index_head_dim = 32;
-  // The producer shape carries a compressed KPool: its indexer cache covers
-  // block_size / index_kpool tokens per block, narrower than the C4 pool's
-  // K/V span. DSV4 pool shapes never carry an index shape (their constructor
-  // returns early), so build the producer shape from a compressed-KPool
-  // model's args purely to feed index_block_capacity.
+  // Use a grouped producer shape. The index plane deliberately has fewer rows
+  // than KEY so registration must read each tensor's own shape.
   ModelArgs shape_args;
-  shape_args.n_layers(3)
+  shape_args.model_type("deepseek_v4")
+      .n_layers(3)
       .n_heads(1)
       .n_kv_heads(1)
       .head_dim(64)
       .index_n_heads(1)
-      .index_head_dim(32)
-      .index_kpool(4)
-      .index_kpool_compress(true);
+      .index_head_dim(32);
   KVCacheCapacity shape_capacity;
-  shape_capacity.n_blocks(4)
-      .block_size(128)
-      .num_linear_state_blocks(2)
-      .kpool_layout(KPoolCacheLayout::COMPRESSED_WITH_TAIL);
+  shape_capacity.n_blocks(4).block_size(128).swa_count(4);
   const KVCacheShape producer_shape(
       shape_capacity, shape_args, /*world_size=*/1);
-  const int64_t index_span = producer_shape.index_cache_shape().at(1);
+  const int64_t index_span = block_size / 4;
   std::vector<KVCache> caches;
   DeepSeekV4KVCacheTensors swa_layer;
   swa_layer.swa_cache =
@@ -2216,9 +2213,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   caches.emplace_back(swa_layer);
 
   DeepSeekV4KVCacheTensors c4_layer;
-  c4_layer.compressed_block_type = BlockType::C4;
-  c4_layer.key_cache = torch::zeros(
-      {8, geometry.c4_physical_dim(), 1, head_dim}, torch::kBFloat16);
+  c4_layer.key_cache =
+      torch::zeros({8, c4_physical_dim, 1, head_dim}, torch::kBFloat16);
   c4_layer.index_cache =
       torch::zeros({8, index_span, 1, index_head_dim}, torch::kInt8);
   c4_layer.swa_cache =
@@ -2234,9 +2230,8 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   caches.emplace_back(c4_layer);
 
   DeepSeekV4KVCacheTensors c128_layer;
-  c128_layer.compressed_block_type = BlockType::C128;
-  c128_layer.key_cache = torch::zeros(
-      {16, geometry.c128_physical_dim(), 1, head_dim}, torch::kBFloat16);
+  c128_layer.key_cache =
+      torch::zeros({16, c128_physical_dim, 1, head_dim}, torch::kBFloat16);
   c128_layer.swa_cache =
       torch::zeros({4, block_size, 1, head_dim}, torch::kBFloat16);
   c128_layer.compress_kv_state =
@@ -2248,13 +2243,13 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   transfer.register_kv_cache(caches, producer_shape, torch::kBFloat16);
 
   // One engine registration covers every cache tensor: the SWA layer's
-  // WINDOW, the C4 layer's seven tensors and the C128 layer's four.
+  // SWA, the C4 layer's seven tensors and the C128 layer's four.
   ASSERT_EQ(engine_observer->registered_block_bytes.size(), 1U);
   ASSERT_EQ(engine_observer->registered_block_bytes[0].size(), 12U);
   const WorkerCacheLayoutManifest published = published_layout();
   const auto& manifests = published.tensors;
-  // SWA layer: WINDOW. C4 layer: KEY, INDEX, WINDOW and four state tensors.
-  // C128 layer: KEY, WINDOW and two state tensors.
+  // SWA layer: SWA. C4 layer: KEY, INDEX, SWA and four state tensors.
+  // C128 layer: KEY, SWA and two state tensors.
   ASSERT_EQ(manifests.size(), 12U);
   const auto find_manifest = [&manifests](int64_t layer_id,
                                           KVCacheTensorRole role) {
@@ -2268,20 +2263,17 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   const auto c4_key = find_manifest(1, KVCacheTensorRole::KEY);
   ASSERT_NE(c4_key, manifests.end());
-  EXPECT_EQ(c4_key->group_id, cache_group_id(BlockType::C4));
+  EXPECT_EQ(c4_key->group_id, cache_group_id(BlockType::KV));
   EXPECT_EQ(c4_key->block_token_capacity,
-            static_cast<uint64_t>(geometry.c4_physical_dim()));
+            static_cast<uint64_t>(c4_physical_dim));
   EXPECT_EQ(c4_key->resource_count, 8U);
   ASSERT_EQ(c4_key->shard.spans.size(), 1U);
 
-  // INDEX shares the C4 pool but runs at the compressed KPool's narrower
-  // span: describe validates it against index_block_capacity while the
-  // manifest still reports the pool's K/V span.
+  // The index plane uses its own physical shape.
   const auto c4_index = find_manifest(1, KVCacheTensorRole::INDEX);
   ASSERT_NE(c4_index, manifests.end());
-  EXPECT_EQ(c4_index->group_id, cache_group_id(BlockType::C4));
-  EXPECT_EQ(c4_index->block_token_capacity,
-            static_cast<uint64_t>(geometry.c4_physical_dim()));
+  EXPECT_EQ(c4_index->group_id, cache_group_id(BlockType::KV));
+  EXPECT_EQ(c4_index->block_token_capacity, static_cast<uint64_t>(index_span));
   EXPECT_EQ(c4_index->resource_count, 8U);
   ASSERT_EQ(c4_index->shard.spans.size(), 1U);
   EXPECT_EQ(c4_index->shard.spans[0].repeat_count,
@@ -2289,33 +2281,18 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   const auto c128_key = find_manifest(2, KVCacheTensorRole::KEY);
   ASSERT_NE(c128_key, manifests.end());
-  EXPECT_EQ(c128_key->group_id, cache_group_id(BlockType::C128));
+  EXPECT_EQ(c128_key->group_id, cache_group_id(BlockType::KV));
   EXPECT_EQ(c128_key->block_token_capacity,
-            static_cast<uint64_t>(geometry.c128_physical_dim()));
+            static_cast<uint64_t>(c128_physical_dim));
   EXPECT_EQ(c128_key->resource_count, 16U);
 
-  // Typed-pool spans join the layout fingerprint: a peer built without
-  // per-pool spans fails pairing with an explicit fingerprint mismatch
-  // instead of a per-tensor capacity error. Only pools whose span deviates
-  // from the uniform block capacity join (C4 and C128 here); pools at the
-  // uniform span keep the fingerprint untouched.
-  const std::string& fingerprint = published.fingerprint;
-  EXPECT_NE(fingerprint.find("|pool_token_spans:"), std::string::npos);
-  EXPECT_NE(
-      fingerprint.find(":" + std::to_string(geometry.c4_physical_dim()) + ";"),
-      std::string::npos);
-  EXPECT_NE(fingerprint.find(
-                ":" + std::to_string(geometry.c128_physical_dim()) + ";"),
-            std::string::npos);
-
-  // The SWA pool has no recorded span: WINDOW and the state tensors fall
-  // back to the scheduler block size.
-  const auto c4_window = find_manifest(1, KVCacheTensorRole::WINDOW);
+  // The SWA plane and the state tensors retain their SWA block coverage.
+  const auto c4_window = find_manifest(1, KVCacheTensorRole::SWA);
   ASSERT_NE(c4_window, manifests.end());
   EXPECT_EQ(c4_window->group_id, cache_group_id(BlockType::SWA));
   EXPECT_EQ(c4_window->block_token_capacity, static_cast<uint64_t>(block_size));
 
-  const auto swa_window = find_manifest(0, KVCacheTensorRole::WINDOW);
+  const auto swa_window = find_manifest(0, KVCacheTensorRole::SWA);
   ASSERT_NE(swa_window, manifests.end());
   EXPECT_EQ(swa_window->group_id, cache_group_id(BlockType::SWA));
   EXPECT_EQ(swa_window->block_token_capacity,
@@ -2338,9 +2315,9 @@ TEST(MooncakeKVCacheTransferDefaultTest,
                : engine_observer->registered_block_bytes[0][it - addrs.begin()];
   };
   EXPECT_EQ(buffer_block_bytes(c4_layer.key_cache),
-            static_cast<uint64_t>(geometry.c4_physical_dim() * head_dim * 2));
+            static_cast<uint64_t>(c4_physical_dim * head_dim * 2));
   EXPECT_EQ(buffer_block_bytes(c128_layer.key_cache),
-            static_cast<uint64_t>(geometry.c128_physical_dim() * head_dim * 2));
+            static_cast<uint64_t>(c128_physical_dim * head_dim * 2));
   EXPECT_EQ(buffer_block_bytes(swa_layer.swa_cache),
             static_cast<uint64_t>(block_size * head_dim * 2));
 }
@@ -2583,7 +2560,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
-     GroupedPullUsesSwaAndCompressedMappings) {
+     PullUsesCanonicalSwaAndHistoryMappings) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
       /*listen_port=*/0, torch::Device(torch::kCPU));
   RecordingMooncakeTransferEngine* engine_observer = engine.get();
@@ -2595,7 +2572,6 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   DeepSeekV4KVCacheTensors tensors;
   tensors.key_cache = torch::zeros({4, 2});
   tensors.swa_cache = torch::zeros({4, 3});
-  tensors.compressed_block_type = BlockType::C4;
   std::vector<KVCache> caches;
   caches.emplace_back(tensors);
   transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
@@ -2605,7 +2581,7 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   swa_mapping.local_ids = {1};
   swa_mapping.remote_ids = {11};
   KVTransferMapping c4_mapping;
-  c4_mapping.group_id = cache_group_id(BlockType::C4);
+  c4_mapping.group_id = cache_group_id(BlockType::KV);
   c4_mapping.local_ids = {2};
   c4_mapping.remote_ids = {12};
 
@@ -2619,6 +2595,86 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   EXPECT_EQ(mappings[0].local_ids, swa_mapping.local_ids);
   EXPECT_EQ(mappings[1].buf_id, 1);
   EXPECT_EQ(mappings[1].remote_ids, c4_mapping.remote_ids);
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     CanonicalHistoryMappingCoversHeterogeneousLayersAndDraft) {
+  for (const std::vector<int64_t>& physical_rows :
+       {std::vector<int64_t>{256, 8, 256}, std::vector<int64_t>{64, 128, 64}}) {
+    SCOPED_TRACE(physical_rows.front());
+    auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+        0, torch::Device(torch::kCPU));
+    RecordingMooncakeTransferEngine* engine_observer = engine.get();
+    MooncakeKVCacheTransferDefault transfer(
+        0, 0, torch::Device(torch::kCPU), "test", std::move(engine));
+    std::vector<KVCache> caches;
+    caches.reserve(physical_rows.size());
+    for (const int64_t rows : physical_rows) {
+      DeepSeekV4KVCacheTensors tensors;
+      tensors.swa_cache = torch::zeros({4, 3});
+      tensors.key_cache = torch::zeros({4, rows});
+      tensors.index_cache = torch::zeros({4, rows / 2});
+      caches.emplace_back(std::move(tensors));
+    }
+    transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+    KVTransferMapping swa;
+    swa.group_id = cache_group_id(BlockType::SWA);
+    swa.local_ids = {1};
+    swa.remote_ids = {2};
+    KVTransferMapping history;
+    history.group_id = cache_group_id(BlockType::KV);
+    history.local_ids = {2, 3};
+    history.remote_ids = {0, 1};
+    history.remote_shared_num = 1;
+    ASSERT_TRUE(transfer.pull_kv_blocks(1, "remote", {swa, history}));
+    ASSERT_EQ(engine_observer->move_calls.size(), 1U);
+    const auto& buffers = engine_observer->move_calls[0].mappings;
+    ASSERT_EQ(buffers.size(), physical_rows.size() * 3);
+    for (size_t index = 0; index < buffers.size(); ++index) {
+      const KVTransferMapping& expected = index % 3 == 0 ? swa : history;
+      EXPECT_EQ(buffers[index].buf_id, static_cast<int64_t>(index));
+      EXPECT_EQ(buffers[index].local_ids, expected.local_ids);
+      EXPECT_EQ(buffers[index].remote_ids, expected.remote_ids);
+    }
+    KVTransferMapping empty_history;
+    empty_history.group_id = history.group_id;
+    ASSERT_TRUE(transfer.pull_kv_blocks(1, "remote", {swa, empty_history}));
+    ASSERT_EQ(engine_observer->move_calls.size(), 2U);
+    EXPECT_EQ(engine_observer->move_calls[1].mappings.size(),
+              physical_rows.size());
+    EXPECT_FALSE(transfer.pull_kv_blocks(1, "remote", {swa, history, history}));
+    EXPECT_FALSE(transfer.pull_kv_blocks(1, "remote", {swa, swa, history}));
+    EXPECT_EQ(engine_observer->move_calls.size(), 2U);
+    std::vector<KVCache> draft_caches;
+    draft_caches.emplace_back(
+        KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+    transfer.register_kv_cache_spec(
+        draft_caches, KVCacheShape(), torch::kFloat32);
+    ASSERT_TRUE(transfer.pull_kv_blocks(1, "remote", {swa, history}));
+    ASSERT_EQ(engine_observer->move_calls.size(), 3U);
+    EXPECT_EQ(engine_observer->move_calls[2].mappings.size(),
+              physical_rows.size() * 3 + 2);
+  }
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     HistoryMappingCannotReplaceRequiredWindow) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(
+      0, 0, torch::Device(torch::kCPU), "test", std::move(engine));
+  DeepSeekV4KVCacheTensors tensors;
+  tensors.swa_cache = torch::zeros({4, 2});
+  std::vector<KVCache> caches;
+  caches.emplace_back(std::move(tensors));
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.local_ids = {1};
+  mapping.remote_ids = {2};
+  EXPECT_FALSE(transfer.pull_kv_blocks(1, "remote", {mapping}));
+  EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
@@ -2718,7 +2774,6 @@ class DraftKvPushMappingTest : public ::testing::Test {
     DeepSeekV4KVCacheTensors main_tensors;
     main_tensors.swa_cache = torch::zeros({8, 3});
     main_tensors.key_cache = torch::zeros({8, 2});
-    main_tensors.compressed_block_type = BlockType::C4;
     main_caches_.emplace_back(main_tensors);
     transfer_->register_kv_cache(main_caches_, KVCacheShape(), torch::kFloat32);
 
@@ -2731,20 +2786,20 @@ class DraftKvPushMappingTest : public ::testing::Test {
     info_.mappings[0].remote_ids = {2};
     info_.mappings[0].remote_shared_num = 1;
     KVTransferMapping compressed;
-    compressed.group_id = cache_group_id(BlockType::C4);
+    compressed.group_id = cache_group_id(BlockType::KV);
     compressed.local_ids = {3};
     compressed.remote_ids = {4, 5, 6, 7};
     info_.mappings.emplace_back(std::move(compressed));
   }
 
   void register_draft(bool with_compressed_layer) {
-    draft_caches_.reserve(with_compressed_layer ? 2 : 1);
+    draft_caches_.reserve(with_compressed_layer ? 3 : 1);
     DeepSeekV4KVCacheTensors draft_tensors;
     draft_tensors.swa_cache = torch::zeros({8, 3});
     draft_caches_.emplace_back(draft_tensors);
     if (with_compressed_layer) {
       draft_tensors.key_cache = torch::zeros({8, 2});
-      draft_tensors.compressed_block_type = BlockType::C4;
+      draft_caches_.emplace_back(draft_tensors);
       draft_caches_.emplace_back(draft_tensors);
     }
     transfer_->register_kv_cache_spec(
@@ -2779,8 +2834,9 @@ class DraftKvPushMappingTest : public ::testing::Test {
   TransferKVInfo info_;
 };
 
-TEST_F(DraftKvPushMappingTest, UnsplitDraftIgnoresTargetOnlyCompressedGroups) {
+TEST_F(DraftKvPushMappingTest, UnsplitDraftIgnoresTargetOnlyHistory) {
   register_draft(/*with_compressed_layer=*/false);
+  info_.mappings[1].group_id = cache_group_id(BlockType::KV);
   EXPECT_TRUE(push(/*is_spec_draft=*/true, /*kv_split_size=*/1).empty());
   // Preparing the asynchronous draft view must not mutate target metadata.
   ASSERT_EQ(info_.mappings.size(), 2U);
@@ -2788,7 +2844,7 @@ TEST_F(DraftKvPushMappingTest, UnsplitDraftIgnoresTargetOnlyCompressedGroups) {
   EXPECT_EQ(info_.mappings[1].local_ids, (std::vector<uint64_t>{3}));
   EXPECT_EQ(info_.mappings[1].remote_ids, (std::vector<uint64_t>{4, 5, 6, 7}));
   EXPECT_TRUE(push(/*is_spec_draft=*/false, /*kv_split_size=*/4).empty());
-  // MAIN still validates its compressed group instead of filtering it away.
+  // MAIN still validates its history resource instead of filtering it away.
   EXPECT_FALSE(push(/*is_spec_draft=*/false, /*kv_split_size=*/1).empty());
 }
 
@@ -2830,13 +2886,15 @@ TEST_F(DraftKvPushMappingTest, RejectsDuplicateRequiredDraftGroup) {
   expect_draft_failure();
 }
 
-TEST_F(DraftKvPushMappingTest, KeepsCompressedGroupsRegisteredByLaterLayers) {
+TEST_F(DraftKvPushMappingTest, KeepsHistoryRegisteredByLaterLayers) {
   register_draft(/*with_compressed_layer=*/true);
-  // A compressed group actually owned by the draft cannot be discarded to
+  info_.mappings[1].group_id = cache_group_id(BlockType::KV);
+  // History actually owned by the draft cannot be discarded to
   // make a width-one transfer appear valid. A sharded MTP-style draft keeps
   // the original width-four mapping and must still pass.
   expect_draft_failure();
   EXPECT_TRUE(push(/*is_spec_draft=*/true, /*kv_split_size=*/4).empty());
+  EXPECT_EQ(info_.mappings[1].group_id, cache_group_id(BlockType::KV));
   info_.mappings.pop_back();
   expect_draft_failure();
 }
@@ -2907,11 +2965,11 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
-     KvSplitFilterRemapsGroupedAttentionCaches) {
+     KvSplitFilterRemapsHistoryAndKeepsStateSlots) {
   TransferKVInfo info = make_info(/*dst_dp_size=*/1,
                                   /*dst_tp_size=*/1,
                                   /*dst_dp_rank=*/0);
-  info.mappings[0].group_id = cache_group_id(BlockType::C4);
+  info.mappings[0].group_id = cache_group_id(BlockType::KV);
   info.mappings[0].remote_ids = {21, 22, 23, 24};
   KVTransferMapping linear_mapping;
   linear_mapping.group_id = cache_group_id(BlockType::LINEAR);

@@ -100,6 +100,7 @@ void deepseek_v41_decode_gather(const torch::Tensor& swa,
                                 const torch::Tensor& topk,
                                 int64_t position,
                                 int32_t window,
+                                int32_t compressed_physical_dim,
                                 torch::Tensor output,
                                 torch::Tensor length);
 

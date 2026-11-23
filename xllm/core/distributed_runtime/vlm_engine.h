@@ -111,7 +111,6 @@ class VLMEngine : public Engine {
   // VLM physical-layout guard before common cache-pool setup.
   static std::unique_ptr<KVCacheManager> make_kv_cache_manager(
       BlockManagerPool::Options& block_options,
-      const ModelArgs& args,
       const runtime::Options& runtime_options,
       const KVCacheCapacity& kv_cache_cap,
       bool has_gdn_state,

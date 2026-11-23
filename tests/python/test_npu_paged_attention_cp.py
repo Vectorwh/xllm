@@ -701,7 +701,7 @@ def _replicated_shard_backend(
     metadata.q_cu_seq_lens = torch.tensor([0, 8, 12], dtype=torch.int32)
     metadata.kv_seq_lens = _REPLICATED_KV_SEQ_LENS
     metadata.local_slot_mapping = KVShardLayout(
-        physical_block_size=2,
+        physical_dim=2,
         dcp_size=_SHARD_KV_SPLIT,
         dcp_rank=_SHARD_RANK,
     ).localize_slots(slots)
@@ -942,7 +942,7 @@ def test_linear_state_slots_are_replicated_not_owner_localized() -> None:
     assert read_indices is slots
     assert write_indices is slots
     # What routing them through the KV shard layout would have produced.
-    localized = KVShardLayout(physical_block_size=2, dcp_size=2, dcp_rank=0).localize_slots(slots)
+    localized = KVShardLayout(physical_dim=2, dcp_size=2, dcp_rank=0).localize_slots(slots)
     torch.testing.assert_close(localized, torch.tensor([-1, 2, -1], dtype=torch.int64))
     assert not torch.equal(read_indices, localized)
 

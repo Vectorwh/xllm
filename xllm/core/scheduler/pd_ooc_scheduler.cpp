@@ -1558,10 +1558,11 @@ void PDOOCScheduler::dispatch_requests() {
         if (discard_cancelled_dispatch_request(requests[i])) {
           continue;
         }
+        const proto::DisaggResponse& accepted = resps.resps()[i];
         for (auto& sequence : requests[i]->sequences()) {
           TransferKVInfo info;
           info.request_id = requests[i]->request_id();
-          const proto::DisaggResponse& resp = resps.resps()[i];
+          const proto::DisaggResponse& resp = accepted;
           // Resolve with the allocation response at hand, exactly as the
           // non-OOC dispatch does: without the rank_local_mapping claim the
           // push path treats every mapping as strided and an equal-width
@@ -2125,10 +2126,11 @@ void PDOOCScheduler::dispatch_offline_requests() {
       if (discard_cancelled_dispatch_request(request)) {
         continue;
       }
+      const proto::DisaggResponse& accepted = resps.resps()[0];
       for (auto& sequence : request->sequences()) {
         TransferKVInfo info;
         info.request_id = request->request_id();
-        const proto::DisaggResponse& resp = resps.resps()[0];
+        const proto::DisaggResponse& resp = accepted;
         // Resolve with the allocation response at hand, exactly as the
         // online dispatch paths do, so an equal-width pair claims the
         // rank-local mapping instead of the strided one. The record is the

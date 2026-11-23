@@ -81,15 +81,16 @@ def _caches(model: DeepseekV41ForCausalLM, total: int) -> list[LayerCache]:
         swa = torch.zeros(count, _BLOCK_SIZE, cfg.head_dim, dtype=torch.bfloat16, device="npu:0")
         ratio = cfg.compress_ratios[layer]
         source = layer in cfg.kv_source_layer_ids
+        physical_dim = _BLOCK_SIZE // ratio if source else 0
         # State blocks follow SWA block IDs, but use the production ring-32 stride.
         state_shape = (count, _COMPRESS_STATE_ROWS, cfg.head_dim)
         caches.append(
             LayerCache(
-                key=torch.zeros(count, _BLOCK_SIZE, cfg.head_dim, dtype=swa.dtype, device=swa.device)
+                key=torch.zeros(count, physical_dim, cfg.head_dim, dtype=swa.dtype, device=swa.device)
                 if source
                 else None,
                 value=None,
-                index=torch.zeros(count, _BLOCK_SIZE, cfg.index_head_dim, dtype=torch.int8, device=swa.device)
+                index=torch.zeros(count, physical_dim, cfg.index_head_dim, dtype=torch.int8, device=swa.device)
                 if source
                 else None,
                 swa=swa,
@@ -99,7 +100,7 @@ def _caches(model: DeepseekV41ForCausalLM, total: int) -> list[LayerCache]:
                 compress_score_state=torch.zeros(state_shape, dtype=torch.float32, device=swa.device)
                 if source and ratio > 1
                 else None,
-                indexer_scale=torch.zeros(count, _BLOCK_SIZE, 1, dtype=torch.float16, device=swa.device)
+                indexer_scale=torch.zeros(count, physical_dim, 1, dtype=torch.float16, device=swa.device)
                 if source
                 else None,
             )
@@ -110,38 +111,34 @@ def _caches(model: DeepseekV41ForCausalLM, total: int) -> list[LayerCache]:
 def _shared_prefix_views(cache: LayerCache, prefix: int, ratio: int) -> dict[str, torch.Tensor]:
     """Views of every completed shared block, with each plane's own row stride."""
     views: dict[str, torch.Tensor] = {}
-    swa_count = prefix // _BLOCK_SIZE
+    shared_blocks = prefix // _BLOCK_SIZE
     for name in ("swa", "compress_kv_state", "compress_score_state"):
         tensor = getattr(cache, name)
         if tensor is not None:
-            views[name] = tensor[1 : 1 + swa_count]
+            views[name] = tensor[1 : 1 + shared_blocks]
     if ratio > 0:
-        token_count = prefix // (_BLOCK_SIZE * ratio)
         for name in ("key", "index", "indexer_scale"):
             tensor = getattr(cache, name)
             if tensor is not None:
-                views[name] = tensor[1 : 1 + token_count]
+                views[name] = tensor[1 : 1 + shared_blocks]
     return views
 
 
 def _tables(
     total: int, *, prefix: int = 0, retain_swa_history: bool = False, window_blocks: int = 1
 ) -> list[torch.Tensor]:
-    tables = []
-    for ratio in (1, 2, 1):
-        span = _BLOCK_SIZE * ratio
-        count = (total + span - 1) // span
-        table = torch.arange(1, count + 1, dtype=torch.int32).view(1, -1)
-        if prefix:
-            shared = prefix // span
-            # Leave one unused block between source and private continuation.
-            table[0, shared:] += 1
-        tables.append(table)
+    count = (total + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    kv_table = torch.arange(1, count + 1, dtype=torch.int32).view(1, -1)
+    shared = prefix // _BLOCK_SIZE
+    if prefix:
+        # Leave one unused block between source and private continuation.
+        kv_table[0, shared:] += 1
+    swa_table = kv_table.clone()
     if prefix and not retain_swa_history:
         # SWA readers need only the last window; logical placeholders keep
         # absolute positions stable, matching the composite export contract.
-        tables[0][0, : max(0, prefix // _BLOCK_SIZE - window_blocks)] = -1
-    return tables
+        swa_table[0, : max(0, shared - window_blocks)] = -1
+    return [swa_table, kv_table]
 
 
 def _swa_slots(table: torch.Tensor, start: int, count: int) -> list[int]:
@@ -169,11 +166,6 @@ def _short_prefix_config(window: int, ratios: list[int]) -> dict[str, Any]:
     }
 
 
-def _short_prefix_tables(total: int, ratios: list[int], *, prefix: int = 0) -> list[torch.Tensor]:
-    tables = _tables(total, prefix=prefix, retain_swa_history=True)
-    return tables if 2 in ratios else [tables[0], tables[2]]
-
-
 def _host_round_trip_prefix(
     model: DeepseekV41ForCausalLM,
     caches: list[LayerCache],
@@ -182,18 +174,17 @@ def _host_round_trip_prefix(
 ) -> tuple[list[LayerCache], list[torch.Tensor]]:
     restored = _caches(model, int(tables[0].numel()) * _BLOCK_SIZE)
     restored_tables = [table.clone() for table in tables]
-    for table, ratio in zip(restored_tables, (1, 2, 1), strict=True):
-        count = prefix // (_BLOCK_SIZE * ratio)
-        table[0, :count] = torch.where(table[0, :count] >= 0, table[0, :count] + 1, table[0, :count])
     swa_count = prefix // _BLOCK_SIZE
+    for table in restored_tables:
+        shared = table[0, :swa_count]
+        shared[shared >= 0] += 1
     window_blocks = (model.cfg.window_size + _BLOCK_SIZE - 1) // _BLOCK_SIZE
     first = max(0, swa_count - window_blocks)
     for layer, (source, target) in enumerate(zip(caches, restored, strict=True)):
         target.swa[first + 2 : swa_count + 2].copy_(source.swa[first + 1 : swa_count + 1].cpu())
         if layer in model.cfg.kv_source_layer_ids:
-            count = prefix // (_BLOCK_SIZE * model.cfg.compress_ratios[layer])
             for name in ("key", "index", "indexer_scale"):
-                getattr(target, name)[2 : count + 2].copy_(getattr(source, name)[1 : count + 1].cpu())
+                getattr(target, name)[2 : swa_count + 2].copy_(getattr(source, name)[1 : swa_count + 1].cpu())
     return restored, restored_tables
 
 
@@ -326,7 +317,7 @@ def test_prefix_alias_logits_match_full_prefill(
         for layer, (source, restored) in enumerate(zip(cached_caches, restored_caches, strict=True)):
             if layer not in cached_model.cfg.kv_source_layer_ids:
                 continue
-            blocks = prefix // (_BLOCK_SIZE * cached_model.cfg.compress_ratios[layer])
+            blocks = prefix // _BLOCK_SIZE
             for name in ("key", "index", "indexer_scale"):
                 getattr(restored, name)[2 : blocks + 2].copy_(getattr(source, name)[1 : blocks + 1].cpu().to("npu:0"))
     restored_backend = _make_csa2_backend(cached_model.cfg, torch.device("npu:0"))
@@ -409,8 +400,8 @@ def test_short_prefix_c1_alias_logits_match_full_prefill(suffix: int) -> None:
     source_backend.bind_kv_caches(source_caches)
     ids = (torch.arange(total, device="npu:0", dtype=torch.int64) * 7) % 63 + 1
     swa_table = torch.arange(1, (total + window - 1) // window + 1, dtype=torch.int32).view(1, -1)
-    golden = _step(baseline, baseline_backend, baseline_caches, ids, 0, [swa_table, _tables(total)[2]])[prefix:]
-    _step(cached, source_backend, source_caches, ids[:prefix], 0, [swa_table[:, :1], _tables(prefix)[2]])
+    golden = _step(baseline, baseline_backend, baseline_caches, ids, 0, [swa_table, _tables(total)[1]])[prefix:]
+    _step(cached, source_backend, source_caches, ids[:prefix], 0, [swa_table[:, :1], _tables(prefix)[1]])
     shared = [
         {
             name: tensor
@@ -435,7 +426,7 @@ def test_short_prefix_c1_alias_logits_match_full_prefill(suffix: int) -> None:
         restored_caches,
         ids[prefix:],
         prefix,
-        [swa_table + 1, _tables(total, prefix=prefix)[2]],
+        [swa_table + 1, _tables(total, prefix=prefix)[1]],
     )
     assert torch.isfinite(golden).all() and torch.isfinite(actual).all()
     error = (actual - golden).abs().max().item()
@@ -460,21 +451,24 @@ def test_short_prefix_physical_swa_slot_contract(prefix: int, window: int, ratio
     total = prefix + suffix
     cfg = DeepseekV41Config.from_dict(_short_prefix_config(window, ratios))
     backend = _make_csa2_backend(cfg, torch.device("cpu"))
-    tables = _short_prefix_tables(total, ratios, prefix=prefix)
-    source_tables = _short_prefix_tables(prefix, ratios)
+    tables = _tables(total, prefix=prefix, retain_swa_history=True)
+    source_tables = _tables(prefix)
     for table, source in zip(tables, source_tables, strict=True):
         assert torch.equal(table[:, : source.size(1)], source)
         assert set(table[0, source.size(1) :].tolist()).isdisjoint(source[0].tolist())
     caches = [LayerCache(key=None, value=None, swa=torch.full((12, _BLOCK_SIZE, 8), -13.0)) for _ in ratios]
     backend.bind_kv_caches(caches)
     assert backend._swa_ring_blocks == window // _BLOCK_SIZE
-    assert backend.group_infos[0].block_size == caches[0].swa.size(1) == _BLOCK_SIZE
+    assert backend.group_infos[0].physical_dim == caches[0].swa.size(1) == _BLOCK_SIZE
     assert [gi.ratio for gi in backend.group_infos if gi.cache_type == DSA_CACHE_TOKEN] == (
         [2, 1] if 2 in ratios else [1]
     )
     for layer_specs in backend.caches_info:
         for spec in layer_specs:
-            assert spec.block_size == _BLOCK_SIZE
+            expected_physical_dim = (
+                _BLOCK_SIZE if spec.cache_type == DSA_CACHE_SLIDING_WINDOW else _BLOCK_SIZE // spec.ratio
+            )
+            assert spec.physical_dim == expected_physical_dim
     specs_before = [[vars(spec).copy() for spec in layer] for layer in backend.caches_info]
     metadata = SimpleNamespace(
         is_prefill=False,
@@ -567,9 +561,9 @@ def test_short_prefix_shared_swa_alias_logits_match_full_prefill(
                 tensor = getattr(cache, name)
                 if tensor is not None:
                     tensor.fill_(abs(poison) / 32 if name == "indexer_scale" else poison)
-    full_tables = _short_prefix_tables(total, ratios)
-    source_tables = _short_prefix_tables(prefix, ratios)
-    private_tables = _short_prefix_tables(total, ratios, prefix=prefix)
+    full_tables = _tables(total)
+    source_tables = _tables(prefix)
+    private_tables = _tables(total, prefix=prefix, retain_swa_history=True)
     for table, source in zip(private_tables, source_tables, strict=True):
         shared_count = source.size(1)
         assert torch.equal(table[:, :shared_count], source), "all historical IDs must survive"
@@ -608,7 +602,7 @@ def test_short_prefix_shared_swa_alias_logits_match_full_prefill(
     restored_backend = _make_csa2_backend(cached.cfg, torch.device("npu:0"))
     restored_backend.bind_kv_caches(restored_caches)
     assert restored_backend._swa_ring_blocks == window // _BLOCK_SIZE
-    assert restored_backend.group_infos[0].block_size == _BLOCK_SIZE
+    assert restored_backend.group_infos[0].physical_dim == _BLOCK_SIZE
     actual = _step(
         cached,
         restored_backend,

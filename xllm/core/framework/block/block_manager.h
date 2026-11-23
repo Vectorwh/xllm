@@ -52,7 +52,11 @@ class BlockManager {
  public:
   struct Options {
     PROPERTY(uint32_t, num_blocks) = 0;
+    // Tokens per block. For the composite and the SWA leaf this is the KV block
+    // size.
     PROPERTY(int32_t, block_size) = 0;
+    // Tokens per SWA block, independent of the KV block size and model window.
+    PROPERTY(int32_t, swa_block_size) = 0;
     PROPERTY(bool, enable_prefix_cache) = true;
     PROPERTY(bool, enable_disagg_pd) = false;
     // Token-level sliding window size for composite SWA allocation.
@@ -61,13 +65,10 @@ class BlockManager {
     PROPERTY(uint32_t, swa_blocks_per_seq) = 0;
     // Total physical SWA rows computed by the KV cache estimator.
     PROPERTY(uint32_t, swa_num_blocks) = 0;
-    PROPERTY(uint32_t, c4_num_blocks) = 0;
-    PROPERTY(uint32_t, c128_num_blocks) = 0;
     // Scheduler token budget used to size the shared SWA burst pool.
     PROPERTY(uint32_t, max_tokens_per_batch) = 0;
     // For CompositeBlockManager (passed from upstream).
     PROPERTY(std::vector<uint32_t>, manager_types) = {};
-    PROPERTY(std::vector<uint32_t>, compress_ratios) = {};
     PROPERTY(uint32_t, max_seqs_per_batch) = 0;
     // Hasher type bound to the engine (TEXT for LLM, MM for VLM).
     PROPERTY(BlockHasherType, hasher_type) = BlockHasherType::TEXT;
@@ -91,10 +92,6 @@ class BlockManager {
     PROPERTY(int64_t, num_layers) = 0;
     PROPERTY(int64_t, slot_size) = 0;
     PROPERTY(std::string, model_id);
-    // Model type of the owning engine (e.g. "deepseek_v41"). Used by
-    // build_composite_leaves to select model-specific composite behavior by
-    // explicit identity instead of inferring it from compress_ratios.
-    PROPERTY(std::string, model_type);
     // Linear-state (Qwen3.5 GDN) resource leaf. When enable_linear_state is
     // set, build_composite_leaves appends a LINEAR leaf on top of the KV
     // family. linear_state_num_slots is the total physical slot count [0, N)
@@ -141,7 +138,7 @@ class BlockManager {
 
   // Returns the shared-prefix vector for the caller's Sequence. The vector's
   // shape is leaf-defined:
-  //   - KV / C4 / C128 return a solid prefix `[valid, valid, ..., valid]`;
+  //   - KV return a solid prefix `[valid, valid, ..., valid]`;
   //     length in blocks × block_size() is the matched-token count.
   //   - SWA returns a gap-tolerant `[opt_valid, ..., valid_last]` where the
   //     length equals last-hit-index + 1 in base blocks (attention only reads
@@ -187,10 +184,14 @@ class BlockManager {
   // get the options for the block manager
   const Options& options() const { return options_; }
 
-  // get number of slots per block
-  size_t block_size() const { return options_.block_size(); }
+  size_t block_size() const {
+    if (block_type() == BlockType::SWA && options_.swa_block_size() > 0) {
+      return static_cast<size_t>(options_.swa_block_size());
+    }
+    return static_cast<size_t>(options_.block_size());
+  }
 
-  // The block category this leaf serves (KV / SWA / C4 / C128 / EMBEDDING /
+  // The block category this leaf serves (KV / SWA / EMBEDDING /
   // LINEAR). A leaf
   // reads its own held-block count from the sequence under this type, and the
   // CompositeBlockManager inserts the returned blocks into the sequence under

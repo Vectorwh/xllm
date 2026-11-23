@@ -110,9 +110,8 @@ TEST(BatchTransportTest, PackedMediaIdentity) {
   uint64_t tag = 0;
   ASSERT_GE(packed.payload().size(), sizeof(tag));
   std::memcpy(&tag, packed.payload().data(), sizeof(tag));
-  // The RAW-input format tag moved to v9 when every KV transfer mapping gained
-  // its stride routing fields (remote_shared_num, local_block_start).
-  EXPECT_EQ(tag, 0x584C4C4D00000009ULL);
+  // v11 derives each step's destination origin from remote_shared_num.
+  EXPECT_EQ(tag, 0x584C4C4D0000000BULL);
   proto::ForwardInput envelope;
   *envelope.mutable_packed_input() = packed;
   proto::ForwardInput received;

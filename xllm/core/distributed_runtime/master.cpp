@@ -567,6 +567,10 @@ Master::Master(const Options& options, EngineType type)
   const auto model_path =
       std::filesystem::path(options_.model_path()).lexically_normal();
   if (options_.host_blocks_factor() > 1.0) {
+    // VLM and VLMSSM share the LLM host-cache path. DeepSeek-V4.1 serving
+    // uses --backend=vlm with DSpark, and Store requires host_blocks_factor
+    // above 1. Gate only the speculative algorithms that do not share the
+    // target cache.
     const bool supports_host_offload =
         type == EngineType::LLM || type == EngineType::VLM ||
         ((type == EngineType::SSM || type == EngineType::VLMSSM) &&

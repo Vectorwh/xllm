@@ -93,12 +93,7 @@ size_t KVCacheState::num_blocks(BlockType type) const {
 bool KVCacheState::has_any_blocks() const {
   // Cache-bearing types only; EMBEDDING is a per-sequence resource block, not
   // token cache, and must not count toward "the sequence already holds cache".
-  for (const BlockType type : {BlockType::KV,
-                               BlockType::SWA,
-                               BlockType::C1,
-                               BlockType::C2,
-                               BlockType::C4,
-                               BlockType::C128}) {
+  for (const BlockType type : {BlockType::KV, BlockType::SWA}) {
     const auto it = composite_blocks_.find(type);
     if (it != composite_blocks_.end() && !it->second.empty()) {
       return true;
@@ -342,36 +337,26 @@ void KVCacheState::update_slice_window_pos() {
 }
 
 size_t KVCacheState::current_max_tokens_capacity() const {
-  const Slice<Block> kv = blocks(BlockType::KV);
-  if (!kv.empty()) {
-    const auto size_it = block_sizes_.find(BlockType::KV);
-    CHECK(size_it != block_sizes_.end());
-    return kv.size() * size_it->second;
-  }
-  // DSV4: only the compressed incremental groups (C4 / C128, and the V4.1
-  // TOKEN groups C1 / C2) have a linear token capacity. The SWA ring is
-  // excluded on purpose -- its committed tokens keep advancing past
-  // ring_capacity * block_size, so counting it here would make
-  // incr_kv_cache_tokens_num's CHECK fail.
-  size_t capacity = 0;
-  for (const BlockType type :
-       {BlockType::C1, BlockType::C2, BlockType::C4, BlockType::C128}) {
-    const Slice<Block> bs = blocks(type);
-    if (bs.empty()) {
+  for (const BlockType type : {BlockType::KV, BlockType::SWA}) {
+    const Slice<Block> held = blocks(type);
+    if (held.empty()) {
       continue;
     }
     const auto size_it = block_sizes_.find(type);
     CHECK(size_it != block_sizes_.end());
-    const size_t group_capacity = bs.size() * size_it->second;
-    capacity =
-        capacity == 0 ? group_capacity : std::min(capacity, group_capacity);
+    // SWA tables retain absolute logical columns, including placeholders for
+    // slid-out blocks. Their length bounds committed tokens, not ring memory.
+    return held.size() * size_it->second;
   }
-  return capacity;
+  return 0;
 }
 
 std::vector<std::pair<BlockType, const std::vector<Block>*>>
 KVCacheState::multi_block_export_view() const {
   std::vector<std::pair<BlockType, const std::vector<Block>*>> view;
+  if (!has_multi_block_export()) {
+    return view;
+  }
   view.reserve(kMultiBlockExportOrder.size());
   for (const BlockType type : kMultiBlockExportOrder) {
     const auto it = composite_blocks_.find(type);
@@ -383,13 +368,7 @@ KVCacheState::multi_block_export_view() const {
 }
 
 bool KVCacheState::has_multi_block_export() const {
-  for (const BlockType type : kMultiBlockExportOrder) {
-    const auto it = composite_blocks_.find(type);
-    if (it != composite_blocks_.end() && !it->second.empty()) {
-      return true;
-    }
-  }
-  return false;
+  return !blocks(BlockType::SWA).empty();
 }
 
 int32_t KVCacheState::get_embedding_block_id() const {

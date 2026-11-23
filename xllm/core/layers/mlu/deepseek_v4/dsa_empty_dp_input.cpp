@@ -39,7 +39,11 @@ int32_t dummy_kv_len(const std::vector<xllm::DSAGroupInfo>& group_infos,
 }
 
 int64_t group_block_num(const xllm::DSAGroupInfo& group_info, int32_t kv_len) {
-  const int64_t block_size = std::max<int64_t>(group_info.block_size, 1);
+  const int64_t physical_dim = std::max<int64_t>(group_info.physical_dim, 1);
+  const int64_t compress_ratio = group_info.type == xllm::DSACacheType::TOKEN
+                                     ? std::max<int64_t>(group_info.ratio, 1)
+                                     : 1;
+  const int64_t block_size = physical_dim * compress_ratio;
   return std::max<int64_t>(div_up(kv_len, block_size), 1);
 }
 
@@ -91,12 +95,18 @@ void fill_dsv4_empty_dp_params(ModelInputParams& params,
   params.attention.device.block_tables =
       torch::zeros({1, max_block_num}, int_options);
 
-  params.multi_block_tables.clear();
-  params.multi_block_tables.reserve(group_infos.size());
+  const int32_t table_count = dsa_block_table_count(group_infos);
+  std::vector<int64_t> table_columns(table_count, 1);
   for (const DSAGroupInfo& group_info : group_infos) {
-    const int64_t block_num = group_block_num(group_info, kv_len);
+    const int32_t table_index = static_cast<int32_t>(group_info.type);
+    table_columns[table_index] = std::max(table_columns[table_index],
+                                          group_block_num(group_info, kv_len));
+  }
+  params.multi_block_tables.clear();
+  params.multi_block_tables.reserve(table_count);
+  for (const int64_t columns : table_columns) {
     params.multi_block_tables.emplace_back(
-        torch::zeros({1, block_num}, int_options));
+        torch::zeros({1, columns}, int_options));
   }
 }
 

@@ -26,7 +26,7 @@ limitations under the License.
 
 namespace xllm {
 
-inline constexpr uint32_t kCacheLayoutSchemaVersion = 1;
+inline constexpr uint32_t kCacheLayoutSchemaVersion = 2;
 
 enum class CacheNamespace : int8_t {
   MAIN = 0,
@@ -62,6 +62,7 @@ struct CacheTensorManifest {
   uint64_t physical_rows_per_resource = 1;
   uint64_t resource_stride_bytes = 0;
   uint64_t buffer_bytes = 0;
+  // Physical token-axis span, independent of original-token coverage.
   uint64_t block_token_capacity = 0;
   // XTensor resources are page-mapped at runtime and therefore bind an
   // explicit GlobalXTensor byte offset instead of resource_id * stride.

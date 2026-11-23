@@ -145,7 +145,7 @@ void sync_dsa_seq_metadata(AttentionMetadata& attn_metadata,
 torch::Tensor build_decode_slot_mapping(const torch::Tensor& cache_block_table,
                                         const xllm::layer::DSAMetadata& dsa,
                                         int64_t compress_ratio,
-                                        int64_t block_size,
+                                        int64_t physical_dim,
                                         const torch::Device& device) {
   const int64_t batch_size = static_cast<int64_t>(dsa.start_pos_vec.size());
   if (batch_size == 0 || !dsa.input_positions.defined() ||
@@ -168,9 +168,10 @@ torch::Tensor build_decode_slot_mapping(const torch::Tensor& cache_block_table,
     const int64_t q_end = dsa.query_start_offsets[seq_idx + 1];
     for (int64_t ci = q_begin; ci < q_end; ++ci) {
       int32_t lid = pos_acc[ci] / compress_ratio;
-      int32_t block_col = lid / block_size;
-      slot_mapping_vec.push_back(
-          block_table_acc[seq_idx][block_col] * block_size + lid % block_size);
+      int32_t block_col = lid / physical_dim;
+      slot_mapping_vec.push_back(block_table_acc[seq_idx][block_col] *
+                                     physical_dim +
+                                 lid % physical_dim);
     }
   }
   return torch::tensor(
@@ -248,7 +249,7 @@ void DSAMetadataBuilderMlu::build_dsa_fields(
         active_multi_block_tables[0].dim() == 2 &&
         active_multi_block_tables[0].size(0) > 1 &&
         static_cast<size_t>(active_multi_block_tables[0].size(0)) <=
-            group_infos.size()) {
+            static_cast<size_t>(dsa_block_table_count(group_infos))) {
       const auto packed = active_multi_block_tables[0].contiguous();
       std::vector<torch::Tensor> unpacked_tables;
       unpacked_tables.reserve(packed.size(0));
@@ -263,10 +264,16 @@ void DSAMetadataBuilderMlu::build_dsa_fields(
           << "[manager][batch, blocks]. manager_num=" << manager_num;
     }
 
-    CHECK_LE(manager_num, static_cast<int32_t>(group_infos.size()))
-        << "DSAMetadataBuilderMlu: manager_num(" << manager_num
-        << ") exceeds group_infos size(" << group_infos.size()
-        << "), cannot align manager/group mapping.";
+    CHECK_EQ(active_multi_block_tables.size(),
+             static_cast<size_t>(dsa_block_table_count(group_infos)))
+        << "DSA logical block table count does not match model bindings";
+    for (const torch::Tensor& table : active_multi_block_tables) {
+      CHECK(table.defined() && table.dim() == 2)
+          << "DSA logical block tables must be two-dimensional";
+      CHECK_GE(table.size(0), batch_size)
+          << "DSA logical block table has fewer rows than the request batch";
+    }
+    const int32_t group_count = static_cast<int32_t>(group_infos.size());
     const int32_t n_layers = static_cast<int32_t>(caches_info.size());
     const std::vector<int32_t>& ctx_lens = kv_lens_vec;
     int64_t total_tokens = 0;
@@ -274,20 +281,21 @@ void DSAMetadataBuilderMlu::build_dsa_fields(
       total_tokens += static_cast<int64_t>(len);
     }
 
-    std::vector<torch::Tensor> proc_slots(manager_num);
-    std::vector<torch::Tensor> proc_bt(manager_num);
-    for (int32_t m = 0; m < manager_num; ++m) {
-      process_group(active_multi_block_tables[m],
-                    group_infos[m],
-                    ctx_lens,
-                    q_lens_vec,
-                    batch_size,
-                    total_tokens,
-                    proc_bt[m],
-                    proc_slots[m]);
+    std::vector<torch::Tensor> proc_slots(group_count);
+    std::vector<torch::Tensor> proc_bt(group_count);
+    for (int32_t m = 0; m < group_count; ++m) {
+      process_group(
+          active_multi_block_tables[static_cast<int32_t>(group_infos[m].type)],
+          group_infos[m],
+          ctx_lens,
+          q_lens_vec,
+          batch_size,
+          total_tokens,
+          proc_bt[m],
+          proc_slots[m]);
       if (group_infos[m].type == DSACacheType::SLIDING_WINDOW) {
         proc_bt[m] = sanitize_swa_table(proc_bt[m],
-                                        group_infos[m].block_size,
+                                        group_infos[m].physical_dim,
                                         ctx_lens,
                                         q_lens_vec,
                                         batch_size,
@@ -304,7 +312,7 @@ void DSAMetadataBuilderMlu::build_dsa_fields(
     const torch::Device target_device =
         positions.defined() ? positions.device() : torch::Device(torch::kCPU);
     if (!target_device.is_cpu()) {
-      for (int32_t m = 0; m < manager_num; ++m) {
+      for (int32_t m = 0; m < group_count; ++m) {
         if (proc_bt[m].defined() && proc_bt[m].device() != target_device) {
           proc_bt[m] = safe_to(
               proc_bt[m], proc_bt[m].options().device(target_device), true);
@@ -318,13 +326,17 @@ void DSAMetadataBuilderMlu::build_dsa_fields(
       }
     }
 
-    std::vector<torch::Tensor> decode_slots(manager_num);
+    std::vector<torch::Tensor> decode_slots(group_count);
     if (is_decode) {
-      for (int32_t m = 0; m < manager_num; ++m) {
+      for (int32_t m = 0; m < group_count; ++m) {
         const int64_t ratio = static_cast<int64_t>(group_infos[m].ratio);
         if (group_infos[m].type == DSACacheType::TOKEN && ratio > 1) {
-          decode_slots[m] = build_decode_slot_mapping(
-              proc_bt[m], dsa, ratio, group_infos[m].block_size, target_device);
+          decode_slots[m] =
+              build_decode_slot_mapping(proc_bt[m],
+                                        dsa,
+                                        ratio,
+                                        group_infos[m].physical_dim,
+                                        target_device);
         }
       }
     }
@@ -338,7 +350,7 @@ void DSAMetadataBuilderMlu::build_dsa_fields(
       dsa.slot_mappings[lid].resize(lci.size());
       for (size_t ci = 0; ci < lci.size(); ++ci) {
         int32_t gid = lci[ci].group_id;
-        if (gid < manager_num) {
+        if (gid < group_count) {
           dsa.block_tables[lid][ci] = proc_bt[gid];
           torch::Tensor slot_mapping = proc_slots[gid];
           if (is_decode && lci[ci].type == DSACacheType::TOKEN &&
@@ -361,7 +373,7 @@ torch::Tensor DSAMetadataBuilderMlu::expand_blocks_to_slots(
     const std::vector<int32_t>& ctx_lens,
     int32_t batch_size,
     int64_t total_tokens) {
-  const int32_t bs = gi.block_size;
+  const int32_t physical_dim = gi.physical_dim;
   auto slots = torch::full({total_tokens}, -1, torch::kInt32);
   auto slots_acc = slots.accessor<int32_t, 1>();
   auto bt_acc = block_table.accessor<int32_t, 2>();
@@ -376,9 +388,9 @@ torch::Tensor DSAMetadataBuilderMlu::expand_blocks_to_slots(
     for (int32_t blk = 0; blk < max_blocks && filled < slot_num; ++blk) {
       int32_t block_id = bt_acc[seq][blk];
       if (block_id < 0) break;
-      for (int32_t off = 0; off < bs && filled < slot_num; ++off) {
-        slots_acc[start_idx + filled] =
-            static_cast<int32_t>(static_cast<int64_t>(block_id) * bs + off);
+      for (int32_t off = 0; off < physical_dim && filled < slot_num; ++off) {
+        slots_acc[start_idx + filled] = static_cast<int32_t>(
+            static_cast<int64_t>(block_id) * physical_dim + off);
         ++filled;
       }
     }
@@ -393,12 +405,12 @@ int64_t DSAMetadataBuilderMlu::compute_slot_num(const DSAGroupInfo& gi,
     return token_len / gi.ratio;
   }
   // SLIDING_WINDOW
-  const int32_t bs = gi.block_size;
-  if (token_len > bs) {
-    return token_len % bs + bs;
+  const int32_t block_size = gi.physical_dim;
+  if (token_len > block_size) {
+    return token_len % block_size + block_size;
   }
-  int64_t n = token_len % bs;
-  return (n == 0 && token_len > 0) ? bs : n;
+  int64_t n = token_len % block_size;
+  return (n == 0 && token_len > 0) ? block_size : n;
 }
 
 void DSAMetadataBuilderMlu::process_group(const torch::Tensor& raw_bt,
@@ -412,7 +424,7 @@ void DSAMetadataBuilderMlu::process_group(const torch::Tensor& raw_bt,
   if (gi.type == DSACacheType::TOKEN) {
     process_token_group(raw_bt,
                         gi.ratio,
-                        gi.block_size,
+                        gi.physical_dim,
                         ctx_lens,
                         q_lens,
                         batch_size,
@@ -420,8 +432,13 @@ void DSAMetadataBuilderMlu::process_group(const torch::Tensor& raw_bt,
                         out_bt,
                         out_slots);
   } else if (gi.type == DSACacheType::SLIDING_WINDOW) {
-    process_swa_group(
-        raw_bt, gi.block_size, ctx_lens, q_lens, batch_size, out_bt, out_slots);
+    process_swa_group(raw_bt,
+                      gi.physical_dim,
+                      ctx_lens,
+                      q_lens,
+                      batch_size,
+                      out_bt,
+                      out_slots);
   } else {
     torch::Tensor raw_slots =
         expand_blocks_to_slots(raw_bt, gi, ctx_lens, batch_size, total_tokens);
@@ -433,7 +450,7 @@ void DSAMetadataBuilderMlu::process_group(const torch::Tensor& raw_bt,
 void DSAMetadataBuilderMlu::process_token_group(
     const torch::Tensor& raw_bt,
     int32_t ratio,
-    int32_t block_size,
+    int32_t physical_dim,
     const std::vector<int32_t>& ctx_lens,
     const std::vector<int32_t>& q_lens,
     int32_t batch_size,
@@ -447,8 +464,8 @@ void DSAMetadataBuilderMlu::process_token_group(
       << "process_token_group requires q_lens.size == batch_size, got "
       << q_lens.size() << " vs " << batch_size;
   CHECK_GT(ratio, 0) << "process_token_group requires ratio > 0, got " << ratio;
-  CHECK_GT(block_size, 0) << "process_token_group requires block_size > 0, got "
-                          << block_size;
+  CHECK_GT(physical_dim, 0)
+      << "process_token_group requires physical_dim > 0, got " << physical_dim;
   CHECK_EQ(raw_bt.dim(), 2)
       << "process_token_group requires raw_bt dim == 2, got " << raw_bt.dim();
 
@@ -475,14 +492,14 @@ void DSAMetadataBuilderMlu::process_token_group(
   auto out_slots_acc = out_slots_tensor.accessor<int32_t, 1>();
   auto raw_bt_acc = raw_bt.accessor<int32_t, 2>();
   const int64_t max_blocks = raw_bt.size(1);
-  const int64_t block_size_i64 = static_cast<int64_t>(block_size);
+  const int64_t physical_dim_i64 = static_cast<int64_t>(physical_dim);
 
   auto slot_for_compressed_index = [&](int32_t seq,
                                        int64_t compressed_idx) -> int32_t {
     if (max_blocks <= 0) {
       return -1;
     }
-    const int64_t block_idx = compressed_idx / block_size_i64;
+    const int64_t block_idx = compressed_idx / physical_dim_i64;
     if (block_idx >= max_blocks) {
       return -1;
     }
@@ -490,9 +507,9 @@ void DSAMetadataBuilderMlu::process_token_group(
     if (block_id < 0) {
       return -1;
     }
-    const int64_t block_offset = compressed_idx % block_size_i64;
+    const int64_t block_offset = compressed_idx % physical_dim_i64;
     return static_cast<int32_t>(
-        static_cast<int64_t>(block_id) * block_size_i64 + block_offset);
+        static_cast<int64_t>(block_id) * physical_dim_i64 + block_offset);
   };
 
   int64_t write_idx = 0;
@@ -640,7 +657,7 @@ void DSAMetadataBuilderMlu::build_c128_meta(
       << "DSAMetadataBuilderMlu: c128 group id exceeds processed block tables.";
   const DSAGroupInfo& c128_group = group_infos[c128_gid];
   const torch::Tensor& block_table = proc_bt[c128_gid];
-  const int32_t block_size = c128_group.block_size;
+  const int32_t physical_dim = c128_group.physical_dim;
 
   const int64_t total_tokens = dsa_metadata.query_start_offsets.back();
   int64_t max_context_len = 0;
@@ -658,7 +675,7 @@ void DSAMetadataBuilderMlu::build_c128_meta(
   const torch::TensorOptions int_options =
       torch::TensorOptions().dtype(torch::kInt32);
   const int64_t table_cols =
-      std::max<int64_t>((max_context_len + block_size - 1) / block_size, 1);
+      std::max<int64_t>((max_context_len + physical_dim - 1) / physical_dim, 1);
   torch::Tensor table =
       torch::full({total_tokens, table_cols}, -1, int_options);
   torch::Tensor src =
@@ -678,7 +695,7 @@ void DSAMetadataBuilderMlu::build_c128_meta(
       const int64_t context_len =
           (dsa_metadata.start_pos_vec[seq_idx] + token_idx + 1) / kC128Ratio;
       context_lens.emplace_back(static_cast<int32_t>(context_len));
-      const int64_t blocks = (context_len + block_size - 1) / block_size;
+      const int64_t blocks = (context_len + physical_dim - 1) / physical_dim;
       const int64_t cols = std::min<int64_t>(blocks, src.size(1));
       for (int64_t col = 0; col < cols; ++col) {
         table_acc[row][col] = src_acc[seq_idx][col];

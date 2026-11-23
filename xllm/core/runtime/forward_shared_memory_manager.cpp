@@ -133,7 +133,11 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // v9: each KVTransferMapping gains remote_shared_num and local_block_start
 // (stride routing under a D-side shared prefix), 12 bytes per mapping; a v8
 // reader would misparse every later mapping and the sections after them.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D00000009ULL;
+// v10: every mapping declares the destination-table origin explicitly,
+// independent of its resource identity (8 more bytes per mapping).
+// v11: removes the redundant destination origin; derive each step's origin
+// from remote_shared_num and local_block_start instead.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D0000000BULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -913,7 +917,7 @@ inline void write_kv_transfer_mappings(
     write_vector(buffer, mapping.local_ids);
     write_vector(buffer, mapping.remote_ids);
     // Stride routing fields: a non-scheduling rank rebuilds each destination
-    // stripe from remote_shared_num and local_block_start, so dropping them
+    // stripe from local_block_start and remote_shared_num, so dropping them
     // here sends the wrong stripe whenever the shared prefix ends inside a
     // source block.
     write_data(buffer, mapping.remote_shared_num);

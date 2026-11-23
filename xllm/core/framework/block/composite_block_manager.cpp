@@ -26,9 +26,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/prefix_cache/block_hasher.h"
-#include "core/util/utils.h"
 #include "embedding_block_manager.h"
-#include "framework/kv_cache/deepseek_v4_cache_geometry.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
 #include "linear_state_block_manager.h"
 #include "sliding_window_block_manager.h"
@@ -92,20 +90,14 @@ bool leaf_participates_in_prefix_cache(BlockType type,
                                        bool instance_is_decode) {
   switch (type) {
     case BlockType::KV:
-    case BlockType::C4:
-    case BlockType::C128:
       return true;
     case BlockType::SWA:
     case BlockType::LINEAR:
       return !instance_is_decode;
     case BlockType::EMBEDDING:
       return false;
-    // C1/C2 reuse committed prefixes through the same path as V4 C4/C128.
-    // Like V4, Decode keeps SWA private and receives it through the common
-    // PD transfer path before queueing the first forward.
-    case BlockType::C1:
-    case BlockType::C2:
-      return true;
+    default:
+      break;
   }
   // Fail loudly on unhandled BlockType. Falling back to false would silently
   // disable prefix cache for the new leaf across both P and D, and every
@@ -113,24 +105,6 @@ bool leaf_participates_in_prefix_cache(BlockType type,
   LOG(FATAL) << "leaf_participates_in_prefix_cache: unhandled BlockType="
              << static_cast<int32_t>(type);
   return false;
-}
-
-// Map a composite sub-manager's compression ratio to its cache-group BlockType.
-// V4.1 TOKEN groups: ratio 1 -> C1, ratio 2 -> C2; V4 compressed groups:
-// ratio 4 -> C4, ratio 128 -> C128. Any other ratio falls back to C128,
-// matching the historical inline ternary; callers CHECK the valid set where it
-// matters.
-inline BlockType block_type_from_compress_ratio(uint32_t ratio) {
-  if (ratio == 1) {
-    return BlockType::C1;
-  }
-  if (ratio == 2) {
-    return BlockType::C2;
-  }
-  if (ratio == 4) {
-    return BlockType::C4;
-  }
-  return BlockType::C128;
 }
 
 // Wrap the leaf in a concurrency adapter when sequence-level calls may run
@@ -184,40 +158,17 @@ CompositeBlockManager::LeafMap build_composite_leaves(
   const bool kv_participates =
       leaf_participates_in_prefix_cache(BlockType::KV, is_decode);
 
-  const bool is_v41_token =
-      util::is_deepseek_v41_model_type(options.model_type());
   bool prefix_cache_on = options.enable_prefix_cache();
-  if (is_v41_token && prefix_cache_on && !is_decode) {
-    CHECK(options.hasher_type() == BlockHasherType::TEXT ||
-          options.hasher_type() == BlockHasherType::MM)
-        << "V4.1 TOKEN prefix cache supports TEXT/MM hashers only";
-  }
-  // Anchor the prefix cache only on cache groups this instance actually
-  // registers. leaf_participates_in_prefix_cache reports C4/C128 as true
-  // unconditionally, so probing them without checking registration would keep
-  // prefix cache on for an unsupported shape and then abort classification.
-  bool grouped_anchor_participates = false;
-  for (size_t i = 0; i < options.manager_types().size(); ++i) {
-    if (options.manager_types()[i] != kManagerTypeBlockManagerImpl) {
-      continue;  // The SWA leaf alone is not a prefix-cache anchor.
-    }
-    if (i >= options.compress_ratios().size()) {
-      break;  // Size mismatch is CHECKed when the leaves are built.
-    }
-    const uint32_t ratio = options.compress_ratios()[i];
-    const BlockType key = block_type_from_compress_ratio(ratio);
-    const bool participates = leaf_participates_in_prefix_cache(key, is_decode);
-    if (participates) {
-      grouped_anchor_participates = true;
-      break;
-    }
-  }
+  // KV participates on both Prefill and Decode. SWA stays private
+  // on Decode, so the KV leaf is the prefix-cache anchor there.
+  const bool grouped_anchor_participates =
+      std::find(options.manager_types().begin(),
+                options.manager_types().end(),
+                kManagerTypeBlockManagerImpl) != options.manager_types().end();
   if (prefix_cache_on && !options.manager_types().empty() &&
       !grouped_anchor_participates) {
-    LOG(WARNING) << "grouped cache has no prefix-cache-capable group for "
-                    "model_type="
-                 << options.model_type()
-                 << "; disabling prefix cache for this instance";
+    LOG(WARNING) << "grouped cache has no prefix-cache-capable KV; "
+                    "disabling prefix cache for this instance";
     prefix_cache_on = false;
   }
 
@@ -277,64 +228,25 @@ CompositeBlockManager::LeafMap build_composite_leaves(
     return leaves;
   }
 
-  // DSV4: SWA + compressed (C4 / C128) leaves; DSV4.1: SWA + TOKEN (C1 / C2)
-  // leaves.
   const size_t n = options.manager_types().size();
-  CHECK_EQ(n, options.compress_ratios().size())
-      << "manager_types and compress_ratios must have the same size";
-  CHECK_GT(n, 0u) << "Composite requires at least one sub-manager";
 
   for (size_t i = 0; i < n; ++i) {
     const uint32_t type = options.manager_types()[i];
-    const uint32_t compress_ratio = options.compress_ratios()[i];
     BlockManager::Options opts = options;
 
     if (type == kManagerTypeBlockManagerImpl) {
-      CHECK(compress_ratio == 1 || compress_ratio == 2 || compress_ratio == 4 ||
-            compress_ratio == 128)
-          << "unexpected compress_ratio " << compress_ratio
-          << " for composite BlockManagerImpl sub-manager";
-      // V4.1 TOKEN groups: C1 (ratio 1) / C2 (ratio 2); V4 compressed groups:
-      // C4 (ratio 4) / C128 (ratio 128). Ratios 1 and 2 only appear together
-      // on V4.1 models.
-      const BlockType key = block_type_from_compress_ratio(compress_ratio);
-      if (compress_ratio == 1 || compress_ratio == 2) {
-        // V4.1 TOKEN group: a C2 block spans two engine blocks and a C1 block
-        // spans one, so scale the logical block size and shrink the block count
-        // to keep the same token capacity as the engine-block pool.
-        opts.block_size(static_cast<uint32_t>(options.block_size()) *
-                        compress_ratio);
-        opts.num_blocks(static_cast<uint32_t>(options.num_blocks()) /
-                        compress_ratio);
-      } else {
-        const Dsv4CacheGeometry& geometry =
-            KVCacheConfig::get_instance().dsv4_cache_geometry();
-        const int64_t logical_block_size =
-            geometry.compressed_block_token_size();
-        uint32_t typed_num_blocks = compress_ratio == 4
-                                        ? options.c4_num_blocks()
-                                        : options.c128_num_blocks();
-        if (typed_num_blocks == 0) {
-          CHECK_GT(options.block_size(), 0);
-          const int64_t base_token_capacity =
-              static_cast<int64_t>(options.num_blocks()) * options.block_size();
-          typed_num_blocks = static_cast<uint32_t>(
-              base_token_capacity / geometry.compressed_block_token_size());
-        }
-        CHECK_GT(typed_num_blocks, 0u)
-            << "missing DSV4 compressed block count for ratio "
-            << compress_ratio;
-        opts.block_size(static_cast<int32_t>(logical_block_size))
-            .num_blocks(typed_num_blocks);
-      }
-      const bool compressed_participates =
+      const BlockType key = BlockType::KV;
+      CHECK_GT(options.num_blocks(), 0u) << "missing KV block count";
+      CHECK_GT(options.block_size(), 0)
+          << "KV block size must be declared by cache capacity planning";
+
+      const bool kv_participates =
           leaf_participates_in_prefix_cache(key, is_decode);
-      const bool compressed_prefix_cache =
-          prefix_cache_on && compressed_participates;
+      const bool kv_prefix_cache = prefix_cache_on && kv_participates;
       opts.block_type(key)
-          .enable_prefix_cache(compressed_prefix_cache)
+          .enable_prefix_cache(kv_prefix_cache)
           .hasher_type(options.hasher_type());
-      // C4/C128: full-history attention (no window), so hits must form a
+      // KV uses full attention (no window), so hits must form a
       // solid left-to-right prefix. The default BlockManagerImpl probe is
       // exactly right. Cross-leaf min happens in the composite.
       leaves.emplace(key,
@@ -342,7 +254,7 @@ CompositeBlockManager::LeafMap build_composite_leaves(
                          maybe_concurrent(
                              std::make_unique<BlockManagerImpl>(opts), options),
                          /*participates_in_admission=*/true,
-                         /*supports_prefix_cache=*/compressed_prefix_cache});
+                         /*supports_prefix_cache=*/kv_prefix_cache});
     } else if (type == kManagerTypeSlidingWindowBlockManager) {
       const uint32_t swa_blocks_per_seq = options.swa_blocks_per_seq();
       CHECK_GT(swa_blocks_per_seq, 0u) << "swa_blocks_per_seq must be positive";
@@ -353,6 +265,7 @@ CompositeBlockManager::LeafMap build_composite_leaves(
       CHECK_GT(swa_total_blocks, 0u)
           << "swa_num_blocks must be provided by the KV cache estimator";
       const bool swa_prefix_cache = prefix_cache_on && swa_participates;
+      CHECK_GT(options.swa_block_size(), 0);
       opts.num_blocks(swa_total_blocks)
           .swa_blocks_per_seq(swa_blocks_per_seq)
           .sliding_window_size(sliding_window_size)
@@ -372,14 +285,10 @@ CompositeBlockManager::LeafMap build_composite_leaves(
       LOG(FATAL) << "Unknown manager_type " << type;
     }
   }
-  const auto c4 = leaves.find(BlockType::C4);
-  const auto c128 = leaves.find(BlockType::C128);
-  if (c4 != leaves.end() && c128 != leaves.end() &&
-      c4->second.participates_in_admission &&
-      c128->second.participates_in_admission) {
-    CHECK_EQ(c4->second.leaf->num_total_blocks(),
-             c128->second.leaf->num_total_blocks())
-        << "DSV4 C4 and C128 admission capacity must stay aligned";
+  const auto kv = leaves.find(BlockType::KV);
+  if (kv != leaves.end()) {
+    CHECK(kv->second.participates_in_admission)
+        << "KV leaf must participate in admission";
   }
   return leaves;
 }
@@ -393,16 +302,6 @@ CompositeBlockManager::CompositeBlockManager(
       combination_(classify_leaf_combination(leaves_)),
       publish_mode_(publish_mode) {
   CHECK(!leaves_.empty()) << "CompositeBlockManager requires at least one leaf";
-  if (combination_ == LeafCombination::SWA_COMPRESSED &&
-      (leaves_.contains(BlockType::C1) || leaves_.contains(BlockType::C2))) {
-    const auto swa = leaves_.find(BlockType::SWA);
-    CHECK(swa != leaves_.end() && swa->second.leaf != nullptr)
-        << "Grouped history prefix requires physical SWA storage";
-    // V4.1 restores SWA prefixes on Prefill; PD Decode gets a
-    // non-shared window from P, so only its history leaves participate.
-    CHECK(options.instance_is_decode() || swa->second.supports_prefix_cache)
-        << "Prefill history prefix requires the SWA restore window";
-  }
 }
 
 CompositeBlockManager::LeafCombination
@@ -412,42 +311,16 @@ CompositeBlockManager::classify_leaf_combination(const LeafMap& leaves) {
     return it != leaves.end() && it->second.supports_prefix_cache;
   };
   const bool has_kv = has_prefix(BlockType::KV);
-  // SWA prefix-cache capability, not merely the presence of a physical leaf.
-  const bool has_swa = has_prefix(BlockType::SWA);
-  const bool has_c4 = has_prefix(BlockType::C4);
-  const bool has_c128 = has_prefix(BlockType::C128);
-  const bool has_c1 = has_prefix(BlockType::C1);
-  const bool has_c2 = has_prefix(BlockType::C2);
+  // Decode receives the window through PD and does not probe its SWA prefix.
+  // Its physical SWA dependency still selects KV/SWA recovery rules.
+  const bool has_swa = leaves.contains(BlockType::SWA);
   const bool has_linear = has_prefix(BlockType::LINEAR);
-
-  // SWA_COMPRESSED requires C4 + C128 to make sense (a compressed shape with
-  // only one granularity is not a shape we ship). SWA is optional here on
-  // purpose: the DECODE role turns off SWA prefix cache via the role
-  // predicate, so has_swa is false while C4/C128 stay on -- trim /
-  // classify still route through this branch, but probes will be missing
-  // the SWA entry and trim_swa_compressed guards accordingly.
-  if (has_c4 || has_c128) {
-    CHECK(has_c4 && has_c128)
-        << "SWA_COMPRESSED requires both C4 and C128 with prefix cache on; "
-        << "got C4=" << has_c4 << " C128=" << has_c128;
-    CHECK(!has_kv) << "SWA_COMPRESSED must not carry a KV leaf";
-    CHECK(!has_linear) << "SWA_COMPRESSED must not carry a LINEAR leaf";
-    CHECK(!has_c1 && !has_c2) << "V4 must not carry V4.1 TOKEN leaves";
-    return LeafCombination::SWA_COMPRESSED;
+  if (has_kv && has_swa) {
+    CHECK(!has_linear) << "SWA_KV must not carry a LINEAR prefix leaf";
+    return LeafCombination::SWA_KV;
   }
-  if (has_c1 || has_c2) {
-    CHECK(!has_kv && !has_linear)
-        << "V4.1 prefix cache must not carry KV or LINEAR leaves";
-    // Like V4, Decode omits SWA prefix probes; trim_swa_compressed checks
-    // the window only when a participating SWA probe is present.
-    return LeafCombination::SWA_COMPRESSED;
-  }
-  if (has_swa) {
-    // A prefix-cache-on SWA leaf paired with no compressed leaves is not a
-    // shape we build; the classifier surfaces the misconfiguration loudly
-    // instead of silently mounting garbage.
-    LOG(FATAL) << "SWA prefix cache requires a full-history TOKEN (C1/C2) or "
-                  "compressed (C4/C128) leaf, but none were found";
+  if (has_prefix(BlockType::SWA)) {
+    LOG(FATAL) << "SWA prefix cache requires a KV leaf";
   }
   if (has_kv) {
     return has_linear ? LeafCombination::FLAT_KV_LINEAR
@@ -476,7 +349,7 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
   size_t cacheable_tokens =
       std::min(seq->kv_cache_tokens_num(), seq->tokens().size());
   size_t cache_unit_size = 0;
-  if (combination_ == LeafCombination::SWA_COMPRESSED) {
+  if (combination_ == LeafCombination::SWA_KV) {
     BlockManager* anchor = nullptr;
     for (const auto& [type, entry] : leaves_) {
       if (!entry.supports_prefix_cache || type == BlockType::SWA ||
@@ -528,7 +401,7 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
     if (blocks == nullptr || blocks->empty()) {
       continue;
     }
-    const size_t num_full = combination_ == LeafCombination::SWA_COMPRESSED
+    const size_t num_full = combination_ == LeafCombination::SWA_KV
                                 ? cacheable_tokens / block_size
                                 : publishable_tokens(*seq, leaf) / block_size;
     size_t cached = kv.num_cached_blocks(type);
@@ -537,8 +410,7 @@ void CompositeBlockManager::cache_full_blocks_for_sequence(Sequence* seq) {
       continue;
     }
 
-    if (combination_ == LeafCombination::SWA_COMPRESSED &&
-        type == BlockType::SWA) {
+    if (combination_ == LeafCombination::SWA_KV && type == BlockType::SWA) {
       const size_t blocks_per_unit = cache_unit_size / block_size;
       const size_t blocks_per_window =
           static_cast<size_t>(leaf.options().swa_blocks_per_seq());
@@ -797,20 +669,18 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
   return out;
 }
 
-// SWA_COMPRESSED: cross-leaf min -> largest-block clamp -> SWA tail-continuity
-// (fallback in complete compressed units) -> per-leaf trim.
-TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
-                                size_t max_prefix_tokens) {
+// SWA_KV: cross-leaf min -> largest-block clamp -> SWA tail-continuity
+// (fallback in complete KV blocks) -> per-leaf trim.
+TrimOutcome trim_swa_kv(std::vector<ProbeResult> probes,
+                        size_t max_prefix_tokens) {
   TrimOutcome out;
   size_t cache_unit_size = 0;
-  bool token_groups = false;
   for (const auto& p : probes) {
     if (p.type != BlockType::SWA) {
       cache_unit_size = std::max(cache_unit_size, p.block_size);
     }
-    token_groups |= p.type == BlockType::C1 || p.type == BlockType::C2;
   }
-  CHECK_GT(cache_unit_size, 0u) << "SWA_COMPRESSED trim requires a compressed "
+  CHECK_GT(cache_unit_size, 0u) << "SWA_KV trim requires a KV "
                                    "leaf with non-zero block_size";
 
   size_t safe_hit_tokens = std::numeric_limits<size_t>::max();
@@ -819,7 +689,7 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
   }
   safe_hit_tokens = (safe_hit_tokens / cache_unit_size) * cache_unit_size;
 
-  // A forward pass must retain at least one compressed unit to compute. Clamp
+  // A forward pass must retain at least one KV block to compute. Clamp
   // an exact prompt hit before validating the SWA window, because the window at
   // the full-prompt boundary can be valid while the preceding window has
   // already been evicted.
@@ -829,7 +699,7 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
 
   // SWA attention reads the last `swa_blocks_per_seq` base blocks; a middle
   // invalid placeholder in that tail means garbage KV. Fall back in
-  // compressed-unit steps until the tail is fully valid.
+  // KV block steps until the tail is fully valid.
   auto swa_it =
       std::find_if(probes.begin(), probes.end(), [](const ProbeResult& p) {
         return p.type == BlockType::SWA;
@@ -842,19 +712,13 @@ TrimOutcome trim_swa_compressed(std::vector<ProbeResult> probes,
     if (swa_block_size > 0 && window_blocks > 0) {
       while (safe_hit_tokens >= cache_unit_size) {
         const size_t trimmed_len = safe_hit_tokens / swa_block_size;
-        // C1/C2 units can be shorter than SWA's window. Before the window
-        // fills, V4.1 needs every available history block, not a full window:
-        // positions before sequence start have no KV and attention masks them
-        // using the actual sequence length. Check every existing tail block.
-        const size_t tail_required =
-            token_groups ? std::min(trimmed_len, window_blocks) : window_blocks;
-        bool tail_ok = trimmed_len >= tail_required;
-        if (tail_ok) {
-          for (size_t i = trimmed_len - tail_required; i < trimmed_len; ++i) {
-            if (i >= swa_vector.size() || !swa_vector[i].is_valid()) {
-              tail_ok = false;
-              break;
-            }
+        // The trimmed prefix needs only the window within the sequence.
+        const size_t tail_required = std::min(trimmed_len, window_blocks);
+        bool tail_ok = true;
+        for (size_t i = trimmed_len - tail_required; i < trimmed_len; ++i) {
+          if (i >= swa_vector.size() || !swa_vector[i].is_valid()) {
+            tail_ok = false;
+            break;
           }
         }
         if (tail_ok) {
@@ -948,13 +812,13 @@ size_t CompositeBlockManager::prefix_hit_tokens(
   if (probes.empty()) {
     return 0;
   }
-  if (combination_ == LeafCombination::SWA_COMPRESSED) {
+  if (combination_ == LeafCombination::SWA_KV) {
     size_t max_tokens = sequence.num_tokens() - 1;
     for (const SampleSlot& slot : sequence.sample_slots()) {
       max_tokens = std::min(
           max_tokens, slot.token_position == 0 ? 0 : slot.token_position - 1);
     }
-    return trim_swa_compressed(std::move(probes), max_tokens).safe_hit_tokens;
+    return trim_swa_kv(std::move(probes), max_tokens).safe_hit_tokens;
   }
   if (combination_ == LeafCombination::FLAT_KV_LINEAR) {
     return trim_flat_kv_linear(std::move(probes)).safe_hit_tokens;
@@ -978,7 +842,7 @@ void CompositeBlockManager::allocate_shared_for_sequence(
     Sequence* seq,
     KVCacheState& kv_state) {
   // Shared flow: probe -> trim -> mount. Trim strategy is per-shape (see
-  // trim_flat_kv / trim_flat_kv_linear / trim_swa_compressed).
+  // trim_flat_kv / trim_flat_kv_linear / trim_swa_kv).
   if (seq == nullptr || combination_ == LeafCombination::UNSUPPORTED) {
     return;
   }
@@ -988,15 +852,9 @@ void CompositeBlockManager::allocate_shared_for_sequence(
   // some schedulers (PD-OOC, disagg-decode) reach the hashing paths through
   // BlockManagerPool::allocate/try_allocate, which hold no pool-level guard.
   PrefixCacheAdapterIdScope adapter_scope(seq->adapter_id());
-  if (combination_ == LeafCombination::FLAT_KV_LINEAR &&
-      kv_state.prefix_cache_matched()) {
-    return;
-  }
-  // Unlike V4 compressed probes, TOKEN leaves append to existing aliases.
-  // A V4.1 continuation must use its mounted state rather than mount it again.
-  if (combination_ == LeafCombination::SWA_COMPRESSED &&
-      (leaves_.contains(BlockType::C1) || leaves_.contains(BlockType::C2)) &&
-      (kv_state.prefix_cache_matched() || kv_state.kv_cache_tokens_num() > 0)) {
+  // Host and HBM have separate states. Preserve this tier's mounted prefix
+  // and computed tokens across allocation retries and continuation requests.
+  if (kv_state.prefix_cache_matched() || kv_state.kv_cache_tokens_num() > 0) {
     return;
   }
   std::vector<ProbeResult> probes = probe_prefix_cache(seq, leaves_, kv_state);
@@ -1013,7 +871,7 @@ void CompositeBlockManager::allocate_shared_for_sequence(
     case LeafCombination::FLAT_KV_LINEAR:
       trimmed = trim_flat_kv_linear(std::move(probes));
       break;
-    case LeafCombination::SWA_COMPRESSED: {
+    case LeafCombination::SWA_KV: {
       size_t max_prefix_tokens =
           seq->tokens().empty() ? 0 : seq->tokens().size() - 1;
       // KV aliases do not retain hidden states needed by /v1/sample. Keep the
@@ -1023,7 +881,7 @@ void CompositeBlockManager::allocate_shared_for_sequence(
             slot.token_position == 0 ? 0 : slot.token_position - 1;
         max_prefix_tokens = std::min(max_prefix_tokens, source_position);
       }
-      trimmed = trim_swa_compressed(std::move(probes), max_prefix_tokens);
+      trimmed = trim_swa_kv(std::move(probes), max_prefix_tokens);
       break;
     }
     case LeafCombination::UNSUPPORTED:
@@ -1048,7 +906,7 @@ void CompositeBlockManager::allocate_shared_for_sequence(
       }
       break;
     }
-    case LeafCombination::SWA_COMPRESSED: {
+    case LeafCombination::SWA_KV: {
       for (ProbeResult& probe : trimmed.to_mount) {
         kv_state.mount_composite_shared(probe.type, std::move(probe.blocks));
       }
@@ -1068,7 +926,7 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq) {
 void CompositeBlockManager::cache_for_sequence(Sequence* seq,
                                                size_t num_tokens) {
   // Chunked-prefill mid-step: only KV needs a token-clamped flush now;
-  // SWA / C4 / C128 get their flush from the pre-grow hook at the top of
+  // SWA / KV get their flush from the pre-grow hook at the top of
   // the next allocate_sequence.
   if (seq == nullptr || seq->is_graph_warmup() ||
       combination_ == LeafCombination::UNSUPPORTED ||
@@ -1100,7 +958,7 @@ void CompositeBlockManager::cache_for_sequence(Sequence* seq,
       publish_blocks(seq, kv_leaf, BlockType::KV, publish_begin, publish_end);
       break;
     }
-    case LeafCombination::SWA_COMPRESSED:
+    case LeafCombination::SWA_KV:
     case LeafCombination::UNSUPPORTED:
       break;
   }
@@ -1122,8 +980,8 @@ void CompositeBlockManager::trim_prefetch_blocks(Sequence* seq,
   PrefixCacheAdapterIdScope adapter_scope(seq->adapter_id());
   // Prefetch finalization is deliberately leaf-owned. In particular, the
   // LINEAR and SWA leaves collapse their sparse temporary vectors differently
-  // from full-cache KV/C4/C128 leaves; the composite only fans out the same
-  // logical boundary and never interprets physical block counts.
+  // from KV leaves; the composite only fans out the
+  // same logical boundary and never interprets physical block counts.
   for (auto& [type, entry] : leaves_) {
     if (type == BlockType::EMBEDDING) {
       continue;

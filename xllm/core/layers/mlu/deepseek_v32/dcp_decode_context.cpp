@@ -119,14 +119,13 @@ DsaTopkState DcpDecodeContext::localize_topk(
       torch::empty({rows, width}, global_table.options());
   torch::Tensor local_lens =
       torch::empty({rows}, global_context_lens.options());
-  kernel::mlu::dcp_localize_topk(
-      global_table,
-      global_context_lens,
-      static_cast<int32_t>(layout_.dcp_rank()),
-      static_cast<int32_t>(layout_.dcp_size()),
-      static_cast<int32_t>(layout_.physical_block_size()),
-      local_table,
-      local_lens);
+  kernel::mlu::dcp_localize_topk(global_table,
+                                 global_context_lens,
+                                 static_cast<int32_t>(layout_.dcp_rank()),
+                                 static_cast<int32_t>(layout_.dcp_size()),
+                                 static_cast<int32_t>(layout_.physical_dim()),
+                                 local_table,
+                                 local_lens);
 
   return DsaTopkState(std::move(local_table), std::move(local_lens));
 }

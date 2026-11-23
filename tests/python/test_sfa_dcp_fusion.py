@@ -59,7 +59,7 @@ def _make_logical_slots(
     torch.manual_seed(0)
     slots = torch.randint(
         0,
-        8 * layout.logical_block_size,
+        8 * layout.block_size,
         (num_tokens, width),
         device=device,
         dtype=torch.int32,
@@ -104,15 +104,15 @@ def _naive_owned_pack(row: list[int], layout: KVShardLayout) -> list[int]:
     for slot in row:
         if slot < 0:
             continue
-        block, offset = divmod(slot, layout.logical_block_size)
-        stripe, local_offset = divmod(offset, layout.physical_block_size)
+        block, offset = divmod(slot, layout.block_size)
+        stripe, local_offset = divmod(offset, layout.physical_dim)
         if stripe == layout.dcp_rank:
-            owned.append(block * layout.physical_block_size + local_offset)
+            owned.append(block * layout.physical_dim + local_offset)
     return owned + [KVShardLayout.INVALID_SLOT] * (len(row) - len(owned))
 
 
 def test_remap_sparse_indices_accepts_kpool_tail_wider_than_index_topk() -> None:
-    layout = KVShardLayout(physical_block_size=4, dcp_size=2, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=4, dcp_size=2, dcp_rank=0)
     slots = torch.tensor([[0, 5, -1, 8, 12, 1, 4]], dtype=torch.int32)
 
     remapped = remap_sparse_indices(slots, layout, index_topk=4)
@@ -129,7 +129,7 @@ def test_fill_wide_remap_matches_the_whole_row_reference() -> None:
     The AOT kernel only packs the configured prefix, so the tail is joined by
     ``_fill_wide_remap``; on CPU the packed prefix comes from the layout.
     """
-    layout = KVShardLayout(physical_block_size=128, dcp_size=4, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=128, dcp_size=4, dcp_rank=0)
     slots = _make_logical_slots(4, layout, device=torch.device("cpu"), width=TOPK + KPOOL_TAIL_COLS)
 
     out = torch.empty_like(slots)
@@ -147,7 +147,7 @@ def test_fill_wide_remap_matches_the_whole_row_reference() -> None:
 
 def test_fill_wide_remap_keeps_a_fully_owned_tail_contiguous() -> None:
     """With every slot owned there is no ``-1`` padding to hide the tail behind."""
-    layout = KVShardLayout(physical_block_size=128, dcp_size=1, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=128, dcp_size=1, dcp_rank=0)
     slots = torch.cat(
         [
             torch.arange(TOPK, dtype=torch.int32),
@@ -185,10 +185,10 @@ def test_fused_remap_matches_naive() -> None:
         (64, 2, 1, 8),
         (128, 32, 7, 8),
     )
-    for physical_block_size, dcp_size, dcp_rank, num_tokens in cases:
+    for physical_dim, dcp_size, dcp_rank, num_tokens in cases:
         for width in (TOPK, TOPK + KPOOL_TAIL_COLS):
             layout = KVShardLayout(
-                physical_block_size=physical_block_size,
+                physical_dim=physical_dim,
                 dcp_size=dcp_size,
                 dcp_rank=dcp_rank,
             )
@@ -198,7 +198,7 @@ def test_fused_remap_matches_naive() -> None:
             scratch = torch.empty(num_tokens * TOPK, dtype=torch.int32, device=device)
             fused = torch.ops.xllm_ops.sfa_dcp_remap_out(
                 prefix,
-                layout.physical_block_size,
+                layout.physical_dim,
                 layout.dcp_size,
                 layout.dcp_rank,
                 out,
@@ -217,7 +217,7 @@ def test_fused_remap_matches_naive() -> None:
             naive = remap_sparse_indices(slots, layout, index_topk=TOPK)
             _assert_valid_slots_form_one_run(fused)
             assert torch.equal(fused, naive), (
-                f"remap mismatch pb={physical_block_size} dcp={dcp_size} T={num_tokens} width={width}"
+                f"remap mismatch pb={physical_dim} dcp={dcp_size} T={num_tokens} width={width}"
             )
 
 
@@ -233,7 +233,7 @@ def test_kpool_topk_coordinates_remap_through_production_entry() -> None:
     columns hold the always-select-tail positions. Expected values are
     hand-derived from the layout arithmetic, not from the code under test.
     """
-    layout = KVShardLayout(physical_block_size=128, dcp_size=2, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=128, dcp_size=2, dcp_rank=0)
     impl = AscendSFADCPImpl(
         _IdentityDcpGroup(),
         scale=0.1,
@@ -280,7 +280,7 @@ def test_wide_spec_verify_remap_falls_back_and_stays_correct(
     part 2 drives the production entry at 300 rows and checks the result
     against both the whole-row reference and an independent naive walk.
     """
-    layout = KVShardLayout(physical_block_size=128, dcp_size=2, dcp_rank=0)
+    layout = KVShardLayout(physical_dim=128, dcp_size=2, dcp_rank=0)
 
     # Part 1: the width constraint in isolation. All other fused-path
     # preconditions hold (index_topk, power-of-two sizes, int32, contiguous,
@@ -292,14 +292,14 @@ def test_wide_spec_verify_remap_falls_back_and_stays_correct(
         assert _can_use_fused_remap(
             at_limit,
             index_topk=TOPK,
-            physical_block_size=128,
+            physical_dim=128,
             dcp_size=2,
         )
         beyond_limit = torch.zeros((FUSED_REMAP_MAX_TOKENS + 1, TOPK), dtype=torch.int32)
         assert not _can_use_fused_remap(
             beyond_limit,
             index_topk=TOPK,
-            physical_block_size=128,
+            physical_dim=128,
             dcp_size=2,
         )
 

@@ -1415,39 +1415,38 @@ def test_build_cache_specs_v41() -> None:
         compress_ratios=[0, 0, 2, 2, 1, 1],
         kv_source_layer_ids=[2, 4],
         index_source_layer_ids=[2, 4, 5],
-        window_size=128,
+        swa_block_size=128,
         n_layers=6,
     )
     # Group registration order is exact: [SWA, TOKEN(2), TOKEN(1)] -- also when
     # the kv-source input arrives unsorted (groups register by layer id).
     expected_groups = [
         (DSA_CACHE_SLIDING_WINDOW, 1, 128),
-        (DSA_CACHE_TOKEN, 2, 128),
+        (DSA_CACHE_TOKEN, 2, 64),
         (DSA_CACHE_TOKEN, 1, 128),
     ]
-    assert [(g.cache_type, g.ratio, g.block_size) for g in group_infos] == expected_groups
+    assert [(g.cache_type, g.ratio, g.physical_dim) for g in group_infos] == expected_groups
     _, unsorted = build_cache_specs_v41(
         compress_ratios=[1, 1, 2, 2, 1, 1],
         kv_source_layer_ids=[4, 2],
         index_source_layer_ids=[2, 4, 5],
-        window_size=128,
+        swa_block_size=128,
         n_layers=6,
     )
-    assert [(g.cache_type, g.ratio, g.block_size) for g in unsorted] == expected_groups
+    assert [(g.cache_type, g.ratio, g.physical_dim) for g in unsorted] == expected_groups
 
-    # A plan whose lowest-id kv-source carries ratio 1 would register
-    # [SWA, TOKEN(1), TOKEN(2)], diverging from the worker multi_block_tables
-    # export order (kMultiBlockExportOrder -> [SWA, TOKEN(2), TOKEN(1)]). The
-    # builder pairs tables and groups by index, so this must fail loud rather
-    # than mis-pair them.
-    with pytest.raises(ValueError, match="export order"):
-        build_cache_specs_v41(
-            compress_ratios=[0, 0, 1, 1, 2, 2],
-            kv_source_layer_ids=[2, 4],
-            index_source_layer_ids=[2, 4, 5],
-            window_size=128,
-            n_layers=6,
-        )
+    _, reversed_groups = build_cache_specs_v41(
+        compress_ratios=[0, 0, 1, 1, 2, 2],
+        kv_source_layer_ids=[2, 4],
+        index_source_layer_ids=[2, 4, 5],
+        swa_block_size=128,
+        n_layers=6,
+    )
+    assert [(g.cache_type, g.ratio, g.physical_dim) for g in reversed_groups] == [
+        (DSA_CACHE_SLIDING_WINDOW, 1, 128),
+        (DSA_CACHE_TOKEN, 1, 128),
+        (DSA_CACHE_TOKEN, 2, 64),
+    ]
 
     def entries(layer_id: int) -> list[tuple[int, int, int]]:
         return [(c.cache_type, c.ratio, c.group_id) for c in caches_info[layer_id]]
@@ -1483,6 +1482,7 @@ def test_build_cache_specs_v41() -> None:
 
 # TOKEN cache block size of the V4.1 layout (contract section 2).
 _TOKEN_BLOCK_SIZE = 128
+_COMPRESSOR_STATE_ROWS = 32
 # SWA ring blocks per sequence (contract: the ring is at least 2 blocks).
 _SWA_RING_BLOCKS = 2
 # The host-side metadata fields (kv_seq_lens_host / q_seq_lens_host) are CPU
@@ -1594,6 +1594,8 @@ def _allocate_v41_layer_caches(
     device: torch.device | None = None,
     *,
     reserve_token_sink: bool = False,
+    swa_blocks_per_seq: int = _SWA_RING_BLOCKS,
+    kv_blocks_per_seq: int = 1,
 ) -> list[LayerCache]:
     """LayerCache tensors for the contract-section-2 layout.
 
@@ -1604,29 +1606,34 @@ def _allocate_v41_layer_caches(
     """
     device = device or torch.device("cpu")
 
-    def swa(dtype_: torch.dtype = dtype) -> torch.Tensor:
-        blocks = _SWA_RING_BLOCKS * n_seqs + int(reserve_token_sink)
-        return torch.zeros(blocks, cfg.window_size, cfg.head_dim, dtype=dtype_, device=device)
+    swa_blocks = swa_blocks_per_seq * n_seqs + int(reserve_token_sink)
 
-    token_blocks = n_seqs + 1 if reserve_token_sink else n_seqs
+    def swa() -> torch.Tensor:
+        return torch.zeros(swa_blocks, cfg.window_size, cfg.head_dim, dtype=dtype, device=device)
+
+    def state() -> torch.Tensor:
+        return torch.zeros(swa_blocks, _COMPRESSOR_STATE_ROWS, cfg.head_dim, dtype=torch.float32, device=device)
+
+    token_blocks = kv_blocks_per_seq * n_seqs + int(reserve_token_sink)
     caches: list[LayerCache] = []
     for layer_id in range(cfg.n_layers):
         if layer_id not in cfg.kv_source_layer_ids:
             caches.append(LayerCache(key=None, value=None, swa=swa()))
             continue
         ratio = cfg.compress_ratios[layer_id]
+        physical_dim = _TOKEN_BLOCK_SIZE // ratio
         states = ratio > 1
         caches.append(
             LayerCache(
-                key=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.head_dim, dtype=dtype, device=device),
+                key=torch.zeros(token_blocks, physical_dim, cfg.head_dim, dtype=dtype, device=device),
                 value=None,
                 # The NPU platform policy keeps the index plane in INT8 plus an
                 # FP16 per-token scale; the pure-Python tests mirror it.
-                index=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, cfg.index_head_dim, dtype=torch.int8, device=device),
+                index=torch.zeros(token_blocks, physical_dim, cfg.index_head_dim, dtype=torch.int8, device=device),
                 swa=swa(),
-                compress_kv_state=swa(torch.float32) if states else None,
-                compress_score_state=swa(torch.float32) if states else None,
-                indexer_scale=torch.zeros(token_blocks, _TOKEN_BLOCK_SIZE, 1, dtype=torch.float16, device=device),
+                compress_kv_state=state() if states else None,
+                compress_score_state=state() if states else None,
+                indexer_scale=torch.zeros(token_blocks, physical_dim, 1, dtype=torch.float16, device=device),
             )
         )
     return caches
@@ -1635,9 +1642,8 @@ def _allocate_v41_layer_caches(
 class _V41ForwardHarness:
     """Drives one model through ModelExecutor with synthetic paging metadata.
 
-    The block tables follow the contract-section-2 groups: the SWA ring (two
-    blocks per sequence), the TOKEN(2) pool of layer 2 and the TOKEN(1) pool
-    of layer 4, one block per sequence each.
+    Each sequence has two SWA ring blocks and its own KV blocks. The layers
+    with ratios 1 and 2 address the same KV block ID in their own tensors.
     """
 
     def __init__(
@@ -1647,6 +1653,8 @@ class _V41ForwardHarness:
         n_seqs: int,
         dtype: torch.dtype,
         device: torch.device | None = None,
+        *,
+        kv_blocks_per_seq: int = 1,
     ) -> None:
         self.lm = lm
         self.cfg = lm.cfg
@@ -1658,10 +1666,11 @@ class _V41ForwardHarness:
         )
         # Block 0 of every pool is a reserved zero padding sink, so real
         # per-sequence blocks are addressed 1-based (matching production).
-        self.tok2_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
-        self.tok1_bt = (torch.arange(n_seqs, dtype=torch.int32, device=self.device) + 1).view(n_seqs, 1)
+        self.kv_bt = torch.arange(1, kv_blocks_per_seq * n_seqs + 1, dtype=torch.int32, device=self.device).view(
+            n_seqs, kv_blocks_per_seq
+        )
         self.layer_caches = _allocate_v41_layer_caches(
-            self.cfg, n_seqs, dtype, device=self.device, reserve_token_sink=True
+            self.cfg, n_seqs, dtype, device=self.device, reserve_token_sink=True, kv_blocks_per_seq=kv_blocks_per_seq
         )
         self.executor = ModelExecutor(lm, dict(config), max_seqs_per_batch=n_seqs)
         self.executor.bind_kv_caches(self.layer_caches)
@@ -1682,7 +1691,7 @@ class _V41ForwardHarness:
             is_chunked_prefill=is_chunked_prefill,
             is_mixed=False,
             is_spec_verify=False,
-            multi_block_tables=[self.swa_bt, self.tok2_bt, self.tok1_bt],
+            multi_block_tables=[self.swa_bt, self.kv_bt],
             kv_seq_lens_host=torch.tensor(kv_lens, dtype=torch.int32, device=_HOST_DEVICE),
             kv_seq_lens_host_values=list(kv_lens),
             q_seq_lens_host=torch.tensor(q_lens, dtype=torch.int32, device=_HOST_DEVICE),
@@ -1725,7 +1734,6 @@ def test_compressor_math() -> None:
         return backend._builder.build(
             multi_block_tables=[
                 torch.tensor([[0, 1]], dtype=torch.int32),
-                torch.tensor([[0]], dtype=torch.int32),
                 torch.tensor([[0]], dtype=torch.int32),
             ],
             kv_seq_lens=[kv_len],
@@ -1855,7 +1863,6 @@ def test_compressor_padded_row_uses_nonnegative_rope_position() -> None:
         multi_block_tables=[
             torch.tensor([[0, 1]], dtype=torch.int32),
             torch.tensor([[0]], dtype=torch.int32),
-            torch.tensor([[0]], dtype=torch.int32),
         ],
         kv_seq_lens=[0],
         q_seq_lens=[1],
@@ -1917,7 +1924,6 @@ def test_compressor_state_ring_read_before_write() -> None:
         # so the state slot is exactly ``position % state_rows``.
         return backend._builder.build(
             multi_block_tables=[
-                torch.tensor([[0]], dtype=torch.int32),
                 torch.tensor([[0]], dtype=torch.int32),
                 torch.tensor([[0]], dtype=torch.int32),
             ],
@@ -2016,7 +2022,6 @@ def test_compressor_state_park_tail_window(monkeypatch: pytest.MonkeyPatch) -> N
         # One SWA ring block per sequence, so a state slot is ``position % 32``.
         return backend._builder.build(
             multi_block_tables=[
-                torch.tensor([[0]], dtype=torch.int32),
                 torch.tensor([[0]], dtype=torch.int32),
                 torch.tensor([[0]], dtype=torch.int32),
             ],
@@ -3738,7 +3743,6 @@ def test_v41_compressor_swa_ring_blocks_derivation() -> None:
     """_swa_ring_blocks = (window - 1) // swa_block + 1 (block_utils.cpp)."""
     cfg = DeepseekV41Config.from_dict(_DEEPSEEK_V41_FORWARD_CONFIG)
     backend = _make_csa2_backend(cfg)
-    # Before the caches are bound the window_size fallback yields production 1.
     assert backend._swa_ring_blocks == 1
     backend.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
     assert backend._swa_ring_blocks == 1
@@ -3747,6 +3751,9 @@ def test_v41_compressor_swa_ring_blocks_derivation() -> None:
         return _make_csa2_backend(SimpleNamespace(**{**vars(cfg), "window_size": window}))
 
     wide_window = with_window(256)
+    assert wide_window.window_size == 256
+    assert wide_window.group_infos[0].physical_dim == wide_window.page_size == 128
+    assert wide_window._swa_ring_blocks == 2
     wide_window.bind_kv_caches([SimpleNamespace(swa=torch.zeros(2, 128, 8))])
     assert wide_window._swa_ring_blocks == 2
     wider_window = with_window(384)
@@ -3771,7 +3778,6 @@ def test_v41_compressor_gate_is_decode_only(monkeypatch: pytest.MonkeyPatch) -> 
     dsa = backend._builder.build(
         multi_block_tables=[
             torch.tensor([[0, 1]], dtype=torch.int32),
-            torch.tensor([[0]], dtype=torch.int32),
             torch.tensor([[0]], dtype=torch.int32),
         ],
         kv_seq_lens=[3],
@@ -3810,8 +3816,7 @@ def test_v41_compressor_uses_current_position_state_block(monkeypatch: pytest.Mo
     dsa = backend._builder.build(
         multi_block_tables=[
             torch.tensor([[-1, 1, 2]], dtype=torch.int32),
-            torch.tensor([[0, 1, 2]], dtype=torch.int32),
-            torch.tensor([[0, 1, 2]], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
         ],
         kv_seq_lens=[position + 1],
         q_seq_lens=[1],
@@ -3843,7 +3848,7 @@ def test_v41_compressor_swa_table_column0_matches_across_widths() -> None:
         compress_ratios=[0, 2],
         kv_source_layer_ids=[1],
         index_source_layer_ids=[1],
-        window_size=128,
+        swa_block_size=128,
         n_layers=2,
     )
     builder = DsaMetadataBuilder(caches_info, group_infos)

@@ -48,6 +48,7 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       host_linear_capacity->second > 0;
   block_options.num_blocks(options_.num_blocks())
       .block_size(options_.block_size())
+      .swa_block_size(options_.swa_block_size())
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_kvcache_store(options_.enable_kvcache_store())
@@ -55,18 +56,14 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       .sliding_window_size(options_.sliding_window_size())
       .swa_blocks_per_seq(options_.swa_blocks_per_seq())
       .swa_num_blocks(options_.swa_num_blocks())
-      .c4_num_blocks(options_.c4_num_blocks())
-      .c128_num_blocks(options_.c128_num_blocks())
       .max_tokens_per_batch(options_.max_tokens_per_batch())
       .manager_types(options_.manager_types())
-      .compress_ratios(options_.compress_ratios())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .hasher_type(options_.hasher_type())
       .enable_xtensor(options_.enable_xtensor())
       .num_layers(options_.num_layers())
       .slot_size(options_.slot_size())
       .model_id(options_.model_id())
-      .model_type(options_.model_type())
       .enable_linear_state(options_.enable_linear_state())
       .linear_state_num_slots(options_.linear_state_num_slots())
       .preserve_decode_checkpoint(options_.enable_host_offload() &&
@@ -79,7 +76,7 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
     // The pool always holds a CompositeBlockManager. Its KV leaf is a flat
     // BlockManagerImpl, or an XTensorBlockManagerImpl when enable_xtensor (the
     // builder picks); the grouped leaves come from manager_types -- V4's
-    // SWA / C4 / C128 or V4.1's SWA / C2 / C1; the LINEAR leaf is added by the
+    // SWA / KV; the LINEAR leaf is added by the
     // builder when enable_linear_state. The per-sequence
     // EMBEDDING resource leaf is appended here under the EMBEDDING key when
     // spec decode needs it. Every leaf is routed by its BlockType.
@@ -212,13 +209,11 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
   AUTO_COUNTER(allocate_blocks_latency_seconds);
   DCHECK(sequence != nullptr);
   int32_t dp_rank = get_dp_rank(sequence);
-  // "Started empty" = the sequence holds no cache-bearing blocks of ANY type
-  // (KV / SWA / C4 / C128), not just KV. DSV4 sequences never hold KV, so a
-  // KV-only check would treat every DSV4 grow as a fresh allocation and, on
-  // failure, wrongly deallocate + reset the already-held SWA/C4/C128 blocks.
+  // A window-only sequence already owns cache even without KV.
+  // Failed growth must preserve those blocks rather than reset the sequence.
   const bool started_empty = !sequence->has_any_blocks();
 
-  // The leaves (KV / SWA / C4 / C128 / EMBEDDING / LINEAR) each apply their own
+  // The leaves (KV / SWA / EMBEDDING / LINEAR) apply their own
   // strategy; the pool only orchestrates prefix-share-then-beam-then-grow,
   // which beam (KV copy-on-write) must sit between.
   auto* composite =
@@ -227,10 +222,8 @@ bool BlockManagerPool::allocate(Sequence* sequence, size_t num_tokens) {
     composite->allocate_shared_for_sequence(sequence);
   }
   // Beam swap decision uses the KV block count after the shared attach.
-  const size_t kv_blocks = sequence->kv_state().num_blocks(BlockType::KV);
-  const size_t block_size = options_.block_size();
-  const size_t kv_blocks_needed = (num_tokens + block_size - 1) / block_size;
-  const bool kv_already_satisfied = kv_blocks_needed <= kv_blocks;
+  const bool kv_already_satisfied =
+      num_tokens <= sequence->kv_state().current_max_tokens_capacity();
   if (!process_beam_search(sequence, /*need_swap*/ kv_already_satisfied)) {
     return false;
   }
@@ -256,7 +249,7 @@ std::vector<Block> BlockManagerPool::allocate(size_t num_tokens,
   // block_managers_[dp_rank] is always a CompositeBlockManager, whose
   // type-ambiguous allocate(size_t) is NOT_IMPLEMENTED. Route to the KV leaf
   // explicitly (this raw-block path is the flat-KV-only helper used to seed /
-  // evict the prefix cache; DSV4 has no KV leaf and must not call it).
+  // evict the prefix cache; a window-only layout must not call it).
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
   return composite->allocate_blocks(BlockType::KV, num_blocks_needed);
@@ -357,7 +350,7 @@ void BlockManagerPool::allocate_shared(Sequence* sequence) {
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
   if ((composite->leaf_combination() ==
-           CompositeBlockManager::LeafCombination::SWA_COMPRESSED ||
+           CompositeBlockManager::LeafCombination::SWA_KV ||
        composite->leaf_combination() ==
            CompositeBlockManager::LeafCombination::FLAT_KV_LINEAR) &&
       sequence->kv_state().prefix_cache_matched()) {

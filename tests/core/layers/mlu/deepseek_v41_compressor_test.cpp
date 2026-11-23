@@ -142,7 +142,7 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
       input.attention.host.q_seq_lens = {0, count, 2 * count};
       auto swa_table = torch::tensor({1, 0}, torch::kInt32).view({2, 1});
       auto main_table = torch::tensor({3, 1, 2, 0}, torch::kInt32).view({2, 2});
-      input.multi_block_tables = {swa_table, main_table, main_table};
+      input.multi_block_tables = {swa_table, main_table};
       Csa2Context shared;
       shared.topk.resize(2);
       for (auto& topk : shared.topk) {

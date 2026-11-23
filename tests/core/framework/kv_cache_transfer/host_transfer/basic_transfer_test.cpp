@@ -171,6 +171,47 @@ TEST(BasicHostKVTransferTest, RoundTripUsesConfiguredLayerEventGroups) {
   transfer.drain();
 }
 
+TEST(BasicHostKVTransferTest, OffloadCopiesOnlySelectedCompletedBlock) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator device is required for Host KV transfer.";
+  }
+
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  auto compute_stream = device.get_stream_from_pool();
+  const auto host_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  constexpr int64_t kBlockElements = 128;
+  constexpr int32_t kCompletedValue = 37;
+  constexpr int32_t kOtherValue = 91;
+  torch::Tensor host_key = torch::zeros({2, 1, kBlockElements}, host_options);
+  torch::Tensor device_key =
+      torch::empty({2, kBlockElements}, host_options.device(device.unwrap()));
+  {
+    c10::StreamGuard guard = compute_stream->set_stream_guard();
+    device_key[0].fill_(kCompletedValue);
+    device_key[1].fill_(kOtherValue);
+  }
+  ASSERT_EQ(compute_stream->synchronize(), 0);
+
+  HostKVGroupLayout group;
+  group.group_id = 9;
+  group.host_roles.emplace(KVCacheTensorRole::KEY, host_key);
+  group.layers.emplace_back(
+      HostKVLayerLayout{0, 0, {{KVCacheTensorRole::KEY, device_key}}});
+  BasicHostKVTransfer transfer(
+      HostKVLayout(/*num_layers=*/1, {std::move(group)}, device.unwrap()),
+      device,
+      *compute_stream,
+      /*layer_copy_batches=*/1);
+  const HostKVRequest request{{HostKVMapping{9, 1, 0}}};
+  ASSERT_TRUE(transfer.offload(request));
+  EXPECT_TRUE(torch::equal(host_key[0], torch::zeros_like(host_key[0])));
+  EXPECT_TRUE(torch::equal(host_key[1],
+                           torch::full_like(host_key[1], kCompletedValue)));
+}
+
 TEST(BasicHostKVTransferTest, OffloadAndRestoreLinearCheckpointRows) {
   if (Platform::device_count() < 1) {
     GTEST_SKIP() << "An accelerator device is required for Host KV transfer.";

@@ -1007,6 +1007,35 @@ TEST_F(BlockManagerPoolTest, AllocateAfterPrefixCacheHitAllocatesSuffixBlocks) {
             hit_seq.num_tokens());
 }
 
+TEST_F(BlockManagerPoolTest, WindowOnlyAdmissionUsesLogicalCapacity) {
+  BlockManagerPool::Options options;
+  options.num_blocks(1)
+      .host_num_blocks(0)
+      .block_size(2048)
+      .swa_block_size(4)
+      .sliding_window_size(4)
+      .swa_blocks_per_seq(1)
+      .swa_num_blocks(8)
+      .max_seqs_per_batch(1)
+      .enable_prefix_cache(false)
+      .manager_types({1});
+  block_test::TestBlockManagerPool pool(options, /*dp_size=*/1);
+  Sequence sequence = make_sequence(0, {1, 2, 3, 4, 5, 6, 7, 8, 9});
+  ASSERT_TRUE(pool.try_allocate(&sequence));
+  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 9u);
+  EXPECT_EQ(sequence.kv_state().current_max_tokens_capacity(), 12u);
+  EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::KV), 0u);
+
+  // Sliding out a physical block must retain its logical column and capacity.
+  std::vector<Block>* blocks =
+      sequence.kv_state().mutable_blocks(BlockType::SWA);
+  blocks->front() = Block();
+  EXPECT_EQ(sequence.kv_state().current_max_tokens_capacity(), 12u);
+  sequence.kv_state().incr_kv_cache_tokens_num(3);
+  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 12u);
+  pool.deallocate(&sequence);
+}
+
 TEST_F(BlockManagerPoolTest, LinearStateMatchesOnlyCheckpointHashes) {
   ScopedValue<int32_t> max_seqs_guard(&FLAGS_max_seqs_per_batch, 4);
 
@@ -1607,6 +1636,56 @@ TEST_F(BlockManagerPoolTest, ExactPromptStopsAtEarlierCheckpoint) {
   ASSERT_TRUE(allocate_next_linear_chunk(pool, exact_seq));
   EXPECT_EQ(exact_seq.kv_state().shared_blocks_num(BlockType::KV), 2u);
   exact_seq.reset();
+}
+
+// Two beams share one KV tail. A second fork that still fits the last logical
+// block copies that tail. Growing past the block boundary appends a new block
+// and leaves the shared tail in place.
+TEST_F(BlockManagerPoolTest, SharedTailForkCopiesOnlyTheInCapacityTail) {
+  constexpr int32_t kBlockSize = 4;
+  BlockManagerPool::Options options;
+  options.num_blocks(8).block_size(kBlockSize).enable_prefix_cache(false);
+  BlockManagerPool pool(options, /*dp_size=*/1);
+
+  sampling_param_.beam_width = 2;
+  Sequence sequence =
+      make_sequence(0, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8});
+  sequence.set_dp_rank(0);
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/kBlockSize));
+  const Slice<Block> allocated = sequence.kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(allocated.size(), 1u);
+  const int32_t shared_tail_id = allocated[0].id();
+  ASSERT_GE(shared_tail_id, 0);
+  EXPECT_EQ(allocated[0].ref_count(), 1u);
+
+  std::vector<Block> shared_tail(allocated.begin(), allocated.end());
+  sequence.kv_state().set_src_blocks(shared_tail, /*need_swap=*/true);
+  ASSERT_TRUE(pool.allocate(&sequence, /*num_tokens=*/kBlockSize));
+
+  const Slice<Block> copied = sequence.kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(copied.size(), 1u);
+  EXPECT_NE(copied[0].id(), shared_tail_id);
+  EXPECT_EQ(copied[0].ref_count(), 1u);
+  EXPECT_EQ(shared_tail[0].ref_count(), 1u);
+  const auto* swaps = pool.get_swap_block_transfer_infos();
+  ASSERT_NE(swaps, nullptr);
+  ASSERT_EQ(swaps->size(), 1u);
+  ASSERT_EQ((*swaps)[0].size(), 1u);
+  EXPECT_EQ((*swaps)[0][0].src_block_id, shared_tail_id);
+  EXPECT_EQ((*swaps)[0][0].dst_block_id, copied[0].id());
+
+  // The next token crosses the logical block. CoW must not run: the shared
+  // tail stays, and growth appends one new block.
+  const int32_t kept_tail_id = copied[0].id();
+  sequence.kv_state().set_src_blocks(
+      std::vector<Block>(copied.begin(), copied.end()), /*need_swap=*/true);
+  ASSERT_TRUE(pool.allocate(&sequence, sequence.num_tokens()));
+
+  const Slice<Block> extended = sequence.kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(extended.size(), 2u);
+  EXPECT_EQ(extended[0].id(), kept_tail_id);
+  EXPECT_NE(extended[1].id(), kept_tail_id);
+  ASSERT_EQ((*swaps)[0].size(), 1u);
 }
 
 namespace {

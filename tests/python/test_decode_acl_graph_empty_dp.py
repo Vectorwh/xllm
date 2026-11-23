@@ -136,7 +136,6 @@ def test_dsa_graph_empty_rank_uses_reserved_block_zero() -> None:
         multi_block_tables=(
             torch.full((4, 4), 99, dtype=torch.int32),
             torch.full((4, 2), 99, dtype=torch.int32),
-            torch.full((4, 1), 99, dtype=torch.int32),
         )
     )
     metadata = SimpleNamespace(multi_block_tables=(), is_dummy=True)
@@ -214,7 +213,7 @@ def test_empty_dp_shard_without_manager_tables_replays_the_graph() -> None:
     assert view is not metadata
     assert tuple(view.block_table.shape) == (1, 1)
     assert view.slot_mapping.tolist() == [0]
-    assert [tuple(table.shape) for table in view.multi_block_tables] == [(1, 1)] * 3
+    assert [tuple(table.shape) for table in view.multi_block_tables] == [(1, 1)] * 2
     # Read-through: untouched fields still come from the original metadata.
     assert view.kv_seq_lens_host_values == [1]
     assert view.is_dummy is True
@@ -278,7 +277,7 @@ def test_busy_dsa_rank_admits_without_flat_scheduler_slots() -> None:
     runner = _dsa_runner()
     input_ids = torch.tensor([1], dtype=torch.int32)
     manager_table = torch.tensor([[3]], dtype=torch.int32)
-    metadata = _dsa_metadata((manager_table,) * 3, dummy=False)
+    metadata = _dsa_metadata((manager_table,) * 2, dummy=False)
     metadata.new_cache_slots_host_values = []
     metadata.slot_mapping = torch.empty(0, dtype=torch.int32)
 

@@ -266,6 +266,9 @@ std::optional<proto::ProviderDescriptor> build_native_provider_descriptor(
                       error);
   const std::optional<std::string> renderer_digest = required_digest(
       kRendererDigestDomain, config.renderer_contract, "renderer", error);
+  // Always publish the layout digest. Deployed Service rejects a Native
+  // descriptor when kv.kv_layout_digest is empty, even though it does not
+  // compare that digest across Prefill and Decode.
   const std::optional<std::string> kv_layout_digest = required_digest(
       kKVLayoutDigestDomain, config.kv_layout_contract, "KV layout", error);
   const std::optional<std::string> head_shard_digest =
@@ -584,9 +587,11 @@ std::string renderer_contract(const TokenizerArgs& tokenizer,
   return contract;
 }
 
+// Fingerprint the physical cache this Engine allocated. Service admission
+// only requires the resulting digest to be present; Prefill and Decode may
+// differ because block size, manager types, and compression are local.
 std::string kv_layout_contract(const ModelArgs& args,
-                               const BlockManagerPool::Options& options,
-                               bool include_block_size) {
+                               const BlockManagerPool::Options& options) {
   std::string contract;
   append_contract_value(args.model_type(), &contract);
   append_contract_value(args.dtype(), &contract);
@@ -598,21 +603,21 @@ std::string kv_layout_contract(const ModelArgs& args,
   append_numeric_contract_value(args.enable_mla(), &contract);
   append_numeric_contract_value(args.kv_lora_rank(), &contract);
   append_numeric_contract_value(args.window_size(), &contract);
-  if (include_block_size) {
-    append_numeric_contract_value(options.block_size(), &contract);
-  }
+  append_numeric_contract_value(options.block_size(), &contract);
   for (uint32_t manager_type : options.manager_types()) {
     append_numeric_contract_value(manager_type, &contract);
   }
-  for (uint32_t ratio : options.compress_ratios()) {
+  // Hash the loaded model ratios, not the block-manager copy. The same cache
+  // groups with different compression must not share a layout digest.
+  for (const int32_t ratio : args.compress_ratios()) {
     append_numeric_contract_value(ratio, &contract);
   }
   return contract;
 }
 
 std::vector<std::string> cache_groups(const BlockManagerPool& pool) {
-  // Manager implementation IDs are not cache identities: C1/C2 and C4/C128
-  // each share a manager implementation. Advertise the actual pool leaves.
+  // Manager implementation IDs are not logical cache identities. Advertise
+  // the actual pool leaves.
   const auto utilization = pool.block_utilization_by_type_per_dp();
   CHECK(!utilization.empty());
   std::vector<std::string> groups;
@@ -787,13 +792,8 @@ collect_native_provider_descriptor_config(
       .cp = cp,
       .super_node_id =
           util::get_optional_string_env("EA_SUPER_POD_ID").value_or(""),
-      .kv_layout_contract = kv_layout_contract(model_args,
-                                               block_manager_pool.options(),
-                                               /*include_block_size=*/true),
-      .kv_transfer_layout_contract =
-          kv_layout_contract(model_args,
-                             block_manager_pool.options(),
-                             /*include_block_size=*/false),
+      .kv_layout_contract =
+          kv_layout_contract(model_args, block_manager_pool.options()),
       .kv_cache_dtype = kv_cache.kv_cache_dtype(),
       .block_size = static_cast<uint32_t>(block_manager_pool.block_size()),
       .hash_seed = kv_cache.xxh3_128bits_seed(),

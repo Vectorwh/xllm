@@ -25,7 +25,6 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
-#include "core/framework/config/kv_cache_config.h"
 #include "core/util/json_reader.h"
 #include "models/model_registry.h"
 
@@ -125,13 +124,6 @@ inline void validate_deepseek_v41_args(const ModelArgs& args,
         << args.engram_max_ngram_size()
         << ", window_size=" << args.window_size();
   }
-  // SWA group chunk width is taken from window_size while the device block
-  // width is taken from block_size; anchoring the two (equality) is pending
-  // confirmation of the online config's window_size, so only block_size is
-  // asserted here.
-  CHECK_EQ(KVCacheConfig::get_instance().block_size(), 128)
-      << "DeepSeek V4.1 currently only supports block_size=128, got "
-      << KVCacheConfig::get_instance().block_size();
   CHECK_GT(args.n_routed_experts(), 0)
       << "deepseek_v41 config n_routed_experts must be > 0, got "
       << args.n_routed_experts();

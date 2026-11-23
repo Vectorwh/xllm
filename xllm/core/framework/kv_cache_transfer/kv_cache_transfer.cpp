@@ -364,28 +364,17 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
       }
       const std::vector<uint64_t>& remote_ids = mapping.remote_ids;
       const size_t stride = static_cast<size_t>(kv_split_size);
-      const size_t shared = static_cast<size_t>(mapping.remote_shared_num);
       // Positions alone do not identify a block: a per-step mapping starts at
       // the transfer cursor and may have dropped whole blocks the shared
       // prefix already covers, so the builder records the block index of
       // local_ids[0]. A later dispatch step starts well past
       // floor(shared / stride), and deriving the start from the shared count
-      // would shift every stripe by that difference. The list begins at the
-      // first stripe that is not shared, which is the same base the builder
-      // used when emitting it.
+      // would shift every stripe by that difference. The emitted destination
+      // slice starts at this block's first stripe or after the shared prefix,
+      // whichever comes later.
       const size_t block_start = static_cast<size_t>(mapping.local_block_start);
-      // Where the emitted list starts depends on the cache group: a flat KV
-      // response omits the destination blocks D already holds (the builder
-      // subtracts remote_shared_num), while a grouped response keeps its full
-      // logical table and is emitted from block_start * stride with no
-      // subtraction. Using the flat base for a grouped group shifts every read
-      // by (shared - block_start * stride) = shared % stride entries and drops
-      // the stripes that straddle the prefix, so the pairs would carry the
-      // wrong destination block. One base per group kind keeps both in step
-      // with batch_input_builder's remote_origin.
-      const size_t remote_base = block_type.value() == BlockType::KV
-                                     ? std::max(block_start * stride, shared)
-                                     : block_start * stride;
+      const size_t remote_base = std::max(
+          block_start * stride, static_cast<size_t>(mapping.remote_shared_num));
       std::vector<uint64_t> kept_local;
       std::vector<uint64_t> kept_remote;
       kept_local.reserve(mapping.local_ids.size());
@@ -401,6 +390,9 @@ std::vector<TransferKVInfo> filter_kv_split_infos(
         const size_t remote_idx = remote_block - remote_base;
         if (remote_idx >= remote_ids.size()) {
           break;
+        }
+        if (kept_local.empty()) {
+          mapping.local_block_start = static_cast<uint64_t>(block_start + k);
         }
         kept_local.emplace_back(mapping.local_ids[k]);
         kept_remote.emplace_back(remote_ids[remote_idx]);

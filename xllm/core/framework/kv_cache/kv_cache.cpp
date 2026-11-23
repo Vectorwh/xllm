@@ -135,10 +135,9 @@ std::unique_ptr<KVCacheImpl> create_host_kv_cache_impl(
   CHECK(!create_options.mla_packed_c8())
       << "Host KV cache offload does not support the SFA C8 packed layout; "
          "set --host_blocks_factor=0 or --kv_cache_dtype=auto.";
-  if (util::is_deepseek_v4_model_type(create_options.model_type())) {
-    return std::make_unique<DeepSeekV4KVCacheImpl>(
-        kv_cache_shape, create_options, type, layer_count);
-  }
+  CHECK(!kv_cache_shape.has_grouped_cache_layout())
+      << "Grouped Host tensors must be constructed from persistent cache "
+         "views.";
 
   switch (type) {
     case BlockType::LINEAR:
@@ -415,8 +414,8 @@ void allocate_kv_caches(std::vector<KVCache>& kv_caches,
       layer_compress_ratios.emplace_back(compress_ratio);
       if (ratio_shape_summaries.find(compress_ratio) ==
           ratio_shape_summaries.end()) {
-        ratio_shape_summaries.emplace(
-            compress_ratio, dsv4_shape_summary(tensors, compress_ratio));
+        ratio_shape_summaries.emplace(compress_ratio,
+                                      dsv4_shape_summary(tensors));
       }
       kv_caches.emplace_back(tensors);
     }

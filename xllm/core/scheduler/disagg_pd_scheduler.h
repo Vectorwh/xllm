@@ -58,7 +58,7 @@ bool has_rank_preserving_kv_groups(const proto::DisaggResponse& response);
 
 // The KV-split admission decision one dispatched request resolves to: the
 // width plan, the TransferKVInfo mapping claim it licenses, and the rejection
-// reason when no mapping is expressible.
+// reason when the width or allocation mapping contract is incompatible.
 struct KvSplitDispatchPlan {
   KvSplitWidthPlan plan = KvSplitWidthPlan::UNRECONCILABLE;
   // Whether a TransferKVInfo built from the decode instance's allocation
@@ -79,9 +79,9 @@ struct KvSplitDispatchPlan {
 // `src_kv_split_size` / `src_cp_index_write_mode` are the SOURCE's declared
 // width and write mode (instance_info_); `remote_info` is the destination's
 // registered record. `response` is nullptr until the AddNewRequests RPC has
-// returned: the plan and rejection reason are then still exact, while
-// rank_local_mapping stays false because the destination's group layout is
-// not yet known.
+// returned: only the width plan is known. After the RPC, destination group IDs
+// are validated before installing transfer state. KV tables start after their
+// shared prefix; other groups start at logical block zero.
 //
 // Both overrides MUST resolve the plan through this helper. The OOC path
 // historically skipped it, so an equal-width pair (decode declaring

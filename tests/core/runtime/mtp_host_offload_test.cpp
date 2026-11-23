@@ -75,14 +75,11 @@ KVCacheShape make_cache_shape(const ModelArgs& model_args) {
 }
 
 KVCacheShape make_dsv4_cache_shape(const ModelArgs& model_args,
-                                   int64_t c4_count,
-                                   int64_t c128_count) {
+                                   int64_t history_count) {
   KVCacheCapacity capacity;
-  capacity.n_blocks(kBlockCount)
-      .block_size(kBlockSize)
+  capacity.block_size(kBlockSize)
       .swa_count(kBlockCount)
-      .c4_count(c4_count)
-      .c128_count(c128_count);
+      .n_blocks(history_count);
   return KVCacheShape(capacity, model_args, /*world_size=*/1);
 }
 
@@ -913,7 +910,7 @@ TEST(SpeculativeDraftKVCacheShapeTest, ReusesGroupedTargetPoolCounts) {
   draft_model_args.compress_ratios({1, 4, 128});
 
   KVCacheCapacity target_capacity;
-  target_capacity.block_size(kBlockSize).swa_count(2).c4_count(3).c128_count(5);
+  target_capacity.block_size(kBlockSize).swa_count(2).n_blocks(5);
   const KVCacheShape target_shape(
       target_capacity, target_model_args, /*world_size=*/8);
 
@@ -925,7 +922,7 @@ TEST(SpeculativeDraftKVCacheShapeTest, ReusesGroupedTargetPoolCounts) {
                                              /*kv_cache_dtype=*/"auto");
 
   EXPECT_TRUE(draft_shape.has_grouped_cache_layout());
-  EXPECT_EQ(draft_shape.key_cache_shape(), (std::vector<int64_t>{2, 3, 5}));
+  EXPECT_EQ(draft_shape.key_cache_shape(), (std::vector<int64_t>{2, 5}));
 }
 
 TEST_F(MTPHostOffloadTest, VectorTransferWithoutHierarchyIsNoop) {
@@ -1288,10 +1285,10 @@ TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {
   draft_model_args.index_head_dim(4)
       .window_size(kBlockSize)
       .compress_ratios({1});
-  const KVCacheShape target_shape = make_dsv4_cache_shape(
-      target_model_args, /*c4_count=*/kBlockCount, /*c128_count=*/kBlockCount);
+  const KVCacheShape target_shape =
+      make_dsv4_cache_shape(target_model_args, /*history_count=*/kBlockCount);
   const KVCacheShape draft_shape =
-      make_dsv4_cache_shape(draft_model_args, /*c4_count=*/0, /*c128_count=*/0);
+      make_dsv4_cache_shape(draft_model_args, /*history_count=*/0);
 
   TestMTPWorker worker(parallel_args, device.unwrap(), options);
   auto target = std::make_unique<HierarchyTransferTestWorker>(
@@ -1312,12 +1309,9 @@ TEST_F(MTPHostOffloadTest, Dsv4DraftSkipsUnsupportedCompressedBlockTypes) {
   ASSERT_TRUE(unified_transfer->supports_block_type(
       HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::SWA));
   ASSERT_FALSE(unified_transfer->supports_block_type(
-      HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::C4));
-  ASSERT_FALSE(unified_transfer->supports_block_type(
-      HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::C128));
+      HierarchyKVCacheTransfer::CacheRole::DRAFT, BlockType::KV));
 
-  const std::vector<BlockType> block_types = {
-      BlockType::SWA, BlockType::C4, BlockType::C128};
+  const std::vector<BlockType> block_types = {BlockType::SWA, BlockType::KV};
   std::vector<BlockTransferInfo> offload_info;
   std::vector<BlockTransferInfo> load_info;
   offload_info.reserve(block_types.size());

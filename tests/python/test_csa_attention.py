@@ -132,28 +132,21 @@ def test_dspark_native_swa_indices_map_expanded_metadata_ring() -> None:
         dspark_use_native_sas=True,
     )
     compressed_metadata = backend._builder.build(
-        multi_block_tables=[torch.tensor([[20, 21]], dtype=torch.int32)],
-        kv_seq_lens=[9],
+        multi_block_tables=[torch.tensor([[20, 37]], dtype=torch.int32)],
+        kv_seq_lens=[130],
         q_seq_lens=[2],
-        positions=torch.tensor([7, 8], dtype=torch.int64),
+        positions=torch.tensor([128, 129], dtype=torch.int64),
         dsa_cos_sin=None,
         is_prefill=False,
         is_chunked_prefill=False,
     )
 
-    # ``CsaAttentionBackend`` builds the metadata without overriding
-    # ``read_table_layout``, so it inherits the shared right-aligned default
-    # (``READ_TABLE_LAYOUT_RIGHT_ALIGNED``): only the retained columns are
-    # filled, at ``raw[s, d % semantic_cols]``, leaving the leading columns as
-    # ``-1``. Only v41/``csa2`` opts into the ring layout that rings every
-    # column (``[[20, 21, 20]]``). ``_build_dspark_swa_indices`` is
-    # layout-adaptive, so the resolved slots below are unchanged -- which is
-    # what this test actually pins.
-    assert compressed_metadata.block_tables[0][0].tolist() == [[-1, 21, 20]]
+    assert backend.page_size == 128
+    assert compressed_metadata.block_tables[0][0].tolist() == [[20, 37]]
     backend._build_dspark_swa_metadata(compressed_metadata)
 
     expected = torch.full((128,), -1, dtype=torch.int32)
-    expected[:6] = torch.tensor([83, 84, 85, 86, 87, 80], dtype=torch.int32)
+    expected[:6] = torch.tensor([2684, 2685, 2686, 2687, 4736, 4737], dtype=torch.int32)
     for row in range(2):
         torch.testing.assert_close(compressed_metadata.explicit_swa_indices[row, 0], expected, rtol=0, atol=0)
 
@@ -641,7 +634,7 @@ def test_dspark_native_attention_uses_explicit_swa_indices(monkeypatch: pytest.M
         dspark_block_size=3,
         dspark_use_native_sas=True,
     )
-    swa = torch.zeros(3, 4, 1, 4)
+    swa = torch.zeros(3, 128, 1, 4)
     backend.bind_kv_caches([LayerCache(key=None, value=None, swa=swa)])
     compressed_metadata = backend._builder.build(
         multi_block_tables=[torch.tensor([[0, 1, 2]], dtype=torch.int32)],
@@ -678,7 +671,7 @@ def test_dspark_native_attention_uses_explicit_swa_indices(monkeypatch: pytest.M
     assert calls[0]["ori_sparse_indices"].shape == (3, 1, 128)
     assert calls[0]["ori_win_left"] == 6
     assert calls[0]["cu_seqlens_ori_kv"] is None
-    torch.testing.assert_close(swa.view(12, 4)[3:6], kv.view(3, 4), rtol=0, atol=0)
+    torch.testing.assert_close(swa.view(-1, 4)[3:6], kv.view(3, 4), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
@@ -701,7 +694,7 @@ def test_dspark_native_mixed_ratio_decode_uses_expanded_window(
         dspark_use_native_sas=True,
     )
     cmp_cache = torch.zeros((1, 512 if compress_ratio == 4 else 16, 1, 4))
-    backend.bind_kv_caches([LayerCache(key=cmp_cache, value=None, swa=torch.zeros(2, 4, 1, 4))])
+    backend.bind_kv_caches([LayerCache(key=cmp_cache, value=None, swa=torch.zeros(2, 128, 1, 4))])
     metadata_tables = [torch.tensor([[0, 1]], dtype=torch.int32), torch.tensor([[0]], dtype=torch.int32)]
     compressed_metadata = backend._builder.build(
         metadata_tables, [128], [3], torch.arange(125, 128, dtype=torch.int64), None, False, False
@@ -757,8 +750,9 @@ def test_csa_execute_requires_model_compressor(monkeypatch: pytest.MonkeyPatch) 
             empty_cache,
         ]
     )
+    # compress_ratios [0, 4, 128] bind two logical tables: SWA and TOKEN.
     compressed_metadata = backend._builder.build(
-        [torch.tensor([[1]], dtype=torch.int32) for _ in range(3)],
+        [torch.tensor([[1]], dtype=torch.int32) for _ in range(2)],
         [1],
         [1],
         torch.tensor([0], dtype=torch.int64),
@@ -1302,11 +1296,10 @@ def _inplace_make_backend() -> CsaAttentionBackend:
 
 
 def _multi_block_tables(batch: int, seed: int) -> tuple[torch.Tensor, ...]:
-    """One manager table per group in the fixed export order (SWA first)."""
+    """Logical SWA/KV inputs shared by the physical cache groups."""
     tables = (
         torch.full((batch, 2), seed + 1, dtype=torch.int32),
         torch.full((batch, 4), seed + 2, dtype=torch.int32),
-        torch.full((batch, 2), seed + 3, dtype=torch.int32),
     )
     return tables
 

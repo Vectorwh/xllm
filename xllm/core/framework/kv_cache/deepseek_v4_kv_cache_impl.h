@@ -23,8 +23,6 @@ limitations under the License.
 
 namespace xllm {
 
-class KVCacheShape;
-
 class Dsv4StateCache final {
  public:
   Dsv4StateCache() = default;
@@ -49,11 +47,7 @@ class Dsv4StateCache final {
 
 class DeepSeekV4KVCacheImpl final : public KVCacheImpl {
  public:
-  explicit DeepSeekV4KVCacheImpl(const DeepSeekV4KVCacheTensors& tensors);
-  DeepSeekV4KVCacheImpl(const KVCacheShape& kv_cache_shape,
-                        const KVCacheCreateOptions& create_options,
-                        BlockType type,
-                        int64_t layer_count);
+  explicit DeepSeekV4KVCacheImpl(DeepSeekV4KVCacheTensors tensors);
 
   torch::Tensor get_k_cache() const override;
   torch::Tensor get_index_cache() const override;
@@ -83,7 +77,6 @@ class DeepSeekV4KVCacheImpl final : public KVCacheImpl {
   torch::Tensor swa_cache_;
   Dsv4StateCache compress_state_;
   Dsv4StateCache index_state_;
-  BlockType compressed_block_type_ = BlockType::KV;
 };
 
 DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
@@ -91,7 +84,6 @@ DeepSeekV4KVCacheTensors create_dsv4_cache_tensors(
     const KVCacheCreateOptions& create_options,
     int64_t layer_idx);
 
-std::string dsv4_shape_summary(const DeepSeekV4KVCacheTensors& tensors,
-                               int32_t compress_ratio);
+std::string dsv4_shape_summary(const DeepSeekV4KVCacheTensors& tensors);
 
 }  // namespace xllm

@@ -1180,9 +1180,9 @@ void DFlashWorkerImpl::finalize_validate_output_async(
   target_output.defer_block_speculative_metrics = true;
   pending_context_ = std::move(pending);
   prepared_context_ready_.reset();
-  VLOG(1) << "DFlash step-local output submitted: batch_id="
-          << input.input_params.meta.batch_id
-          << ", sequences=" << input.input_params.meta.num_sequences;
+  VLOG(10) << "DFlash step-local output submitted: batch_id="
+           << input.input_params.meta.batch_id
+           << ", sequences=" << input.input_params.meta.num_sequences;
 }
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
@@ -2168,7 +2168,7 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
 #if defined(USE_NPU)
     if (options_.enable_graph()) {
       build_dflash_expanded_spec_verify_graph_input(
-          input_params, device_.unwrap(), logical_block_size());
+          input_params, device_.unwrap(), block_size());
     }
 #endif
   }
@@ -2213,7 +2213,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   }
   // The draft addresses its own pool, so both the row builder below and the
   // draft's attention must see this rank's expanded block table. Expand before
-  // building the rows: calc_slot_id indexes it with the physical block size.
+  // building the rows: calc_slot_id indexes it with the physical dim.
   expand_draft_block_tables(input_params);
 
   specBuilder::DecodeBuildBuffers buf;

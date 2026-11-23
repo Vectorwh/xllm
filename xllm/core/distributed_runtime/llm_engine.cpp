@@ -487,6 +487,10 @@ int64_t LLMEngine::get_effective_xtensor_weight_size(
 }
 
 KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
+  if (util::is_deepseek_v4_model_type(args_.model_type())) {
+    CHECK_EQ(ParallelConfig::get_instance().kv_split_size_effective(), 1)
+        << "DSV4 grouped cache allocation does not support KV split.";
+  }
   const KVCacheConfig& cache_config = KVCacheConfig::get_instance();
   const int32_t prefill_buffers = cache_config.prefill_layerwise_num_buffers();
   const PrefillLayerwiseEligibility layerwise_eligibility =
@@ -653,12 +657,12 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
             << ", n_layers: " << kv_cache_cap.n_layers()
             << ", kv_cache_dtype: " << options_.kv_cache_dtype();
 
-  CHECK_GT(kv_cache_cap.n_blocks(), 0) << "no memory for kv cache";
+  CHECK(kv_cache_cap.n_blocks() > 0 || kv_cache_cap.swa_count() > 0)
+      << "no memory for kv cache";
   const int32_t block_size = static_cast<int32_t>(kv_cache_cap.block_size());
   const bool has_gdn_state = has_linear_attention_layers(args_);
   const bool has_kpool_state = kv_cache_cap.kpool_tail_slot_size() > 0;
   const bool enable_state_cache = has_gdn_state || has_kpool_state;
-
   // Validate host offload before constructing block managers or asking workers
   // to allocate potentially large pinned host tensors.
   const KVCacheShape kv_cache_shape(
@@ -700,7 +704,6 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .model_id(options_.model_id())
       .server_idx(options_.server_idx())
       .is_draft_engine(options_.is_draft_engine())
-      .model_type(args_.model_type())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
       .num_speculative_tokens(options_.num_speculative_tokens())
       .num_embedding_blocks(
@@ -713,20 +716,11 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     options.linear_state_num_slots(
         static_cast<int32_t>(kv_cache_cap.num_linear_state_blocks()));
   }
-  configure_dsv4_block_manager_options(args_,
-                                       options,
-                                       kv_cache_cap,
-                                       block_size,
-                                       options_.max_tokens_per_batch());
+  configure_dsv4_block_manager_options(
+      args_, options, kv_cache_cap, options_.max_tokens_per_batch());
 
-  kv_cache_manager_ = create_kv_cache_manager(options,
-                                              args_,
-                                              options_,
-                                              kv_cache_cap,
-                                              has_gdn_state,
-                                              this,
-                                              dp_size_,
-                                              block_size);
+  kv_cache_manager_ = create_kv_cache_manager(
+      options, options_, kv_cache_cap, has_gdn_state, this, dp_size_);
 
   // init kv cache for each worker in parallel
   std::vector<folly::SemiFuture<bool>> futures;
@@ -759,12 +753,11 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
                 << ")";
     } else {
       const auto free_blocks_per_dp = kv_cache_manager_->num_free_blocks();
-      const int64_t logical_block_size = kv_cache_manager_->block_size();
+      const int64_t kv_block_size = kv_cache_manager_->block_size();
       for (size_t dp_rank = 0; dp_rank < free_blocks_per_dp.size(); ++dp_rank) {
         const int64_t token_capacity =
-            static_cast<int64_t>(free_blocks_per_dp[dp_rank]) *
-            logical_block_size;
-        // Logical block size already includes KV splitting. This is a DP-level
+            static_cast<int64_t>(free_blocks_per_dp[dp_rank]) * kv_block_size;
+        // Block size already includes KV splitting. This is a DP-level
         // slot upper bound; sequence tails and other state can limit admission.
         LOG(INFO) << "KV token capacity: dp_rank=" << dp_rank
                   << ", kv_split_size=" << kv_split_size_eff
