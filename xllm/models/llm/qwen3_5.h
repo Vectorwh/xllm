@@ -23,6 +23,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/util/model_config_utils.h"
 #include "models/model_registry.h"
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA) || \
     defined(USE_DCU)
@@ -93,6 +94,7 @@ TORCH_MODULE(Qwen3_5ForCausalLM);
                                       default_num_experts,                     \
                                       default_num_experts_per_tok,             \
                                       default_shared_expert_intermediate_size) \
+  util::load_qwen3_5_vision_token_ids(json, args);                             \
   LOAD_ARG_TEXT_OR_ROOT(attention_bias, "attention_bias", false);              \
   LOAD_ARG_TEXT_OR_ROOT(attention_dropout, "attention_dropout", 0.0f);         \
   LOAD_ARG_TEXT_OR_ROOT(bos_token_id, "bos_token_id", 151643);                 \

@@ -18,13 +18,62 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cstdio>
+#include <limits>
+#include <optional>
 
 namespace xllm {
 
+namespace {
+
+struct VisionGrid {
+  int32_t frames;
+  int32_t tokens_per_frame;
+};
+
+std::optional<VisionGrid> read_vision_grid(const MMDataItem& item,
+                                           int32_t merge_size) {
+  const bool image = item.is_type(MMType::IMAGE);
+  const auto it = item.data().find(image ? "image_grid_thw" : "video_grid_thw");
+  if (it == item.data().end() || merge_size <= 0 ||
+      item.has(image ? "video_grid_thw" : "image_grid_thw")) {
+    return std::nullopt;
+  }
+  const auto* grid = std::get_if<torch::Tensor>(&it->second);
+  if (grid == nullptr || !grid->defined() || grid->dim() != 2 ||
+      grid->size(0) != 1 || grid->size(1) != 3 ||
+      (grid->scalar_type() != torch::kInt32 &&
+       grid->scalar_type() != torch::kInt64)) {
+    return std::nullopt;
+  }
+  const auto row = (*grid)[0];
+  const int64_t t = row[0].item<int64_t>();
+  const int64_t h = row[1].item<int64_t>();
+  const int64_t w = row[2].item<int64_t>();
+  constexpr int64_t kMaxGridSize = std::numeric_limits<int32_t>::max();
+  if (t <= 0 || h <= 0 || w <= 0 || h > kMaxGridSize || w > kMaxGridSize ||
+      h % merge_size != 0 || w % merge_size != 0 ||
+      kMaxGridSize / t / (h / merge_size) < w / merge_size) {
+    return std::nullopt;
+  }
+  if (item.is_embedded()) {
+    const auto& value = item.data().at(get_embedding_key(item.type()));
+    const auto* embedding = std::get_if<torch::Tensor>(&value);
+    if (embedding == nullptr || !embedding->defined() || embedding->dim() < 1 ||
+        embedding->size(0) != t * (h / merge_size) * (w / merge_size)) {
+      return std::nullopt;
+    }
+  }
+  return VisionGrid{static_cast<int32_t>(t),
+                    static_cast<int32_t>((h / merge_size) * (w / merge_size))};
+}
+
+}  // namespace
+
 Qwen3VLPromptProcessor::Qwen3VLPromptProcessor(const ModelArgs& args) {
-  merge_size_ = args.mm_image_merge_size();
+  max_context_len_ = args.max_position_embeddings();
+  merge_size_ = args.mm_spatial_merge_size() > 0 ? args.mm_spatial_merge_size()
+                                                 : args.mm_image_merge_size();
   vision_start_token_id_ = args.vision_start_token_id();
   vision_end_token_id_ = args.vision_end_token_id();
   image_token_id_ = args.image_token_id();
@@ -34,67 +83,67 @@ Qwen3VLPromptProcessor::Qwen3VLPromptProcessor(const ModelArgs& args) {
 
 bool Qwen3VLPromptProcessor::process(std::string& prompt,
                                      const MMData& mm_data) {
-  torch::Tensor image_grid_thw;
-  if (auto res = mm_data.get<torch::Tensor>("image_grid_thw"))
-    image_grid_thw = res.value();
-
-  torch::Tensor video_grid_thw;
-  if (auto res = mm_data.get<torch::Tensor>("video_grid_thw"))
-    video_grid_thw = res.value();
-
-  if (!image_grid_thw.defined() && !video_grid_thw.defined()) return true;
-
-  std::vector<VideoMetadata> video_metadata;
-  mm_data.get_metadata(MMType::VIDEO, video_metadata);
-  if (video_grid_thw.defined()) {
-    CHECK(video_metadata.size() == static_cast<size_t>(video_grid_thw.size(0)));
+  if (!mm_data.valid()) {
+    return (vision_start_token_id_ <= 0 ||
+            prompt.find(vision_start_token_) == std::string::npos) &&
+           (vision_end_token_id_ <= 0 ||
+            prompt.find(vision_end_token_) == std::string::npos) &&
+           (image_token_id_ <= 0 ||
+            prompt.find(image_token_) == std::string::npos) &&
+           (video_token_id_ <= 0 ||
+            prompt.find(video_token_) == std::string::npos);
   }
-
-  const int32_t merge_length = merge_size_ * merge_size_;
-
-  int32_t total_image_token = 0;
-  if (image_grid_thw.defined()) {
-    int32_t count = image_grid_thw.size(0);
-    for (int32_t idx = 0; idx < count; ++idx) {
-      total_image_token +=
-          image_grid_thw[idx].prod().item<int32_t>() / merge_length;
+  if (!mm_data.hold<MMItemVec>() || mm_data.empty()) {
+    return false;
+  }
+  const auto& items = mm_data.items<MMItemVec>();
+  int64_t remaining = max_context_len_;
+  std::vector<VisionGrid> grids;
+  grids.reserve(items.size());
+  for (const auto& item : items) {
+    if (!item.is_type(MMType::IMAGE) && !item.is_type(MMType::VIDEO)) {
+      return false;
     }
-  }
-
-  int32_t total_video_token = 0;
-  if (video_grid_thw.defined()) {
-    int32_t count = video_grid_thw.size(0);
-    for (int32_t idx = 0; idx < count; ++idx) {
-      total_video_token +=
-          video_grid_thw[idx].prod().item<int32_t>() / merge_length;
+    const auto grid = read_vision_grid(item, merge_size_);
+    if (!grid) {
+      return false;
     }
+    const int64_t visual_tokens =
+        static_cast<int64_t>(grid->frames) * grid->tokens_per_frame;
+    if (visual_tokens >= remaining) {
+      return false;
+    }
+    remaining -= visual_tokens;
+    grids.emplace_back(*grid);
   }
 
-  size_t total_token_len = total_image_token * image_token_.size() +
-                           total_video_token * video_token_.size();
+  size_t item_index = 0;
   std::string data;
-  data.reserve(prompt.size() + total_token_len);
-
-  int32_t image_index = 0;
-  int32_t video_index = 0;
-
+  data.reserve(prompt.size());
   size_t begin = 0;
   auto pair = find_vision_token(prompt, begin);
 
   while (pair.second != std::string::npos) {
-    if (pair.first == TokenType::IMAGE) {
+    if (item_index == items.size()) {
+      return false;
+    }
+    const auto& grid = grids[item_index];
+    const auto& item = items[item_index++];
+    const bool is_image = pair.first == TokenType::IMAGE;
+    if (!item.is_type(is_image ? MMType::IMAGE : MMType::VIDEO)) {
+      return false;
+    }
+    if (is_image) {
       data.append(prompt, begin, pair.second - begin);
 
-      auto token_num =
-          image_grid_thw[image_index].prod().item<int32_t>() / merge_length;
+      int32_t token_num = grid.frames * grid.tokens_per_frame;
       while (token_num--) {
         data.append(image_token_);
       }
 
-      ++image_index;
       begin = pair.second + image_token_.size();
 
-    } else if (pair.first == TokenType::VIDEO) {
+    } else {
       const size_t pos = pair.second;
       const size_t vs_len = vision_start_token_.size();
       const size_t ve_len = vision_end_token_.size();
@@ -112,21 +161,18 @@ bool Qwen3VLPromptProcessor::process(std::string& prompt,
 
       data.append(prompt, begin, replace_begin - begin);
 
-      const int32_t num_frames = video_grid_thw[video_index][0].item<int32_t>();
-      const int32_t token_num = video_grid_thw[video_index][1].item<int32_t>() *
-                                video_grid_thw[video_index][2].item<int32_t>() /
-                                merge_length;
-
-      const auto& timestamps = video_metadata[video_index].timestamps;
-      CHECK(!timestamps.empty());
-
-      auto selected = build_timestamps(
-          timestamps, static_cast<size_t>(num_frames), temporal_patch_size_);
-
+      const auto metadata = item.get_metadata<VideoMetadata>();
+      if (!metadata || metadata->timestamps.empty() ||
+          temporal_patch_size_ <= 0) {
+        return false;
+      }
+      const int32_t num_frames = grid.frames;
+      const auto selected = build_timestamps(
+          metadata->timestamps, num_frames, temporal_patch_size_);
       for (int32_t idx = 0; idx < num_frames; ++idx) {
         data.append(format_timestamp_str(selected[idx]));
         data.append(vision_start_token_);
-        int32_t num = token_num;
+        int32_t num = grid.tokens_per_frame;
 
         while (num--) {
           data.append(video_token_);
@@ -134,113 +180,92 @@ bool Qwen3VLPromptProcessor::process(std::string& prompt,
         data.append(vision_end_token_);
       }
 
-      ++video_index;
       begin = replace_end;
-    } else {
-      LOG(FATAL) << "Unexpected token type encountered.";
     }
 
     pair = find_vision_token(prompt, begin);
   }
 
+  if (item_index != items.size()) {
+    return false;
+  }
   if (begin < prompt.size()) data.append(prompt, begin, std::string::npos);
   prompt = std::move(data);
   return true;
 }
 
+bool Qwen3VLPromptProcessor::validate_text_tokens(
+    const std::vector<int32_t>& token_ids) const {
+  return std::none_of(token_ids.begin(), token_ids.end(), [this](int32_t id) {
+    return id > 0 &&
+           (id == vision_start_token_id_ || id == vision_end_token_id_ ||
+            id == image_token_id_ || id == video_token_id_);
+  });
+}
+
 bool Qwen3VLPromptProcessor::find_mm_spans(
     const std::vector<int32_t>& token_ids,
     MMData& mm_data) {
-  auto start = token_ids.begin();
-  int32_t global_mm_index = 0;
-  int32_t offset = 0;
-  int32_t length = 0;
-  auto& mm_items = mm_data.items<MMItemVec>();
-
-  torch::Tensor video_grid_thw;
-  if (auto res = mm_data.get<torch::Tensor>("video_grid_thw")) {
-    video_grid_thw = res.value();
+  if (!mm_data.valid()) {
+    return validate_text_tokens(token_ids);
+  }
+  if (!mm_data.hold<MMItemVec>() || mm_data.empty() ||
+      token_ids.size() > std::numeric_limits<int32_t>::max()) {
+    return false;
   }
 
-  int32_t video_index = 0;
-  int32_t video_frames_left = 0;
-  int32_t video_span_start = -1;
-  int32_t video_span_end = -1;
-  std::vector<uint8_t> video_mask;
-
-  while (true) {
-    auto vision_start_it =
-        std::find(start, token_ids.end(), vision_start_token_id_);
-    if (vision_start_it == token_ids.end()) {
-      break;
+  const auto is_marker = [this](int32_t id) {
+    return id == vision_start_token_id_ || id == vision_end_token_id_ ||
+           id == image_token_id_ || id == video_token_id_;
+  };
+  auto cursor = token_ids.begin();
+  for (auto& item : mm_data.items<MMItemVec>()) {
+    const bool is_image = item.is_type(MMType::IMAGE);
+    if (!is_image && !item.is_type(MMType::VIDEO)) {
+      return false;
     }
-    auto vision_end_it =
-        std::find(vision_start_it + 1, token_ids.end(), vision_end_token_id_);
-    CHECK(vision_end_it != token_ids.end());
-
-    offset = std::distance(token_ids.begin(), vision_start_it);
-    length = std::distance(vision_start_it + 1, vision_end_it);
-
-    int32_t first_token = *(vision_start_it + 1);
-    if (first_token == image_token_id_) {
-      CHECK(global_mm_index < mm_items.size());
-      auto& item = mm_items[global_mm_index];
-      item.mutable_state().mutable_token_pos() = {offset + 1, length};
-      item.mutable_state().mutable_mm_token_mask() = torch::ones(
-          {length},
-          torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU));
-      item.mutable_state().mutable_mm_token_num() = length;
-      ++global_mm_index;
-
-    } else if (first_token == video_token_id_) {
-      if (video_frames_left == 0) {
-        CHECK(video_grid_thw.defined() && video_grid_thw.numel() > 0)
-            << "video token exists but video_grid_thw is missing";
-        CHECK(video_index < video_grid_thw.size(0));
-        CHECK(global_mm_index < mm_items.size());
-
-        video_frames_left = video_grid_thw[video_index][0].item<int32_t>();
-        video_span_start = offset + 1;
-        video_span_end = video_span_start;
-        video_mask.clear();
-      }
-
-      CHECK(video_frames_left > 0);
-      const int32_t frame_span_start = offset + 1;
-      const int32_t frame_span_end = frame_span_start + length;
-      if (video_span_end < frame_span_start) {
-        video_mask.insert(
-            video_mask.end(), frame_span_start - video_span_end, 0);
-      }
-      for (auto token_it = vision_start_it + 1; token_it != vision_end_it;
-           ++token_it) {
-        video_mask.push_back(
-            static_cast<uint8_t>(*token_it == video_token_id_));
-      }
-      video_span_end = frame_span_end;
-      --video_frames_left;
-      if (video_frames_left == 0) {
-        auto& item = mm_items[global_mm_index];
-        item.mutable_state().mutable_token_pos() = {
-            video_span_start, video_span_end - video_span_start};
-        item.mutable_state().mutable_mm_token_mask() =
-            torch::from_blob(
-                video_mask.data(),
-                {static_cast<int64_t>(video_mask.size())},
-                torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU))
-                .clone();
-        const torch::Tensor& mask = item.state().mm_token_mask();
-        item.mutable_state().mutable_mm_token_num() =
-            static_cast<int32_t>(mask.sum().item<int64_t>());
-
-        ++global_mm_index;
-        ++video_index;
-      }
+    const auto grid = read_vision_grid(item, merge_size_);
+    if (!grid) {
+      return false;
     }
-
-    start = std::next(vision_end_it);
+    // Images occupy one span. Video frames have separate timestamped spans.
+    const int32_t spans = is_image ? 1 : grid->frames;
+    const int32_t pads = is_image ? grid->frames * grid->tokens_per_frame
+                                  : grid->tokens_per_frame;
+    const int32_t pad_id = is_image ? image_token_id_ : video_token_id_;
+    auto first_pad = cursor;
+    for (int32_t span = 0; span < spans; ++span) {
+      cursor = std::find_if(cursor, token_ids.end(), is_marker);
+      if (cursor == token_ids.end() || *cursor != vision_start_token_id_) {
+        return false;
+      }
+      ++cursor;
+      if (token_ids.end() - cursor <= pads) {
+        return false;
+      }
+      if (span == 0) {
+        first_pad = cursor;
+      }
+      const auto end = cursor + pads;
+      if (*end != vision_end_token_id_ ||
+          !std::all_of(
+              cursor, end, [pad_id](int32_t id) { return id == pad_id; })) {
+        return false;
+      }
+      cursor = end + 1;
+    }
+    const auto last = cursor - 1;
+    const int32_t offset = static_cast<int32_t>(first_pad - token_ids.begin());
+    const int32_t length = static_cast<int32_t>(last - first_pad);
+    auto& state = item.mutable_state();
+    state.mutable_token_pos() = {offset, length};
+    state.mutable_mm_token_num() = spans * pads;
+    state.mutable_mm_token_mask() =
+        is_image
+            ? torch::ones({length}, torch::kBool)
+            : torch::tensor(std::vector<int32_t>(first_pad, last)) == pad_id;
   }
-  return true;
+  return std::none_of(cursor, token_ids.end(), is_marker);
 }
 
 std::pair<Qwen3VLPromptProcessor::TokenType, size_t>

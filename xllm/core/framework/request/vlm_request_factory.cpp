@@ -306,7 +306,7 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
   } else if (sp.prompt_tokens) {
     // Tokens are authoritative only for text. Media must carry typed spans or
     // pass through the processor so its mRoPE and embedding metadata agree.
-    if (!mm_data.empty() || sp.prompt_tokens->empty() ||
+    if (mm_data.valid() || sp.prompt_tokens->empty() ||
         std::any_of(sp.prompt_tokens->begin(),
                     sp.prompt_tokens->end(),
                     [this](int32_t token) {
@@ -315,6 +315,13 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
                     })) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                           "Invalid pretokenized VLM text input",
+                          sp.service_request_id,
+                          sp.source_xservice_addr);
+      return nullptr;
+    }
+    if (!processor_->bind_prompt_tokens(*sp.prompt_tokens, mm_data)) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "Unbound media marker in pretokenized VLM text input",
                           sp.service_request_id,
                           sp.source_xservice_addr);
       return nullptr;

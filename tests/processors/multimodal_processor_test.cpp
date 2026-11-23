@@ -29,6 +29,7 @@ limitations under the License.
 #include "processors/qwen2_vl_image_processor.h"
 #include "processors/qwen2_vl_video_processor.h"
 #include "processors/qwen3_omni_video_processor.h"
+#include "processors/qwen3_vl_prompt_processor.h"
 #include "processors/qwen3_vl_video_processor.h"
 
 namespace xllm {
@@ -59,6 +60,71 @@ ModelArgs pixel_dtype_args() {
       .mm_video_normalize_mean({0.48145466, 0.4578275, 0.40821073})
       .mm_video_normalize_std({0.26862954, 0.26130258, 0.27577711});
   return args;
+}
+
+TEST(Qwen3VLPromptProcessorTest, BindsOneSpanPerVideoFrame) {
+  ModelArgs args = pixel_dtype_args();
+  args.vision_start_token_id(81).vision_end_token_id(82).video_token_id(84);
+  args.mm_temporal_patch_size(2).max_position_embeddings(128);
+  Qwen3VLPromptProcessor processor(args);
+  MMData data;
+  auto& video = data.add(MMType::VIDEO);
+  video.add("video_grid_thw", torch::tensor({{2, 2, 2}}));
+  VideoMetadata metadata;
+  metadata.timestamps = {0.0, 0.0, 1.0, 1.0};
+  video.set_metadata(metadata);
+  std::string prompt = "<|vision_start|><|video_pad|><|vision_end|>";
+  ASSERT_TRUE(processor.process(prompt, data));
+  EXPECT_EQ(prompt,
+            "<0.0 seconds><|vision_start|><|video_pad|><|vision_end|>"
+            "<1.0 seconds><|vision_start|><|video_pad|><|vision_end|>");
+
+  // Two frames with one visual token each, separated by ordinary text.
+  ASSERT_TRUE(processor.find_mm_spans({81, 84, 82, 10, 81, 84, 82}, data));
+  const auto& state = data.items<MMItemVec>().front().state();
+  EXPECT_EQ(state.mm_token_num(), 2);
+  EXPECT_EQ(state.token_pos().length, 5);
+  EXPECT_FALSE(processor.find_mm_spans({81, 84, 82}, data));
+}
+
+TEST(Qwen3VLPromptProcessorTest, ChecksCombinedVisualTokenBudget) {
+  ModelArgs args;
+  args.mm_spatial_merge_size(2).max_position_embeddings(8);
+  MMData data;
+  for (int32_t i = 0; i < 2; ++i) {
+    data.add(MMType::IMAGE).add("image_grid_thw", torch::tensor({{1, 4, 4}}));
+  }
+  std::string prompt = "<|image_pad|><|image_pad|>";
+  EXPECT_FALSE(Qwen3VLPromptProcessor(args).process(prompt, data));
+  EXPECT_EQ(prompt, "<|image_pad|><|image_pad|>");
+  args.max_position_embeddings(9);
+  EXPECT_TRUE(Qwen3VLPromptProcessor(args).process(prompt, data));
+}
+
+TEST(Qwen3VLPromptProcessorTest, RejectsEmbeddingRowCountMismatch) {
+  ModelArgs args;
+  args.mm_spatial_merge_size(2).max_position_embeddings(32);
+  Qwen3VLPromptProcessor processor(args);
+  MMData data;
+  auto& image = data.add(MMType::IMAGE);
+  image.add("image_grid_thw", torch::tensor({{1, 4, 4}}));
+  image.add(get_embedding_key(MMType::IMAGE), torch::zeros({3, 2}));
+  std::string prompt = "<|image_pad|>";
+  EXPECT_FALSE(processor.process(prompt, data));
+  EXPECT_EQ(prompt, "<|image_pad|>");
+}
+
+TEST(Qwen3VLPromptProcessorTest, RejectsUnboundVisionMarkersInText) {
+  ModelArgs args;
+  args.vision_start_token_id(81).vision_end_token_id(82).image_token_id(83);
+  Qwen3VLPromptProcessor processor(args);
+  MMData data;
+  std::string prompt = "<|vision_start|><|image_pad|><|vision_end|>";
+  EXPECT_FALSE(processor.process(prompt, data));
+  EXPECT_FALSE(processor.find_mm_spans({81, 83, 82}, data));
+  std::string text = "hello";
+  EXPECT_TRUE(processor.process(text, data));
+  EXPECT_TRUE(processor.find_mm_spans({37, 52, 0}, data));
 }
 
 void expect_pixel_item_matches(const MMDataItem& actual,

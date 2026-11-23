@@ -42,6 +42,16 @@ constexpr int64_t kHiddenSize = 128;
 
 using Weights = std::unordered_map<std::string, torch::Tensor>;
 
+TEST(Qwen35MluTextTest, TextOnlyPositionsAdvanceOnAllThreeAxes) {
+  const std::vector<int32_t> tokens{37, 52, 0};
+  const auto [positions, delta] =
+      Qwen3VLMPositionGenerator().generate(tokens, MMData{}, ModelArgs{});
+  EXPECT_EQ(positions.scalar_type(), torch::kInt32);
+  EXPECT_TRUE(torch::equal(positions,
+                           torch::tensor({{0, 1, 2}, {0, 1, 2}, {0, 1, 2}})));
+  EXPECT_EQ(delta, 0);
+}
+
 class InMemoryModelLoader final : public ModelLoader {
  public:
   explicit InMemoryModelLoader(std::vector<Weights> shards) {

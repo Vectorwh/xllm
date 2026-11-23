@@ -220,6 +220,25 @@ TEST(HFModelLoaderTest, SlidingAttentionUsesPagedKvClassification) {
   EXPECT_TRUE(is_linear_attention_layer(1, 4, args.layer_types()));
 }
 
+TEST(HFModelLoaderTest, Qwen35TextLoadsVisionMarkersFromCheckpoint) {
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"({
+    "vision_start_token_id": 81, "vision_end_token_id": 82,
+    "image_token_id": 83, "video_token_id": 84
+  })"));
+  for (const char* name : {"qwen3_5_text", "qwen3_5_moe_text"}) {
+    SCOPED_TRACE(name);
+    const auto loader = ModelRegistry::get_model_args_loader(name);
+    ASSERT_TRUE(loader);
+    ModelArgs args;
+    ASSERT_TRUE(loader(reader, &args));
+    EXPECT_EQ(args.vision_start_token_id(), 81);
+    EXPECT_EQ(args.vision_end_token_id(), 82);
+    EXPECT_EQ(args.image_token_id(), 83);
+    EXPECT_EQ(args.video_token_id(), 84);
+  }
+}
+
 TEST(HFModelLoaderTest, Qwen35DenseBackendAwareModelTypeSelection) {
   JsonReader reader;
   ASSERT_TRUE(reader.parse_text(R"json(

@@ -365,6 +365,10 @@ std::tuple<torch::Tensor, int32_t> Qwen3VLMPositionGenerator::generate(
     Slice<int32_t> input_tokens,
     const MMData& mm_data,
     const ModelArgs& model_args) const {
+  if (!mm_data.valid()) {
+    const int64_t length = static_cast<int64_t>(input_tokens.size());
+    return {torch::arange(length, torch::kInt32).expand({3, length}), 0};
+  }
   torch::Tensor image_grid_thw = get_mm_tensor(mm_data, "image_grid_thw");
   torch::Tensor video_grid_thw = get_mm_tensor(mm_data, "video_grid_thw");
   int32_t image_token_id = model_args.image_token_id();

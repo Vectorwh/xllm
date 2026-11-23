@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/rotary_embedding_util.h"
+#include "core/util/model_config_utils.h"
 #include "models/model_registry.h"
 #include "models/vlm/mposition/mposition.h"
 #include "models/vlm/qwen3_vl_base.h"
@@ -225,6 +226,7 @@ TORCH_MODULE(Qwen3_5ForConditionalGeneration);
 #define LOAD_QWEN3_5_COMMON_ARGS()                                             \
   LOAD_ARG_OR(model_type, "model_type", "qwen3_5");                            \
   LOAD_ARG_OR(dtype, "text_config.dtype", "bfloat16");                         \
+  util::load_qwen3_5_vision_token_ids(json, args);                             \
   LOAD_ARG_OR(vocab_size, "text_config.vocab_size", 248320);                   \
   LOAD_ARG_OR(hidden_size, "text_config.hidden_size", 5120);                   \
   LOAD_ARG_OR(hidden_act, "text_config.hidden_act", "silu");                   \
@@ -282,10 +284,6 @@ TORCH_MODULE(Qwen3_5ForConditionalGeneration);
   LOAD_ARG_OR(mamba_ssm_dtype, "text_config.mamba_ssm_dtype", "float32")
 
 #define LOAD_QWEN3_5_VISION_ARGS()                                             \
-  LOAD_ARG_OR(image_token_id, "image_token_id", 248056);                       \
-  LOAD_ARG_OR(video_token_id, "video_token_id", 248057);                       \
-  LOAD_ARG_OR(vision_start_token_id, "vision_start_token_id", 248053);         \
-  LOAD_ARG_OR(vision_end_token_id, "vision_end_token_id", 248054);             \
   LOAD_ARG_OR(mm_deepstack_visual_indexes,                                     \
               "vision_config.deepstack_visual_indexes",                        \
               std::vector<int64_t>());                                         \

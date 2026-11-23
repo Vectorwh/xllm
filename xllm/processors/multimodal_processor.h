@@ -56,8 +56,8 @@ class MultimodalProcessorBase {
                                   MMData& data) const = 0;
 
   virtual bool bind_prompt_tokens(const std::vector<int32_t>& /*token_ids*/,
-                                  MMData& /*mm_data*/) const {
-    return false;
+                                  MMData& mm_data) const {
+    return !mm_data.valid();
   }
 
  protected:
@@ -139,6 +139,9 @@ class MultimodalProcessor final : public MultimodalProcessorBase {
 
   bool bind_prompt_tokens(const std::vector<int32_t>& token_ids,
                           MMData& mm_data) const override {
+    if (!mm_data.valid()) {
+      return prompt_processor_->validate_text_tokens(token_ids);
+    }
     return prompt_processor_->find_mm_spans(token_ids, mm_data);
   }
 

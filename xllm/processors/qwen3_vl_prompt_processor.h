@@ -36,6 +36,8 @@ class Qwen3VLPromptProcessor final : public PromptProcessor {
   explicit Qwen3VLPromptProcessor(const ModelArgs& args);
 
   bool process(std::string& prompt, const MMData& mm_data) override;
+  bool validate_text_tokens(
+      const std::vector<int32_t>& token_ids) const override;
   bool find_mm_spans(const std::vector<int32_t>& token_ids,
                      MMData& mm_data) override;
 
@@ -56,6 +58,7 @@ class Qwen3VLPromptProcessor final : public PromptProcessor {
   int32_t vision_end_token_id_;
   int32_t image_token_id_;
   int32_t video_token_id_;
+  int64_t max_context_len_;
   int32_t merge_size_ = 0;
   int32_t temporal_patch_size_ = 0;
 };

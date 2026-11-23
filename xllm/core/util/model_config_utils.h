@@ -23,8 +23,11 @@ limitations under the License.
 namespace xllm {
 
 class JsonReader;
+struct ModelArgs;
 
 namespace util {
+
+void load_qwen3_5_vision_token_ids(const JsonReader& reader, ModelArgs* args);
 
 std::string get_model_type(const JsonReader& reader,
                            const std::filesystem::path& model_path,

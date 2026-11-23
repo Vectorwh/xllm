@@ -34,6 +34,11 @@ class PromptProcessor {
   // false rejects the request at construction.
   virtual bool process(std::string& prompt, const MMData& mm_data) = 0;
 
+  virtual bool validate_text_tokens(
+      const std::vector<int32_t>& /*token_ids*/) const {
+    return true;
+  }
+
   // Optional token-level fixup, run after tokenization and before
   // find_mm_spans. Used by models whose placeholder blocks need
   // position-dependent padding (e.g. DeepSeek-V4.1 compressor alignment).

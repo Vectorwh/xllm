@@ -18,12 +18,23 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cstdint>
 #include <filesystem>
 
+#include "core/framework/model/model_args.h"
 #include "core/util/dit_model_discovery.h"
 #include "core/util/json_reader.h"
 
 namespace xllm::util {
+
+void load_qwen3_5_vision_token_ids(const JsonReader& reader, ModelArgs* args) {
+  args->image_token_id(reader.value_or<int32_t>("image_token_id", 248056));
+  args->video_token_id(reader.value_or<int32_t>("video_token_id", 248057));
+  args->vision_start_token_id(
+      reader.value_or<int32_t>("vision_start_token_id", 248053));
+  args->vision_end_token_id(
+      reader.value_or<int32_t>("vision_end_token_id", 248054));
+}
 
 std::string get_model_type(const JsonReader& reader,
                            const std::filesystem::path& model_path,
