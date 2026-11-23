@@ -245,4 +245,16 @@ const bool glm5_next_mtp_adapter_registered = []() {
 REGISTER_MODEL_ARGS_LOADER(glm5_next, &glm5_next_args::load_model_args);
 REGISTER_MODEL_ARGS_LOADER(glm5_next_mtp, &glm5_next_args::load_model_args);
 
+#if defined(USE_NPU)
+namespace {
+[[maybe_unused]] const bool kGlm5NextNpuHeadShardingRegistered = []() {
+  for (const char* model_type : {"glm5_next", "glm5_next_mtp"}) {
+    ModelRegistry::register_linear_head_sharding(
+        model_type, LinearHeadSharding::ATTENTION_TP_OR_CP);
+  }
+  return true;
+}();
+}  // namespace
+#endif
+
 }  // namespace xllm

@@ -353,7 +353,8 @@ def _patch_cp_gather(monkeypatch, remote_by_local: dict[tuple[object, ...], torc
     return gather
 
 
-def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> None:
+@pytest.mark.parametrize("head_sharded", [False, True])
+def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch, head_sharded: bool) -> None:
     attention = glm5_next.Glm5NextKdaAttention.__new__(glm5_next.Glm5NextKdaAttention)
     nn.Module.__init__(attention)
     attention.layer_id = 0
@@ -365,6 +366,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     attention.tp = 1
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = head_sharded
     attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
@@ -387,6 +389,8 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     }
     gather = _patch_cp_gather(monkeypatch, remote_by_local)
 
+    reduce = MagicMock(side_effect=lambda value, **kwargs: value.mul_(2))
+    monkeypatch.setattr(glm5_next.distributed, "all_reduce_", reduce)
     backend = MagicMock()
     backend.execute_linear.side_effect = lambda mixed_qkv, _beta, _layer, *, raw_gate_proj, cp_context=None: (
         mixed_qkv[:, :1].transpose(1, 2).unsqueeze(2)
@@ -394,7 +398,7 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=cp_context),
     ):
         output = attention(local_hidden, torch.tensor([[0, 3]], dtype=torch.int32), torch.tensor([[True, True]]))
 
@@ -405,9 +409,17 @@ def test_kda_cp_materializes_global_rows_and_reshards_output(monkeypatch) -> Non
     torch.testing.assert_close(mixed_qkv, expected_hidden.view(1, 1, 4).expand(1, 3, 4))
     torch.testing.assert_close(raw_gate_proj, expected_hidden.view(1, 4, 1, 1) * 10)
     torch.testing.assert_close(beta, expected_hidden.view(1, 4, 1))
-    assert gather.call_count == 3
-    torch.testing.assert_close(attention.o_norm.call_args.args[1], local_hidden.unsqueeze(-1) * 100)
-    torch.testing.assert_close(output, torch.tensor([[[101.0], [404.0]]]))
+    assert gather.call_count == (1 if head_sharded else 3)
+    gate_hidden = expected_hidden.view(1, 4, 1) if head_sharded else local_hidden
+    torch.testing.assert_close(attention.o_norm.call_args.args[1], gate_hidden.unsqueeze(-1) * 100)
+    expected = torch.tensor([[[101.0], [404.0]]]) * (2 if head_sharded else 1)
+    torch.testing.assert_close(output, expected)
+    if head_sharded:
+        assert reduce.call_count == 1
+        assert reduce.call_args.kwargs == {"group_name": "cp"}
+        assert tuple(reduce.call_args.args[0].shape) == (1, 4, 1)
+    else:
+        reduce.assert_not_called()
 
 
 def test_kda_cp_one_keeps_full_postprocessing() -> None:
@@ -422,6 +434,7 @@ def test_kda_cp_one_keeps_full_postprocessing() -> None:
     attention.tp = 1
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = False
     attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
@@ -441,7 +454,7 @@ def test_kda_cp_one_keeps_full_postprocessing() -> None:
         patch.object(
             glm5_next,
             "get_forward_context_or_none",
-            return_value=SimpleNamespace(attention_backend=backend, cp_context=None),
+            return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=None),
         ),
         patch.object(glm5_next, "cp_merge_rows") as merge_rows,
         patch.object(glm5_next, "cp_shard_rows") as shard_rows,
@@ -522,6 +535,7 @@ def test_kda_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> 
     attention.tp = 2
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = False
     attention.enable_kda_cp = False
     attention.input_projection_sizes = (12, 2, 4)
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
@@ -556,7 +570,7 @@ def test_kda_cp_projects_only_local_rows_and_overwrites_padding(monkeypatch) -> 
         patch.object(
             glm5_next,
             "get_forward_context_or_none",
-            return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+            return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=cp_context),
         ),
         patch.object(glm5_next, "cp_merge_rows", merge),
         patch.object(glm5_next.distributed, "all_reduce_", side_effect=compensate, create=True) as all_reduce,
@@ -584,6 +598,7 @@ def test_kda_pcp_eplv2_sp_masks_padding_before_reducing() -> None:
     attention.input_projection_sizes = (12, 2, 4)
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = False
     attention.enable_kda_cp = False
     attention.cfg = SimpleNamespace(hidden_size=3)
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
@@ -603,7 +618,9 @@ def test_kda_pcp_eplv2_sp_masks_padding_before_reducing() -> None:
         patch.object(
             glm5_next,
             "get_forward_context_or_none",
-            return_value=SimpleNamespace(attention_backend=backend, cp_context=_cp2_padded_context()),
+            return_value=SimpleNamespace(
+                layer_shared_cache={}, attention_backend=backend, cp_context=_cp2_padded_context()
+            ),
         ),
         patch.object(
             glm5_next, "cp_merge_rows", side_effect=[torch.ones(3, 12), torch.ones(3, 2, 2), torch.ones(3, 2)]
@@ -674,18 +691,11 @@ def test_mla_cp_one_keeps_full_postprocessing() -> None:
     torch.testing.assert_close(topk, torch.tensor([[[10]], [[20]], [[30]]], dtype=torch.int32))
 
 
-def test_mla_cp_projects_global_rows_and_reshards_output() -> None:
-    """The model-side CP row layout is partition-independent.
-
-    ``Glm5NextMlaAttention`` merges to the complete logical stream, runs the
-    indexer and every projection on those global rows, and reshards the
-    backend output. Only the attention backend partitions the query rows, so
-    the projection GEMMs keep ``M = the global token count`` exactly as in
-    the ``cp_size == 1`` path.
-    """
+def test_mla_cp_projects_local_queries_and_preserves_global_cache_inputs() -> None:
+    """Only Q-B and absorbed Q use local rows; cache/indexer inputs stay global."""
     indexer = MagicMock()
     global_topk = torch.arange(6, dtype=torch.int32).view(3, 1, 2)
-    indexer.select_qli.return_value = global_topk
+    indexer.select_qli.return_value = torch.cat((global_topk[:1], torch.zeros_like(global_topk[:1])))
     attention = _make_mla_attention(indexer)
     attention.hidden_size = 3
     attention.qk_nope_head_dim = 2
@@ -706,7 +716,7 @@ def test_mla_cp_projects_global_rows_and_reshards_output() -> None:
     global_attn_out = torch.arange(18, dtype=torch.float32).view(3, 2, 3)
     backend = MagicMock()
     backend.mla_index_context.return_value = object()
-    backend.execute_mla.return_value = global_attn_out
+    backend.execute_mla.return_value = torch.cat((global_attn_out[:1], torch.zeros_like(global_attn_out[:1])))
     merge = MagicMock(side_effect=[global_hidden.squeeze(0), global_positions.reshape(-1, 1)])
 
     def fake_shard(value: torch.Tensor, _ctx: object) -> torch.Tensor:
@@ -716,12 +726,13 @@ def test_mla_cp_projects_global_rows_and_reshards_output() -> None:
         return torch.cat([rows, padding], dim=0)
 
     shard = MagicMock(side_effect=fake_shard)
+    forward_context = SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend)
 
     with (
         patch.object(
             glm5_next,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=forward_context,
         ),
         patch.object(glm5_next, "cp_merge_rows", merge),
         patch.object(glm5_next, "cp_shard_rows", shard),
@@ -737,22 +748,31 @@ def test_mla_cp_projects_global_rows_and_reshards_output() -> None:
     assert merge.call_count == 2
     assert indexer.select_qli.call_args.args[0].shape == (1, 3, 3)
     torch.testing.assert_close(indexer.select_qli.call_args.args[0], global_hidden)
-    assert backend.execute_mla.call_args.args[0].shape == (3, 2, 3)
+    assert backend.execute_mla.call_args.args[0].shape == (2, 2, 3)
     assert backend.execute_mla.call_args.args[2].shape == (3, 1, 3)
-    torch.testing.assert_close(backend.execute_mla.call_args.kwargs["topk"], global_topk)
-    assert shard.call_count == 2
+    torch.testing.assert_close(backend.execute_mla.call_args.kwargs["topk"], indexer.select_qli.return_value)
+    assert shard.call_count == 1
+    assert backend.execute_mla.call_args.kwargs["cp_local_output"] is True
+    assert backend.execute_mla.call_args.kwargs["cp_local_query"] is True
+    assert backend.execute_mla.call_args.kwargs["cp_local_topk"] is True
     assert attention.o_proj.input_shape == (2, 6)
+    global_mask = indexer.select_qli.call_args.args[3]
+    with (
+        patch.object(glm5_next, "get_forward_context_or_none", return_value=forward_context),
+        patch.object(torch.Tensor, "item", side_effect=AssertionError("CP mask must not synchronize")),
+    ):
+        assert glm5_next._kpool_attention_mask_all_valid(global_mask)
 
 
 def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk() -> None:
     indexer = MagicMock()
     global_topk = torch.tensor([[[10]], [[20]], [[30]]], dtype=torch.int32)
-    indexer.select_qli.return_value = global_topk
+    indexer.select_qli.return_value = torch.cat((global_topk[:1], torch.zeros_like(global_topk[:1])))
     attention = _make_mla_attention(indexer)
     cp_context = _cp2_padded_context()
     backend = MagicMock()
     backend.mla_index_context.return_value = object()
-    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[22.0]], [[33.0]]])
+    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[0.0]]])
     merge = MagicMock(
         side_effect=[
             torch.tensor([[1.0], [2.0], [3.0]]),
@@ -763,7 +783,7 @@ def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk()
         patch.object(
             glm5_next,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
         ),
         patch.object(glm5_next, "cp_merge_rows", merge),
         patch.object(
@@ -780,19 +800,13 @@ def test_mla_pcp_eplv2_sp_masks_padding_before_reducing_and_returns_local_topk()
     torch.testing.assert_close(topk, torch.tensor([[[10]], [[0]]], dtype=torch.int32))
 
 
-def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank() -> None:
-    """MLA/DSA counterpart of the KDA rank-invariance test.
-
-    Under CP the model merges every rank up to the complete logical stream
-    before touching the indexer or the backend, so both ranks hand them the
-    *same* global rows. Every projection GEMM therefore runs with the global
-    batch shape on every rank, exactly as in the ``cp_size == 1`` path.
-    """
+def test_mla_cp_cache_inputs_are_global_and_queries_follow_each_rank(monkeypatch) -> None:
+    """Preserve global cache writes while selecting each rank's query rows."""
     indexer = MagicMock()
     indexer.select_qli.return_value = torch.zeros(4, 1, 1, dtype=torch.int32)
     backend = MagicMock()
     backend.mla_index_context.return_value = object()
-    backend.execute_mla.return_value = torch.zeros(4, 1, 1)
+    backend.execute_mla.return_value = torch.zeros(2, 1, 1)
     global_hidden = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
     global_positions = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
 
@@ -810,10 +824,9 @@ def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank() -> None:
             patch.object(
                 glm5_next,
                 "get_forward_context",
-                return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+                return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
             ),
             patch.object(glm5_next, "cp_merge_rows", merge),
-            patch.object(glm5_next, "cp_shard_rows", MagicMock(return_value=torch.zeros(2, 1, 1))),
         ):
             attention(local_hidden, local_positions, torch.tensor([[True, True]]))
         assert merge.call_count == 2
@@ -829,7 +842,10 @@ def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank() -> None:
     for rank in (0, 1):
         torch.testing.assert_close(captured_by_rank[rank]["index_hidden_states"], global_hidden)
         torch.testing.assert_close(captured_by_rank[rank]["index_position_ids"], global_positions)
-        torch.testing.assert_close(captured_by_rank[rank]["q_latent"], global_hidden.reshape(4, 1, 1))
+        rows = torch.tensor([0, 3] if rank == 0 else [1, 2])
+        torch.testing.assert_close(
+            captured_by_rank[rank]["q_latent"], global_hidden.reshape(4, 1, 1).index_select(0, rows)
+        )
         torch.testing.assert_close(captured_by_rank[rank]["k_latent_3d"], global_hidden.reshape(4, 1, 1))
 
     # The two ranks are no longer fed different token rows: global means global.
@@ -839,16 +855,14 @@ def test_mla_cp_indexer_and_backend_receive_global_rows_for_each_rank() -> None:
     )
 
 
-def test_dsa_cp_full_indexer_uses_global_rows_and_reshards_topk() -> None:
-    """A full-indexer DSA layer under CP merges to global rows first: the
-    indexer sees the complete logical stream, the MLA backend sees global
-    q/kv/topk (so its projections keep ``M = T_global``), and the returned
-    top-k is resharded to CP-local for the next shared-indexer layer.
+def test_dsa_cp_full_indexer_keeps_local_topk(monkeypatch) -> None:
+    """The indexer and cache see global rows while MLA queries stay local.
+    Top-k remains local for the next shared-indexer layer.
     ``previous_topk_indices`` is ignored because a full indexer recomputes.
     """
     indexer = MagicMock()
     global_topk = torch.tensor([[[10]], [[20]], [[30]], [[40]]], dtype=torch.int32)
-    indexer.select_qli.return_value = global_topk
+    indexer.select_qli.return_value = global_topk.index_select(0, torch.tensor([0, 3]))
     attention = _make_mla_attention(indexer)
     cp_context = _cp2_context(0)
     previous_topk = torch.tensor([[[50]], [[80]]], dtype=torch.int32)
@@ -856,13 +870,13 @@ def test_dsa_cp_full_indexer_uses_global_rows_and_reshards_topk() -> None:
     global_positions = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
     backend = MagicMock()
     backend.mla_index_context.return_value = object()
-    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[22.0]], [[33.0]], [[44.0]]])
+    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[44.0]]])
 
     with (
         patch.object(
             glm5_next,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
         ),
         patch.object(
             glm5_next,
@@ -884,38 +898,40 @@ def test_dsa_cp_full_indexer_uses_global_rows_and_reshards_topk() -> None:
 
     # Hidden + positions are merged; a full indexer never merges prev top-k.
     assert merge.call_count == 2
-    assert shard.call_count == 2
+    assert shard.call_count == 1
+    assert backend.execute_mla.call_args.kwargs["cp_local_output"] is True
+    assert backend.execute_mla.call_args.kwargs["cp_local_query"] is True
+    assert backend.execute_mla.call_args.kwargs["cp_local_topk"] is True
     index_args = indexer.select_qli.call_args.args
     torch.testing.assert_close(index_args[0], global_hidden)
     torch.testing.assert_close(index_args[1], global_hidden.reshape(4, 1))
     torch.testing.assert_close(index_args[2], global_positions)
     torch.testing.assert_close(index_args[3], torch.ones(1, 4, dtype=torch.bool))
-    torch.testing.assert_close(backend.execute_mla.call_args.args[0], global_hidden.reshape(4, 1, 1))
-    torch.testing.assert_close(backend.execute_mla.call_args.kwargs["topk"], global_topk)
+    torch.testing.assert_close(
+        backend.execute_mla.call_args.args[0], global_hidden.reshape(4, 1, 1).index_select(0, torch.tensor([0, 3]))
+    )
+    torch.testing.assert_close(backend.execute_mla.call_args.kwargs["topk"], indexer.select_qli.return_value)
     torch.testing.assert_close(output, torch.tensor([[11.0], [44.0]]))
     torch.testing.assert_close(topk, global_topk.index_select(0, torch.tensor([0, 3])))
 
 
-def test_dsa_cp_shared_indexer_merges_local_topk_back_to_global() -> None:
+def test_dsa_cp_shared_indexer_reuses_local_topk(monkeypatch) -> None:
     """A shared-indexer DSA layer receives the preceding layer's CP-local top-k,
-    merges it (with hidden and positions) back to global rows, and hands the
-    global tensor to the backend. The returned top-k is resharded again for the
-    next shared layer.
+    passes it directly to the backend and retains it for the next shared layer.
     """
     attention = _make_mla_attention(None)
     cp_context = _cp2_context(0)
     local_topk = torch.tensor([[[10]], [[40]]], dtype=torch.int32)
-    global_topk = torch.tensor([[[10]], [[20]], [[30]], [[40]]], dtype=torch.int32)
     global_hidden = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
     global_positions = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
     backend = MagicMock()
-    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[22.0]], [[33.0]], [[44.0]]])
+    backend.execute_mla.return_value = torch.tensor([[[11.0]], [[44.0]]])
 
     with (
         patch.object(
             glm5_next,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
         ),
         patch.object(
             glm5_next,
@@ -924,7 +940,6 @@ def test_dsa_cp_shared_indexer_merges_local_topk_back_to_global() -> None:
                 side_effect=[
                     global_hidden.squeeze(0),
                     global_positions.reshape(-1, 1),
-                    global_topk.reshape(4, -1),
                 ]
             ),
         ) as merge,
@@ -941,8 +956,8 @@ def test_dsa_cp_shared_indexer_merges_local_topk_back_to_global() -> None:
             local_topk,
         )
 
-    assert merge.call_count == 3  # hidden + positions + the shared top-k
-    torch.testing.assert_close(backend.execute_mla.call_args.kwargs["topk"], global_topk)
+    assert merge.call_count == 2  # hidden and positions; indices stay local
+    torch.testing.assert_close(backend.execute_mla.call_args.kwargs["topk"], local_topk)
     torch.testing.assert_close(output, torch.tensor([[11.0], [44.0]]))
     torch.testing.assert_close(topk, local_topk)
 
@@ -1072,7 +1087,9 @@ def test_dsa_indexer_packs_global_rows_per_request_for_varlen_batch() -> None:
     with patch.object(
         glm5_next,
         "get_forward_context",
-        return_value=SimpleNamespace(metadata=SimpleNamespace(q_cu_seq_lens=torch.tensor([0, 5, 7]))),
+        return_value=SimpleNamespace(
+            layer_shared_cache={}, metadata=SimpleNamespace(q_cu_seq_lens=torch.tensor([0, 5, 7]))
+        ),
     ):
         topk = indexer.select_qli(
             hidden_states=hidden,
@@ -1449,7 +1466,7 @@ def test_kda_cp_backend_inputs_are_identical_regardless_of_local_rank(monkeypatc
         with patch.object(
             glm5_next,
             "get_forward_context_or_none",
-            return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+            return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=cp_context),
         ):
             attention(local_hidden, torch.tensor([[0, 3]], dtype=torch.int32), torch.tensor([[True, True]]))
         mixed_qkv, beta, layer = backend.execute_linear.call_args.args
@@ -1529,7 +1546,7 @@ def test_mla_cp_backend_inputs_are_identical_regardless_of_local_rank(monkeypatc
     indexer.select_qli.return_value = torch.zeros(4, 1, 1, dtype=torch.int32)
     backend = MagicMock()
     backend.mla_index_context.return_value = object()
-    backend.execute_mla.return_value = torch.zeros(4, 1, 1)
+    backend.execute_mla.return_value = torch.zeros(2, 1, 1)
 
     captured_by_rank: dict[int, dict[str, torch.Tensor]] = {}
     for rank, local_hidden, local_positions in (
@@ -1543,7 +1560,7 @@ def test_mla_cp_backend_inputs_are_identical_regardless_of_local_rank(monkeypatc
         with patch.object(
             glm5_next,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
         ):
             attention(local_hidden, local_positions, torch.tensor([[True, True]]))
         index_args = indexer.select_qli.call_args.args
@@ -1556,8 +1573,10 @@ def test_mla_cp_backend_inputs_are_identical_regardless_of_local_rank(monkeypatc
         }
 
     assert gather.call_count == 4
-    for key in ("index_hidden_states", "index_position_ids", "q_latent", "k_latent_3d"):
+    for key in ("index_hidden_states", "index_position_ids", "k_latent_3d"):
         torch.testing.assert_close(captured_by_rank[0][key], captured_by_rank[1][key])
+    torch.testing.assert_close(captured_by_rank[0]["q_latent"].reshape(-1), hidden_r0.reshape(-1))
+    torch.testing.assert_close(captured_by_rank[1]["q_latent"].reshape(-1), hidden_r1.reshape(-1))
     expected_hidden = torch.tensor([1.0, 2.0, 3.0, 4.0])
     torch.testing.assert_close(captured_by_rank[0]["index_hidden_states"].reshape(-1), expected_hidden)
     torch.testing.assert_close(captured_by_rank[0]["k_latent_3d"].reshape(-1), expected_hidden)
@@ -1604,7 +1623,7 @@ def test_kda_cp_prefill_to_decode_handoff_matches_noncp_baseline(monkeypatch, ca
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_baseline, cp_context=None),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
     ):
         attention_baseline(
             torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
@@ -1765,6 +1784,7 @@ def _make_kda_attention_for_cross_rank_test() -> glm5_next.Glm5NextKdaAttention:
     attention.tp = 1
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = False
     attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
@@ -1798,6 +1818,7 @@ def _make_kda_attention_for_handoff_test() -> glm5_next.Glm5NextKdaAttention:
     attention.tp = 1
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = False
     attention.enable_kda_cp = False
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),
@@ -2017,12 +2038,16 @@ def _index_writer_with_attend_all_topk(
     arguments such as the CP ``query_rows`` row plan are accepted and
     ignored, matching the real signature's defaults.
     """
-    del qr, attention_mask, kwargs
+    del qr, attention_mask
     num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
     packed = hidden_states.reshape(num_tokens, -1) * 1000  # distinguishable from raw hidden values
     ctx.update_index_cache(packed, None)
     kv_len = int(ctx.actual_seq_kv.reshape(-1)[-1].item())
-    return torch.arange(kv_len, dtype=torch.int32).view(1, 1, -1).expand(num_tokens, 1, -1)
+    topk = torch.arange(kv_len, dtype=torch.int32).view(1, 1, -1).expand(num_tokens, 1, -1)
+    if kwargs.get("cp_local_output", False):
+        context = glm5_next.get_forward_context().cp_context
+        return glm5_next.cp_shard_rows(topk.reshape(num_tokens, -1), context).unsqueeze(1)
+    return topk
 
 
 def _run_kda_cp_rank_prefill(
@@ -2050,7 +2075,7 @@ def _run_kda_cp_rank_prefill(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=cp_context),
     ):
         attention(local_hidden, local_positions, torch.tensor([[True, True]]))
 
@@ -2067,7 +2092,7 @@ def _run_kda_decode_step(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend, cp_context=None),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=None),
     ):
         return attention(
             torch.tensor([[[5.0]]]), torch.tensor([[4]], dtype=torch.int32), torch.ones(1, 1, dtype=torch.bool)
@@ -2232,12 +2257,12 @@ def _run_mla_cp_rank_prefill(
         patch.object(
             glm5_next,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
         ),
         patch.object(
             npu_paged_attention_module,
             "get_forward_context",
-            return_value=SimpleNamespace(cp_context=cp_context, attention_backend=backend),
+            return_value=SimpleNamespace(layer_shared_cache={}, cp_context=cp_context, attention_backend=backend),
         ),
     ):
         attention(local_hidden, local_positions, torch.tensor([[True, True]]))
@@ -2605,6 +2630,7 @@ def _cp2_chunk_context(rank: int) -> SimpleNamespace:
         shard_index=shard_index,
         shard_gather_index=shard_gather_index,
         shard_valid_mask=torch.tensor([True, False]),
+        query_index=torch.tensor([0], dtype=torch.int64),
         restore_index=torch.tensor([0, 2], dtype=torch.int64),
     )
 
@@ -2659,7 +2685,7 @@ def _run_kda_cp_rank_chunk(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend, cp_context=cp_context),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend, cp_context=cp_context),
     ):
         attention(local_hidden, local_positions, torch.tensor([[True, False]]))
 
@@ -2712,7 +2738,7 @@ def test_kda_cp_chunked_prefill_matches_noncp_nonchunked_baseline(monkeypatch, c
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_baseline, cp_context=None),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
     ):
         attention_baseline(
             torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
@@ -2808,7 +2834,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_baseline, cp_context=None),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
     ):
         baseline_prefill_output = attention_baseline(
             torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
@@ -2825,7 +2851,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_baseline, cp_context=None),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
     ):
         attention_baseline(
             torch.tensor([[[5.0], [6.0]]]),
@@ -2851,7 +2877,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_cp, cp_context=_cp2_context(0)),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_cp, cp_context=_cp2_context(0)),
     ):
         cp_prefill_output_rank0 = attention_cp_rank0(
             torch.tensor([[[1.0], [4.0]]]),
@@ -2873,7 +2899,9 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_rank1, cp_context=_cp2_context(1)),
+        return_value=SimpleNamespace(
+            layer_shared_cache={}, attention_backend=backend_rank1, cp_context=_cp2_context(1)
+        ),
     ):
         cp_prefill_output_rank1 = attention_cp_rank1(
             torch.tensor([[[2.0], [3.0]]]),
@@ -2911,7 +2939,9 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_cp, cp_context=_cp2_chunk_context(0)),
+        return_value=SimpleNamespace(
+            layer_shared_cache={}, attention_backend=backend_cp, cp_context=_cp2_chunk_context(0)
+        ),
     ):
         cp_verify_output = attention_cp_rank0(
             torch.tensor([[[5.0], [0.0]]]),
@@ -2989,7 +3019,7 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_baseline, cp_context=None),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
     ):
         baseline_output = attention_baseline(
             torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
@@ -3018,7 +3048,7 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
     with patch.object(
         glm5_next,
         "get_forward_context_or_none",
-        return_value=SimpleNamespace(attention_backend=backend_cp, cp_context=cp_context),
+        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_cp, cp_context=cp_context),
     ):
         cp_output = attention_cp(
             torch.tensor([[[1.0], [4.0]]]),

@@ -20,7 +20,10 @@ limitations under the License.
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <vector>
 
+#include "core/framework/parallel_state/context_parallel_topology.h"
 #include "xllm_atb_layers/core/include/atb_speed/base/external_comm_manager.h"
 
 namespace xllm {
@@ -97,6 +100,34 @@ TEST(TestMappingNPU, ToJsonUsesHcclBuffsizeEnv) {
   nlohmann::json mlp_tp = data["mlpTp"];
   int32_t mlp_tp_buffer_size = mlp_tp["bufferSize"];
   EXPECT_EQ(mlp_tp_buffer_size, 128);
+}
+
+TEST(TestMappingNPU, ContextParallelGroupsStayWithinDataParallelReplicas) {
+  constexpr int32_t kWorldSize = 16;
+  const std::vector<std::tuple<int32_t, int32_t, int32_t>> layouts = {
+      {2, 8, 2}, {2, 4, 4}, {2, 4, 2}, {1, 8, 2}, {8, 1, 1}};
+  for (const auto& [dp_size, cp_size, kv_split_size] : layouts) {
+    MappingNPU::Options options;
+    options.dp_size(dp_size)
+        .cp_size(cp_size)
+        .tp_size(kWorldSize / dp_size / cp_size)
+        .moe_tp_size(1)
+        .moe_ep_size(kWorldSize)
+        .sp_size(1)
+        .kv_split_size(kv_split_size);
+    for (int32_t rank = 0; rank < kWorldSize; ++rank) {
+      SCOPED_TRACE(::testing::Message() << "dp=" << dp_size << " cp=" << cp_size
+                                        << " rank=" << rank);
+      const parallel_state::ContextParallelTopology topology(
+          rank, kWorldSize, dp_size, cp_size, kv_split_size);
+      MappingNPU mapping("", kWorldSize, rank, options);
+      const auto data = mapping.to_json();
+      EXPECT_EQ(data["attnCp"]["rankIds"], topology.pcp_group_ranks());
+      EXPECT_EQ(data["attnCp"]["rank"], topology.pcp_rank());
+      EXPECT_EQ(data["kvSplit"]["rankIds"], topology.dcp_group_ranks());
+      EXPECT_EQ(data["kvSplit"]["rank"], topology.dcp_rank());
+    }
+  }
 }
 
 TEST(TestMappingNPU, BufferOffsetIsExplicitAndRankIndependent) {

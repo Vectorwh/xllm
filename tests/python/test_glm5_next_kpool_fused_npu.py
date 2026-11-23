@@ -31,6 +31,91 @@ from xllm.python.models.glm5_next_kpool import (  # noqa: E402
 )
 
 
+@pytest.mark.parametrize(
+    "query_lens,prefix_lens",
+    [((16384,), (0,)), ((16384,), (3,)), ((1, 16383), (16383, 0))],
+)
+@torch.inference_mode()
+def test_cp_tnd_selection_preserves_per_query_causal_tails(
+    query_lens: tuple[int, ...], prefix_lens: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = os.environ.get("XLLM_EXPORT_PATH")
+    if artifact is None or not torch.npu.is_available():
+        pytest.skip("requires an NPU and XLLM_EXPORT_PATH")
+    torch.ops.load_library(artifact)
+    from xllm.python.kernels_npu.sparse_attention import pool_key_indexer
+    from xllm.python.model_executor.cp_utils import build_cp_context, cp_real_query_rows
+    from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+    from xllm.python.models import glm5_next
+    from xllm.python.models.glm5_next import Glm5NextConfig, Glm5NextIndexer
+
+    monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", pool_key_indexer, raising=False)
+
+    torch.npu.set_device(0)
+    torch.manual_seed(43)
+    device = torch.device("npu:0")
+    config = Glm5NextConfig(
+        hidden_size=16,
+        q_lora_rank=16,
+        index_n_heads=32,
+        index_head_dim=128,
+        index_kpool=4,
+        index_topk=2048,
+        index_kpool_always_select_tail=True,
+    )
+    indexer = Glm5NextIndexer(config, 1, torch.bfloat16, device).to(device=device, dtype=torch.bfloat16)
+    tokens = sum(query_lens)
+    qr = torch.randn(tokens, 16, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(tokens, 32, device=device, dtype=torch.bfloat16)
+    positions = torch.cat(
+        [torch.arange(prefix, prefix + length, device=device) for prefix, length in zip(prefix_lens, query_lens)]
+    )
+    kv_lens = [prefix + length for prefix, length in zip(prefix_lens, query_lens)]
+    pages = max((length + 63) // 64 for length in kv_lens) + 1
+    table = torch.arange(1, pages * len(query_lens) + 1, device=device, dtype=torch.int32).reshape(
+        len(query_lens), pages
+    )
+    cache = torch.randn(pages * len(query_lens) + 1, 16, 1, 128, device=device, dtype=torch.bfloat16)
+    cp_context = build_cp_context(list(query_lens), kv_lens, 8, 0, device)
+    rows = cp_real_query_rows(cp_context)
+    hidden = torch.randn(1, tokens, 16, device=device, dtype=torch.bfloat16)
+    full_keys, full_weights = indexer._project_key_weights(hidden)
+    local_keys, local_weights = indexer._project_key_weights(hidden, rows)
+    torch.testing.assert_close(local_keys, full_keys, rtol=0, atol=0)
+    torch.testing.assert_close(
+        local_weights[0].index_select(0, rows), full_weights[0].index_select(0, rows), rtol=0, atol=0
+    )
+    expected = torch.full((tokens, 1, indexer.topk_output_width), -1, device=device, dtype=torch.int32)
+    start = 0
+    for request, length in enumerate(query_lens):
+        selected = rows[(rows >= start) & (rows < start + length)]
+        if selected.numel():
+            selected_indices = indexer._select_topk_fused_pa(
+                indexer.wq_b(qr.index_select(0, selected)).reshape(1, selected.numel(), 32, 128),
+                weights.index_select(0, selected).unsqueeze(0),
+                torch.tensor([kv_lens[request]], device=device, dtype=torch.int32),
+                torch.ones(1, selected.numel(), device=device, dtype=torch.bool),
+                cache,
+                table[request : request + 1],
+                query_positions=positions.index_select(0, selected).unsqueeze(0),
+                attention_mask_all_valid=True,
+            )
+            expected.index_copy_(0, selected, selected_indices.reshape(-1, 1, indexer.topk_output_width).int())
+        start += length
+    with forward_context(ForwardContext(None, device, None, [], cp_context=cp_context)):
+        actual = indexer._select_topk_fused_cp_paged(qr, weights, positions, rows, cache, table, cp_context, tokens)
+        local = indexer._select_topk_fused_cp_paged(
+            qr, weights, positions, rows, cache, table, cp_context, tokens, local_output=True
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        local.index_select(0, cp_context.query_index), expected.index_select(0, rows), rtol=0, atol=0
+    )
+    padding = torch.ones(cp_context.total_local, dtype=torch.bool, device=device)
+    padding[cp_context.query_index] = False
+    assert torch.all(local[padding] == -1)
+
+
 @pytest.mark.parametrize("chunks", [(64,), (1, 2, 3, 4, 17, 37), (4096,), (3, 4093)])
 @pytest.mark.parametrize("restore_prefix", [False, True])
 @torch.inference_mode()
@@ -204,6 +289,84 @@ def test_batched_fused_kpool_keeps_requests_and_cached_geometry_independent() ->
             assert batched[request_idx][0].shape == expected[0].shape == (0, 128)
         offset += length
     torch.testing.assert_close(tail, old_tail, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("query_lens", [(1, 4095), (3, 61), (3, 3)])
+@torch.inference_mode()
+def test_varlen_fused_storage_matches_portable_cache_and_tail(query_lens: tuple[int, ...]) -> None:
+    artifact = os.environ.get("XLLM_EXPORT_PATH")
+    if artifact is None or not torch.npu.is_available():
+        pytest.skip("requires an NPU and XLLM_EXPORT_PATH")
+    if not hasattr(torch.ops.xllm_ops, "key_pool"):
+        torch.ops.load_library(artifact)
+    torch.npu.set_device(0)
+    torch.manual_seed(42)
+    hidden = torch.randn(sum(query_lens), 4096, dtype=torch.bfloat16, device="npu")
+    key_weight = torch.randn(128, 4096, dtype=torch.bfloat16, device="npu") * 0.02
+    gate_weight = torch.randn_like(key_weight) * 0.02
+    ape = torch.randn(4, 128, device="npu")
+    norm_weight = torch.randn(128, device="npu")
+    norm_bias = torch.randn_like(norm_weight)
+    tail = torch.randn(4, 2, 9, 128, device="npu")
+    ids = torch.tensor([2, 1], dtype=torch.int32, device="npu")
+    positions = torch.cat([torch.arange(3, 3 + length, device="npu") for length in query_lens])
+    table = torch.tensor([[1], [2]], dtype=torch.int32, device="npu")
+    cache = torch.zeros(3, 4097, 1, 128, dtype=torch.bfloat16, device="npu")
+    valid = torch.ones(sum(query_lens), dtype=torch.bool, device="npu")
+    valid[-2] = False
+    tail_valid = torch.ones_like(valid)
+    states = prepare_fused_kpool_states(
+        hidden,
+        key_weight,
+        gate_weight,
+        ape,
+        norm_weight,
+        norm_bias,
+        tail,
+        ids,
+        positions,
+        query_lens,
+        4,
+        1e-6,
+    )
+    raw = F.layer_norm(F.linear(hidden, key_weight).float(), (128,), norm_weight, norm_bias, 1e-6)
+    gates = F.linear(hidden, gate_weight)
+    write_ids = ids if query_lens[0] == 1 else torch.tensor([1, 3], dtype=torch.int32, device="npu")
+    expected_cache, expected_tail = cache.clone(), tail.clone()
+    _store_compressed_kpool_torch(
+        raw,
+        gates,
+        valid,
+        tail_valid,
+        positions,
+        expected_cache,
+        expected_tail,
+        ids,
+        write_ids,
+        table,
+        query_lens,
+        ape,
+        4,
+        fused_states=states,
+    )
+    update_compressed_kpool(
+        raw,
+        gates,
+        valid,
+        tail_valid,
+        positions,
+        cache,
+        tail,
+        ids,
+        write_ids,
+        table,
+        query_lens,
+        ape,
+        4,
+        fused_states=states,
+    )
+    torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+    torch.testing.assert_close(tail, expected_tail, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("query_width", [1, 3, 8])

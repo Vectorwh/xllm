@@ -17,7 +17,7 @@ from __future__ import annotations
 import torch
 
 from xllm.python.attention.backend import AttentionMetadata
-from xllm.python.model_executor.cp_utils import build_cp_context
+from xllm.python.model_executor.cp_utils import CpContext, build_cp_context
 from xllm.python.model_executor.forward_context import (
     EplbRuntimeState,
     ForwardContext,
@@ -55,6 +55,8 @@ class EagerRunner(BaseRunner):
     # the prefill sequence across these ranks; decode is left on the non-CP path.
     cp_size: int = 1
     cp_rank: int = 0
+    _cp_context_key: tuple[tuple[int, ...], tuple[int, ...], int, int, torch.device] | None = None
+    _cp_context: CpContext | None = None
 
     @property
     def model_restores_aux_hidden_under_cp(self) -> bool:
@@ -129,13 +131,20 @@ class EagerRunner(BaseRunner):
                     raise RuntimeError("Python Context-Parallel requires host query and KV sequence lengths")
             else:
                 q_seq_lens, kv_seq_lens = seq_lens
-                cp_context = build_cp_context(
-                    q_seq_lens,
-                    kv_seq_lens,
-                    self.cp_size,
-                    self.cp_rank,
-                    self.device,
-                )
+                context_key = (tuple(q_seq_lens), tuple(kv_seq_lens), self.cp_size, self.cp_rank, self.device)
+                # CP indices depend only on geometry. Reusing the previous
+                # immutable plan avoids blocking H2D copies between equal
+                # prefill chunks; retain just one plan to bound device memory.
+                if context_key != self._cp_context_key:
+                    self._cp_context = build_cp_context(
+                        q_seq_lens,
+                        kv_seq_lens,
+                        self.cp_size,
+                        self.cp_rank,
+                        self.device,
+                    )
+                    self._cp_context_key = context_key
+                cp_context = self._cp_context
 
         execution_contexts = {}
         if self.execution_metadata_builders:

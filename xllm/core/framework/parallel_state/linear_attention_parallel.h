@@ -28,6 +28,7 @@ namespace xllm {
 enum class LinearHeadSharding : int8_t {
   ATTENTION_TP,
   CP_TP,
+  ATTENTION_TP_OR_CP,
 };
 
 struct LinearAttentionPolicy {
@@ -56,6 +57,8 @@ inline int64_t linear_head_tp_size(const LinearAttentionPolicy& policy,
       return attention_tp_size;
     case LinearHeadSharding::CP_TP:
       return attention_tp_size * cp_size;
+    case LinearHeadSharding::ATTENTION_TP_OR_CP:
+      return attention_tp_size > 1 ? attention_tp_size : cp_size;
   }
   LOG(FATAL) << "Invalid linear head sharding mode";
   return 0;

@@ -18,7 +18,7 @@ from __future__ import annotations
 import functools
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
 
@@ -29,6 +29,7 @@ from xllm.python.attention.backend import (
 )
 from xllm.python.model_executor.forward_context import (
     get_execution_buffer,
+    get_forward_context_or_none,
     in_acl_graph,
 )
 
@@ -67,6 +68,20 @@ def _get_host_q_cu_seq_lens(metadata, expected_num_seqs: int) -> list[int]:
     if q_cu_seq_lens.device.type != "cpu":
         raise RuntimeError("NPU KDA multi-sequence prefill requires host q_cu_seq_lens metadata")
     return [int(value) for value in q_cu_seq_lens.to(torch.int64).tolist()]
+
+
+def _has_adjacent_state_indices(indices: torch.Tensor) -> bool:
+    """Check immutable state-slot metadata once across the forward's layers."""
+    context = get_forward_context_or_none()
+    if context is None:
+        return bool((indices[1:] == indices[:-1]).any().item())
+    # State-slot metadata is read-only during a forward. The version also
+    # invalidates cached checks if a caller performs a tracked in-place write.
+    version = None if torch.is_inference(indices) else indices._version
+    key = (_has_adjacent_state_indices, indices, version)
+    if key not in context.layer_shared_cache:
+        context.layer_shared_cache[key] = bool((indices[1:] == indices[:-1]).any().item())
+    return cast(bool, context.layer_shared_cache[key])
 
 
 def _take_leading_token_rows(tensor: torch.Tensor | None, num_rows: int, keep_rows: int) -> torch.Tensor | None:
@@ -1565,6 +1580,7 @@ class KdaLinearAttentionMixin:
                 device=device,
             )
         else:
+            source_idx = idx
             if idx.dtype != torch.int64:
                 idx = idx.to(torch.int64)
             if read_idx is not None and read_idx.dtype != torch.int64:
@@ -1630,7 +1646,7 @@ class KdaLinearAttentionMixin:
             q_rows = 0 if in_graph else (int(q_cu_raw.numel()) - 1 if q_cu_raw is not None else 0)
             per_row_idx = None
             per_row_cu = None
-            if q_rows == idx.numel() and idx.numel() > 1 and bool((idx[1:] == idx[:-1]).any().item()):
+            if q_rows == idx.numel() and idx.numel() > 1 and _has_adjacent_state_indices(source_idx):
                 # Defensive: indices already duplicated per row.
                 per_row_idx = idx
                 per_row_cu = q_cu_raw
@@ -1642,7 +1658,7 @@ class KdaLinearAttentionMixin:
                 0 < q_rows < idx.numel()
                 and idx.numel() % q_rows == 0
                 and idx.numel() > 1
-                and bool((idx[1:] == idx[:-1]).any().item())
+                and _has_adjacent_state_indices(source_idx)
             ):
                 # Chunked-typed spec verify: q_cu is sequence-scoped while
                 # linear_state_indices is per-row (one row per token).

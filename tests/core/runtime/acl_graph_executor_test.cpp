@@ -1328,57 +1328,60 @@ TEST(AclGraphPersistentParamTest, Qwen35DpDecodeClearsInactiveRankState) {
 }
 
 TEST(AclGraphPersistentParamTest, EmptyDpDecodePadsCumulativeQueryLengths) {
-  const torch::Device device(torch::kCPU);
-  const auto int_options = torch::TensorOptions().dtype(torch::kInt);
-  ModelArgs args;
-  args.model_type("deepseek_v32")
-      .dtype("float32")
-      .hidden_size(8)
-      .head_dim(0)
-      .max_position_embeddings(32);
-  runtime::Options options;
-  options.world_size(2)
-      .dp_size(2)
-      .enable_graph(true)
-      .block_size(4)
-      .max_seqs_per_batch(4)
-      .max_tokens_per_batch(4)
-      .num_decoding_tokens(1);
-  npu::GraphPersistentParam persistent_param(
-      args, device, options, /*need_update_attn_mask=*/false);
-  ModelInputParams params;
-  params.meta.batch_forward_type = BatchForwardType::DECODE;
-  params.parallel.dp_global_token_nums = {0, 1};
-  params.parallel.raw_dp_global_token_nums = {0, 1};
-  params.parallel.dp_is_decode = {1, 1};
-  // Empty batches can carry either an undefined or an empty query tensor.
-  for (const bool defined_q_cu : {false, true}) {
-    SCOPED_TRACE(defined_q_cu);
-    params.attention.device.q_cu_seq_lens =
-        defined_q_cu ? torch::empty({0}, int_options) : torch::Tensor();
-    for (const uint32_t bucket : {1, 2, 4}) {
-      SCOPED_TRACE(bucket);
-      const auto capture =
-          persistent_param.update(torch::ones({1}, int_options),
-                                  torch::Tensor(),
-                                  torch::Tensor(),
-                                  torch::zeros({1}, int_options),
-                                  params,
-                                  bucket,
-                                  /*return_capture_params=*/true,
-                                  /*skip_token_update=*/false,
-                                  /*for_capture=*/true,
-                                  /*update_paged_attention_plan=*/false);
-      ASSERT_TRUE(capture.has_value());
-      EXPECT_TRUE(capture->enable_graph);
-      EXPECT_FALSE(params.enable_graph);
-      EXPECT_EQ(capture->meta.actual_num_sequences, 0);
-      EXPECT_EQ(capture->meta.num_sequences, bucket);
-      ASSERT_TRUE(capture->attention.device.q_cu_seq_lens.defined());
-      EXPECT_TRUE(torch::equal(
-          capture->attention.device.q_cu_seq_lens,
-          torch::arange(1, static_cast<int64_t>(bucket) + 1, int_options)));
-      EXPECT_EQ(capture->attention.device.kv_seq_lens.numel(), bucket);
+  for (const char* model_type : {"deepseek_v32", "glm_moe_dsa"}) {
+    SCOPED_TRACE(model_type);
+    const torch::Device device(torch::kCPU);
+    const auto int_options = torch::TensorOptions().dtype(torch::kInt);
+    ModelArgs args;
+    args.model_type(model_type)
+        .dtype("float32")
+        .hidden_size(8)
+        .head_dim(0)
+        .max_position_embeddings(32);
+    runtime::Options options;
+    options.world_size(2)
+        .dp_size(2)
+        .enable_graph(true)
+        .block_size(4)
+        .max_seqs_per_batch(4)
+        .max_tokens_per_batch(4)
+        .num_decoding_tokens(1);
+    npu::GraphPersistentParam persistent_param(
+        args, device, options, /*need_update_attn_mask=*/false);
+    ModelInputParams params;
+    params.meta.batch_forward_type = BatchForwardType::DECODE;
+    params.parallel.dp_global_token_nums = {0, 1};
+    params.parallel.raw_dp_global_token_nums = {0, 1};
+    params.parallel.dp_is_decode = {1, 1};
+    // Empty batches can carry either an undefined or an empty query tensor.
+    for (const bool defined_q_cu : {false, true}) {
+      SCOPED_TRACE(defined_q_cu);
+      params.attention.device.q_cu_seq_lens =
+          defined_q_cu ? torch::empty({0}, int_options) : torch::Tensor();
+      for (const uint32_t bucket : {1, 2, 4}) {
+        SCOPED_TRACE(bucket);
+        const auto capture =
+            persistent_param.update(torch::ones({1}, int_options),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::zeros({1}, int_options),
+                                    params,
+                                    bucket,
+                                    /*return_capture_params=*/true,
+                                    /*skip_token_update=*/false,
+                                    /*for_capture=*/true,
+                                    /*update_paged_attention_plan=*/false);
+        ASSERT_TRUE(capture.has_value());
+        EXPECT_TRUE(capture->enable_graph);
+        EXPECT_FALSE(params.enable_graph);
+        EXPECT_EQ(capture->meta.actual_num_sequences, 0);
+        EXPECT_EQ(capture->meta.num_sequences, bucket);
+        ASSERT_TRUE(capture->attention.device.q_cu_seq_lens.defined());
+        EXPECT_TRUE(torch::equal(
+            capture->attention.device.q_cu_seq_lens,
+            torch::arange(1, static_cast<int64_t>(bucket) + 1, int_options)));
+        EXPECT_EQ(capture->attention.device.kv_seq_lens.numel(), bucket);
+      }
     }
   }
 }

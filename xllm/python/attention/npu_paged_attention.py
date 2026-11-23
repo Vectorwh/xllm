@@ -1053,6 +1053,9 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         topk: torch.Tensor | None = None,
         cache_is_preprocessed: bool = False,
         unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
+        cp_local_output: bool = False,
+        cp_local_query: bool = False,
+        cp_local_topk: bool = False,
     ) -> torch.Tensor:
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV.
 
@@ -1079,6 +1082,17 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         if self._mla_actual_seq_q is None or self._mla_actual_seq_kv is None:
             raise RuntimeError("MLA requires query and KV sequence lengths")
 
+        cp_context = get_forward_context().cp_context
+        rope_dim = getattr(layer, "qk_rope_head_dim", None)
+        if cp_local_output and (cp_context is None or rope_dim != 0):
+            raise ValueError("CP-local MLA output requires CP NoPE attention")
+        if cp_local_query and not cp_local_output:
+            raise ValueError("CP-local MLA queries require CP-local output")
+        if cp_local_topk and not cp_local_output:
+            raise ValueError("CP-local MLA indices require CP-local output")
+        if self.uses_host_main_kv and (cp_local_output or cp_local_query or cp_local_topk):
+            raise ValueError("CP-local MLA layouts are not supported with host KV offload")
+
         if self.uses_host_main_kv:
             return self._execute_kv_offload(q_latent, q_pe, k_latent_3d, k_pe_3d, layer, topk, cache_is_preprocessed)
 
@@ -1094,18 +1108,15 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
                 "dense MLA in this configuration has no C8 kernel."
             )
 
-        cp_context = get_forward_context().cp_context
-        rope_dim = getattr(layer, "qk_rope_head_dim", None)
         if cp_context is not None and rope_dim == 0:
-            # GLM-5 Next NoPE DSA under CP prefill. The model always merges
-            # to global rows, so every projection/indexer GEMM upstream ran
-            # with M = the global token count, exactly as in the cp_size == 1
-            # path. The latent cache is written once through the global slot
+            # NoPE DSA under CP prefill retains global cache/indexer inputs
+            # while queries may already be projected in CP-local order.
+            # The latent cache is written once through the global slot
             # mapping when the cache is a full replica and through the
             # owner-local one when it is owner-sharded (kv_split), then the
             # materialization reconstructs the read view. Under CP this rank
-            # attends only its own real query rows and scatters them back
-            # into the global layout for the model's reshard -- the
+            # attends only its own real query rows and returns either its
+            # padded local layout or the existing global layout -- the
             # partitioned call IS the CP path (no runtime switch: cp
             # membership is uniform across the CP group, so gating on it can
             # never desynchronize ranks, and the ON-vs-OFF equivalence was
@@ -1149,6 +1160,9 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
                 block_table,
                 cp_context,
                 layer_id,
+                local_output=cp_local_output,
+                local_query=cp_local_query,
+                local_topk=cp_local_topk,
             )
 
         if cp_context is None:
@@ -1297,6 +1311,10 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         cp_context: CpContext,
         rows: torch.Tensor,
         layer_id: int,
+        *,
+        local_output: bool = False,
+        local_query: bool = False,
+        local_topk: bool = False,
     ) -> torch.Tensor:
         """One sparse MLA call over this rank's real query rows, scattered back.
 
@@ -1306,17 +1324,22 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         rows run through one ``sparse_mode=3`` call over their exact causal
         prefix, and the result is scattered back into a global-layout tensor
         at those rows (padding and peer-owned rows stay zero).
+        With ``local_output``, scatter directly into the padded CP-local
+        layout instead, avoiding a global allocation and its later gather.
 
         An empty ``rows`` set means this rank owns no real query row (all of
         its chunks are padding): the latent-cache write already ran in the
         caller, so the rank stays a full CP participant in the collectives
         and there is nothing left to attend.
         """
+        output_shape = (cp_context.total_local, *q_latent.shape[1:]) if local_output else q_latent.shape
         if rows.numel() == 0:
-            return q_latent.new_zeros(q_latent.shape)
-        q_real = q_latent.index_select(0, rows).contiguous()
+            return q_latent.new_zeros(output_shape)
+        query_rows = cp_context.query_index if local_query else rows
+        q_real = q_latent.index_select(0, query_rows).contiguous()
         q_pe_real = q_pe.index_select(0, rows).contiguous() if q_pe is not None else None
-        topk_real = topk.index_select(0, rows).contiguous()
+        topk_rows = cp_context.query_index if local_topk else rows
+        topk_real = topk.index_select(0, topk_rows).contiguous()
         local_block_table = block_table.index_select(0, cp_context.segment_seq_indices).contiguous()
         output = self._mla_sparse(
             q_real,
@@ -1329,8 +1352,11 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
             cp_context.segment_kv_seq_lens_tensor,
             layer_id,
         )
-        scattered = q_latent.new_zeros(q_latent.shape)
-        scattered.index_copy_(0, rows, output)
+        scattered = q_latent.new_zeros(output_shape)
+        output_rows = cp_context.query_index if local_output else rows
+        # CP rows are unique. ScatterNd writes the selected rows directly,
+        # avoiding index_copy_'s expensive wide-row update on padded batches.
+        kernels.scatter_nd_update(scattered, output_rows[:, None], output)
         return scattered
 
     def _mla_cp_partitioned_query(
@@ -1341,15 +1367,17 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         block_table: torch.Tensor,
         cp_context: CpContext,
         layer_id: int,
+        *,
+        local_output: bool = False,
+        local_query: bool = False,
+        local_topk: bool = False,
     ) -> torch.Tensor:
         """Sparse NoPE MLA over only this rank's real CP query rows.
 
-        ``q_latent``/``topk`` are the model's **global** ``[T_global, ...]``
-        rows -- the same tensors a ``cp_size == 1`` forward would attend --
-        so every upstream projection and the indexer keep ``M = T_global``
-        and stay bit-identical to ``cp_size == 1``. ``shard_index`` maps a
-        local row to
-        its global row, so ``shard_index[query_index]`` selects exactly this
+        ``topk`` retains global row order. By default, ``q_latent`` also
+        contains global rows; ``local_query`` accepts the padded CP-local
+        layout instead. ``shard_index`` maps a local row to its global row,
+        so ``shard_index[query_index]`` selects exactly this
         rank's real rows. One sparse MLA call then covers every non-empty
         ``(sequence, half)`` segment over its exact causal prefix
         (``sparse_mode=3``), and the result is scattered back into a
@@ -1357,6 +1385,10 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         ``cp_shard_rows`` can reslice it unchanged (padding and peer-owned rows
         stay zero).
 
+        Cache writes and owner-shard materialization run in the caller.
+        ``local_output`` changes only the returned output's row layout.
+        ``local_query`` and ``local_topk`` accept queries and indices in
+        padded CP-local order. Cache/page metadata retains global positions.
         """
         # real_rows carries this rank's CP shard's global row indices: the CP
         # partition assigns each global row to exactly one rank and
@@ -1376,6 +1408,9 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
             cp_context,
             real_rows,
             layer_id,
+            local_output=local_output,
+            local_query=local_query,
+            local_topk=local_topk,
         )
 
     # SFA C8 packed-row tile size. Must stay in sync with the C++

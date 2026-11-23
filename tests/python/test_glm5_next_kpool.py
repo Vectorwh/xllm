@@ -75,6 +75,31 @@ def test_kpool_mask_validity_is_shared_across_layers_but_not_forwards(monkeypatc
     assert len(reads) == 3
 
 
+@pytest.mark.parametrize("host_lengths", [[9, 17], None])
+def test_kpool_kv_length_uses_host_metadata_and_expires_after_forward(
+    host_lengths: list[int] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lengths = torch.tensor([9, 17])
+    metadata = SimpleNamespace(kv_seq_lens_host_values=host_lengths)
+    item = torch.Tensor.item
+    reads = []
+
+    def _item(value: torch.Tensor) -> int:
+        reads.append(value)
+        return item(value)
+
+    monkeypatch.setattr(torch.Tensor, "item", _item)
+    with forward_context(ForwardContext(None, torch.device("cpu"), metadata, [])):
+        for _ in range(3):
+            assert glm5_next._kpool_max_kv_len(lengths) == 17
+    assert len(reads) == (0 if host_lengths else 1)
+
+    metadata.kv_seq_lens_host_values = [10, 18] if host_lengths else None
+    with forward_context(ForwardContext(None, torch.device("cpu"), metadata, [])):
+        assert glm5_next._kpool_max_kv_len(lengths + 1) == 18
+    assert len(reads) == (0 if host_lengths else 2)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4, 17])
 @torch.inference_mode()
 def test_indexer_key_weights_projection_preserves_parameters(num_tokens: int) -> None:
@@ -848,3 +873,22 @@ def test_fp32_tail_store_preserves_native_dtype_gate_rows_on_graph_replay() -> N
         torch.testing.assert_close(actual_tail, expected_tail, rtol=0, atol=0)
     finally:
         torch.use_deterministic_algorithms(deterministic)
+
+
+def test_compressed_kpool_rejects_ambiguous_segment_table() -> None:
+    with pytest.raises(ValueError, match="one row per request or query token"):
+        update_compressed_kpool(
+            torch.zeros(8, 2),
+            torch.zeros(8, 2),
+            torch.ones(8, dtype=torch.bool),
+            torch.ones(8, dtype=torch.bool),
+            torch.arange(8),
+            torch.zeros(4, 4, 1, 2),
+            torch.zeros(4, 2, 4, 2),
+            torch.tensor([1, 2]),
+            torch.tensor([1, 2]),
+            torch.zeros(4, 1, dtype=torch.int32),
+            [3, 5],
+            torch.zeros(4, 2),
+            4,
+        )

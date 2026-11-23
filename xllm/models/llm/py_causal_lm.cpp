@@ -296,6 +296,14 @@ PyCausalLM::PyCausalLM(const ModelContext& context, bool is_vlm)
       if (cp_size_ > 1) {
         per_rank_rows *= 2;
       }
+      // Prefill also uses MegaMoE. Per-sequence zigzag padding contributes
+      // fewer than two extra rows per CP rank before TP source sharding.
+      const int64_t max_tokens = static_cast<int64_t>(
+          SchedulerConfig::get_instance().max_tokens_per_batch());
+      const int64_t cp_rows = (max_tokens + cp_size_ - 1) / cp_size_ +
+                              (cp_size_ > 1 ? 2 * max_seqs : 0);
+      per_rank_rows =
+          std::max(per_rank_rows, (cp_rows + tp_size_ - 1) / tp_size_);
       comm_spec.max_num_tokens_per_rank = per_rank_rows;
     } else if (is_dsv41_mega_moe_model) {
       // EPLv2 routes the TP-local prefill rows through MegaMoE. The scheduler

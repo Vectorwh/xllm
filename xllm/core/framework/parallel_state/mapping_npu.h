@@ -130,12 +130,8 @@ class MappingNPU final {
 
   void get_cp_group(ParallelInfo& parallel_info);
 
-  // Build the KV-split parallel group. Layout reuses get_dp_group's stride
-  // scheme so that when `attn_kv_split_.group_size() == attn_cp_.group_size()`
-  // the resulting rank_ids match attn_cp_ exactly (and the ATB
-  // ExternalCommManager de-duplicates the HCCL commDomain). When kv_split_size
-  // == 1 each rank is its own group (no AllGather participants), matching the
-  // "full-replica / skip prefix AllGather" mode.
+  // Build KV-split groups within each DP replica, using CP's stride layout.
+  // Equal CP/KV widths share rank IDs; width 1 creates singleton groups.
   void get_kv_split_group(ParallelInfo& parallel_info);
 
   // Split every attention TP group into ordered contiguous layerwise-split

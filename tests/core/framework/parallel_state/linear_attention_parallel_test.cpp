@@ -139,5 +139,16 @@ TEST(LinearAttentionParallelTest,
   }
 }
 
+TEST(LinearAttentionParallelTest, CpHeadsAreUsedOnlyWithoutAttentionTp) {
+  const LinearAttentionPolicy policy{LinearHeadSharding::ATTENTION_TP_OR_CP,
+                                     false};
+  EXPECT_EQ(linear_head_tp_size(policy, /*attention_tp_size=*/1, /*cp_size=*/8),
+            8);
+  EXPECT_EQ(linear_head_tp_size(policy, /*attention_tp_size=*/2, /*cp_size=*/8),
+            2);
+  EXPECT_EQ(linear_head_tp_size(policy, /*attention_tp_size=*/2, /*cp_size=*/1),
+            2);
+}
+
 }  // namespace
 }  // namespace xllm

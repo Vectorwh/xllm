@@ -2652,6 +2652,39 @@ def test_eager_runner_preserves_qwen_pure_prefill_cp_context_contract() -> None:
     )
 
 
+def test_eager_runner_reuses_cp_plan_only_for_matching_geometry() -> None:
+    runner = _make_eager_runner()
+    metadata = SimpleNamespace(
+        is_prefill=True,
+        is_chunked_prefill=False,
+        is_mixed=False,
+        is_spec_verify=False,
+        q_seq_lens_host=torch.tensor([3, 5], dtype=torch.int32),
+        kv_seq_lens_host=torch.tensor([3, 5], dtype=torch.int32),
+    )
+    contexts = []
+
+    def execute_model(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        contexts.append(get_forward_context().cp_context)
+        return input_ids
+
+    runner.model.side_effect = execute_model
+    plans = [object(), object(), object()]
+    with patch(
+        "xllm.python.model_executor.runners.eager.build_cp_context",
+        side_effect=plans,
+    ) as build_context:
+        runner.execute(torch.zeros(8), torch.arange(8), metadata)
+        runner.execute(torch.zeros(8), torch.arange(8), metadata)
+        metadata.kv_seq_lens_host = torch.tensor([7, 9], dtype=torch.int32)
+        runner.execute(torch.zeros(8), torch.arange(8), metadata)
+        metadata.q_seq_lens_host = torch.tensor([4, 4], dtype=torch.int32)
+        runner.execute(torch.zeros(8), torch.arange(8), metadata)
+
+    assert build_context.call_count == 3
+    assert contexts == [plans[0], plans[0], plans[1], plans[2]]
+
+
 def test_eager_runner_skips_cp_for_empty_rank() -> None:
     runner = _make_eager_runner()
     metadata = SimpleNamespace(

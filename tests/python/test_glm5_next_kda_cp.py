@@ -1260,6 +1260,7 @@ def _forward_test_attention(enable_kda_cp: bool = True) -> glm5_next.Glm5NextKda
     attention.tp = 1
     # The config-channel switch (the ctor normally stores it from
     # cfg.enable_kda_cp; the __new__-based stub pins it directly).
+    attention.use_cp_head_sharding = False
     attention.enable_kda_cp = enable_kda_cp
     attention.in_proj_qkvbfg_a = lambda hidden: torch.cat(
         (hidden.expand(-1, -1, 3), hidden, hidden, hidden),

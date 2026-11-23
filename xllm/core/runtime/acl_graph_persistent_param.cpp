@@ -1317,15 +1317,16 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   const bool synthesize_empty_hybrid_q_cu =
       !has_q_cu && is_hybrid_spec_verify_chunked_prefill &&
       is_empty_qwen3_5_dp_graph_rank;
-  // V3.2 LightningIndexer executes padded queries even on an empty DP shard.
-  // Its cumulative lengths must cover every padded row. This graph-only
+  // DeepSeek V3.2 and GLM DSA use LightningIndexer for padded queries even on
+  // an empty DP shard. Its cumulative lengths must cover every padded row. This
   // update receives pre-graph params: enable_graph is set on the returned
   // graph_params below, so use the executor options rather than that input bit.
   // Empty shards may have either undefined or defined-but-empty lengths.
   const bool synthesize_empty_decode_q_cu =
       !has_q_cu && options_.enable_graph() &&
-      args_.model_type() == "deepseek_v32" && is_empty_dp_graph_rank &&
-      is_decode && !is_hybrid_linear_attention_;
+      (args_.model_type() == "deepseek_v32" ||
+       args_.model_type() == "glm_moe_dsa") &&
+      is_empty_dp_graph_rank && is_decode && !is_hybrid_linear_attention_;
   const bool synthesize_empty_q_cu =
       synthesize_empty_hybrid_q_cu || synthesize_empty_decode_q_cu;
   if (has_q_cu || synthesize_empty_q_cu) {

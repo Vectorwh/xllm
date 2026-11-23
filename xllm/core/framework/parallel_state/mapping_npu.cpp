@@ -20,6 +20,7 @@ limitations under the License.
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 #define MAX_LCCL_COMM_DOMAIN 63
 #define ENV_enable_extra_o_proj_tp false
@@ -84,7 +85,8 @@ MappingNPU::MappingNPU(const std::string rank_table_file,
   get_tp_group(lm_head_tp_);
   get_dp_group(lm_head_dp_);
   get_tp_group(attn_inner_sp_);
-  get_dp_group(attn_cp_);
+  // Emit exactly world_size / cp_size groups, without the legacy extra tail.
+  get_cp_group(attn_cp_);
   // KV-split group lives alongside attn_cp_. When kv_split_size == cp_size
   // (the default fallback) it produces an identical rank_ids list, so the ATB
   // ExternalCommManager will de-dup the underlying HCCL commDomain. When
@@ -247,12 +249,6 @@ void MappingNPU::validate() {
       << "World size should be multiple of the number of nodes. "
          "Please check `world_size` and `ranktablefile`.";
 
-  /* TODO: Decouple the initialization processes of DP and CP, remove this
-   * constraint */
-  if (attn_cp_.group_size() > 1) {
-    CHECK(attn_dp_.group_size() == 1) << "DP size should be 1 if CP size > 1";
-  }
-
   // kv_split_size must be 1 or a divisor of cp_size (<= cp_size).
   const int32_t kv_split = attn_kv_split_.group_size();
   const int32_t cp_sz = std::max(1, attn_cp_.group_size());
@@ -397,13 +393,41 @@ void MappingNPU::get_dp_group(ParallelInfo& parallel_info) {
   parallel_info.rank(local_rank);
 }
 
+void MappingNPU::get_cp_group(ParallelInfo& parallel_info) {
+  // CP and KV ownership vary inside a DP replica, whose layout is [CP, TP].
+  const int32_t dp_size = attn_dp_.group_size();
+  const int32_t dp_width = world_size_ / dp_size;
+  const int32_t group_size = parallel_info.group_size();
+  CHECK_EQ(dp_width % group_size, 0)
+      << "Invalid CP grouping: dp_width=" << dp_width
+      << " group_size=" << group_size;
+  const int32_t stride = dp_width / group_size;
+  const int32_t num_groups = world_size_ / group_size;
+  std::vector<std::vector<int32_t>> rank_per_group;
+  rank_per_group.reserve(num_groups);
+  for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
+    const int32_t dp_start = dp_rank * dp_width;
+    for (int32_t offset = 0; offset < stride; ++offset) {
+      auto& ranks = rank_per_group.emplace_back();
+      ranks.reserve(group_size);
+      for (int32_t member = 0; member < group_size; ++member) {
+        ranks.emplace_back(dp_start + offset + member * stride);
+      }
+    }
+  }
+  auto [group_id, local_rank] = get_current_group_id(rank_per_group, rank_);
+  CHECK(group_id >= 0 && local_rank >= 0)
+      << "CP group does not contain rank=" << rank_
+      << " world_size=" << world_size_ << " dp_size=" << dp_size
+      << " group_size=" << group_size;
+  parallel_info.num_group(num_groups);
+  parallel_info.rank_per_group(std::move(rank_per_group));
+  parallel_info.current_group_id(group_id);
+  parallel_info.rank(local_rank);
+}
+
 void MappingNPU::get_kv_split_group(ParallelInfo& parallel_info) {
-  // Reuse the get_dp_group stride layout. The stride is world_size /
-  // group_size, so when group_size == attn_cp_.group_size() the produced
-  // rank_per_group is identical to attn_cp_'s and ATB will de-dup the HCCL
-  // commDomain. When group_size == 1 each rank is its own single-element group,
-  // i.e. no collective communication will be issued for KV split.
-  get_dp_group(parallel_info);
+  get_cp_group(parallel_info);
 }
 
 void MappingNPU::get_layerwise_split_group(ParallelInfo& parallel_info) {

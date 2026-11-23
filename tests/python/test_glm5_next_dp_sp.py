@@ -52,13 +52,14 @@ def _cfg(dp: int, rank: int) -> glm5_next.Glm5NextConfig:
 
 def _context(counts: tuple[int, ...], raw: tuple[int, ...], **kwargs: object) -> SimpleNamespace:
     return SimpleNamespace(
+        layer_shared_cache={},
         metadata=SimpleNamespace(
             dp_execution_token_counts=counts,
             raw_dp_execution_token_counts=raw,
             is_spec_verify=False,
             expanded_decode_metadata=None,
             **kwargs,
-        )
+        ),
     )
 
 
@@ -93,6 +94,7 @@ def test_pcp_prefill_shards_use_pcp_mask_and_one_ep_capacity(
     global_counts = (3,) if dp == 1 else (3, 7)
     dispatch_tokens = set()
     owners = set()
+    monkeypatch.setattr(glm5_next.distributed, "all_gather", lambda rows, *args: rows.repeat(8), raising=False)
     for global_rank in range(8):
         dp_rank = global_rank // (pcp * tp)
         cp_rank = (global_rank // tp) % pcp
@@ -125,6 +127,9 @@ def test_empty_dp_pcp_prefill_uses_active_dispatch_and_inactive_mask(monkeypatch
     policy = Eplv2CommPolicy(512)
     dispatch_tokens = set()
     backends = set()
+    monkeypatch.setattr(
+        glm5_next.distributed, "all_gather", lambda rows, *args: torch.tensor([2] * 4 + [1] * 4), raising=False
+    )
     for global_rank in range(dp * pcp * tp):
         dp_rank = global_rank // (pcp * tp)
         cp_rank = (global_rank // tp) % pcp
@@ -153,8 +158,49 @@ def test_empty_dp_pcp_prefill_uses_active_dispatch_and_inactive_mask(monkeypatch
         if empty:
             assert mask.tolist() == [False]
             assert not layout.shard(torch.zeros(1, dtype=torch.bool)).any()
-    assert dispatch_tokens == {8}
+    assert dispatch_tokens == {2}
     assert len(backends) == 1
+
+
+def test_pcp_capacity_uses_actual_shards_and_is_shared_between_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(2, 0)
+    cfg.cp_size, cfg.cp_rank, cfg.tp_size, cfg.tp_rank = 8, 0, 1, 0
+    cfg.ep_size = 16
+    context = _context((16384, 1), (16384, 1), is_prefill=True)
+    context.cp_context = SimpleNamespace(cp_size=8, cp_rank=0, shard_valid_mask=torch.ones(2048, dtype=torch.bool))
+    gather = Mock(return_value=torch.tensor([2048] * 8 + [1] * 8))
+    monkeypatch.setattr(glm5_next.distributed, "all_gather", gather, raising=False)
+    monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
+    monkeypatch.setattr(glm5_next, "in_acl_graph", lambda: False)
+    for _ in range(2):
+        layout, _ = glm5_next._eplv2_token_layout(cfg, torch.ones(2048, 8), Eplv2CommPolicy(4096))
+        assert layout.dispatch_tokens == 2048
+        assert layout.routed_backend == "mc2"
+    gather.assert_called_once()
+
+
+def test_pcp_capacity_host_exchange_retains_peer_max_without_npu_collective(monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _cfg(2, 0)
+    cfg.tp_size = 1
+    context = _context((16384, 1), (16384, 1), is_prefill=True)
+    group = object()
+    context.layer_shared_cache[(glm5_next._pcp_dp_dispatch_rows, "host_group")] = group
+    monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: context)
+    device_exchange = Mock(side_effect=AssertionError("capacity must not use the NPU stream"))
+    monkeypatch.setattr(glm5_next.distributed, "all_gather", device_exchange, raising=False)
+
+    def reduce(rows: torch.Tensor, *, op: object, group: object) -> None:
+        assert rows.device.type == "cpu"
+        assert rows.item() == 1
+        rows.fill_(2050)
+
+    host_exchange = Mock(side_effect=reduce)
+    monkeypatch.setattr(glm5_next.dist, "all_reduce", host_exchange)
+    for _ in range(2):
+        assert glm5_next._pcp_dp_dispatch_rows(cfg, (16384, 0), torch.ones(1, 8)) == 2050
+    host_exchange.assert_called_once()
+    assert host_exchange.call_args.kwargs["group"] is group
+    device_exchange.assert_not_called()
 
 
 @pytest.mark.parametrize("dp,pcp,tp", [(1, 2, 4), (2, 2, 2)])
@@ -246,6 +292,25 @@ def test_only_routed_transport_is_padded_shared_keeps_local_rows(backend: str, m
     if backend == "mc2":
         assert routed.call_args.kwargs["x_active_mask"].tolist() == [True, False, False]
         assert routed.call_args.kwargs["ep_rank"] == 4
+
+
+@pytest.mark.parametrize("backend", ["mc2", "alltoall", "megamoe"])
+def test_shared_expert_overlap_remains_enabled_for_all_transports(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(2, 4)
+    cfg.eplv2_shared_overlap = True
+    layer = glm5_next.Glm5NextMoE(cfg, torch.float32, torch.device("cpu"))
+    layer.use_w8a8 = True
+    layer._shared_stream = object()
+    source = Mock(side_effect=lambda hidden, *args, **kwargs: hidden)
+    monkeypatch.setattr(layer, "_forward_source", source)
+    monkeypatch.setattr(glm5_next, "get_forward_context_or_none", lambda: None)
+    layout = TokenParallelLayout(1, cfg.tp_size, cfg.tp_rank, backend, dispatch_rows=1)
+    hidden = torch.ones(1, cfg.hidden_size)
+    mask = torch.ones(1, dtype=torch.bool)
+    torch.testing.assert_close(layer(hidden, token_layout=layout, token_mask=mask), hidden)
+    assert source.call_args.kwargs["shared_stream"] is layer._shared_stream
 
 
 @pytest.mark.parametrize("rank,expected", [(0, [True, True, True, False]), (1, [True, False, False, False])])

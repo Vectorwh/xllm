@@ -132,6 +132,9 @@ def update_compressed_kpool(
     if sum(query_lens) != flat_k.shape[0]:
         raise ValueError("kPool query groups must cover every token row")
 
+    if block_table.ndim != 2 or block_table.shape[0] not in (len(query_lens), sum(query_lens)):
+        raise ValueError("kPool block table must have one row per request or query token")
+
     head_dim = flat_k.shape[-1]
     if compressed_cache.shape[-1] != head_dim or tail_cache.shape[-1] != head_dim:
         raise ValueError("kPool cache and tail dimensions must match projected K")
@@ -142,8 +145,7 @@ def update_compressed_kpool(
         fused_states is not None
         and raw_k.device.type == "npu"
         and query_lens
-        and query_lens[0] > 0
-        and all(length == query_lens[0] for length in query_lens)
+        and all(length > 0 for length in query_lens)
         and head_dim <= 128
         and compressed_cache.is_contiguous()
         and tail_cache.is_contiguous()
@@ -151,21 +153,58 @@ def update_compressed_kpool(
     ):
         from xllm.python.kernels_npu.triton.kpool_compress import store_fused_kpool
 
-        store_fused_kpool(
-            raw_k,
-            gate_scores,
-            valid_rows,
-            tail_valid_rows,
-            positions,
-            compressed_cache,
-            tail_cache,
-            tail_read_ids,
-            tail_write_ids,
-            block_table,
-            query_lens[0],
-            rate,
-            list(fused_states),
-        )
+        # Prefix restores can read a slot another request will replace.
+        # Snapshot both old read/write slots for this batch before any launch;
+        # storage is O(batch), independent of the total tail-cache capacity.
+        read_tail = None
+        if tail_read_ids is not tail_write_ids:
+            snapshot_ids = torch.stack(
+                (tail_read_ids.reshape(-1)[: len(query_lens)], tail_write_ids.reshape(-1)[: len(query_lens)]), dim=1
+            )
+            read_tail = tail_cache.index_select(0, snapshot_ids.reshape(-1).long().clamp(0, tail_cache.shape[0] - 1))
+        if all(length == query_lens[0] for length in query_lens):
+            store_fused_kpool(
+                raw_k,
+                gate_scores,
+                valid_rows,
+                tail_valid_rows,
+                positions,
+                compressed_cache,
+                tail_cache,
+                tail_read_ids,
+                tail_write_ids,
+                block_table,
+                query_lens[0],
+                rate,
+                list(fused_states),
+                read_tail_cache=read_tail,
+            )
+        else:
+            row_start = 0
+            for request, query_len in enumerate(query_lens):
+                row_end = row_start + query_len
+                read_ids = tail_read_ids.reshape(-1)[request : request + 1]
+                write_ids = (
+                    read_ids if tail_read_ids is tail_write_ids else tail_write_ids.reshape(-1)[request : request + 1]
+                )
+                table_row = request if block_table.shape[0] == len(query_lens) else row_start
+                store_fused_kpool(
+                    flat_k[row_start:row_end],
+                    flat_gate[row_start:row_end],
+                    flat_valid[row_start:row_end],
+                    flat_tail_valid[row_start:row_end],
+                    flat_positions[row_start:row_end],
+                    compressed_cache,
+                    tail_cache,
+                    read_ids,
+                    write_ids,
+                    block_table[table_row : table_row + 1],
+                    query_len,
+                    rate,
+                    [fused_states[request]],
+                    read_tail_cache=None if read_tail is None else read_tail[2 * request : 2 * request + 2],
+                )
+                row_start = row_end
         return
 
     _store_compressed_kpool_torch(

@@ -32,15 +32,16 @@ def _store_fused_pool(
     table_ptr,
     request,
     read_id,
+    read_slot,
     first_position,
     pool,
     NUM_POOL_BLOCKS: tl.constexpr,
     POOL_BLOCK_SIZE: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
-    TABLE_REQUEST_STRIDE: tl.constexpr,
+    TABLE_WIDTH,
+    TABLE_REQUEST_STRIDE,
     TAIL_CAPACITY: tl.constexpr,
-    POOLED_ROWS: tl.constexpr,
-    QUERY_LEN: tl.constexpr,
+    POOLED_ROWS,
+    QUERY_LEN,
     RATE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -60,7 +61,7 @@ def _store_fused_pool(
         from_current = (source >= 0) & (source < QUERY_LEN) & (current_position == position)
         current_valid = tl.load(valid_ptr + first_row + safe_source).to(tl.int1)
         old_gate = tl.load(
-            tail_ptr + ((read_id * 2 + 1) * TAIL_CAPACITY + position % TAIL_CAPACITY) * HEAD_DIM,
+            tail_ptr + ((read_slot * 2 + 1) * TAIL_CAPACITY + position % TAIL_CAPACITY) * HEAD_DIM,
             mask=position >= 0,
             other=float("-inf"),
         ).to(tl.float32)
@@ -86,7 +87,21 @@ def _store_fused_pool(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "valid_ptr",
+        "positions_ptr",
+        "pooled_ptr",
+        "cache_ptr",
+        "tail_ptr",
+        "read_ids_ptr",
+        "table_ptr",
+        "POOLED_ROWS",
+        "QUERY_LEN",
+        "TABLE_WIDTH",
+        "TABLE_REQUEST_STRIDE",
+    ]
+)
 def _store_fused_pools_kernel(
     valid_ptr,
     positions_ptr,
@@ -96,13 +111,14 @@ def _store_fused_pools_kernel(
     table_ptr,
     read_ids_ptr,
     NUM_TAIL_SLOTS: tl.constexpr,
+    SNAPSHOT_TAIL_IO: tl.constexpr,
     NUM_POOL_BLOCKS: tl.constexpr,
     POOL_BLOCK_SIZE: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
-    TABLE_REQUEST_STRIDE: tl.constexpr,
+    TABLE_WIDTH,
+    TABLE_REQUEST_STRIDE,
     TAIL_CAPACITY: tl.constexpr,
-    POOLED_ROWS: tl.constexpr,
-    QUERY_LEN: tl.constexpr,
+    POOLED_ROWS,
+    QUERY_LEN,
     RATE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -121,6 +137,7 @@ def _store_fused_pools_kernel(
         table_ptr,
         request,
         read_id,
+        request * 2 if SNAPSHOT_TAIL_IO else read_id,
         first_position,
         pool,
         NUM_POOL_BLOCKS,
@@ -136,7 +153,27 @@ def _store_fused_pools_kernel(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "keys_ptr",
+        "gates_ptr",
+        "valid_ptr",
+        "tail_valid_ptr",
+        "positions_ptr",
+        "pooled_ptr",
+        "states_ptr",
+        "cache_ptr",
+        "tail_ptr",
+        "read_tail_ptr",
+        "read_ids_ptr",
+        "write_ids_ptr",
+        "table_ptr",
+        "POOLED_ROWS",
+        "QUERY_LEN",
+        "TABLE_WIDTH",
+        "TABLE_REQUEST_STRIDE",
+    ]
+)
 def _store_fused_kpool_kernel(
     keys_ptr,
     gates_ptr,
@@ -147,23 +184,25 @@ def _store_fused_kpool_kernel(
     states_ptr,
     cache_ptr,
     tail_ptr,
+    read_tail_ptr,
     read_ids_ptr,
     write_ids_ptr,
     table_ptr,
     NUM_TAIL_SLOTS: tl.constexpr,
+    SNAPSHOT_TAIL_IO: tl.constexpr,
     NUM_POOL_BLOCKS: tl.constexpr,
     POOL_BLOCK_SIZE: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
-    TABLE_REQUEST_STRIDE: tl.constexpr,
+    TABLE_WIDTH,
+    TABLE_REQUEST_STRIDE,
     TAIL_CAPACITY: tl.constexpr,
-    POOLED_ROWS: tl.constexpr,
-    QUERY_LEN: tl.constexpr,
+    POOLED_ROWS,
+    QUERY_LEN,
     RATE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_TAIL: tl.constexpr,
     BLOCK_Q: tl.constexpr,
-    STASH_START: tl.constexpr,
+    SMALL_QUERY: tl.constexpr,
     DISTINCT_TAIL_IO: tl.constexpr,
 ):
     """Store CANN results without recomputing pooling or serial tensor writes."""
@@ -177,19 +216,20 @@ def _store_fused_kpool_kernel(
     write_id = tl.minimum(tl.maximum(write_id, 0), NUM_TAIL_SLOTS - 1)
     first_position = tl.load(positions_ptr + first_row).to(tl.int64)
 
-    # A request owns its tail and pool slots. Read the old tail for every
-    # completion before replacing any of that request's circular history.
-    if QUERY_LEN <= 8:
-        for pool in tl.static_range((QUERY_LEN + RATE - 1) // RATE):
+    # Write slots belong to one request. Read slots may alias other requests'
+    # write slots; out-of-place restores read the batch snapshot instead.
+    if SMALL_QUERY:
+        for pool in tl.static_range((8 + RATE - 1) // RATE):
             _store_fused_pool(
                 valid_ptr,
                 positions_ptr,
                 pooled_ptr,
                 cache_ptr,
-                tail_ptr,
+                read_tail_ptr,
                 table_ptr,
                 request,
                 read_id,
+                request * 2 if SNAPSHOT_TAIL_IO else read_id,
                 first_position,
                 pool,
                 NUM_POOL_BLOCKS,
@@ -209,12 +249,14 @@ def _store_fused_kpool_kernel(
     base_id = write_id
     if DISTINCT_TAIL_IO:
         base_id = tl.where((read_id > 0) & (write_id > 0), read_id, write_id)
+    if SNAPSHOT_TAIL_IO:
+        base_id = request * 2 + tl.where((read_id > 0) & (write_id > 0), 0, 1)
     base = (base_id * 2 * TAIL_CAPACITY + tail_rows[:, None]) * HEAD_DIM + dims[None, :]
-    keys = tl.load(tail_ptr + base, tail_mask, other=0).to(tl.float32)
-    gates = tl.load(tail_ptr + base + TAIL_CAPACITY * HEAD_DIM, tail_mask, other=float("-inf")).to(tl.float32)
+    keys = tl.load(read_tail_ptr + base, tail_mask, other=0).to(tl.float32)
+    gates = tl.load(read_tail_ptr + base + TAIL_CAPACITY * HEAD_DIM, tail_mask, other=float("-inf")).to(tl.float32)
     # Select the last current token for each ring row in registers. Padded
     # rows never write, even when their clamped position aliases a live row.
-    for offset in tl.static_range(STASH_START, QUERY_LEN):
+    for offset in range(tl.maximum(0, QUERY_LEN - TAIL_CAPACITY), QUERY_LEN):
         position = tl.load(positions_ptr + first_row + offset).to(tl.int64)
         valid = tl.load(tail_valid_ptr + first_row + offset).to(tl.int1)
         current_keys = tl.load(keys_ptr + (first_row + offset) * HEAD_DIM + dims, dim_valid, other=0)
@@ -255,6 +297,8 @@ def store_fused_kpool(
     query_len: int,
     rate: int,
     fused_states: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    read_tail_cache: torch.Tensor | None = None,
 ) -> None:
     """Persist uniform queries, retaining CANN's exact FP32 tail."""
     if len(fused_states) == 1:
@@ -264,7 +308,11 @@ def store_fused_kpool(
         pooled = torch.stack([state[0] for state in fused_states])
         states = torch.stack([state[1] for state in fused_states])
     head_dim = raw_k.shape[-1]
+    snapshot_tail_io = read_tail_cache is not None
+    read_tail_cache = tail_cache if read_tail_cache is None else read_tail_cache
     requests = len(fused_states)
+    if block_table.ndim != 2 or block_table.shape[0] not in (requests, requests * query_len):
+        raise ValueError("kPool block table must have one row per request or query token")
     table_stride = block_table.stride(0) * (query_len if block_table.shape[0] != requests else 1)
     if query_len > 8:
         _store_fused_pools_kernel[(requests, triton.cdiv(query_len, rate))](
@@ -272,10 +320,11 @@ def store_fused_kpool(
             positions.reshape(-1).contiguous(),
             pooled,
             compressed_cache,
-            tail_cache,
+            read_tail_cache,
             block_table,
             tail_read_ids.reshape(-1).contiguous(),
             NUM_TAIL_SLOTS=tail_cache.shape[0],
+            SNAPSHOT_TAIL_IO=snapshot_tail_io,
             NUM_POOL_BLOCKS=compressed_cache.shape[0],
             POOL_BLOCK_SIZE=compressed_cache.shape[1],
             TABLE_WIDTH=block_table.shape[1],
@@ -297,10 +346,12 @@ def store_fused_kpool(
         states,
         compressed_cache,
         tail_cache,
+        read_tail_cache,
         tail_read_ids.reshape(-1).contiguous(),
         tail_write_ids.reshape(-1).contiguous(),
         block_table,
         NUM_TAIL_SLOTS=tail_cache.shape[0],
+        SNAPSHOT_TAIL_IO=snapshot_tail_io,
         NUM_POOL_BLOCKS=compressed_cache.shape[0],
         POOL_BLOCK_SIZE=compressed_cache.shape[1],
         TABLE_WIDTH=block_table.shape[1],
@@ -313,7 +364,7 @@ def store_fused_kpool(
         BLOCK_D=triton.next_power_of_2(head_dim),
         BLOCK_TAIL=triton.next_power_of_2(tail_cache.shape[2]),
         BLOCK_Q=triton.next_power_of_2(query_len),
-        STASH_START=max(0, query_len - tail_cache.shape[2]),
+        SMALL_QUERY=query_len <= 8,
         DISTINCT_TAIL_IO=tail_read_ids is not tail_write_ids,
     )
 

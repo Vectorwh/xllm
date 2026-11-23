@@ -24,9 +24,11 @@ import torch.nn.functional as functional
 
 from xllm.python.attention.kda_linear_attention import (
     KdaLinearAttentionMixin,
+    _has_adjacent_state_indices,
     _take_leading_token_rows,
 )
 from xllm.python.layers.qlinear import QLinearWeightLoader
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import glm5_next
 from xllm.python.models.glm5_next import _KDA_IN_PROJ
 
@@ -76,6 +78,31 @@ def test_leading_token_rows_slice_tokens_when_heads_equal_bucket() -> None:
     assert _take_leading_token_rows(None, 8, 6) is None
 
 
+def test_state_index_check_is_shared_only_within_one_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    indices = torch.tensor([2, 5, 7], dtype=torch.int32)
+    original_item = torch.Tensor.item
+    reads = 0
+
+    def item(tensor: torch.Tensor) -> object:
+        nonlocal reads
+        reads += 1
+        return original_item(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "item", item)
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
+        assert not _has_adjacent_state_indices(indices)
+        assert not _has_adjacent_state_indices(indices)
+        indices[1] = indices[0]
+        assert _has_adjacent_state_indices(indices)
+    assert reads == 2
+
+    indices[1] = indices[0]
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
+        assert _has_adjacent_state_indices(indices)
+        assert _has_adjacent_state_indices(indices)
+    assert reads == 3
+
+
 class _StateDict:
     def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
         self.tensors = tensors
@@ -87,8 +114,18 @@ class _StateDict:
         return self.tensors[name]
 
 
-def _make_model(tp_size: int, tp_rank: int) -> tuple[glm5_next.Glm5NextForCausalLM, dict[str, torch.Tensor]]:
-    config = glm5_next.Glm5NextConfig(hidden_size=32, kda_num_heads=8, kda_head_dim=8, tp_size=tp_size, tp_rank=tp_rank)
+def _make_model(
+    tp_size: int, tp_rank: int, *, cp_size: int = 1, cp_rank: int = 0
+) -> tuple[glm5_next.Glm5NextForCausalLM, dict[str, torch.Tensor]]:
+    config = glm5_next.Glm5NextConfig(
+        hidden_size=32,
+        kda_num_heads=8,
+        kda_head_dim=8,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
     attention = glm5_next.Glm5NextKdaAttention(config, 0, torch.float32, torch.device("cpu"))
     model = glm5_next.Glm5NextForCausalLM.__new__(glm5_next.Glm5NextForCausalLM)
     torch.nn.Module.__init__(model)
@@ -118,7 +155,9 @@ def _make_model(tp_size: int, tp_rank: int) -> tuple[glm5_next.Glm5NextForCausal
     tensors = {
         _ATTENTION_PREFIX + name: torch.randn(shape, generator=generator) * 0.1 for name, shape in shapes.items()
     }
-    loader = QLinearWeightLoader(model, [_StateDict(tensors)], tp_size, tp_rank)
+    loader = QLinearWeightLoader(
+        model, [_StateDict(tensors)], config.kda_head_parallel_size, config.kda_head_parallel_rank
+    )
     model._load_kda_attn(loader, _ATTENTION_PREFIX, 0)
     return model, tensors
 
@@ -800,3 +839,28 @@ def test_real_kda_merged_projection_graph_replay(
             record_property(f"replay_{replay_index}_{name}_relative_l2", relative_l2)
             assert max_error <= torch.finfo(torch.bfloat16).eps * reference_peak + 1e-5, name
             assert relative_l2 <= 1e-3, name
+
+
+@pytest.mark.parametrize("tp_size,tp_rank,cp_size,cp_rank,width,rank", [(1, 0, 4, 3, 4, 3), (2, 1, 4, 3, 2, 1)])
+@torch.inference_mode()
+def test_cp_head_projection_and_state_weights_follow_same_shard(
+    tp_size: int, tp_rank: int, cp_size: int, cp_rank: int, width: int, rank: int
+) -> None:
+    model, tensors = _make_model(tp_size, tp_rank, cp_size=cp_size, cp_rank=cp_rank)
+    attention = model.model.layers[0].self_attn
+    assert model.cfg.kda_head_parallel_size == width
+    assert model.cfg.kda_head_parallel_rank == rank
+    assert attention.num_heads_local == 8 // width
+    expected = torch.cat(_input_weights(tensors, width, rank), dim=0)
+    torch.testing.assert_close(attention.in_proj_qkvbfg_a.weight, expected)
+    for name, actual in [
+        ("forget_gate.f_b_proj.weight", attention.forget_gate.f_b_proj.weight),
+        ("forget_gate.dt_bias", attention.forget_gate.dt_bias),
+        ("forget_gate.A_log", attention.forget_gate.A_log),
+        ("g_b_proj.weight", attention.g_b_proj.weight),
+    ]:
+        torch.testing.assert_close(actual, _shard_rows(tensors[_ATTENTION_PREFIX + name], width, rank))
+    torch.testing.assert_close(
+        attention.o_proj.weight,
+        tensors[_ATTENTION_PREFIX + "o_proj.weight"].chunk(width, dim=1)[rank],
+    )

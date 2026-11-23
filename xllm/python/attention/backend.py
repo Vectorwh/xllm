@@ -406,6 +406,9 @@ class AttentionBackend(ABC):
         topk: torch.Tensor | None = None,
         cache_is_preprocessed: bool = False,
         unabsorbed_prefill: MlaUnabsorbedPrefill | None = None,
+        cp_local_output: bool = False,
+        cp_local_query: bool = False,
+        cp_local_topk: bool = False,
     ) -> torch.Tensor:
         """Absorbed-MLA attention over paged latent (nope) + rope caches.
 
@@ -417,6 +420,13 @@ class AttentionBackend(ABC):
         ``unabsorbed_prefill`` explicitly requests expanded K/V for full
         prefill and returns ``[T, H, value_dim]`` instead; the caller must not
         apply ``W_UV`` again. Existing callers leave this argument unset.
+
+        ``cp_local_output`` requests this CP rank's padded local rows instead
+        of a global output with zeroed peer rows. Only CP NoPE sparse MLA
+        supports this layout; cache writes still consume global input rows.
+        ``cp_local_query`` also accepts queries in that padded local layout;
+        ``cp_local_topk`` accepts top-k indices in that same padded local
+        row order. Latent-cache inputs retain their global row order.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support MLA")
 

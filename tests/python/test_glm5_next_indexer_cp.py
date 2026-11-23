@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import glm5_next
 from xllm.python.models.glm5_next_kpool import update_compressed_kpool
 
@@ -161,6 +162,37 @@ def test_select_qli_query_rows_partition_matches_full_stream() -> None:
     outside[rows] = False
     assert bool((sliced[outside] == -1).all()), "rows outside query_rows must stay -1 in the full-layout output"
 
+    local_rows = torch.cat((torch.arange(128), torch.arange(KV_LEN - 128, KV_LEN)))
+    shard_index = torch.cat((local_rows, torch.tensor([-1])))
+    cp_context = SimpleNamespace(
+        total_local=shard_index.numel(),
+        shard_index=shard_index,
+        shard_gather_index=shard_index.clamp_min(0),
+        shard_valid_mask=shard_index >= 0,
+        query_index=torch.arange(local_rows.numel()),
+        q_cu_seqlens=[128, local_rows.numel()],
+    )
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=cp_context)):
+        local = indexer.select_qli(
+            hidden, qr, positions, mask, ctx, None, backend, query_rows=local_rows, cp_local_output=True
+        )
+    assert local.shape[0] == cp_context.total_local
+    torch.testing.assert_close(local[cp_context.query_index], full[local_rows], rtol=0, atol=0)
+
+    rows = torch.tensor([2, 0, 5, 7, KV_LEN])
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
+        first = glm5_next._kpool_query_rows_by_sequence(rows, [4, 4], 8)
+        repeated = glm5_next._kpool_query_rows_by_sequence(rows, [4, 4], 8)
+        assert repeated is first
+        assert [part.tolist() for part in first] == [[2, 0], [5, 7]]
+        trimmed = glm5_next._kpool_query_rows_by_sequence(rows, [4, 2], 6)
+        assert [part.tolist() for part in trimmed] == [[2, 0], [5]]
+    rows[0] = 3
+    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
+        next_forward = glm5_next._kpool_query_rows_by_sequence(rows, [4, 4], 8)
+        assert next_forward is not first
+        assert [part.tolist() for part in next_forward] == [[3, 0], [5, 7]]
+
 
 @torch.inference_mode()
 def test_select_qli_query_rows_empty_fills_invalid() -> None:
@@ -207,3 +239,75 @@ def test_select_qli_query_rows_active_under_kv_split_replicated(monkeypatch: pyt
     monkeypatch.setattr(glm5_next, "cp_index_write_replicated", lambda: False)
     fallback = _select_qli(rows)
     assert torch.equal(fallback, full), "sharded kv_split must fall back to the full stream verbatim"
+
+
+@pytest.mark.parametrize("query_lens", [(4, 4), (5, 3)])
+@torch.inference_mode()
+def test_select_qli_partition_preserves_request_histories(
+    monkeypatch: pytest.MonkeyPatch, query_lens: tuple[int, int]
+) -> None:
+    """CP rows spanning two requests must use their respective causal histories."""
+    torch.manual_seed(43)
+    indexer, _, _, _, _, ctx, _ = _wired_select_qli_inputs()
+    total = sum(query_lens)
+    hidden = torch.randn(1, total, 16, dtype=torch.bfloat16)
+    qr = torch.randn(total, 16, dtype=torch.bfloat16)
+    positions = torch.cat([torch.arange(KV_LEN - length, KV_LEN) for length in query_lens]).unsqueeze(0)
+    mask = torch.ones(1, total, dtype=torch.bool)
+    history = torch.randn(2, KV_LEN, HEAD_DIM * 2 + 1, dtype=torch.bfloat16)
+    history[..., -1] = 1
+    ctx.block_table = torch.tensor([[0], [1]], dtype=torch.int32)
+    ctx.actual_seq_kv = torch.tensor([KV_LEN, KV_LEN])
+    metadata = SimpleNamespace(q_cu_seq_lens=torch.tensor([0, query_lens[0], total]))
+    monkeypatch.setattr(
+        glm5_next, "get_forward_context", lambda: SimpleNamespace(layer_shared_cache={}, metadata=metadata)
+    )
+    backend = SimpleNamespace(gather_index_history=lambda *_: history)
+    rows = torch.tensor([1, query_lens[0] - 1, query_lens[0] + 1, total - 1])
+    full = indexer.select_qli(hidden, qr, positions, mask, ctx, None, backend)
+    partitioned = indexer.select_qli(hidden, qr, positions, mask, ctx, None, backend, query_rows=rows)
+    assert torch.equal(partitioned[rows], full[rows])
+    outside = torch.ones(total, dtype=torch.bool)
+    outside[rows] = False
+    assert bool((partitioned[outside] == -1).all())
+
+
+@torch.inference_mode()
+def test_select_qli_partition_preserves_paged_request_caches() -> None:
+    """Unequal requests must retain distinct pool-cache pages during CP scoring."""
+    torch.manual_seed(44)
+    indexer = _indexer(torch.device("cpu"))
+    indexer.index_kpool_compress_gate.zero_()
+    indexer.index_kpool_compress_ape.zero_()
+    indexer.process_weights_after_loading()
+    indexer._uses_npu_compressed_tail = True
+    query_lens = (8, 12)
+    total = sum(query_lens)
+    hidden = torch.randn(1, total, 16, dtype=torch.bfloat16)
+    qr = torch.randn(total, 16, dtype=torch.bfloat16)
+    positions = torch.cat([torch.arange(length) for length in query_lens]).unsqueeze(0)
+    mask = torch.ones(1, total, dtype=torch.bool)
+    cache = torch.zeros(3, POOLS_PER_BLOCK, 1, HEAD_DIM, dtype=torch.bfloat16)
+    tail = torch.zeros(3, 2, RATE, HEAD_DIM, dtype=torch.bfloat16)
+    ctx = SimpleNamespace(
+        index_cache=cache,
+        slot_mapping=torch.arange(1, total + 1, dtype=torch.int64),
+        block_table=torch.tensor([[1], [2]], dtype=torch.int32),
+        actual_seq_kv=torch.tensor(query_lens),
+        kpool_tail=tail,
+        kpool_tail_read_indices=torch.tensor([1, 2], dtype=torch.int32),
+        kpool_tail_write_indices=torch.tensor([1, 2], dtype=torch.int32),
+        kpool_query_lens=query_lens,
+        has_kv_shard=False,
+        localize_pool_block_table=lambda table: table,
+    )
+    rows = torch.tensor([3, 7, 11, 15, 19])
+    full = indexer.select_qli(hidden, qr, positions, mask, ctx, None, None)
+    assert not torch.equal(cache[1], cache[2])
+    cache.zero_()
+    tail.zero_()
+    partitioned = indexer.select_qli(hidden, qr, positions, mask, ctx, None, None, query_rows=rows)
+    assert torch.equal(partitioned[rows], full[rows])
+    outside = torch.ones(total, dtype=torch.bool)
+    outside[rows] = False
+    assert bool((partitioned[outside] == -1).all())

@@ -51,6 +51,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -66,6 +67,7 @@ from xllm.python.layers.moe import MoECore, clamped_silu_and_mul, clamped_silu_a
 from xllm.python.layers.moe_parallel import Eplv2CommPolicy
 from xllm.python.layers.npu.glm5_next_metadata import Glm5NextEplv2Metadata
 from xllm.python.model_executor.cp_utils import (
+    CpContext,
     cp_index_write_replicated,
     cp_merge_rows,
     cp_real_query_rows,
@@ -472,6 +474,15 @@ class Glm5NextConfig:
                 "full" if (max(i - offset + 1, 0) % max(freq, 1)) == 0 else "shared" for i in range(n)
             ]
 
+    @property
+    def kda_head_parallel_size(self) -> int:
+        """Use CP head sharding when attention TP is disabled, as in va."""
+        return self.tp_size if self.tp_size > 1 else self.cp_size
+
+    @property
+    def kda_head_parallel_rank(self) -> int:
+        return self.tp_rank if self.tp_size > 1 else self.cp_rank
+
     def is_dsa(self, layer_id: int) -> bool:
         return layer_id < len(self.layer_types) and self.layer_types[layer_id] == "deepseek_sparse_attention"
 
@@ -503,7 +514,7 @@ class Glm5NextForgetGate(nn.Module):
     def __init__(self, cfg: Glm5NextConfig, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.head_dim = cfg.kda_head_dim
-        self.num_heads = cfg.kda_num_heads // cfg.tp_size  # local per-rank
+        self.num_heads = cfg.kda_num_heads // cfg.kda_head_parallel_size
         self.qkv_dim = self.head_dim * self.num_heads
         self.f_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
         self.dt_bias = nn.Parameter(torch.zeros(self.qkv_dim, dtype=torch.float32))
@@ -575,6 +586,8 @@ def _stable_pack(dst: torch.Tensor | None, packed: torch.Tensor) -> torch.Tensor
 def _zero_cp_padding(tensor: torch.Tensor, cp_context: Any) -> torch.Tensor:
     """Zero this rank's zigzag padding rows."""
     total_local = cp_context.total_local
+    if cp_context.query_index.numel() == total_local:
+        return tensor
     token_axis = 0 if tensor.shape[0] == total_local else 1
     mask_shape = [1] * tensor.dim()
     mask_shape[token_axis] = total_local
@@ -610,19 +623,15 @@ class Glm5NextKdaAttention(Attention):
         self.cfg = cfg
         self.layer_id = layer_id
         self.hidden_size = cfg.hidden_size
-        # Head-sharded TP (mirrors DSA). super().__init__ reports the FULL
-        # kda_num_heads (the executor's C++ cache shape divides it by tp via
-        # linear_num_key_heads/world_size — see kv_cache_shape.cpp), so the
-        # framework conv/ssm slots are already this rank's head-subset
-        # ([slots, conv_dim/tp, len] / [slots, nh/tp, k_hd, v_hd]). The model
-        # therefore computes ONLY its local heads so mixed_qkv ([B, conv_dim/tp,
-        # S]) matches the framework conv_state ([B, conv_dim/tp, len]) — without
-        # this the cat at the conv window mismatches ([conv_dim/tp] vs
-        # [conv_dim]) at tp>1. At tp==1 num_heads_local==num_heads (no-op), so
-        # the standalone align path is unchanged.
-        self.tp = cfg.tp_size
+        # TP owns KDA heads when enabled; otherwise CP owns heads, as in va.
+        # The registered linear-state policy uses the same width for cache
+        # allocation, memory estimation, and PD head-slice transfer.
+        self.use_cp_head_sharding = cfg.tp_size == 1 and cfg.cp_size > 1
+        self.tp = cfg.kda_head_parallel_size
         self.num_heads = cfg.kda_num_heads  # full (reported to base / bookkeeping)
-        self.num_heads_local = cfg.kda_num_heads // cfg.tp_size
+        if cfg.kda_num_heads % self.tp:
+            raise ValueError("KDA heads must divide the head-parallel group")
+        self.num_heads_local = cfg.kda_num_heads // self.tp
         self.head_dim = cfg.kda_head_dim
         self.qkv_dim = self.head_dim * self.num_heads_local  # local per-rank
         self.conv_kernel_size = cfg.short_conv_kernel_size
@@ -697,6 +706,10 @@ class Glm5NextKdaAttention(Attention):
         output_layout: TokenParallelLayout | None = None,
     ) -> torch.Tensor:
         wait_for_layer_load(self.layer_id)
+        ctx = get_forward_context_or_none()
+        cp_context = getattr(ctx, "cp_context", None) if ctx is not None else None
+        if self.use_cp_head_sharding and cp_context is not None:
+            hidden_states = cp_merge_rows(hidden_states.reshape(-1, self.hidden_size), cp_context).unsqueeze(0)
         batch_size, seq_len = hidden_states.shape[:2]
         projected = self.in_proj_qkvbfg_a(hidden_states)
         mixed_qkv, beta_raw, fg_latents = projected.split(self.input_projection_sizes, dim=-1)
@@ -711,13 +724,11 @@ class Glm5NextKdaAttention(Attention):
         # KDA conv1d + delta-rule + conv/ssm state is owned by the backend
         # (NpuPagedAttentionBackend.execute_linear). No self-contained fallback
         # — KDA must run inside the engine with a bound backend.
-        ctx = get_forward_context_or_none()
         backend = getattr(ctx, "attention_backend", None) if ctx is not None else None
         if backend is None or getattr(backend, "execute_linear", None) is None:
             raise RuntimeError(
                 "Glm5NextKdaAttention requires an attention backend with execute_linear; run inside the engine."
             )
-        cp_context = getattr(ctx, "cp_context", None)
         # KDA CP eligibility comes only from rank-uniform state (batch
         # metadata + zigzag chunk arithmetic + the one-time CP-ops probe in
         # the shared helper), so every CP rank takes the same branch here.
@@ -725,10 +736,11 @@ class Glm5NextKdaAttention(Attention):
         # (--enable_kda_cp; false keeps the byte-identical legacy path).
         kda_cp_active = (
             self.enable_kda_cp
+            and not self.use_cp_head_sharding
             and cp_context is not None
             and kda_cp_prefill_eligible(cp_context, getattr(ctx, "metadata", None), self)
         )
-        if cp_context is not None and not kda_cp_active:
+        if cp_context is not None and not kda_cp_active and not self.use_cp_head_sharding:
             # Merging to global rows is also what makes the per-sequence conv/ssm
             # state safe to *replicate* across the CP ranks when KV is
             # owner-sharded (BlockType::LINEAR is not a kv-split block type):
@@ -756,7 +768,7 @@ class Glm5NextKdaAttention(Attention):
             cp_context=cp_context if kda_cp_active else None,
         )
 
-        if cp_context is not None and not kda_cp_active:
+        if cp_context is not None and not kda_cp_active and not self.use_cp_head_sharding:
             core_attn_out = cp_shard_rows(
                 core_attn_out.reshape(-1, self.num_heads_local, self.head_dim),
                 cp_context,
@@ -767,11 +779,15 @@ class Glm5NextKdaAttention(Attention):
         # all-reduce across ranks to assemble the full hidden (mirrors DSA
         # o_proj). At tp==1 this is a no-op.
         o = self.o_proj(output)
+        if self.use_cp_head_sharding:
+            distributed.all_reduce_(o, group_name="cp")
+            if cp_context is not None:
+                o = cp_shard_rows(o.reshape(-1, self.hidden_size), cp_context).unsqueeze(0)
         if output_layout is not None:
             if cp_context is not None:
                 o = _zero_cp_padding(o, cp_context)
             return output_layout.reduce_scatter(o.reshape(-1, self.cfg.hidden_size)).unsqueeze(0)
-        if self.tp > 1:
+        if self.tp > 1 and not self.use_cp_head_sharding:
             distributed.all_reduce_(o)
         if cp_context is not None:
             o = _zero_cp_padding(o, cp_context)
@@ -785,17 +801,28 @@ def _current_q_seq_lens(num_seqs: int, num_tokens: int) -> list[int]:
     boundaries live in the attention metadata's ``q_cu_seq_lens`` (cumulative
     offsets, same source the KDA layers use).
     """
-    q_cu = get_forward_context().metadata.q_cu_seq_lens
-    if q_cu is None:
-        raise RuntimeError(
-            f"varlen batch without q_cu_seq_lens: cannot split num_tokens={num_tokens} across num_seqs={num_seqs}"
-        )
-    ends = q_cu[1:].cpu().tolist()
+    context = get_forward_context()
+    metadata = context.metadata
+    key = (_current_q_seq_lens, num_seqs, num_tokens)
+    if key in context.layer_shared_cache:
+        return cast(list[int], context.layer_shared_cache[key])
+    host_values = getattr(metadata, "q_cu_seq_lens_host_values", None)
+    if host_values is not None and len(host_values) == num_seqs + 1:
+        ends = [int(value) for value in host_values[1:]]
+    else:
+        q_cu = metadata.q_cu_seq_lens
+        if q_cu is None:
+            raise RuntimeError(
+                f"varlen batch without q_cu_seq_lens: cannot split num_tokens={num_tokens} across num_seqs={num_seqs}"
+            )
+        ends = q_cu[1:].cpu().tolist()
     if len(ends) != num_seqs or ends[-1] != num_tokens:
         raise RuntimeError(
             f"q_cu_seq_lens does not describe this batch: ends={ends}, num_seqs={num_seqs}, num_tokens={num_tokens}"
         )
-    return [ends[0]] + [ends[i] - ends[i - 1] for i in range(1, len(ends))]
+    query_lens = [ends[0]] + [ends[i] - ends[i - 1] for i in range(1, len(ends))]
+    context.layer_shared_cache[key] = query_lens
+    return query_lens
 
 
 def _prefix_token_tensor(tensor: torch.Tensor, num_tokens: int, keep_rows: int) -> torch.Tensor:
@@ -839,6 +866,34 @@ def _kpool_update_query_lens(ctx: MlaIndexContext, num_tokens: int) -> list[int]
     return _current_q_seq_lens(num_cache_rows, num_tokens)
 
 
+def _kpool_request_bounds(
+    query_lens: list[int], device: torch.device, query_lens_device: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Share request offsets across layers without draining the compute stream."""
+    context = get_forward_context_or_none()
+    cache = context.layer_shared_cache if context is not None else {}
+    key = (_kpool_request_bounds, tuple(query_lens), device, query_lens_device)
+    if key not in cache:
+        if query_lens_device is not None:
+            if query_lens_device.numel() != len(query_lens):
+                raise RuntimeError("device KPool query lengths must match the logical request count")
+            cumulative = F.pad(torch.cumsum(query_lens_device.reshape(-1), dim=0, dtype=torch.int64), (1, 0))
+            bounds = (cumulative[:-1], cumulative[1:] - 1)
+        else:
+            cumulative = [0]
+            for length in query_lens:
+                cumulative.append(cumulative[-1] + length)
+            host = torch.tensor(
+                [cumulative[:-1], [end - 1 for end in cumulative[1:]]],
+                dtype=torch.int64,
+                pin_memory=device.type == "npu",
+            )
+            uploaded = host.to(device=device, non_blocking=True)
+            bounds = (uploaded[0], uploaded[1])
+        cache[key] = bounds
+    return cast(tuple[torch.Tensor, torch.Tensor], cache[key])
+
+
 def _kpool_logical_rows(
     block_table: torch.Tensor,
     kv_lens: torch.Tensor,
@@ -848,25 +903,14 @@ def _kpool_logical_rows(
     """Collapse token-expanded MTP metadata to one row per request."""
     num_requests = len(query_lens)
     num_tokens = sum(query_lens)
-    starts = None
-    ends = None
+    starts = ends = None
     if query_lens_device is not None:
-        if query_lens_device.numel() != num_requests:
-            raise RuntimeError("device KPool query lengths must match the logical request count")
-        cumulative_lengths = F.pad(
-            torch.cumsum(query_lens_device.reshape(-1), dim=0, dtype=torch.int32),
-            (1, 0),
-        )
-        starts = cumulative_lengths[:-1].to(torch.int64)
-        ends = cumulative_lengths[1:].to(torch.int64) - 1
+        starts, ends = _kpool_request_bounds(query_lens, block_table.device, query_lens_device)
     if block_table.shape[0] == num_requests:
         logical_block_table = block_table
     elif block_table.shape[0] >= num_tokens:
         if starts is None:
-            request_starts = [0]
-            for query_len in query_lens[:-1]:
-                request_starts.append(request_starts[-1] + query_len)
-            starts = torch.tensor(request_starts, dtype=torch.int64, device=block_table.device)
+            starts, _ = _kpool_request_bounds(query_lens, block_table.device, query_lens_device)
         logical_block_table = block_table.index_select(0, starts)
     else:
         raise RuntimeError(
@@ -878,12 +922,7 @@ def _kpool_logical_rows(
         logical_kv_lens = kv_lens.reshape(-1)
     elif kv_lens.numel() >= num_tokens:
         if ends is None:
-            request_ends = []
-            covered_rows = 0
-            for query_len in query_lens:
-                covered_rows += query_len
-                request_ends.append(covered_rows - 1)
-            ends = torch.tensor(request_ends, dtype=torch.int64, device=kv_lens.device)
+            _, ends = _kpool_request_bounds(query_lens, kv_lens.device, query_lens_device)
         logical_kv_lens = kv_lens.reshape(-1).index_select(0, ends)
     else:
         raise RuntimeError(
@@ -911,18 +950,7 @@ def _kpool_logical_state_indices(
                 "kPool state indices do not cover every logical request or query row: "
                 f"state_rows={indices.numel()}, requests={num_requests}, query_rows={num_tokens}"
             )
-        if query_lens_device is not None:
-            if query_lens_device.numel() != num_requests:
-                raise RuntimeError("device KPool query lengths must match the logical request count")
-            starts = F.pad(
-                torch.cumsum(query_lens_device.reshape(-1), dim=0, dtype=torch.int32),
-                (1, 0),
-            )[:-1].to(torch.int64)
-        else:
-            request_starts = [0]
-            for query_len in query_lens[:-1]:
-                request_starts.append(request_starts[-1] + query_len)
-            starts = torch.tensor(request_starts, dtype=torch.int64, device=indices.device)
+        starts, _ = _kpool_request_bounds(query_lens, indices.device, query_lens_device)
         return indices.reshape(-1).index_select(0, starts)
 
     if read_indices is write_indices:
@@ -942,6 +970,40 @@ def _kpool_attention_mask_all_valid(attention_mask: torch.Tensor) -> bool:
     if key not in context.layer_shared_cache:
         context.layer_shared_cache[key] = bool(attention_mask.all().item())
     return cast(bool, context.layer_shared_cache[key])
+
+
+def _kpool_max_kv_len(kv_seq_lens: torch.Tensor) -> int:
+    """Reuse host sequence lengths, or read them once for all indexer layers."""
+    context = get_forward_context_or_none()
+    if context is None:
+        return int(kv_seq_lens.max().item())
+    key = (_kpool_max_kv_len, kv_seq_lens.numel())
+    if key not in context.layer_shared_cache:
+        host_lengths = getattr(context.metadata, "kv_seq_lens_host_values", None)
+        if host_lengths and len(host_lengths) == kv_seq_lens.numel():
+            max_length = max(int(length) for length in host_lengths)
+        else:
+            max_length = int(kv_seq_lens.max().item())
+        context.layer_shared_cache[key] = max_length
+    return cast(int, context.layer_shared_cache[key])
+
+
+def _kpool_query_rows_by_sequence(
+    query_rows: torch.Tensor, query_lens: list[int], num_tokens: int
+) -> tuple[torch.Tensor, ...]:
+    """Partition immutable CP query indices once for all indexer layers."""
+    context = get_forward_context_or_none()
+    cache = context.layer_shared_cache if context is not None else {}
+    key = (_kpool_query_rows_by_sequence, query_rows, tuple(query_lens), num_tokens)
+    if key not in cache:
+        rows = query_rows[query_rows < num_tokens]
+        start = 0
+        partitions = []
+        for query_len in query_lens:
+            partitions.append(rows[(rows >= start) & (rows < start + query_len)])
+            start += query_len
+        cache[key] = tuple(partitions)
+    return cast(tuple[torch.Tensor, ...], cache[key])
 
 
 def _kpool_valid_rows(attention_mask: torch.Tensor, slot_mapping: torch.Tensor) -> torch.Tensor:
@@ -1045,8 +1107,19 @@ class Glm5NextIndexer(nn.Module):
             head_weight = self.weights_proj.weight.float()
         return F.linear(hidden_states.float(), head_weight).to(hidden_states.dtype)
 
-    def _project_key_weights(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        weights = self._project_head_weights(hidden_states)
+    def _project_key_weights(
+        self, hidden_states: torch.Tensor, query_rows: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query_rows is None:
+            weights = self._project_head_weights(hidden_states)
+        else:
+            # Head weights only score this rank's queries. The key projection
+            # still covers the global stream for replicated cache updates.
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            local_weights = self._project_head_weights(flat.index_select(0, query_rows))
+            weights = hidden_states.new_zeros((flat.shape[0], self.n_heads))
+            weights.index_copy_(0, query_rows, local_weights)
+            weights = weights.reshape(*hidden_states.shape[:-1], self.n_heads)
         if self._wk_weight is None:
             return self.wk(hidden_states), weights
         projected = F.linear(hidden_states, self._wk_weight)
@@ -1125,6 +1198,7 @@ class Glm5NextIndexer(nn.Module):
         pool_block_table: torch.Tensor,
         query_positions: torch.Tensor | None = None,
         pool_query_block_table: torch.Tensor | None = None,
+        attention_mask_all_valid: bool | None = None,
     ) -> torch.Tensor | None:
         """Run PoolKeyIndexer through the paged PA_BBND pool cache."""
         if pool_cache.dtype != query.dtype:
@@ -1162,7 +1236,9 @@ class Glm5NextIndexer(nn.Module):
                     pool_block_table[:, None, :].expand(batch_size, query_len, -1).reshape(batch_size * query_len, -1)
                 )
         valid_rows = None
-        if not in_acl_graph() and not bool(attention_mask.all().item()):
+        if not in_acl_graph() and not (
+            attention_mask_all_valid if attention_mask_all_valid is not None else bool(attention_mask.all().item())
+        ):
             # The fused kernel consumes one query per row. Exclude padding
             # before execution, then restore its sentinel rows in logical order.
             # ``kernel_tail_k`` below is zero when the tail is not always
@@ -1241,6 +1317,86 @@ class Glm5NextIndexer(nn.Module):
         restored_indices.index_copy_(0, valid_rows, compact_indices.long())
         return restored_indices.reshape(batch_size, query_len, output_width)
 
+    def _select_topk_fused_cp_paged(
+        self,
+        qr: torch.Tensor,
+        weights: torch.Tensor,
+        positions: torch.Tensor,
+        query_rows: torch.Tensor,
+        pool_cache: torch.Tensor,
+        pool_block_table: torch.Tensor,
+        cp_context: CpContext,
+        full_num_tokens: int,
+        *,
+        local_output: bool = False,
+    ) -> torch.Tensor:
+        """Score contiguous CP segments together using causal TND metadata."""
+        context = get_forward_context()
+        key = (Glm5NextIndexer._select_topk_fused_cp_paged, self.index_kpool)
+        if key not in context.layer_shared_cache:
+            query_ends = cp_context.q_cu_seqlens
+            kv_lengths = cp_context.segment_kv_seq_lens
+            device = qr.device
+            context.layer_shared_cache[key] = (
+                torch.tensor([*query_ends, query_ends[-1] + 1], dtype=torch.int32, pin_memory=device.type == "npu").to(
+                    device, non_blocking=True
+                ),
+                torch.tensor(
+                    [length // self.index_kpool for length in kv_lengths] + [1],
+                    dtype=torch.int32,
+                    pin_memory=device.type == "npu",
+                ).to(device, non_blocking=True),
+                torch.tensor(
+                    [length % self.index_kpool for length in kv_lengths] + [0],
+                    dtype=torch.int32,
+                    pin_memory=device.type == "npu",
+                ).to(device, non_blocking=True),
+                positions.reshape(-1).index_select(0, query_rows),
+                torch.arange(self.index_kpool - 1, device=device),
+            )
+        query_ends, pool_lengths, tails, local_positions, tail_columns = context.layer_shared_cache[key]
+        local_qr = qr.reshape(-1, qr.shape[-1]).index_select(0, query_rows)
+        query = self.wq_b(local_qr).reshape(-1, self.n_heads, self.head_dim)
+        local_weights = weights.reshape(-1, self.n_heads).index_select(0, query_rows)
+        # A final dummy query with a nonempty history keeps CANN's TND
+        # zero-work initialization from writing beyond the output allocation.
+        query = F.pad(query, (0, 0, 0, 0, 0, 1))
+        local_weights = F.pad(local_weights, (0, 0, 0, 1))
+        tables = pool_block_table.index_select(0, cp_context.segment_seq_indices)
+        tables = F.pad(tables, (0, 0, 0, 1)).clamp_min(0).to(torch.int32).contiguous()
+        indices, _ = kernels.pool_key_indexer(
+            query,
+            pool_cache,
+            local_weights,
+            tails,
+            self.topk,
+            self.index_kpool,
+            actual_seq_q=query_ends,
+            actual_seq_k=pool_lengths,
+            block_table=tables,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            sparse_indices_mode=0,
+        )
+        indices = indices[: query_rows.numel()]
+        # CANN's TND tail belongs to the segment end. Replace it with each
+        # query's own causal tail, directly after its valid expanded pools.
+        indices[:, self.topk :] = -1
+        tail_start = torch.div(local_positions + 1, self.index_kpool, rounding_mode="floor") * self.index_kpool
+        tail_values = torch.where(
+            tail_columns[None] < (local_positions + 1 - tail_start)[:, None],
+            tail_start[:, None] + tail_columns[None],
+            -1,
+        ).to(indices.dtype)
+        tail_offsets = tail_start.clamp(max=self.topk)[:, None] + tail_columns[None]
+        indices.scatter_(1, tail_offsets, tail_values)
+        output_rows = cp_context.query_index if local_output else query_rows
+        output_tokens = cp_context.total_local if local_output else full_num_tokens
+        scattered = torch.full((output_tokens, 1, self.topk_output_width), -1, dtype=torch.int32, device=qr.device)
+        scattered.index_copy_(0, output_rows, indices.unsqueeze(1))
+        return scattered
+
     @property
     def topk_output_width(self) -> int:
         """Width of the topk output's last dim, tail pools included."""
@@ -1264,6 +1420,7 @@ class Glm5NextIndexer(nn.Module):
         query_positions: torch.Tensor | None = None,
         pool_query_block_table: torch.Tensor | None = None,
         append_unscored_tail: bool = False,
+        attention_mask_all_valid: bool | None = None,
     ) -> torch.Tensor:
         """Top-k pool selection over the FULL packed index history.
 
@@ -1334,6 +1491,7 @@ class Glm5NextIndexer(nn.Module):
                     pool_block_table,
                     query_positions,
                     pool_query_block_table,
+                    attention_mask_all_valid,
                 )
                 if fused_indices is not None:
                     return fused_indices
@@ -1489,6 +1647,8 @@ class Glm5NextIndexer(nn.Module):
         layer: Attention,
         backend,
         query_rows: torch.Tensor | None = None,
+        *,
+        cp_local_output: bool = False,
     ) -> torch.Tensor:
         """Update the selected KPool layout and return SFA token indices.
 
@@ -1504,20 +1664,31 @@ class Glm5NextIndexer(nn.Module):
         this rank's real merged-stream rows via ``query_rows``: the key-side
         pool write still runs on the full stream, while the query side scores
         only those rows -- bit-exact on the non-fused path, where each row's
-        pool scores are independent of every other row -- and scatters the
-        selected rows back into the full-layout tensor, so every downstream
-        consumer (backend row select, ``cp_shard_rows``, the shared-layer
-        merge) keeps the exact legacy contract. Active under
+        pool scores are independent of every other row. ``cp_local_output``
+        retains the padded local layout for MLA and shared-indexer layers;
+        the default restores the full-layout tensor. Active under
         ``kv_split_size > 1`` as long as the index write mode is the default
         replicated one (full per-rank index replica, per-sequence
-        page-expanded read tables); the non-default sharded mode, acl_graph
-        capture, varlen batches and non-uniform query spans fall back to the
-        full stream.
+        page-expanded read tables); the non-default sharded mode and acl_graph
+        capture fall back to the full stream. Variable-length batches retain
+        their per-request history and causal positions during partitioning.
         """
         batch_size, seq_len = hidden_states.shape[:2]
         num_tokens = batch_size * seq_len
         full_num_tokens = num_tokens
-        key, weights = self._project_key_weights(hidden_states)
+        context = get_forward_context_or_none()
+        cp_context = context.cp_context if context is not None else None
+        if cp_local_output and cp_context is None:
+            raise ValueError("CP-local indexer output requires a CP context")
+        local_weight_rows = None
+        if (
+            query_rows is not None
+            and cp_context is not None
+            and not in_acl_graph()
+            and (not ctx.has_kv_shard or cp_index_write_replicated())
+        ):
+            local_weight_rows = query_rows
+        key, weights = self._project_key_weights(hidden_states, local_weight_rows)
         if ctx.block_table is None:
             raise RuntimeError("GLM-5.3-Flash kPool requires a block table")
 
@@ -1715,36 +1886,48 @@ class Glm5NextIndexer(nn.Module):
             q_lens = _current_q_seq_lens(num_seqs, num_tokens)
         max_q = max(q_lens)
         is_varlen = max_q * num_seqs != num_tokens
-        if not is_varlen:
-            # Uniform per-sequence lengths (single sequence, packed
-            # one-token decode, equal-length batch): a plain view is exact
-            # and allocation-free — the decode hot path stays untouched.
-            qr_bsd = qr.view(num_seqs, max_q, -1)
-            hidden_bsd = hidden_states.view(num_seqs, max_q, -1)
-            mask_bsd = attention_mask.view(num_seqs, max_q)
-            weights_bsd = weights.view(num_seqs, max_q, self.n_heads)
-            positions_bsd = positions.view(num_seqs, max_q)
-        else:
-            # Varlen batch (unequal prompts prefilled together): the engine
-            # flattens the batch to [1, T, D]; scatter tokens to a padded
-            # [num_seqs, max_q, ...] layout by the real sequence boundaries
-            # and mask the pad rows; the top-k rows are gathered back to the
-            # flat [T, ...] order below.
-            starts = [0]
-            for seq_len_i in q_lens[:-1]:
-                starts.append(starts[-1] + seq_len_i)
-            device = qr.device
-            starts_t = torch.tensor(starts, device=device, dtype=torch.int64)
-            lens_t = torch.tensor(q_lens, device=device, dtype=torch.int64)
-            q_offsets = torch.arange(max_q, device=device, dtype=torch.int64)
-            src = starts_t[:, None] + q_offsets[None, :]
-            valid = q_offsets[None, :] < lens_t[:, None]
-            src_flat = src.clamp(max=num_tokens - 1).reshape(-1)
-            qr_bsd = qr.index_select(0, src_flat).view(num_seqs, max_q, -1)
-            hidden_bsd = hidden_states.reshape(num_tokens, -1).index_select(0, src_flat).view(num_seqs, max_q, -1)
-            mask_bsd = attention_mask.reshape(-1).index_select(0, src_flat).view(num_seqs, max_q) & valid
-            weights_bsd = weights.reshape(num_tokens, self.n_heads).index_select(0, src_flat).view(num_seqs, max_q, -1)
-            positions_bsd = positions.reshape(-1).index_select(0, src_flat).view(num_seqs, max_q)
+        partition_queries = (
+            query_rows is not None and not in_acl_graph() and (not ctx.has_kv_shard or cp_index_write_replicated())
+        )
+        # A subset of an all-valid source mask remains all-valid. Reuse that
+        # proof across layers instead of synchronizing each CP query slice.
+        attention_mask_all_valid = None
+        if pool_cache is not None and not in_acl_graph() and (partition_queries or not is_varlen):
+            if _kpool_attention_mask_all_valid(attention_mask):
+                attention_mask_all_valid = True
+        if not partition_queries:
+            if not is_varlen:
+                # Uniform per-sequence lengths (single sequence, packed
+                # one-token decode, equal-length batch): a plain view is exact
+                # and allocation-free — the decode hot path stays untouched.
+                qr_bsd = qr.view(num_seqs, max_q, -1)
+                hidden_bsd = hidden_states.view(num_seqs, max_q, -1)
+                mask_bsd = attention_mask.view(num_seqs, max_q)
+                weights_bsd = weights.view(num_seqs, max_q, self.n_heads)
+                positions_bsd = positions.view(num_seqs, max_q)
+            else:
+                # Varlen batch (unequal prompts prefilled together): the engine
+                # flattens the batch to [1, T, D]; scatter tokens to a padded
+                # [num_seqs, max_q, ...] layout by the real sequence boundaries
+                # and mask the pad rows; the top-k rows are gathered back to the
+                # flat [T, ...] order below.
+                starts = [0]
+                for seq_len_i in q_lens[:-1]:
+                    starts.append(starts[-1] + seq_len_i)
+                device = qr.device
+                starts_t = torch.tensor(starts, device=device, dtype=torch.int64)
+                lens_t = torch.tensor(q_lens, device=device, dtype=torch.int64)
+                q_offsets = torch.arange(max_q, device=device, dtype=torch.int64)
+                src = starts_t[:, None] + q_offsets[None, :]
+                valid = q_offsets[None, :] < lens_t[:, None]
+                src_flat = src.clamp(max=num_tokens - 1).reshape(-1)
+                qr_bsd = qr.index_select(0, src_flat).view(num_seqs, max_q, -1)
+                hidden_bsd = hidden_states.reshape(num_tokens, -1).index_select(0, src_flat).view(num_seqs, max_q, -1)
+                mask_bsd = attention_mask.reshape(-1).index_select(0, src_flat).view(num_seqs, max_q) & valid
+                weights_bsd = (
+                    weights.reshape(num_tokens, self.n_heads).index_select(0, src_flat).view(num_seqs, max_q, -1)
+                )
+                positions_bsd = positions.reshape(-1).index_select(0, src_flat).view(num_seqs, max_q)
 
         if in_acl_graph():
             token_page_size = (
@@ -1752,7 +1935,7 @@ class Glm5NextIndexer(nn.Module):
             )
             kv_len = ctx.block_table.shape[1] * token_page_size
         elif pool_cache is not None:
-            kv_len = int(kpool_kv_lens.max().item())
+            kv_len = _kpool_max_kv_len(kpool_kv_lens)
         else:
             kv_len = packed_history.shape[1]
         if pool_cache is not None:
@@ -1764,98 +1947,105 @@ class Glm5NextIndexer(nn.Module):
         else:
             key_valid = torch.arange(kv_len, device=packed_history.device)[None, :] < logical_kv_lens[:, None]
             kv_seq_lens = None
-        alpha_active = (
-            query_rows is not None
-            and not in_acl_graph()
-            and (not ctx.has_kv_shard or cp_index_write_replicated())
-            and num_seqs == 1
-            and not is_varlen
-        )
-        if alpha_active:
-            # The alpha plan: score only this rank's real CP query rows. The pool
-            # write above ran on the full merged stream; the query side is
-            # row-independent (bit-exact on the non-fused path), so a row
-            # subset with its true global positions selects the same top-k.
-            # Scatter the rows back into the full-layout tensor so every
-            # downstream consumer (backend row select, cp_shard_rows, the
-            # shared-layer merge) keeps its exact legacy contract.
-            # Under kv_split > 1 the DEFAULT replicated write mode keeps the
-            # index cache a full per-rank replica read through per-sequence
-            # page-expanded tables (materialized_block_table is [num_seqs,
-            # blocks * kv_split]; the fused path broadcasts it per row), so
-            # the query-side slice stays exact there too. The non-default
-            # sharded mode (cross-rank reconstructed reads), acl_graph
-            # capture, varlen batches and non-uniform query spans fall back
-            # to the full stream.
-            rows = query_rows.to(device=qr_bsd.device, dtype=torch.long)
-            rows = rows[rows < num_tokens]  # bucket padding beyond the spans keeps -1
-            if rows.numel() == 0:
-                topk_indices = torch.full(
-                    (num_tokens, 1, self.topk_output_width), -1, dtype=torch.int32, device=qr_bsd.device
+        if partition_queries:
+            context = get_forward_context_or_none()
+            cp_context = context.cp_context if context is not None else None
+            if (
+                cp_context is not None
+                and query_rows.numel() >= 128
+                and cp_context.q_cu_seqlens[-1] == query_rows.numel()
+                and attention_mask_all_valid
+                and pool_cache is not None
+                and pool_cache.dtype == qr.dtype
+                and self.index_kpool_always_select_tail
+                and not self._fused_kpool_disabled
+            ):
+                return self._select_topk_fused_cp_paged(
+                    qr,
+                    weights,
+                    positions,
+                    query_rows,
+                    pool_cache,
+                    pool_read_block_table,
+                    cp_context,
+                    full_num_tokens,
+                    local_output=cp_local_output,
                 )
-                if num_tokens < full_num_tokens:
-                    topk_indices = F.pad(topk_indices, (0, 0, 0, 0, 0, full_num_tokens - num_tokens), value=-1)
-                return topk_indices
-            # Full-M wq_b projection, sliced afterwards: select_topk consumes
-            # it via projected_q so the sliced batch reuses these exact bits.
-            q_full = self.wq_b(qr_bsd)
-            q_sub = q_full[:, rows]
-            select_q = q_sub
-            select_hidden = hidden_bsd[:, rows]
-            # All sliced rows belong to one causal batch, so a uniform mask
-            # reproduces the full-stream mask rows for the subset.
-            select_mask = torch.ones(1, rows.numel(), dtype=mask_bsd.dtype, device=mask_bsd.device)
-            select_weights = weights_bsd[:, rows]
-            select_positions = positions_bsd[:, rows]
-            select_kv_seq_lens = kv_seq_lens
-            if rows.numel() == 1:
-                # A single row enters the fused path's query_len == 1 branch,
-                # which reads visibility from kv_seq_lens instead of the
-                # per-row positions: pass the row's own causal length.
-                select_kv_seq_lens = (select_positions.reshape(-1) + 1).to(torch.int32)
-            select_projected_q = q_sub
-        else:
-            select_q = qr_bsd
-            select_hidden = hidden_bsd
-            select_mask = mask_bsd
-            select_weights = weights_bsd
-            select_positions = positions_bsd
-            select_kv_seq_lens = kv_seq_lens
-            select_projected_q = None
-        # One keyword table for both paths so the alpha branch cannot drift
-        # from the full-stream semantics (CP only runs in multi-card
-        # prefill, which single-card regression does not cover).
+            # A CP shard may cross request boundaries. Score its rows against
+            # each request's own history, retaining the original causal positions.
+            rows = query_rows.to(device=qr.device, dtype=torch.long)
+            sequence_query_rows = _kpool_query_rows_by_sequence(rows, q_lens, num_tokens)
+            scattered = torch.full(
+                (full_num_tokens, 1, self.topk_output_width), -1, dtype=torch.int32, device=qr.device
+            )
+            for sequence, sequence_rows in enumerate(sequence_query_rows):
+                if sequence_rows.numel() == 0:
+                    continue
+                select_qr = qr.reshape(num_tokens, -1).index_select(0, sequence_rows).unsqueeze(0)
+                select_q = self.wq_b(select_qr)
+                select_hidden = hidden_states.reshape(num_tokens, -1).index_select(0, sequence_rows).unsqueeze(0)
+                select_mask = attention_mask.reshape(-1).index_select(0, sequence_rows).unsqueeze(0)
+                select_weights = weights.reshape(num_tokens, self.n_heads).index_select(0, sequence_rows).unsqueeze(0)
+                select_positions = positions.reshape(-1).index_select(0, sequence_rows).unsqueeze(0)
+                select_kv_seq_lens = kv_seq_lens[sequence : sequence + 1] if kv_seq_lens is not None else None
+                if sequence_rows.numel() == 1:
+                    # The fused one-query route reads causal visibility from
+                    # kv_seq_lens rather than query_positions.
+                    select_kv_seq_lens = (select_positions.reshape(-1) + 1).to(torch.int32)
+                select_table = (
+                    pool_read_block_table[sequence : sequence + 1] if pool_read_block_table is not None else None
+                )
+                query_table = (
+                    pool_query_block_table.index_select(0, sequence_rows)
+                    if pool_query_block_table is not None and pool_query_block_table.shape[0] >= num_tokens
+                    else select_table
+                )
+                selected = self.select_topk(
+                    select_q,
+                    select_hidden,
+                    select_mask,
+                    kv_len=kv_len,
+                    current_length=kv_len,
+                    packed_states=packed_history[sequence : sequence + 1] if packed_history is not None else None,
+                    projected_weights=select_weights,
+                    projected_q=select_q,
+                    key_valid=key_valid[sequence : sequence + 1] if key_valid is not None else None,
+                    kv_seq_lens=select_kv_seq_lens,
+                    pool_cache=pool_cache,
+                    pool_block_table=select_table,
+                    query_positions=select_positions,
+                    pool_query_block_table=query_table,
+                    append_unscored_tail=uses_compressed_tail and self.index_kpool_always_select_tail,
+                    attention_mask_all_valid=attention_mask_all_valid,
+                )
+                scattered.index_copy_(0, sequence_rows, selected.reshape(sequence_rows.numel(), 1, -1).to(torch.int32))
+            if cp_local_output:
+                return cp_shard_rows(scattered.reshape(full_num_tokens, -1), cp_context).unsqueeze(1)
+            return scattered
         topk_indices = self.select_topk(
-            select_q,
-            select_hidden,
-            select_mask,
+            qr_bsd,
+            hidden_bsd,
+            mask_bsd,
             kv_len=kv_len,
             current_length=kv_len,
             packed_states=packed_history,
-            projected_weights=select_weights,
-            projected_q=select_projected_q,
+            projected_weights=weights_bsd,
             key_valid=key_valid,
-            kv_seq_lens=select_kv_seq_lens,
+            kv_seq_lens=kv_seq_lens,
             pool_cache=pool_cache,
             pool_block_table=pool_read_block_table,
-            query_positions=select_positions,
+            query_positions=positions_bsd,
             pool_query_block_table=pool_query_block_table,
             append_unscored_tail=uses_compressed_tail and self.index_kpool_always_select_tail,
+            attention_mask_all_valid=attention_mask_all_valid,
         )
-        if alpha_active:
-            # [1, n_real, W] -> scatter into a -1-filled full-layout tensor
-            # (padding rows carry -1 exactly like the legacy padded path).
-            topk_indices = topk_indices.reshape(rows.numel(), 1, -1).to(torch.int32)
-            scattered = torch.full(
-                (num_tokens, 1, topk_indices.shape[-1]), -1, dtype=torch.int32, device=topk_indices.device
-            )
-            scattered[rows] = topk_indices
-            topk_indices = scattered
         if is_varlen:
             topk_indices = topk_indices[valid]
         topk_indices = topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
         if num_tokens < full_num_tokens:
             topk_indices = F.pad(topk_indices, (0, 0, 0, 0, 0, full_num_tokens - num_tokens), value=-1)
+        if cp_local_output:
+            return cp_shard_rows(topk_indices.reshape(full_num_tokens, -1), cp_context).unsqueeze(1)
         return topk_indices
 
 
@@ -2037,12 +2227,9 @@ class Glm5NextMlaAttention(Attention):
         wait_for_layer_load(self.layer_id)
         forward_context = get_forward_context()
         cp_context = getattr(forward_context, "cp_context", None)
-        # CP keeps the model-side row layout identical to ``cp_size == 1``:
-        # merge to global order, project, index and top-k on the complete
-        # logical stream, then reshard the layer output. Only the backend's
-        # sparse attention partitions the query rows (always, under CP);
-        # because that happens after every projection, the GEMM batch shape
-        # -- and so every projection's bits -- stays exactly the legacy one.
+        # Cache and indexer inputs retain global sequence order. Query-only
+        # projections below consume this rank's padded rows so CP does not
+        # repeat the peer ranks' Q-B and absorbed-Q matrix multiplications.
         if cp_context is not None:
             hidden_states = cp_merge_rows(
                 hidden_states.reshape(-1, self.hidden_size),
@@ -2058,13 +2245,10 @@ class Glm5NextMlaAttention(Attention):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-            # Only shared-indexer layers consume top-k rows produced on the
-            # preceding CP-sharded layer; full indexers compute their own rows.
-            if self.indexer is None and prev_topk_indices is not None:
-                prev_topk_indices = cp_merge_rows(
-                    prev_topk_indices.reshape(prev_topk_indices.shape[0], -1),
-                    cp_context,
-                )
+            # CP merge removes padding; the new mask needs no device validity read.
+            mask_key = (_kpool_attention_mask_all_valid, attention_mask.shape)
+            forward_context.layer_shared_cache[mask_key] = True
+            # Shared indexers retain the preceding layer's padded local rows.
 
         num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
         hidden = hidden_states.view(num_tokens, -1)
@@ -2074,16 +2258,31 @@ class Glm5NextMlaAttention(Attention):
         topk = None
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
-            query_rows = cp_real_query_rows(cp_context) if cp_context is not None else None
+            query_rows = None
+            if cp_context is not None:
+                query_key = (cp_real_query_rows, "glm5_next_indexer")
+                if query_key not in forward_context.layer_shared_cache:
+                    forward_context.layer_shared_cache[query_key] = cp_real_query_rows(cp_context)
+                query_rows = forward_context.layer_shared_cache[query_key]
             topk = self.indexer.select_qli(
-                hidden_states, q_c, position_ids, attention_mask, ctx, self, backend, query_rows=query_rows
+                hidden_states,
+                q_c,
+                position_ids,
+                attention_mask,
+                ctx,
+                self,
+                backend,
+                query_rows=query_rows,
+                cp_local_output=cp_context is not None,
             )
         else:
             if prev_topk_indices is None:
                 raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
-            topk = prev_topk_indices.reshape(num_tokens, 1, -1).to(torch.int32)
+            topk_tokens = cp_context.total_local if cp_context is not None else num_tokens
+            topk = prev_topk_indices.reshape(topk_tokens, 1, -1).to(torch.int32)
 
-        q = self.q_b_proj(q_c).view(num_tokens, self.num_heads_local, self.qk_head_dim)
+        q_input = cp_shard_rows(q_c, cp_context) if cp_context is not None else q_c
+        q = self.q_b_proj(q_input).view(-1, self.num_heads_local, self.qk_head_dim)
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_latent = kernels.batch_matmul_transpose(q_nope, self.W_UK)
 
@@ -2095,18 +2294,27 @@ class Glm5NextMlaAttention(Attention):
         k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
         k_pe = None
 
-        attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe, self, topk=topk)
-        if cp_context is not None:
-            attn_out = cp_shard_rows(
-                attn_out.reshape(num_tokens, self.num_heads_local, self.kv_lora_rank),
-                cp_context,
+        if cp_context is None:
+            attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe, self, topk=topk)
+        else:
+            # The backend already computes only this rank's real query rows.
+            # Keep its padded local output instead of scattering to a global
+            # tensor and immediately selecting the same local rows again.
+            attn_out = backend.execute_mla(
+                q_latent,
+                q_pe,
+                k_latent_3d,
+                k_pe,
+                self,
+                topk=topk,
+                cp_local_output=True,
+                cp_local_query=True,
+                cp_local_topk=True,
             )
         local_num_tokens = attn_out.shape[0]
         v_full = kernels.batch_matmul_transpose(attn_out, self.W_UV)
         v_full = v_full.reshape(local_num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
-        if cp_context is not None:
-            topk = cp_shard_rows(topk.reshape(num_tokens, -1), cp_context).view(cp_context.total_local, 1, -1)
         if output_layout is not None:
             # Zero padding before reduce-scatter. The all-reduce path below
             # must zero afterwards: the reduction itself writes into padding.
@@ -2356,11 +2564,27 @@ def _select_eplv2_backend(
     return policy.select(dispatch_tokens, graph=graph), graph
 
 
-def _pcp_dp_dispatch_rows(cfg: Glm5NextConfig, counts: object) -> int:
-    """EP capacity shared by every DP rank, including zigzag-padded PCP shards."""
-    if counts is None or len(counts) != cfg.dp_size or any(count <= 0 for count in counts):
-        raise ValueError("DP/PCP EPLv2 requires positive global execution counts")
-    return (2 * max(counts) + cfg.tp_size - 1) // cfg.tp_size
+def _pcp_dp_dispatch_rows(cfg: Glm5NextConfig, counts: object, hidden: torch.Tensor) -> int:
+    """Exchange actual PCP shard lengths once per forward, including dummy ranks."""
+    if counts is None or len(counts) != cfg.dp_size or any(count < 0 for count in counts):
+        raise ValueError("DP/PCP EPLv2 requires non-negative global execution counts")
+    context = get_forward_context_or_none()
+    cache = context.layer_shared_cache
+    host_group = cache.get((_pcp_dp_dispatch_rows, "host_group"))
+    key = ("glm5_next_pcp_dispatch_rows", cfg.ep_size, cfg.tp_size, host_group)
+    if key not in cache:
+        rows = max(1, (hidden.numel() // hidden.shape[-1] + cfg.tp_size - 1) // cfg.tp_size)
+        if host_group is not None:
+            # Capacity is host shape metadata. Keep its exchange independent
+            # of the previous overlapped forward's NPU compute/HCCL streams.
+            local_rows = torch.tensor([rows], dtype=torch.int64)
+            dist.all_reduce(local_rows, op=dist.ReduceOp.MAX, group=host_group)
+            cache[key] = int(local_rows.item())
+        else:
+            local_rows = torch.tensor([rows], dtype=torch.int64, device=hidden.device)
+            ep_rows = distributed.all_gather(local_rows, 0, cfg.ep_size, "moe_ep")
+            cache[key] = max(ep_rows.cpu().tolist())
+    return cache[key]
 
 
 def _eplv2_token_layout(
@@ -2380,10 +2604,9 @@ def _eplv2_token_layout(
             cfg.cp_rank,
         ):
             raise ValueError("GLM EPLv2 PCP requires a matching prefill shard on every PCP rank")
-        # InputBatch counts describe global (pre-PCP) rows. Zigzag padding can
-        # make one local shard as large as twice that count; DP must share one
-        # EP capacity. A single DP group already has equal local lengths.
-        dispatch_rows = _pcp_dp_dispatch_rows(cfg, counts) if cfg.dp_size > 1 else None
+        # Pre-PCP token counts do not describe the local padded shard. Share
+        # its actual capacity before any layer chooses an EP transport.
+        dispatch_rows = _pcp_dp_dispatch_rows(cfg, counts, hidden) if cfg.dp_size > 1 else None
         layout = TokenParallelLayout(rows, cfg.tp_size, cfg.tp_rank, dispatch_rows=dispatch_rows)
         mask = cp_context.shard_valid_mask
     else:
@@ -2400,7 +2623,7 @@ def _eplv2_token_layout(
                 rows,
                 cfg.tp_size,
                 cfg.tp_rank,
-                dispatch_rows=_pcp_dp_dispatch_rows(cfg, counts),
+                dispatch_rows=_pcp_dp_dispatch_rows(cfg, counts, hidden),
             )
             mask = torch.zeros(rows, dtype=torch.bool, device=hidden.device)
         else:
@@ -2963,6 +3186,8 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextModel(nn.Module):
+    _pcp_dispatch_host_group: dist.ProcessGroup | None = None
+
     # The forward's CP exit merges BOTH the final hidden state and the
     # aux-hidden buffer back to global row order (cp_merge_rows on each),
     # so a target-side spec-verify draft reads token-aligned rows. The
@@ -2974,6 +3199,17 @@ class Glm5NextModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         self._comm_policy = _eplv2_comm_policy(cfg)
+        self._pcp_dispatch_host_group = None
+        if cfg.expert_parallel_degree == 2 and cfg.cp_size > 1 and cfg.dp_size > 1:
+            ep_group = distributed.moe_ep_group(device)
+            if ep_group is not None:
+                if dist.get_world_size(ep_group) != cfg.ep_size:
+                    raise ValueError("PCP dispatch capacity requires the complete MoE EP group")
+                self._pcp_dispatch_host_group = dist.new_group(
+                    ranks=dist.get_process_group_ranks(ep_group),
+                    backend="gloo",
+                    use_local_synchronization=True,
+                )
         self.embed_tokens = HiddenParallelEmbedding(
             cfg.vocab_size,
             cfg.hidden_size // cfg.tp_size,
@@ -3034,6 +3270,8 @@ class Glm5NextModel(nn.Module):
         is_eplv2 = getattr(self.cfg, "expert_parallel_degree", 0) == 2
         forward_context = get_forward_context_or_none() if is_eplv2 else get_forward_context()
         cp_context = getattr(forward_context, "cp_context", None)
+        if self._pcp_dispatch_host_group is not None:
+            forward_context.layer_shared_cache[(_pcp_dp_dispatch_rows, "host_group")] = self._pcp_dispatch_host_group
         if cp_context is not None:
             hidden = cp_shard_rows(hidden.view(-1, self.cfg.hidden_size), cp_context).unsqueeze(0)
             position_ids = cp_shard_positions(position_ids.reshape(-1), cp_context).unsqueeze(0).contiguous()
@@ -3220,6 +3458,9 @@ class Glm5NextForCausalLM(PyModelBase):
     # -- weight loading ---------------------------------------------------
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         L = QLinearWeightLoader(self, state_dicts, tp_size, tp_rank)
+        kda_loader = QLinearWeightLoader(
+            self, state_dicts, self.cfg.kda_head_parallel_size, self.cfg.kda_head_parallel_rank
+        )
 
         # Wrap the underlying loader's find/load_tensor with real-checkpoint key
         # aliasing (model. -> model.language_model. + mHC {site}_hc.{param} ->
@@ -3250,6 +3491,10 @@ class Glm5NextForCausalLM(PyModelBase):
         L._w8.load_tensor = _aliased_load_tensor
         L.find = _aliased_find
         L.load_tensor = _aliased_load_tensor
+        kda_loader._w8.find = _aliased_find
+        kda_loader._w8.load_tensor = _aliased_load_tensor
+        kda_loader.find = _aliased_find
+        kda_loader.load_tensor = _aliased_load_tensor
 
         # embed_tokens: HiddenParallelEmbedding — shard the hidden dim (dim 1).
         L.load_fp("model.embed_tokens.weight", dim=1)
@@ -3261,7 +3506,7 @@ class Glm5NextForCausalLM(PyModelBase):
             if self.cfg.is_dsa(i):
                 self._load_dsa_attn(L, attn, i)
             else:
-                self._load_kda_attn(L, attn, i)
+                self._load_kda_attn(kda_loader, attn, i)
             self._load_mlp(L, p + "mlp.", i)
             # mHC residual sites (always on, replicated).
             for hc in ("attn_hc", "ffn_hc"):

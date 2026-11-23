@@ -18,7 +18,7 @@ import sys
 import types
 from importlib.util import find_spec
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
 import torch
@@ -382,7 +382,12 @@ def _nope_cp_partition_backend(nope_cache: torch.Tensor) -> NpuPagedAttentionBac
     return backend
 
 
-def test_mla_nope_cp_partitions_query_and_skips_rope_cache() -> None:
+@pytest.mark.parametrize(
+    "local_output,local_query,local_topk", [(False, False, False), (True, False, False), (True, True, True)]
+)
+def test_mla_nope_cp_partitions_query_and_skips_rope_cache(
+    local_output: bool, local_query: bool, local_topk: bool
+) -> None:
     """Partitioned NoPE CP path: the model's **global** latent/query/topk reach
     the backend unchanged, the sparse kernel runs on this rank's real global
     rows only, and the result is scattered back into the global layout the
@@ -405,7 +410,20 @@ def test_mla_nope_cp_partitions_query_and_skips_rope_cache() -> None:
         patch.object(torch.ops.xllm_ops, "reshape_paged_cache", create=True) as reshape,
         patch.object(backend, "_mla_sparse", side_effect=lambda query, *_args: torch.ones_like(query)) as sparse,
     ):
-        output = backend.execute_mla(q_latent, None, k_latent, None, layer, topk)
+        query = q_latent
+        if local_query:
+            query = q_latent.index_select(0, cp_context.shard_index.clamp_min(0))
+        output = backend.execute_mla(
+            query,
+            None,
+            k_latent,
+            None,
+            layer,
+            topk.index_select(0, cp_context.shard_index.clamp_min(0)) if local_topk else topk,
+            cp_local_output=local_output,
+            cp_local_query=local_query,
+            cp_local_topk=local_topk,
+        )
 
     # The global latent is written straight through the global slot mapping.
     reshape.assert_called_once_with(
@@ -420,6 +438,7 @@ def test_mla_nope_cp_partitions_query_and_skips_rope_cache() -> None:
     torch.testing.assert_close(sparse_args[0], q_latent.index_select(0, real_rows))
     assert sparse_args[1] is None  # q_pe
     assert sparse_args[3] is None  # rope cache
+    torch.testing.assert_close(sparse_args[4], topk.index_select(0, real_rows))
     torch.testing.assert_close(
         sparse_args[5],
         torch.tensor([[0, 1], [0, 1], [2, 3]], dtype=torch.int32),
@@ -428,8 +447,32 @@ def test_mla_nope_cp_partitions_query_and_skips_rope_cache() -> None:
     assert sparse_args[7] is cp_context.segment_kv_seq_lens_tensor
     # Global-layout return: computed rows filled, the peer-owned row zero.
     assert output.shape == q_latent.shape
-    torch.testing.assert_close(output.index_select(0, real_rows), torch.ones(5, 1, 2))
-    torch.testing.assert_close(output[1], torch.zeros(1, 2))
+    output_rows = cp_context.query_index if local_output else real_rows
+    padding_row = 2 if local_output else 1
+    torch.testing.assert_close(output.index_select(0, output_rows), torch.ones(5, 1, 2))
+    torch.testing.assert_close(output[padding_row], torch.zeros(1, 2))
+
+
+@pytest.mark.parametrize("local_query", [False, True])
+def test_mla_cp_local_output_keeps_noncontiguous_global_queries_in_local_order(local_query: bool) -> None:
+    backend = _nope_cp_partition_backend(torch.zeros(4, 8, 2))
+    context = _nope_cp_partition_context()
+    context.total_local = 3
+    context.shard_index = torch.tensor([3, 0, 5])
+    context.query_index = torch.tensor([0, 2, 1])
+    query = torch.arange(12, dtype=torch.float32).view(6, 1, 2)
+    with patch.object(backend, "_mla_sparse", side_effect=lambda q, *_args: q * 2):
+        result = backend._mla_cp_partitioned_query(
+            query.index_select(0, context.shard_index) if local_query else query,
+            torch.zeros(6, 1, 1, dtype=torch.int32),
+            backend._kv_caches[0].key,
+            backend._block_table_i32,
+            context,
+            0,
+            local_output=True,
+            local_query=local_query,
+        )
+    torch.testing.assert_close(result, query.index_select(0, context.shard_index) * 2)
 
 
 def test_mla_nope_cp_empty_rank_skips_sparse_and_keeps_cache_write() -> None:
@@ -464,7 +507,8 @@ def test_mla_nope_cp_empty_rank_skips_sparse_and_keeps_cache_write() -> None:
     assert torch.equal(output, torch.zeros_like(q_latent))
 
 
-def test_mla_nope_cp_partition_helper_returns_global_zeros_for_empty_rank() -> None:
+@pytest.mark.parametrize("local_output", [False, True])
+def test_mla_nope_cp_partition_helper_returns_global_zeros_for_empty_rank(local_output: bool) -> None:
     """An all-padding rank owns no real global row, so the helper itself must
     skip the sparse kernel and return a zero tensor in the global layout the
     model reslices."""
@@ -472,6 +516,7 @@ def test_mla_nope_cp_partition_helper_returns_global_zeros_for_empty_rank() -> N
     backend = _nope_cp_partition_backend(nope_cache)
     cp_context = _nope_cp_partition_context()
     cp_context.query_index = torch.zeros(0, dtype=torch.int64)
+    cp_context.total_local = 2
     q_latent = torch.arange(12, dtype=torch.float32).view(6, 1, 2)
 
     with patch.object(backend, "_mla_sparse", create=True) as sparse:
@@ -482,11 +527,12 @@ def test_mla_nope_cp_partition_helper_returns_global_zeros_for_empty_rank() -> N
             backend._block_table_i32,
             cp_context,
             0,
+            local_output=local_output,
         )
 
     sparse.assert_not_called()
-    assert output.shape == q_latent.shape
-    assert torch.equal(output, torch.zeros_like(q_latent))
+    assert output.shape == ((2, 1, 2) if local_output else q_latent.shape)
+    assert torch.equal(output, torch.zeros_like(output))
 
 
 @pytest.mark.parametrize("has_kv_shard", [False, True])
@@ -1461,3 +1507,25 @@ def test_sharded_write_mode_warns_once_about_equal_width_decode_links(
         _shard_prepared_backend(index_cache, metadata)
     logger_spy.warning.assert_called_once()
     assert npu_paged_attention_module._sharded_write_transfer_warning_emitted is True
+
+
+def test_cp_local_mla_rejects_host_offload_before_execution() -> None:
+    backend = _nope_cp_partition_backend(torch.zeros(4, 8, 2))
+    with (
+        patch.object(NpuPagedAttentionBackend, "uses_host_main_kv", new_callable=PropertyMock, return_value=True),
+        patch(
+            "xllm.python.attention.npu_paged_attention.get_forward_context",
+            return_value=SimpleNamespace(cp_context=_nope_cp_partition_context()),
+        ),
+        patch.object(backend, "_execute_kv_offload") as offload,
+        pytest.raises(ValueError, match="host KV offload"),
+    ):
+        backend.execute_mla(
+            torch.zeros(6, 1, 2),
+            None,
+            None,
+            None,
+            SimpleNamespace(layer_id=0, qk_rope_head_dim=0),
+            cp_local_output=True,
+        )
+    offload.assert_not_called()

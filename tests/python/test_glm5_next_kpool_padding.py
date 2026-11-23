@@ -13,11 +13,41 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import glm5_next
+
+
+@pytest.mark.parametrize("host_metadata", [True, False])
+def test_varlen_query_lengths_use_host_metadata_or_one_copy_per_forward(
+    host_metadata: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata = SimpleNamespace(
+        q_cu_seq_lens=torch.tensor([0, 1, 16384]),
+        q_cu_seq_lens_host_values=[0, 1, 16384] if host_metadata else None,
+    )
+    original_cpu = torch.Tensor.cpu
+    copies = 0
+
+    def cpu(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal copies
+        assert not host_metadata, "host lengths must avoid a device-to-host copy"
+        copies += 1
+        return original_cpu(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", cpu)
+    with forward_context(ForwardContext(None, torch.device("cpu"), metadata, [])):
+        assert glm5_next._current_q_seq_lens(2, 16384) == [1, 16383]
+        assert glm5_next._current_q_seq_lens(2, 16384) == [1, 16383]
+    metadata.q_cu_seq_lens[1] = 2
+    metadata.q_cu_seq_lens_host_values = [0, 2, 16384] if host_metadata else None
+    with forward_context(ForwardContext(None, torch.device("cpu"), metadata, [])):
+        assert glm5_next._current_q_seq_lens(2, 16384) == [2, 16382]
+    assert copies == (0 if host_metadata else 2)
 
 
 def _make_indexer(device: torch.device) -> glm5_next.Glm5NextIndexer:
@@ -110,6 +140,33 @@ def test_all_padding_returns_sentinels_without_kernel(monkeypatch: pytest.Monkey
     )
     assert result is not None
     torch.testing.assert_close(result, torch.full((2, 4, 11), -1, dtype=torch.long))
+
+
+@torch.inference_mode()
+def test_fused_selection_reuses_all_valid_source_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    indexer = _make_indexer(torch.device("cpu"))
+    query = torch.ones(1, 4, 2, 128, dtype=torch.bfloat16)
+    weights = torch.ones(1, 4, 2, dtype=torch.bfloat16)
+    lengths = torch.tensor([16], dtype=torch.int32)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    cache = torch.zeros(2, 16, 1, 128, dtype=torch.bfloat16)
+    table = torch.tensor([[1]], dtype=torch.int32)
+    positions = torch.arange(12, 16).unsqueeze(0)
+
+    def _kernel(*args: object, **kwargs: object) -> tuple[torch.Tensor, None]:
+        return torch.arange(11).expand(4, 11).clone(), None
+
+    monkeypatch.setattr(glm5_next.kernels, "pool_key_indexer", _kernel, raising=False)
+    expected = indexer._select_topk_fused_pa(query, weights, lengths, mask, cache, table, positions)
+
+    def _unexpected_item(value: torch.Tensor) -> None:
+        pytest.fail("an all-valid source mask must not be read back for every CP slice")
+
+    monkeypatch.setattr(torch.Tensor, "item", _unexpected_item)
+    actual = indexer._select_topk_fused_pa(
+        query, weights, lengths, mask, cache, table, positions, attention_mask_all_valid=True
+    )
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(not os.getenv("XLLM_KDA_TEST_NPU_DEVICE"), reason="NPU device not configured")
