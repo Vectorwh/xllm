@@ -55,6 +55,9 @@ class DisaggPDServiceImpl {
   void cancel_request(const proto::CancelRequestRequest* request,
                       proto::CancelRequestResponse* response);
 
+  void mark_kv_unsafe(const proto::MarkKVUnsafeRequest* request,
+                      proto::MarkKVUnsafeResponse* response);
+
  protected:
   // Rebuilds the request for the decode instance. On a nullptr return,
   // `constraint_rejected` (optional) reports whether the failure was a

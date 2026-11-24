@@ -219,7 +219,8 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
 
   bool move_memory_regions(const std::string& remote_addr,
                            const std::vector<ByteRegion>& /*regions*/,
-                           MoveOpcode opcode) override {
+                           MoveOpcode opcode,
+                           bool* /*unsafe*/ = nullptr) override {
     move_calls.emplace_back(MoveCall{remote_addr, {}, opcode});
     return move_result;
   }

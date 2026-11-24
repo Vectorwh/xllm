@@ -321,6 +321,10 @@ class TestDisaggPDScheduler final
 
   void report_queues() { report_request_queue_metrics(); }
 
+  void release_expired_kv_leases_for_test() {
+    release_expired_kv_unsafe_leases();
+  }
+
   void enqueue_dispatch(std::shared_ptr<Request> request) {
     enqueue_ready_request(std::move(request));
   }
@@ -2603,6 +2607,65 @@ TEST_F(ReservationTest, ReleaseNeverConsumesAnotherReservation) {
   EXPECT_DOUBLE_EQ(reservations->get_value(), 0.0);
   EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks(),
             (std::vector<size_t>{0, 0}));
+}
+
+TEST_F(ReservationTest, UnsafeMarkLeasesReleasedBlocksUntilExpiry) {
+  auto request = reserve();
+  BlockManager* embedding = request->sequences()[0]
+                                ->kv_state()
+                                .blocks(BlockType::EMBEDDING)[0]
+                                .manager();
+  ASSERT_EQ(embedding->num_used_blocks(), 1u);
+  const int32_t previous_lease_seconds =
+      DisaggPDConfig::get_instance().kv_unsafe_lease_seconds();
+  DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(1);
+  // Restore even when an assertion below aborts the test body: the config is
+  // a process-wide singleton shared with the remaining cases.
+  ScopeGuard restore_lease([previous_lease_seconds] {
+    DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(
+        previous_lease_seconds);
+  });
+  ASSERT_TRUE(decode_.mark_kv_unsafe("req"));
+  ASSERT_TRUE(decode_.release_reservation("req", "reservation"));
+  // The reservation is consumed, but its target blocks stay leased.
+  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_EQ(embedding->num_used_blocks(), 1u);
+  decode_.report_queues();
+  auto* leases =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_kv_lease", "0"});
+  ASSERT_NE(leases, nullptr);
+  EXPECT_DOUBLE_EQ(leases->get_value(), 1.0);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  decode_.release_expired_kv_leases_for_test();
+  EXPECT_EQ(embedding->num_used_blocks(), 0u);
+  decode_.report_queues();
+  EXPECT_DOUBLE_EQ(leases->get_value(), 0.0);
+}
+
+TEST_F(ReservationTest, UnsafeMarkLeasesBlocksOnUnlink) {
+  auto request = reserve();
+  BlockManager* embedding = request->sequences()[0]
+                                ->kv_state()
+                                .blocks(BlockType::EMBEDDING)[0]
+                                .manager();
+  ASSERT_EQ(embedding->num_used_blocks(), 1u);
+  const int32_t previous_lease_seconds =
+      DisaggPDConfig::get_instance().kv_unsafe_lease_seconds();
+  DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(1);
+  ScopeGuard restore_lease([previous_lease_seconds] {
+    DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(
+        previous_lease_seconds);
+  });
+  ASSERT_TRUE(decode_.mark_kv_unsafe("req"));
+  // Unlink is a second waiting-reservation exit and must not bypass the mark.
+  ASSERT_TRUE(decode_.unlink_instance("prefill", {}, {}, {}, 1, 1));
+  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_EQ(embedding->num_used_blocks(), 1u);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  decode_.release_expired_kv_leases_for_test();
+  EXPECT_EQ(embedding->num_used_blocks(), 0u);
 }
 
 TEST_F(ReservationTest, ReleaseBeforeLateAllocationPreventsReservation) {

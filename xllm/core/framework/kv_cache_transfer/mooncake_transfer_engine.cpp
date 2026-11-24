@@ -18,9 +18,11 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <thread>
 #include <unordered_set>
 
 #include "absl/strings/str_join.h"
@@ -106,25 +108,71 @@ bool multiply_overflows(uint64_t lhs, uint64_t rhs) {
   return lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs;
 }
 
-bool wait_batch(TransferEngine* engine, BatchID batch_id) {
+enum class BatchRetirement {
+  RETIRED,
+  FAILED_RETIRED,
+  UNSAFE,
+};
+
+constexpr std::chrono::seconds kBatchRetirementDeadline{30};
+// Back off while the batch stays busy: a stuck transfer would otherwise issue
+// up to 4096 status queries plus one free per 100us for the whole deadline.
+constexpr std::chrono::microseconds kBatchRetirementPollMin{100};
+constexpr std::chrono::microseconds kBatchRetirementPollMax{10000};
+
+// getBatchTransferStatus reports FAILED as soon as one task fails, while its
+// siblings may still be writing into the caller's buffers. Poll every task and
+// use freeBatchID as the retirement signal. A failure with any sibling still
+// running, a timed-out slice, or an unbounded wait all mean the caller must
+// lease the affected ranges instead of returning them to the free pool.
+BatchRetirement wait_batch_and_free(TransferEngine* engine,
+                                    BatchID batch_id,
+                                    size_t task_count) {
+  const auto started_at = std::chrono::steady_clock::now();
+  bool failed = false;
+  std::chrono::microseconds poll_interval = kBatchRetirementPollMin;
   while (true) {
-    TransferStatus status;
-    mooncake::Status result = engine->getBatchTransferStatus(batch_id, status);
-    if (!result.ok()) {
-      LOG(ERROR) << "getBatchTransferStatus not ok";
-      return false;
+    bool unsafe = false;
+    for (size_t task_id = 0; task_id < task_count; ++task_id) {
+      TransferStatus status;
+      const mooncake::Status queried =
+          engine->getTransferStatus(batch_id, task_id, status);
+      if (!queried.ok()) {
+        failed = true;
+        continue;
+      }
+      if (status.s == TransferStatusEnum::TIMEOUT) {
+        unsafe = true;
+      } else if (status.s == TransferStatusEnum::FAILED) {
+        failed = true;
+      }
     }
-    if (status.s == TransferStatusEnum::COMPLETED) {
-      return true;
+    const mooncake::Status freed = engine->freeBatchID(batch_id);
+    if (unsafe) {
+      return BatchRetirement::UNSAFE;
     }
-    if (status.s == TransferStatusEnum::FAILED) {
-      LOG(ERROR) << "getBatchTransferStatus failed";
-      return false;
+    if (freed.ok()) {
+      return failed ? BatchRetirement::FAILED_RETIRED
+                    : BatchRetirement::RETIRED;
     }
-    if (status.s == TransferStatusEnum::TIMEOUT) {
-      LOG(ERROR) << "Sync data transfer timeout";
-      return false;
+    if (!freed.IsBatchBusy()) {
+      LOG(ERROR) << "Mooncake batch cleanup failed, batch=" << batch_id
+                 << ", status=" << freed.ToString();
+      return BatchRetirement::UNSAFE;
     }
+    if (failed) {
+      // A terminal failure with siblings still running cannot prove those
+      // siblings stopped touching the buffers; fail fast and lease them.
+      return BatchRetirement::UNSAFE;
+    }
+    if (std::chrono::steady_clock::now() - started_at >=
+        kBatchRetirementDeadline) {
+      LOG(ERROR) << "Mooncake batch retirement deadline exceeded, batch="
+                 << batch_id << ", tasks=" << task_count;
+      return BatchRetirement::UNSAFE;
+    }
+    std::this_thread::sleep_for(poll_interval);
+    poll_interval = std::min(poll_interval * 2, kBatchRetirementPollMax);
   }
 }
 
@@ -1092,7 +1140,11 @@ bool MooncakeTransferEngine::move_memory_groups(
 bool MooncakeTransferEngine::move_memory_regions(
     const std::string& remote_addr,
     const std::vector<ByteRegion>& regions,
-    MoveOpcode move_opcode) {
+    MoveOpcode move_opcode,
+    bool* unsafe) {
+  if (unsafe != nullptr) {
+    *unsafe = false;
+  }
   if (regions.empty()) {
     return true;
   }
@@ -1183,18 +1235,34 @@ bool MooncakeTransferEngine::move_memory_regions(
     const size_t end = std::min(begin + kMaxRegionsPerBatch, entries.size());
     std::vector<TransferRequest> batch_entries(entries.begin() + begin,
                                                entries.begin() + end);
-    const BatchID batch_id = engine->allocateBatchID(batch_entries.size());
-    mooncake::Status submit_status =
+    const size_t task_count = batch_entries.size();
+    const BatchID batch_id = engine->allocateBatchID(task_count);
+    const mooncake::Status submit_status =
         engine->submitTransfer(batch_id, batch_entries);
     if (!submit_status.ok()) {
-      LOG(ERROR) << "submit byte regions failed";
+      // A failed submit can leave unsubmitted tasks with zero slices, which
+      // status queries report as COMPLETED; no retirement can be proven for
+      // entries whose submission was rejected. Match the pre-existing failure
+      // contract: one cleanup attempt, then fail without waiting.
+      LOG(ERROR) << "submit byte regions failed, batch=" << batch_id
+                 << ", status=" << submit_status.ToString();
+      const mooncake::Status free_status = engine->freeBatchID(batch_id);
+      if (!free_status.ok()) {
+        LOG(ERROR) << "submit-failed batch cleanup deferred, batch=" << batch_id
+                   << ", status=" << free_status.ToString();
+      }
+      if (unsafe != nullptr) {
+        *unsafe = true;
+      }
       COUNTER_INC(mooncake_transfer_failed_total);
-      engine->freeBatchID(batch_id);
       return false;
     }
-    const bool transfer_success = wait_batch(engine, batch_id);
-    const mooncake::Status free_status = engine->freeBatchID(batch_id);
-    if (!free_status.ok() || !transfer_success) {
+    const BatchRetirement retirement =
+        wait_batch_and_free(engine, batch_id, task_count);
+    if (retirement != BatchRetirement::RETIRED) {
+      if (unsafe != nullptr && retirement == BatchRetirement::UNSAFE) {
+        *unsafe = true;
+      }
       LOG(ERROR) << "MoonCake byte-region batch failed";
       COUNTER_INC(mooncake_transfer_failed_total);
       return false;

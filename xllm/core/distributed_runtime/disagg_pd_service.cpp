@@ -43,6 +43,15 @@ void DisaggPDService::CancelRequest(
   disagg_pd_service_impl_->cancel_request(request, response);
 }
 
+void DisaggPDService::MarkKVUnsafe(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::MarkKVUnsafeRequest* request,
+    proto::MarkKVUnsafeResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  disagg_pd_service_impl_->mark_kv_unsafe(request, response);
+}
+
 void DisaggPDService::AddNewRequests(
     ::google::protobuf::RpcController* controller,
     const proto::DisaggRequests* request,

@@ -536,6 +536,7 @@ void DisaggPDScheduler::start_rpc_server() {
 }
 
 void DisaggPDScheduler::step(const absl::Duration& timeout) {
+  release_expired_kv_unsafe_leases();
   ContinuousScheduler::step(timeout);
   // Send first generation token to decode instance.
   // Always check (not gated on last_step_prefill_) because chunked prefill
@@ -570,6 +571,8 @@ void DisaggPDScheduler::append_request_queue_metrics(
   queues.emplace_back(
       scheduler_queue_metric::kPdReservation,
       reservation_waiting_requests_.load(std::memory_order_relaxed));
+  queues.emplace_back(scheduler_queue_metric::kPdKvLease,
+                      kv_unsafe_lease_holders_.load(std::memory_order_relaxed));
 }
 
 bool DisaggPDScheduler::discard_cancelled_dispatch_request(
@@ -1336,6 +1339,7 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
     return false;
   }
   std::shared_ptr<Request> request;
+  bool leased = false;
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
     const absl::Time now = absl::Now();
@@ -1352,11 +1356,93 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
     }
     request = take_waiting_request(req_id);
     decode_cancellation_entries_.erase(req_id);
+    leased = lease_waiting_reservation_if_unsafe_locked(req_id, request, now);
   }
-  if (request != nullptr) {
+  // Deallocation stays outside the lock, as in the clean path.
+  if (request != nullptr && !leased) {
     request->reset();
   }
   return true;
+}
+
+bool DisaggPDScheduler::lease_waiting_reservation_if_unsafe_locked(
+    const std::string& req_id,
+    const std::shared_ptr<Request>& request,
+    absl::Time now) {
+  if (request == nullptr) {
+    return true;
+  }
+  const auto unsafe_it = unsafe_reservations_.find(
+      reservation_key(req_id, request->state().pd_reservation_id));
+  if (unsafe_it == unsafe_reservations_.end()) {
+    return false;
+  }
+  unsafe_reservations_.erase(unsafe_it);
+  // The sender could not prove it stopped writing these buffers. Park the
+  // request (and with it every target block) until the lease expires instead
+  // of returning the blocks to the pool for immediate reuse.
+  const absl::Time lease_deadline =
+      now +
+      absl::Seconds(
+          ::xllm::DisaggPDConfig::get_instance().kv_unsafe_lease_seconds());
+  kv_unsafe_leases_.push_back({request, lease_deadline});
+  kv_unsafe_lease_holders_.fetch_add(1, std::memory_order_relaxed);
+  LOG(WARNING) << "Decode holds KV blocks of an unsafe PUSH transfer, "
+               << "request_id=" << req_id
+               << ", reservation_id=" << request->state().pd_reservation_id
+               << ", release_at=" << lease_deadline;
+  return true;
+}
+
+bool DisaggPDScheduler::mark_kv_unsafe(const std::string& req_id) {
+  if (req_id.empty()) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+  const absl::Time now = absl::Now();
+  prune_cancelled_reservations(now);
+  const auto it = received_request_map_.find(req_id);
+  if (it == received_request_map_.end()) {
+    // The reservation is already gone: the blocks were returned before the
+    // sender proved retirement, so the hardware hazard can no longer be
+    // contained on this side. No tombstone: a mark only ever protects the
+    // reservation its transfer was writing to, and PUSH allocation precedes
+    // every transfer, so a matching waiting reservation always exists.
+    LOG(ERROR) << "Unsafe KV transfer mark has no waiting reservation, "
+               << "request_id=" << req_id;
+    return false;
+  }
+  unsafe_reservations_.insert(
+      reservation_key(req_id, it->second->state().pd_reservation_id));
+  return true;
+}
+
+void DisaggPDScheduler::release_expired_kv_unsafe_leases() {
+  if (kv_unsafe_lease_holders_.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+  std::vector<std::shared_ptr<Request>> expired;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    const absl::Time now = absl::Now();
+    for (auto it = kv_unsafe_leases_.begin(); it != kv_unsafe_leases_.end();) {
+      if (it->deadline <= now) {
+        expired.emplace_back(std::move(it->request));
+        it = kv_unsafe_leases_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (expired.empty()) {
+    return;
+  }
+  kv_unsafe_lease_holders_.fetch_sub(expired.size(), std::memory_order_relaxed);
+  for (const auto& request : expired) {
+    LOG(INFO) << "KV unsafe-transfer lease expired, returning blocks, "
+              << "request_id=" << request->request_id();
+    request->reset();
+  }
 }
 
 proto::CancelRequestResponse::Result DisaggPDScheduler::cancel_request(
@@ -1472,6 +1558,12 @@ bool DisaggPDScheduler::decode_recv_first_generation(
       return false;
     }
     request = take_waiting_request(req_id);
+    // The reservation is handed off, so no later release can consume an
+    // unsafe mark for it; drop the mark with the reservation.
+    if (request != nullptr) {
+      unsafe_reservations_.erase(
+          reservation_key(req_id, request->state().pd_reservation_id));
+    }
   }
 
   auto& sequences = request->sequences();
@@ -1910,8 +2002,19 @@ bool DisaggPDScheduler::unlink_instance(
     auto it = instance_to_received_requests_map_.find(instance_name);
     if (it != instance_to_received_requests_map_.end()) {
       // This reverse index excludes preparing and handed-off requests.
+      const absl::Time now = absl::Now();
       for (const auto& req_id : it->second) {
-        received_request_map_.erase(req_id);
+        auto request_it = received_request_map_.find(req_id);
+        if (request_it != received_request_map_.end()) {
+          auto request = std::move(request_it->second);
+          received_request_map_.erase(request_it);
+          // Unlink is another waiting-reservation exit and must honour an
+          // unsafe mark exactly like release_reservation does. Unlike a
+          // release, an unmarked reservation is only dropped here: unlink
+          // never resets the request, it releases ownership.
+          (void)lease_waiting_reservation_if_unsafe_locked(
+              req_id, request, now);
+        }
         request_to_instance_map_.erase(req_id);
         decode_cancellation_entries_.erase(req_id);
       }

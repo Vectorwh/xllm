@@ -72,7 +72,10 @@ cc_library(
     :kv_transfer_completion
     :parallel_state
     :platform
+    absl::time
+    brpc
     glog::glog
+    proto::xllm_proto
     torch
 )
 

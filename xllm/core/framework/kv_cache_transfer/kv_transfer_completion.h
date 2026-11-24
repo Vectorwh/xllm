@@ -64,6 +64,12 @@ class KVTransferCompletion final {
   // Waits until all owned transfers finish and returns the failed request IDs.
   std::unordered_set<std::string> wait();
 
+  // Request IDs whose transfer ended without a proof that the target buffers
+  // stopped being accessed. Always a subset of the failed IDs.
+  const std::unordered_set<std::string>& unsafe_request_ids() const {
+    return unsafe_request_ids_;
+  }
+
  private:
   // Aggregates the pending futures into one completion bounded by
   // collect_timeout. Returns the aggregated Try: hasValue means every transfer
@@ -85,12 +91,16 @@ class KVTransferCompletion final {
   };
   std::vector<PendingTransfer> futures_;
   std::unordered_set<std::string> failed_request_ids_;
+  std::unordered_set<std::string> unsafe_request_ids_;
   bool waited_ = false;
 };
 
-// Waits for KV push completion and reduces failed request IDs across the
-// replicated TP/CP groups on PUSH-sending instances. The instance role is
-// identical across ranks; an empty local transfer list is not a safe gate.
+// Waits for the owned PUSH transfers, reports every request whose transfer
+// did not retire safely to its Decode peer, and returns the failed request IDs
+// reduced across ranks. The instance role is identical across ranks; an empty
+// local transfer list is not a safe gate. The report RPC completes before this
+// call returns, so Decode has parked the affected target blocks before the
+// caller's failure output lets the scheduler release those reservations.
 std::vector<std::string> finalize_kv_push_failures(
     KVTransferCompletion& kv_transfers,
     const std::vector<TransferKVInfo>& transfer_kv_infos,

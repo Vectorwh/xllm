@@ -51,6 +51,7 @@ class DisaggPDConfig final {
          "disagg_pd_port",
          "instance_role",
          "kv_cache_transfer_mode",
+         "kv_unsafe_lease_seconds",
          "transfer_listen_port"}};
     return kOptionCategory;
   }
@@ -64,6 +65,13 @@ class DisaggPDConfig final {
   PROPERTY(std::string, instance_role) = "DEFAULT";
 
   PROPERTY(std::string, kv_cache_transfer_mode) = "PUSH";
+
+  // Decode holds the target blocks of a request whose PUSH transfer ended
+  // without a retirement proof (timeout or failed batch retirement) for this
+  // long instead of returning them to the pool immediately. Covers the window
+  // in which the sender may still write those buffers; after it expires the
+  // residual hardware hazard is accepted.
+  PROPERTY(int32_t, kv_unsafe_lease_seconds) = 120;
 
   PROPERTY(int32_t, transfer_listen_port) = 26000;
 

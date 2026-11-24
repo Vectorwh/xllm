@@ -411,6 +411,7 @@ void ContinuousScheduler::report_request_queue_metrics() {
   for (const auto& [queue_name, count] : request_queue_samples_) {
     if (queue_name != scheduler_queue_metric::kPdDispatchActive &&
         queue_name != scheduler_queue_metric::kPdKvPrepare &&
+        queue_name != scheduler_queue_metric::kPdKvLease &&
         queue_name != scheduler_queue_metric::kPrefetch) {
       waiting_requests += count;
     }

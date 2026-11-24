@@ -62,6 +62,7 @@ inline constexpr char kPdDispatch[] = "pd_dispatch";
 inline constexpr char kPdDispatchActive[] = "pd_dispatch_active";
 inline constexpr char kPdKvPrepare[] = "pd_kv_prepare";
 inline constexpr char kPdReservation[] = "pd_reservation";
+inline constexpr char kPdKvLease[] = "pd_kv_lease";
 inline constexpr char kOfflinePrefill[] = "offline_prefill";
 inline constexpr char kOfflineDecode[] = "offline_decode";
 inline constexpr char kDiTDeferred[] = "dit_deferred";

@@ -13,19 +13,138 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <absl/time/clock.h>
+#include <absl/time/time.h>
+#include <brpc/channel.h>
+#include <brpc/controller.h>
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "core/common/types.h"
 #include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/platform/device.h"
+#include "disagg_pd.pb.h"
 
 namespace xllm {
 namespace {
+
+constexpr int32_t kUnsafeMarkAttempts = 3;
+constexpr int32_t kUnsafeMarkTimeoutMs = 1000;
+constexpr int32_t kUnsafeMarkBackoffMs = 50;
+
+// Tells one Decode peer that the PUSH transfers of `request_ids` ended without
+// a retirement proof, so releasing each reservation must park its target
+// blocks for a lease. One channel serves every request of the peer. Returns
+// the number of requests whose mark was not delivered: NOT_FOUND/NOT_SUPPORTED
+// replies mean nothing is left to protect there, so retrying cannot help.
+// Blocking here is deliberate -- for every delivered mark the caller returns
+// the transfer failure only after this RPC completes, which orders the mark
+// before the release RPC the scheduler sends for the same request. Marks still
+// undelivered when the peer stops answering keep no ordering guarantee; their
+// requests fall back to the plain release path, which the change note records
+// as an accepted residual risk.
+size_t mark_peer_requests_unsafe(const std::string& address,
+                                 const std::vector<std::string>& request_ids,
+                                 size_t& protected_requests,
+                                 size_t& unprotected_requests) {
+  brpc::Channel channel;
+  brpc::ChannelOptions options;
+  options.timeout_ms = kUnsafeMarkTimeoutMs;
+  options.connect_timeout_ms = kUnsafeMarkTimeoutMs;
+  options.max_retry = 0;
+  if (channel.Init(address.c_str(), nullptr, &options) != 0) {
+    LOG(ERROR) << "KV unsafe-transfer mark failed, peer=" << address
+               << ", channel initialization failed, requests="
+               << request_ids.size();
+    return request_ids.size();
+  }
+  proto::DisaggPDService_Stub stub(&channel);
+  for (size_t index = 0; index < request_ids.size(); ++index) {
+    const std::string& request_id = request_ids[index];
+    proto::MarkKVUnsafeRequest mark;
+    mark.set_req_id(request_id);
+    bool delivered = false;
+    for (int32_t attempt = 1; attempt <= kUnsafeMarkAttempts; ++attempt) {
+      brpc::Controller cntl;
+      proto::MarkKVUnsafeResponse response;
+      stub.MarkKVUnsafe(&cntl, &mark, &response, nullptr);
+      if (!cntl.Failed()) {
+        delivered = true;
+        if (response.result() == proto::MarkKVUnsafeResponse::MARKED) {
+          ++protected_requests;
+        } else {
+          ++unprotected_requests;
+          LOG(WARNING) << "KV unsafe-transfer mark not applied, request_id="
+                       << request_id << ", peer=" << address
+                       << ", result=" << response.result();
+        }
+        break;
+      }
+      LOG(WARNING) << "KV unsafe-transfer mark retry, request_id=" << request_id
+                   << ", peer=" << address << ", attempt=" << attempt
+                   << ", rpc_error=" << cntl.ErrorText();
+      if (attempt < kUnsafeMarkAttempts) {
+        absl::SleepFor(absl::Milliseconds(kUnsafeMarkBackoffMs));
+      }
+    }
+    if (!delivered) {
+      // The peer stopped answering: repeating the retry budget for its
+      // remaining requests would stall the failing step for seconds.
+      return request_ids.size() - index;
+    }
+  }
+  return 0;
+}
+
+// Marks every request whose PUSH transfer the local rank could not retire.
+void notify_kv_transfer_unsafe(
+    const std::vector<TransferKVInfo>& transfer_kv_infos,
+    const std::unordered_set<std::string>& unsafe_request_ids) {
+  if (unsafe_request_ids.empty()) {
+    return;
+  }
+  std::unordered_map<std::string, std::vector<std::string>> peer_requests;
+  std::unordered_set<std::string> seen_request_ids;
+  for (const TransferKVInfo& info : transfer_kv_infos) {
+    if (unsafe_request_ids.find(info.request_id) == unsafe_request_ids.end()) {
+      continue;
+    }
+    if (!seen_request_ids.insert(info.request_id).second) {
+      continue;
+    }
+    const std::string& address = info.remote_instance_info.rpc_address;
+    if (address.empty()) {
+      LOG(ERROR) << "Unsafe KV transfer has no Decode rpc address, request_id="
+                 << info.request_id;
+      continue;
+    }
+    peer_requests[address].emplace_back(info.request_id);
+  }
+
+  size_t protected_requests = 0;
+  size_t unprotected_requests = 0;
+  size_t undelivered = 0;
+  for (const auto& [address, request_ids] : peer_requests) {
+    undelivered += mark_peer_requests_unsafe(
+        address, request_ids, protected_requests, unprotected_requests);
+  }
+  if (undelivered > 0) {
+    LOG(ERROR) << "Unsafe KV transfer marks undelivered, requests="
+               << undelivered
+               << "; Decode may reuse blocks that are still being written";
+  }
+  if (unprotected_requests > 0) {
+    LOG(ERROR) << "Unsafe KV transfer marks delivered but not protected, "
+               << "requests=" << unprotected_requests
+               << "; Decode may reuse blocks that are still being written";
+  }
+}
 
 uint64_t hash_transfer_request_ids(
     const std::vector<std::string>& request_ids) {
@@ -198,6 +317,10 @@ std::vector<std::string> finalize_kv_push_failures(
     CHECK(local_failed_request_ids.empty());
     return {};
   }
+  // Runs before this step produces the failed request IDs, so Decode holds
+  // the unsafe mark by the time the scheduler releases each reservation there.
+  notify_kv_transfer_unsafe(transfer_kv_infos,
+                            kv_transfers.unsafe_request_ids());
   return reduce_failed_request_ids(
       local_failed_request_ids, canonical_request_ids, parallel_args, device);
 }

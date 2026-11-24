@@ -276,6 +276,18 @@ void DisaggPDServiceImpl::cancel_request(
   response->set_result(scheduler_->cancel_request(*request));
 }
 
+void DisaggPDServiceImpl::mark_kv_unsafe(
+    const proto::MarkKVUnsafeRequest* request,
+    proto::MarkKVUnsafeResponse* response) {
+  if (!scheduler_->supports_kv_unsafe_lease()) {
+    response->set_result(proto::MarkKVUnsafeResponse::NOT_SUPPORTED);
+    return;
+  }
+  const bool marked = scheduler_->mark_kv_unsafe(request->req_id());
+  response->set_result(marked ? proto::MarkKVUnsafeResponse::MARKED
+                              : proto::MarkKVUnsafeResponse::NOT_FOUND);
+}
+
 void DisaggPDServiceImpl::release_reservation(
     const proto::ReleaseReservationRequest* request,
     proto::ReleaseReservationResponse* response) {

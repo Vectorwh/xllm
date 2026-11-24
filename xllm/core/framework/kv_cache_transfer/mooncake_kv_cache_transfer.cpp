@@ -777,6 +777,9 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
   }
 
   std::unordered_set<std::string> failed_keys;
+  // Failures whose batch retirement proved the destination buffers were no
+  // longer written; only these may be reported as UNSAFE to the caller.
+  std::unordered_set<std::string> unsafe_keys;
   const CacheNamespace cache_namespace =
       is_spec_draft ? CacheNamespace::SPEC_DRAFT : CacheNamespace::MAIN;
   for (int64_t layer_index = 0; layer_index < num_layers; ++layer_index) {
@@ -811,12 +814,20 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
       if (regions.empty()) {
         continue;
       }
+      bool unsafe = false;
       const bool success = mooncake_te_->move_memory_regions(
-          kv_info.dst_addr, regions, MooncakeTransferEngine::MoveOpcode::WRITE);
+          kv_info.dst_addr,
+          regions,
+          MooncakeTransferEngine::MoveOpcode::WRITE,
+          &unsafe);
       if (!success) {
         LOG(ERROR) << "Push KV byte regions failed, layer=" << layer_index
-                   << ", destination=" << kv_info.dst_addr;
+                   << ", destination=" << kv_info.dst_addr
+                   << ", unsafe=" << unsafe;
         failed_keys.insert(key);
+        if (unsafe) {
+          unsafe_keys.insert(key);
+        }
         layer_safe = false;
       }
     }
@@ -830,8 +841,10 @@ MooncakeKVCacheTransferDefault::push_kv_blocks(
     if (failed_keys.find(key) == failed_keys.end()) {
       continue;
     }
-    results.push_back(
-        {merged_kv_infos.at(key).request_ids, KVTransferErrorCode::FAILED});
+    results.push_back({merged_kv_infos.at(key).request_ids,
+                       unsafe_keys.find(key) == unsafe_keys.end()
+                           ? KVTransferErrorCode::FAILED
+                           : KVTransferErrorCode::UNSAFE});
   }
   VLOG(10) << "[Mooncake][PDTransfer] direction=push, destinations="
            << keys.size() << ", layers=" << num_layers
@@ -1105,6 +1118,9 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
   auto& allocator = XTensorAllocator::get_instance();
 
   std::unordered_set<std::string> failed_keys;
+  // Failures whose batch retirement proved the destination buffers were no
+  // longer written; only these may be reported as UNSAFE to the caller.
+  std::unordered_set<std::string> unsafe_keys;
   for (int64_t layer_index = 0; layer_index < num_layers_; ++layer_index) {
     if (!layer_synchronizer->synchronize_layer(layer_index)) {
       LOG(ERROR) << "Synchronize XTensor KV cache layer failed, layer="
@@ -1242,14 +1258,20 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
         failed_keys.insert(key);
         continue;
       }
+      bool unsafe = false;
       const bool ret =
           regions.empty() || xtensor_te->move_memory_regions(
                                  kv_info.dst_addr,
                                  regions,
-                                 MooncakeTransferEngine::MoveOpcode::WRITE);
+                                 MooncakeTransferEngine::MoveOpcode::WRITE,
+                                 &unsafe);
       if (!ret) {
-        LOG(ERROR) << "push_kv_blocks_impl failed at layer " << layer_index;
+        LOG(ERROR) << "push_kv_blocks_impl failed at layer " << layer_index
+                   << ", unsafe=" << unsafe;
         failed_keys.insert(key);
+        if (unsafe) {
+          unsafe_keys.insert(key);
+        }
         layer_safe = false;
       }
     }
@@ -1262,8 +1284,10 @@ MooncakeKVCacheTransferXTensor::push_kv_blocks_impl(
   results.reserve(failed_keys.size());
   for (const std::string& key : keys) {
     if (failed_keys.find(key) != failed_keys.end()) {
-      results.push_back(
-          {merged_kv_infos.at(key).request_ids, KVTransferErrorCode::FAILED});
+      results.push_back({merged_kv_infos.at(key).request_ids,
+                         unsafe_keys.find(key) == unsafe_keys.end()
+                             ? KVTransferErrorCode::FAILED
+                             : KVTransferErrorCode::UNSAFE});
     }
   }
   VLOG(1) << "push_kv_blocks_impl completed, num_layers=" << num_layers_

@@ -24,6 +24,10 @@ namespace xllm {
 enum class KVTransferErrorCode : uint8_t {
   NONE = 0,
   FAILED = 1,
+  // The transfer did not prove that the target buffers stopped being accessed
+  // (timeout/give-up, or a failure with siblings still in flight). Callers
+  // must lease the affected request's blocks instead of releasing them.
+  UNSAFE = 2,
 };
 
 struct KVTransferTaskResult {

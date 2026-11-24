@@ -169,19 +169,31 @@ std::unordered_set<std::string> KVTransferCompletion::wait() {
                    << result.exception().what();
         failed_request_ids_.insert(futures_[index].fallback_request_ids.begin(),
                                    futures_[index].fallback_request_ids.end());
+        // A future that threw never reported a batch status either, so it
+        // cannot prove the destination buffers were retired.
+        unsafe_request_ids_.insert(futures_[index].fallback_request_ids.begin(),
+                                   futures_[index].fallback_request_ids.end());
         continue;
       }
       for (const KVTransferTaskResult& task : result.value()) {
         if (task.error_code != KVTransferErrorCode::NONE) {
           failed_request_ids_.insert(task.request_ids.begin(),
                                      task.request_ids.end());
+          if (task.error_code == KVTransferErrorCode::UNSAFE) {
+            unsafe_request_ids_.insert(task.request_ids.begin(),
+                                       task.request_ids.end());
+          }
         }
       }
     }
   }
   if (timed_out) {
+    // A transfer that did not even report a batch status never proved that
+    // the destination buffers were retired, so its requests are unsafe too.
     for (const PendingTransfer& pending : futures_) {
       failed_request_ids_.insert(pending.fallback_request_ids.begin(),
+                                 pending.fallback_request_ids.end());
+      unsafe_request_ids_.insert(pending.fallback_request_ids.begin(),
                                  pending.fallback_request_ids.end());
     }
   }

@@ -183,7 +183,8 @@ class MooncakeTransferEngine {
 
   virtual bool move_memory_regions(const std::string& remote_addr,
                                    const std::vector<ByteRegion>& regions,
-                                   MoveOpcode move_opcode);
+                                   MoveOpcode move_opcode,
+                                   bool* unsafe = nullptr);
 
   bool link_sessions(const std::vector<uint64_t>& cluster_ids,
                      const std::vector<std::string>& remote_addrs);

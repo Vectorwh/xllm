@@ -43,6 +43,12 @@ DEFINE_string(kv_cache_transfer_mode,
               "PUSH",
               "The mode of kv cache transfer(e.g. PUSH, PULL).");
 
+DEFINE_int32(kv_unsafe_lease_seconds,
+             120,
+             "How long a Decode instance keeps the target blocks of a request "
+             "whose PUSH transfer ended without a retirement proof before "
+             "returning them to the pool.");
+
 DEFINE_int32(transfer_listen_port, 26000, "The KVCacheTranfer listen port.");
 
 DEFINE_bool(kv_push_dst_rotate,
@@ -58,6 +64,7 @@ void DisaggPDConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disagg_pd_port);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(instance_role);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_cache_transfer_mode);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_unsafe_lease_seconds);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(transfer_listen_port);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(kv_push_dst_rotate);
 }
@@ -69,6 +76,7 @@ void DisaggPDConfig::from_json(const JsonReader& json) {
   // instance role is different for prefill and decode instances, so we don't
   // need to assign it from json XLLM_CONFIG_ASSIGN_FROM_JSON(instance_role);
   XLLM_CONFIG_ASSIGN_FROM_JSON(kv_cache_transfer_mode);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(kv_unsafe_lease_seconds);
   XLLM_CONFIG_ASSIGN_FROM_JSON(transfer_listen_port);
 }
 
@@ -87,6 +95,8 @@ void DisaggPDConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, kv_cache_transfer_mode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, kv_unsafe_lease_seconds);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, transfer_listen_port);
 }
 
@@ -100,6 +110,10 @@ void DisaggPDConfig::initialize() {
   if (const auto& json_config = config::get_parsed_json_config()) {
     from_json(*json_config);
   }
+  // A non-positive lease would return unsafely written blocks to the pool
+  // immediately, silently disabling the protection.
+  CHECK_GT(kv_unsafe_lease_seconds(), 0)
+      << "kv_unsafe_lease_seconds must be positive";
 }
 
 void DisaggPDConfig::normalize_mlu(KVCacheConfig& kv_cache_config,

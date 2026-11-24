@@ -373,10 +373,33 @@ message CancelRequestResponse {
   Result result = 1;
 }
 
+// Prefill -> Decode: a PUSH transfer of this request ended without proof that
+// the destination buffers stopped being written (timeout or failed batch
+// retirement). Decode must hold the waiting reservation's target blocks for a
+// lease instead of reusing them when the reservation is released. Idempotent.
+message MarkKVUnsafeRequest {
+  string req_id = 1;
+}
+
+message MarkKVUnsafeResponse {
+  enum Result {
+    UNKNOWN = 0;
+    // The waiting reservation was found and will be leased on release.
+    MARKED = 1;
+    // No matching waiting reservation (already handed off or released).
+    NOT_FOUND = 2;
+    // This instance keeps its own reservation lifecycle (PD-OOC) and cannot
+    // lease the blocks.
+    NOT_SUPPORTED = 3;
+  }
+  Result result = 1;
+}
+
 service DisaggPDService {
   rpc CancelRequest(CancelRequestRequest) returns (CancelRequestResponse) {}
   rpc ReleaseReservation(ReleaseReservationRequest)
       returns (ReleaseReservationResponse) {}
+  rpc MarkKVUnsafe(MarkKVUnsafeRequest) returns (MarkKVUnsafeResponse) {}
   rpc AddNewRequests(DisaggRequests) returns (DisaggResponses) {}
   rpc FirstGeneration(DisaggGenerationsRequests) returns (Status) {}
   rpc MultiGenerations(DisaggGenerationsRequests) returns (Status) {}
