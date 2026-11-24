@@ -53,14 +53,15 @@ SlidingWindowBlockManager::allocate_for_sequence(Sequence* seq,
 
   // Both cases pad invalid blocks through the window start, then the growth
   // below allocates only the missing tail. A cursor behind the sequence uses
-  // the cached length; decode admission has not advanced its cursor yet, so
-  // it uses the sequence length.
+  // the cached length; a PD receive uses the already-computed remote length.
   const size_t seq_cached_tokens = seq->kv_cache_tokens_num();
   const size_t state_cached_tokens = kv_state.kv_cache_tokens_num();
   size_t window_basis = 0;
   if (seq_cached_tokens > state_cached_tokens) {
     window_basis = seq_cached_tokens;
-  } else if (kv_state.num_blocks(block_type()) == 0 &&
+  } else if (seq->cache_allocation_mode() ==
+                 CacheAllocationMode::DECODE_RECEIVE &&
+             kv_state.num_blocks(block_type()) == 0 &&
              options_.instance_is_decode()) {
     window_basis = num_tokens;
   }

@@ -1533,13 +1533,13 @@ TEST(DisaggPDSchedulerTest, V41DecodePrefixHitWaitsForSwaHandoff) {
     TestDisaggPDScheduler scheduler(&engine, options, /*start_services=*/false);
     auto request = make_request(tokens);
     Sequence* sequence = request->sequences()[0].get();
+    sequence->set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
     ASSERT_EQ(pool->prefix_hit_tokens(*sequence, /*rank=*/0), 512u);
-    pool->allocate_shared(sequence);
-    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::KV), 4u);
-    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::SWA), 0u);
     // Use Decode admission, which reserves the full prompt but does not
     // certify that P has filled these destination blocks.
     ASSERT_TRUE(pool->try_allocate(sequence));
+    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::KV), 4u);
+    ASSERT_EQ(sequence->kv_state().shared_blocks_num(BlockType::SWA), 0u);
     ASSERT_EQ(sequence->kv_state().kv_cache_tokens_num(), tokens.size());
     ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
     std::shared_ptr<Request> queued;

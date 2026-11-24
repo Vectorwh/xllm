@@ -808,6 +808,19 @@ TEST(SpecDecodeInputBuilderTest, GroupedPrefillSwaSlotsWrapRing) {
             std::vector<int32_t>({40, 41, 42}));
 }
 
+TEST(SpecDecodeInputBuilderTest, GroupedPrefillKeepsSkippedSwaSlotsAligned) {
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 2;
+  input.positions_host = torch::tensor({3, 4, 5, 8}, torch::kInt);
+  input.input_params.attention.host.q_seq_lens = to_layout_seq_lens({3, 1});
+  input.input_params.attention.host.kv_seq_lens = to_layout_seq_lens({6, 9});
+  input.input_params.multi_block_tables = {
+      torch::tensor({{-1, 21, -1}, {31, 32, 33}}, torch::kInt)};
+
+  EXPECT_EQ(build_grouped_prefill_swa_slots(input, /*block_size=*/4),
+            std::vector<int32_t>({-1, 84, 85, 132}));
+}
+
 TEST(SpecDecodeInputBuilderTest, MultiBlockKeepsSparseAbsoluteRows) {
   std::vector<int32_t> kv_seq_lens = to_layout_seq_lens({24, 20});
   torch::Tensor positions = torch::tensor({23, 19}, torch::kInt);

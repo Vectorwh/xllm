@@ -580,11 +580,10 @@ namespace {
 
 using ProbeResult = CompositeBlockManager::ProbeResult;
 
-// Trim outcome. `to_mount` feeds the shape's mount step; `to_drop` is
-// destroyed with the probe so its Block references fall on their own.
+// Trim outcome. `to_mount` feeds the shape's mount step; dropped probe blocks
+// release when the trimming function returns.
 struct TrimOutcome {
   std::vector<ProbeResult> to_mount;
-  std::vector<ProbeResult> to_drop;
   size_t safe_hit_tokens = 0;
 };
 
@@ -638,16 +637,7 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
   }
 
   if (safe_count < kv.blocks.size()) {
-    ProbeResult drop = {kv.type,
-                        kv.leaf,
-                        /*blocks=*/{},
-                        /*block_size=*/kv.block_size};
-    drop.blocks.reserve(kv.blocks.size() - safe_count);
-    for (size_t i = safe_count; i < kv.blocks.size(); ++i) {
-      drop.blocks.emplace_back(std::move(kv.blocks[i]));
-    }
     kv.blocks.resize(safe_count);
-    out.to_drop.emplace_back(std::move(drop));
   }
   out.safe_hit_tokens = safe_count * kv_block_size;
   out.to_mount = std::move(probes);
@@ -664,7 +654,6 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
                                             std::move(source_blocks),
                                             linear->block_size});
     }
-    out.to_drop.emplace_back(std::move(*linear));
   }
   return out;
 }
@@ -674,6 +663,17 @@ TrimOutcome trim_flat_kv_linear(std::vector<ProbeResult> probes) {
 TrimOutcome trim_swa_kv(std::vector<ProbeResult> probes,
                         size_t max_prefix_tokens) {
   TrimOutcome out;
+  const auto swa_it =
+      std::find_if(probes.begin(), probes.end(), [](const ProbeResult& probe) {
+        return probe.type == BlockType::SWA;
+      });
+  if (swa_it == probes.end() ||
+      std::none_of(swa_it->blocks.begin(),
+                   swa_it->blocks.end(),
+                   [](const Block& block) { return block.is_valid(); })) {
+    return out;
+  }
+
   size_t cache_unit_size = 0;
   for (const auto& p : probes) {
     if (p.type != BlockType::SWA) {
@@ -689,10 +689,9 @@ TrimOutcome trim_swa_kv(std::vector<ProbeResult> probes,
   }
   safe_hit_tokens = (safe_hit_tokens / cache_unit_size) * cache_unit_size;
 
-  // A forward pass must retain at least one KV block to compute. Clamp
-  // an exact prompt hit before validating the SWA window, because the window at
-  // the full-prompt boundary can be valid while the preceding window has
-  // already been evicted.
+  // Clamp to the caller's compute boundary before validating the SWA window,
+  // because the window at the boundary can be valid while the preceding
+  // window has already been evicted.
   safe_hit_tokens =
       (std::min(safe_hit_tokens, max_prefix_tokens) / cache_unit_size) *
       cache_unit_size;
@@ -700,11 +699,7 @@ TrimOutcome trim_swa_kv(std::vector<ProbeResult> probes,
   // SWA attention reads the last `swa_blocks_per_seq` base blocks; a middle
   // invalid placeholder in that tail means garbage KV. Fall back in
   // KV block steps until the tail is fully valid.
-  auto swa_it =
-      std::find_if(probes.begin(), probes.end(), [](const ProbeResult& p) {
-        return p.type == BlockType::SWA;
-      });
-  if (swa_it != probes.end() && safe_hit_tokens > 0) {
+  if (safe_hit_tokens > 0) {
     const size_t swa_block_size = swa_it->block_size;
     const size_t window_blocks =
         static_cast<size_t>(swa_it->leaf->options().swa_blocks_per_seq());
@@ -733,7 +728,6 @@ TrimOutcome trim_swa_kv(std::vector<ProbeResult> probes,
   }
 
   if (safe_hit_tokens == 0) {
-    out.to_drop = std::move(probes);
     return out;
   }
 
@@ -741,16 +735,7 @@ TrimOutcome trim_swa_kv(std::vector<ProbeResult> probes,
   for (auto& p : probes) {
     const size_t target_len = safe_hit_tokens / p.block_size;
     if (p.blocks.size() > target_len) {
-      ProbeResult drop = {p.type,
-                          p.leaf,
-                          /*blocks=*/{},
-                          /*block_size=*/p.block_size};
-      drop.blocks.reserve(p.blocks.size() - target_len);
-      for (size_t i = target_len; i < p.blocks.size(); ++i) {
-        drop.blocks.emplace_back(std::move(p.blocks[i]));
-      }
       p.blocks.resize(target_len);
-      out.to_drop.emplace_back(std::move(drop));
     }
     out.to_mount.emplace_back(std::move(p));
   }
@@ -813,6 +798,11 @@ size_t CompositeBlockManager::prefix_hit_tokens(
     return 0;
   }
   if (combination_ == LeafCombination::SWA_KV) {
+    if (sequence.cache_allocation_mode() ==
+        CacheAllocationMode::DECODE_RECEIVE) {
+      auto kv = take_probe(probes, BlockType::KV);
+      return kv.has_value() ? kv->blocks.size() * kv->block_size : 0;
+    }
     size_t max_tokens = sequence.num_tokens() - 1;
     for (const SampleSlot& slot : sequence.sample_slots()) {
       max_tokens = std::min(
@@ -872,6 +862,15 @@ void CompositeBlockManager::allocate_shared_for_sequence(
       trimmed = trim_flat_kv_linear(std::move(probes));
       break;
     case LeafCombination::SWA_KV: {
+      if (seq->cache_allocation_mode() == CacheAllocationMode::DECODE_RECEIVE) {
+        auto kv_probe = take_probe(probes, BlockType::KV);
+        CHECK(kv_probe.has_value()) << "SWA_KV expects a KV probe";
+        trimmed.safe_hit_tokens =
+            kv_probe->blocks.size() * kv_probe->block_size;
+        trimmed.to_mount.emplace_back(std::move(*kv_probe));
+        probes.clear();
+        break;
+      }
       size_t max_prefix_tokens =
           seq->tokens().empty() ? 0 : seq->tokens().size() - 1;
       // KV aliases do not retain hidden states needed by /v1/sample. Keep the
@@ -887,8 +886,6 @@ void CompositeBlockManager::allocate_shared_for_sequence(
     case LeafCombination::UNSUPPORTED:
       return;
   }
-
-  trimmed.to_drop.clear();
 
   // FLAT_KV{,_LINEAR} let KVCacheState own replace and exact-repeat. Composite
   // layouts mount every leaf before advancing the sequence-level token count

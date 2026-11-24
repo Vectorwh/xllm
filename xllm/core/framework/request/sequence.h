@@ -73,6 +73,11 @@ enum class SequenceStage : int8_t {
   DECODE = 2
 };
 
+enum class CacheAllocationMode : uint8_t {
+  LOCAL_COMPUTE,
+  DECODE_RECEIVE,
+};
+
 struct RequestFailureState final {
   std::optional<Status> status;
 };
@@ -142,6 +147,13 @@ struct SequenceParams {
 
 class Sequence final {
  public:
+  CacheAllocationMode cache_allocation_mode() const {
+    return cache_allocation_mode_;
+  }
+  void set_cache_allocation_mode(CacheAllocationMode mode) {
+    cache_allocation_mode_ = mode;
+  }
+
   Sequence(size_t index,
            const std::vector<int32_t>& prompt_token_ids,
            torch::Tensor input_embedding,
@@ -776,6 +788,8 @@ class Sequence final {
   // but the generated tokens are retained for the next execution.
   // In the next execution, we should treat these generated tokens as prompts.
   size_t volatile_num_prompt_tokens_ = 0;
+  CacheAllocationMode cache_allocation_mode_ =
+      CacheAllocationMode::LOCAL_COMPUTE;
 
   // is the sequence finished
   mutable bool finished_ = false;

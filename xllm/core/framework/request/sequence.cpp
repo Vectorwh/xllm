@@ -383,6 +383,7 @@ Sequence::Sequence(const Sequence& other, size_t index)
                                    *other.json_object_state_)),
       constraint_machine_(other.constraint_machine_),
       volatile_num_prompt_tokens_(other.volatile_num_prompt_tokens_),
+      cache_allocation_mode_(other.cache_allocation_mode_),
       finished_(other.finished_),
       finish_status_invalidated_(other.finish_status_invalidated_),
       finish_reason_(other.finish_reason_),

@@ -505,6 +505,10 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
         host_options.enable_prefix_cache(true);
         host_options.block_size(options_.block_size());
       }
+      if (type == BlockType::SWA && host_options.instance_is_decode() &&
+          options_.enable_host_offload()) {
+        host_options.enable_prefix_cache(true);
+      }
 
       std::unique_ptr<BlockManager> leaf;
       if (type == BlockType::SWA) {
@@ -1020,10 +1024,6 @@ void HierarchyBlockManagerPool::allocate_shared(Sequence* sequence) {
   const int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
-  if (sequence->stage() == SequenceStage::DECODE) {
-    composite->allocate_shared_for_sequence(sequence);
-    return;
-  }
   KVCacheState& hbm_state = sequence->kv_state();
   if (!hbm_state.prefix_cache_matched()) {
     composite->allocate_shared_for_sequence(sequence);

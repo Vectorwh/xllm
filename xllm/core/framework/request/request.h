@@ -90,7 +90,12 @@ class Request : public RequestBase {
 
   size_t total_num_blocks();
 
-  void set_preempted() { state_.preempted = true; }
+  void set_preempted() {
+    state_.preempted = true;
+    for (const auto& sequence : sequences()) {
+      sequence->set_cache_allocation_mode(CacheAllocationMode::LOCAL_COMPUTE);
+    }
+  }
 
   bool preempted() const { return state_.preempted; }
 

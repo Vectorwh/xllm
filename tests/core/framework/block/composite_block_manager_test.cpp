@@ -1397,6 +1397,7 @@ TEST(CompositeBlockManagerTest, DecodeInitialSwaAllocationKeepsOnlyWindowTail) {
   const size_t num_tokens = logical_blocks * kBaseBlockSize;
   Sequence seq = MakeTestSequence(0, std::vector<int32_t>(num_tokens, 7));
 
+  seq.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
   ASSERT_TRUE(manager.allocate_sequence(&seq, num_tokens));
   const std::vector<Block> swa = SwaBlocks(seq);
   ASSERT_EQ(swa.size(), logical_blocks);
@@ -1407,6 +1408,58 @@ TEST(CompositeBlockManagerTest, DecodeInitialSwaAllocationKeepsOnlyWindowTail) {
   EXPECT_TRUE(swa[logical_blocks - 1].is_valid());
 
   manager.deallocate_for_sequence(&seq);
+}
+
+TEST(CompositeBlockManagerTest, DecodeRecomputeAllocatesFirstSwaChunk) {
+  const size_t chunk_blocks = 4;
+  const size_t chunk_tokens = chunk_blocks * kBaseBlockSize;
+  auto opts = MakeCompositeOptions(/*base_num_blocks=*/32,
+                                   kBaseBlockSize,
+                                   kBaseBlockSize,
+                                   /*max_seqs_per_batch=*/1);
+  opts.instance_is_decode(true).enable_prefix_cache(false);
+  CompositeBlockManager manager(build_composite_leaves(opts), opts);
+  Sequence seq = MakeTestSequence(0, std::vector<int32_t>(2 * chunk_tokens, 7));
+
+  ASSERT_TRUE(manager.allocate_sequence(&seq, chunk_tokens));
+  const auto swa = seq.kv_state().blocks(BlockType::SWA);
+  ASSERT_EQ(swa.size(), chunk_blocks);
+  for (const Block& block : swa) {
+    EXPECT_TRUE(block.is_valid());
+  }
+  manager.deallocate_for_sequence(&seq);
+}
+
+TEST(CompositeBlockManagerTest, DecodeRecomputeDoesNotMountKvWithoutSwa) {
+  const size_t num_tokens = 4 * kBaseBlockSize;
+  const std::vector<int32_t> prompt(num_tokens, 7);
+  auto opts = MakeCompositeOptions(/*base_num_blocks=*/32,
+                                   kBaseBlockSize,
+                                   kBaseBlockSize,
+                                   /*max_seqs_per_batch=*/1);
+  opts.instance_is_decode(true);
+  CompositeBlockManager manager(build_composite_leaves(opts), opts);
+  Sequence seed = MakeTestSequence(0, prompt);
+  seed.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
+  ASSERT_TRUE(manager.allocate_sequence(&seed, num_tokens));
+  seed.kv_state().set_kv_cache_tokens_num(num_tokens);
+  manager.deallocate_for_sequence(&seed);
+
+  Sequence local = MakeTestSequence(1, prompt);
+  EXPECT_EQ(manager.prefix_hit_tokens(local), 0u);
+  manager.allocate_shared_for_sequence(&local);
+  EXPECT_EQ(local.kv_cache_tokens_num(), 0u);
+  EXPECT_EQ(local.kv_state().shared_blocks_num(BlockType::KV), 0u);
+
+  Sequence receiver = MakeTestSequence(2, prompt);
+  receiver.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
+  EXPECT_EQ(manager.prefix_hit_tokens(receiver), num_tokens);
+  manager.allocate_shared_for_sequence(&receiver);
+  EXPECT_EQ(receiver.kv_state().shared_blocks_num(BlockType::KV),
+            num_tokens / kBaseBlockSize);
+  EXPECT_EQ(receiver.kv_cache_tokens_num(), num_tokens);
+  EXPECT_EQ(receiver.kv_state().shared_blocks_num(BlockType::SWA), 0u);
+  manager.deallocate_for_sequence(&receiver);
 }
 
 TEST(CompositeBlockManagerTest,
@@ -1428,6 +1481,7 @@ TEST(CompositeBlockManagerTest,
       (num_tokens + kBaseBlockSize - 1) / kBaseBlockSize;
   Sequence seq = MakeTestSequence(0, std::vector<int32_t>(num_tokens, 7));
 
+  seq.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
   ASSERT_TRUE(manager.allocate_sequence(&seq, num_tokens));
   const std::vector<Block> swa = SwaBlocks(seq);
   ASSERT_EQ(swa.size(), logical_blocks);
@@ -1457,6 +1511,7 @@ TEST(CompositeBlockManagerTest,
   const size_t num_tokens = 2 * kBaseBlockSize - 1;
   Sequence seq = MakeTestSequence(0, std::vector<int32_t>(num_tokens, 7));
 
+  seq.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
   ASSERT_TRUE(manager.allocate_sequence(&seq, num_tokens));
   const std::vector<Block> swa = SwaBlocks(seq);
   ASSERT_EQ(swa.size(), 2u);

@@ -317,6 +317,10 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
 
     auto& sequences = new_request->sequences();
     Sequence* sequence = sequences[0].get();
+    for (const auto& admitted_sequence : sequences) {
+      admitted_sequence->set_cache_allocation_mode(
+          CacheAllocationMode::DECODE_RECEIVE);
+    }
 
     const DecodeAdmissionResult admission = scheduler_->try_admit(new_request);
     if (admission != DecodeAdmissionResult::ADMITTED) {

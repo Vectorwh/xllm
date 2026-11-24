@@ -286,18 +286,33 @@ int32_t calc_slot_id(int32_t position,
   return block_id * block_size + block_offset;
 }
 
-int32_t calc_ring_slot_id(int32_t position,
-                          const Slice<int32_t>& block_table_slice,
-                          int32_t block_size) {
+namespace {
+
+int32_t lookup_ring_slot_id(int32_t position,
+                            const Slice<int32_t>& block_table_slice,
+                            int32_t block_size) {
   CHECK_GT(block_size, 0) << "invalid block_size=" << block_size;
   CHECK_GE(position, 0) << "invalid position=" << position;
   CHECK(!block_table_slice.empty()) << "circular block table must not be empty";
   const int32_t block_idx =
       (position / block_size) % static_cast<int32_t>(block_table_slice.size());
   const int32_t block_id = block_table_slice[block_idx];
-  CHECK_GE(block_id, 0) << "invalid circular block_id=" << block_id;
+  if (block_id < 0) {
+    return block_id;
+  }
   const int32_t block_offset = position % block_size;
   return block_id * block_size + block_offset;
+}
+
+}  // namespace
+
+int32_t calc_ring_slot_id(int32_t position,
+                          const Slice<int32_t>& block_table_slice,
+                          int32_t block_size) {
+  const int32_t slot_id =
+      lookup_ring_slot_id(position, block_table_slice, block_size);
+  CHECK_GE(slot_id, 0) << "invalid circular block_id=" << slot_id;
+  return slot_id;
 }
 
 std::vector<int32_t> build_grouped_prefill_swa_slots(const ForwardInput& input,
@@ -322,7 +337,7 @@ std::vector<int32_t> build_grouped_prefill_swa_slots(const ForwardInput& input,
     const Slice<int32_t>& swa_block_table =
         ctx.multi_block_tables.front()[static_cast<size_t>(seq_id)];
     for (int32_t query_idx = 0; query_idx < q_len; ++query_idx) {
-      slots.emplace_back(calc_ring_slot_id(
+      slots.emplace_back(lookup_ring_slot_id(
           query_start + query_idx, swa_block_table, block_size));
     }
   }

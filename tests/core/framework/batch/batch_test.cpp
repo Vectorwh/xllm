@@ -2699,6 +2699,7 @@ TEST(BatchTest, DecodeEngramHistoryPreservesSparseSwaColumns) {
     std::vector<int32_t> tokens(prompt_size);
     std::iota(tokens.begin(), tokens.end(), 1);
     Sequence seq = make_basic_sequence(tokens);
+    seq.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
     seq.kv_state().add_blocks(
         BlockType::KV,
         kv_manager.allocate((prompt_size + block_size) / block_size));
@@ -2864,6 +2865,7 @@ TEST(BatchTest, DecodeEngramHistorySkipsInvalidSwaPlaceholder) {
   SlidingWindowBlockManager swa_manager(options);
 
   Sequence seq = make_basic_sequence({1});
+  seq.set_cache_allocation_mode(CacheAllocationMode::DECODE_RECEIVE);
   seq.kv_state().add_blocks(BlockType::KV, kv_manager.allocate(3));
   seq.kv_state().incr_kv_cache_tokens_num(1);
   seq.append_token(2);

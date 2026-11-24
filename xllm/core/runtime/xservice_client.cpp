@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
+#include <brpc/errno.pb.h>
 #include <glog/logging.h>
 #include <google/protobuf/util/json_util.h>
 #include <unistd.h>
@@ -46,6 +47,7 @@ namespace xllm {
 namespace {
 
 inline constexpr uint32_t kKVEventContractVersion = 1;
+constexpr int32_t kGenerationsRpcTimeoutMs = 1000;
 
 proto::KVEventKind prefix_cache_kind_to_proto(PrefixCacheEventKind kind) {
   switch (kind) {
@@ -1210,12 +1212,7 @@ std::vector<bool> XServiceClient::generations(
       continue;
     }
     ctx.issued = true;
-    // Leave the controller timeout unset so brpc uses chan_options_.timeout_ms,
-    // which init() copies from ServiceConfig::rpc_channel_timeout_ms(). A
-    // positive value bounds this Join; -1 (the default) still waits
-    // indefinitely. generations() runs on AsyncResponseProcessor's single
-    // rpc thread, so an unbounded wait stalls every later service-routed
-    // batch. Do not set -1 here: that overrides a configured channel timeout.
+    ctx.cntl.set_timeout_ms(kGenerationsRpcTimeoutMs);
     service_stub->Generations(
         &ctx.cntl, &ctx.gens, &ctx.resp, brpc::DoNothing());
   }
@@ -1233,7 +1230,11 @@ std::vector<bool> XServiceClient::generations(
     const std::vector<size_t>& indices = ctx.output_indices;
 
     if (!ctx.issued || ctx.cntl.Failed()) {
-      if (ctx.cntl.Failed()) {
+      if (ctx.cntl.ErrorCode() == brpc::ERPCTIMEDOUT) {
+        LOG(ERROR) << "Generations RPC timed out, service=" << service_addr
+                   << ", timeout_ms=" << kGenerationsRpcTimeoutMs
+                   << ", outputs=" << indices.size();
+      } else if (ctx.cntl.Failed()) {
         LOG(ERROR) << "Fail to response tokens to xservice server "
                    << service_addr << ", error text: " << ctx.cntl.ErrorText();
       }
