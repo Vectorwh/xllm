@@ -128,6 +128,17 @@ void RequestTiming::record_queued(TimePoint now) {
   }
 }
 
+std::optional<double> RequestTiming::local_elapsed_since_queued_seconds(
+    TimePoint now) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::optional<TimePoint>& queued =
+      pd_imported_ ? pd_queued_ts_ : queued_ts_;
+  if (!queued.has_value() || now < *queued) {
+    return std::nullopt;
+  }
+  return std::chrono::duration<double>(now - *queued).count();
+}
+
 void RequestTiming::record_scheduled(TimePoint now) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!finished_ts_.has_value() && pd_local_ && !pd_scheduled_ts_.has_value()) {

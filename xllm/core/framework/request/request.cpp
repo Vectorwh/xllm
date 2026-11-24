@@ -745,6 +745,9 @@ void Request::log_statistic(double total_latency, bool prefill_stage) {
 void Request::log_error_statistic(const Status& status,
                                   const char* outcome_name) {
   // log the request statistics
+  const double request_elapsed_s = elapsed_seconds();
+  const double local_enqueue_elapsed_s =
+      state_.timing->local_elapsed_since_queued_seconds().value_or(-1.0);
   int32_t idx = 0;
   for (const auto& seq : sequences()) {
     LOG(INFO) << "record_type: sequence_terminal, request_id: " << request_id_
@@ -754,9 +757,13 @@ void Request::log_error_statistic(const Status& status,
               << "status_code: " << static_cast<int32_t>(status.code())
               << optional_field(", status_msg: ", status.message())
               << ", prompt_tokens: " << seq->num_prompt_tokens() << ", "
-              << "max_tokens: "
+              << "generated_tokens: " << seq->num_committed_generated_tokens()
+              << ", max_tokens: "
               << seq->stopping_checker()->get_max_generated_tokens() << ", "
-              << "temperature: " << seq->sampling_param()->temperature;
+              << "temperature: " << seq->sampling_param()->temperature
+              << std::fixed << std::setprecision(3)
+              << ", request_elapsed_s: " << request_elapsed_s
+              << ", local_enqueue_elapsed_s: " << local_enqueue_elapsed_s;
   }
 }
 

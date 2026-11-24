@@ -88,6 +88,8 @@ class RequestTiming final {
       TimePoint now = Clock::now());
   void record_arrival(TimePoint now = Clock::now());
   void record_queued(TimePoint now = Clock::now());
+  std::optional<double> local_elapsed_since_queued_seconds(
+      TimePoint now = Clock::now()) const;
   void record_scheduled(TimePoint now = Clock::now());
   bool has_scheduled() const {
     return scheduled_.load(std::memory_order_acquire);

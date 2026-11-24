@@ -133,6 +133,22 @@ TEST(RequestTimingTest, SharedOutputSignalsAndPdRestoreAreIdempotent) {
   EXPECT_FALSE(timing.record_core_output(at_ms(90)));
 }
 
+TEST(RequestTimingTest, QueueElapsedUsesCurrentLocalEnqueue) {
+  RequestTiming timing;
+  EXPECT_FALSE(timing.local_elapsed_since_queued_seconds(at_ms(1000)));
+  timing.record_queued(at_ms(100));
+  timing.record_scheduled(at_ms(200));
+  EXPECT_EQ(timing.local_elapsed_since_queued_seconds(at_ms(1350)), 1.25);
+
+  timing.restore_pd(timing.snapshot(at_ms(1500)));
+  EXPECT_FALSE(timing.local_elapsed_since_queued_seconds(at_ms(1600)));
+  timing.record_queued(at_ms(1750));
+  timing.record_queued(at_ms(1800));
+  timing.update_from_finished_request(/*generation_complete=*/false,
+                                      at_ms(2000));
+  EXPECT_EQ(timing.local_elapsed_since_queued_seconds(at_ms(3000)), 1.25);
+}
+
 TEST(RequestTimingTest, ReversedQueueCannotBecomeComplete) {
   RequestTiming timing;
   timing.record_queued(at_ms(20));
