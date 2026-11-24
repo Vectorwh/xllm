@@ -36,7 +36,6 @@ from xllm.python.attention.backend import (
     MlaIndexContext,
     MlaPreprocessContext,
     MlaUnabsorbedPrefill,
-    build_speculative_ssm_state_indices,
     linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
 )
@@ -508,58 +507,6 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         if has_sparse_index or has_latent_only_cache:
             self._is_mla = True
         self._uses_sparse_mla = self._is_mla and has_sparse_index
-
-    def _prepare_speculative_ssm_state_indices(
-        self,
-        metadata: AttentionMetadata,
-        *,
-        graph_mode: bool,
-    ) -> None:
-        """Build the speculative SSM checkpoint table once for the current batch."""
-        self._prepared_ssm_state_indices = None
-        accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
-        checkpoint_stride = self._linear_state_checkpoint_stride
-        if accepted_tokens is None or checkpoint_stride is None:
-            return
-
-        state_indices = getattr(metadata, "linear_state_write_indices", None)
-        if state_indices is None:
-            state_indices = getattr(metadata, "linear_state_indices", None)
-        if state_indices is None:
-            return
-
-        q_seq_lens = getattr(metadata, "q_seq_lens", None)
-        # ACL Graph expands state slots per token row, while q_seq_lens keeps
-        # the logical sequence grouping used by execute_linear's graph V3
-        # dispatch. Keep this derivation aligned with that grouping logic.
-        if graph_mode and q_seq_lens is not None:
-            num_seqs = int(q_seq_lens.numel())
-            group_width = int(getattr(metadata, "spec_group_width", 0))
-            if group_width > 1:
-                # An incomplete bucket tail has no recurrent state checkpoint.
-                state_indices = state_indices[: num_seqs * group_width]
-        else:
-            num_seqs = int(accepted_tokens.numel())
-        if num_seqs <= 0 or state_indices.numel() < num_seqs or state_indices.numel() % num_seqs:
-            raise RuntimeError(
-                "Speculative SSM state metadata is not grouped by logical sequence: "
-                f"slots={state_indices.numel()}, sequences={num_seqs}"
-            )
-        logical_state_indices = state_indices.reshape(num_seqs, -1)[:, 0]
-        prepared_indices = build_speculative_ssm_state_indices(
-            logical_state_indices,
-            checkpoint_stride,
-        )
-        if graph_mode:
-            static_indices = getattr(metadata, "linear_state_checkpoint_indices", None)
-            if static_indices is None:
-                static_indices = torch.empty_like(prepared_indices)
-                metadata.linear_state_checkpoint_indices = static_indices
-            elif static_indices.shape != prepared_indices.shape:
-                raise RuntimeError("Speculative SSM checkpoint shape changed after graph allocation")
-            static_indices.copy_(prepared_indices)
-            prepared_indices = static_indices
-        self._prepared_ssm_state_indices = prepared_indices
 
     @staticmethod
     def _query_sequence_ends(
