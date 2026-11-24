@@ -20,6 +20,7 @@ limitations under the License.
 #include <atb_speed/utils/timer.h>
 #include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
+#include <torch_npu/csrc/core/npu/NPUGraphsUtils.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/torch_npu.h>
 
@@ -45,6 +46,7 @@ AtbBuffer::AtbBuffer(uint64_t buffer_size, at::Device device)
 
   if (buffer_size_ > 0) {
     at_tensor_ = create_attensor(buffer_size_);
+    buffer_size_ = static_cast<uint64_t>(at_tensor_.numel());
   }
 }
 
@@ -55,8 +57,15 @@ void* AtbBuffer::get_buffer(uint64_t buffer_size) {
     return at_tensor_.data_ptr();
   }
 
-  aclrtSynchronizeStream(
-      c10_npu::getCurrentNPUStream(device_.index()).stream());
+  // Graph execution must use scratch owned by its slot, never replace this
+  // shared eager buffer while capture is active.
+  CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() ==
+        c10_npu::CaptureStatus::None)
+      << "ATB eager workspace cannot grow during graph capture";
+  CHECK_EQ(aclrtSynchronizeStream(
+               c10_npu::getCurrentNPUStream(device_.index()).stream()),
+           ACL_SUCCESS)
+      << "Failed to synchronize before growing ATB eager workspace";
 
   at_tensor_.reset();
   at_tensor_ = create_attensor(buffer_size);

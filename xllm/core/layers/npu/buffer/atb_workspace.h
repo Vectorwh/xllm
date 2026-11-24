@@ -19,10 +19,42 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "atb_buffer.h"
 
 namespace xllm {
+
+// Temporary capture workaround for models using the ATB workspace API.
+// Remove this adapter once those model paths manage capture-safe workspace
+// lifetimes. Until then, share scratch within one serial executor slot and
+// retain each allocation to preserve addresses in all captured graphs.
+class AtbGraphWorkspace final {
+ public:
+  class Scope final {
+   public:
+    explicit Scope(AtbGraphWorkspace& workspace);
+    ~Scope();
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+   private:
+    AtbGraphWorkspace* previous_;
+  };
+
+  explicit AtbGraphWorkspace(torch::Device device) : device_(device) {}
+  AtbGraphWorkspace(const AtbGraphWorkspace&) = delete;
+  AtbGraphWorkspace& operator=(const AtbGraphWorkspace&) = delete;
+
+  static AtbGraphWorkspace* current();
+  void* get_buffer(uint64_t size_bytes, int32_t device_id);
+
+ private:
+  static thread_local AtbGraphWorkspace* current_;
+  torch::Device device_;
+  uint64_t capacity_bytes_ = 0;
+  std::vector<torch::Tensor> buffers_;
+};
 
 class AtbWorkspace {
  public:

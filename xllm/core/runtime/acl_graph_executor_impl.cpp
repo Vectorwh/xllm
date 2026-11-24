@@ -592,6 +592,7 @@ bool AclGraph::capture(CausalLM* model,
           graph_pool,
           aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
       capture_started = true;
+      AtbGraphWorkspace::Scope workspace_scope(atb_workspace_);
       // Execute forward pass - NPUGraph mempool manages temporary tensors
       auto forward_result =
           model->forward({persistent_param_.persistent_tokens(num_tokens_)},
@@ -1206,6 +1207,7 @@ AclGraphExecutorImpl::AclGraphExecutorImpl(CausalLM* model,
         model_->supports_mla_graph_kv_bucketing(),
         graph_capture_sizes_);
     slot.graph_pool = c10_npu::graph_pool_handle();
+    slot.atb_workspace = std::make_unique<AtbGraphWorkspace>(device_);
   }
 }
 
@@ -1601,7 +1603,8 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   auto graph =
       std::make_shared<AclGraph>(active_persistent_param,
                                  device_.index(),
-                                 active_slot.graph_capture_stream.value());
+                                 active_slot.graph_capture_stream.value(),
+                                 *active_slot.atb_workspace);
   VLOG(kGraphExecutorLogVerboseLevel)
       << "AclGraphExecutorImpl::run() in capture mode";
   const bool capture_success = graph->capture(model_,

@@ -20,6 +20,8 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -60,6 +62,7 @@ limitations under the License.
 #pragma GCC diagnostic ignored "-Wattributes"
 #endif
 
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUEvent.h"
 #include "torch_npu/csrc/core/npu/NPUGraph.h"
 
@@ -367,6 +370,29 @@ class HybridConv1dMockLM final : public CausalLM {
 
     hidden = linear_->forward(hidden);
 
+    if (atb_workspace_ != nullptr) {
+      // Request scratch through the production API. AclGraph::capture must
+      // install the slot's workspace; this mock never creates a Scope.
+      constexpr int64_t kMiB = 1024 * 1024;
+      const int64_t scratch_bytes = num_tokens <= 8 ? kMiB : 2 * kMiB;
+      const auto scratch_options =
+          torch::TensorOptions().dtype(torch::kUInt8).device(device_);
+      void* small_address = atb_workspace_->get_workspace_buffer(128);
+      torch::Tensor small =
+          torch::from_blob(small_address, {128}, scratch_options);
+      small.fill_(7);
+      hidden = hidden + small.select(0, 0).to(kDtype);
+      void* large_address = atb_workspace_->get_workspace_buffer(scratch_bytes);
+      torch::Tensor large =
+          torch::from_blob(large_address, {scratch_bytes}, scratch_options);
+      large.fill_(13);
+      hidden = hidden + large.select(0, 0).to(kDtype);
+      if (register_graph_task) {
+        captured_scratch_.emplace_back(
+            std::array<void*, 2>{small_address, large_address});
+      }
+    }
+
     return ModelOutput(hidden);
   }
 
@@ -403,6 +429,13 @@ class HybridConv1dMockLM final : public CausalLM {
   size_t fia_graph_task_count() const { return fia_graph_task_count_; }
   void enable_mock_ssm_transition() { enable_mock_ssm_transition_ = true; }
   int32_t capture_forward_count() const { return capture_forward_count_; }
+  void enable_atb_workspace() {
+    atb_workspace_ = std::make_unique<AtbWorkspace>(device_);
+    captured_scratch_.reserve(6);
+  }
+  const std::vector<std::array<void*, 2>>& captured_scratch() const {
+    return captured_scratch_;
+  }
   void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
   void update_expert_weight(int32_t) override {}
   layer::NpuLmHead get_npu_lm_head() override {
@@ -431,6 +464,8 @@ class HybridConv1dMockLM final : public CausalLM {
   size_t fia_graph_task_count_ = 0;
   bool enable_mock_ssm_transition_ = false;
   int32_t capture_forward_count_ = 0;
+  std::unique_ptr<AtbWorkspace> atb_workspace_;
+  std::vector<std::array<void*, 2>> captured_scratch_;
 };
 
 class AclGraphTaskUpdateTest : public ::testing::Test {
@@ -1760,4 +1795,176 @@ TEST_F(AclGraphTaskUpdateTest, StaticMtpPrepareRejectsUnsupportedWidth) {
                               /*atol=*/1e-2));
   EXPECT_EQ(model_->capture_forward_count(), 1);
 }
+
+TEST_F(AclGraphTaskUpdateTest, AtbWorkspaceReusesBucketsAndIsolatesSlots) {
+  constexpr uint64_t kMiB = 1024 * 1024;
+  ExecutionConfig::get_instance().enable_graph_double_buffer(true);
+  model_->enable_atb_workspace();
+  auto kv_graph = create_hybrid_kv_caches();
+  npu::AclGraphExecutorImpl executor(
+      model_.get(), model_args_, *device_, options_);
+
+  // Capture buckets 4, 8 and 16 in both slots, then replay every live graph
+  // after both slot workspaces have grown and eager scratch has been replaced.
+  int32_t step = 0;
+  for (uint32_t batch_size : {3, 3, 5, 5, 9, 9, 3, 3, 5, 5, 9, 9}) {
+    SCOPED_TRACE(step);
+    reset_sequences();
+    auto batch = create_decode_batch(batch_size, /*token_seed=*/100 + step);
+    auto input = batch->prepare_forward_input(
+        options_.num_decoding_tokens(), 0, model_args_);
+    input = input.to(*device_, kDtype);
+    populate_query_start_loc(input.input_params);
+    auto kv_eager = clone_kv_caches(kv_graph);
+    const auto actual = executor.run(
+        input.token_ids, input.positions, kv_graph, input.input_params);
+    const auto expected = model_->forward(
+        input.token_ids, input.positions, kv_eager, input.input_params);
+    ASSERT_TRUE(torch::allclose(actual.hidden_states.to(torch::kFloat32),
+                                expected.hidden_states.to(torch::kFloat32),
+                                /*rtol=*/1e-2,
+                                /*atol=*/1e-2));
+    ++step;
+  }
+  ASSERT_EQ(executor.get_graph_count(), 6);
+  ASSERT_EQ(executor.get_graph_memory_pool_count(), 2);
+  ASSERT_EQ(model_->capture_forward_count(), 6);
+  const auto& scratch = model_->captured_scratch();
+  ASSERT_EQ(scratch.size(), 6);
+  for (size_t slot = 0; slot < 2; ++slot) {
+    EXPECT_NE(scratch[slot][0], scratch[slot][1]);
+    // Bucket 8 reuses the allocation made by bucket 4. Bucket 16 grows once,
+    // while the smaller allocation stays alive for the earlier graphs.
+    EXPECT_EQ(scratch[slot + 2][0], scratch[slot][1]);
+    EXPECT_EQ(scratch[slot + 2][1], scratch[slot][1]);
+    EXPECT_EQ(scratch[slot + 4][0], scratch[slot][1]);
+    EXPECT_NE(scratch[slot + 4][1], scratch[slot][1]);
+  }
+  // Check every retained generation while graphs in both slots are alive.
+  // Output equality alone cannot detect accidental sharing between slots.
+  const std::array<std::array<void*, 3>, 2> slot_addresses = {{
+      {scratch[0][0], scratch[0][1], scratch[4][1]},
+      {scratch[1][0], scratch[1][1], scratch[5][1]},
+  }};
+  const std::array<uint64_t, 3> generation_bytes = {128, kMiB, 2 * kMiB};
+  for (size_t first_generation = 0; first_generation < 3; ++first_generation) {
+    const uintptr_t first =
+        reinterpret_cast<uintptr_t>(slot_addresses[0][first_generation]);
+    for (size_t second_generation = 0; second_generation < 3;
+         ++second_generation) {
+      const uintptr_t second =
+          reinterpret_cast<uintptr_t>(slot_addresses[1][second_generation]);
+      EXPECT_TRUE(first + generation_bytes[first_generation] <= second ||
+                  second + generation_bytes[second_generation] <= first);
+    }
+  }
+}
+
+// Exercise real NPUGraph allocation/replay: growth within one capture must
+// retain previous scratch, and a second graph/eager growth must not replace it.
+TEST(AtbGraphWorkspaceTest, PreservesScratchAcrossGrowthAndSeparateGraphs) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kUInt8).device(device);
+  AtbWorkspace workspace(device);
+  AtbGraphWorkspace first_workspace(device);
+  AtbGraphWorkspace second_workspace(device);
+  c10_npu::NPUGraph first_graph;
+  c10_npu::NPUGraph second_graph;
+  const auto original_stream = c10_npu::getCurrentNPUStream();
+  const auto capture_stream =
+      c10_npu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0);
+  torch::Tensor first_output = torch::zeros({128}, options);
+  torch::Tensor grown_output = torch::zeros({4096}, options);
+  torch::Tensor second_output = torch::zeros({4096}, options);
+  torch::npu::synchronize();
+  c10_npu::setCurrentNPUStream(capture_stream);
+  first_graph.capture_begin();
+  {
+    AtbGraphWorkspace::Scope scope(first_workspace);
+    EXPECT_EQ(workspace.get_workspace_buffer(0), nullptr);
+    torch::Tensor small =
+        torch::from_blob(workspace.get_workspace_buffer(128), {128}, options);
+    small.fill_(7);
+    first_output.copy_(small);
+    torch::Tensor large =
+        torch::from_blob(workspace.get_workspace_buffer(4096), {4096}, options);
+    large.fill_(13);
+    grown_output.copy_(large);
+    EXPECT_EQ(workspace.get_workspace_buffer(0), nullptr);
+    EXPECT_EQ(workspace.get_workspace_buffer(4096), large.data_ptr());
+  }
+  first_graph.capture_end();
+  second_graph.capture_begin();
+  {
+    AtbGraphWorkspace::Scope scope(second_workspace);
+    torch::Tensor scratch =
+        torch::from_blob(workspace.get_workspace_buffer(4096), {4096}, options);
+    scratch.fill_(21);
+    second_output.copy_(scratch);
+  }
+  second_graph.capture_end();
+  ASSERT_EQ(aclrtSynchronizeStream(capture_stream.stream()), ACL_SUCCESS);
+  // Allocate on the eager path after both captures, then replay both graphs.
+  workspace.get_workspace_buffer(8192);
+  first_output.zero_();
+  grown_output.zero_();
+  second_output.zero_();
+  first_graph.replay();
+  second_graph.replay();
+  ASSERT_EQ(aclrtSynchronizeStream(capture_stream.stream()), ACL_SUCCESS);
+  c10_npu::setCurrentNPUStream(original_stream);
+  EXPECT_TRUE(
+      torch::equal(first_output.cpu(), torch::full({128}, 7, torch::kUInt8)));
+  EXPECT_TRUE(
+      torch::equal(grown_output.cpu(), torch::full({4096}, 13, torch::kUInt8)));
+  EXPECT_TRUE(torch::equal(second_output.cpu(),
+                           torch::full({4096}, 21, torch::kUInt8)));
+}
+
+// Slowly increasing layer scratch must not retain one almost-identical
+// allocation per layer. Measure actual allocator bytes, including its padding.
+TEST(AtbGraphWorkspaceTest, BoundsRetainedMemoryForSmallGrowth) {
+  constexpr int64_t kMiB = 1024 * 1024;
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kUInt8).device(device);
+  AtbWorkspace workspace(device);
+  AtbGraphWorkspace graph_workspace(device);
+  c10_npu::NPUGraph graph;
+  const auto original_stream = c10_npu::getCurrentNPUStream();
+  const auto capture_stream =
+      c10_npu::getStreamFromPool(/*isHighPriority=*/false, /*device=*/0);
+  torch::Tensor output = torch::zeros({1}, options);
+  torch::npu::synchronize();
+  c10_npu::setCurrentNPUStream(capture_stream);
+  graph.capture_begin();
+  const auto before = c10_npu::NPUCachingAllocator::getDeviceStats(0);
+  {
+    AtbGraphWorkspace::Scope scope(graph_workspace);
+    void* address = nullptr;
+    for (int64_t bytes = kMiB; bytes <= kMiB + 64; ++bytes) {
+      address = workspace.get_workspace_buffer(bytes);
+    }
+    torch::Tensor scratch = torch::from_blob(address, {1}, options);
+    scratch.fill_(17);
+    output.copy_(scratch);
+  }
+  graph.capture_end();
+  EXPECT_EQ(aclrtSynchronizeStream(capture_stream.stream()), ACL_SUCCESS);
+  const auto after = c10_npu::NPUCachingAllocator::getDeviceStats(0);
+  const size_t aggregate =
+      static_cast<size_t>(c10_npu::NPUCachingAllocator::StatType::AGGREGATE);
+  const int64_t retained_bytes = after.allocated_bytes[aggregate].current -
+                                 before.allocated_bytes[aggregate].current;
+  RecordProperty("retained_workspace_bytes", retained_bytes);
+  // The largest request is about 1 MiB. Allow allocator padding, but reject
+  // retaining about 65 MiB just because 65 layers requested slightly more.
+  EXPECT_LE(retained_bytes, 8 * kMiB);
+  graph.replay();
+  EXPECT_EQ(aclrtSynchronizeStream(capture_stream.stream()), ACL_SUCCESS);
+  c10_npu::setCurrentNPUStream(original_stream);
+  EXPECT_TRUE(torch::equal(output.cpu(), torch::full({1}, 17, torch::kUInt8)));
+}
+
 }  // namespace xllm

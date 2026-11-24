@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/layers/npu/buffer/atb_workspace.h"
 #include "core/runtime/acl_graph_persistent_param.h"
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
@@ -102,8 +103,11 @@ class AclGraph {
  public:
   AclGraph(GraphPersistentParam& persistent_param,
            c10::DeviceIndex device_index,
-           const c10_npu::NPUStream& capture_stream)
-      : persistent_param_(persistent_param), device_index_(device_index) {
+           const c10_npu::NPUStream& capture_stream,
+           AtbGraphWorkspace& atb_workspace)
+      : atb_workspace_(atb_workspace),
+        persistent_param_(persistent_param),
+        device_index_(device_index) {
     initialize_streams(device_index, capture_stream);
   }
 
@@ -165,6 +169,9 @@ class AclGraph {
   bool static_graph_task_signature_matches(
       const ModelInputParams& params) const;
   void capture_static_graph_task_signature(const ModelInputParams& params);
+
+  // The slot owns scratch and destroys its graphs before releasing it.
+  AtbGraphWorkspace& atb_workspace_;
 
   // NPUGraph with mempool for managing temporary tensors during forward pass
   c10_npu::NPUGraph graph_;
@@ -252,6 +259,9 @@ class AclGraphExecutorImpl : public ExecutorImpl {
     std::unique_ptr<GraphPersistentParam> persistent_param;
     c10_npu::MempoolId_t graph_pool{0, 0};
     std::optional<c10_npu::NPUStream> graph_capture_stream;
+    // Like graph_pool, scratch is shared only within a serial execution slot.
+    // Declare it before graphs so their destructors synchronize before release.
+    std::unique_ptr<AtbGraphWorkspace> atb_workspace;
     absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> graphs;
     // LRU shared by spec-verify and raw-shape-specialized DP-EP decode graphs.
     std::deque<uint64_t> specialized_graph_keys;
