@@ -18,10 +18,15 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
 
 #include "framework/state_dict/state_dict.h"
 
@@ -265,6 +270,211 @@ bool LoRAAdapterLoader::load_weights(const std::string& safetensors_path,
   LOG(INFO) << "[LoRAAdapterLoader] " << safetensors_path << " taken=" << taken
             << " skipped=" << skipped;
   return true;
+}
+
+std::optional<LoRAAdapter> LoRAAdapterLoader::load_dit(const LoRARequest& req) {
+  namespace fs = std::filesystem;
+  try {
+    // 1. Resolve the safetensors file.
+    fs::path weights_path(req.lora_path);
+    if (fs::is_directory(weights_path)) {
+      std::vector<fs::path> candidates;
+      for (const auto& entry : fs::directory_iterator(weights_path)) {
+        if (entry.is_regular_file() &&
+            entry.path().extension() == ".safetensors") {
+          candidates.emplace_back(entry.path());
+        }
+      }
+      if (candidates.size() != 1) {
+        LOG(ERROR)
+            << "DiT LoRA directory requires exactly one safetensors file: "
+            << weights_path;
+        return std::nullopt;
+      }
+      weights_path = candidates.front();
+    } else if (!fs::is_regular_file(weights_path) ||
+               weights_path.extension() != ".safetensors") {
+      LOG(ERROR) << "Invalid DiT LoRA file: " << weights_path;
+      return std::nullopt;
+    }
+
+    // 2. Read and validate the safetensors header and metadata.
+    std::ifstream stream(weights_path, std::ios::binary);
+    std::array<unsigned char, 8> length_bytes{};
+    stream.read(reinterpret_cast<char*>(length_bytes.data()),
+                length_bytes.size());
+    uint64_t header_size = 0;
+    for (size_t i = 0; i < length_bytes.size(); ++i) {
+      header_size |= static_cast<uint64_t>(length_bytes[i]) << (8 * i);
+    }
+    constexpr uint64_t kMaxHeaderBytes = 100 * 1024 * 1024;
+    const uint64_t file_size = fs::file_size(weights_path);
+    if (!stream || file_size < 8 || header_size == 0 ||
+        header_size > kMaxHeaderBytes || header_size > file_size - 8) {
+      LOG(ERROR) << "Invalid DiT LoRA safetensors header: " << weights_path;
+      return std::nullopt;
+    }
+    std::string header(header_size, '\0');
+    stream.read(header.data(), static_cast<std::streamsize>(header_size));
+    if (!stream) {
+      LOG(ERROR) << "Truncated DiT LoRA header: " << weights_path;
+      return std::nullopt;
+    }
+    const nlohmann::json metadata = nlohmann::json::parse(header).value(
+        "__metadata__", nlohmann::json::object());
+    if (!metadata.is_object()) {
+      LOG(ERROR) << "Invalid DiT LoRA metadata: " << weights_path;
+      return std::nullopt;
+    }
+
+    // 3. Load A/B tensors, infer rank, and retain CPU-owned copies.
+    LoRAAdapter adapter;
+    adapter.request = req;
+    auto state_dict = StateDictFromSafeTensor::load(weights_path.string());
+    if (!state_dict) {
+      return std::nullopt;
+    }
+    constexpr std::string_view kAlphaSuffix = ".alpha";
+    constexpr std::array<std::string_view, 3> kPrefixes = {
+        kHfPrefix, "diffusion_model.", "transformer."};
+    constexpr std::array<std::pair<std::string_view, std::string_view>, 4>
+        kSuffixAliases = {{{".lora_down.weight", kLoraATag},
+                           {".lora_up.weight", kLoraBTag},
+                           {".lora_A.default.weight", kLoraATag},
+                           {".lora_B.default.weight", kLoraBTag}}};
+    std::unordered_map<std::string, double> projection_alphas;
+    for (const auto& [raw_name, tensor] : *state_dict) {
+      std::string normalized = raw_name;
+      for (const std::string_view prefix : kPrefixes) {
+        if (normalized.starts_with(prefix)) {
+          normalized.erase(/*index=*/0, prefix.size());
+        }
+      }
+      if (normalized.ends_with(kAlphaSuffix)) {
+        if (tensor.numel() != 1) {
+          LOG(ERROR) << "Expected scalar alpha for " << raw_name << " in "
+                     << weights_path;
+          return std::nullopt;
+        }
+        normalized.resize(normalized.size() - kAlphaSuffix.size());
+        const double alpha = tensor.item<double>();
+        if (!std::isfinite(alpha) || alpha < 0 ||
+            !projection_alphas.try_emplace(std::move(normalized), alpha)
+                 .second) {
+          LOG(ERROR) << "Invalid or duplicate alpha for " << raw_name << " in "
+                     << weights_path;
+          return std::nullopt;
+        }
+        continue;
+      }
+      for (const auto& [suffix, canonical] : kSuffixAliases) {
+        if (normalized.ends_with(suffix)) {
+          normalized.replace(
+              normalized.size() - suffix.size(), suffix.size(), canonical);
+          break;
+        }
+      }
+      const auto name = canonicalize_weight_name(normalized);
+      if (!name || tensor.dim() != 2 || !tensor.is_floating_point()) {
+        LOG(ERROR) << "Unsupported DiT LoRA tensor " << raw_name << " in "
+                   << weights_path;
+        return std::nullopt;
+      }
+      const int64_t rank =
+          name->back() == 'A' ? tensor.size(0) : tensor.size(1);
+      if (rank <= 0 || rank > config_.max_lora_rank ||
+          (adapter.r != 0 && adapter.r != rank)) {
+        LOG(ERROR) << "Invalid/inconsistent DiT LoRA rank=" << rank << " for "
+                   << raw_name << " in " << weights_path
+                   << ", max_lora_rank=" << config_.max_lora_rank;
+        return std::nullopt;
+      }
+      adapter.r = static_cast<int32_t>(rank);
+      if (!adapter.tensors.emplace(*name, tensor.clone()).second) {
+        LOG(ERROR) << "Duplicate DiT LoRA tensor " << *name << " in "
+                   << weights_path;
+        return std::nullopt;
+      }
+    }
+    if (adapter.tensors.empty()) {
+      LOG(ERROR) << "No DiT LoRA tensors: " << weights_path;
+      return std::nullopt;
+    }
+
+    // 4. Validate A/B pairs and collect projection targets.
+    adapter.target_modules.reserve(adapter.tensors.size() / 2);
+    for (const auto& entry : adapter.tensors) {
+      const std::string& name = entry.first;
+      const std::string target = name.substr(0, name.size() - 2);
+      const bool is_a = name.back() == 'A';
+      if (!adapter.tensors.contains(target + (is_a ? "#B" : "#A"))) {
+        LOG(ERROR) << "Incomplete DiT LoRA A/B pair " << target << " in "
+                   << weights_path;
+        return std::nullopt;
+      }
+      if (is_a) {
+        adapter.target_modules.emplace_back(target);
+      }
+    }
+    for (const auto& entry : projection_alphas) {
+      if (!adapter.tensors.contains(entry.first + "#A")) {
+        LOG(ERROR) << "Alpha without a DiT LoRA target " << entry.first
+                   << " in " << weights_path;
+        return std::nullopt;
+      }
+    }
+
+    // 5. Resolve alpha and fold per-projection scales into B.
+    double metadata_alpha = adapter.r;
+    if (metadata.contains("alpha")) {
+      const nlohmann::json parsed =
+          nlohmann::json::parse(metadata.at("alpha").get<std::string>());
+      if (!parsed.is_number()) {
+        LOG(ERROR) << "Invalid DiT LoRA metadata alpha in " << weights_path;
+        return std::nullopt;
+      }
+      metadata_alpha = parsed.get<double>();
+    }
+    const double default_scale = metadata_alpha / adapter.r;
+    if (metadata_alpha < 0 ||
+        !std::isfinite(static_cast<float>(default_scale))) {
+      LOG(ERROR) << "Invalid DiT LoRA alpha in " << weights_path;
+      return std::nullopt;
+    }
+
+    const bool fold_scales = !projection_alphas.empty();
+    adapter.scaling = fold_scales ? 1.0f : static_cast<float>(default_scale);
+    if (fold_scales) {
+      for (const std::string& target : adapter.target_modules) {
+        const auto alpha = projection_alphas.find(target);
+        const double scale = alpha == projection_alphas.end()
+                                 ? default_scale
+                                 : alpha->second / adapter.r;
+        if (!std::isfinite(static_cast<float>(scale))) {
+          LOG(ERROR) << "Invalid DiT LoRA alpha for " << target << " in "
+                     << weights_path;
+          return std::nullopt;
+        }
+        if (scale != 1.0) {
+          adapter.tensors.at(target + "#B").mul_(scale);
+        }
+      }
+    }
+    LOG(INFO) << "DiT LoRA '" << req.lora_name << "' rank=" << adapter.r
+              << ", default_alpha=" << metadata_alpha
+              << ", scaling=" << adapter.scaling
+              << ", folded_scales=" << fold_scales
+              << ", targets=" << adapter.target_modules.size();
+    return adapter;
+  } catch (const nlohmann::json::exception& error) {
+    LOG(ERROR) << "Invalid DiT LoRA JSON for " << req.lora_path << ": "
+               << error.what();
+    return std::nullopt;
+  } catch (const fs::filesystem_error& error) {
+    LOG(ERROR) << "Invalid DiT LoRA path " << req.lora_path << ": "
+               << error.what();
+    return std::nullopt;
+  }
 }
 
 }  // namespace xllm

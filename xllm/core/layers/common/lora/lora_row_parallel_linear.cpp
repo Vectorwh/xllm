@@ -489,9 +489,5 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   return y;
 }
 
-void LoRARowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
-  base_->load_state_dict(state_dict);
-}
-
 }  // namespace layer
 }  // namespace xllm

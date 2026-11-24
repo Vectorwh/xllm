@@ -17,10 +17,14 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -29,12 +33,14 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/dit_cache/dit_cache.h"
 #include "core/framework/dit_model_loader.h"
+#include "core/framework/lora/dit_lora_runtime.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model_context.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/request/dit_request_state.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
+#include "core/layers/common/lora/lora_linear.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "models/dit/autoencoders/autoencoder_kl.h"
 #include "models/dit/autoencoders/autoencoder_kl_qwenimage.h"
@@ -1286,6 +1292,152 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
       LOG(INFO) << "QwenImageEditPlusPipeline tokenizer loaded";
     }
 #endif
+  }
+
+  bool load_lora_model(const LoRAConfig& config,
+                       const std::vector<LoRARequest>& requests) {
+    const ProcessGroup* tp_check = parallel_args_.dit_tp_group_;
+    if (tp_check != nullptr && tp_check->world_size() > 1) {
+      LOG(ERROR) << "Qwen Image Edit Plus LoRA requires DiT TP=1";
+      return false;
+    }
+
+    using ParallelType = dit::DiTLoRARuntime::ParallelType;
+    dit::DiTLoRARuntime::Targets targets;
+    const auto add_target = [&targets](std::string name,
+                                       dit::DiTLoRARuntime::Target target) {
+      const auto [position, inserted] =
+          targets.try_emplace(std::move(name), std::move(target));
+      CHECK(inserted) << "Duplicate Qwen Image LoRA target: "
+                      << position->first;
+    };
+    // A fused QKV projection serves three independent adapter entries, one
+    // per lane, installed at the lane's offset in the fused output.
+    const auto expand_fused_qkv =
+        [&add_target](const std::string& proj_name,
+                      layer::LoRABaseColumnParallelLinearImpl& projector,
+                      int64_t tp_rank,
+                      int64_t tp_size) -> bool {
+      static constexpr std::array<const char*, 3> kQKVLanes = {
+          "to_q", "to_k", "to_v"};
+      static constexpr std::array<const char*, 3> kAddQKVLanes = {
+          "add_q_proj", "add_k_proj", "add_v_proj"};
+      const std::array<const char*, 3>* lanes = nullptr;
+      std::string_view marker;
+      if (proj_name.ends_with(".to_qkv")) {
+        lanes = &kQKVLanes;
+        marker = "to_qkv";
+      } else if (proj_name.ends_with(".add_qkv")) {
+        lanes = &kAddQKVLanes;
+        marker = "add_qkv";
+      } else {
+        return false;
+      }
+      const torch::Tensor weight = projector.weight();
+      CHECK_EQ(weight.dim(), 2);
+      CHECK_EQ(weight.size(0) % 3, 0);
+      const int64_t lane_output = weight.size(0) / 3;
+      const std::string base =
+          proj_name.substr(0, proj_name.size() - marker.size());
+      for (int64_t lane = 0; lane < 3; ++lane) {
+        add_target(
+            base + (*lanes)[lane],
+            dit::DiTLoRARuntime::Target{
+                ParallelType::COLUMN,
+                weight.size(1),
+                lane_output,
+                weight.scalar_type(),
+                tp_rank,
+                tp_size,
+                /*layout=*/{},
+                [projector_ptr = &projector, offset = lane * lane_output](
+                    uint64_t adapter_id,
+                    torch::Tensor a,
+                    torch::Tensor b,
+                    float scaling) {
+                  projector_ptr->load_state_dict(
+                      adapter_id, std::move(a), std::move(b), scaling, offset);
+                }});
+      }
+      return true;
+    };
+
+    // Targets only live for this synchronous load. The transformer owns the
+    // projectors throughout the call.
+    lora::visit_lora_projectors<layer::LoRABaseColumnParallelLinearImpl,
+                                layer::LoRABaseRowParallelLinearImpl,
+                                layer::LoRABaseAddMatmulWeightTransposedImpl>(
+        *transformer_,
+        /*root_prefix=*/"",
+        {{"attn_processor_.attn.qkv_linear", "attn.to_qkv"},
+         {"attn_processor_.attn.add_qkv_linear", "attn.add_qkv"},
+         {"attn_processor_.attn.q_linear", "attn.to_q"},
+         {"attn_processor_.attn.k_linear", "attn.to_k"},
+         {"attn_processor_.attn.v_linear", "attn.to_v"},
+         {"attn_processor_.attn.add_q_linear", "attn.add_q_proj"},
+         {"attn_processor_.attn.add_k_linear", "attn.add_k_proj"},
+         {"attn_processor_.attn.add_v_linear", "attn.add_v_proj"},
+         {"attn_processor_.attn.to_out.0", "attn.to_out.0"},
+         {"attn_processor_.attn.to_add_out_linear", "attn.to_add_out"},
+         {"linear1", "net.0.proj"},
+         {"linear2", "net.2"}},
+        [&](std::string proj_name, auto& projector) {
+          using Wrapper = std::remove_reference_t<decltype(projector)>;
+          if constexpr (std::is_same_v<
+                            Wrapper,
+                            layer::LoRABaseAddMatmulWeightTransposedImpl>) {
+            add_target(
+                std::move(proj_name),
+                dit::DiTLoRARuntime::Target{
+                    ParallelType::COLUMN,
+                    projector.in_features(),
+                    projector.out_features(),
+                    projector.weight_dtype(),
+                    /*tp_rank=*/0,
+                    /*tp_size=*/1,
+                    /*layout=*/{},
+                    [projector_ptr = &projector](uint64_t adapter_id,
+                                                 torch::Tensor a,
+                                                 torch::Tensor b,
+                                                 float scaling) {
+                      projector_ptr->load_state_dict(
+                          adapter_id, std::move(a), std::move(b), scaling);
+                    }});
+          } else {
+            constexpr bool kIsColumn =
+                std::is_same_v<Wrapper,
+                               layer::LoRABaseColumnParallelLinearImpl>;
+            const ProcessGroup* pg = projector.process_group();
+            const int64_t tp_rank = pg == nullptr ? 0 : pg->rank();
+            const int64_t tp_size = pg == nullptr ? 1 : pg->world_size();
+            if constexpr (kIsColumn) {
+              if (expand_fused_qkv(proj_name, projector, tp_rank, tp_size)) {
+                return;
+              }
+            }
+            const torch::Tensor weight = projector.weight();
+            CHECK_EQ(weight.dim(), 2);
+            add_target(
+                std::move(proj_name),
+                dit::DiTLoRARuntime::Target{
+                    kIsColumn ? ParallelType::COLUMN : ParallelType::ROW,
+                    weight.size(1),
+                    weight.size(0),
+                    weight.scalar_type(),
+                    tp_rank,
+                    tp_size,
+                    /*layout=*/{},
+                    [projector_ptr = &projector](uint64_t adapter_id,
+                                                 torch::Tensor a,
+                                                 torch::Tensor b,
+                                                 float scaling) {
+                      projector_ptr->load_state_dict(
+                          adapter_id, std::move(a), std::move(b), scaling);
+                    }});
+          }
+        });
+    return dit::DiTLoRARuntime::instance().load_adapters(
+        config, requests, device_, targets);
   }
 
  private:

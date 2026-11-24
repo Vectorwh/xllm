@@ -27,6 +27,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,7 @@ limitations under the License.
 #include "core/framework/dit_model_context.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/lora/dit_lora_runtime.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
@@ -534,6 +536,69 @@ class MiniMaxH3PipelineImpl final : public torch::nn::Module {
           ModelLoader::create(component_loader->model_weights_path()));
     }
     LOG(INFO) << "MiniMax-H3 " << task_type_ << " native components loaded";
+  }
+
+  bool load_lora_model(const LoRAConfig& config,
+                       const std::vector<LoRARequest>& requests) {
+    dit::DiTLoRARuntime::Targets targets;
+    lora::visit_lora_projectors<layer::LoRABaseColumnParallelLinearImpl,
+                                layer::LoRABaseRowParallelLinearImpl>(
+        *transformer_,
+        /*root_prefix=*/"",
+        {{"ff.proj_in", "ff.net.0.proj"},
+         {"ff.proj_out", "ff.net.2"},
+         {"attn.to_out", "attn.to_out.0"}},
+        [&targets](std::string proj_name, auto& projector) {
+          using ParallelType = dit::DiTLoRARuntime::ParallelType;
+          constexpr bool kIsColumn =
+              std::is_same_v<std::remove_reference_t<decltype(projector)>,
+                             layer::LoRABaseColumnParallelLinearImpl>;
+          const torch::Tensor weight = projector.weight();
+          CHECK_EQ(weight.dim(), 2);
+          CHECK(weight.is_floating_point());
+          CHECK_GT(weight.size(1), 0);
+          CHECK_GT(weight.size(0), 0);
+          const ProcessGroup* pg = projector.process_group();
+          const int64_t tp_rank = pg == nullptr ? 0 : pg->rank();
+          const int64_t tp_size = pg == nullptr ? 1 : pg->world_size();
+          CHECK_GE(tp_rank, 0);
+          CHECK_LT(tp_rank, tp_size);
+
+          dit::DiTLoRAOutputLayout layout;
+          if (kIsColumn && proj_name.ends_with(".ff.net.0.proj")) {
+            const int64_t global_out = weight.size(0) * tp_size;
+            CHECK_EQ(global_out % 2, 0);
+            const int64_t ffn_dim = global_out / 2;
+#if defined(USE_NPU)
+            layout = {{ffn_dim, ffn_dim}, {1, 0}};
+#else
+            layout = {{ffn_dim, ffn_dim}, {0, 1}};
+#endif
+          }
+          // Targets only live for this synchronous load. The transformer owns
+          // the projectors throughout the call.
+          const auto [position, inserted] = targets.try_emplace(
+              std::move(proj_name),
+              dit::DiTLoRARuntime::Target{
+                  kIsColumn ? ParallelType::COLUMN : ParallelType::ROW,
+                  weight.size(1),
+                  weight.size(0),
+                  weight.scalar_type(),
+                  tp_rank,
+                  tp_size,
+                  std::move(layout),
+                  [projector_ptr = &projector](uint64_t adapter_id,
+                                               torch::Tensor a,
+                                               torch::Tensor b,
+                                               float scaling) {
+                    projector_ptr->load_state_dict(
+                        adapter_id, std::move(a), std::move(b), scaling);
+                  }});
+          CHECK(inserted) << "Duplicate MiniMax-H3 LoRA target: "
+                          << position->first;
+        });
+    return dit::DiTLoRARuntime::instance().load_adapters(
+        config, requests, options_.device(), targets);
   }
 
  private:

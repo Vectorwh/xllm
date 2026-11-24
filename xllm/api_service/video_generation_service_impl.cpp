@@ -15,6 +15,10 @@ limitations under the License.
 
 #include "api_service/video_generation_service_impl.h"
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "api_service/mm_service_utils.h"
@@ -85,8 +89,13 @@ void VideoGenerationServiceImpl::process_async_impl(
     std::shared_ptr<VideoGenerationCall> call) {
   const auto& rpc_request = call->request();
   const std::string& model = rpc_request.model();
-  const Status admission_status = api_service_internal::admit_rpc_request(
-      model, models_, master_->get_rate_limiter());
+  std::vector<uint64_t> adapter_ids;
+  const Status admission_status =
+      api_service_internal::admit_dit_request(model,
+                                              master_->options().model_id(),
+                                              models_,
+                                              master_->get_rate_limiter(),
+                                              adapter_ids);
   if (!admission_status.ok()) {
     call->finish_with_error(admission_status);
     return;
@@ -100,6 +109,7 @@ void VideoGenerationServiceImpl::process_async_impl(
                                   call->get_x_request_time(),
                                   BinaryPayload(call->take_request_iobuf()));
 
+  request_params.generation_params.lora_adapter_ids = std::move(adapter_ids);
   std::string saved_request_id = request_params.request_id;
   std::string output_type = request_params.generation_params.output_type;
   rate_limit_guard.dismiss();

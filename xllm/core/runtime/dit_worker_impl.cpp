@@ -33,6 +33,9 @@ limitations under the License.
 #include "core/framework/dit_model_loader.h"
 #include "core/platform/device.h"
 #include "framework/dit_cache/dit_cache.h"
+#include "framework/lora/dit_lora_context.h"
+#include "framework/lora/dit_lora_runtime.h"
+#include "framework/lora/lora_runtime.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/model_registry.h"
 #include "util/threadpool.h"
@@ -105,6 +108,7 @@ bool DiTWorkerImpl::init_model(const std::string& model_weights_path,
                                int32_t random_seed,
                                MasterStatus master_status) {
   CHECK(dit_model_ == nullptr) << "Model is already initialized.";
+  torch::DeviceGuard device_guard(device_);
 
   // set same random seed for all worker
   device_.set_seed(random_seed);
@@ -130,9 +134,25 @@ bool DiTWorkerImpl::init_model(const std::string& model_weights_path,
                                  cache_config,
                                  model_type);
 
+  const LoRAConfig& lora_config = LoRARuntime::instance().config();
+  std::vector<LoRARequest> adapters;
+  if (lora_config.enable_lora) {
+    CHECK(!options_.enable_offline_inference())
+        << "DiT LoRA supports online serving only";
+    // Online ranks are separate processes, each with its own registry.
+    adapters = dit::DiTLoRARuntime::register_adapters(
+        lora_config, options_.model_id(), LoRARuntime::instance().registry());
+  }
   dit_model_ = create_dit_model(dit_context_);
   CHECK(dit_model_ != nullptr) << "Failed to create model.";
   dit_model_->load_model(std::move(loader));
+  if (lora_config.enable_lora) {
+    if (!dit_model_->load_lora_model(lora_config, adapters)) {
+      LOG(ERROR) << "Failed to load DiT LoRA adapters for " << model_type;
+      return false;
+    }
+    CHECK_EQ(device_.synchronize_default_stream(), 0);
+  }
 
   dit_model_executor_ =
       std::make_unique<DiTExecutor>(dit_model_.get(), options_);
@@ -165,8 +185,11 @@ std::optional<ForwardOutput> DiTWorkerImpl::step(const ForwardInput& inputs) {
   Timer timer;
   ForwardInput input_on_device = inputs.to(device_, dtype_);
   CHECK(input_on_device.input_params.dit_forward_input.has_value());
-  DiTForwardOutput output = dit_model_executor_->forward(
-      *input_on_device.input_params.dit_forward_input);
+  const DiTForwardInput& dit_input =
+      *input_on_device.input_params.dit_forward_input;
+  const dit::DiTLoRAScope lora_scope(
+      dit_input.generation_params.lora_adapter_ids);
+  DiTForwardOutput output = dit_model_executor_->forward(dit_input);
 
   const int32_t ret = device_.synchronize_default_stream();
   CHECK_EQ(ret, 0) << "synchronize_default_stream failed";

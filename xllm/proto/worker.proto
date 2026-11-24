@@ -303,6 +303,8 @@ message DiTForwardInput {
 
   repeated MediaNamedTensor media_sources = 21;
   repeated NamedTensor tensor_sources = 22;
+  // An empty list selects the base model.
+  repeated uint64 lora_adapter_ids = 23;
 }
 
 message DiTForwardOutput {

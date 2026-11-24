@@ -92,6 +92,11 @@ class LoRAAdapterLoader {
   // loads whatever it can.
   std::optional<LoRAAdapter> load(const LoRARequest& req);
 
+  // DiT accepts a safetensors file or directory and ignores JSON config files.
+  // Per-projection alpha overrides metadata alpha. Missing alpha equals rank.
+  // Target binding is validated by the worker's DiT target registry.
+  std::optional<LoRAAdapter> load_dit(const LoRARequest& req);
+
  private:
   // adapter_config.json parser. Returns false on any structural problem.
   bool parse_config(const std::string& path,

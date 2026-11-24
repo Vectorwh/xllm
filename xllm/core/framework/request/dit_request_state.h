@@ -67,7 +67,8 @@ struct DiTGenerationParams {
            diffusion_steps == other.diffusion_steps &&
            temperature == other.temperature && top_k == other.top_k &&
            top_p == other.top_p &&
-           repetition_penalty == other.repetition_penalty;
+           repetition_penalty == other.repetition_penalty &&
+           lora_adapter_ids == other.lora_adapter_ids;
   }
 
   bool operator!=(const DiTGenerationParams& other) const {
@@ -139,6 +140,9 @@ struct DiTGenerationParams {
   int32_t top_k = 0;
   float top_p = 1.0f;
   float repetition_penalty = 1.1f;
+
+  // Sorted adapter IDs resolved at admission. {0} selects the base model.
+  std::vector<uint64_t> lora_adapter_ids{0};
 };
 
 struct DiTInputParams {

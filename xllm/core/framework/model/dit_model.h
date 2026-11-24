@@ -22,6 +22,8 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/dit_model_loader.h"
+#include "core/framework/lora/lora_config.h"
+#include "core/framework/lora/lora_request.h"
 #include "core/runtime/dit_forward_params.h"
 namespace xllm {
 
@@ -33,6 +35,8 @@ class DiTModel : public torch::nn::Module {
   virtual torch::Device device() const = 0;
   virtual const torch::TensorOptions& options() const = 0;
   virtual void load_model(std::unique_ptr<DiTModelLoader> loader) = 0;
+  virtual bool load_lora_model(const LoRAConfig& config,
+                               const std::vector<LoRARequest>& requests) = 0;
 };
 
 template <typename Model>
@@ -47,6 +51,16 @@ class DiTModelImpl : public DiTModel {
   const torch::TensorOptions& options() const override { return options_; }
   void load_model(std::unique_ptr<DiTModelLoader> loader) override {
     model_->load_model(std::move(loader));
+  }
+  bool load_lora_model(const LoRAConfig& config,
+                       const std::vector<LoRARequest>& requests) override {
+    if (requests.empty()) {
+      return true;
+    }
+    if constexpr (requires { model_->load_lora_model(config, requests); }) {
+      return model_->load_lora_model(config, requests);
+    }
+    return false;
   }
 
  private:

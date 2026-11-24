@@ -12,6 +12,9 @@ include(cc_test)
 #                         forward paths can pick them up in one lookup.
 #                         Replaced by proper LoraCacheManager (M4) once
 #                         per-adapter and per-layer routing lands.
+#   DiT: dit_lora_runtime (static adapter store) + dit_lora_context
+#        (batch-wide TLS routing). The delta math lives in the
+#        :common_layers DiT wrappers, which sit above this library.
 cc_library(
   NAME
     lora
@@ -23,6 +26,8 @@ cc_library(
     lora_runtime.h
     lora_context.h
     lora_metrics.h
+    dit_lora_runtime.h
+    dit_lora_context.h
     $<$<BOOL:${USE_NPU}>:ascendc/ascendc_lora_storage.h>
     $<$<BOOL:${USE_NPU}>:ascendc/xllm_lora_ascendc_binding.h>
   SRCS
@@ -32,6 +37,8 @@ cc_library(
     lora_runtime.cpp
     lora_context.cpp
     lora_metrics.cpp
+    dit_lora_runtime.cpp
+    dit_lora_context.cpp
     $<$<BOOL:${USE_NPU}>:ascendc/ascendc_lora_storage.cpp>
     $<$<BOOL:${USE_NPU}>:ascendc/xllm_lora_ascendc_binding.cpp>
   DEPS

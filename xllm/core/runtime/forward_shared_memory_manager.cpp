@@ -137,7 +137,8 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // independent of its resource identity (8 more bytes per mapping).
 // v11: removes the redundant destination origin; derive each step's origin
 // from remote_shared_num and local_block_start instead.
-constexpr uint64_t kRawInputFormatTag = 0x584C4C4D0000000BULL;
+// v12: DiT forward inputs store a length-prefixed list of LoRA adapter IDs.
+constexpr uint64_t kRawInputFormatTag = 0x584C4C4D0000000CULL;
 
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
@@ -444,6 +445,7 @@ inline size_t get_tensor_parameters_size(const TensorParameters& parameters) {
 
 inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
   size_t size = type_size<int>;  // batch_size
+  size += get_vector_size(input.generation_params.lora_adapter_ids);
 
   // Vector of strings
   size += get_string_vector_size(input.prompts);
@@ -1242,6 +1244,7 @@ inline void write_dit_generation_params(RawInputSerializeContext& context,
 inline void write_dit_forward_input(char*& buffer,
                                     const DiTForwardInput& input) {
   write_data(buffer, input.batch_size);
+  write_vector(buffer, input.generation_params.lora_adapter_ids);
 
   write_string_vector(buffer, input.prompts);
   write_string_vector(buffer, input.prompts_2);
@@ -1269,6 +1272,7 @@ inline void write_dit_forward_input(char*& buffer,
 inline void write_dit_forward_input(RawInputSerializeContext& context,
                                     const DiTForwardInput& input) {
   write_data(context.descriptor, input.batch_size);
+  write_vector(context.descriptor, input.generation_params.lora_adapter_ids);
 
   write_string_vector(context.descriptor, input.prompts);
   write_string_vector(context.descriptor, input.prompts_2);
@@ -2372,6 +2376,7 @@ inline void read_dit_forward_input(const char*& buffer,
                                    DiTForwardInput& input,
                                    bool stabilize_host_tensors = false) {
   read_data(buffer, input.batch_size);
+  read_vector(buffer, input.generation_params.lora_adapter_ids);
 
   read_string_vector(buffer, input.prompts);
   read_string_vector(buffer, input.prompts_2);
@@ -2418,6 +2423,7 @@ inline void read_dit_forward_input(ReadContext& context,
                                    DiTForwardInput& input,
                                    bool stabilize_host_tensors = false) {
   read_data(context, input.batch_size);
+  read_vector(context, input.generation_params.lora_adapter_ids);
 
   read_string_vector(context, input.prompts);
   read_string_vector(context, input.prompts_2);

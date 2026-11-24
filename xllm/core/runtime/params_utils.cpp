@@ -717,6 +717,11 @@ bool dit_forward_input_to_proto(const DiTForwardInput& dit_inputs,
     return false;
   }
 
+  const std::vector<uint64_t>& adapter_ids =
+      dit_inputs.generation_params.lora_adapter_ids;
+  pb_dit_inputs->mutable_lora_adapter_ids()->Assign(adapter_ids.begin(),
+                                                    adapter_ids.end());
+
   return true;
 }
 
@@ -842,6 +847,16 @@ bool proto_to_dit_forward_input(const proto::DiTForwardInput& pb_dit_inputs,
   if (pb_dit_inputs.has_audio_prompt_text()) {
     dit_inputs.audio_prompt_text = pb_dit_inputs.audio_prompt_text();
   }
+
+  std::vector<uint64_t>& adapter_ids =
+      dit_inputs.generation_params.lora_adapter_ids;
+  if (pb_dit_inputs.lora_adapter_ids().empty()) {
+    adapter_ids = {0};
+  } else {
+    adapter_ids.assign(pb_dit_inputs.lora_adapter_ids().begin(),
+                       pb_dit_inputs.lora_adapter_ids().end());
+  }
+
   return true;
 }
 

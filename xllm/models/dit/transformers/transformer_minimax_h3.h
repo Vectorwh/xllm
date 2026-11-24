@@ -25,6 +25,7 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -38,6 +39,8 @@ limitations under the License.
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
 #include "core/layers/common/linear.h"
+#include "framework/lora/dit_lora_context.h"
+#include "layers/common/lora/lora_linear.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -122,34 +125,37 @@ class H3SwiGLUFFNImpl final : public torch::nn::Module {
     const QuantArgs& quant_args = context.get_quant_args();
     proj_in_ =
         register_module("proj_in",
-                        layer::ColumnParallelLinear(hidden_size,
-                                                    2 * ffn_dim,
-                                                    bias,
-                                                    /*gather_output=*/false,
-                                                    quant_args,
-                                                    tp_group_,
-                                                    options_));
+                        layer::LoRABaseColumnParallelLinear(hidden_size,
+                                                            2 * ffn_dim,
+                                                            bias,
+                                                            /*gather_output=*/
+                                                            false,
+                                                            quant_args,
+                                                            tp_group_,
+                                                            options_));
     proj_out_ = register_module(
         "proj_out",
-        layer::RowParallelLinear(ffn_dim,
-                                 hidden_size,
-                                 bias,
-                                 /*input_is_parallelized=*/true,
-                                 /*enable_result_reduction=*/true,
-                                 quant_args,
-                                 tp_group_,
-                                 options_));
+        layer::LoRABaseRowParallelLinear(ffn_dim,
+                                         hidden_size,
+                                         bias,
+                                         /*input_is_parallelized=*/true,
+                                         /*enable_result_reduction=*/true,
+                                         quant_args,
+                                         tp_group_,
+                                         options_));
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) {
-    torch::Tensor x = proj_in_->forward(hidden_states);
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
+    torch::Tensor x = proj_in_->forward(hidden_states, adapter_ids);
 #if defined(USE_NPU)
     torch::Tensor activation = kernel::npu::active(x, /*act_mode=*/"swiglu");
 #else
     std::vector<torch::Tensor> chunks = x.chunk(2, /*dim=*/-1);
     torch::Tensor activation = chunks[0] * torch::silu(chunks[1]);
 #endif
-    return proj_out_->forward(activation);
+    return proj_out_->forward(activation, adapter_ids);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -195,14 +201,12 @@ class H3SwiGLUFFNImpl final : public torch::nn::Module {
             torch::cat({up_shards[tp_rank], gate_shards[tp_rank]}, /*dim=*/0)
                 .to(options_);
 #endif
-        for (auto& parameter : proj_in_->named_parameters()) {
-          if (parameter.key() == "weight") {
-            CHECK_EQ(parameter.value().sizes(), local_weight.sizes());
-            parameter.value().data().copy_(local_weight);
-            proj_in_weight_is_loaded_ = true;
-            break;
-          }
-        }
+        // The wrapper nests the base under "base.", so write through the
+        // weight() accessor instead of matching named_parameters keys.
+        torch::Tensor proj_in_weight = proj_in_->weight();
+        CHECK_EQ(proj_in_weight.sizes(), local_weight.sizes());
+        proj_in_weight.data().copy_(local_weight);
+        proj_in_weight_is_loaded_ = true;
       }
     }
     proj_out_->load_state_dict(state_dict.get_dict_with_prefix("net.2."));
@@ -218,8 +222,8 @@ class H3SwiGLUFFNImpl final : public torch::nn::Module {
  private:
   torch::TensorOptions options_;
   ProcessGroup* tp_group_ = nullptr;
-  layer::ColumnParallelLinear proj_in_{nullptr};
-  layer::RowParallelLinear proj_out_{nullptr};
+  layer::LoRABaseColumnParallelLinear proj_in_{nullptr};
+  layer::LoRABaseRowParallelLinear proj_out_{nullptr};
   bool proj_in_weight_is_loaded_ = false;
 };
 TORCH_MODULE(H3SwiGLUFFN);
@@ -385,40 +389,43 @@ class H3AttentionImpl final : public torch::nn::Module,
     const int64_t inner_dim = heads * dim_head;
     const QuantArgs& quant_args = context.get_quant_args();
     const torch::TensorOptions& options = context.get_tensor_options();
-    to_q_ = register_module("to_q",
-                            layer::ColumnParallelLinear(hidden_size,
-                                                        inner_dim,
-                                                        /*bias=*/false,
-                                                        /*gather_output=*/false,
-                                                        quant_args,
-                                                        tp_group,
-                                                        options));
-    to_k_ = register_module("to_k",
-                            layer::ColumnParallelLinear(hidden_size,
-                                                        inner_dim,
-                                                        /*bias=*/false,
-                                                        /*gather_output=*/false,
-                                                        quant_args,
-                                                        tp_group,
-                                                        options));
-    to_v_ = register_module("to_v",
-                            layer::ColumnParallelLinear(hidden_size,
-                                                        inner_dim,
-                                                        /*bias=*/false,
-                                                        /*gather_output=*/false,
-                                                        quant_args,
-                                                        tp_group,
-                                                        options));
+    to_q_ = register_module(
+        "to_q",
+        layer::LoRABaseColumnParallelLinear(hidden_size,
+                                            inner_dim,
+                                            /*bias=*/false,
+                                            /*gather_output=*/false,
+                                            quant_args,
+                                            tp_group,
+                                            options));
+    to_k_ = register_module(
+        "to_k",
+        layer::LoRABaseColumnParallelLinear(hidden_size,
+                                            inner_dim,
+                                            /*bias=*/false,
+                                            /*gather_output=*/false,
+                                            quant_args,
+                                            tp_group,
+                                            options));
+    to_v_ = register_module(
+        "to_v",
+        layer::LoRABaseColumnParallelLinear(hidden_size,
+                                            inner_dim,
+                                            /*bias=*/false,
+                                            /*gather_output=*/false,
+                                            quant_args,
+                                            tp_group,
+                                            options));
     to_out_ = register_module(
         "to_out",
-        layer::RowParallelLinear(inner_dim,
-                                 hidden_size,
-                                 /*bias=*/false,
-                                 /*input_is_parallelized=*/true,
-                                 /*enable_result_reduction=*/true,
-                                 quant_args,
-                                 tp_group,
-                                 options));
+        layer::LoRABaseRowParallelLinear(inner_dim,
+                                         hidden_size,
+                                         /*bias=*/false,
+                                         /*input_is_parallelized=*/true,
+                                         /*enable_result_reduction=*/true,
+                                         quant_args,
+                                         tp_group,
+                                         options));
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states,
@@ -428,7 +435,9 @@ class H3AttentionImpl final : public torch::nn::Module,
         DiTConfig::get_instance().dit_sp_communication_overlap();
     const int64_t batch_size = hidden_states.size(0);
     const int64_t local_sequence_length = hidden_states.size(1);
-    torch::Tensor q_projection = to_q_->forward(hidden_states);
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
+    torch::Tensor q_projection = to_q_->forward(hidden_states, adapter_ids);
     torch::Tensor q = q_projection.view(
         {batch_size, local_sequence_length, local_heads_, dim_head_});
     std::function<torch::Tensor()> q_work;
@@ -441,7 +450,7 @@ class H3AttentionImpl final : public torch::nn::Module,
                                         process_group_);
     }
 
-    torch::Tensor k_projection = to_k_->forward(hidden_states);
+    torch::Tensor k_projection = to_k_->forward(hidden_states, adapter_ids);
     torch::Tensor k = k_projection.view(
         {batch_size, local_sequence_length, local_heads_, dim_head_});
     std::function<torch::Tensor()> k_work;
@@ -454,7 +463,7 @@ class H3AttentionImpl final : public torch::nn::Module,
                                         process_group_);
     }
 
-    torch::Tensor v_projection = to_v_->forward(hidden_states);
+    torch::Tensor v_projection = to_v_->forward(hidden_states, adapter_ids);
     torch::Tensor v = v_projection.view(
         {batch_size, local_sequence_length, local_heads_, dim_head_});
     std::function<torch::Tensor()> v_work;
@@ -517,7 +526,7 @@ class H3AttentionImpl final : public torch::nn::Module,
     }
     out =
         out.view({batch_size, local_sequence_length, local_heads_ * dim_head_});
-    return to_out_->forward(out);
+    return to_out_->forward(out, adapter_ids);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -547,10 +556,10 @@ class H3AttentionImpl final : public torch::nn::Module,
   int64_t dim_head_;
   int64_t sp_size_;
   bool use_laser_attention_;
-  layer::ColumnParallelLinear to_q_{nullptr};
-  layer::ColumnParallelLinear to_k_{nullptr};
-  layer::ColumnParallelLinear to_v_{nullptr};
-  layer::RowParallelLinear to_out_{nullptr};
+  layer::LoRABaseColumnParallelLinear to_q_{nullptr};
+  layer::LoRABaseColumnParallelLinear to_k_{nullptr};
+  layer::LoRABaseColumnParallelLinear to_v_{nullptr};
+  layer::LoRABaseRowParallelLinear to_out_{nullptr};
   H3RMSNorm norm_q_{nullptr};
   H3RMSNorm norm_k_{nullptr};
 };

@@ -15,9 +15,13 @@ limitations under the License.
 
 #include "api_service/request_admission.h"
 
+#include <absl/strings/ascii.h>
+#include <absl/strings/str_split.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <limits>
+#include <utility>
 
 #include "core/framework/config/service_config.h"
 #include "core/framework/lora/lora_runtime.h"
@@ -72,6 +76,41 @@ Status admit_rpc_request(const std::string& model,
     return rate_limiter_rejection_status(*rate_limiter);
   }
   return {};
+}
+
+Status admit_dit_request(const std::string& model,
+                         const std::string& base_model,
+                         const absl::flat_hash_set<std::string>& models,
+                         RateLimiter* rate_limiter,
+                         std::vector<uint64_t>& adapter_ids) {
+  const LoRARuntime& runtime = LoRARuntime::instance();
+  std::vector<uint64_t> resolved_ids;
+  if (!models.contains(model) && runtime.enabled()) {
+    // DiT registers all static adapters before serving requests.
+    const std::vector<std::string> names = absl::StrSplit(model, ',');
+    resolved_ids.reserve(names.size());
+    for (const std::string& name : names) {
+      const auto adapter = runtime.registry().lookup(
+          std::string(absl::StripAsciiWhitespace(name)));
+      if (!adapter.has_value() || adapter->base_model_name != base_model) {
+        return model_not_supported_status();
+      }
+      resolved_ids.emplace_back(adapter->lora_int_id);
+    }
+    std::sort(resolved_ids.begin(), resolved_ids.end());
+    if (std::adjacent_find(resolved_ids.begin(), resolved_ids.end()) !=
+        resolved_ids.end()) {
+      return Status::invalid_parameter("Duplicate LoRA adapter", "model");
+    }
+  }
+
+  const Status status = admit_rpc_request(
+      resolved_ids.empty() ? model : base_model, models, rate_limiter);
+  if (status.ok()) {
+    adapter_ids = resolved_ids.empty() ? std::vector<uint64_t>{0}
+                                       : std::move(resolved_ids);
+  }
+  return status;
 }
 
 }  // namespace xllm::api_service_internal

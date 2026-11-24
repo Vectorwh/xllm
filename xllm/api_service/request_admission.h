@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "core/common/rate_limiter.h"
 #include "core/common/types.h"
@@ -39,5 +40,12 @@ Status admit_rpc_request(const std::string& model,
                          RateLimiter* rate_limiter,
                          bool supports_lora = false,
                          int64_t num_requests = 1);
+
+// Resolves the static adapter list before acquiring an admission slot.
+Status admit_dit_request(const std::string& model,
+                         const std::string& base_model,
+                         const absl::flat_hash_set<std::string>& models,
+                         RateLimiter* rate_limiter,
+                         std::vector<uint64_t>& adapter_ids);
 
 }  // namespace xllm::api_service_internal

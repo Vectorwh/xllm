@@ -377,11 +377,6 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
 }
 
 void LoRAColumnParallelLinearImpl::load_state_dict(
-    const StateDict& state_dict) {
-  base_->load_state_dict(state_dict);
-}
-
-void LoRAColumnParallelLinearImpl::load_state_dict(
     const StateDict& state_dict,
     const std::vector<std::string>& prefixes) {
   base_->load_state_dict(state_dict, prefixes);

@@ -35,12 +35,13 @@ limitations under the License.
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
-#include "layers/common/linear.h"
+#include "layers/common/lora/lora_linear.h"
 
 namespace xllm {
 namespace layer {
 
-class LoRAColumnParallelLinearImpl : public torch::nn::Module {
+class LoRAColumnParallelLinearImpl final
+    : public LoRABaseColumnParallelLinearImpl {
  public:
   LoRAColumnParallelLinearImpl() = default;
 
@@ -63,14 +64,13 @@ class LoRAColumnParallelLinearImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor input);
 
-  void load_state_dict(const StateDict& state_dict);
+  using LoRABaseColumnParallelLinearImpl::load_state_dict;
   void load_state_dict(const StateDict& state_dict,
                        const std::vector<std::string>& prefixes);
   void load_state_dict(const StateDict& state_dict,
                        int32_t shard_tensor_count,
                        const std::vector<int64_t>& shard_sizes);
 
-  torch::Tensor weight() const { return base_->weight(); }
   std::optional<torch::Tensor> get_input_scale() const {
     return base_->get_input_scale();
   }
@@ -82,19 +82,17 @@ class LoRAColumnParallelLinearImpl : public torch::nn::Module {
   // current batch: DenseMLPImpl's quantized-allgather fast path bypasses
   // forward(), which would silently drop the LoRA delta for adapter
   // batches.
-  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
   bool uses_w8a8_dynamic_quant() const;
   torch::Tensor forward_quantized(const W8A8DynamicInput& input) {
     return base_->forward_quantized(input);
   }
 
-  void pretty_print(std::ostream& stream) const {
+  void pretty_print(std::ostream& stream) const override {
     stream << name() << " (LoRA-wrapped/" << proj_name_
            << ")  base_weight=" << base_->weight().sizes();
   }
 
  private:
-  ColumnParallelLinear base_{nullptr};
   std::string proj_name_;  // "gate_up_proj" for fused, or single
   int64_t in_features_ = 0;
   int64_t out_features_ = 0;      // per-rank local, total (fused = 2*inter)

@@ -46,12 +46,12 @@ limitations under the License.
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
-#include "layers/common/linear.h"
+#include "layers/common/lora/lora_linear.h"
 
 namespace xllm {
 namespace layer {
 
-class LoRARowParallelLinearImpl : public torch::nn::Module {
+class LoRARowParallelLinearImpl final : public LoRABaseRowParallelLinearImpl {
  public:
   LoRARowParallelLinearImpl() = default;
 
@@ -82,19 +82,12 @@ class LoRARowParallelLinearImpl : public torch::nn::Module {
   // sharded modes CHECK-fail loudly instead of silently mis-shaping.
   torch::Tensor forward(torch::Tensor input, RowParallelReduceMode reduce_mode);
 
-  // Passthrough so verify_loaded_weights() can poll the base's load state
-  // through the wrapper (mirrors RowParallelLinearImpl::is_weight_loaded).
-  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
-
-  void load_state_dict(const StateDict& state_dict);
-
-  void pretty_print(std::ostream& stream) const {
+  void pretty_print(std::ostream& stream) const override {
     stream << name() << " (LoRA-wrapped/" << proj_name_
            << ")  base_weight=" << base_->weight().sizes();
   }
 
  private:
-  RowParallelLinear base_{nullptr};
   std::string proj_name_;
   int64_t in_features_ = 0;
   int64_t out_features_ = 0;

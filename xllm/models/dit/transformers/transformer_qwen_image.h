@@ -27,16 +27,19 @@ limitations under the License.
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "core/framework/config/dit_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/dit_cache/dit_cache.h"
 #include "core/framework/dit_model_loader.h"
+#include "core/framework/lora/dit_lora_context.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/state_dict/state_dict.h"
@@ -45,6 +48,7 @@ limitations under the License.
 #include "core/layers/common/ada_layer_norm.h"
 #include "core/layers/common/add_matmul.h"
 #include "core/layers/common/linear.h"
+#include "core/layers/common/lora/lora_linear.h"
 #if defined(USE_DCU)
 #include "core/layers/dcu/flash_attention.h"
 #endif
@@ -167,6 +171,7 @@ inline torch::Tensor qwen_image_joint_attention(
 }
 
 namespace qwenimage {
+
 #if defined(USE_NPU)
 inline torch::Tensor qwen_npu_fusion_attention_v3(
     const torch::Tensor& joint_query,
@@ -618,44 +623,44 @@ class AttentionImpl final : public torch::nn::Module {
                      !only_cross_attention;
     if (use_fused_qkv_) {
       // The existing fused CMO projections use the model dtype.
-      to_qkv_ =
-          register_module("qkv_linear",
-                          layer::ColumnParallelLinear(query_dim,
-                                                      3 * q_dim,
-                                                      bias,
-                                                      /*gather_output=*/false,
-                                                      QuantArgs{},
-                                                      tp_group,
-                                                      options_));
+      to_qkv_ = register_module(
+          "qkv_linear",
+          layer::LoRABaseColumnParallelLinear(query_dim,
+                                              3 * q_dim,
+                                              bias,
+                                              /*gather_output=*/false,
+                                              QuantArgs{},
+                                              tp_group,
+                                              options_));
     } else {
-      to_q_ =
-          register_module("q_linear",
-                          layer::ColumnParallelLinear(query_dim,
-                                                      q_dim,
-                                                      bias,
-                                                      /*gather_output=*/false,
-                                                      quant_args_,
-                                                      tp_group,
-                                                      options_));
+      to_q_ = register_module(
+          "q_linear",
+          layer::LoRABaseColumnParallelLinear(query_dim,
+                                              q_dim,
+                                              bias,
+                                              /*gather_output=*/false,
+                                              quant_args_,
+                                              tp_group,
+                                              options_));
       if (!only_cross_attention) {
         to_k_ = register_module(
             "k_linear",
-            layer::ColumnParallelLinear(cross_attention_dim.value(),
-                                        kv_dim,
-                                        bias,
-                                        /*gather_output=*/false,
-                                        quant_args_,
-                                        tp_group,
-                                        options_));
+            layer::LoRABaseColumnParallelLinear(cross_attention_dim.value(),
+                                                kv_dim,
+                                                bias,
+                                                /*gather_output=*/false,
+                                                quant_args_,
+                                                tp_group,
+                                                options_));
         to_v_ = register_module(
             "v_linear",
-            layer::ColumnParallelLinear(cross_attention_dim.value(),
-                                        kv_dim,
-                                        bias,
-                                        /*gather_output=*/false,
-                                        quant_args_,
-                                        tp_group,
-                                        options_));
+            layer::LoRABaseColumnParallelLinear(cross_attention_dim.value(),
+                                                kv_dim,
+                                                bias,
+                                                /*gather_output=*/false,
+                                                quant_args_,
+                                                tp_group,
+                                                options_));
       }
     }
 
@@ -663,55 +668,56 @@ class AttentionImpl final : public torch::nn::Module {
       if (use_fused_qkv_ && context_pre_only.has_value()) {
         add_qkv_ = register_module(
             "add_qkv_linear",
-            layer::ColumnParallelLinear(added_kv_proj_dim.value(),
-                                        3 * q_dim,
-                                        added_proj_bias,
-                                        /*gather_output=*/false,
-                                        QuantArgs{},
-                                        tp_group,
-                                        options_));
+            layer::LoRABaseColumnParallelLinear(added_kv_proj_dim.value(),
+                                                3 * q_dim,
+                                                added_proj_bias,
+                                                /*gather_output=*/false,
+                                                QuantArgs{},
+                                                tp_group,
+                                                options_));
       } else {
         add_k_proj_ = register_module(
             "add_k_linear",
-            layer::ColumnParallelLinear(added_kv_proj_dim.value(),
-                                        kv_dim,
-                                        added_proj_bias,
-                                        /*gather_output=*/false,
-                                        quant_args_,
-                                        tp_group,
-                                        options_));
+            layer::LoRABaseColumnParallelLinear(added_kv_proj_dim.value(),
+                                                kv_dim,
+                                                added_proj_bias,
+                                                /*gather_output=*/false,
+                                                quant_args_,
+                                                tp_group,
+                                                options_));
         add_v_proj_ = register_module(
             "add_v_linear",
-            layer::ColumnParallelLinear(added_kv_proj_dim.value(),
-                                        kv_dim,
-                                        added_proj_bias,
-                                        /*gather_output=*/false,
-                                        quant_args_,
-                                        tp_group,
-                                        options_));
+            layer::LoRABaseColumnParallelLinear(added_kv_proj_dim.value(),
+                                                kv_dim,
+                                                added_proj_bias,
+                                                /*gather_output=*/false,
+                                                quant_args_,
+                                                tp_group,
+                                                options_));
         if (context_pre_only.has_value()) {
           add_q_proj_ = register_module(
               "add_q_linear",
-              layer::ColumnParallelLinear(added_kv_proj_dim.value(),
-                                          q_dim,
-                                          added_proj_bias,
-                                          /*gather_output=*/false,
-                                          quant_args_,
-                                          tp_group,
-                                          options_));
+              layer::LoRABaseColumnParallelLinear(added_kv_proj_dim.value(),
+                                                  q_dim,
+                                                  added_proj_bias,
+                                                  /*gather_output=*/false,
+                                                  quant_args_,
+                                                  tp_group,
+                                                  options_));
         }
       }
     }
 
     if (!pre_only) {
-      to_out_ = layer::RowParallelLinear(q_dim,
-                                         out_dim.value(),
-                                         out_bias,
-                                         /*input_is_parallelized=*/true,
-                                         /*enable_result_reduction=*/false,
-                                         quant_args_,
-                                         tp_group,
-                                         options_);
+      to_out_ =
+          layer::LoRABaseRowParallelLinear(q_dim,
+                                           out_dim.value(),
+                                           out_bias,
+                                           /*input_is_parallelized=*/true,
+                                           /*enable_result_reduction=*/false,
+                                           quant_args_,
+                                           tp_group,
+                                           options_);
       // Retain the to_out.0 registration while calling the typed projection.
       auto out_projections = register_module("to_out", torch::nn::ModuleList());
       out_projections->push_back(to_out_);
@@ -720,14 +726,14 @@ class AttentionImpl final : public torch::nn::Module {
     if (context_pre_only.has_value() && context_pre_only.value()) {
       to_add_out_ = register_module(
           "to_add_out_linear",
-          layer::RowParallelLinear(q_dim,
-                                   out_context_dim.value(),
-                                   out_bias,
-                                   /*input_is_parallelized=*/true,
-                                   /*enable_result_reduction=*/false,
-                                   quant_args_,
-                                   tp_group,
-                                   options_));
+          layer::LoRABaseRowParallelLinear(q_dim,
+                                           out_context_dim.value(),
+                                           out_bias,
+                                           /*input_is_parallelized=*/true,
+                                           /*enable_result_reduction=*/false,
+                                           quant_args_,
+                                           tp_group,
+                                           options_));
     }
 
     // Added QK normalization for added KV projections
@@ -808,26 +814,30 @@ class AttentionImpl final : public torch::nn::Module {
 
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> project_qkv(
       const torch::Tensor& hidden_states) {
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
     if (use_fused_qkv_) {
-      auto qkv = to_qkv_->forward(hidden_states);
+      auto qkv = to_qkv_->forward(hidden_states, adapter_ids);
       auto chunks = qkv.chunk(/*chunks=*/3, /*dim=*/-1);
       return {chunks[0], chunks[1], chunks[2]};
     }
-    return {to_q_->forward(hidden_states),
-            to_k_->forward(hidden_states),
-            to_v_->forward(hidden_states)};
+    return {to_q_->forward(hidden_states, adapter_ids),
+            to_k_->forward(hidden_states, adapter_ids),
+            to_v_->forward(hidden_states, adapter_ids)};
   }
 
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> project_added_qkv(
       const torch::Tensor& encoder_hidden_states) {
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
     if (use_fused_qkv_) {
-      auto qkv = add_qkv_->forward(encoder_hidden_states);
+      auto qkv = add_qkv_->forward(encoder_hidden_states, adapter_ids);
       auto chunks = qkv.chunk(/*chunks=*/3, /*dim=*/-1);
       return {chunks[0], chunks[1], chunks[2]};
     }
-    return {add_q_proj_->forward(encoder_hidden_states),
-            add_k_proj_->forward(encoder_hidden_states),
-            add_v_proj_->forward(encoder_hidden_states)};
+    return {add_q_proj_->forward(encoder_hidden_states, adapter_ids),
+            add_k_proj_->forward(encoder_hidden_states, adapter_ids),
+            add_v_proj_->forward(encoder_hidden_states, adapter_ids)};
   }
 
  public:
@@ -842,13 +852,14 @@ class AttentionImpl final : public torch::nn::Module {
   QuantArgs quant_args_;
   torch::nn::LayerNorm layer_norm_q_{nullptr}, layer_norm_k_{nullptr},
       norm_cross_{nullptr};
-  layer::ColumnParallelLinear to_q_{nullptr}, to_k_{nullptr}, to_v_{nullptr};
-  layer::ColumnParallelLinear to_qkv_{nullptr};
-  layer::ColumnParallelLinear add_k_proj_{nullptr}, add_v_proj_{nullptr},
-      add_q_proj_{nullptr};
-  layer::ColumnParallelLinear add_qkv_{nullptr};
-  layer::RowParallelLinear to_out_{nullptr};
-  layer::RowParallelLinear to_add_out_{nullptr};
+  layer::LoRABaseColumnParallelLinear to_q_{nullptr}, to_k_{nullptr},
+      to_v_{nullptr};
+  layer::LoRABaseColumnParallelLinear to_qkv_{nullptr};
+  layer::LoRABaseColumnParallelLinear add_k_proj_{nullptr},
+      add_v_proj_{nullptr}, add_q_proj_{nullptr};
+  layer::LoRABaseColumnParallelLinear add_qkv_{nullptr};
+  layer::LoRABaseRowParallelLinear to_out_{nullptr};
+  layer::LoRABaseRowParallelLinear to_add_out_{nullptr};
 
   // Assuming you have RMSNorm implemented
   RMSNorm norm_q_{nullptr}, norm_k_{nullptr}, norm_added_q_{nullptr},
@@ -863,14 +874,13 @@ class FeedForwardImpl final : public torch::nn::Module {
                            int64_t dim_out,
                            int64_t mult = 4)
       : options_(context.get_tensor_options()) {
-    auto model_args = context.get_model_args();
     quant_args_ = context.get_quant_args();
     int64_t inner_dim = dim * 4;
 
     // linear1
     linear1_ =
         register_module("linear1",
-                        layer::AddMatmulWeightTransposed(
+                        layer::LoRABaseAddMatmulWeightTransposed(
                             dim, inner_dim, true, options_, quant_args_));
 
     // activation
@@ -885,12 +895,14 @@ class FeedForwardImpl final : public torch::nn::Module {
     // linear2
     linear2_ =
         register_module("linear2",
-                        layer::AddMatmulWeightTransposed(
+                        layer::LoRABaseAddMatmulWeightTransposed(
                             inner_dim, dim_out, true, options_, quant_args_));
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) {
-    torch::Tensor out = linear1_->forward(hidden_states);
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
+    torch::Tensor out = linear1_->forward(hidden_states, adapter_ids);
 #if defined(USE_NPU)
     // Reuse kernel::active (gelu_pytorch_tanh → npu_gelu tanh).
     xllm::kernel::ActivationParams act_params;
@@ -902,8 +914,7 @@ class FeedForwardImpl final : public torch::nn::Module {
 #else
     out = activation_(out);
 #endif
-    out = linear2_->forward(out);
-    return out;
+    return linear2_->forward(out, adapter_ids);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -919,8 +930,8 @@ class FeedForwardImpl final : public torch::nn::Module {
   }
 
  private:
-  layer::AddMatmulWeightTransposed linear1_{nullptr};
-  layer::AddMatmulWeightTransposed linear2_{nullptr};
+  layer::LoRABaseAddMatmulWeightTransposed linear1_{nullptr};
+  layer::LoRABaseAddMatmulWeightTransposed linear2_{nullptr};
   torch::nn::Functional activation_{nullptr};
   QuantArgs quant_args_;
   torch::TensorOptions options_;
@@ -1875,8 +1886,10 @@ class QwenDoubleStreamAttnProcessor2_0Impl : public torch::nn::Module {
     }
 
     // Apply output projections
-    img_attn_output = attn_->to_out_->forward(img_attn_output);
-    txt_attn_output = attn_->to_add_out_->forward(txt_attn_output);
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
+    img_attn_output = attn_->to_out_->forward(img_attn_output, adapter_ids);
+    txt_attn_output = attn_->to_add_out_->forward(txt_attn_output, adapter_ids);
     return std::make_tuple(img_attn_output, txt_attn_output);
   }
 
@@ -2049,15 +2062,17 @@ class QwenDoubleStreamAttnProcessorCMO2_0Impl : public torch::nn::Module {
         /*async_ops=*/true,
         attn_->sp_group_);
 
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
     img_attn_output = img_out_handler();
     img_attn_output =
         img_attn_output.view({hidden_states.size(0), -1, q_hidden_size_});
-    img_attn_output = attn_->to_out_->forward(img_attn_output);
+    img_attn_output = attn_->to_out_->forward(img_attn_output, adapter_ids);
 
     txt_attn_output = txt_out_handler();
     txt_attn_output = txt_attn_output.view(
         {encoder_hidden_states.size(0), -1, q_hidden_size_});
-    txt_attn_output = attn_->to_add_out_->forward(txt_attn_output);
+    txt_attn_output = attn_->to_add_out_->forward(txt_attn_output, adapter_ids);
 
     return std::make_tuple(img_attn_output, txt_attn_output);
   }
@@ -2098,7 +2113,7 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
     img_mod_ = register_module(
         "img_mod",
         torch::nn::Sequential(torch::nn::SiLU(),
-                              layer::AddMatmulWeightTransposed(
+                              layer::LoRABaseAddMatmulWeightTransposed(
                                   dim, 6 * dim, true, options_, quant_args_)));
 
     // Image normalization
@@ -2150,7 +2165,7 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
     txt_mod_ = register_module(
         "txt_mod",
         torch::nn::Sequential(torch::nn::SiLU(),
-                              layer::AddMatmulWeightTransposed(
+                              layer::LoRABaseAddMatmulWeightTransposed(
                                   dim, 6 * dim, true, options_, quant_args_)));
 
     // Text normalization 1
@@ -2231,14 +2246,22 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
           joint_attention_kwargs = {},
       const torch::Tensor& modulate_index = torch::Tensor()) {
     // Get modulation parameters for both streams
-    auto img_mod_params = img_mod_->forward(temb);  // [B, 6*dim]
+    const std::span<const uint64_t> adapter_ids =
+        dit::active_dit_lora_adapter_ids();
+    const torch::Tensor img_mod_params =
+        img_mod_[1]->as<layer::LoRABaseAddMatmulWeightTransposed>()->forward(
+            img_mod_[0]->as<torch::nn::SiLU>()->forward(temb),
+            adapter_ids);  // [B, 6*dim]
     torch::Tensor new_temb;
     if (zero_cond_t_) {
       new_temb = temb.chunk(2, 0)[0];
     } else {
       new_temb = temb;
     }
-    auto txt_mod_params = txt_mod_->forward(new_temb);  // [B, 6*dim]
+    const torch::Tensor txt_mod_params =
+        txt_mod_[1]->as<layer::LoRABaseAddMatmulWeightTransposed>()->forward(
+            txt_mod_[0]->as<torch::nn::SiLU>()->forward(new_temb),
+            adapter_ids);  // [B, 6*dim]
     //  Split modulation parameters for norm1 and norm2
     auto img_mod_chunks = img_mod_params.chunk(2, -1);
     auto img_mod1 = img_mod_chunks[0];  // [B, 3*dim]
@@ -2310,11 +2333,13 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    img_mod_[1]->as<layer::AddMatmulWeightTransposed>()->load_state_dict(
-        state_dict.get_dict_with_prefix("img_mod.1."));
+    img_mod_[1]
+        ->as<layer::LoRABaseAddMatmulWeightTransposed>()
+        ->load_state_dict(state_dict.get_dict_with_prefix("img_mod.1."));
     img_mlp_->load_state_dict(state_dict.get_dict_with_prefix("img_mlp."));
-    txt_mod_[1]->as<layer::AddMatmulWeightTransposed>()->load_state_dict(
-        state_dict.get_dict_with_prefix("txt_mod.1."));
+    txt_mod_[1]
+        ->as<layer::LoRABaseAddMatmulWeightTransposed>()
+        ->load_state_dict(state_dict.get_dict_with_prefix("txt_mod.1."));
     txt_mlp_->load_state_dict(state_dict.get_dict_with_prefix("txt_mlp."));
     if (use_dit_sp_communication_overlap()) {
       attn_cmo_processor_->load_state_dict(
@@ -2326,11 +2351,13 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
   }
 
   void verify_loaded_weights(const std::string& prefix) {
-    img_mod_[1]->as<layer::AddMatmulWeightTransposed>()->verify_loaded_weights(
-        prefix + "img_mod.1.");
+    img_mod_[1]
+        ->as<layer::LoRABaseAddMatmulWeightTransposed>()
+        ->verify_loaded_weights(prefix + "img_mod.1.");
     img_mlp_->verify_loaded_weights(prefix + "img_mlp.");
-    txt_mod_[1]->as<layer::AddMatmulWeightTransposed>()->verify_loaded_weights(
-        prefix + "txt_mod.1.");
+    txt_mod_[1]
+        ->as<layer::LoRABaseAddMatmulWeightTransposed>()
+        ->verify_loaded_weights(prefix + "txt_mod.1.");
     txt_mlp_->verify_loaded_weights(prefix + "txt_mlp.");
     if (use_dit_sp_communication_overlap()) {
       attn_cmo_processor_->verify_loaded_weights(prefix + "attn.");

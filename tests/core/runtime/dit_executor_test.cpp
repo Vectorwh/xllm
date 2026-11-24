@@ -20,6 +20,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include "core/common/metrics.h"
 
@@ -45,6 +46,10 @@ class RecordingDiTModel final : public DiTModel {
   torch::Device device() const override { return torch::Device(torch::kCPU); }
   const torch::TensorOptions& options() const override { return options_; }
   void load_model(std::unique_ptr<DiTModelLoader> /*loader*/) override {}
+  bool load_lora_model(const LoRAConfig& /*config*/,
+                       const std::vector<LoRARequest>& requests) override {
+    return requests.empty();
+  }
 
   int32_t calls_ = 0;
   int32_t last_batch_size_ = 0;

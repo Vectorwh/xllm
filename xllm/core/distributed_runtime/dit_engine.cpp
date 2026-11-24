@@ -26,6 +26,9 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/platform/device.h"
 #include "core/util/model_config_utils.h"
+#include "framework/lora/dit_lora_runtime.h"
+#include "framework/lora/lora_metrics.h"
+#include "framework/lora/lora_runtime.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "runtime/worker.h"
@@ -84,6 +87,14 @@ bool DiTEngine::init() {
 }
 
 bool DiTEngine::init_model() {
+  const LoRAConfig& lora_config = LoRARuntime::instance().config();
+  std::vector<LoRARequest> adapters;
+  if (lora_config.enable_lora) {
+    CHECK(!options_.enable_offline_inference())
+        << "DiT LoRA supports online serving only";
+    adapters = dit::DiTLoRARuntime::register_adapters(
+        lora_config, options_.model_id(), LoRARuntime::instance().registry());
+  }
   const std::string& model_path = options_.model_path();
   // The engine only stores the top-level pipeline identity. Component args
   // remain in each worker's DiTModelContext.
@@ -109,6 +120,9 @@ bool DiTEngine::init_model() {
     }
   }
 
+  for (const LoRARequest& adapter : adapters) {
+    LoRAMetrics::instance().set_state(adapter.lora_int_id, /*state=*/1);
+  }
   LOG(INFO) << "All workers successfully initialized the model.";
   return true;
 }
