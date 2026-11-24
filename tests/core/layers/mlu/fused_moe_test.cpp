@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "layers/mlu/fused_moe.h"
 
+#include <ATen/CPUGeneratorImpl.h>
 #include <c10/core/DeviceGuard.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -24,7 +25,10 @@ limitations under the License.
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <memory>
 #include <mutex>
+#include <numeric>
+#include <utility>
 
 #include "framework/model/model_args.h"
 #include "framework/model_context.h"
@@ -41,6 +45,16 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 namespace {
+
+class GroupedGemmReferenceMoEImpl final : public FusedMoEImpl {
+ public:
+  using FusedMoEImpl::FusedMoEImpl;
+
+  void load_state_dict(const StateDict& state_dict) override {
+    load_experts(state_dict.get_dict_with_prefix("experts."));
+    prepare_scale_layout();
+  }
+};
 
 class CountingReduceProcessGroup : public test::MockProcessGroup {
  public:
@@ -187,6 +201,7 @@ class FusedMoETest : public ::testing::Test {
     return bf16(intermediate * activation * 0.05f * down_q * 0.1f);
   }
 
+  template <typename MoeImpl = FusedMoEImpl>
   FusedMoE create_fused_moe(int64_t num_experts,
                             int64_t top_k,
                             int64_t num_expert_group,
@@ -217,13 +232,15 @@ class FusedMoETest : public ::testing::Test {
     const FusedMoEArgs moe_args{
         .is_gated = is_gated,
         .enable_result_reduction = enable_result_reduction};
-    return FusedMoE(FusedMoEImpl(args,
-                                 moe_args,
-                                 quant_args_,
-                                 parallel_args_,
-                                 options_,
-                                 routed_comm_stream_,
-                                 shared_compute_stream_));
+    std::shared_ptr<FusedMoEImpl> moe =
+        std::make_shared<MoeImpl>(args,
+                                  moe_args,
+                                  quant_args_,
+                                  parallel_args_,
+                                  options_,
+                                  routed_comm_stream_,
+                                  shared_compute_stream_);
+    return FusedMoE(std::move(moe));
   }
 
   void set_tp_ctx(int64_t world_size) {
@@ -271,6 +288,52 @@ class FusedMoETest : public ::testing::Test {
   torch::Tensor create_custom_input(const std::vector<int64_t>& shape,
                                     const std::vector<float>& values) {
     return test::create_custom_input(shape, values, options_);
+  }
+
+  static constexpr int64_t kRoutedHidden = 5120;
+  static constexpr int64_t kRoutedIntermediate = 2304;
+
+  std::unordered_map<std::string, torch::Tensor> make_routed_ffn_weights(
+      int64_t experts,
+      const torch::Generator& rng) {
+    std::unordered_map<std::string, torch::Tensor> weights;
+    for (int64_t expert = 0; expert < experts; ++expert) {
+      for (const std::string projection :
+           {"gate_proj", "up_proj", "down_proj"}) {
+        const bool down = projection == "down_proj";
+        const int64_t rows = down ? kRoutedHidden : kRoutedIntermediate;
+        const int64_t cols = down ? kRoutedIntermediate : kRoutedHidden;
+        const std::string key =
+            "experts." + std::to_string(expert) + "." + projection + ".";
+        weights[key + "qweight"] =
+            torch::randint(-128, 128, {rows, cols / 2}, rng, torch::kInt8);
+        weights[key + "per_channel_scale"] =
+            torch::randint(1, 16, {rows, cols / 128}, rng, torch::kFloat32) /
+            1024;
+        weights[key + "smooth"] = torch::ones({cols}, torch::kFloat32);
+      }
+    }
+    return weights;
+  }
+
+  template <typename MoeImpl = FusedMoEImpl>
+  FusedMoE load_routed_ffn(
+      int64_t experts,
+      const std::unordered_map<std::string, torch::Tensor>& weights) {
+    quant_args_.moe_weight_bits() = 4;
+    quant_args_.group_size() = 128;
+    model_args_.model_type() = "deepseek_v41";
+    model_args_.swiglu_limit() = 10.0f;
+    auto moe = create_fused_moe<MoeImpl>(experts,
+                                         /*top_k=*/1,
+                                         /*num_expert_group=*/1,
+                                         /*topk_group=*/1,
+                                         /*route_scale=*/1.0,
+                                         kRoutedHidden,
+                                         kRoutedIntermediate,
+                                         /*n_shared_experts=*/0);
+    moe->load_state_dict(StateDict(weights));
+    return moe;
   }
 
   void check_mixed_experts(const std::string& model_type,
@@ -416,6 +479,98 @@ TEST_F(FusedMoETest, PrecisionVerificationTest) {
   const auto expected = torch::full(
       {2, kHidden}, bf16(bf16(routed * 2.5f) + shared), torch::kBFloat16);
   verify_tensor_close(actual.cpu(), expected, 0.02, 0.001);
+}
+
+TEST_F(FusedMoETest, PackedRoutedFfnMatchesGroupedGemm) {
+  constexpr int64_t kExperts = 2;
+  auto rng = at::detail::createCPUGenerator(/*seed_val=*/133);
+  auto weights = make_routed_ffn_weights(kExperts, rng);
+  // One non-representable scale in the down projection must preserve FP32
+  // scales for both GEMMs. Exercise both encodings with the same weights.
+  for (const bool exact : {true, false}) {
+    if (!exact) {
+      weights.at("experts.0.down_proj.per_channel_scale").mul_(1.1f);
+    }
+    auto reference =
+        load_routed_ffn<GroupedGemmReferenceMoEImpl>(kExperts, weights);
+    auto fused = load_routed_ffn(kExperts, weights);
+    ASSERT_EQ(fused->named_parameters()["w13_scale"].scalar_type(),
+              exact ? torch::kBFloat16 : torch::kFloat32);
+    for (const int64_t rows : {1, 273}) {
+      const auto hidden =
+          torch::randn({rows, kRoutedHidden}, rng, torch::kFloat32)
+              .to(options_);
+      // Decode leaves expert 0 empty. Prefill splits unequally across both.
+      const auto ids = torch::arange(rows, torch::kInt32)
+                           .remainder(5)
+                           .eq(0)
+                           .to(options_.dtype(torch::kInt32))
+                           .view({rows, 1});
+      FusedMoEImpl::RouteInfo route{
+          torch::ones({rows, 1}, options_.dtype(torch::kFloat32)), ids};
+      const auto expected = reference->forward_experts(hidden, false, route);
+      const auto actual = fused->forward_experts(hidden, false, route);
+      EXPECT_TRUE(expected.abs().max().item<float>() > 0.0f);
+      EXPECT_TRUE(actual.equal(expected))
+          << "rows=" << rows << ", exact=" << exact;
+    }
+  }
+}
+
+TEST_F(FusedMoETest, PackedRoutedFfnIrregularCountsMatchGroupedGemm) {
+  constexpr int64_t kExperts = 6;
+  auto rng = at::detail::createCPUGenerator(/*seed_val=*/404);
+  const auto weights = make_routed_ffn_weights(kExperts, rng);
+  auto reference =
+      load_routed_ffn<GroupedGemmReferenceMoEImpl>(kExperts, weights);
+  auto fused = load_routed_ffn(kExperts, weights);
+  ASSERT_EQ(fused->named_parameters()["w13_scale"].scalar_type(),
+            torch::kBFloat16);
+
+  // Cross the old 96-row boundary, leave a cluster with a single item,
+  // and route a large expert alongside tiny and empty experts.
+  for (const std::vector<int32_t>& counts :
+       std::vector<std::vector<int32_t>>{{97, 97, 97, 97, 97, 97},
+                                         {96, 96, 96, 96, 96, 0},
+                                         {3, 250, 1, 2, 0, 0}}) {
+    const int64_t rows =
+        std::accumulate(counts.begin(), counts.end(), int64_t{0});
+    std::vector<int32_t> ids;
+    ids.reserve(rows);
+    for (int32_t expert = 0; expert < kExperts; ++expert) {
+      ids.insert(ids.end(), counts[expert], expert);
+    }
+    auto hidden =
+        torch::randn({rows, kRoutedHidden}, rng, torch::kFloat32).to(options_);
+    FusedMoEImpl::RouteInfo route{
+        torch::ones({rows, 1}, options_.dtype(torch::kFloat32)),
+        torch::tensor(ids, options_.dtype(torch::kInt32)).view({rows, 1})};
+    SCOPED_TRACE(::testing::PrintToString(counts));
+    const auto actual = fused->forward_experts(hidden, false, route);
+    const auto batched = reference->forward_experts(hidden, false, route).cpu();
+    const auto actual_cpu = actual.cpu();
+    EXPECT_GT(batched.abs().max().item<float>(), 0.0f);
+    // The batched reference can round a token scale one FP32 step differently.
+    // Bound every output by one BF16 step in the direction of the fused result.
+    EXPECT_TRUE(torch::nextafter(batched, actual_cpu).equal(actual_cpu));
+
+    // Expert rows are independent. Run the unfused reference one expert at a
+    // time to verify each scheduled slice exactly, including its start offset.
+    int64_t start = 0;
+    for (const int32_t count : counts) {
+      if (count == 0) {
+        continue;
+      }
+      FusedMoEImpl::RouteInfo expert_route{
+          route.reduce_weight.narrow(0, start, count),
+          route.expert_id.narrow(0, start, count)};
+      const auto expected = reference->forward_experts(
+          hidden.narrow(0, start, count), false, expert_route);
+      EXPECT_TRUE(actual.narrow(0, start, count).equal(expected))
+          << "start=" << start;
+      start += count;
+    }
+  }
 }
 
 TEST_F(FusedMoETest, W4A8GroupwiseSmokeTest) {

@@ -42,6 +42,14 @@ class MOESoftPlusTopKImpl final : public torch::nn::Module {
       const torch::Tensor& scores,
       const std::optional<torch::Tensor>& input_ids = std::nullopt);
 
+  // Prepare the supported BF16 router once after loading gate weights.
+  void prepare_fused_router(const torch::Tensor& gate_weight);
+
+  // Hash routing and other model layouts retain their separate scoring path.
+  std::optional<std::tuple<torch::Tensor, torch::Tensor>> forward_fused_router(
+      const torch::Tensor& hidden_states,
+      const std::optional<torch::Tensor>& input_ids = std::nullopt);
+
   void load_state_dict(const StateDict& state_dict);
   // Non-hash checkpoints require bias; visual routing additionally requires
   // bias_vl. Missing required weights fail verification instead of routing with
@@ -56,6 +64,11 @@ class MOESoftPlusTopKImpl final : public torch::nn::Module {
   bool use_hash_ = false;
   bool use_visual_bias_ = false;
   int64_t image_token_id_ = -1;
+
+  torch::Tensor packed_gate_weight_;
+  // Few-expert gates only: SRAM-resident packing for batches above the
+  // workspace paths.
+  torch::Tensor packed_resident_gate_weight_;
 
   DEFINE_WEIGHT(tid2eid);
   DEFINE_WEIGHT(bias);

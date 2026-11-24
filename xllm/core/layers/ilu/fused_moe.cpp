@@ -123,8 +123,6 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
          ::xllm::SpeculativeConfig::get_instance().num_speculative_tokens()) *
         effective_seqs * topk_;
 
-    // make sure that all layers share the same deep ep instance
-    //  so that the memory footprint is minimized
     deep_ep_ = DeepEPManager::get_instance(dispatch_token_size,
                                            combine_token_size,
                                            max_num_tokens_per_rank,

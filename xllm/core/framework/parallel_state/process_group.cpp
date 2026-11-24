@@ -25,6 +25,8 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "core/framework/parallel_state/npu_process_group.h"
 #elif defined(USE_MLU)
+#include <framework/core/device.h>
+
 #include "core/framework/parallel_state/mlu_process_group.h"
 #elif defined(USE_CUDA) || defined(USE_DCU)
 #include "core/framework/parallel_state/cuda_process_group.h"
@@ -185,6 +187,15 @@ namespace xllm {
 ProcessGroup::~ProcessGroup() { shutdown_backend(); }
 
 void ProcessGroup::shutdown_backend() {
+  if (deep_ep_cache_) {
+#if defined(USE_MLU)
+    // Dispatch and combine can run on side streams and use handle-owned
+    // buffers.
+    torch::DeviceGuard guard(device_);
+    torch_mlu::synchronize();
+#endif
+    deep_ep_cache_.reset();
+  }
   if (pg_ == nullptr) {
     return;
   }

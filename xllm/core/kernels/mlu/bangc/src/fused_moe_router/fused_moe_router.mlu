@@ -1,0 +1,1481 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Fused MoE router: gate GEMM (BF16) -> BF16 round -> sqrt(softplus) ->
+// bias-selected TopK -> normalize * scale, one Union8 launch.
+//
+// Token-split path: every IPU owns a contiguous token range and computes all
+// experts for it. The gate weight is prepacked per K block in WRAM order
+// [nkb][LT16][E/16][kb] and staged by the MPU through two SRAM banks (two K
+// blocks each), so GDRAM sees the weights once per cluster and every token
+// once. Scoring and TopK run vectorized on the owning IPU (pieces from the
+// previous fused_router kernel: exact torch_mlu softplus branches, pooled
+// TopK).
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include <limits>
+
+#include "kernels/mlu/bangc/src/fused_moe_router/launcher.h"
+
+namespace xllm::kernel::mlu::bangc {
+
+namespace {
+constexpr int32_t kMaxExperts = 384;
+constexpr int32_t kMaxTopk = 8;
+constexpr int32_t kChunk = 128;       // tokens per conv call
+constexpr int32_t kPassTokens = 128;  // tokens per IPU per weight pass
+constexpr int32_t kTile = 64;         // tokens per scoring/TopK tile
+// A pass that ends the kernel may finish up to this many tokens as one tile:
+// the prefetch buffer is dead then, so both scoring tiles can grow into it.
+constexpr int32_t kWideTile = 96;
+constexpr int32_t kMaxBlockBytes =
+    245760;  // one K block of all experts (half of WRAM)
+constexpr int32_t kMaxSliceBytes = kChunk * 320 * 2;
+constexpr int32_t kBankBlocks = 1;  // K blocks per SRAM bank
+constexpr int32_t kBank2Tokens =
+    40;  // token-split: tokens per core up to which banks hold 2 blocks
+constexpr int32_t kSplitCores = 16;  // K-split path: one K block per core
+constexpr int32_t kCkChunk = 32;     // cluster-K path: tokens per conv call
+constexpr int32_t kCkRows = 24;      // cluster-K path: tokens per merge tile
+constexpr int32_t kAccBytes = kPassTokens * kMaxExperts * 4;
+constexpr int32_t kTileElems = kTile * kMaxExperts;
+// Phase-2 scratch aliases the (then dead) input slices.
+constexpr int32_t kScratchBytes = 3 * kTileElems * 4 + 12288;
+constexpr int32_t kArenaBytes = kAccBytes + kScratchBytes;
+static_assert(2 * kMaxSliceBytes <= kScratchBytes,
+              "input slices alias the scoring scratch");
+static_assert(kArenaBytes <= 500 * 1024, "router arena");
+static_assert(2 * kWideTile * kMaxExperts * 4 + 12288 <= kScratchBytes,
+              "wide tiles fit the scoring scratch");
+static_assert((3 * kMaxTopk + 4) * kWideTile * 4 <= 12288,
+              "TopK work area holds a wide tile");
+static_assert(kWideTile * kMaxTopk <= 2 * kTile * kMaxTopk,
+              "a wide tile fits the two output buffers");
+
+// sqrt(softplus(x)) in FP32, in place, with two scratch tiles. exp/log go
+// through pow2/log2 (the library exp/log are ~10x slower); like torch_mlu,
+// x < -11 returns exp(x).
+__mlu_func__ void score_tile(float* x, float* e, float* sp, int32_t n) {
+  __bang_mineq_scalar(e, x, 80.0f, n);
+  __bang_mul_scalar(e, e, 1.4426950408889634f, n);
+  __bang_pow2(e, e, n);
+  __bang_add_scalar(sp, e, 1.0f, n);
+  __bang_log2(sp, sp, n);
+  __bang_mul_scalar(sp, sp, 0.6931471805599453f, n);
+  // Preserve the linear positive tail, including logits beyond the exp clamp.
+  __bang_maximum(sp, sp, x, n);
+  __bang_lt_scalar(x, x, -11.0f, n);  // x becomes the negative-tail mask
+  __bang_sub(e, e, sp, n);
+  __bang_fusion(FUSION_FMA, sp, e, x, sp, n, n);
+  __bang_sqrt(x, sp, n);
+}
+
+// Consecutive tokens of the same modality share one broadcast add. The token
+// IDs occupy the TopK work buffer only until selection starts.
+template <typename TokenId>
+__mlu_func__ void add_token_bias(float* biased,
+                                 const float* scores,
+                                 const RouterBias& bias,
+                                 TokenId* ids,
+                                 int32_t first,
+                                 int32_t rows,
+                                 int32_t experts) {
+  __memcpy(ids,
+           static_cast<const TokenId*>(bias.input_ids) + first,
+           rows * sizeof(TokenId),
+           GDRAM2NRAM);
+  int32_t start = 0;
+  while (start < rows) {
+    const bool image = ids[start] == bias.image_token_id;
+    int32_t end = start + 1;
+    while (end < rows && (ids[end] == bias.image_token_id) == image) {
+      ++end;
+    }
+    __bang_cycle_add(biased + start * experts,
+                     scores + start * experts,
+                     image ? bias.visual : bias.text,
+                     (end - start) * experts,
+                     experts);
+    start = end;
+  }
+}
+
+// scores[rows][experts] (unbiased) -> weights[rows][topk], ids[rows][topk].
+// Rows are treated as channels so one pooling instruction picks one expert
+// for every row; first-maximum pooling keeps lower-ID ties first.
+__mlu_func__ void select_tile(const float* scores,
+                              const RouterBias& bias,
+                              float* biased,
+                              float* transposed,
+                              uint32_t* work,
+                              float* out_weights,
+                              int32_t* out_ids,
+                              int32_t rows,
+                              int32_t experts,
+                              int32_t topk,
+                              float scale,
+                              int32_t* built_rows,
+                              int32_t first) {
+  uint32_t* const pooled = work;                          // [topk][rows]
+  uint32_t* const offsets = work + kMaxTopk * kWideTile;  // [topk][rows]
+  int32_t* const row_index =
+      reinterpret_cast<int32_t*>(work + 2 * kMaxTopk * kWideTile);
+  float* const fill = reinterpret_cast<float*>(row_index + kWideTile);
+  float* const values = fill + kWideTile;              // [topk][rows]
+  float* const denom = values + kMaxTopk * kWideTile;  // [rows]
+  uint32_t* const row_base = reinterpret_cast<uint32_t*>(denom + kWideTile);
+  if (bias.input_ids == nullptr) {
+    __bang_cycle_add(biased, scores, bias.text, rows * experts, experts);
+  } else if (bias.int64_ids) {
+    add_token_bias(biased,
+                   scores,
+                   bias,
+                   reinterpret_cast<int64_t*>(work),
+                   first,
+                   rows,
+                   experts);
+  } else {
+    add_token_bias(biased,
+                   scores,
+                   bias,
+                   reinterpret_cast<int32_t*>(work),
+                   first,
+                   rows,
+                   experts);
+  }
+  __bang_transpose(transposed, biased, rows, experts);
+  // Row indices, the erase fill and the gather row bases are identical for
+  // every tile of the same height: built once per kernel.
+  // Both tables hold byte offsets (row * 4 and row * experts * 4).
+  if (*built_rows != rows) {
+    __bang_incseq(row_index, rows);
+    __bang_write_value(fill, rows, -std::numeric_limits<float>::infinity());
+    __bang_mul_scalar(row_base,
+                      reinterpret_cast<uint32_t*>(row_index),
+                      static_cast<uint32_t>(experts * sizeof(float)),
+                      rows);
+    __bang_mul_scalar(reinterpret_cast<uint32_t*>(row_index),
+                      reinterpret_cast<uint32_t*>(row_index),
+                      static_cast<uint32_t>(sizeof(float)),
+                      rows);
+    *built_rows = rows;
+  }
+  for (int32_t k = 0; k < topk; ++k) {
+    uint32_t* ids = pooled + k * rows;
+    __bang_maxpool_index(ids, transposed, rows, 1, experts, 1, experts, 1, 1);
+    if (k + 1 < topk) {  // the last winner needs no erase
+      // byte offset in the transposed [experts][rows] layout
+      __bang_fusion(FUSION_FMA,
+                    offsets,
+                    ids,
+                    static_cast<uint32_t>(rows * sizeof(float)),
+                    reinterpret_cast<uint32_t*>(row_index),
+                    rows,
+                    rows);
+      __sync_compute();
+      __scatter(transposed,
+                fill,
+                offsets,
+                sizeof(float),
+                NRAM2NRAM,
+                sizeof(float),
+                rows);
+      __sync_move();
+    }
+  }
+  // Gather the unbiased scores: byte offset (row * experts + id) * 4.
+  __bang_fusion(FUSION_FMA,
+                offsets,
+                pooled,
+                static_cast<uint32_t>(sizeof(float)),
+                row_base,
+                topk * rows,
+                rows);
+  __sync_compute();
+  __gather(values,
+           scores,
+           offsets,
+           sizeof(float),
+           NRAM2NRAM,
+           sizeof(float),
+           topk * rows);
+  __sync_move();
+  // values is [topk][rows]: one pooling instruction sums the topk winners of
+  // every row (rows are the channels).
+  __bang_sumpool(denom, values, rows, 1, topk, 1, topk);
+  __bang_add_scalar(denom, denom, 1.0e-20f, rows);
+  __bang_recip(denom, denom, rows);
+  __bang_mul_scalar(denom, denom, scale, rows);
+  __bang_cycle_mul(values, values, denom, topk * rows, rows);
+  __bang_transpose(out_weights, values, topk, rows);
+  __bang_transpose(reinterpret_cast<uint32_t*>(out_ids), pooled, topk, rows);
+}
+
+struct Tile {
+  float* t1;
+  float* t2;
+  uint32_t* work;
+  float* weights;
+  int32_t* ids;
+  int32_t* built_rows;
+};
+
+// Round the FP32 gate sums to BF16, score, select and store `count` tokens.
+// Works in place on the (dead afterwards) accumulator plus two scratch tiles.
+// The tile height is a template argument: selecting the tile layout at run
+// time costs ~0.5us per call on every path.
+template <int32_t tile_rows = kTile>
+__mlu_func__ void finish_tokens(const Tile& t,
+                                float* acc,
+                                const RouterBias& bias,
+                                float* out_weights,
+                                int32_t* out_ids,
+                                int32_t first,
+                                int32_t count,
+                                int32_t experts,
+                                int32_t topk,
+                                float scale) {
+  int32_t buf = 0;
+  for (int32_t done = 0; done < count; done += tile_rows, buf = 1 - buf) {
+    const int32_t rows = count - done < tile_rows ? count - done : tile_rows;
+    const int32_t n = rows * experts;
+    float* const t0 = acc + done * experts;
+    // Materialize the BF16 gate output exactly like the linear layer does.
+    __bang_float2bfloat16_rn(reinterpret_cast<bfloat16_t*>(t.t1), t0, n);
+    __bang_bfloat162float(t0, reinterpret_cast<bfloat16_t*>(t.t1), n);
+    score_tile(t0, t.t1, t.t2, n);
+    // Two output buffers alternate so the stores overlap the next tile.
+    float* const w = t.weights + buf * kTile * kMaxTopk;
+    int32_t* const ids = t.ids + buf * kTile * kMaxTopk;
+    select_tile(t0,
+                bias,
+                t.t1,
+                t.t2,
+                t.work,
+                w,
+                ids,
+                rows,
+                experts,
+                topk,
+                scale,
+                t.built_rows,
+                first + done);
+    __sync_compute();
+    if (done >= 2 * tile_rows) {
+      __sync_io();  // the store that last used this buffer
+    }
+    __memcpy_async(out_weights + static_cast<int64_t>(first + done) * topk,
+                   w,
+                   rows * topk * sizeof(float),
+                   NRAM2GDRAM);
+    __memcpy_async(out_ids + static_cast<int64_t>(first + done) * topk,
+                   ids,
+                   rows * topk * sizeof(int32_t),
+                   NRAM2GDRAM);
+  }
+}
+
+// Tokens of one core in weight pass `pass` (token-split path). Every tile
+// costs a fixed ~5us, so passes take whole 64-token tiles and only the last
+// pass carries the remainder: with at most 32 extra tokens it is finished as
+// one wide tile instead of a full tile plus a tiny one.
+__mlu_func__ int32_t pass_tokens(int32_t tokens, int32_t passes, int32_t pass) {
+  if (passes == 1) {
+    return tokens;
+  }
+  const int32_t blocks = tokens / kTile;
+  const int32_t rem = tokens % kTile;
+  if (rem == 0) {
+    return (blocks / passes + (pass < blocks % passes ? 1 : 0)) * kTile;
+  }
+  if (pass + 1 == passes) {
+    return kTile + rem;
+  }
+  const int32_t others = blocks - 1;
+  return (others / (passes - 1) + (pass < others % (passes - 1) ? 1 : 0)) *
+         kTile;
+}
+
+__mlu_global__ void fused_moe_router_kernel(const bfloat16_t* hidden,
+                                            const bfloat16_t* weight,
+                                            RouterBias bias,
+                                            float* out_weights,
+                                            int32_t* out_ids,
+                                            float* workspace,
+                                            int32_t valid,
+                                            int32_t experts,
+                                            int32_t topk,
+                                            float scale,
+                                            int32_t parts) {
+  constexpr int32_t hidden_size = kRouterHidden;
+  constexpr int32_t kb = kRouterBlock;
+  constexpr int32_t nkb = hidden_size / kb;
+  __nram__ int8_t arena[kArenaBytes] __attribute__((aligned(128)));
+  __nram__ float text_bias[kMaxExperts];
+  __nram__ float visual_bias[kMaxExperts];
+  __nram__ float tile_weights[2 * kTile * kMaxTopk];
+  __nram__ int32_t tile_ids[2 * kTile * kMaxTopk];
+  __wram__ int8_t wram[512 * 1024];
+  __mlu_shared__ int8_t shared[2 * 2 * kMaxBlockBytes]
+      __attribute__((aligned(128)));
+  const bool ipu = __is_ipu();
+  const int32_t block_bytes = experts * kb * 2;  // one K block, all experts
+  const int32_t slot_bytes =
+      experts / 16 * kb * 2;  // LT-local size of one WRAM slot
+  float* const acc = reinterpret_cast<float*>(arena);
+  int8_t* const scratch = arena + kAccBytes;
+  Tile tile;
+  // Scratch: two scoring tiles (aliasing the input slices), the work area and
+  // a buffer for the first input slice of the next pass.
+  tile.t1 = reinterpret_cast<float*>(scratch);
+  tile.t2 = tile.t1 + kTileElems;
+  tile.work = reinterpret_cast<uint32_t*>(tile.t2 + kTileElems);
+  bfloat16_t* const pre =
+      reinterpret_cast<bfloat16_t*>(scratch + 2 * kTileElems * 4 + 12288);
+  tile.weights = tile_weights;
+  tile.ids = tile_ids;
+  int32_t built_rows = 0;
+  tile.built_rows = &built_rows;
+  // Wide layout for the final pass (overlaps `pre`, which is dead by then).
+  Tile wide = tile;
+  wide.t2 = wide.t1 + kWideTile * kMaxExperts;
+  wide.work = reinterpret_cast<uint32_t*>(wide.t2 + kWideTile * kMaxExperts);
+  int32_t wide_built_rows = 0;
+  wide.built_rows = &wide_built_rows;
+  if (ipu && (parts != kSplitCores || coreId % 2 == 0)) {
+    __memcpy_async(text_bias, bias.text, experts * sizeof(float), GDRAM2NRAM);
+    if (bias.input_ids != nullptr) {
+      __memcpy_async(
+          visual_bias, bias.visual, experts * sizeof(float), GDRAM2NRAM);
+    }
+  }
+  bias.text = text_bias;
+  bias.visual = visual_bias;
+  if (parts == kSplitCores) {
+    // Few tokens: one K block per core (two cores per cluster), partial sums
+    // meet in the GDRAM workspace [nkb][valid][experts].
+    const bool worker = ipu && coreId % 2 == 0;
+    const int32_t slot = clusterId * 2 + coreId / 2;
+    const int32_t partial_bytes = valid * experts * 4;
+    if (worker) {
+      if (slot < nkb && valid > 0) {
+        __memcpy_async(wram,
+                       reinterpret_cast<const int8_t*>(weight) +
+                           static_cast<int64_t>(slot) * block_bytes,
+                       block_bytes,
+                       GDRAM2WRAM);
+        __memcpy_async(scratch,
+                       hidden + slot * kb,
+                       kb * 2,
+                       GDRAM2NRAM,
+                       kb * 2,
+                       hidden_size * 2,
+                       valid - 1);
+        __sync();
+        __bang_conv(acc,
+                    reinterpret_cast<const bfloat16_t*>(scratch),
+                    reinterpret_cast<const bfloat16_t*>(wram),
+                    kb,
+                    valid,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    experts);
+        __sync_compute();
+        __memcpy_async(reinterpret_cast<int8_t*>(workspace) +
+                           static_cast<int64_t>(slot) * partial_bytes,
+                       acc,
+                       partial_bytes,
+                       NRAM2GDRAM);
+      }
+    }
+    __sync();
+    __sync_all();
+    if (worker && valid > 0) {
+      const int32_t per = (valid + kSplitCores - 1) / kSplitCores;
+      const int32_t first = slot * per;
+      const int32_t count =
+          first < valid ? (valid - first < per ? valid - first : per) : 0;
+      if (count > 0) {
+        // [nkb][count][experts] partials of this core's tokens, summed in K
+        // order.
+        const int32_t n = count * experts;
+        float* const parts = reinterpret_cast<float*>(scratch);
+        __memcpy(parts,
+                 workspace + static_cast<int64_t>(first) * experts,
+                 n * 4,
+                 GDRAM2NRAM,
+                 n * 4,
+                 partial_bytes,
+                 nkb - 1);
+        __bang_add(acc, parts, parts + n, n);
+        for (int32_t block = 2; block < nkb; ++block) {
+          __bang_add(acc, acc, parts + block * n, n);
+        }
+        __sync_compute();
+        finish_tokens(tile,
+                      acc,
+                      bias,
+                      out_weights,
+                      out_ids,
+                      first,
+                      count,
+                      experts,
+                      topk,
+                      scale);
+      }
+    }
+  } else if (parts == 8) {
+    // Mid-size batches: cluster c owns K blocks 2c and 2c+1 (resident in both
+    // WRAM slots of its four IPUs, staged once through SRAM); the IPUs split
+    // the tokens. Per-cluster partial sums meet in the workspace
+    // [clusters][valid][experts] and are added in cluster order.
+    const int32_t per4 = (valid + coreDim - 1) / coreDim;
+    const int32_t partial_bytes = valid * experts * 4;
+    if (!ipu) {
+      __memcpy_async(shared,
+                     reinterpret_cast<const int8_t*>(weight) +
+                         static_cast<int64_t>(clusterId) * 2 * block_bytes,
+                     2 * block_bytes,
+                     GDRAM2SRAM);
+      __sync();
+      __sync_cluster();
+    } else {
+      const int32_t first = coreId * per4 < valid ? coreId * per4 : valid;
+      const int32_t count = first + per4 < valid ? per4 : valid - first;
+      const int32_t slice = kCkChunk * kb * 2;
+      bfloat16_t* const in = reinterpret_cast<bfloat16_t*>(scratch);
+      int32_t sel = 0;
+      if (count > 0) {
+        const int32_t m = count < kCkChunk ? count : kCkChunk;
+        // Both K blocks of the cluster in one DMA: rows of [2][kb]; the
+        // convolutions read every other "pixel" (width 2, stride 2).
+        __memcpy_async(in,
+                       hidden + static_cast<int64_t>(first) * hidden_size +
+                           clusterId * 2 * kb,
+                       kb * 4,
+                       GDRAM2NRAM,
+                       kb * 4,
+                       hidden_size * 2,
+                       m - 1);
+      }
+      __sync();
+      __sync_cluster();
+      if (count > 0) {
+        __memcpy_async(wram, shared, block_bytes, SRAM2WRAM);
+        __sync();
+        // The second slot loads while the first block is being convolved.
+        __memcpy_async(
+            wram + slot_bytes, shared + block_bytes, block_bytes, SRAM2WRAM);
+      }
+      for (int32_t done = 0; done < count; done += kCkChunk) {
+        const int32_t m = count - done < kCkChunk ? count - done : kCkChunk;
+        const int32_t next = done + kCkChunk;
+        if (next < count) {
+          const int32_t nm = count - next < kCkChunk ? count - next : kCkChunk;
+          __memcpy_async(reinterpret_cast<int8_t*>(in) + (1 - sel) * 2 * slice,
+                         hidden +
+                             static_cast<int64_t>(first + next) * hidden_size +
+                             clusterId * 2 * kb,
+                         kb * 4,
+                         GDRAM2NRAM,
+                         kb * 4,
+                         hidden_size * 2,
+                         nm - 1);
+        }
+        float* const a = acc + sel * kCkChunk * experts;
+        const bfloat16_t* const src = reinterpret_cast<const bfloat16_t*>(
+            reinterpret_cast<int8_t*>(in) + sel * 2 * slice);
+        __bang_conv(a,
+                    src,
+                    reinterpret_cast<const bfloat16_t*>(wram),
+                    kb,
+                    m,
+                    2,
+                    1,
+                    1,
+                    2,
+                    1,
+                    experts);
+        if (done == 0) {
+          __sync();  // slot 1 has arrived
+        }
+        __bang_conv_partial(
+            a,
+            src + kb,
+            reinterpret_cast<const bfloat16_t*>(wram + slot_bytes),
+            a,
+            kb,
+            m,
+            2,
+            1,
+            1,
+            2,
+            1,
+            experts);
+        __sync();  // also completes the store that last used the other acc
+        __memcpy_async(reinterpret_cast<int8_t*>(workspace) +
+                           static_cast<int64_t>(clusterId) * partial_bytes +
+                           static_cast<int64_t>(first + done) * experts * 4,
+                       a,
+                       m * experts * 4,
+                       NRAM2GDRAM);
+        sel = 1 - sel;
+      }
+    }
+    __sync();
+    __sync_all();
+    if (ipu && valid > 0) {
+      const int32_t per = (valid + taskDim - 1) / taskDim;
+      const int32_t first = taskId * per < valid ? taskId * per : valid;
+      const int32_t count = first + per < valid ? per : valid - first;
+      float* const parts = reinterpret_cast<float*>(scratch);
+      for (int32_t done = 0; done < count; done += kCkRows) {
+        const int32_t rows = count - done < kCkRows ? count - done : kCkRows;
+        const int32_t n = rows * experts;
+        __memcpy(parts,
+                 workspace + static_cast<int64_t>(first + done) * experts,
+                 n * 4,
+                 GDRAM2NRAM,
+                 n * 4,
+                 partial_bytes,
+                 clusterDim - 1);
+        __bang_add(acc, parts, parts + n, n);
+        for (int32_t c = 2; c < clusterDim; ++c) {
+          __bang_add(acc, acc, parts + c * n, n);
+        }
+        __sync_compute();
+        finish_tokens(tile,
+                      acc,
+                      bias,
+                      out_weights,
+                      out_ids,
+                      first + done,
+                      rows,
+                      experts,
+                      topk,
+                      scale);
+      }
+    }
+  } else {
+    // Each cluster processes all K blocks for its tokens, or shares them
+    // with the other clusters in its K group and sums their partial results.
+    const bool khalf = parts > 1;
+    const int32_t shares = taskDim / parts;
+    const int32_t per = (valid + shares - 1) / shares;
+    const int32_t block_first = (clusterId % parts) * (nkb / parts);
+    const int32_t block_count = nkb / parts;
+    const int32_t partial_bytes = valid * experts * 4;
+    // Few tokens per core: the MPU staging paces the IPUs, larger banks help;
+    // many tokens: one-block banks keep the WRAM refill seamless.
+    const int32_t bank_blocks =
+        (khalf || per <= kBank2Tokens) ? 2 : kBankBlocks;
+    const int32_t bank_bytes = bank_blocks * block_bytes;
+    const int32_t steps_per_pass = block_count / bank_blocks;
+    const int32_t passes = (per + kPassTokens - 1) / kPassTokens;
+    const int32_t steps = passes * steps_per_pass;
+    if (!ipu) {
+      const int8_t* const wbase =
+          reinterpret_cast<const int8_t*>(weight) +
+          static_cast<int64_t>(block_first) * block_bytes;
+      if (steps > 0) {
+        __memcpy_async(shared, wbase, bank_bytes, GDRAM2SRAM);
+      }
+      __sync();
+      __sync_cluster();
+      for (int32_t step = 1; step <= steps; ++step) {
+        if (step < steps) {
+          __memcpy_async(
+              shared + (step & 1) * bank_bytes,
+              wbase + static_cast<int64_t>(step % steps_per_pass) * bank_bytes,
+              bank_bytes,
+              GDRAM2SRAM);
+        }
+        __sync();
+        __sync_cluster();
+      }
+      if (khalf) {
+        __sync();
+        __sync_all();
+      }
+      return;
+    }
+    bfloat16_t* const inbuf0 = reinterpret_cast<bfloat16_t*>(scratch);
+    bfloat16_t* const inbuf1 =
+        reinterpret_cast<bfloat16_t*>(scratch + kMaxSliceBytes);
+    const int32_t share = (clusterId / parts) * coreDim + coreId;
+    const int32_t core_begin = share * per < valid ? share * per : valid;
+    const int32_t core_end =
+        core_begin + per < valid ? core_begin + per : valid;
+    __sync();
+    __sync_cluster();
+    int32_t step = 0;
+    int32_t first = core_begin;
+    for (int32_t pass = 0; pass < passes; ++pass) {
+      const int32_t core_tokens = core_end - core_begin;
+      // Token-split: every core follows the split of a full core (`per`
+      // tokens) and a shorter trailing core fills it front to back; cores of
+      // one cluster share the per-block barrier, so their passes must not be
+      // mismatched. K-group passes are merged later in small tiles, where an
+      // even split is best.
+      const int32_t left = core_end - first;
+      const int32_t full = pass_tokens(per, passes, pass);
+      const int32_t count =
+          khalf ? core_tokens / passes + (pass < core_tokens % passes ? 1 : 0)
+                : (left < full ? left : full);
+      const int32_t chunks = (count + kChunk - 1) / kChunk;
+      const int32_t m0 = chunks == 2 ? (count + 1) / 2 : count;
+      // The first slice of this pass was prefetched into `pre` (at kernel
+      // start or during the previous pass's scoring).
+      const bfloat16_t* cur = pre;
+      bfloat16_t* nxt = inbuf0;
+      if (count > 0 && pass == 0) {
+        __memcpy_async(pre,
+                       hidden + static_cast<int64_t>(first) * hidden_size +
+                           block_first * kb,
+                       kb * 2,
+                       GDRAM2NRAM,
+                       kb * 2,
+                       hidden_size * 2,
+                       m0 - 1);
+      }
+      for (int32_t q = 0; q < steps_per_pass; ++q, ++step) {
+        const int8_t* bank = shared + (step & 1) * bank_bytes;
+        const int8_t* next_bank = shared + ((step + 1) & 1) * bank_bytes;
+        if (count > 0 && step == 0) {
+          __memcpy_async(wram + (block_first & 1) * slot_bytes,
+                         bank,
+                         block_bytes,
+                         SRAM2WRAM);
+          __sync();
+        } else if (count > 0 && q == 0) {
+          __sync_io();  // prefetched slice and the previous pass's stores
+        }
+        for (int32_t b = 0; b < bank_blocks; ++b) {
+          const int32_t block = block_first + bank_blocks * q + b;
+          if (b + 1 == bank_blocks) {
+            // The last block of this bank is already in WRAM: release the
+            // bank to the MPU now and pull the next bank's first block while
+            // this block is being convolved.
+            __sync();
+            __sync_cluster();
+            if (count > 0 && step + 1 < steps) {
+              __memcpy_async(wram + ((block + 1) & 1) * slot_bytes,
+                             next_bank,
+                             block_bytes,
+                             SRAM2WRAM);
+            }
+          } else if (count > 0) {
+            __memcpy_async(wram + ((block + 1) & 1) * slot_bytes,
+                           bank + (b + 1) * block_bytes,
+                           block_bytes,
+                           SRAM2WRAM);
+          }
+          for (int32_t chunk = 0; chunk < chunks && count > 0; ++chunk) {
+            const int32_t m = chunk == 0 ? m0 : count - m0;
+            // Prefetch the next slice (next chunk, or chunk 0 of the next K
+            // block).
+            int32_t next_chunk = chunk + 1;
+            int32_t next_block = block;
+            if (next_chunk == chunks) {
+              next_chunk = 0;
+              ++next_block;
+            }
+            if (next_block < block_first + block_count) {
+              const int32_t nm = next_chunk == 0 ? m0 : count - m0;
+              __memcpy_async(
+                  nxt,
+                  hidden +
+                      static_cast<int64_t>(first + (next_chunk == 0 ? 0 : m0)) *
+                          hidden_size +
+                      next_block * kb,
+                  kb * 2,
+                  GDRAM2NRAM,
+                  kb * 2,
+                  hidden_size * 2,
+                  nm - 1);
+            }
+            float* a = acc + (chunk == 0 ? 0 : m0 * experts);
+            if (block == block_first) {
+              // The first K block needs no partial: no accumulator zeroing.
+              __bang_conv(a,
+                          cur,
+                          reinterpret_cast<const bfloat16_t*>(
+                              wram + (block & 1) * slot_bytes),
+                          kb,
+                          m,
+                          1,
+                          1,
+                          1,
+                          1,
+                          1,
+                          experts);
+            } else {
+              __bang_conv_partial(a,
+                                  cur,
+                                  reinterpret_cast<const bfloat16_t*>(
+                                      wram + (block & 1) * slot_bytes),
+                                  a,
+                                  kb,
+                                  m,
+                                  1,
+                                  1,
+                                  1,
+                                  1,
+                                  1,
+                                  experts);
+            }
+            __sync();
+            cur = nxt;
+            nxt = nxt == inbuf0 ? inbuf1 : inbuf0;
+          }
+        }
+      }
+      if (khalf) {
+        if (count > 0) {
+          __memcpy_async(
+              reinterpret_cast<int8_t*>(workspace) +
+                  static_cast<int64_t>(clusterId % parts) * partial_bytes +
+                  static_cast<int64_t>(first) * experts * 4,
+              acc,
+              count * experts * 4,
+              NRAM2GDRAM);
+        }
+      } else {
+        // Pull the next pass's first slice while this pass is scored.
+        if (pass + 1 < passes) {
+          const int32_t nfirst = first + count;
+          const int32_t nleft = core_end - nfirst;
+          const int32_t nfull = pass_tokens(per, passes, pass + 1);
+          const int32_t ncount = nleft < nfull ? nleft : nfull;
+          const int32_t nchunks = (ncount + kChunk - 1) / kChunk;
+          const int32_t nm0 = nchunks == 2 ? (ncount + 1) / 2 : ncount;
+          if (ncount > 0) {
+            __memcpy_async(pre,
+                           hidden + static_cast<int64_t>(nfirst) * hidden_size +
+                               block_first * kb,
+                           kb * 2,
+                           GDRAM2NRAM,
+                           kb * 2,
+                           hidden_size * 2,
+                           nm0 - 1);
+          }
+        }
+        // Scoring and selection; the input slices are dead now.
+        const bool use_wide =
+            pass + 1 == passes && count > kTile && count <= kWideTile;
+        if (use_wide) {
+          __sync_io();  // stores of earlier passes still use the output buffers
+          finish_tokens<kWideTile>(wide,
+                                   acc,
+                                   bias,
+                                   out_weights,
+                                   out_ids,
+                                   first,
+                                   count,
+                                   experts,
+                                   topk,
+                                   scale);
+        } else {
+          finish_tokens(tile,
+                        acc,
+                        bias,
+                        out_weights,
+                        out_ids,
+                        first,
+                        count,
+                        experts,
+                        topk,
+                        scale);
+        }
+      }
+      first += count;
+    }
+    if (khalf) {
+      __sync();
+      __sync_all();
+      // Merge the two K-half partial sums of this core's tokens and finish.
+      const int32_t per32 = (valid + taskDim - 1) / taskDim;
+      const int32_t first = taskId * per32 < valid ? taskId * per32 : valid;
+      const int32_t count = first + per32 < valid ? per32 : valid - first;
+      float* const slices = reinterpret_cast<float*>(scratch);
+      const int32_t tile_rows = parts == 2 ? kTile : (parts == 4 ? 48 : 24);
+      for (int32_t done = 0; done < count; done += tile_rows) {
+        const int32_t rows =
+            count - done < tile_rows ? count - done : tile_rows;
+        const int32_t n = rows * experts;
+        __memcpy(slices,
+                 workspace + static_cast<int64_t>(first + done) * experts,
+                 n * 4,
+                 GDRAM2NRAM,
+                 n * 4,
+                 partial_bytes,
+                 parts - 1);
+        __bang_add(acc, slices, slices + n, n);
+        for (int32_t p = 2; p < parts; ++p) {
+          __bang_add(acc, acc, slices + p * n, n);
+        }
+        __sync_compute();
+        finish_tokens(tile,
+                      acc,
+                      bias,
+                      out_weights,
+                      out_ids,
+                      first + done,
+                      rows,
+                      experts,
+                      topk,
+                      scale);
+      }
+    }
+  }
+}
+
+constexpr int32_t kResidentBytes = kRouterResidentExperts * kRouterHidden * 2;
+
+__mlu_func__ void sync_pio0_csimd() {
+  __asm__ volatile("sync.pio0.csimd;\n\t");
+}
+__mlu_func__ void sync_pio1_csimd() {
+  __asm__ volatile("sync.pio1.csimd;\n\t");
+}
+__mlu_func__ void sync_psimd_cio0() {
+  __asm__ volatile("sync.psimd.cio0;\n\t");
+}
+__mlu_func__ void sync_psimd_cio1() {
+  __asm__ volatile("sync.psimd.cio1;\n\t");
+}
+__mlu_func__ void sync_pmv_csimd() { __asm__ volatile("sync.pmv.csimd;\n\t"); }
+__mlu_func__ void sync_psimd_cmv() { __asm__ volatile("sync.psimd.cmv;\n\t"); }
+
+// One 2-K-block input slice on IO0 or IO1: `rows` tokens of 2*kb (2560B,
+// 512B-aligned).
+template <int32_t Channel>
+__mlu_func__ void fetch_pair_ch(bfloat16_t* dst,
+                                const bfloat16_t* hidden,
+                                int32_t first,
+                                int32_t rows,
+                                int32_t pair,
+                                int32_t kb,
+                                int32_t hidden_size) {
+  const bfloat16_t* const src =
+      hidden + static_cast<int64_t>(first) * hidden_size + pair * (2 * kb);
+  const uint32_t size = static_cast<uint32_t>(2 * kb * 2);
+  const int64_t dst_stride = static_cast<int64_t>(2 * kb * 2);
+  const int64_t src_stride = static_cast<int64_t>(hidden_size * 2);
+  const uint32_t segnum = static_cast<uint32_t>(rows - 1);
+  if constexpr (Channel == 0) {
+    __asm__ volatile(
+        "ld.stride.async.nram.gdram.io0 [%[dst]], [%[src]], %[sz], %[ds], "
+        "%[ss], %[seg];\n\t"
+        :
+        : [dst] "r"(dst),
+          [src] "r"(src),
+          [sz] "r"(size),
+          [ds] "r"(dst_stride),
+          [ss] "r"(src_stride),
+          [seg] "r"(segnum)
+        : "memory");
+  } else {
+    __asm__ volatile(
+        "ld.stride.async.nram.gdram.io1 [%[dst]], [%[src]], %[sz], %[ds], "
+        "%[ss], %[seg];\n\t"
+        :
+        : [dst] "r"(dst),
+          [src] "r"(src),
+          [sz] "r"(size),
+          [ds] "r"(dst_stride),
+          [ss] "r"(src_stride),
+          [seg] "r"(segnum)
+        : "memory");
+  }
+}
+
+__mlu_func__ void store_io1(void* dst, const void* src, uint32_t bytes) {
+  __asm__ volatile("st.async.gdram.nram.io1 [%[dst]], [%[src]], %[sz];\n\t"
+                   :
+                   : [dst] "r"(dst), [src] "r"(src), [sz] "r"(bytes)
+                   : "memory");
+}
+
+__mlu_func__ void conv_partial_cvt_bf16(bfloat16_t* dst,
+                                        const bfloat16_t* src,
+                                        const bfloat16_t* flt,
+                                        const float* part,
+                                        int32_t ci,
+                                        int32_t h,
+                                        int32_t co) {
+  __asm__ volatile(
+      "conv.nram.rn.f32.bf16.bf16 [%[d]], [%[s]], [%[f]], %[ci], %[h], 2, 1, "
+      "1, 2, 1, %[co], .add.partial.rn([%[p]]), .cvt.dst.rn.bf16();\n\t"
+      :
+      : [d] "r"(dst),
+        [s] "r"(src),
+        [f] "r"(flt),
+        [p] "r"(part),
+        [ci] "r"(ci),
+        [h] "r"(h),
+        [co] "r"(co)
+      : "memory");
+}
+
+// Score, select, normalize and IO1-store a <=WorkStride-row tile whose FP32
+// logits `x` have already been BF16-rounded via conv .cvt.dst.rn.bf16 +
+// bf16->fp32.
+template <int32_t WorkStride, int32_t Experts>
+__mlu_func__ void finish_tile_128_rounded(float* x,
+                                          float* e,
+                                          float* sp,
+                                          uint32_t* work,
+                                          int32_t* row_index,
+                                          float* fill,
+                                          uint32_t* row_base,
+                                          float* absmax_tmp,
+                                          const RouterBias& bias,
+                                          float* out_weights,
+                                          int32_t* out_ids,
+                                          float* w,
+                                          int32_t* wid,
+                                          int32_t first,
+                                          int32_t rows,
+                                          int32_t topk,
+                                          float scale,
+                                          int32_t* built_rows) {
+  constexpr int32_t kMaxR = WorkStride;
+  constexpr int32_t kExperts = Experts;
+  const int32_t n = rows * kExperts;
+  uint32_t* const pooled = work;                      // [topk][kMaxR]
+  uint32_t* const offsets = work + kMaxTopk * kMaxR;  // [topk][kMaxR]
+  float* const values =
+      reinterpret_cast<float*>(work + 2 * kMaxTopk * kMaxR);  // [topk][kMaxR]
+  float* const denom = values + kMaxTopk * kMaxR;             // [kMaxR]
+
+  __asm__ volatile("absmax.nram.f32 [%[dst]], [%[src]], %[num];\n\t"
+                   :
+                   : [dst] "r"(absmax_tmp), [src] "r"(x), [num] "r"(n)
+                   : "memory");
+  __sync_compute();
+  if (absmax_tmp[0] <= 11.0f) {
+    __bang_mul_scalar(e, x, 1.4426950408889634f, n);
+    __bang_pow2(e, e, n);
+    __bang_add_scalar(sp, e, 1.0f, n);
+    __bang_log2(sp, sp, n);
+    __bang_mul_scalar(sp, sp, 0.6931471805599453f, n);
+    __bang_sqrt(x, sp, n);
+  } else {
+    score_tile(x, e, sp, n);
+  }
+
+  if (bias.input_ids == nullptr) {
+    __bang_cycle_add(e, x, bias.text, n, kExperts);
+  } else if (bias.int64_ids) {
+    add_token_bias(
+        e, x, bias, reinterpret_cast<int64_t*>(work), first, rows, kExperts);
+  } else {
+    add_token_bias(
+        e, x, bias, reinterpret_cast<int32_t*>(work), first, rows, kExperts);
+  }
+  __bang_transpose(sp, e, rows, kExperts);
+  if (*built_rows != rows) {
+    __bang_incseq(row_index, rows);
+    __bang_write_value(fill, rows, -std::numeric_limits<float>::infinity());
+    __bang_mul_scalar(row_base,
+                      reinterpret_cast<uint32_t*>(row_index),
+                      static_cast<uint32_t>(kExperts * sizeof(float)),
+                      rows);
+    __bang_mul_scalar(reinterpret_cast<uint32_t*>(row_index),
+                      reinterpret_cast<uint32_t*>(row_index),
+                      static_cast<uint32_t>(sizeof(float)),
+                      rows);
+    *built_rows = rows;
+  }
+  for (int32_t k = 0; k < topk; ++k) {
+    uint32_t* const ids = pooled + k * rows;
+    __bang_maxpool_index(ids, sp, rows, 1, kExperts, 1, kExperts, 1, 1);
+    if (k + 1 < topk) {
+      __bang_fusion(FUSION_FMA,
+                    offsets,
+                    ids,
+                    static_cast<uint32_t>(rows * sizeof(float)),
+                    reinterpret_cast<uint32_t*>(row_index),
+                    rows,
+                    rows);
+      sync_psimd_cmv();
+      __scatter(
+          sp, fill, offsets, sizeof(float), NRAM2NRAM, sizeof(float), rows);
+      sync_pmv_csimd();
+    }
+  }
+  __bang_fusion(FUSION_FMA,
+                offsets,
+                pooled,
+                static_cast<uint32_t>(sizeof(float)),
+                row_base,
+                topk * rows,
+                rows);
+  sync_psimd_cmv();
+  __gather(
+      values, x, offsets, sizeof(float), NRAM2NRAM, sizeof(float), topk * rows);
+  sync_pmv_csimd();
+  if (topk == 3) {
+    const float eps = 1.0e-20f;
+    __asm__ volatile(
+        "fuse.nram.f32 [%[dst]], %[num], [%[v0]], .add([%[v1]]), "
+        ".add([%[v2]]), .add(%[eps]);\n\t"
+        :
+        : [dst] "r"(denom),
+          [num] "r"(rows),
+          [v0] "r"(values),
+          [v1] "r"(values + rows),
+          [v2] "r"(values + 2 * rows),
+          [eps] "r"(eps)
+        : "memory");
+  } else {
+    __bang_sumpool(denom, values, rows, 1, topk, 1, topk);
+    __bang_add_scalar(denom, denom, 1.0e-20f, rows);
+  }
+  __bang_recip(denom, denom, rows);
+  __bang_mul_scalar(denom, denom, scale, rows);
+  __bang_cycle_mul(values, values, denom, topk * rows, rows);
+  __bang_transpose(w, values, topk, rows);
+  __bang_transpose(reinterpret_cast<uint32_t*>(wid), pooled, topk, rows);
+  sync_psimd_cio1();
+  store_io1(out_weights + static_cast<int64_t>(first) * topk,
+            w,
+            static_cast<uint32_t>(rows * topk * sizeof(float)));
+  store_io1(out_ids + static_cast<int64_t>(first) * topk,
+            wid,
+            static_cast<uint32_t>(rows * topk * sizeof(int32_t)));
+}
+
+// Dedicated SRAM-resident kernel for E=128, H=5120, kb=640 (nkb=8, npairs=4):
+// compile-time geometry avoids monolithic-kernel overhead, 260-row passes
+// (4x65 chunks, 2x130 scoring tiles) avoid +1-token wave cliffs while reusing
+// WRAM weights 4x, dual-channel IO0/IO1 keeps two 2D DMAs in flight,
+// per-cluster cyclic pair rotation (p0 = clusterId & 3) eliminates HBM channel
+// conflicts across clusters, index tables are prebuilt before Barrier 0, and
+// the final K-block fuses FP32->BF16 rounding into conv.nram
+// (.cvt.dst.rn.bf16).
+__mlu_global__ void fused_moe_router_resident_kernel(const bfloat16_t* hidden,
+                                                     const bfloat16_t* weight,
+                                                     RouterBias bias,
+                                                     float* out_weights,
+                                                     int32_t* out_ids,
+                                                     int32_t valid,
+                                                     int32_t topk,
+                                                     float scale) {
+  constexpr int32_t kH = kRouterHidden;
+  constexpr int32_t kE = kRouterResidentExperts;
+  constexpr int32_t kKb = kRouterResidentBlock;
+  constexpr int32_t kNpairs = 4;
+  constexpr int32_t kResRows = 260;
+  constexpr int32_t kResChunk = 65;
+  constexpr int32_t kResScoreTile = 130;
+  constexpr int32_t kWorkStride = 136;
+  constexpr int32_t kTableStride = 160;
+  constexpr int32_t kBlockBytes = kE * kKb * 2;
+  constexpr int32_t kSlotBytes = (kE / 16) * kKb * 2;
+  constexpr int32_t kAccBytesRes = kResRows * kE * 4;
+  constexpr int32_t kSliceStride =
+      ((kResChunk * 2 * kKb * 2 + kKb * 2) + 127) & ~127;
+  constexpr int32_t kOutBufElems = 2 * kResScoreTile * kMaxTopk;
+  constexpr int32_t kTableBytes = 3 * kTableStride * 4;
+  constexpr int32_t kBf16TmpBytes = kResChunk * kE * 2;
+  constexpr int32_t kResArenaBytes = kAccBytesRes + 2 * kSliceStride +
+                                     2 * kOutBufElems * 4 + kTableBytes + 128 +
+                                     kBf16TmpBytes;
+  static_assert(kResRows >= 2 * kResScoreTile,
+                "acc upper half must hold a full scoring tile");
+  static_assert(
+      2 * kResScoreTile * kE * 4 + (3 * kMaxTopk + 1) * kWorkStride * 4 <=
+          kSliceStride,
+      "scoring scratch fits in in1");
+  static_assert(kResArenaBytes + 2 * kE * 4 <= 500 * 1024,
+                "resident arena fits NRAM");
+
+  __nram__ int8_t arena[kResArenaBytes] __attribute__((aligned(128)));
+  __nram__ float text_bias[kE] __attribute__((aligned(128)));
+  __nram__ float visual_bias[kE] __attribute__((aligned(128)));
+  __wram__ int8_t wram[512 * 1024] __attribute__((aligned(128)));
+  __mlu_shared__ int8_t shared[kResidentBytes] __attribute__((aligned(128)));
+
+  const bool ipu = __is_ipu();
+  const int32_t p0 = clusterId & 3;
+  const int32_t b0 = 2 * p0;
+
+  if (!ipu) {
+    const int8_t* const wbase = reinterpret_cast<const int8_t*>(weight);
+    __memcpy_async(shared + b0 * kBlockBytes,
+                   wbase + b0 * kBlockBytes,
+                   2 * kBlockBytes,
+                   GDRAM2SRAM);
+    __sync_io();
+    __sync_cluster();  // Barrier 0: cluster's starting pair is in SRAM
+    if (b0 > 0) {
+      __memcpy_async(shared, wbase, b0 * kBlockBytes, GDRAM2SRAM);
+    }
+    if (b0 + 2 < 8) {
+      __memcpy_async(shared + (b0 + 2) * kBlockBytes,
+                     wbase + (b0 + 2) * kBlockBytes,
+                     (8 - (b0 + 2)) * kBlockBytes,
+                     GDRAM2SRAM);
+    }
+    __sync_io();
+    __sync_cluster();  // Barrier 1: all 8 blocks are in SRAM
+    return;
+  }
+
+  __memcpy_async(text_bias, bias.text, kE * sizeof(float), GDRAM2NRAM);
+  if (bias.input_ids != nullptr) {
+    __memcpy_async(visual_bias, bias.visual, kE * sizeof(float), GDRAM2NRAM);
+  }
+  bias.text = text_bias;
+  bias.visual = visual_bias;
+
+  const int32_t max_wave_tokens = taskDim * kResRows;
+  const int32_t passes =
+      valid > 0 ? (valid + max_wave_tokens - 1) / max_wave_tokens : 0;
+  const int32_t w_base = passes > 0 ? valid / passes : 0;
+  const int32_t w_extra = passes > 0 ? valid % passes : 0;
+  auto wave_core_first = [&](int32_t p) -> int32_t {
+    const int32_t wb = p * w_base + (p < w_extra ? p : w_extra);
+    const int32_t wt = w_base + (p < w_extra ? 1 : 0);
+    const int32_t q = wt / taskDim;
+    const int32_t rem = wt % taskDim;
+    return wb + taskId * q + (taskId < rem ? taskId : rem);
+  };
+  auto wave_core_rows = [&](int32_t p) -> int32_t {
+    const int32_t wt = w_base + (p < w_extra ? 1 : 0);
+    return wt / taskDim + (taskId < wt % taskDim ? 1 : 0);
+  };
+  int32_t npass = 0;
+  while (npass < passes && wave_core_rows(npass) > 0) {
+    ++npass;
+  }
+
+  float* const acc = reinterpret_cast<float*>(arena);
+  int8_t* const in0 = arena + kAccBytesRes;
+  int8_t* const in1 = in0 + kSliceStride;
+  float* const res_out_w = reinterpret_cast<float*>(in1 + kSliceStride);
+  int32_t* const res_out_id =
+      reinterpret_cast<int32_t*>(res_out_w + kOutBufElems);
+  int8_t* const table_base =
+      reinterpret_cast<int8_t*>(res_out_id + kOutBufElems);
+  int32_t* const sc_row_index = reinterpret_cast<int32_t*>(table_base);
+  float* const sc_fill = reinterpret_cast<float*>(sc_row_index + kTableStride);
+  uint32_t* const sc_row_base =
+      reinterpret_cast<uint32_t*>(sc_fill + kTableStride);
+  float* const sc_absmax_tmp =
+      reinterpret_cast<float*>(table_base + kTableBytes);
+  bfloat16_t* const acc_bf16_tmp = reinterpret_cast<bfloat16_t*>(
+      reinterpret_cast<int8_t*>(sc_absmax_tmp) + 128);
+  float* const sc_e = reinterpret_cast<float*>(in1);
+  float* const sc_sp = sc_e + kResScoreTile * kE;
+  uint32_t* const sc_work =
+      reinterpret_cast<uint32_t*>(sc_sp + kResScoreTile * kE);
+  int32_t sc_built_rows = 0;
+
+  auto launch_pass_step = [&](int32_t pf, int32_t pc, int32_t step) {
+    const int32_t pch = (pc + kResChunk - 1) / kResChunk;
+    const int32_t pcb = pc / pch;
+    const int32_t pce = pc % pch;
+    const int32_t spair = ((step / pch) + p0) & 3;
+    const int32_t schunk = step % pch;
+    const int32_t soff = schunk * pcb + (schunk < pce ? schunk : pce);
+    const int32_t srows = pcb + (schunk < pce ? 1 : 0);
+    if ((step & 1) == 0) {
+      fetch_pair_ch<0>(reinterpret_cast<bfloat16_t*>(in0),
+                       hidden,
+                       pf + soff,
+                       srows,
+                       spair,
+                       kKb,
+                       kH);
+    } else {
+      fetch_pair_ch<1>(reinterpret_cast<bfloat16_t*>(in1),
+                       hidden,
+                       pf + soff,
+                       srows,
+                       spair,
+                       kKb,
+                       kH);
+    }
+  };
+
+  int32_t next_p_first = npass > 0 ? wave_core_first(0) : 0;
+  int32_t next_p_rows = npass > 0 ? wave_core_rows(0) : 0;
+  if (npass > 0) {
+    launch_pass_step(next_p_first, next_p_rows, 0);
+    launch_pass_step(next_p_first, next_p_rows, 1);
+    const int32_t c0 = next_p_rows;
+    const int32_t ch0 = (c0 + kResChunk - 1) / kResChunk;
+    const int32_t init_rows =
+        c0 <= kResScoreTile ? c0
+                            : (2 * (c0 / ch0) + (c0 % ch0 >= 2 ? 2 : c0 % ch0));
+    __bang_incseq(sc_row_index, init_rows);
+    __bang_write_value(
+        sc_fill, init_rows, -std::numeric_limits<float>::infinity());
+    __bang_mul_scalar(sc_row_base,
+                      reinterpret_cast<uint32_t*>(sc_row_index),
+                      static_cast<uint32_t>(kE * sizeof(float)),
+                      init_rows);
+    __bang_mul_scalar(reinterpret_cast<uint32_t*>(sc_row_index),
+                      reinterpret_cast<uint32_t*>(sc_row_index),
+                      static_cast<uint32_t>(sizeof(float)),
+                      init_rows);
+    sc_built_rows = init_rows;
+  }
+  __sync_cluster();  // Barrier 0
+  if (npass > 0) {
+    __memcpy_async(wram, shared + b0 * kBlockBytes, kBlockBytes, SRAM2WRAM);
+  }
+  bool barrier1_done = false;
+  const bfloat16_t* const w0 = reinterpret_cast<const bfloat16_t*>(wram);
+  const bfloat16_t* const w1 =
+      reinterpret_cast<const bfloat16_t*>(wram + kSlotBytes);
+  bfloat16_t* const acc_bf16_base = reinterpret_cast<bfloat16_t*>(acc);
+  bfloat16_t* const acc_bf16_hi =
+      reinterpret_cast<bfloat16_t*>(acc + kResScoreTile * kE);
+  float* const acc_fp32_hi = acc + kResScoreTile * kE;
+
+  for (int32_t pass = 0; pass < npass; ++pass) {
+    const int32_t p_first = next_p_first;
+    const int32_t count = next_p_rows;
+    const bool has_next = pass + 1 < npass;
+    if (has_next) {
+      next_p_first = wave_core_first(pass + 1);
+      next_p_rows = wave_core_rows(pass + 1);
+    }
+    const int32_t chunks = (count + kResChunk - 1) / kResChunk;
+    const int32_t c_base = count / chunks;
+    const int32_t c_extra = count % chunks;
+    auto chunk_off = [&](int32_t c) {
+      return c * c_base + (c < c_extra ? c : c_extra);
+    };
+    auto chunk_rows = [&](int32_t c) { return c_base + (c < c_extra ? 1 : 0); };
+    const int32_t m0 = chunk_rows(0);
+    int32_t pf_pi = 0;
+    int32_t pf_ch = 2;
+    while (pf_ch >= chunks) {
+      pf_ch -= chunks;
+      ++pf_pi;
+    }
+
+    int32_t sel = 0;
+    for (int32_t pi = 0; pi < kNpairs; ++pi) {
+      const int32_t pair = (pi + p0) & 3;
+      const int32_t next_pair = (pi + 1 + p0) & 3;
+      const bool need_next_wram = (pi + 1 < kNpairs) || has_next;
+      sync_pmv_csimd();
+      sync_psimd_cmv();
+      __memcpy_async(wram + kSlotBytes,
+                     shared + (2 * pair + 1) * kBlockBytes,
+                     kBlockBytes,
+                     SRAM2WRAM);
+
+      for (int32_t chunk = 0; chunk < chunks; ++chunk, sel = 1 - sel) {
+        const int32_t off = chunk_off(chunk);
+        const int32_t m = chunk_rows(chunk);
+        if (sel == 0) {
+          sync_pio0_csimd();
+        } else {
+          sync_pio1_csimd();
+        }
+        const bfloat16_t* const cur =
+            reinterpret_cast<const bfloat16_t*>(sel == 0 ? in0 : in1);
+        float* const a = acc + off * kE;
+        if (pi == 0) {
+          __bang_conv(a, cur, w0, kKb, m, 2, 1, 1, 2, 1, kE);
+        } else {
+          __bang_conv_partial(a, cur, w0, a, kKb, m, 2, 1, 1, 2, 1, kE);
+        }
+        if (chunk == 0) {
+          sync_pmv_csimd();
+        }
+        if (chunk + 1 == chunks && need_next_wram) {
+          if (!barrier1_done) {
+            __sync_cluster();  // Barrier 1
+            barrier1_done = true;
+          }
+          sync_psimd_cmv();
+          __memcpy_async(wram,
+                         shared + (2 * next_pair) * kBlockBytes,
+                         kBlockBytes,
+                         SRAM2WRAM);
+        }
+        if (pi + 1 < kNpairs) {
+          __bang_conv_partial(a, cur + kKb, w1, a, kKb, m, 2, 1, 1, 2, 1, kE);
+        } else {
+          bfloat16_t* dst_bf16;
+          if (count <= kResScoreTile) {
+            dst_bf16 = acc_bf16_hi + off * kE;
+          } else if (chunk == 0) {
+            dst_bf16 = acc_bf16_tmp;
+          } else {
+            dst_bf16 = acc_bf16_base + (off - m0) * kE;
+          }
+          conv_partial_cvt_bf16(dst_bf16, cur + kKb, w1, a, kKb, m, kE);
+        }
+
+        if (pf_pi < kNpairs) {
+          const int32_t np = (pf_pi + p0) & 3;
+          if (sel == 0) {
+            sync_psimd_cio0();
+            fetch_pair_ch<0>(reinterpret_cast<bfloat16_t*>(in0),
+                             hidden,
+                             p_first + chunk_off(pf_ch),
+                             chunk_rows(pf_ch),
+                             np,
+                             kKb,
+                             kH);
+          } else {
+            sync_psimd_cio1();
+            fetch_pair_ch<1>(reinterpret_cast<bfloat16_t*>(in1),
+                             hidden,
+                             p_first + chunk_off(pf_ch),
+                             chunk_rows(pf_ch),
+                             np,
+                             kKb,
+                             kH);
+          }
+          if (++pf_ch == chunks) {
+            pf_ch = 0;
+            ++pf_pi;
+          }
+        } else if (sel == 0 && has_next) {
+          sync_psimd_cio0();
+          launch_pass_step(next_p_first, next_p_rows, 0);
+        }
+      }
+    }
+
+    const int32_t stiles = count <= kResScoreTile ? 1 : 2;
+    const int32_t m1 = stiles == 2 ? chunk_rows(1) : 0;
+    const int32_t s_rows0 = stiles == 1 ? count : (m0 + m1);
+    for (int32_t st = 0; st < stiles; ++st) {
+      float* tile_x;
+      int32_t s_off;
+      int32_t s_rows;
+      if (stiles == 1) {
+        __bang_bfloat162float(acc, acc_bf16_hi, count * kE);
+        tile_x = acc;
+        s_off = 0;
+        s_rows = count;
+      } else if (st == 0) {
+        __bang_bfloat162float(acc_fp32_hi, acc_bf16_tmp, m0 * kE);
+        __bang_bfloat162float(acc_fp32_hi + m0 * kE, acc_bf16_base, m1 * kE);
+        tile_x = acc_fp32_hi;
+        s_off = 0;
+        s_rows = s_rows0;
+      } else {
+        s_rows = count - s_rows0;
+        __bang_bfloat162float(
+            acc_fp32_hi, acc_bf16_base + m1 * kE, s_rows * kE);
+        tile_x = acc_fp32_hi;
+        s_off = s_rows0;
+      }
+      finish_tile_128_rounded<kWorkStride, kE>(
+          tile_x,
+          sc_e,
+          sc_sp,
+          sc_work,
+          sc_row_index,
+          sc_fill,
+          sc_row_base,
+          sc_absmax_tmp,
+          bias,
+          out_weights,
+          out_ids,
+          res_out_w + st * kResScoreTile * kMaxTopk,
+          res_out_id + st * kResScoreTile * kMaxTopk,
+          p_first + s_off,
+          s_rows,
+          topk,
+          scale,
+          &sc_built_rows);
+    }
+    if (has_next) {
+      launch_pass_step(next_p_first, next_p_rows, 1);
+    }
+  }
+  if (!barrier1_done) {
+    __sync_cluster();
+  }
+  __sync();
+}
+
+}  // namespace
+
+void fused_moe_router_launch(void* queue,
+                             const void* hidden,
+                             const void* weight,
+                             RouterBias bias,
+                             float* out_weights,
+                             int32_t* out_ids,
+                             int32_t rows,
+                             int32_t experts,
+                             int32_t topk,
+                             float scale,
+                             int32_t partitions,
+                             float* workspace) {
+  // Align the partial-score slots to cache lines. The caller reserves slack.
+  workspace =
+      reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(workspace) + 127) &
+                               ~static_cast<uintptr_t>(127));
+  const cnrtDim3_t dim = {32, 1, 1};
+  fused_moe_router_kernel<<<dim,
+                            cnrtFuncTypeUnion8,
+                            static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const bfloat16_t*>(hidden),
+      static_cast<const bfloat16_t*>(weight),
+      bias,
+      out_weights,
+      out_ids,
+      workspace,
+      rows,
+      experts,
+      topk,
+      scale,
+      partitions);
+}
+
+void fused_moe_router_resident_launch(void* queue,
+                                      const void* hidden,
+                                      const void* weight,
+                                      RouterBias bias,
+                                      float* out_weights,
+                                      int32_t* out_ids,
+                                      int32_t rows,
+                                      int32_t topk,
+                                      float scale) {
+  const cnrtDim3_t dim = {32, 1, 1};
+  fused_moe_router_resident_kernel<<<dim,
+                                     cnrtFuncTypeUnion8,
+                                     static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<const bfloat16_t*>(hidden),
+      static_cast<const bfloat16_t*>(weight),
+      bias,
+      out_weights,
+      out_ids,
+      rows,
+      topk,
+      scale);
+}
+
+}  // namespace xllm::kernel::mlu::bangc

@@ -96,6 +96,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     : num_total_experts_(model_args.n_routed_experts()),
       topk_(model_args.num_experts_per_tok()),
       hidden_size_(model_args.hidden_size()),
+      intermediate_size_(model_args.moe_intermediate_size()),
       n_shared_experts_(model_args.n_shared_experts()),
       is_gated_(moe_args.is_gated),
       enable_result_reduction_(moe_args.enable_result_reduction),
@@ -122,8 +123,6 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
   shared_stream_ = shared_compute_stream;
 
   const int64_t num_experts = num_total_experts_;
-  const int64_t intermediate_size =
-      static_cast<int64_t>(model_args.moe_intermediate_size());
   int64_t ep_size = parallel_args.ep_size();
   int64_t ep_rank = 0;
   tp_pg_ = parallel_args.tp_group_;
@@ -186,8 +185,6 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
          ::xllm::SpeculativeConfig::get_instance().num_speculative_tokens()) *
         effective_seqs * topk_;
 
-    // make sure that all layers share the same deep ep instance
-    //  so that the memory footprint is minimized
     deep_ep_ = DeepEPManager::get_instance(dispatch_token_size,
                                            combine_token_size,
                                            max_num_tokens_per_rank,
@@ -235,7 +232,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
     shared_experts_ = register_module(
         "shared_experts",
         MluDenseMLP(hidden_size_,
-                    intermediate_size * n_shared_experts_,
+                    intermediate_size_ * n_shared_experts_,
                     is_gated_,
                     false,
                     hidden_act_,
@@ -249,7 +246,7 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
 
   // create weight buffer
   const int64_t world_size = tp_pg_->world_size();
-  int64_t local_intermediate_size = intermediate_size / world_size;
+  int64_t local_intermediate_size = intermediate_size_ / world_size;
   const bool is_groupwise_scale = quant_args_.group_size() > 0;
   int64_t w13_scale_group_cols = 0;
   int64_t w2_scale_group_cols = 0;
@@ -435,6 +432,16 @@ torch::Tensor FusedMoEImpl::compute_routed_experts(
     int64_t group_gemm_max_dim,
     int64_t expert_size,
     SelectedExpertInfo& selected_expert_info) {
+  if (fused_moe_ffn_) {
+    CHECK_EQ(hidden_states_dtype, torch::kBFloat16);
+    const auto input = view_as_dtype(expand_hidden_states, torch::kInt8);
+    const auto scale = view_as_dtype(
+        selected_expert_info.input_scale.value().flatten(), torch::kFloat32);
+    auto output = fused_moe_ffn_->forward(
+        input, scale, selected_expert_info.token_count_slice);
+    selected_expert_info.input_scale.reset();
+    return output;
+  }
   torch::Tensor gemm_workspace;
 
   torch::Tensor gemm1_out =
@@ -705,8 +712,6 @@ void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
   const int64_t start_expert_id = start_expert_id_;
   const int64_t num_experts_per_rank = num_experts_per_rank_;
   const bool w4 = moe_weight_bits_ == 4;
-  const int64_t intermediate_size =
-      w2_.size(2) * weight_pack_factor_ * world_size;
   std::vector<std::string> prefixes = {"gate_proj.", "up_proj."};
   for (int64_t expert = 0; expert < num_total_experts_; ++expert) {
     const std::string prefix = std::to_string(expert) + ".";
@@ -726,8 +731,8 @@ void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
       const bool down = projection == "down_proj.";
       if (w4) {
         check_ct_expert(expert_dict.get_dict_with_prefix(projection),
-                        down ? intermediate_size : hidden_size_,
-                        down ? hidden_size_ : intermediate_size,
+                        down ? intermediate_size_ : hidden_size_,
+                        down ? hidden_size_ : intermediate_size_,
                         quant_args_.group_size());
       } else {
         check_ct_scale(expert_dict.get_tensor(projection + "weight_scale"),
@@ -737,7 +742,7 @@ void FusedMoEImpl::load_ct_experts(const StateDict& state_dict) {
         const auto smooth = expert_dict.get_tensor(projection + "smooth");
         CHECK(!smooth.defined() ||
               (smooth.is_floating_point() && smooth.dim() == 1 &&
-               smooth.numel() == (down ? intermediate_size : hidden_size_)))
+               smooth.numel() == (down ? intermediate_size_ : hidden_size_)))
             << "Compressed-tensors expert smooth shape or dtype mismatch: "
             << module;
       }
@@ -834,6 +839,17 @@ void FusedMoEImpl::load_state_dict(const StateDict& state_dict) {
     // This conversion reallocates registered scale tensors, so do it before
     // MLU graph capture begins and owns its temporary allocation pool.
     prepare_scale_layout();
+    if (!fused_moe_ffn_ && w13_is_loaded_ && w2_is_loaded_ &&
+        act_smooth_is_loaded_) {
+      fused_moe_ffn_ = kernel::mlu::bangc::PackedMoeFfn::try_pack(
+          {w13_, w2_, w13_scale_, w2_scale_, act_smooth_},
+          {.weight_bits = moe_weight_bits_,
+           .group_size = quant_args_.group_size(),
+           .output_dtype = options_.dtype().toScalarType(),
+           .is_gated = is_gated_,
+           .activation = hidden_act_,
+           .swiglu_limit = swiglu_limit_});
+    }
   }
 }
 

@@ -53,7 +53,6 @@ struct DeepEPMetaResult {
 // between expert ranks
 class DeepEPImpl : public torch::nn::Module {
  public:
-  DeepEPImpl() = default;
   /**
    * @param dispatch_token_size Number of bytes in one token for the dispatch
    * stage
@@ -130,8 +129,10 @@ class DeepEPImpl : public torch::nn::Module {
  private:
   int64_t handle_ = 0;  // Communication handle
   bool is_initialized_ = false;
-  const ParallelArgs& parallel_args_;
-  const torch::TensorOptions& options_;
+  int32_t rank_;
+  int32_t ep_size_;
+  int64_t num_global_experts_;
+  torch::Device device_;
 
   // Buffers created for communication; registered to support module
   // state/save/load and .to(device)
@@ -144,38 +145,15 @@ class DeepEPImpl : public torch::nn::Module {
 };
 TORCH_MODULE(DeepEP);
 
-// DeepEPManager is a singleton class that manages the creation and destruction
-// of DeepEP instances
-class DeepEPManager {
+// Layers with compatible collective handles share their communication buffers.
+class DeepEPManager final {
  public:
   static DeepEP get_instance(int64_t dispatch_token_size,
                              int64_t combine_token_size,
                              int64_t max_num_tokens_per_rank,
                              int64_t num_global_experts,
                              const ParallelArgs& parallel_args,
-                             const torch::TensorOptions& options) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (instance_.is_empty()) {
-      instance_ = DeepEP(dispatch_token_size,
-                         combine_token_size,
-                         max_num_tokens_per_rank,
-                         num_global_experts,
-                         parallel_args,
-                         options);
-    }
-    return instance_;
-  };
-
-  static void destroy() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!instance_.is_empty()) {
-      instance_ = DeepEP(nullptr);
-    }
-  }
-
- private:
-  static std::mutex mutex_;
-  static DeepEP instance_;
+                             const torch::TensorOptions& options);
 };
 
 }  // namespace layer

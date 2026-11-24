@@ -37,7 +37,6 @@ limitations under the License.
 #include "platform/model_stream_registry.h"
 #include "platform/platform.h"
 #include "tests/core/forked_rank_session.h"
-#include "tests/core/layers/mlu/deep_ep_test_scope.h"
 #include "util/net.h"
 #include "util/tensor_helper.h"
 
@@ -314,7 +313,6 @@ int32_t run_all2all_basic_test_child(All2AllTestParams params) {
                        .requires_grad(false);
 
     // 6. Create model args and quant args
-    ::xllm::test::DeepEpTestScope deep_ep_scope;
     ModelArgs model_args = create_model_args(params);
     QuantArgs quant_args = create_quant_args(params);
     ModelStreamRegistry stream_registry(device);
@@ -425,7 +423,6 @@ int32_t run_all2all_selected_route_test_child(All2AllTestParams params) {
                        .device(device)
                        .requires_grad(false);
 
-    ::xllm::test::DeepEpTestScope deep_ep_scope;
     ModelArgs model_args = create_model_args(params);
     QuantArgs quant_args = create_quant_args(params);
     ModelStreamRegistry stream_registry(device);

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/layers/mlu/moe_gate.h"
 
+#include <utility>
+
 #include "core/util/utils.h"
 #include "kernels/ops_api.h"
 
@@ -68,6 +70,13 @@ MoEGateImpl::MoEGateImpl(const ModelArgs& model_args,
 std::tuple<torch::Tensor, torch::Tensor> MoEGateImpl::forward(
     torch::Tensor& hidden_states,
     const std::optional<torch::Tensor>& input_ids) {
+  if (moe_softplus_topk_) {
+    auto fused =
+        moe_softplus_topk_->forward_fused_router(hidden_states, input_ids);
+    if (fused.has_value()) {
+      return std::move(fused.value());
+    }
+  }
   torch::Tensor router_logits = gate_->forward(hidden_states);
   torch::Tensor router_logits_2d =
       router_logits.reshape({-1, router_logits.size(-1)});
@@ -103,6 +112,9 @@ void MoEGateImpl::load_state_dict(const StateDict& state_dict) {
   }
   if (moe_softplus_topk_) {
     moe_softplus_topk_->load_state_dict(state_dict);
+    if (state_dict.has("weight")) {
+      moe_softplus_topk_->prepare_fused_router(gate_->weight());
+    }
   }
 }
 

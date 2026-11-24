@@ -29,7 +29,7 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-// MoE Gate: gate projection (ReplicatedLinear) + moe_active_topk.
+// MoE gate with fused BF16 sqrtsoftplus routing for supported MLU models.
 class MoEGateImpl : public torch::nn::Module {
  public:
   MoEGateImpl() = default;
@@ -43,7 +43,8 @@ class MoEGateImpl : public torch::nn::Module {
               bool use_hash = false);
 
   // Forward: hidden_states -> (reduce_weight, expert_id).
-  // Reshapes hidden_states to 2D, runs gate projection, then moe_active_topk.
+  // Uses the prepared fused router, or the model-specific projection/scoring
+  // path.
   std::tuple<torch::Tensor, torch::Tensor> forward(
       torch::Tensor& hidden_states,
       const std::optional<torch::Tensor>& input_ids = std::nullopt);

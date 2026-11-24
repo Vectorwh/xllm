@@ -252,6 +252,7 @@ cc_test(
     moe_layer_test
   SRCS
     moe_gate_test.cpp
+    moe_router_test.cpp
     fused_moe_test.cpp
     moe_weight_loader_helper_test.cpp
     deepseek_v32/deepseek_v32_sparse_moe_block_test.cpp

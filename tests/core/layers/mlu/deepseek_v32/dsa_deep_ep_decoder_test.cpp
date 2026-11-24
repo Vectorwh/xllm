@@ -952,8 +952,6 @@ int32_t run_remote_decoder(int32_t rank, int32_t port) {
   }
 
   device_guard.synchronize_default_stream();
-  deep_ep = DeepEP(nullptr);
-  DeepEPManager::destroy();
   return 0;
 }
 

@@ -27,6 +27,7 @@ limitations under the License.
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/state_dict/utils.h"
+#include "kernels/mlu/bangc/include/fused_moe_ffn.h"
 #include "layers/common/deep_ep.h"
 #include "layers/common/fused_moe_base.h"
 #include "layers/mlu/dense_mlp.h"
@@ -141,6 +142,7 @@ class FusedMoEImpl : public torch::nn::Module {
   int64_t num_total_experts_;
   int64_t topk_;
   int64_t hidden_size_;
+  int64_t intermediate_size_;
   int64_t n_shared_experts_;
   bool is_gated_;
   bool enable_result_reduction_;
@@ -189,6 +191,7 @@ class FusedMoEImpl : public torch::nn::Module {
 
   torch::List<int64_t> w13_scale_quant_flag_;
   torch::List<int64_t> w2_scale_quant_flag_;
+  std::optional<kernel::mlu::bangc::PackedMoeFfn> fused_moe_ffn_;
   bool scale_layout_prepared_ = false;
   bool ct_verified_ = false;
 

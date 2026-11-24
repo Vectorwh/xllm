@@ -33,7 +33,6 @@ limitations under the License.
 #include "platform/model_stream_registry.h"
 #include "platform/platform.h"
 #include "tests/core/forked_rank_session.h"
-#include "tests/core/layers/mlu/deep_ep_test_scope.h"
 #include "util/net.h"
 
 namespace xllm::layer {
@@ -212,7 +211,6 @@ int32_t run_rank(int32_t rank,
       &single_rank);
   const auto options =
       torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
-  ::xllm::test::DeepEpTestScope deep_ep_scope;
   const ModelArgs model_args = make_model_args(with_shared);
   ModelStreamRegistry streams(device.unwrap());
   SparseMoEBlock block(model_args,

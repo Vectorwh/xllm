@@ -198,7 +198,8 @@ class DeepseekV41EngramImpl final : public torch::nn::Module {
                       int64_t* output) const;
   void lookup_host_rows(const torch::Tensor& hashes,
                         torch::Tensor& weight_rows,
-                        torch::Tensor& scale_rows) const;
+                        torch::Tensor& scale_rows,
+                        int32_t cpu_threads) const;
   torch::Tensor hash_on_device(const torch::Tensor& tokens,
                                const EngramDeviceHasher::Input& input) const;
   int64_t hash_columns() const;

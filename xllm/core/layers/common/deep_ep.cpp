@@ -13,9 +13,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "deep_ep.h"
+#include "layers/common/deep_ep.h"
 
+#include <c10/util/hash.h>
 #include <glog/logging.h>
+
+#include <memory>
+#include <mutex>
+#include <tuple>
+#include <unordered_map>
 
 #include "framework/parallel_state/process_group.h"
 #include "kernels/ops_api.h"
@@ -71,11 +77,67 @@ void offload_exchange_info_allgather(
 }  // namespace
 
 namespace xllm {
+struct DeepEPCache {
+  using Key = std::tuple<int32_t,
+                         int32_t,
+                         int32_t,
+                         torch::Device,
+                         torch::ScalarType,
+                         int64_t,
+                         int64_t,
+                         int64_t,
+                         int64_t>;
+  struct Entry {
+    std::once_flag initialized;
+    layer::DeepEP instance{nullptr};
+  };
+  std::mutex mutex;
+  std::unordered_map<Key, Entry, c10::hash<Key>> entries;
+};
+
+DeepEPCache& ProcessGroup::deep_ep_cache() {
+  std::call_once(deep_ep_cache_once_,
+                 [this] { deep_ep_cache_ = std::make_shared<DeepEPCache>(); });
+  return *deep_ep_cache_;
+}
+
 namespace layer {
 
-// initialize the static members of DeepEPManager
-std::mutex DeepEPManager::mutex_;
-DeepEP DeepEPManager::instance_ = DeepEP(nullptr);
+DeepEP DeepEPManager::get_instance(int64_t dispatch_token_size,
+                                   int64_t combine_token_size,
+                                   int64_t max_num_tokens_per_rank,
+                                   int64_t num_global_experts,
+                                   const ParallelArgs& parallel_args,
+                                   const torch::TensorOptions& options) {
+  CHECK(parallel_args.moe_ep_group_ != nullptr);
+  auto& cache = parallel_args.moe_ep_group_->deep_ep_cache();
+  const DeepEPCache::Key key{parallel_args.rank_,
+                             parallel_args.world_size_,
+                             parallel_args.ep_size(),
+                             options.device(),
+                             options.dtype().toScalarType(),
+                             dispatch_token_size,
+                             combine_token_size,
+                             max_num_tokens_per_rank,
+                             num_global_experts};
+  // Entries live until group teardown. Rehashing preserves their addresses.
+  DeepEPCache::Entry* entry;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    entry = &cache.entries[key];
+  }
+  // Handle creation is collective. Other local ranks must be able to enter
+  // the same collective while this rank initializes its configuration.
+  std::call_once(entry->initialized, [&] {
+    entry->instance = DeepEP(dispatch_token_size,
+                             combine_token_size,
+                             max_num_tokens_per_rank,
+                             num_global_experts,
+                             parallel_args,
+                             options);
+  });
+  return entry->instance;
+}
 
 DeepEPImpl::DeepEPImpl(int64_t dispatch_token_size,
                        int64_t combine_token_size,
@@ -83,7 +145,10 @@ DeepEPImpl::DeepEPImpl(int64_t dispatch_token_size,
                        int64_t num_global_experts,
                        const ParallelArgs& parallel_args,
                        const torch::TensorOptions& options)
-    : parallel_args_(parallel_args), options_(options) {
+    : rank_(parallel_args.rank_),
+      ep_size_(parallel_args.ep_size()),
+      num_global_experts_(num_global_experts),
+      device_(options.device()) {
   // make sure the size of moe_ep_group is equal nranks
   CHECK(parallel_args.ep_size() == parallel_args.world_size_)
       << "DeepEp only support the condition of ep_size == world_size";
@@ -103,7 +168,7 @@ DeepEPImpl::DeepEPImpl(int64_t dispatch_token_size,
   create_params.max_token_num = max_num_tokens_per_rank;
   create_params.rank = rank;
   create_params.nrank = nranks;
-  create_params.device = options_.device();
+  create_params.device = device_;
 
   // moe_all2all_create returns a vector of tensors:
   // index 0 is a tensor contains [handle, exchange_info_size]
@@ -138,14 +203,14 @@ DeepEPImpl::DeepEPImpl(int64_t dispatch_token_size,
   torch::Tensor all_exchange_info =
       torch::empty({nranks, exchange_info.size(0)}, cpu_options);
   offload_exchange_info_allgather(
-      moe_ep_group, exchange_info, all_exchange_info, options_.device());
+      moe_ep_group, exchange_info, all_exchange_info, device_);
 
   // Step 3: moe_all2all_init to configure the all_exchange_info into the
   // handle. Only needs to be done once.
   xllm::kernel::MoeAll2AllInitParams init_params;
   init_params.handle = handle_;
   init_params.all_exchange_info = all_exchange_info;
-  init_params.device = options_.device();
+  init_params.device = device_;
   xllm::kernel::moe_all2all_init(init_params);
 
   // prepare variables that facilitate the usage of deep ep dispatch and combine
@@ -153,9 +218,9 @@ DeepEPImpl::DeepEPImpl(int64_t dispatch_token_size,
   deep_ep_params_.combine_token_size = combine_token_size;
   deep_ep_params_.max_num_tokens_per_rank = max_num_tokens_per_rank;
   deep_ep_params_.dispatch_recv_layout =
-      torch::empty({nranks, 2}, options_.dtype(torch::kInt32));
+      torch::empty({nranks, 2}, options.dtype(torch::kInt32));
   deep_ep_params_.dispatch_recv_token_num =
-      torch::empty({num_global_experts}, options_.dtype(torch::kInt32));
+      torch::empty({num_global_experts}, options.dtype(torch::kInt32));
   deep_ep_params_.max_num_tokens_recv = max_num_tokens_per_rank * nranks;
 
   is_initialized_ = true;
@@ -165,7 +230,7 @@ DeepEPImpl::~DeepEPImpl() {
   if (is_initialized_) {
     xllm::kernel::MoeAll2AllDestroyParams destroy_params;
     destroy_params.handle = handle_;
-    destroy_params.device = options_.device();
+    destroy_params.device = device_;
     xllm::kernel::moe_all2all_destroy(destroy_params);
   }
 }
@@ -178,6 +243,14 @@ void DeepEPImpl::dispatch(int64_t token_byte,
                           const torch::Tensor& recv_token_num,
                           const std::optional<torch::Tensor>& send_token,
                           const std::optional<torch::Tensor>& recv_token) {
+  CHECK(send_token_num.dim() == 1 && recv_token_num.dim() == 1 &&
+        send_token_num.size(0) == num_global_experts_ &&
+        recv_token_num.size(0) == num_global_experts_)
+      << "DeepEP dispatch on rank " << rank_ << " expects "
+      << num_global_experts_
+      << " expert counts per tensor, send=" << send_token_num.sizes()
+      << ", recv=" << recv_token_num.sizes() << ", token capacity per rank="
+      << deep_ep_params_.max_num_tokens_per_rank;
   xllm::kernel::MoeAll2AllDispatchParams params;
   params.handle = handle_;
   params.token_byte = token_byte;
@@ -215,7 +288,7 @@ void DeepEPImpl::dispatch_step(int64_t num_token_expand,
   // 1. Generate send layout
   xllm::kernel::MoeAll2AllGenSendLayoutParams gen_send_layout_params;
   gen_send_layout_params.token_count = token_count_slice;
-  gen_send_layout_params.nrank = parallel_args_.ep_size();
+  gen_send_layout_params.nrank = ep_size_;
   torch::Tensor dispatch_send_layout =
       xllm::kernel::moe_all2all_gen_send_layout(gen_send_layout_params);
 
@@ -238,7 +311,7 @@ DeepEPMetaResult DeepEPImpl::process_dispatch_result(
   // Note: we need to reshape token_num view based on current EP config
   gen_gather_index_params.token_num =
       deep_ep_params_.dispatch_recv_token_num.view(
-          {parallel_args_.ep_size(), num_experts_per_rank});
+          {ep_size_, num_experts_per_rank});
   gen_gather_index_params.pad_num = deep_ep_params_.max_num_tokens_per_rank;
 
   std::vector<torch::Tensor> gen_gather_index_output =
@@ -295,7 +368,7 @@ torch::Tensor DeepEPImpl::combine_step_pack(
   // 2. Generate Combine Layout
   xllm::kernel::MoeAll2AllGenSendLayoutParams gen_send_layout_params;
   gen_send_layout_params.token_count = deep_ep_params_.dispatch_recv_token_num;
-  gen_send_layout_params.nrank = parallel_args_.ep_size();
+  gen_send_layout_params.nrank = ep_size_;
   torch::Tensor combine_send_layout =
       xllm::kernel::moe_all2all_gen_send_layout(gen_send_layout_params);
 

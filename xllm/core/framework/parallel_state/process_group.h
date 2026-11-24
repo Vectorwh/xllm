@@ -32,6 +32,7 @@ limitations under the License.
 namespace xllm {
 
 class ProcessGroupImpl;
+struct DeepEPCache;
 
 std::pair<int, std::vector<uint64_t>> get_group_rank(int world_size,
                                                      int global_rank,
@@ -64,6 +65,8 @@ class ProcessGroup {
   }
 
   const torch::Device& device() const { return device_; }
+
+  DeepEPCache& deep_ep_cache();
 
   // allreduce: reduce the input tensor across all processes, and all processes
   // get the result.
@@ -149,6 +152,9 @@ class ProcessGroup {
 #endif
 
  private:
+  std::once_flag deep_ep_cache_once_;
+  std::shared_ptr<DeepEPCache> deep_ep_cache_;
+
   // rank of current process.
   int32_t rank_ = 0;
 

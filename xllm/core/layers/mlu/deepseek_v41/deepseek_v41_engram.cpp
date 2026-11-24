@@ -57,6 +57,12 @@ void configure_engram_cpu_threads(int32_t threads) {
   }
 }
 
+int32_t engram_lookup_cpu_threads(const ModelInputParams& input) {
+  const bool is_decode = input.meta.batch_forward_type.is_decode() ||
+                         has_device_rewritten_tokens(input);
+  return is_decode ? 1 : torch::get_num_threads();
+}
+
 struct EngramOptions {
   bool cpu_offload = true;
   bool node_shared_memory = false;
@@ -481,7 +487,8 @@ void DeepseekV41EngramImpl::load_state_dict(const StateDict& state) {
 
 void DeepseekV41EngramImpl::lookup_host_rows(const torch::Tensor& hashes,
                                              torch::Tensor& weight_rows,
-                                             torch::Tensor& scale_rows) const {
+                                             torch::Tensor& scale_rows,
+                                             int32_t cpu_threads) const {
   const auto& weight = weights_.at("embed.weight");
   const auto& scale = weights_.at("embed.scale");
   CHECK(hashes.device().is_cpu() && hashes.is_contiguous());
@@ -525,10 +532,16 @@ void DeepseekV41EngramImpl::lookup_host_rows(const torch::Tensor& hashes,
                   scale_dim);
     }
   };
-  // Keep small decode lookups on their callback thread. Large prefill gathers
-  // use the caller's bounded intra-op pool instead of serial random reads.
+  // Decode callbacks across ranks compete for the same cores when each
+  // lookup starts an OpenMP team, even when only a few threads copy rows.
+  const int64_t rows_to_gather = weight_rows.size(0);
+  if (cpu_threads == 1) {
+    gather(0, rows_to_gather);
+    return;
+  }
+  configure_engram_cpu_threads(cpu_threads);
   constexpr int64_t kGatherGrain = 1024;
-  torch::parallel_for(0, weight_rows.size(0), kGatherGrain, gather);
+  torch::parallel_for(0, rows_to_gather, kGatherGrain, gather);
 }
 
 void DeepseekV41EngramImpl::verify_loaded_weights() const {
@@ -789,7 +802,7 @@ void DeepseekV41EngramImpl::HashState::prepare(const ModelInputParams& input,
     history_ready_.place(
         torch_mlu::getCurrentMLUStream(owner_.options_.device().index()));
   }
-  cpu_threads_ = torch::get_num_threads();
+  cpu_threads_ = engram_lookup_cpu_threads(input);
   // A prior eager prepare is not the input for this graph invocation. Inline
   // capture must record its CPU callback unless prefetch supplies fresh rows.
   prefetched_ = false;
@@ -798,24 +811,26 @@ void DeepseekV41EngramImpl::HashState::prepare(const ModelInputParams& input,
 
 void DeepseekV41EngramImpl::HashState::compute(void* state) noexcept {
   auto& hash = *static_cast<HashState*>(state);
-  configure_engram_cpu_threads(hash.cpu_threads_);
   torch::NoGradGuard guard;
   hash.owner_.compute_hashes(hash.host_tokens_.data_ptr<int64_t>(),
                              hash.host_history_.data_ptr<int64_t>(),
                              hash.lengths_,
                              hash.host_hashes_.data_ptr<int64_t>());
   if (hash.owner_.cpu_offload_) {
-    hash.owner_.lookup_host_rows(
-        hash.host_hashes_, hash.host_weight_rows_, hash.host_scale_rows_);
+    hash.owner_.lookup_host_rows(hash.host_hashes_,
+                                 hash.host_weight_rows_,
+                                 hash.host_scale_rows_,
+                                 hash.cpu_threads_);
   }
 }
 
 void DeepseekV41EngramImpl::HashState::lookup(void* state) noexcept {
   auto& hash = *static_cast<HashState*>(state);
-  configure_engram_cpu_threads(hash.cpu_threads_);
   torch::NoGradGuard guard;
-  hash.owner_.lookup_host_rows(
-      hash.host_hashes_, hash.host_weight_rows_, hash.host_scale_rows_);
+  hash.owner_.lookup_host_rows(hash.host_hashes_,
+                               hash.host_weight_rows_,
+                               hash.host_scale_rows_,
+                               hash.cpu_threads_);
 }
 
 void DeepseekV41EngramImpl::HashState::upload_host_outputs(
@@ -880,6 +895,7 @@ void DeepseekV41EngramImpl::HashState::prepare_eager(
   if (consumed_.isCreated()) {
     consumed_.wait(stream_);
   }
+  cpu_threads_ = engram_lookup_cpu_threads(input);
   const bool device_prefill =
       device_tokens.defined() && owner_.prefill_hashes_on_device(input);
   if (device_prefill) {
@@ -891,7 +907,6 @@ void DeepseekV41EngramImpl::HashState::prepare_eager(
     CHECK_EQ(collect_query_lengths(
                  input, input.meta.num_sequences, /*lengths=*/nullptr),
              host_tokens_.numel());
-    cpu_threads_ = torch::get_num_threads();
     inputs_ready_.place(
         torch_mlu::getCurrentMLUStream(owner_.options_.device().index()));
     inputs_ready_.wait(stream_);
@@ -927,7 +942,6 @@ void DeepseekV41EngramImpl::HashState::prepare_eager(
   copy_lookback_history(history, host_history_);
   CHECK_EQ(collect_query_lengths(input, input.meta.num_sequences, &lengths_),
            tokens.numel());
-  cpu_threads_ = torch::get_num_threads();
   torch_mlu::mlu::MLUStreamGuard guard(stream_);
   CHECK_EQ(cnrtInvokeHostFunc(stream_.stream(), compute, this), cnrtSuccess);
   upload_host_outputs(/*include_hashes=*/true);

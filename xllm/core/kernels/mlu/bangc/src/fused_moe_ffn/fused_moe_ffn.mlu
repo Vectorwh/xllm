@@ -1,0 +1,1617 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+// Local expert FFN (W4A8), weight-resident tile pipeline ("layout3").
+//
+// One Union8 launch: GEMM1 -> clamp/SwiGLU/smooth/INT8 -> GEMM2.
+// Work unit  = up to 117 consecutive rows of one expert (one native call per K
+//              slice with in-place accumulation), owned by one cluster.
+// Tile job   = one unit x one N tile (Nt columns), owned by one IPU.
+// WRAM holds Q quarter slots of the tile's weights; each slot is reloaded for
+// the next job as soon as its last use completes (rolling, Q-1 phases ahead).
+// The MPU stages the unit's rows group-major into SRAM once per unit.
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/fused_moe_ffn/launcher.h"
+
+namespace xllm::kernel::mlu::bangc {
+namespace {
+constexpr int32_t kGroup = 128;
+// Match scaled_quantize: round the FP32 reciprocal before multiplying by the
+// row maximum. Dividing the maximum by 127 can change the BF16 down projection.
+constexpr float kInt8ScaleFactor = 1.0f / 127.0f;
+constexpr int32_t kChunk = 117;     // max rows per native call
+constexpr int32_t kUnitRows = 117;  // max rows per unit (one weight pass)
+constexpr int32_t kBankUnit = 100;  // SRAM bank sizing granule (2000/2048 KB)
+constexpr int32_t kTileAlign = 4096;
+constexpr int32_t kMaxExperts = kFfnMaxExperts;
+constexpr int32_t kMaxWidth =
+    kFfnIntermediate;  // activation width (intermediate)
+constexpr int32_t kLtBytes = 32768;
+constexpr int32_t kOnesLt =
+    kLtBytes - 1024;  // all-ones FP32 conv kernel, 16 columns per LT
+constexpr int32_t kArenaBytes = 496 * 1024;
+constexpr int32_t kSharedBytes =
+    2 * kBankUnit * kFfnHidden * 2;  // two SRAM banks
+
+// Scheduling constants tuned across uniform, random, business, and irregular
+// distributions on mtp_592.
+constexpr int32_t kBank0Items = 8;
+constexpr int32_t kMaxParts = 4;
+constexpr int32_t kPartPct = 5;
+constexpr int32_t kGreedyUnits = 16;
+constexpr int32_t kUnevenPct = 12;
+constexpr int32_t kFewRows = 97;
+constexpr int32_t kFewMinRows4 = 38;
+constexpr int32_t kFewMinRows8 = 52;
+constexpr int32_t kHalveRows = 76;
+constexpr int32_t kRem8Max = 2;
+constexpr int32_t kBigRows = 80;
+constexpr int32_t kSmallParts = 4;
+constexpr int32_t kSplitLast = 4;
+constexpr int32_t kIoRows = 56;
+constexpr int32_t kFixRows = 18;
+constexpr int32_t kRealUnitMinRows = 32;
+
+// q calls per job of gq groups each; wq WRAM slots of gw groups each (q % wq ==
+// 0).
+struct Geo {
+  int32_t k, n, groups, q, gq, nt, tiles, slot, fstride, wbytes, wq, gw, cps,
+      ring, bank_rows;
+  bool scale16;  // prepacked scales are BF16 (exactly representable), widened
+                 // on device
+};
+
+__mlu_func__ Geo make_geo(int32_t k,
+                          int32_t n,
+                          int32_t q,
+                          int32_t nt,
+                          int32_t wq,
+                          bool scale16) {
+  Geo g;
+  g.k = k;
+  g.n = n;
+  g.groups = k / kGroup;
+  g.q = q;
+  g.gq = g.groups / q;
+  g.nt = nt;
+  g.tiles = (n + nt - 1) / nt;
+  g.fstride = nt / 16 * (kGroup / 2);
+  g.wq = wq;
+  g.gw = g.groups / wq;
+  g.cps = q / wq;
+  g.scale16 = scale16;
+  g.ring = 3;  // Queue parity needs a look-ahead of exactly two phases.
+  // Rows per SRAM bank: as many whole bank granules as fit (fewer cluster
+  // barriers).
+  g.bank_rows = kSharedBytes / 2 / k / kBankUnit * kBankUnit;
+  if (g.bank_rows > 4 * kBankUnit) {
+    g.bank_rows = 4 * kBankUnit;
+  }
+  g.slot = g.gw * g.fstride;
+  g.wbytes = g.gw * nt * (kGroup / 2);
+  return g;
+}
+
+__mlu_func__ int32_t unit_count(int32_t count) {
+  return (count + kUnitRows - 1) / kUnitRows;
+}
+
+// Units of expert `e` in the few-unit modes: the expert `bump` gets `bump_n`
+// more, and units of more than `hthr` rows are halved.
+__mlu_func__ int32_t item_units(int32_t erows,
+                                int32_t e,
+                                int32_t bump,
+                                int32_t bump_n,
+                                int32_t hthr) {
+  int32_t nu = unit_count(erows) + (e == bump ? bump_n : 0);
+  if (erows > nu * hthr) {
+    nu *= 2;
+  }
+  return nu;
+}
+
+// Units are split into `parts` tile subsets when there are too few units to
+// keep every cluster busy; an item = (unit, part) is owned by one cluster.
+// `span` receives 3600 x the busiest cluster's share (in units) x overhead.
+__mlu_func__ int32_t choose_parts(int32_t units,
+                                  int32_t max_rows,
+                                  int32_t& span) {
+  if (units <= 0 || units >= 8 * clusterDim) {
+    span = (units + clusterDim - 1) / clusterDim * 3600;
+    return 1;
+  }
+  if (units == 1) {
+    span = 3600 * 130 / 100 / (clusterDim - 1);
+    return clusterDim - 1;
+  }
+  int32_t best = 1;
+  int32_t best_span = 1 << 30;
+  // A unit of more than kBankUnit rows fills an SRAM batch alone; with four
+  // parts its six tile jobs would leave half of the cluster's cores idle.
+  const int32_t max_parts = max_rows > kBankUnit ? 3 : kMaxParts;
+  for (int32_t p = 1; p <= max_parts; ++p) {
+    // 12 / p is exact for p <= 4.
+    // Two units x four parts = one six-tile item per cluster: two jobs deep
+    // on half of the cores instead of 1.5 (4/3 of the span).
+    const int32_t s = (units * p + clusterDim - 1) / clusterDim * (12 / p) *
+                      (100 + kPartPct * (p - 1)) *
+                      (p == 4 && units == 2 ? 4 : 3);
+    if (s < best_span) {
+      best_span = s;
+      best = p;
+    }
+  }
+  span = best_span;
+  return best;
+}
+static_assert(kMaxParts <= 4, "choose_parts uses 12 / p");
+
+// Balanced ownership (many units of mixed size): large units are dealt
+// round-robin (pass 0), then the small ones go to the least-loaded cluster
+// (pass 1); the last kSplitLast small units are split into kSmallParts tile
+// subsets that are dealt separately (fine balancing). Every core derives the
+// same owners; loads stay in registers.
+#define FFN3_PICK_MIN(c, owner) \
+  {                             \
+    int32_t best = (c).l0;      \
+    owner = 0;                  \
+    if ((c).l1 < best) {        \
+      best = (c).l1;            \
+      owner = 1;                \
+    }                           \
+    if ((c).l2 < best) {        \
+      best = (c).l2;            \
+      owner = 2;                \
+    }                           \
+    if ((c).l3 < best) {        \
+      best = (c).l3;            \
+      owner = 3;                \
+    }                           \
+    if ((c).l4 < best) {        \
+      best = (c).l4;            \
+      owner = 4;                \
+    }                           \
+    if ((c).l5 < best) {        \
+      best = (c).l5;            \
+      owner = 5;                \
+    }                           \
+    if ((c).l6 < best) {        \
+      best = (c).l6;            \
+      owner = 6;                \
+    }                           \
+    if ((c).l7 < best) {        \
+      best = (c).l7;            \
+      owner = 7;                \
+    }                           \
+  }
+#define FFN3_ADD_LOAD(c, owner, cost) \
+  switch (owner) {                    \
+    case 0:                           \
+      (c).l0 += cost;                 \
+      break;                          \
+    case 1:                           \
+      (c).l1 += cost;                 \
+      break;                          \
+    case 2:                           \
+      (c).l2 += cost;                 \
+      break;                          \
+    case 3:                           \
+      (c).l3 += cost;                 \
+      break;                          \
+    case 4:                           \
+      (c).l4 += cost;                 \
+      break;                          \
+    case 5:                           \
+      (c).l5 += cost;                 \
+      break;                          \
+    case 6:                           \
+      (c).l6 += cost;                 \
+      break;                          \
+    default:                          \
+      (c).l7 += cost;                 \
+      break;                          \
+  }
+
+__mlu_func__ int32_t unit_cost(int32_t rows) {
+  return rows + kFixRows > kIoRows ? rows + kFixRows : kIoRows;
+}
+
+// Rows of one item, group-major, into the SRAM bank at row offset `row_off`.
+__mlu_func__ void mpu_stage_item(int8_t* bank,
+                                 const int8_t* x,
+                                 const Geo& g,
+                                 int32_t rows,
+                                 int32_t row0,
+                                 int32_t row_off) {
+  __memcpy_async(bank + row_off * g.k,
+                 x + static_cast<int64_t>(row0) * g.k,
+                 kGroup,
+                 GDRAM2SRAM,
+                 kGroup,
+                 rows - 1,
+                 rows * kGroup,
+                 g.groups - 1,
+                 g.k,
+                 rows - 1,
+                 kGroup,
+                 g.groups - 1);
+}
+
+// IPU view. Walking every unit of every cluster per job is expensive scalar
+// work, so each IPU records once the items (unit, tile subset) its cluster
+// owns, in the order the MPU stages them.
+constexpr int32_t kMaxTable = 512;
+static_assert(kMaxLaunchRows / kUnitRows + kMaxExperts <= 8 * kMaxTable);
+constexpr int32_t kTableHead =
+    16;  // published table: [0] = item count, then row0[], meta[]
+constexpr int32_t kSplitUnits =
+    8 * 8;  // below this, every unit is split into parts
+
+struct UnitTable {
+  int32_t* row0;  // [kMaxTable]
+  int32_t* meta;  // [kMaxTable] parts << 24 | part << 20 | expert << 8 | rows
+  int32_t n;
+};
+
+struct Loads {
+  int32_t l0, l1, l2, l3, l4, l5, l6, l7;
+};
+
+// Scalar work here delays every core's first load, and scalars that spill to
+// the stack cost ~20 ns per access: each ownership mode has its own lean loop.
+
+// Round-robin ownership, one item per unit: only this cluster's units are
+// visited.
+__mlu_func__ void table_build_plain(UnitTable& t,
+                                    const int32_t* counts,
+                                    int32_t experts) {
+  int32_t n = 0;
+  int32_t begin = 0;
+  int32_t first =
+      clusterId;  // index within the expert of this cluster's next unit
+  for (int32_t e = 0; e < experts; ++e) {
+    const int32_t erows = counts[e];
+    if (erows == 0) {
+      continue;
+    }
+    const int32_t nu = unit_count(erows);
+    if (first < nu) {
+      const int32_t base = erows / nu;
+      const int32_t extra = erows % nu;
+      for (; first < nu && n < kMaxTable; first += clusterDim) {
+        t.row0[n] = begin + first * base + (first < extra ? first : extra);
+        t.meta[n] = 1 << 24 | e << 8 | (base + (first < extra ? 1 : 0));
+        ++n;
+      }
+    }
+    first -= nu;
+    begin += erows;
+  }
+  t.n = n;
+}
+
+// Few units: every unit is split into `parts` tile subsets dealt round-robin.
+// Expert `bump` gets `bump_n` units more than unit_count().
+__mlu_func__ void table_build_split(UnitTable& t,
+                                    const int32_t* counts,
+                                    int32_t experts,
+                                    int32_t parts,
+                                    int32_t bump,
+                                    int32_t bump_n,
+                                    int32_t hthr) {
+  int32_t n = 0;
+  int32_t begin = 0;
+  int32_t item = 0;
+  for (int32_t e = 0; e < experts; ++e) {
+    const int32_t erows = counts[e];
+    if (erows == 0) {
+      continue;
+    }
+    const int32_t nu = item_units(erows, e, bump, bump_n, hthr);
+    if (nu > 0) {
+      const int32_t base = erows / nu;
+      const int32_t extra = erows % nu;
+      int32_t row = begin;
+      for (int32_t i = 0; i < nu; ++i) {
+        const int32_t rows = base + (i < extra ? 1 : 0);
+        for (int32_t part = 0; part < parts; ++part, ++item) {
+          if (item % clusterDim == clusterId && n < kMaxTable) {
+            t.row0[n] = row;
+            t.meta[n] = parts << 24 | part << 20 | e << 8 | rows;
+            ++n;
+          }
+        }
+        row += rows;
+      }
+    }
+    begin += erows;
+  }
+  t.n = n;
+}
+
+// Unequal units: units of at least `bigrows` rows are dealt round-robin
+// (pass 0), the others go to the least-loaded cluster (pass 1) as `parts` tile
+// subsets each, the ones from index `split_from` on as `fine_parts` subsets.
+// Expert `bump` gets `bump_n` extra units.
+__mlu_func__ void table_build_balanced(UnitTable& t,
+                                       const int32_t* counts,
+                                       int32_t experts,
+                                       int32_t split_from,
+                                       int32_t bigrows,
+                                       int32_t parts,
+                                       int32_t fine_parts,
+                                       int32_t bump,
+                                       int32_t bump_n,
+                                       int32_t hthr) {
+  int32_t n = 0;
+  Loads loads = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (bigrows < 256) {
+    int32_t begin = 0;
+    int32_t big = 0;
+    for (int32_t e = 0; e < experts; ++e) {
+      const int32_t erows = counts[e];
+      if (erows == 0) {
+        continue;
+      }
+      const int32_t nu = unit_count(erows);
+      if (nu > 0) {
+        const int32_t base = erows / nu;
+        const int32_t extra = erows % nu;
+        // Units hold `base` rows, the first `extra` of them one more.
+        const int32_t nbig =
+            base >= bigrows ? nu : (base + 1 >= bigrows ? extra : 0);
+        for (int32_t i = 0; i < nbig; ++i, ++big) {
+          const int32_t rows = base + (i < extra ? 1 : 0);
+          const int32_t owner = big % clusterDim;
+          const int32_t cost = unit_cost(rows);
+          FFN3_ADD_LOAD(loads, owner, cost);
+          if (owner == clusterId && n < kMaxTable) {
+            t.row0[n] = begin + i * base + (i < extra ? i : extra);
+            t.meta[n] = 1 << 24 | e << 8 | rows;
+            ++n;
+          }
+        }
+      }
+      begin += erows;
+    }
+  }
+  int32_t begin = 0;
+  int32_t small = 0;
+  for (int32_t e = 0; e < experts; ++e) {
+    const int32_t erows = counts[e];
+    if (erows == 0) {
+      continue;
+    }
+    const int32_t nu = item_units(erows, e, bump, bump_n, hthr);
+    if (nu > 0 && erows / nu < bigrows) {
+      const int32_t base = erows / nu;
+      const int32_t extra = erows % nu;
+      // The small units are the trailing ones (all of them unless base + 1 is
+      // large).
+      for (int32_t i = base + 1 >= bigrows ? extra : 0; i < nu; ++i, ++small) {
+        const int32_t rows = base + (i < extra ? 1 : 0);
+        const int32_t item_parts = small >= split_from ? fine_parts : parts;
+        const int32_t cost = unit_cost(rows) / item_parts;
+        for (int32_t part = 0; part < item_parts; ++part) {
+          int32_t owner;
+          FFN3_PICK_MIN(loads, owner);
+          FFN3_ADD_LOAD(loads, owner, cost);
+          if (owner == clusterId && n < kMaxTable) {
+            t.row0[n] = begin + i * base + (i < extra ? i : extra);
+            t.meta[n] = item_parts << 24 | part << 20 | e << 8 | rows;
+            ++n;
+          }
+        }
+      }
+    }
+    begin += erows;
+  }
+  t.n = n;
+}
+
+__mlu_func__ void table_build(UnitTable& t,
+                              const int32_t* counts,
+                              int32_t experts,
+                              int32_t parts,
+                              bool balanced,
+                              int32_t split_from,
+                              bool greedy,
+                              int32_t bump,
+                              int32_t bump_n,
+                              int32_t rem,
+                              int32_t hthr) {
+  if (rem > 0 || balanced || greedy) {
+    // One dealer, three uses:
+    //  balanced: units of kBigRows rows or more round-robin, the others
+    //            least-loaded, the last few as kSmallParts tile subsets;
+    //  greedy (few unequal units): every unit least-loaded as `parts` subsets;
+    //  rem (equal units, `rem` = 1 or 2 more than a multiple of the cluster
+    //            count): whole units, the last `rem` split over all clusters.
+    const bool fine = rem > 0 || balanced;
+    table_build_balanced(t,
+                         counts,
+                         experts,
+                         fine ? split_from : 1 << 30,
+                         balanced ? kBigRows : 1 << 20,
+                         fine ? 1 : parts,
+                         rem > 0 ? clusterDim / rem : kSmallParts,
+                         bump,
+                         bump_n,
+                         hthr);
+  } else if (parts == 1 && bump < 0 && hthr > kUnitRows) {
+    table_build_plain(t, counts, experts);
+  } else {
+    table_build_split(t, counts, experts, parts, bump, bump_n, hthr);
+  }
+}
+
+// The cluster's jobs (item x tile) dealt round-robin to its cores.
+struct JobIter {
+  bool valid, split0;
+  int32_t idx, part, parts, j,
+      jb;  // table entry, part, tile index, job counter
+  int32_t batch, row_off, seq,
+      bank_rows;                     // SRAM batch bookkeeping (as on the MPU)
+  int32_t expert, row0, rows, tile;  // current job
+};
+
+// Starting batch 0 with a single item lets IPUs start after one item's staging
+// instead of two, when splitting item 0 adds no per-IPU tile imbalance.
+__mlu_func__ bool split_bank0(int32_t n, int32_t tiles, int32_t meta0) {
+  if (n >= kBank0Items) {
+    return true;
+  }
+  if (n < 2 || (meta0 & 255) < 32) {
+    return false;
+  }
+  const int32_t parts0 = meta0 >> 24;
+  if (parts0 == 1 || parts0 == 3) {
+    return true;
+  }
+  if (parts0 == 2) {
+    return tiles % 8 == 0;
+  }
+  return parts0 == 4 && n == 3 && tiles == 24;
+}
+
+__mlu_func__ void job_first(JobIter& job, int32_t bank_rows, bool split0) {
+  job.bank_rows = bank_rows;
+  job.split0 = split0;
+  job.valid = false;
+  job.idx = -1;
+  job.part = 0;
+  job.parts = 1;
+  job.j = -1;
+  job.jb = 0;
+  job.batch = 0;
+  job.row_off = 0;
+  job.seq = -1;
+  job.rows = 0;
+}
+
+// Next item of this cluster; false when exhausted.
+__mlu_func__ bool job_next_item(JobIter& job, const UnitTable& t) {
+  if (++job.idx >= t.n) {
+    return false;
+  }
+  const int32_t used = job.row_off + job.rows;
+  const int32_t meta = t.meta[job.idx];
+  const int32_t rows = meta & 255;
+  if (job.seq >= 0) {
+    // The first batch is a single item when split0 holds: cores start after
+    // one item's staging.
+    if (used + rows > job.bank_rows || (job.seq == 0 && job.split0)) {
+      ++job.batch;
+      job.row_off = 0;
+    } else {
+      job.row_off = used;
+    }
+  }
+  ++job.seq;
+  job.expert = meta >> 8 & 4095;
+  job.part = meta >> 20 & 15;
+  job.parts = meta >> 24;
+  job.row0 = t.row0[job.idx];
+  job.rows = rows;
+  return true;
+}
+
+__mlu_func__ void job_advance(JobIter& job, const UnitTable& t, int32_t tiles) {
+  while (true) {
+    if (job.seq < 0) {  // first call
+      if (!job_next_item(job, t)) {
+        job.valid = false;
+        return;
+      }
+    }
+    ++job.j;
+    const int32_t tile = job.part + job.j * job.parts;
+    if (tile >= tiles) {
+      if (!job_next_item(job, t)) {
+        job.valid = false;
+        return;
+      }
+      job.j = -1;
+      continue;
+    }
+    if (job.jb++ % coreDim == coreId) {
+      job.tile = tile;
+      job.valid = true;
+      return;
+    }
+  }
+}
+
+#define FFN3_MEMCPY_2D(INST, DST, SRC, IOID)                       \
+  asm volatile(INST ".stride.async." DST "." SRC "." IOID          \
+                    " [%[dst]], [%[src]], %[size], %[dststride], " \
+                    "%[srcstride], %[seg];\n\t" ::[dst] "r"(dst),  \
+               [src] "r"(src),                                     \
+               [size] "r"(size),                                   \
+               [dststride] "r"(dst_stride),                        \
+               [srcstride] "r"(src_stride),                        \
+               [seg] "r"(segnum));
+
+__mlu_func__ void load_io0(void* dst,
+                           const void* src,
+                           uint32_t size,
+                           uint32_t dst_stride,
+                           int32_t src_stride,
+                           uint32_t segnum) {
+  FFN3_MEMCPY_2D("ld", "nram", "gdram", "io0");
+}
+__mlu_func__ void store_io1(void* dst,
+                            const void* src,
+                            uint32_t size,
+                            uint32_t dst_stride,
+                            int32_t src_stride,
+                            uint32_t segnum) {
+  FFN3_MEMCPY_2D("st", "gdram", "nram", "io1");
+}
+// FP32 -> BF16 on the MOVE queue (16 elements per block); dst may equal src.
+__mlu_func__ void move_cvt_f32_bf16(bfloat16_t* dst,
+                                    const float* src,
+                                    int32_t elems) {
+  int32_t nb = elems / 16;
+  __asm__ volatile(
+      "move.tiling.async.nram.nram.b32 [%[dst]], [%[src]], 64, 1, 0, 1, 0, "
+      "%[nb], 64, 1, 0, 1, 0, "
+      "64, 1, 0, 1, 0, %[nb], 32, 1, 0, 1, 0, .cvt.rn.bf16.f32();\n\t" ::
+          [dst] "r"(dst),
+      [src] "r"(src),
+      [nb] "r"(nb));
+}
+__mlu_func__ void load_io1(void* dst,
+                           const void* src,
+                           uint32_t size,
+                           uint32_t dst_stride,
+                           int32_t src_stride,
+                           uint32_t segnum) {
+  FFN3_MEMCPY_2D("ld", "nram", "gdram", "io1");
+}
+__mlu_func__ void load_wram_io1(void* dst, const void* src, uint32_t size) {
+  __asm__ volatile(
+      "ld.async.wram.gdram.io1 [%[dst]], [%[src]], %[size];\n\t" ::[dst] "r"(
+          dst),
+      [src] "r"(src),
+      [size] "r"(size));
+}
+// Directional barriers: only the consumer queues wait for the producer queues.
+__mlu_func__ void sync_io0_mv_to_simd() {
+  __asm__ volatile("sync.pio0.pmv.csimd;\n\t");
+}
+__mlu_func__ void sync_io1_mv_to_simd() {
+  __asm__ volatile("sync.pio1.pmv.csimd;\n\t");
+}
+__mlu_func__ void sync_simd_to_io_mv() {
+  __asm__ volatile("sync.psimd.cio.cmv;\n\t");
+}
+__mlu_func__ void move_cvt_bf16_f32(float* dst,
+                                    const bfloat16_t* src,
+                                    int32_t bytes) {
+  int32_t sn0 = 64, sn3 = bytes / 64, ss3 = 64, dn0 = 64, dn3 = sn3, ds3 = 128;
+  __asm__ volatile(
+      "move.tiling.async.nram.nram.b16 [%[dst]], [%[src]], %[sn0], 1, 0, 1, 0, "
+      "%[sn3], %[ss3], 1, 0, 1, 0, "
+      "%[dn0], 1, 0, 1, 0, %[dn3], %[ds3], 1, 0, 1, 0, .cvt.rn.f32.bf16();" ::
+          [dst] "r"(dst),
+      [src] "r"(src),
+      [sn0] "r"(sn0),
+      [sn3] "r"(sn3),
+      [ss3] "r"(ss3),
+      [dn0] "r"(dn0),
+      [dn3] "r"(dn3),
+      [ds3] "r"(ds3));
+}
+__mlu_func__ void sync_io0_to_mv() { __asm__ volatile("sync.pio0.cmv;\n\t"); }
+__mlu_func__ void sync_mv_to_io1() { __asm__ volatile("sync.pmv.cio1;\n\t"); }
+__mlu_func__ void sync_io1_to_mv() { __asm__ volatile("sync.pio1.cmv;\n\t"); }
+
+// Elements between the two accumulator tiles: the tile of kUnitRows rows
+// rounded up to kTileAlign bytes.
+constexpr int32_t tile_elems(int32_t nt) {
+  return (kUnitRows * nt * 4 + kTileAlign - 1) / kTileAlign * kTileAlign / 4;
+}
+
+struct Scratch {
+  float* acc[2];     // [kUnitRows][nt] accumulators of alternating jobs
+  int8_t* inbuf[2];  // [gq][rows][128] input slices
+  float* scl;  // [ring][gw][nt] scale chunks, rolling with the weight slots
+  float* rs;   // [kUnitRows]
+  int8_t* wram;
+};
+
+// The GEMM arena layout depends on the stage geometry.
+__mlu_func__ Scratch make_scratch(int8_t* arena, int8_t* wram, const Geo& g) {
+  Scratch s;
+  const int32_t slice = kChunk * g.gq * kGroup;
+  s.acc[0] = reinterpret_cast<float*>(arena);
+  s.acc[1] = s.acc[0] + tile_elems(g.nt);
+  s.inbuf[0] = reinterpret_cast<int8_t*>(s.acc[1] + tile_elems(g.nt));
+  s.inbuf[1] = s.inbuf[0] + slice;
+  s.scl = reinterpret_cast<float*>(s.inbuf[1] + slice);
+  s.rs = reinterpret_cast<float*>(s.scl + g.ring * g.gw * g.nt);
+  s.wram = wram;
+  return s;
+}
+
+// `scale_groups` = ring * groups per weight chunk (the resident scale chunks).
+// The native call accumulates in place (verified bit-exact on mtp_592), so a
+// job needs its accumulator tile only: no ping-pong partner.
+constexpr int32_t gemm_arena_bytes(int32_t nt,
+                                   int32_t gq,
+                                   int32_t scale_groups) {
+  return 2 * tile_elems(nt) * 4 + 2 * kChunk * gq * kGroup +
+         scale_groups * nt * 4 + kUnitRows * 4;
+}
+static_assert(gemm_arena_bytes(192, 10, 3 * 10) <= kArenaBytes, "GEMM1 arena");
+static_assert(gemm_arena_bytes(256, 6, 3 * 6) <= kArenaBytes, "GEMM2 arena");
+static_assert(kChunk == kUnitRows && kChunk < 256, "unit rows");
+
+__mlu_func__ void load_weights(const Scratch& s,
+                               const Geo& g,
+                               const int8_t* weight,
+                               const float* scales,
+                               int32_t expert,
+                               int32_t tile,
+                               int32_t quarter,
+                               int32_t slot,
+                               int32_t queue) {
+  const int64_t offset =
+      ((static_cast<int64_t>(expert) * g.tiles + tile) * g.wq + quarter) *
+      g.wbytes;
+  // The chunk's scales [gw][nt] travel with it (prepacked [E][T][G][Nt]).
+  const int32_t elems = g.gw * g.nt;
+  const int64_t scale_offset =
+      (static_cast<int64_t>(expert) * g.tiles + tile) * g.groups * g.nt +
+      quarter * elems;
+  float* const scale_dst = s.scl + slot * elems;
+  if (g.scale16) {
+    // BF16 scales land in the back half of the FP32 slot and are widened in
+    // place on the MOVE queue; half the scale traffic on the GDRAM link.
+    const bfloat16_t* const src16 =
+        reinterpret_cast<const bfloat16_t*>(scales) + scale_offset;
+    bfloat16_t* const back = reinterpret_cast<bfloat16_t*>(scale_dst) + elems;
+    if (queue == 1) {
+      load_io1(back, src16, elems * 2, elems * 2, elems * 2, 0);
+      sync_io1_to_mv();
+    } else {
+      __memcpy_async(back, src16, elems * 2, GDRAM2NRAM);
+      sync_io0_to_mv();
+    }
+    move_cvt_bf16_f32(scale_dst, back, elems * 2);
+    if (queue == 1) {
+      load_wram_io1(s.wram + slot * g.slot, weight + offset, g.wbytes);
+    } else {
+      __memcpy_async(
+          s.wram + slot * g.slot, weight + offset, g.wbytes, GDRAM2WRAM);
+    }
+    return;
+  }
+  const float* const scale_src = scales + scale_offset;
+  if (queue == 1) {
+    load_wram_io1(s.wram + slot * g.slot, weight + offset, g.wbytes);
+    load_io1(scale_dst,
+             scale_src,
+             elems * sizeof(float),
+             elems * sizeof(float),
+             elems * sizeof(float),
+             0);
+  } else {
+    __memcpy_async(
+        s.wram + slot * g.slot, weight + offset, g.wbytes, GDRAM2WRAM);
+    __memcpy_async(scale_dst, scale_src, elems * sizeof(float), GDRAM2NRAM);
+  }
+}
+
+// One GEMM stage: destination[row][n] = bf16(row_scale * sum_g scale_g * (x_g .
+// w_g)). `published` is the cluster's item table in SRAM (count, row0[],
+// meta[]); the MPU stages the items' rows bank by bank in exactly the table
+// order.
+__mlu_func__ void gemm_stage(int8_t* arena,
+                             int8_t* wram,
+                             int8_t* shared,
+                             const int32_t* published,
+                             bfloat16_t* destination,
+                             const int8_t* x,
+                             const float* row_scales,
+                             const int8_t* weight,
+                             const float* scales,
+                             const Geo& g,
+                             const UnitTable& table) {
+  const bool ipu = __is_ipu();
+  const int32_t bank_bytes = g.bank_rows * g.k;
+  const Scratch s = make_scratch(arena, wram, g);
+  if (!ipu) {
+    const int32_t n = __load_sram(published);
+    const bool split0 =
+        n > 1 &&
+        split_bank0(
+            n, g.tiles, __load_sram(published + kTableHead + kMaxTable));
+    int32_t batch = 0;
+    int32_t row_off = 0;
+    for (int32_t idx = 0; idx < n; ++idx) {
+      const int32_t rows =
+          __load_sram(published + kTableHead + kMaxTable + idx) & 255;
+      if (row_off + rows > g.bank_rows || (idx == 1 && split0)) {
+        __sync();
+        __sync_cluster();
+        ++batch;
+        row_off = 0;
+      }
+      mpu_stage_item(shared + (batch & 1) * bank_bytes,
+                     x,
+                     g,
+                     rows,
+                     __load_sram(published + kTableHead + idx),
+                     row_off);
+      row_off += rows;
+    }
+    __sync();
+    __sync_cluster();
+    __sync_cluster();
+    return;
+  }
+  const bool split0 =
+      table.n > 1 && split_bank0(table.n, g.tiles, table.meta[0]);
+  // WRAM keeps a ring of g.ring weight chunks; the chunk of phase p (jobs x
+  // wq chunks, in execution order) lives in slot p % ring and is loaded
+  // ring-1 phases ahead. slot_tag identifies the resident (expert, tile,
+  // chunk).
+  int32_t slot_tag[8];
+  for (int32_t slot = 0; slot < g.ring; ++slot) {
+    slot_tag[slot] = -1;
+  }
+  int32_t phase = 0;
+  int32_t batches = 0;
+  {
+    JobIter scan;
+    job_first(scan, g.bank_rows, split0);
+    while (job_next_item(scan, table)) {
+      batches = scan.batch + 1;
+    }
+  }
+  // `ahead` always points one job past the current one; the current job lives
+  // in plain locals (scalar stack traffic is expensive on the device).
+  JobIter ahead;
+  job_first(ahead, g.bank_rows, split0);
+  job_advance(ahead, table, g.tiles);
+  if (ahead.valid) {
+    const int32_t tag = ahead.expert * g.tiles + ahead.tile;
+    for (int32_t chunk = 0; chunk < g.ring - 1; ++chunk) {
+      load_weights(s,
+                   g,
+                   weight,
+                   scales,
+                   ahead.expert,
+                   ahead.tile,
+                   chunk,
+                   chunk,
+                   chunk & 1);
+      slot_tag[chunk] = tag * 8 + chunk;
+    }
+  }
+  __bang_write_value(s.acc[0], 2 * tile_elems(g.nt), 0.0f);
+  // Finished tile whose BF16 conversion, store and clear are still to be
+  // issued; they run on the MOVE/IO1 queues under the next job's calls.
+  float* done = nullptr;
+  int32_t done_rows = 0, done_row0 = 0, done_tile = 0;
+  int32_t jobno = 0;
+  // Calls of the next job under which the finished tile is converted/stored
+  // and then cleared.
+  constexpr int32_t clear_q = 2;
+  constexpr int32_t cvt_q = 0;
+  __sync();
+  __sync_cluster();
+  int32_t batch = 0;
+  int32_t in_sel = 0;
+  int32_t rs_seq = -1;
+  bool fresh = true;
+  while (ahead.valid) {
+    const int32_t job_batch = ahead.batch;
+    const int32_t expert = ahead.expert;
+    const int32_t row0 = ahead.row0;
+    const int32_t rows = ahead.rows;
+    const int32_t row_off = ahead.row_off;
+    const int32_t seq = ahead.seq;
+    const int32_t tile = ahead.tile;
+    job_advance(ahead, table, g.tiles);
+    const bool has_next = ahead.valid;
+    const int32_t next_expert = ahead.expert;
+    const int32_t next_tile = ahead.tile;
+    const bool chain = has_next && ahead.batch == job_batch;
+    const int32_t next_rows = ahead.rows;
+    const int32_t next_row_off = ahead.row_off;
+    while (batch < job_batch) {
+      __sync();
+      __sync_cluster();
+      ++batch;
+      fresh = true;
+    }
+    const int8_t* bank = shared + (batch & 1) * bank_bytes + row_off * g.k;
+    const int32_t tag = expert * g.tiles + tile;
+    bool need_sync = false;
+    for (int32_t chunk = 0; chunk < g.ring - 1; ++chunk) {
+      const int32_t slot = (phase + chunk) % g.ring;
+      if (slot_tag[slot] != tag * 8 + chunk) {  // cold start
+        load_weights(s,
+                     g,
+                     weight,
+                     scales,
+                     expert,
+                     tile,
+                     chunk,
+                     slot,
+                     (phase + chunk) & 1);
+        slot_tag[slot] = tag * 8 + chunk;
+        need_sync = true;
+      }
+    }
+    if (fresh) {
+      // First slice of a batch (right after a full barrier). With directional
+      // barriers the first call waits for the MOVE queue by itself.
+      __memcpy_async(s.inbuf[in_sel], bank, g.gq * rows * kGroup, SRAM2NRAM);
+      fresh = false;
+    }
+    if (need_sync) {
+      __sync();
+    }
+    bool cold = need_sync;
+    const int32_t next_tag = has_next ? next_expert * g.tiles + next_tile : -1;
+    float* acc = s.acc[jobno & 1];
+    ++jobno;
+    for (int32_t quarter = 0; quarter < g.q; ++quarter) {
+      const int32_t slot = phase % g.ring;
+      if (!cold) {
+        // This call waits for its weight chunk (queue = phase parity; the
+        // other queue carries the next phase's chunk) and for the MOVE
+        // queue (input slice, tile clear); loads issued from here on wait
+        // for the previous call, whose buffers they overwrite.
+        if (phase & 1) {
+          sync_io1_mv_to_simd();
+        } else {
+          sync_io0_mv_to_simd();
+        }
+        sync_simd_to_io_mv();
+      }
+      cold = false;
+      if (rs_seq != seq) {
+        __memcpy_async(
+            s.rs, row_scales + row0, rows * sizeof(float), GDRAM2NRAM);
+        rs_seq = seq;
+      }
+      // Prefetch the next step's input slice into the other buffer.
+      const int32_t nq = quarter + 1;
+      if (nq < g.q) {
+        __memcpy_async(s.inbuf[1 - in_sel],
+                       bank + nq * g.gq * rows * kGroup,
+                       g.gq * rows * kGroup,
+                       SRAM2NRAM);
+      } else if (chain) {
+        __memcpy_async(s.inbuf[1 - in_sel],
+                       shared + (batch & 1) * bank_bytes + next_row_off * g.k,
+                       g.gq * next_rows * kGroup,
+                       SRAM2NRAM);
+      }
+      if (quarter % g.cps == 0) {
+        // The slot freed by the previous slot phase receives the weights
+        // that are needed wq-1 slot phases from now.
+        const int32_t lq = (phase + g.ring - 1) & 1;
+        const int32_t target = (phase + g.ring - 1) % g.ring;
+        const int32_t want = quarter / g.cps + g.ring - 1;
+        if (want < g.wq) {
+          load_weights(s, g, weight, scales, expert, tile, want, target, lq);
+          slot_tag[target] = tag * 8 + want;
+        } else if (has_next) {
+          load_weights(s,
+                       g,
+                       weight,
+                       scales,
+                       next_expert,
+                       next_tile,
+                       want - g.wq,
+                       target,
+                       lq);
+          slot_tag[target] = next_tag * 8 + want - g.wq;
+        }
+      }
+      if (done != nullptr && (quarter == cvt_q || quarter == clear_q)) {
+        if (quarter == cvt_q) {
+          const int32_t width =
+              g.n - done_tile * g.nt < g.nt ? g.n - done_tile * g.nt : g.nt;
+          bfloat16_t* const half_tile = reinterpret_cast<bfloat16_t*>(done);
+          move_cvt_f32_bf16(half_tile, done, done_rows * g.nt);
+          sync_mv_to_io1();
+          store_io1(destination + static_cast<int64_t>(done_row0) * g.n +
+                        done_tile * g.nt,
+                    half_tile,
+                    width * sizeof(bfloat16_t),
+                    g.n * sizeof(bfloat16_t),
+                    g.nt * sizeof(bfloat16_t),
+                    done_rows - 1);
+        } else {
+          sync_io1_to_mv();
+          __nramset_async(done, done_rows * g.nt, 0.0f);
+          done = nullptr;
+        }
+      }
+      __bang_group_quant_matmul(
+          acc,
+          acc,
+          s.inbuf[in_sel],
+          reinterpret_cast<int4x2_t*>(s.wram + slot * g.slot +
+                                      quarter % g.cps * g.gq * g.fstride),
+          s.scl + slot * g.gw * g.nt + quarter % g.cps * g.gq * g.nt,
+          rows,
+          kGroup,
+          g.nt,
+          rows * kGroup,
+          g.fstride,
+          g.nt,
+          g.gq);
+      in_sel = 1 - in_sel;
+      if ((quarter + 1) % g.cps == 0) {
+        ++phase;
+      }
+    }
+    // The row scale shares the last call's barrier, so it overlaps the loads
+    // that are still in flight.
+    __bang_expand_channel_mul(
+        acc, s.rs, reinterpret_cast<float*>(s.wram + kOnesLt), acc, rows, g.nt);
+    done = acc;
+    done_rows = rows;
+    done_row0 = row0;
+    done_tile = tile;
+    if (!chain) {
+      fresh = true;
+    }
+  }
+  if (done != nullptr) {
+    const int32_t width =
+        g.n - done_tile * g.nt < g.nt ? g.n - done_tile * g.nt : g.nt;
+    bfloat16_t* const half_tile = reinterpret_cast<bfloat16_t*>(done);
+    __sync();
+    move_cvt_f32_bf16(half_tile, done, done_rows * g.nt);
+    sync_mv_to_io1();
+    store_io1(
+        destination + static_cast<int64_t>(done_row0) * g.n + done_tile * g.nt,
+        half_tile,
+        width * sizeof(bfloat16_t),
+        g.n * sizeof(bfloat16_t),
+        g.nt * sizeof(bfloat16_t),
+        done_rows - 1);
+  }
+  while (batch + 1 < batches) {
+    __sync();
+    __sync_cluster();
+    ++batch;
+  }
+  __sync();
+  __sync_cluster();
+}
+
+// ---------------------------------------------------------------------------
+// Activation stage: clamp + silu*up + smooth + per-row INT8 quantization.
+// Same instruction sequence as the branch's fused_moe_act_quant kernel so the
+// quantized rows match the serving path. Rows are partitioned by core.
+// ---------------------------------------------------------------------------
+constexpr int32_t kActRows = 5;
+constexpr int32_t kActE = kActRows * kMaxWidth;
+constexpr int32_t kRing = 8;
+constexpr int32_t kDecodePerCore = 8;
+constexpr int32_t kStageRows = 256;
+constexpr int32_t kAlign = 128;
+constexpr int32_t align_up(int32_t x) {
+  return (x + kAlign - 1) / kAlign * kAlign;
+}
+constexpr int32_t kGbOff = 0;
+constexpr int32_t kUbOff = kGbOff + align_up(3 * kActE * 2);
+constexpr int32_t kFaOff = kUbOff + align_up(3 * kActE * 2);
+constexpr int32_t kFbOff = kFaOff + align_up(2 * kActE * 4);
+constexpr int32_t kFcOff = kFbOff + align_up(3 * kActE * 4);
+constexpr int32_t kQ8Off = kFcOff + align_up(kActE * 4);
+constexpr int32_t kSmOff = kQ8Off + align_up(2 * kActE);
+constexpr int32_t kMxOff = kSmOff + align_up(2 * kMaxWidth * 4);
+constexpr int32_t kSbufOff = kMxOff + align_up(2 * (kActRows * 4 + 16) * 4);
+constexpr int32_t kScAllOff = kSbufOff + align_up(2 * (kActRows + 16) * 4);
+constexpr int32_t kActEnd = kScAllOff + align_up(kStageRows * 4);
+// Decode layout: up to kDecodePerCore rows per core.
+constexpr int32_t kDGOff = 0;
+constexpr int32_t kDUOff = kDGOff + align_up(kDecodePerCore * kMaxWidth * 2);
+constexpr int32_t kDG32Off = kDUOff + align_up(kDecodePerCore * kMaxWidth * 2);
+constexpr int32_t kDU32Off =
+    kDG32Off + align_up(kDecodePerCore * kMaxWidth * 4);
+constexpr int32_t kDGsOff = kDU32Off + align_up(kDecodePerCore * kMaxWidth * 4);
+constexpr int32_t kDQ8Off = kDGsOff + align_up(kDecodePerCore * kMaxWidth * 4);
+constexpr int32_t kDSmOff = kDQ8Off + align_up(kDecodePerCore * kMaxWidth);
+constexpr int32_t kDMxOff = kDSmOff + align_up(kDecodePerCore * kMaxWidth * 4);
+constexpr int32_t kDScOff = kDMxOff + align_up(64 * 4);
+constexpr int32_t kDecodeEnd = kDScOff + align_up(64 * 4);
+static_assert(kActEnd <= kArenaBytes && kDecodeEnd <= kArenaBytes,
+              "activation arena");
+
+__mlu_func__ void absmax_row(float* dst, const float* src, int32_t n) {
+  __asm__ volatile(
+      "absmax.nram.f32 [%[dst]], [%[src]], %[n];\n\t" ::[dst] "r"(dst),
+      [src] "r"(src),
+      [n] "r"(n));
+}
+__mlu_func__ void mult_cvt_row(int8_t* dst,
+                               const float* src,
+                               float inv,
+                               int32_t n) {
+  __asm__ volatile(
+      "mult.scalar.nram.crn.s8.f32 [%[dst]], [%[src]], %[s], %[n], "
+      ".dstpos(0);\n\t" ::[dst] "r"(dst),
+      [src] "r"(src),
+      [s] "r"(inv),
+      [n] "r"(n));
+}
+__mlu_func__ void chain_row(float* dst,
+                            const float* u,
+                            const float* gs,
+                            const float* smooth,
+                            float limit,
+                            int32_t n) {
+  const float nlimit = -limit;
+  __asm__ volatile(
+      "fuse.nram.f32 [%[dst]], %[n], [%[a]], .max(%[lo]), .min(%[hi]), "
+      ".mul([%[g]]), .mul([%[s]]);\n\t" ::[dst] "r"(dst),
+      [n] "r"(n),
+      [a] "r"(u),
+      [lo] "r"(nlimit),
+      [hi] "r"(limit),
+      [g] "r"(gs),
+      [s] "r"(smooth));
+}
+
+// Both paths return the per-core row stride of the scales staged in cluster
+// SRAM (`staged`), or 0 when the scales were written directly: many cores
+// writing partial lines of the same cache line serialize badly, so the memory
+// core writes the cluster's scales as one run.
+__mlu_func__ int32_t act_small(int8_t* arena,
+                               const int32_t* cnt,
+                               const bfloat16_t* input,
+                               int8_t* output,
+                               float* staged,
+                               const float* smooth,
+                               int32_t total,
+                               int32_t w,
+                               float limit) {
+  const int32_t p = (total + taskDim - 1) / taskDim;
+  const int32_t r0 = taskId * p;
+  const int32_t n = total - r0 < p ? total - r0 : p;
+  if (n <= 0) {
+    return p;
+  }
+  float* const sc = reinterpret_cast<float*>(arena + kDScOff);
+  bfloat16_t* const g = reinterpret_cast<bfloat16_t*>(arena + kDGOff);
+  bfloat16_t* const u = reinterpret_cast<bfloat16_t*>(arena + kDUOff);
+  float* const g32 = reinterpret_cast<float*>(arena + kDG32Off);
+  float* const u32 = reinterpret_cast<float*>(arena + kDU32Off);
+  float* const gs = reinterpret_cast<float*>(arena + kDGsOff);
+  int8_t* const q = reinterpret_cast<int8_t*>(arena + kDQ8Off);
+  float* const smd = reinterpret_cast<float*>(arena + kDSmOff);
+  float* const mxd = reinterpret_cast<float*>(arena + kDMxOff);
+  int32_t expert_of[kDecodePerCore];
+  int32_t e = 0, cum = 0;
+  for (int32_t j = 0; j < n; ++j) {
+    while (cum + cnt[e] <= r0 + j) {
+      cum += cnt[e];
+      ++e;
+    }
+    expert_of[j] = e;
+  }
+  const bfloat16_t* src = input + static_cast<int64_t>(r0) * (2 * w);
+  load_io0(g, src, w * 2, w * 2, w * 4, n - 1);
+  load_io0(u, src + w, w * 2, w * 2, w * 4, n - 1);
+  const float* smooth_ptr[kDecodePerCore];
+  for (int32_t j = 0; j < n; ++j) {
+    if (j > 0 && expert_of[j] == expert_of[j - 1]) {
+      smooth_ptr[j] = smooth_ptr[j - 1];
+    } else {
+      smooth_ptr[j] = smd + j * w;
+      load_io0(smd + j * w,
+               smooth + static_cast<int64_t>(expert_of[j]) * w,
+               w * 4,
+               w * 4,
+               w * 4,
+               0);
+    }
+  }
+  const int32_t ne = n * w;
+  const bfloat16_t lim16 = static_cast<bfloat16_t>(limit);
+  __sync_io();
+  __bang_mineq_scalar(g, g, lim16, ne);
+  __bang_bfloat162float(g32, g, ne);
+  __bang_bfloat162float(u32, u, ne);
+  __bang_active_sigmoid(gs, g32, ne);
+  __bang_mul(gs, gs, g32, ne);
+  for (int32_t j = 0; j < n; ++j) {
+    chain_row(u32 + j * w, u32 + j * w, gs + j * w, smooth_ptr[j], limit, w);
+  }
+  for (int32_t j = 0; j < n; ++j) {
+    absmax_row(mxd + j, u32 + j * w, w);
+  }
+  __sync_compute();
+  for (int32_t j = 0; j < n; ++j) {
+    const float m = mxd[j];
+    sc[j] = m * kInt8ScaleFactor;
+    mult_cvt_row(q + j * w, u32 + j * w, 127.f / m, w);
+  }
+  __sync_compute();
+  store_io1(output + static_cast<int64_t>(r0) * w, q, w, w, w, n - 1);
+  __memcpy(staged + coreId * p, sc, n * sizeof(float), NRAM2SRAM);
+  __sync_io();
+  return p;
+}
+
+__mlu_func__ int32_t act_large(int8_t* arena,
+                               const int32_t* cnt,
+                               const bfloat16_t* input,
+                               int8_t* output,
+                               float* scales,
+                               float* staged,
+                               const float* smooth,
+                               int32_t experts,
+                               int32_t total,
+                               int32_t w,
+                               float limit) {
+#define GB(s) (reinterpret_cast<bfloat16_t*>(arena + kGbOff) + (s) * kActE)
+#define UB(s) (reinterpret_cast<bfloat16_t*>(arena + kUbOff) + (s) * kActE)
+#define FA(s) (reinterpret_cast<float*>(arena + kFaOff) + (s) * kActE)
+#define FB(s) (reinterpret_cast<float*>(arena + kFbOff) + (s) * kActE)
+#define FC (reinterpret_cast<float*>(arena + kFcOff))
+#define Q8(s) (reinterpret_cast<int8_t*>(arena + kQ8Off) + (s) * kActE)
+#define SM(s) (reinterpret_cast<float*>(arena + kSmOff) + (s) * kMaxWidth)
+#define MX(s) \
+  (reinterpret_cast<float*>(arena + kMxOff) + (s) * (kActRows * 4 + 16))
+#define SBUF(s) \
+  (reinterpret_cast<float*>(arena + kSbufOff) + (s) * (kActRows + 16))
+  const int32_t per = (total + taskDim - 1) / taskDim;
+  const int32_t r0 = taskId * per;
+  const int32_t r1 = r0 + per < total ? r0 + per : total;
+  const bool stage = per <= kStageRows;
+  if (r0 >= r1) {
+    return stage ? per : 0;
+  }
+  float* const sc_all = reinterpret_cast<float*>(arena + kScAllOff);
+  int32_t e = 0, base = 0;
+  while (e < experts && base + cnt[e] <= r0) {
+    base += cnt[e];
+    ++e;
+  }
+  int32_t eend = base + cnt[e];
+  const bfloat16_t lim16 = static_cast<bfloat16_t>(limit);
+  int32_t trow[kRing], tn[kRing], texp[kRing], tsm[kRing];
+  int32_t row = r0, issued = 0, sm_exp = -1, sm_cur = 1;
+  for (int32_t i = 0;; ++i) {
+    {  // STORE t = i-5
+      const int32_t t = i - 5;
+      if (t >= 0 && t < issued) {
+        const int32_t s = t & 1, d = t & (kRing - 1);
+        store_io1(output + static_cast<int64_t>(trow[d]) * w,
+                  Q8(s),
+                  w,
+                  w,
+                  w,
+                  tn[d] - 1);
+        if (!stage) {
+          store_io1(scales + trow[d], SBUF(s), tn[d] * sizeof(float), 0, 0, 0);
+        }
+      }
+    }
+    if (row < r1) {  // LOAD t = i
+      const int32_t t = i, d = t & (kRing - 1), s3 = t % 3;
+      while (row >= eend) {
+        ++e;
+        eend += cnt[e];
+      }
+      int32_t n = r1 - row;
+      n = n < eend - row ? n : eend - row;
+      n = n < kActRows ? n : kActRows;
+      trow[d] = row;
+      tn[d] = n;
+      texp[d] = e;
+      const bfloat16_t* src = input + static_cast<int64_t>(row) * (2 * w);
+      load_io0(GB(s3), src, w * 2, w * 2, w * 4, n - 1);
+      load_io0(UB(s3), src + w, w * 2, w * 2, w * 4, n - 1);
+      row += n;
+      issued = i + 1;
+    }
+    {  // CVT t = i-2 (+ smooth load)
+      const int32_t t = i - 2;
+      if (t >= 0 && t < issued) {
+        const int32_t d = t & (kRing - 1), s3 = t % 3, s = t & 1;
+        const int32_t ne = tn[d] * w;
+        move_cvt_bf16_f32(FA(s), GB(s3), ne * 2);
+        move_cvt_bf16_f32(FB(s3), UB(s3), ne * 2);
+        if (texp[d] != sm_exp) {
+          sm_exp = texp[d];
+          sm_cur ^= 1;
+          load_io0(SM(sm_cur),
+                   smooth + static_cast<int64_t>(sm_exp) * w,
+                   w * 4,
+                   w * 4,
+                   w * 4,
+                   0);
+        }
+        tsm[d] = sm_cur;
+      }
+    }
+    {  // MAIN t = i-3
+      const int32_t t = i - 3;
+      if (t >= 0 && t < issued) {
+        const int32_t d = t & (kRing - 1), s = t & 1, s3 = t % 3;
+        const int32_t n = tn[d], ne = n * w;
+        __bang_active_sigmoid(FC, FA(s), ne);
+        __bang_mul(FC, FC, FA(s), ne);
+        for (int32_t r = 0; r < n; ++r) {
+          chain_row(
+              FB(s3) + r * w, FB(s3) + r * w, FC + r * w, SM(tsm[d]), limit, w);
+        }
+        for (int32_t r = 0; r < n; ++r) {
+          absmax_row(MX(s) + r, FB(s3) + r * w, w);
+        }
+      }
+    }
+    {  // CLAMP t = i-1 (gate only; the up clamp is part of the fused chain)
+      const int32_t t = i - 1;
+      if (t >= 0 && t < issued) {
+        const int32_t d = t & (kRing - 1), s3 = t % 3;
+        __bang_mineq_scalar(GB(s3), GB(s3), lim16, tn[d] * w);
+      }
+    }
+    {  // QUANT t = i-4
+      const int32_t t = i - 4;
+      if (t >= 0 && t < issued) {
+        const int32_t d = t & (kRing - 1), s = t & 1, s3 = t % 3;
+        const int32_t n = tn[d];
+        for (int32_t r = 0; r < n; ++r) {
+          const float m = MX(s)[r];
+          SBUF(s)[r] = m * kInt8ScaleFactor;
+          if (stage) {
+            sc_all[trow[d] - r0 + r] = m * kInt8ScaleFactor;
+          }
+          mult_cvt_row(Q8(s) + r * w, FB(s3) + r * w, 127.f / m, w);
+        }
+      }
+    }
+    __sync();
+    if (i >= issued + 4) {
+      break;
+    }
+  }
+  if (stage) {
+    __memcpy(
+        staged + coreId * per, sc_all, (r1 - r0) * sizeof(float), NRAM2SRAM);
+  }
+  return stage ? per : 0;
+}
+
+__mlu_global__ void fused_moe_ffn_kernel(bfloat16_t* output,
+                                         void* workspace,
+                                         const int8_t* input,
+                                         const float* input_scale,
+                                         const int8_t* weight13,
+                                         const int8_t* weight2,
+                                         const float* scale13,
+                                         const float* scale2,
+                                         const float* smooth,
+                                         const int32_t* token_count,
+                                         int32_t rows,
+                                         int32_t experts,
+                                         float clamp_limit,
+                                         bool scale16,
+                                         int64_t skip_rows) {
+  __nram__ int8_t arena[kArenaBytes] __attribute__((aligned(128)));
+  __nram__ int32_t counts[kMaxExperts];
+  __nram__ int32_t table_buf[kTableHead + 2 * kMaxTable]
+      __attribute__((aligned(64)));
+  __wram__ int8_t wram[512 * 1024];
+  __mlu_shared__ int8_t shared[kSharedBytes] __attribute__((aligned(128)));
+  __mlu_shared__ int32_t published[kTableHead + 2 * kMaxTable]
+      __attribute__((aligned(128)));
+  __mlu_shared__ float act_scales[4 * kStageRows] __attribute__((aligned(128)));
+  __mlu_shared__ int32_t act_meta[32] __attribute__((aligned(128)));
+  __nram__ int32_t meta_buf[16] __attribute__((aligned(64)));
+  const bool ipu = __is_ipu();
+  if (ipu) {
+    __memcpy_async(counts, token_count, experts * sizeof(int32_t), GDRAM2NRAM);
+    __bang_write_value(reinterpret_cast<float*>(arena), 4096, 1.0f);
+    __sync_compute();
+    __memcpy_async(wram + kOnesLt, arena, 16384, NRAM2WRAM);
+    __sync_io();
+  }
+  // All scheduling is decided on the IPUs; the MPU only follows the table
+  // that core 0 of its cluster publishes in SRAM.
+  // One pass over the counts (a scalar NRAM access costs ~22 ns): intersect
+  // with [skip_rows, skip_rows + rows), write back only when changed, and
+  // gather unit statistics.
+  int32_t remaining = rows;
+  int32_t units = 0;
+  int32_t real_units = 0;  // units of at least kRealUnitMinRows rows
+  int32_t small_units = 0;
+  int32_t min_rows = 1 << 30;  // smallest / largest unit
+  int32_t max_rows = 0;
+  int32_t top_rows = 0;   // rows of the largest expert
+  int32_t big_units = 0;  // units of more than kHalveRows rows
+  int32_t mid_rows = 0;   // largest unit of at most kHalveRows rows
+  for (int32_t expert = 0; ipu && expert < experts; ++expert) {
+    const int32_t raw_in = counts[expert];
+    const int32_t original = raw_in > 0 ? raw_in : 0;
+    const int32_t skipped =
+        skip_rows < original ? static_cast<int32_t>(skip_rows) : original;
+    skip_rows -= skipped;
+    const int32_t raw = original - skipped;
+    const int32_t count = raw < 0 ? 0 : (raw < remaining ? raw : remaining);
+    if (count != raw_in) {
+      counts[expert] = count;
+    }
+    if (count > 0) {
+      remaining -= count;
+      const int32_t nu = unit_count(count);
+      units += nu;
+      // Units hold count/nu rows, the first count%nu of them one more.
+      const int32_t base = count / nu;
+      if (base >= kRealUnitMinRows) {
+        real_units += nu;
+      }
+      small_units += base + 1 < kBigRows
+                         ? nu
+                         : (base < kBigRows ? nu - (count - base * nu) : 0);
+      min_rows = base < min_rows ? base : min_rows;
+      max_rows = base > max_rows ? base : max_rows;
+      top_rows = count > top_rows ? count : top_rows;
+      if (base > kHalveRows) {
+        big_units += nu;
+      } else {
+        mid_rows = base > mid_rows ? base : mid_rows;
+      }
+    }
+  }
+  const int32_t valid = rows - remaining;
+  // Few units cannot fill the eight clusters evenly; when heavy units coexist
+  // with tiny (<32-row) stragglers at <16 units, schedule bump/parts against
+  // `real_units` so tiny units do not steal cluster slots or trigger spurious
+  // halving.
+  const bool mixed_few =
+      real_units >= 2 && real_units < units && units < kGreedyUnits;
+  int32_t u_sched = mixed_few ? real_units : units;
+  int32_t bump = -1;
+  int32_t bump_n = 0;
+  int32_t hthr = 1 << 20;
+  if (u_sched < clusterDim && u_sched != 4 && top_rows >= kFewRows &&
+      2 * top_rows > valid) {
+    const int32_t target = u_sched < 4 ? 4 : (mixed_few ? 0 : clusterDim);
+    if (target > 0) {
+      const int32_t nu2 = unit_count(top_rows) + target - u_sched;
+      if (top_rows >= nu2 * (target == 4 ? kFewMinRows4 : kFewMinRows8)) {
+        bump_n = target - u_sched;
+        units += bump_n;
+        u_sched += bump_n;
+        max_rows = top_rows / nu2 > mid_rows ? top_rows / nu2 : mid_rows;
+        for (bump = 0; counts[bump] != top_rows; ++bump) {
+        }
+      }
+    }
+  }
+  if (!mixed_few && bump < 0 && big_units > 0 && units < kGreedyUnits) {
+    int32_t span = 0;
+    int32_t span2 = 0;
+    choose_parts(units, max_rows, span);
+    const int32_t rows2 = max_rows / 2 > mid_rows ? max_rows / 2 : mid_rows;
+    choose_parts(units + big_units, rows2, span2);
+    if (span2 * (rows2 + kFixRows) < span * (max_rows + kFixRows)) {
+      hthr = kHalveRows;
+      units += big_units;
+      u_sched = units;
+      max_rows = rows2;
+      min_rows = min_rows > kHalveRows ? min_rows / 2 : min_rows;
+    }
+  }
+  // Units differ in cost: round-robin ownership would overload some clusters.
+  const bool uneven = units > 1 && unit_cost(max_rows) * 100 >
+                                       unit_cost(min_rows) * (100 + kUnevenPct);
+  // Balancing costs scalar time on every core: only when sizes are mixed and
+  // even a worst-case small-unit pile-up fits the per-cluster table.
+  const bool balanced =
+      small_units > 0 &&
+      (units >= kSplitUnits ? small_units < units || uneven
+                            : uneven && units >= kGreedyUnits) &&
+      (units - small_units + clusterDim - 1) / clusterDim + small_units +
+              kSplitLast * (kSmallParts - 1) <=
+          kMaxTable;
+  // Few units: every unit is split into `parts` tile subsets so that all
+  // clusters stay busy (both stages have at least 16 tiles).
+  int32_t span = 0;
+  const int32_t parts = choose_parts(uneven ? u_sched : units, max_rows, span);
+  // Equal units beyond a multiple of the cluster count (see table_build).
+  const int32_t rem = !balanced && !uneven && units > clusterDim &&
+                              units < kSplitUnits &&
+                              units % clusterDim <= kRem8Max
+                          ? units % clusterDim
+                          : 0;
+  const int32_t split_from = rem > 0 ? units - rem : small_units - kSplitLast;
+  UnitTable table = {
+      table_buf + kTableHead, table_buf + kTableHead + kMaxTable, 0};
+  if (ipu) {
+    table_build(table,
+                counts,
+                experts,
+                parts,
+                balanced,
+                split_from,
+                uneven && units < kSplitUnits,
+                bump,
+                bump_n,
+                rem,
+                hthr);
+    if (coreId == 0) {
+      table_buf[0] = table.n;
+      __memcpy(published, table_buf, sizeof(table_buf), NRAM2SRAM);
+    }
+  }
+  __sync();
+  __sync_cluster();
+  // GEMM1 fits in the final output. All clusters finish reading it in the
+  // activation stage before GEMM2 starts overwriting that storage.
+  static_assert(2 * kFfnIntermediate <= kFfnHidden);
+  bfloat16_t* gemm1 = output;
+  int8_t* quant = static_cast<int8_t*>(workspace);
+  float* quant_scale = reinterpret_cast<float*>(
+      quant + static_cast<int64_t>(rows) * kFfnIntermediate);
+  const Geo g1 = make_geo(kFfnHidden, 2 * kFfnIntermediate, 4, 192, 4, scale16);
+  const Geo g2 = make_geo(kFfnIntermediate, kFfnHidden, 3, 256, 3, scale16);
+  gemm_stage(arena,
+             wram,
+             shared,
+             published,
+             gemm1,
+             input,
+             input_scale,
+             weight13,
+             scale13,
+             g1,
+             table);
+  __sync();
+  __sync_all();
+  int32_t stride = 0;
+  if (ipu && valid > 0) {
+    if (valid <= kDecodePerCore * taskDim) {
+      stride = act_small(arena,
+                         counts,
+                         gemm1,
+                         quant,
+                         act_scales,
+                         smooth,
+                         valid,
+                         kFfnIntermediate,
+                         clamp_limit);
+    } else {
+      stride = act_large(arena,
+                         counts,
+                         gemm1,
+                         quant,
+                         quant_scale,
+                         act_scales,
+                         smooth,
+                         experts,
+                         valid,
+                         kFfnIntermediate,
+                         clamp_limit);
+    }
+  }
+  if (ipu) {
+    if (coreId == 0) {
+      // Rows [first, first + count) of this cluster's cores are staged
+      // contiguously in SRAM.
+      const int32_t first = clusterId * coreDim * stride;
+      const int32_t left = valid - first;
+      meta_buf[0] =
+          left <= 0 ? 0 : (left < coreDim * stride ? left : coreDim * stride);
+      meta_buf[1] = first;
+      __memcpy(act_meta, meta_buf, 2 * sizeof(int32_t), NRAM2SRAM);
+    }
+    __sync_cluster();
+  } else {
+    __sync_cluster();
+    const int32_t count = __load_sram(act_meta);
+    if (count > 0) {
+      __memcpy(quant_scale + __load_sram(act_meta + 1),
+               act_scales,
+               count * sizeof(float),
+               SRAM2GDRAM);
+    }
+  }
+  __sync();
+  __sync_all();
+  gemm_stage(arena,
+             wram,
+             shared,
+             published,
+             output,
+             quant,
+             quant_scale,
+             weight2,
+             scale2,
+             g2,
+             table);
+  __sync();
+  __sync_all();
+}
+
+}  // namespace
+
+void fused_moe_ffn_launch(void* queue,
+                          void* output,
+                          void* workspace,
+                          const int8_t* input,
+                          const float* input_scale,
+                          const int8_t* weight13,
+                          const int8_t* weight2,
+                          const void* scale13,
+                          const void* scale2,
+                          const float* smooth,
+                          const int32_t* counts,
+                          int32_t rows,
+                          int32_t experts,
+                          float limit,
+                          bool scale16,
+                          int64_t skip_rows) {
+  const cnrtDim3_t dim = {32, 1, 1};
+  fused_moe_ffn_kernel<<<dim,
+                         cnrtFuncTypeUnion8,
+                         static_cast<cnrtQueue_t>(queue)>>>(
+      static_cast<bfloat16_t*>(output),
+      workspace,
+      input,
+      input_scale,
+      weight13,
+      weight2,
+      static_cast<const float*>(scale13),
+      static_cast<const float*>(scale2),
+      smooth,
+      counts,
+      rows,
+      experts,
+      limit,
+      scale16,
+      skip_rows);
+}
+}  // namespace xllm::kernel::mlu::bangc

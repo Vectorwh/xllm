@@ -140,6 +140,8 @@ void WorkerServer::create_server(const runtime::Options& options,
   // std::make_unique<LLMWorkerImpl>(...);
   // std::unique_ptr<WorkerServiceImpl> worker_service_impl =
   //    std::make_unique<WorkerServiceImpl>(worker_impl);
+  // Release the worker and its model layers before their process groups.
+  std::unique_ptr<CollectiveCommunicatorBase> comm;
   auto worker_service = std::make_shared<WorkerService>(options, device);
 
   std::string addr = net::get_route_ip(master_node_addr);
@@ -173,7 +175,6 @@ void WorkerServer::create_server(const runtime::Options& options,
   }
 
   const ParallelArgs* parallel_args = nullptr;
-  std::unique_ptr<CollectiveCommunicatorBase> comm;
   if (worker_type == WorkerType::DIT) {
     auto dit_comm = std::make_unique<DiTCollectiveCommunicator>(
         worker_global_rank,
