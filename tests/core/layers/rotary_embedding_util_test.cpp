@@ -87,6 +87,84 @@ TEST(RotaryEmbeddingUtilTest, RealSectionsProduceInterleavedMrope) {
   EXPECT_TRUE(sin.is_contiguous());
 }
 
+TEST(RotaryEmbeddingUtilTest, QwenYarnScalesInterleavedMropeAtMillionTokens) {
+  ModelArgs args;
+  args.head_dim() = 256;
+  args.partial_rotary_factor() = 0.25f;
+  args.rope_theta() = 10000000.0f;
+  args.max_position_embeddings() = 1000000;
+  args.rope_scaling_original_max_position_embeddings() = 262144;
+  args.rope_scaling_factor() = 4.0f;
+  args.rope_scaling_beta_fast() = 32;
+  args.rope_scaling_beta_slow() = 1;
+  auto cache = rotary::get_qwen_mrope_cache(args, torch::TensorOptions());
+  auto positions = torch::tensor(
+      {{0, 262144, 999999}, {0, 262145, 999999}, {0, 262146, 999997}},
+      torch::kLong);
+  auto [cos, sin] = rotary::apply_mrope(cache, positions, kMropeSection);
+
+  // Static YaRN reference for original length 262144 and factor 4.
+  EXPECT_EQ(cache.size(0), 1000000);
+  EXPECT_NEAR(cos[0][0].item<float>(), 1.1386294f, 1e-6f);
+  EXPECT_NEAR(sin[1][18].item<float>(), 0.0800844f, 1e-5f);
+  EXPECT_NEAR(sin[2][31].item<float>(), 0.0470921f, 1e-6f);
+  EXPECT_NEAR(sin[2][20].item<float>(), -0.4438114f, 1e-5f);
+}
+
+TEST(RotaryEmbeddingUtilTest, QwenYarnSharesOnlyMatchingServingWindows) {
+  ModelArgs args;
+  args.head_dim() = kRotaryDim;
+  args.partial_rotary_factor() = 1.0f;
+  args.rope_theta() = 10000.0f;
+  args.max_position_embeddings() = kMaxPositions;
+  args.rope_scaling_original_max_position_embeddings() = kMaxPositions;
+  args.rope_scaling_factor() = 2.0f;
+  args.rope_scaling_beta_fast() = 32.0f;
+  args.rope_scaling_beta_slow() = 1.0f;
+  args.rope_scaling_attn_factor() = 1.25f;
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+
+  const auto target = rotary::get_qwen_mrope_cache(args, options);
+  const auto draft = rotary::get_qwen_mrope_cache(args, options);
+  EXPECT_EQ(target.data_ptr(), draft.data_ptr());
+  EXPECT_EQ(target.size(0), kMaxPositions);
+
+  // Matching frequency and magnitude still produce a longer generic cache.
+  const auto scaled =
+      rotary::get_deepseek_rotary_embedding(args.head_dim(),
+                                            kRotaryDim,
+                                            kMaxPositions,
+                                            kMaxPositions,
+                                            args.rope_theta(),
+                                            /*interleaved=*/false,
+                                            args.rope_scaling_factor(),
+                                            /*extrapolation_factor=*/1.0f,
+                                            args.rope_scaling_attn_factor(),
+                                            args.rope_scaling_beta_fast(),
+                                            args.rope_scaling_beta_slow(),
+                                            /*mscale=*/1.0f,
+                                            /*mscale_all_dim=*/1.0f,
+                                            options);
+  EXPECT_EQ(scaled.size(0), 2 * kMaxPositions);
+
+  args.max_position_embeddings() = kMaxPositions / 2;
+  const auto shorter = rotary::get_qwen_mrope_cache(args, options);
+  EXPECT_EQ(shorter.size(0), kMaxPositions / 2);
+}
+
+TEST(RotaryEmbeddingUtilTest, FractionalYarnBetaSetsFrequencyRamp) {
+  auto frequencies = rotary::compute_yarn_inv_freq(
+      /*factor=*/4.0f,
+      /*extrapolation_factor=*/1,
+      /*beta_fast=*/2.0f,
+      /*beta_slow=*/0.5f,
+      /*rotary_dim=*/16,
+      /*theta=*/10000.0f,
+      /*old_context_len=*/64);
+  // The correction range is [1, 3]. Index 2 blends 0.1 and 0.025 equally.
+  EXPECT_NEAR(frequencies[2].item<float>(), 0.0625f, 1e-7f);
+}
+
 TEST(RotaryEmbeddingUtilTest, OneDimensionalPositionsMatchExpandedPositions) {
   torch::Tensor cos_sin_cache = make_cache();
   torch::Tensor positions = torch::tensor({1, 2, 3}, torch::kLong);

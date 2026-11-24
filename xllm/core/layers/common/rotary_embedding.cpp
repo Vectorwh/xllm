@@ -227,7 +227,7 @@ DeepseekScalingRotaryEmbeddingImpl::DeepseekScalingRotaryEmbeddingImpl(
     : head_size_(head_size),
       rotary_dim_(rotary_dim),
       interleaved_(interleaved) {
-  auto inv_freq = rotary::apply_deepseek_yarn_rope_scaling(
+  auto inv_freq = rotary::compute_yarn_inv_freq(
       scaling_factor,
       extrapolation_factor,
       beta_fast,

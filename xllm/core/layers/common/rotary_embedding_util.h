@@ -33,13 +33,13 @@ namespace rotary {
 
 float yarn_get_mscale(float scale, float mscale);
 
-torch::Tensor apply_deepseek_yarn_rope_scaling(float factor,
-                                               int64_t extrapolation_factor,
-                                               int64_t beta_fast,
-                                               int64_t beta_slow,
-                                               int64_t rotary_dim,
-                                               float theta,
-                                               int64_t old_context_len);
+torch::Tensor compute_yarn_inv_freq(float factor,
+                                    int64_t extrapolation_factor,
+                                    float beta_fast,
+                                    float beta_slow,
+                                    int64_t rotary_dim,
+                                    float theta,
+                                    int64_t old_context_len);
 torch::Tensor compute_inv_freq(int64_t rotary_dim,
                                float rope_theta,
                                const torch::TensorOptions& options);
@@ -95,6 +95,9 @@ torch::Tensor get_concat_rotary_embedding(int64_t dim,
                                           int64_t seq_len,
                                           double rope_theta,
                                           const torch::TensorOptions& options);
+
+torch::Tensor get_qwen_mrope_cache(const ModelArgs& args,
+                                   const torch::TensorOptions& options);
 
 std::pair<torch::Tensor, torch::Tensor> apply_mrope(
     const torch::Tensor& cos_sin_cache,

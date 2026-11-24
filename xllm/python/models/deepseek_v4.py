@@ -547,7 +547,7 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        # Match C++ rotary::apply_deepseek_yarn_rope_scaling() and
+        # Match C++ rotary::compute_yarn_inv_freq() and
         # create_cos_sin_tensor(): build the cache in CPU float32, then perform
         # one final transfer/conversion to the model device and dtype. Computing
         # pow/cos/sin directly on NPU can change BF16 cache entries by one ULP.

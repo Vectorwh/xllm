@@ -36,14 +36,8 @@ class Qwen3_5MtpModelImpl final : public Qwen3_5MtpModelImplBase {
       return;
     }
 
-    const ModelArgs& args = context.get_model_args();
-    const int64_t rotary_dim =
-        static_cast<int64_t>(args.head_dim() * args.partial_rotary_factor());
-    cos_sin_ = layer::rotary::get_concat_rotary_embedding(
-        rotary_dim,
-        args.max_position_embeddings(),
-        args.rope_theta(),
-        context.get_tensor_options());
+    cos_sin_ = layer::rotary::get_qwen_mrope_cache(
+        context.get_model_args(), context.get_tensor_options());
   }
 
  protected:

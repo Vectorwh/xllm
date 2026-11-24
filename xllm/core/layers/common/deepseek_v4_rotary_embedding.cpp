@@ -214,14 +214,13 @@ torch::Tensor DeepseekV4RotaryEmbedding::create_cos_sin_cache(
     // The generic YaRN helper takes extrapolation_factor as its second
     // argument.  DeepSeek V4 uses the scaled inv_freq only, so keep the
     // extrapolation multiplier at 1 to match the model's expected cache.
-    inv_freq = rotary::apply_deepseek_yarn_rope_scaling(
-        scaling_factor,
-        1,
-        beta_fast,
-        beta_slow,
-        rotary_dim_,
-        theta,
-        original_max_position_embeddings);
+    inv_freq = rotary::compute_yarn_inv_freq(scaling_factor,
+                                             1,
+                                             beta_fast,
+                                             beta_slow,
+                                             rotary_dim_,
+                                             theta,
+                                             original_max_position_embeddings);
   }
 
   // The following four literals are the generic cache builder's

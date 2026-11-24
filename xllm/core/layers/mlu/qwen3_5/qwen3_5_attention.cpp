@@ -129,18 +129,6 @@ Qwen3_5AttentionImpl::Qwen3_5AttentionImpl(const ModelArgs& args,
                                     scaling_,
                                     num_kv_heads_,
                                     args.sliding_window()));
-
-  // 6. Rotary embedding
-  const int32_t rotary_dim =
-      static_cast<int32_t>(head_dim_ * args.partial_rotary_factor());
-  rotary_emb_ =
-      register_module("rope",
-                      MRotaryEmbedding(rotary_dim,
-                                       args.max_position_embeddings(),
-                                       args.rope_theta(),
-                                       /*interleaved=*/false,
-                                       args.rope_scaling_mrope_section(),
-                                       options));
 }
 
 void Qwen3_5AttentionImpl::rotary_emb_forward(

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -25,6 +26,7 @@ limitations under the License.
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/rotary_embedding_util.h"
+#include "core/platform/platform.h"
 #include "core/util/model_config_utils.h"
 #include "models/model_registry.h"
 #include "models/vlm/mposition/mposition.h"
@@ -86,13 +88,7 @@ class Qwen3_5ModelImpl final
     dp_size_ = parallel_args.dp_size();
 
     if (!mrope_section_.empty()) {
-      int64_t rotary_dim = static_cast<int64_t>(
-          model_args.head_dim() * model_args.partial_rotary_factor());
-      cos_sin_ = layer::rotary::get_concat_rotary_embedding(
-          rotary_dim,
-          model_args.max_position_embeddings(),
-          model_args.rope_theta(),
-          options);
+      cos_sin_ = layer::rotary::get_qwen_mrope_cache(model_args, options);
     }
 
     layers_.reserve(model_args.n_layers());
@@ -223,6 +219,46 @@ using Qwen3_5ForConditionalGenerationImpl =
                                         Qwen3_5ForCausalLM>;
 TORCH_MODULE(Qwen3_5ForConditionalGeneration);
 
+namespace detail {
+
+inline void load_qwen3_5_rope_scaling(const JsonReader& json, ModelArgs* args) {
+  if (args->rope_scaling_rope_type() == "yarn") {
+    CHECK(Platform::is_mlu()) << "Qwen3.5 YaRN requires the MLU backend";
+    LOAD_ARG(rope_scaling_factor, "text_config.rope_parameters.factor");
+    LOAD_ARG(rope_scaling_original_max_position_embeddings,
+             "text_config.rope_parameters.original_max_position_embeddings");
+    LOAD_ARG_OR(
+        rope_scaling_beta_fast, "text_config.rope_parameters.beta_fast", 32);
+    LOAD_ARG_OR(
+        rope_scaling_beta_slow, "text_config.rope_parameters.beta_slow", 1);
+    LOAD_ARG(rope_scaling_attn_factor,
+             "text_config.rope_parameters.attention_factor");
+    const int64_t original =
+        args->rope_scaling_original_max_position_embeddings();
+    const double factor = args->rope_scaling_factor();
+    const double scaled = original * factor;
+    CHECK_GT(original, 0);
+    CHECK_GE(factor, 1.0);
+    CHECK_LE(scaled, std::numeric_limits<int32_t>::max());
+    CHECK_GE(args->rope_scaling_beta_fast(), args->rope_scaling_beta_slow());
+    CHECK_GT(args->rope_scaling_beta_slow(), 0);
+    CHECK(args->rope_scaling_mrope_interleaved());
+    CHECK_EQ(args->rope_scaling_mrope_section().size(), 3);
+    if (!json.value<int32_t>("text_config.max_position_embeddings")
+             .has_value() ||
+        args->max_position_embeddings() == original) {
+      args->max_position_embeddings() = static_cast<int64_t>(scaled);
+    }
+    CHECK_LE(args->max_position_embeddings(), scaled);
+  }
+  if (args->rope_scaling_rope_type() == "default" ||
+      args->rope_scaling_rope_type() == "yarn") {
+    args->rope_scaling_rope_type() = "mrope";
+  }
+}
+
+}  // namespace detail
+
 #define LOAD_QWEN3_5_COMMON_ARGS()                                             \
   LOAD_ARG_OR(model_type, "model_type", "qwen3_5");                            \
   LOAD_ARG_OR(dtype, "text_config.dtype", "bfloat16");                         \
@@ -275,9 +311,7 @@ TORCH_MODULE(Qwen3_5ForConditionalGeneration);
   LOAD_ARG_OR(rope_scaling_rope_type,                                          \
               "text_config.rope_parameters.rope_type",                         \
               "default");                                                      \
-  if (args->rope_scaling_rope_type() == "default") {                           \
-    args->rope_scaling_rope_type() = "mrope";                                  \
-  }                                                                            \
+  detail::load_qwen3_5_rope_scaling(json, args);                               \
   LOAD_ARG_OR(partial_rotary_factor,                                           \
               "text_config.rope_parameters.partial_rotary_factor",             \
               0.25f);                                                          \

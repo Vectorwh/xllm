@@ -126,8 +126,8 @@ struct ModelArgs {
   PROPERTY(float, rope_scaling_high_freq_factor) = 0.0f;
   PROPERTY(float, rope_extrapolation_factor) = 0.0f;
   PROPERTY(int64_t, rope_scaling_original_max_position_embeddings) = 0;
-  PROPERTY(int64_t, rope_scaling_beta_fast) = 0;
-  PROPERTY(int64_t, rope_scaling_beta_slow) = 0;
+  PROPERTY(float, rope_scaling_beta_fast) = 0.0f;
+  PROPERTY(float, rope_scaling_beta_slow) = 0.0f;
   PROPERTY(float, rope_scaling_attn_factor) = 0.0f;
   PROPERTY(float, rope_scaling_mscale) = 0.0f;
   PROPERTY(float, rope_scaling_mscale_all_dim) = 0.0f;

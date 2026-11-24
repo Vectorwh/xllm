@@ -1216,6 +1216,66 @@ TEST(HFModelLoaderTest, ModelAndSharedParserHonorCaptureAliases) {
   }
 }
 
+#if defined(USE_MLU)
+TEST(HFModelLoaderTest, Qwen35YarnExtendsContextAndKeepsMropePositions) {
+  auto loader = ModelRegistry::get_model_args_loader("qwen3_5");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "qwen3_5",
+      "text_config": {
+        "num_key_value_heads": 4,
+        "layer_types": ["full_attention"],
+        "max_position_embeddings": 262144,
+        "rope_parameters": {
+          "rope_type": "yarn",
+          "factor": 4.0,
+          "original_max_position_embeddings": 262144,
+          "mrope_interleaved": true,
+          "mrope_section": [11, 11, 10]
+        }
+      }
+    }
+  )json"));
+
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.max_position_embeddings(), 1048576);
+  EXPECT_EQ(args.rope_scaling_original_max_position_embeddings(), 262144);
+  EXPECT_FLOAT_EQ(args.rope_scaling_factor(), 4.0f);
+  EXPECT_EQ(args.rope_scaling_rope_type(), "mrope");
+  EXPECT_EQ(args.rope_scaling_mrope_section(),
+            (std::vector<int64_t>{11, 11, 10}));
+}
+
+TEST(HFModelLoaderTest, Qwen35MtpYarnHonorsExplicitWindowAndFractionalBeta) {
+  auto loader = ModelRegistry::get_model_args_loader("qwen3_5_mtp");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json({
+    "text_config": {
+      "max_position_embeddings": 16384,
+      "rope_parameters": {
+        "rope_type": "yarn", "factor": 4,
+        "original_max_position_embeddings": 32768,
+        "beta_fast": 2.5, "beta_slow": 0.5
+      }
+    }
+  })json"));
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.max_position_embeddings(), 16384);
+  EXPECT_FLOAT_EQ(args.rope_scaling_beta_fast(), 2.5f);
+  EXPECT_FLOAT_EQ(args.rope_scaling_beta_slow(), 0.5f);
+
+  reader.mutable_data()["text_config"].erase("max_position_embeddings");
+  ModelArgs implicit_window_args;
+  ASSERT_TRUE(loader(reader, &implicit_window_args));
+  EXPECT_EQ(implicit_window_args.max_position_embeddings(), 131072);
+}
+#endif
+
 TEST(HFModelLoaderTest, Qwen35MtpModelArgsFromDenseConfig) {
   auto loader = ModelRegistry::get_model_args_loader("qwen3_5_mtp");
   ASSERT_NE(loader, nullptr);

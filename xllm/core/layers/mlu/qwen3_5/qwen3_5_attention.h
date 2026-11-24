@@ -25,7 +25,6 @@ limitations under the License.
 #include "layers/common/linear.h"
 #include "layers/common/partial_rotary_embedding.h"
 #include "layers/common/qwen3_next_rms_norm.h"
-#include "layers/common/rotary_embedding.h"
 #include "layers/mlu/attention.h"
 
 namespace xllm {
@@ -74,7 +73,6 @@ class Qwen3_5AttentionImpl : public torch::nn::Module {
   Qwen3NextRMSNorm k_norm_{nullptr};
 
   Attention attn_{nullptr};
-  MRotaryEmbedding rotary_emb_{nullptr};
   torch::Tensor mrope_cu_seq_lens_;
 };
 TORCH_MODULE(Qwen3_5Attention);

@@ -88,7 +88,7 @@ std::shared_ptr<NpuRotaryEmbedding> create_rotary_embedding(
     bool interleaved,
     const torch::TensorOptions& options) {
   // rotary positional embedding
-  auto inv_freq = layer::rotary::apply_deepseek_yarn_rope_scaling(
+  auto inv_freq = layer::rotary::compute_yarn_inv_freq(
       args.rope_scaling_factor(),
       args.rope_extrapolation_factor(),
       args.rope_scaling_beta_fast(),

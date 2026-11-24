@@ -21,6 +21,7 @@ limitations under the License.
 #include <boost/algorithm/string.hpp>
 #include <cmath>
 #include <memory>
+#include <mutex>
 
 #include "core/common/global_flags.h"
 #include "core/platform/device.h"
@@ -58,29 +59,30 @@ struct CosSinCacheDescHash {
 };
 
 // Cache manager for cos_sin_cache sharing
-class CosSinCacheManager {
+class CosSinCacheManager final {
  public:
-  static CosSinCacheManager& get_instance() {
-    static CosSinCacheManager instance;
-    return instance;
-  }
-
   torch::Tensor get_or_create_cache(const layer::rotary::CosSinCacheDesc& key,
                                     std::function<torch::Tensor()> factory) {
-    auto it = cache_.find(key);
-    if (it != cache_.end()) {
-      return it->second;  // Return shared tensor
-    }
-    // Create new and cache it
-    auto tensor = factory();
-    cache_[key] = tensor;
-    return tensor;
+    Entry& entry = get_entry(key);
+    std::call_once(entry.once,
+                   [&entry, &factory]() { entry.tensor = factory(); });
+    return entry.tensor;
   }
 
  private:
-  std::unordered_map<layer::rotary::CosSinCacheDesc,
-                     torch::Tensor,
-                     CosSinCacheDescHash>
+  struct Entry {
+    std::once_flag once;
+    torch::Tensor tensor;
+  };
+
+  Entry& get_entry(const layer::rotary::CosSinCacheDesc& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Entries are never erased and references remain valid across rehashes.
+    return cache_[key];
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<layer::rotary::CosSinCacheDesc, Entry, CosSinCacheDescHash>
       cache_;
 };
 
@@ -88,27 +90,27 @@ using torch::indexing::None;
 using ISlice = torch::indexing::Slice;
 
 // Inverse dim formula to find dim based on number of rotations
-inline double yarn_find_correction_dim(int num_rotations,
-                                       int dim,
+inline double yarn_find_correction_dim(float num_rotations,
+                                       int64_t dim,
                                        float theta,
-                                       int max_position_embeddings) {
+                                       int64_t max_position_embeddings) {
   return (dim *
           std::log(max_position_embeddings / (num_rotations * 2 * M_PI))) /
          (2 * std::log(theta));
 }
 
 // Find dim range bounds based on rotations
-inline std::tuple<int, int> yarn_find_correction_range(
-    int low_rot,
-    int high_rot,
-    int dim,
+inline std::tuple<int64_t, int64_t> yarn_find_correction_range(
+    float low_rot,
+    float high_rot,
+    int64_t dim,
     float theta,
-    int max_position_embeddings) {
-  int low = std::floor(
-      yarn_find_correction_dim(low_rot, dim, theta, max_position_embeddings));
-  int high = std::ceil(
-      yarn_find_correction_dim(high_rot, dim, theta, max_position_embeddings));
-  return std::make_tuple(std::max(low, 0), std::min(high, dim - 1));
+    int64_t max_position_embeddings) {
+  const int64_t low = static_cast<int64_t>(std::floor(
+      yarn_find_correction_dim(low_rot, dim, theta, max_position_embeddings)));
+  const int64_t high = static_cast<int64_t>(std::ceil(
+      yarn_find_correction_dim(high_rot, dim, theta, max_position_embeddings)));
+  return std::make_tuple(std::max<int64_t>(low, 0), std::min(high, dim - 1));
 }
 
 // Create cos_sin tensor for rotary embedding cache
@@ -277,20 +279,19 @@ float yarn_get_mscale(float scale, float mscale) {
   return 0.1 * mscale * std::log(scale) + 1.0;
 }
 
-torch::Tensor apply_deepseek_yarn_rope_scaling(float factor,
-                                               int64_t extrapolation_factor,
-                                               int64_t beta_fast,
-                                               int64_t beta_slow,
-                                               int64_t rotary_dim,
-                                               float theta,
-                                               int64_t old_context_len) {
+torch::Tensor compute_yarn_inv_freq(float factor,
+                                    int64_t extrapolation_factor,
+                                    float beta_fast,
+                                    float beta_slow,
+                                    int64_t rotary_dim,
+                                    float theta,
+                                    int64_t old_context_len) {
   CHECK(rotary_dim % 2 == 0) << "rotary_dim must be even";
   const auto slice = torch::arange(0, rotary_dim, 2, torch::kFloat32);
   torch::Tensor pos_freqs = torch::pow(theta, slice / rotary_dim);
   torch::Tensor inv_freq_extrapolation = 1.0 / pos_freqs;
   torch::Tensor inv_freq_interpolation = 1.0 / (factor * pos_freqs);
-  int low, high;
-  std::tie(low, high) = yarn_find_correction_range(
+  const auto [low, high] = yarn_find_correction_range(
       beta_fast, beta_slow, rotary_dim, theta, old_context_len);
   // Get n-d rotational scaling corrected for extrapolation
   torch::Tensor inv_freq_mask =
@@ -332,7 +333,7 @@ torch::Tensor compute_cos_sin_cache(int64_t rotary_dim,
                        options.dtype().toScalarType()};
 
   // Get or create cache using cache manager
-  auto& cache_manager = CosSinCacheManager::get_instance();
+  static CosSinCacheManager cache_manager;
   return cache_manager.get_or_create_cache(desc, [&]() {
     return create_cos_sin_tensor(max_position_embeddings,
                                  scaling_factor,
@@ -366,6 +367,52 @@ torch::Tensor get_concat_rotary_embedding(int64_t dim,
                                           double rope_theta,
                                           const torch::TensorOptions& options) {
   return compute_rotary_embedding(dim, seq_len, rope_theta, options, true);
+}
+
+torch::Tensor get_qwen_mrope_cache(const ModelArgs& args,
+                                   const torch::TensorOptions& options) {
+  const int64_t rotary_dim =
+      static_cast<int64_t>(args.head_dim() * args.partial_rotary_factor());
+  const int64_t max_positions = args.max_position_embeddings();
+  const float factor = args.rope_scaling_factor();
+  if (factor == 0.0f) {
+    return get_concat_rotary_embedding(
+        rotary_dim, max_positions, args.rope_theta(), options);
+  }
+
+  // YaRN uses the original window for its frequency ramp. The serving
+  // window determines how many positions to materialize.
+  const auto inv_freq = compute_yarn_inv_freq(
+      factor,
+      /*extrapolation_factor=*/1,
+      args.rope_scaling_beta_fast(),
+      args.rope_scaling_beta_slow(),
+      rotary_dim,
+      args.rope_theta(),
+      args.rope_scaling_original_max_position_embeddings());
+  const float configured_attn_factor = args.rope_scaling_attn_factor();
+  const float magnitude = configured_attn_factor > 0.0f
+                              ? configured_attn_factor
+                              : yarn_get_mscale(factor, /*mscale=*/1.0f);
+  // This factory materializes the serving window; the generic cache scales it.
+  static CosSinCacheManager qwen_cache;
+  const CosSinCacheDesc desc{rotary_dim,
+                             max_positions,
+                             /*interleaved=*/false,
+                             factor,
+                             magnitude,
+                             /*mscale=*/1.0f,
+                             /*mscale_all_dim=*/1.0f,
+                             compute_inv_freq_hash(inv_freq),
+                             options.device(),
+                             options.dtype().toScalarType()};
+  return qwen_cache.get_or_create_cache(desc, [&]() {
+    const auto positions = torch::arange(max_positions, torch::kFloat32);
+    const auto freqs = torch::outer(positions, inv_freq);
+    const auto cos = (freqs.cos() * magnitude).to(options);
+    const auto sin = (freqs.sin() * magnitude).to(options);
+    return torch::cat({cos, cos, sin, sin}, /*dim=*/-1);
+  });
 }
 
 namespace {
@@ -500,14 +547,14 @@ torch::Tensor get_deepseek_rotary_embedding(
     float mscale,
     float mscale_all_dim,
     const torch::TensorOptions& options) {
-  auto inv_freq = apply_deepseek_yarn_rope_scaling(
-      scaling_factor,
-      extrapolation_factor,
-      beta_fast,
-      beta_slow,
-      rotary_dim,
-      rope_theta,
-      rope_scaling_original_max_position_embeddings);
+  auto inv_freq =
+      compute_yarn_inv_freq(scaling_factor,
+                            extrapolation_factor,
+                            beta_fast,
+                            beta_slow,
+                            rotary_dim,
+                            rope_theta,
+                            rope_scaling_original_max_position_embeddings);
   auto cos_sin = compute_cos_sin_cache(rotary_dim,
                                        max_position_embeddings,
                                        interleaved,
