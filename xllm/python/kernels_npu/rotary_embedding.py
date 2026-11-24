@@ -382,7 +382,7 @@ def wan_interleaved_rope(
     are duplicated (``repeat_interleave(2)``). ``npu_rotary_mul`` in
     ``rotary_mode="interleave"`` reproduces ``x * cos + rotate_half(x) * sin``
     exactly, but only accepts ``BSND`` activations with ``1S1D`` cos/sin tables
-    (single-batch). Multi-batch inputs fall back to the eager fp32 reference.
+    (single-batch). Multi-batch inputs apply the same NPU kernel per sample.
 
     Args:
         value: ``[B, S, H, D]`` activation.
@@ -395,13 +395,18 @@ def wan_interleaved_rope(
     if cos.dim() == 2:
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
-    if value.device.type == "npu" and value.size(0) == 1:
-        seq = cos.size(1)
-        value_bsnd = value.transpose(1, 2).contiguous()  # [1, H, S, D]
-        cos_1s1d = cos[0].reshape(1, 1, seq, cos.size(2)).contiguous()
-        sin_1s1d = sin[0].reshape(1, 1, seq, sin.size(2)).contiguous()
-        out = torch_npu.npu_rotary_mul(value_bsnd, cos_1s1d, sin_1s1d, rotary_mode="interleave")
-        return out.transpose(1, 2)
+    if value.device.type == "npu" and value.size(0) > 0:
+        outputs = []
+        for index in range(value.size(0)):
+            seq = cos.size(1)
+            value_bsnd = value[index : index + 1].transpose(1, 2).contiguous()
+            cosine = cos[0 if cos.size(0) == 1 else index]
+            sine = sin[0 if sin.size(0) == 1 else index]
+            cos_1s1d = cosine.reshape(1, 1, seq, cos.size(2)).contiguous()
+            sin_1s1d = sine.reshape(1, 1, seq, sin.size(2)).contiguous()
+            output = torch_npu.npu_rotary_mul(value_bsnd, cos_1s1d, sin_1s1d, rotary_mode="interleave")
+            outputs.append(output.transpose(1, 2))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
     return _eager_wan_interleaved_rope(value, cos, sin)
 
 

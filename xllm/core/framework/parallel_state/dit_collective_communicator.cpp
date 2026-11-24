@@ -111,13 +111,10 @@ ProcessGroup* DiTCollectiveCommunicator::create_process_group_by_type(
     auto local_rank = parallel_info.rank();
     auto& rank_per_group = parallel_info.rank_per_group()[group_id];
     int port_offset = group_id + 1;
-    // Record the full python-side layout for subgroups that actually span
-    // ranks; the python DiT backend registers the same subgroups so its
-    // collectives match the C++ ProcessGroups rank-for-rank.
-    if (group_size > 1) {
-      parallel_args_->python_group_layouts_["dit_" + group_type] =
-          parallel_info.rank_per_group();
-    }
+    // Record singleton layouts too: an explicitly configured size-one group
+    // must be distinguishable from missing communication metadata in Python.
+    parallel_args_->python_group_layouts_["dit_" + group_type] =
+        parallel_info.rank_per_group();
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
     member_group = std::move(create_process_group(global_rank_,
                                                   local_rank,

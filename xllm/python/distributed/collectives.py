@@ -1194,60 +1194,49 @@ def _all_to_all_4D_shape(x: torch.Tensor, scatter_idx: int, gather_idx: int, wor
     raise RuntimeError(f"all_to_all_4D: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
 
 
+def _prepare_all_to_all_4d(x: torch.Tensor, scatter_idx: int, gather_idx: int, world_size: int) -> torch.Tensor:
+    """Pack rank-major communication buffers for either resharding direction."""
+    _all_to_all_4D_shape(x, scatter_idx, gather_idx, world_size)
+    bs, seqlen, heads, width = x.shape
+    if scatter_idx == 2:
+        return x.reshape(bs, seqlen, world_size, heads // world_size, width).transpose(0, 2).contiguous()
+    return x.reshape(bs, world_size, seqlen // world_size, heads, width).transpose(0, 3).transpose(0, 1).contiguous()
+
+
+def _finish_all_to_all_4d(
+    output: torch.Tensor, input_shape: tuple[int, ...], scatter_idx: int, world_size: int
+) -> torch.Tensor:
+    """Restore the public layout after a completed all-to-all exchange."""
+    bs, seqlen, heads, width = input_shape
+    if scatter_idx == 2:
+        return (
+            output.reshape(seqlen * world_size, bs, heads // world_size, width)
+            .transpose(0, 1)
+            .contiguous()
+            .reshape(bs, seqlen * world_size, heads // world_size, width)
+        )
+    return (
+        output.reshape(heads * world_size, seqlen // world_size, bs, width)
+        .transpose(0, 2)
+        .contiguous()
+        .reshape(bs, seqlen // world_size, heads * world_size, width)
+    )
+
+
 @torch.library.custom_op("xllm_ops::all_to_all_4D", mutates_args=())
 def _all_to_all_4D(
     x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str, world_size: int
 ) -> torch.Tensor:
-    # Pass the group size explicitly so fake/export never reads a live group.
     _all_to_all_4D_shape(x, scatter_idx, gather_idx, world_size)
     if world_size == 1:
-        # The custom-op schema forbids returning an alias of the input.
         return x.clone()
     group = _require_group(x, group_name)
     if group.size() != world_size:
         raise RuntimeError(f"{group_name} world-size mismatch: expected {world_size}, got {group.size()}")
-    sp_size = world_size
-
-    if scatter_idx == 2 and gather_idx == 1:
-        # Sequence shard -> head shard:
-        #   [B, S/sp, H, D] -> [B, S, H/sp, D]
-        bs, shard_seqlen, head_num, head_size = x.shape
-        if head_num % sp_size:
-            raise RuntimeError(f"all_to_all_4D(A): head_num {head_num} not divisible by {sp_size}")
-        shard_head_num = head_num // sp_size
-        seqlen = shard_seqlen * sp_size
-        input_t = x.reshape(bs, shard_seqlen, sp_size, shard_head_num, head_size).transpose(0, 2).contiguous()
-        output = torch.empty_like(input_t)
-        dist.all_to_all_single(output, input_t, group=group)
-        return (
-            output.reshape(seqlen, bs, shard_head_num, head_size)
-            .transpose(0, 1)
-            .contiguous()
-            .reshape(bs, seqlen, shard_head_num, head_size)
-        )
-    if scatter_idx == 1 and gather_idx == 2:
-        # Head shard -> sequence shard:
-        #   [B, S, H/sp, D] -> [B, S/sp, H, D]
-        bs, seqlen, shard_head_num, head_size = x.shape
-        if seqlen % sp_size:
-            raise RuntimeError(f"all_to_all_4D(B): seqlen {seqlen} not divisible by {sp_size}")
-        shard_seqlen = seqlen // sp_size
-        head_num = shard_head_num * sp_size
-        input_t = (
-            x.reshape(bs, sp_size, shard_seqlen, shard_head_num, head_size)
-            .transpose(0, 3)  # (shard_head, sp, shard_seqlen, bs, head)
-            .transpose(0, 1)  # (sp, shard_head, shard_seqlen, bs, head)
-            .contiguous()
-        )
-        output = torch.empty_like(input_t)
-        dist.all_to_all_single(output, input_t, group=group)
-        return (
-            output.reshape(head_num, shard_seqlen, bs, head_size)
-            .transpose(0, 2)
-            .contiguous()
-            .reshape(bs, shard_seqlen, head_num, head_size)
-        )
-    raise RuntimeError(f"all_to_all_4D: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
+    input_t = _prepare_all_to_all_4d(x, scatter_idx, gather_idx, world_size)
+    output = torch.empty_like(input_t)
+    dist.all_to_all_single(output, input_t, group=group)
+    return _finish_all_to_all_4d(output, tuple(x.shape), scatter_idx, world_size)
 
 
 @_all_to_all_4D.register_fake
@@ -1278,77 +1267,24 @@ def all_to_all_4D(x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name
 def all_to_all_4D_async(
     x: torch.Tensor, scatter_idx: int, gather_idx: int, group_name: str
 ) -> Callable[[], torch.Tensor]:
-    """Async variant of :func:`all_to_all_4D`, mirroring the C++
-    ``parallel_state::all_to_all_4D(async_ops=true)`` path.
-
-    The collective is launched with ``async_op=True`` so the host does not
-    block on ``dist.all_to_all_single``; the returned zero-arg callable performs
-    the deferred ``work.wait()`` and output reshape/transpose. Callers overlap
-    later computation with the in-flight communication (e.g. norm+RoPE overlaps
-    the V all-to-all), exactly as the native ``JoyAttention`` does. Identity
-    when the group was never registered or has a single rank.
-    """
-    if (group_name, str(x.device)) not in _groups:
+    """Launch the shared resharding operation and defer waiting and unpacking."""
+    group = named_group(group_name, x.device)
+    if group is None:
         return lambda: x
-    group = _require_group(x, group_name)
-    if x.dim() != 4:
-        raise RuntimeError(f"all_to_all_4D_async: input must be 4D, got dim={x.dim()}")
-    sp_size = group.size()
-    if sp_size == 1:
+    world_size = group.size()
+    _all_to_all_4D_shape(x, scatter_idx, gather_idx, world_size)
+    if world_size == 1:
         return lambda: x
+    input_t = _prepare_all_to_all_4d(x, scatter_idx, gather_idx, world_size)
+    output = torch.empty_like(input_t)
+    input_shape = tuple(x.shape)
+    work = dist.all_to_all_single(output, input_t, group=group, async_op=True)
 
-    if scatter_idx == 2 and gather_idx == 1:
-        # Sequence shard -> head shard:
-        #   [B, S/sp, H, D] -> [B, S, H/sp, D]
-        bs, shard_seqlen, head_num, head_size = x.shape
-        if head_num % sp_size:
-            raise RuntimeError(f"all_to_all_4D_async(A): head_num {head_num} not divisible by {sp_size}")
-        shard_head_num = head_num // sp_size
-        seqlen = shard_seqlen * sp_size
-        input_t = x.reshape(bs, shard_seqlen, sp_size, shard_head_num, head_size).transpose(0, 2).contiguous()
-        output = torch.empty_like(input_t)
-        work = dist.all_to_all_single(output, input_t, group=group, async_op=True)
+    def wait() -> torch.Tensor:
+        work.wait()
+        return _finish_all_to_all_4d(output, input_shape, scatter_idx, world_size)
 
-        def wait() -> torch.Tensor:
-            work.wait()
-            return (
-                output.reshape(seqlen, bs, shard_head_num, head_size)
-                .transpose(0, 1)
-                .contiguous()
-                .reshape(bs, seqlen, shard_head_num, head_size)
-            )
-
-        return wait
-
-    if scatter_idx == 1 and gather_idx == 2:
-        # Head shard -> sequence shard:
-        #   [B, S, H/sp, D] -> [B, S/sp, H, D]
-        bs, seqlen, shard_head_num, head_size = x.shape
-        if seqlen % sp_size:
-            raise RuntimeError(f"all_to_all_4D_async(B): seqlen {seqlen} not divisible by {sp_size}")
-        shard_seqlen = seqlen // sp_size
-        head_num = shard_head_num * sp_size
-        input_t = (
-            x.reshape(bs, sp_size, shard_seqlen, shard_head_num, head_size)
-            .transpose(0, 3)  # (shard_head, sp, shard_seqlen, bs, head)
-            .transpose(0, 1)  # (sp, shard_head, shard_seqlen, bs, head)
-            .contiguous()
-        )
-        output = torch.empty_like(input_t)
-        work = dist.all_to_all_single(output, input_t, group=group, async_op=True)
-
-        def wait() -> torch.Tensor:
-            work.wait()
-            return (
-                output.reshape(head_num, shard_seqlen, bs, head_size)
-                .transpose(0, 2)
-                .contiguous()
-                .reshape(bs, shard_seqlen, head_num, head_size)
-            )
-
-        return wait
-
-    raise RuntimeError(f"all_to_all_4D_async: unsupported scatter/gather pair ({scatter_idx}, {gather_idx})")
+    return wait
 
 
 __all__ = [

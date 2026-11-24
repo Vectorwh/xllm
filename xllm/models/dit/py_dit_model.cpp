@@ -72,12 +72,18 @@ py::object read_component_config(const std::string& component_dir) {
     }
   }
   if (config_path.empty()) {
+    std::vector<std::string> candidates;
     for (const auto& entry :
          std::filesystem::directory_iterator(component_dir)) {
-      if (entry.path().extension() == ".json") {
-        config_path = entry.path().string();
-        break;
+      if (entry.is_regular_file() && entry.path().extension() == ".json") {
+        candidates.emplace_back(entry.path().string());
       }
+    }
+    CHECK_LE(candidates.size(), 1)
+        << "Ambiguous component config in " << component_dir
+        << ": provide config.json or scheduler_config.json";
+    if (!candidates.empty()) {
+      config_path = candidates.front();
     }
   }
   CHECK(!config_path.empty()) << "No JSON config found in " << component_dir;
@@ -148,8 +154,8 @@ void PyDiTModel::register_python_process_groups() {
   const int32_t global_rank = parallel_args_.rank();
   const int32_t global_world_size = parallel_args_.world_size();
 
-  // Collect the kinds that actually span ranks; a single-rank deployment has
-  // no layouts at all and needs no python groups.
+  // Register all recorded layouts, including explicit singleton groups.
+  // Every worker must create these groups in the same order.
   std::vector<std::pair<std::string, const std::vector<std::vector<int32_t>>*>>
       to_register;
   for (const char* kind : kGroupKinds) {
@@ -389,7 +395,6 @@ DiTForwardOutput PyDiTModel::forward(const DiTForwardInput& input) {
   request["prompts"] = py::cast(input.prompts);
   request["negative_prompts"] = py::cast(input.negative_prompts);
   request["batch_size"] = input.batch_size;
-  request["images"] = py::none();
   py::list images_list;
   for (const auto& entry : input.media_sources.entries()) {
     images_list.append(py::cast(entry.tensor));
