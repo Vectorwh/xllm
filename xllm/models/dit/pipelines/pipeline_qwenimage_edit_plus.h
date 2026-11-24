@@ -1296,12 +1296,6 @@ class QwenImageEditPlusPipelineImpl : public torch::nn::Module {
 
   bool load_lora_model(const LoRAConfig& config,
                        const std::vector<LoRARequest>& requests) {
-    const ProcessGroup* tp_check = parallel_args_.dit_tp_group_;
-    if (tp_check != nullptr && tp_check->world_size() > 1) {
-      LOG(ERROR) << "Qwen Image Edit Plus LoRA requires DiT TP=1";
-      return false;
-    }
-
     using ParallelType = dit::DiTLoRARuntime::ParallelType;
     dit::DiTLoRARuntime::Targets targets;
     const auto add_target = [&targets](std::string name,

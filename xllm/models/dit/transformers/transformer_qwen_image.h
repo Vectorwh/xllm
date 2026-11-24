@@ -534,18 +534,25 @@ class AttentionImpl final : public torch::nn::Module {
                 bool elementwise_affine = true,
                 bool is_causal = false,
                 ProcessGroup* sp_group = nullptr)
-      : heads_(heads),
-        kv_heads_(kv_heads.has_value() ? kv_heads.value() : heads),
-        dim_head_(dim_head),
+      : dim_head_(dim_head),
         sp_group_(sp_group),
         sp_size_(sp_group == nullptr ? 1 : sp_group->world_size()),
         options_(context.get_tensor_options()),
         quant_args_(context.get_quant_args()) {
     CHECK_EQ(sp_size_, ::xllm::ParallelConfig::get_instance().sp_size());
-    CHECK_EQ(heads_ % sp_size_, 0)
-        << "Qwen image attention heads must be divisible by SP size";
-    CHECK_EQ(kv_heads_ % sp_size_, 0)
-        << "Qwen image KV heads must be divisible by SP size";
+    const ParallelArgs& parallel_args = context.get_parallel_args();
+    ProcessGroup* tp_group = parallel_args.dit_tp_group_;
+    CHECK(tp_group != nullptr)
+        << "Qwen image attention requires a DiT TP group";
+    const int64_t tp_size = tp_group->world_size();
+    const int64_t global_kv_heads = kv_heads.value_or(heads);
+    const int64_t attention_parallel_size = tp_size * sp_size_;
+    CHECK_EQ(heads % attention_parallel_size, 0)
+        << "Qwen image attention heads must be divisible by TP * SP size";
+    CHECK_EQ(global_kv_heads % attention_parallel_size, 0)
+        << "Qwen image KV heads must be divisible by TP * SP size";
+    local_q_heads_ = heads / tp_size;
+    local_kv_heads_ = global_kv_heads / tp_size;
     if (qk_norm == "layer_norm") {
       layer_norm_q_ = register_module(
           "norm_q",
@@ -618,7 +625,6 @@ class AttentionImpl final : public torch::nn::Module {
     out_context_dim =
         out_context_dim.has_value() ? out_context_dim.value() : query_dim;
 
-    ProcessGroup* tp_group = context.get_parallel_args().dit_tp_group_;
     use_fused_qkv_ = use_dit_sp_communication_overlap() && (q_dim == kv_dim) &&
                      !only_cross_attention;
     if (use_fused_qkv_) {
@@ -714,7 +720,7 @@ class AttentionImpl final : public torch::nn::Module {
                                            out_dim.value(),
                                            out_bias,
                                            /*input_is_parallelized=*/true,
-                                           /*enable_result_reduction=*/false,
+                                           /*enable_result_reduction=*/true,
                                            quant_args_,
                                            tp_group,
                                            options_);
@@ -730,7 +736,7 @@ class AttentionImpl final : public torch::nn::Module {
                                            out_context_dim.value(),
                                            out_bias,
                                            /*input_is_parallelized=*/true,
-                                           /*enable_result_reduction=*/false,
+                                           /*enable_result_reduction=*/true,
                                            quant_args_,
                                            tp_group,
                                            options_));
@@ -841,8 +847,8 @@ class AttentionImpl final : public torch::nn::Module {
   }
 
  public:
-  int64_t heads_;
-  int64_t kv_heads_;
+  int64_t local_q_heads_;
+  int64_t local_kv_heads_;
   int64_t dim_head_;
   bool use_fused_qkv_ = false;
   ProcessGroup* sp_group_;
@@ -872,18 +878,42 @@ class FeedForwardImpl final : public torch::nn::Module {
   explicit FeedForwardImpl(const ModelContext& context,
                            int64_t dim,
                            int64_t dim_out,
-                           int64_t mult = 4)
-      : options_(context.get_tensor_options()) {
-    quant_args_ = context.get_quant_args();
-    int64_t inner_dim = dim * 4;
+                           int64_t mult = 4,
+                           ProcessGroup* tp_group = nullptr) {
+    const torch::TensorOptions& options = context.get_tensor_options();
+    const QuantArgs& quant_args = context.get_quant_args();
+    const int64_t inner_dim = dim * 4;
+    if (tp_group != nullptr && tp_group->world_size() > 1) {
+      tp_linear1_ = register_module(
+          "linear1",
+          layer::LoRABaseColumnParallelLinear(dim,
+                                              inner_dim,
+                                              /*bias=*/true,
+                                              /*gather_output=*/false,
+                                              quant_args,
+                                              tp_group,
+                                              options));
+      tp_linear2_ = register_module(
+          "linear2",
+          layer::LoRABaseRowParallelLinear(inner_dim,
+                                           dim_out,
+                                           /*bias=*/true,
+                                           /*input_is_parallelized=*/true,
+                                           /*enable_result_reduction=*/true,
+                                           quant_args,
+                                           tp_group,
+                                           options));
+    } else {
+      linear1_ = register_module(
+          "linear1",
+          layer::LoRABaseAddMatmulWeightTransposed(
+              dim, inner_dim, /*with_bias=*/true, options, quant_args));
+      linear2_ = register_module(
+          "linear2",
+          layer::LoRABaseAddMatmulWeightTransposed(
+              inner_dim, dim_out, /*with_bias=*/true, options, quant_args));
+    }
 
-    // linear1
-    linear1_ =
-        register_module("linear1",
-                        layer::LoRABaseAddMatmulWeightTransposed(
-                            dim, inner_dim, true, options_, quant_args_));
-
-    // activation
     activation_ =
         register_module("activation",
                         torch::nn::Functional(
@@ -891,18 +921,14 @@ class FeedForwardImpl final : public torch::nn::Module {
                                 [](const torch::Tensor& x) {
                                   return torch::gelu(x, "tanh");
                                 })));
-
-    // linear2
-    linear2_ =
-        register_module("linear2",
-                        layer::LoRABaseAddMatmulWeightTransposed(
-                            inner_dim, dim_out, true, options_, quant_args_));
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states) {
     const std::span<const uint64_t> adapter_ids =
         dit::active_dit_lora_adapter_ids();
-    torch::Tensor out = linear1_->forward(hidden_states, adapter_ids);
+    torch::Tensor out = tp_linear1_
+                            ? tp_linear1_->forward(hidden_states, adapter_ids)
+                            : linear1_->forward(hidden_states, adapter_ids);
 #if defined(USE_NPU)
     // Reuse kernel::active (gelu_pytorch_tanh → npu_gelu tanh).
     xllm::kernel::ActivationParams act_params;
@@ -914,27 +940,41 @@ class FeedForwardImpl final : public torch::nn::Module {
 #else
     out = activation_(out);
 #endif
-    return linear2_->forward(out, adapter_ids);
+    return tp_linear2_ ? tp_linear2_->forward(out, adapter_ids)
+                       : linear2_->forward(out, adapter_ids);
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    // linear1
-    linear1_->load_state_dict(state_dict.get_dict_with_prefix("net.0.proj."));
-    // linear2
-    linear2_->load_state_dict(state_dict.get_dict_with_prefix("net.2."));
+    const StateDict linear1_state =
+        state_dict.get_dict_with_prefix("net.0.proj.");
+    const StateDict linear2_state = state_dict.get_dict_with_prefix("net.2.");
+    if (tp_linear1_) {
+      tp_linear1_->load_state_dict(linear1_state);
+      tp_linear2_->load_state_dict(linear2_state);
+    } else {
+      linear1_->load_state_dict(linear1_state);
+      linear2_->load_state_dict(linear2_state);
+    }
   }
 
   void verify_loaded_weights(const std::string& prefix) {
-    linear1_->verify_loaded_weights(prefix + "net.0.proj.");
-    linear2_->verify_loaded_weights(prefix + "net.2.");
+    if (tp_linear1_) {
+      CHECK(tp_linear1_->is_weight_loaded())
+          << "weight is not loaded for " << prefix << "net.0.proj.weight";
+      CHECK(tp_linear2_->is_weight_loaded())
+          << "weight is not loaded for " << prefix << "net.2.weight";
+    } else {
+      linear1_->verify_loaded_weights(prefix + "net.0.proj.");
+      linear2_->verify_loaded_weights(prefix + "net.2.");
+    }
   }
 
  private:
   layer::LoRABaseAddMatmulWeightTransposed linear1_{nullptr};
   layer::LoRABaseAddMatmulWeightTransposed linear2_{nullptr};
+  layer::LoRABaseColumnParallelLinear tp_linear1_{nullptr};
+  layer::LoRABaseRowParallelLinear tp_linear2_{nullptr};
   torch::nn::Functional activation_{nullptr};
-  QuantArgs quant_args_;
-  torch::TensorOptions options_;
 };
 TORCH_MODULE(FeedForward);
 
@@ -1755,14 +1795,17 @@ class QwenDoubleStreamAttnProcessor2_0Impl : public torch::nn::Module {
 
     // Reshape for multi-head attention
     const int64_t dim_head = attn_->dim_head_;
-    img_query = img_query.unflatten(/*dim=*/-1, {attn_->heads_, dim_head});
-    img_key = img_key.unflatten(/*dim=*/-1, {attn_->kv_heads_, dim_head});
-    img_value = img_value.unflatten(/*dim=*/-1, {attn_->kv_heads_, dim_head});
-    txt_query = txt_query.unflatten(/*dim=*/-1, {attn_->heads_, dim_head});
-    txt_key = txt_key.unflatten(/*dim=*/-1, {attn_->kv_heads_, dim_head});
-    txt_value = txt_value.unflatten(/*dim=*/-1, {attn_->kv_heads_, dim_head});
+    const int64_t local_q_heads = attn_->local_q_heads_;
+    const int64_t local_kv_heads = attn_->local_kv_heads_;
+    img_query = img_query.unflatten(/*dim=*/-1, {local_q_heads, dim_head});
+    img_key = img_key.unflatten(/*dim=*/-1, {local_kv_heads, dim_head});
+    img_value = img_value.unflatten(/*dim=*/-1, {local_kv_heads, dim_head});
+    txt_query = txt_query.unflatten(/*dim=*/-1, {local_q_heads, dim_head});
+    txt_key = txt_key.unflatten(/*dim=*/-1, {local_kv_heads, dim_head});
+    txt_value = txt_value.unflatten(/*dim=*/-1, {local_kv_heads, dim_head});
 
     const int64_t sp_size = attn_->sp_size_;
+    const int64_t sp_q_heads = local_q_heads / sp_size;
     if (sp_size > 1) {
       img_query = parallel_state::all_to_all_4D(img_query,
                                                 /*scatter_idx=*/2,
@@ -1840,7 +1883,7 @@ class QwenDoubleStreamAttnProcessor2_0Impl : public torch::nn::Module {
 
 #if defined(USE_NPU)
     auto joint_hidden_states = qwenimage::qwen_npu_fusion_attention_v3(
-        joint_query, joint_key, joint_value, attn_->heads_ / sp_size);
+        joint_query, joint_key, joint_value, sp_q_heads);
 #else
     auto joint_hidden_states =
         qwen_image_joint_attention(joint_query, joint_key, joint_value);
@@ -1866,23 +1909,22 @@ class QwenDoubleStreamAttnProcessor2_0Impl : public torch::nn::Module {
             img_attn_output, /*tensor_name=*/"hidden_states", /*dim=*/1);
 
     if (sp_size > 1) {
-      const int64_t local_heads = attn_->heads_ / sp_size;
-      img_attn_output = parallel_state::all_to_all_4D(
-                            img_attn_output.unflatten(
-                                /*dim=*/-1, {local_heads, dim_head}),
-                            /*scatter_idx=*/1,
-                            /*gather_idx=*/2,
-                            /*async_ops=*/false,
-                            attn_->sp_group_)()
-                            .flatten(/*start_dim=*/2, /*end_dim=*/3);
-      txt_attn_output = parallel_state::all_to_all_4D(
-                            txt_attn_output.unflatten(
-                                /*dim=*/-1, {local_heads, dim_head}),
-                            /*scatter_idx=*/1,
-                            /*gather_idx=*/2,
-                            /*async_ops=*/false,
-                            attn_->sp_group_)()
-                            .flatten(/*start_dim=*/2, /*end_dim=*/3);
+      img_attn_output =
+          parallel_state::all_to_all_4D(img_attn_output.unflatten(
+                                            /*dim=*/-1, {sp_q_heads, dim_head}),
+                                        /*scatter_idx=*/1,
+                                        /*gather_idx=*/2,
+                                        /*async_ops=*/false,
+                                        attn_->sp_group_)()
+              .flatten(/*start_dim=*/2, /*end_dim=*/3);
+      txt_attn_output =
+          parallel_state::all_to_all_4D(txt_attn_output.unflatten(
+                                            /*dim=*/-1, {sp_q_heads, dim_head}),
+                                        /*scatter_idx=*/1,
+                                        /*gather_idx=*/2,
+                                        /*async_ops=*/false,
+                                        attn_->sp_group_)()
+              .flatten(/*start_dim=*/2, /*end_dim=*/3);
     }
 
     // Apply output projections
@@ -1913,8 +1955,8 @@ class QwenDoubleStreamAttnProcessorCMO2_0Impl : public torch::nn::Module {
                                           const ParallelArgs& parallel_args)
       : parallel_args_(parallel_args) {
     attn_ = register_module("attn", std::move(attn_module));
-    q_heads_ = attn_->heads_;
-    kv_heads_ = attn_->kv_heads_;
+    q_heads_ = attn_->local_q_heads_;
+    kv_heads_ = attn_->local_kv_heads_;
     dim_head_ = attn_->dim_head_;
     q_hidden_size_ = q_heads_ * dim_head_;
   }
@@ -1925,7 +1967,7 @@ class QwenDoubleStreamAttnProcessorCMO2_0Impl : public torch::nn::Module {
       const torch::Tensor& encoder_hidden_states_mask = torch::Tensor(),
       const torch::Tensor& attention_mask = torch::Tensor(),
       const std::tuple<torch::Tensor, torch::Tensor>& image_rotary_emb = {}) {
-    const auto sp_size = ::xllm::ParallelConfig::get_instance().sp_size();
+    const int64_t sp_size = attn_->sp_size_;
     CHECK_GT(sp_size, 1) << "CMO attention requires sequence parallelism";
 
     // Fused QKV MatMul (when enabled), then async AllToAll per tensor.
@@ -2159,7 +2201,12 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
 
     // Image MLP
     img_mlp_ =
-        register_module("img_mlp", qwenimage::FeedForward(context, dim, dim));
+        register_module("img_mlp",
+                        qwenimage::FeedForward(context,
+                                               dim,
+                                               dim,
+                                               /*mult=*/4,
+                                               parallel_args_.dit_tp_group_));
 
     // Text processing modules
     txt_mod_ = register_module(
@@ -2176,7 +2223,12 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
 
     // Text MLP
     txt_mlp_ =
-        register_module("txt_mlp", qwenimage::FeedForward(context, dim, dim));
+        register_module("txt_mlp",
+                        qwenimage::FeedForward(context,
+                                               dim,
+                                               dim,
+                                               /*mult=*/4,
+                                               parallel_args_.dit_tp_group_));
   }
 
   std::pair<torch::Tensor, torch::Tensor> _modulate(
