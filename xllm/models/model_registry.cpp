@@ -663,7 +663,8 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context) {
   // Python backend routing: --model_impl python drives the DiT pipeline from
   // the embedded interpreter while the native pipelines stay registered as
   // the default (and precision-golden) path.
-  if (ModelConfig::is_python_model_impl(
+  if (context.model_type() == "JoyOV2Pipeline" &&
+      ModelConfig::is_python_model_impl(
           ModelConfig::get_instance().model_impl())) {
     return std::make_unique<PyDiTModel>(context);
   }

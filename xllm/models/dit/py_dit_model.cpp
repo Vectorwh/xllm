@@ -37,8 +37,6 @@ limitations under the License.
 #include "models/dit/transformers/transformer_joyo_v2.h"
 #include "models/dit/vlm_encoder_proxy.h"
 #include "models/py_model_helper.h"
-#include "models/vlm/mposition/mposition.h"
-#include "processors/multimodal_processor.h"
 
 namespace py = pybind11;
 
@@ -115,10 +113,6 @@ void clear_python_object(py::object& object) {
 PYBIND11_EMBEDDED_MODULE(xllm_dit, m) {
   py::class_<VlmTextEncoderProxy, std::shared_ptr<VlmTextEncoderProxy>>(
       m, "VlmTextEncoderProxy")
-      .def("encode_prompts",
-           &VlmTextEncoderProxy::encode_prompts,
-           py::arg("prompts"),
-           py::arg("images"))
       .def("encode_joyo_prompts",
            &VlmTextEncoderProxy::encode_joyo_prompts,
            py::arg("prompts"))
@@ -204,7 +198,7 @@ void PyDiTModel::build_text_encoder_proxy() {
       context_.get_model_args("text_encoder");
   ProcessGroup* tp_group = parallel_args_.dit_text_encoder_tp_group_;
   CHECK(tp_group != nullptr)
-      << "JoyImageEditPlus requires an injected text encoder TP group.";
+      << "JoyOV2 requires an injected text encoder TP group.";
   ParallelArgs vlm_parallel_args(
       tp_group->rank(), tp_group->world_size(), tp_group);
   vlm_parallel_args.tp_size(tp_group->world_size());
@@ -232,13 +226,10 @@ void PyDiTModel::build_text_encoder_proxy() {
       << encoder_type;
   std::unique_ptr<CausalVLM> encoder = factory(vlm_context);
   CHECK(encoder != nullptr)
-      << "Failed to create the JoyImageEditPlus text encoder: " << encoder_type;
+      << "Failed to create the JoyOV2 text encoder: " << encoder_type;
 
   text_encoder_proxy_ = std::make_shared<VlmTextEncoderProxy>(
       std::move(encoder), text_encoder_model_args, te_options);
-  text_encoder_proxy_->set_mposition_generator(
-      MPositionGeneratorFactory::get_instance().create_mposition_generator(
-          "qwen3_vl"));
 }
 
 void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
@@ -351,28 +342,17 @@ void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
     // before py::cast registers it into the config dict.
     py::module_::import("xllm_dit");
     text_encoder_loader_ = loader->take_component_loader("text_encoder");
-    // The tokenizer lives in either layout: JoyImageEditPlus ships it inside
-    // text_encoder/, while JoyOV2 ships a top-level tokenizer/ component (HF
-    // fast tokenizer) and text_encoder/ holds weights only — its loader's
-    // tokenizer() would fall back to SentencePiece tokenizer.model and abort.
-    // Prefer the tokenizer component exactly like JoyOV2Pipeline::load_model.
+    // Prefer the top-level JoyOV2 tokenizer component when present.
     std::shared_ptr<Tokenizer> tokenizer;
-    TokenizerArgs tokenizer_args = text_encoder_loader_->tokenizer_args();
     if (loader->has_component("tokenizer")) {
       auto tokenizer_loader = loader->take_component_loader("tokenizer");
       tokenizer = tokenizer_loader->tokenizer();
-      tokenizer_args = tokenizer_loader->tokenizer_args();
     } else {
       tokenizer = text_encoder_loader_->tokenizer();
     }
     CHECK(tokenizer != nullptr)
         << "Failed to load text encoder Qwen3-VL tokenizer";
     text_encoder_proxy_->set_tokenizer(tokenizer);
-    text_encoder_proxy_->set_multimodal_processor(
-        create_multimodal_processor(context_.get_model_args("text_encoder"),
-                                    tokenizer,
-                                    /*max_cache_items=*/0,
-                                    tokenizer_args));
     // Load the VLM weights on the C++ side (KV cache / TP reuse).
     text_encoder_proxy_->encoder()->load_model(std::move(text_encoder_loader_));
     text_encoder_loader_.reset();

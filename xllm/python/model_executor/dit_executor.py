@@ -150,7 +150,7 @@ class DiTPipelineExecutor:
             kwargs["dtype"] = self.component_dtypes[name]
         if name in _NEEDS_DEVICE and "device" in inspect.signature(component_cls.__init__).parameters:
             # Components that shard at construction time look up their named
-            # group by device; the JoyImage transformer predates this hook.
+            # group by device before any component tensor exists.
             kwargs["device"] = self.device
         group_key = _PARALLEL_GROUP_KEY.get(name)
         if group_key is not None and group_key in self.config:

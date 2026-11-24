@@ -17,7 +17,7 @@
 Pipelines compose the sibling DiT components (``transformers/``,
 ``autoencoders/``, ``schedulers/``, ...) into a full denoising loop. The
 registry maps the C++-resolved pipeline type (the ``model_type`` string the
-C++ loader reports, e.g. ``JoyImageEditPlusPipeline``) to its Python class, so
+C++ loader reports, e.g. ``JoyOV2Pipeline``) to its Python class, so
 ``DiTPipelineExecutor`` can build a pipeline from the config dict the C++
 shell passes across the boundary.
 """
@@ -27,10 +27,6 @@ from __future__ import annotations
 from importlib import import_module
 
 _PIPELINES: dict[str, tuple[str, str]] = {
-    "JoyImageEditPlusPipeline": (
-        "xllm.python.models.dit.pipelines.joyimage_edit_plus",
-        "JoyImageEditPlusPipeline",
-    ),
     "JoyOV2Pipeline": (
         "xllm.python.models.dit.pipelines.joyo_v2",
         "JoyOV2Pipeline",

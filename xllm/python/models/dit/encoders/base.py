@@ -14,21 +14,9 @@
 
 """Text encoder contract for DiT pipelines.
 
-The three-method protocol mirrors the C++ pipeline call sites
-(``pipeline_joyimage_edit_plus.h``): ``get_multimodal_embeddings`` (optional,
-vision tower prefill), ``get_input_embeddings`` (token embedding lookup), and
-``forward`` (full pass returning pre-norm hidden states in
-``TextEncoderOutput.residual`` — the JoyImageEditPlus contract).
-
-Two implementations exist:
-  * form A — a native Python encoder registered below (CLIP / UMT5 / ...),
-    created and loaded entirely in Python;
-  * form B — a C++-owned VLM (e.g. Qwen3-VL with paged attention and TP)
-    wrapped by ``vlm_encoder_proxy.h`` and injected as an external object.
-  Form-B proxies additionally expose a high-level ``encode_prompts`` that
-  keeps tokenization and multimodal preprocessing on the C++ side, so a
-  pipeline crosses the language boundary once per request instead of once per
-  tensor.
+The protocol below describes native Python encoders. C++-owned encoders
+are injected as external objects; the JoyOV2 caption proxy exposes
+encode_joyo_prompts for tokenization and full pre-norm text embeddings.
 """
 
 from __future__ import annotations
@@ -48,7 +36,7 @@ class TextEncoderOutput:
     """Output of the text-encoder forward pass.
 
     ``last_hidden_state`` is the final hidden state;
-    ``residual`` is the pre-norm hidden state required by JoyImageEditPlus.
+    ``residual`` is the pre-norm hidden state used by DiT pipelines.
     """
 
     last_hidden_state: torch.Tensor

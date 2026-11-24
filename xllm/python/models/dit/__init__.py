@@ -30,14 +30,6 @@ from __future__ import annotations
 from importlib import import_module
 
 _COMPONENTS: dict[str, tuple[str, str]] = {
-    "AutoencoderKLWan": (
-        "xllm.python.models.dit.autoencoders.autoencoder_kl_wan",
-        "AutoencoderKLWan",
-    ),
-    "JoyImageEditPlusTransformer3DModel": (
-        "xllm.python.models.dit.transformers.joyimage_edit_plus",
-        "JoyImageEditPlusTransformer3DModel",
-    ),
     "JoyOV2Transformer3DModel": (
         "xllm.python.models.dit.transformers.joyo_v2",
         "JoyOV2Transformer3DModel",
