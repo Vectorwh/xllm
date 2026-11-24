@@ -57,12 +57,14 @@ void clear_all_output_embeddings(ForwardOutput& output) {
   clear_selected_embeddings(output);
 }
 
-std::optional<ForwardOutput> run_worker_no_sync(WorkerImpl& worker,
-                                                const ForwardInput& input,
-                                                Stream& prepare_stream,
-                                                Stream& compute_stream,
-                                                ForwardInput* processed_output,
-                                                WorkerStreamOptions options) {
+std::optional<ForwardOutput> run_worker_no_sync(
+    WorkerImpl& worker,
+    const ForwardInput& input,
+    Stream& prepare_stream,
+    Stream& compute_stream,
+    ForwardInput* processed_output,
+    WorkerStreamOptions options,
+    const std::function<void(ModelInputParams&)>& adjust_prepared_params) {
   if (processed_output == nullptr) {
     ForwardInput processed_input;
     return run_worker_no_sync(worker,
@@ -70,11 +72,15 @@ std::optional<ForwardOutput> run_worker_no_sync(WorkerImpl& worker,
                               prepare_stream,
                               compute_stream,
                               &processed_input,
-                              options);
+                              options,
+                              adjust_prepared_params);
   }
   ForwardInput& processed_input = *processed_output;
   worker.prepare_work_before_execute_on_stream(
       input, processed_input, prepare_stream, options.record_input_ready_event);
+  if (adjust_prepared_params) {
+    adjust_prepared_params(processed_input.input_params);
+  }
   if (!options.record_output_ready_event) {
     if (auto* llm_worker = dynamic_cast<LLMWorkerImpl*>(&worker);
         llm_worker != nullptr) {

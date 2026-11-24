@@ -184,6 +184,9 @@ void register_attention_metadata_views(py::module_& module) {
       .def_property_readonly("is_spec_verify",
                              &PyAttentionMetadataView::is_spec_verify)
       .def_property_readonly(
+          "keep_cp_aux_in_gather_order",
+          &PyAttentionMetadataView::keep_cp_aux_in_gather_order)
+      .def_property_readonly(
           "use_dflash_proposal_attention",
           &PyAttentionMetadataView::use_dflash_proposal_attention)
       .def_property_readonly("spec_verify_width",
@@ -251,6 +254,7 @@ PyAttentionMetadataView::PyAttentionMetadataView(
     int32_t dummy_token_count)
     : PyAttentionMetadataView(std::move(metadata)) {
   CHECK_GT(dummy_token_count, 0);
+  keep_cp_aux_in_gather_order_ = params.keep_cp_aux_in_gather_order;
   new_cache_slots_host_values_ = params.attention.host.new_cache_slots;
 #if defined(USE_NPU)
   // Host twin of has_initial_states, populated only when the materialized
@@ -606,6 +610,10 @@ bool PyAttentionMetadataView::is_mixed() const { return metadata_->is_mixed; }
 
 bool PyAttentionMetadataView::is_spec_verify() const {
   return metadata_->is_spec_verify;
+}
+
+bool PyAttentionMetadataView::keep_cp_aux_in_gather_order() const {
+  return keep_cp_aux_in_gather_order_;
 }
 
 bool PyAttentionMetadataView::use_dflash_proposal_attention() const {

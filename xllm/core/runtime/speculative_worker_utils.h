@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 
 #include "runtime/forward_params.h"
@@ -49,13 +50,15 @@ struct WorkerStreamOptions {
 // execution. MTP can defer the leaf LLM output event until its final sampling
 // work; DFlash retains the default input and output events. Other worker
 // types keep their own output-event behavior.
+// The optional callback can adjust host metadata after preparation.
 std::optional<ForwardOutput> run_worker_no_sync(
     WorkerImpl& worker,
     const ForwardInput& input,
     Stream& prepare_stream,
     Stream& compute_stream,
     ForwardInput* processed_output = nullptr,
-    WorkerStreamOptions options = {});
+    WorkerStreamOptions options = {},
+    const std::function<void(ModelInputParams&)>& adjust_prepared_params = {});
 
 }  // namespace speculative_worker
 }  // namespace xllm

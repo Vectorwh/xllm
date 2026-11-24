@@ -37,6 +37,8 @@ struct ModelOutput {
   torch::Tensor residual;
   // [num_tokens, ...]
   torch::Tensor aux_hidden_states;
+  // Maps packed token rows to padded CP gather rows in aux_hidden_states.
+  torch::Tensor aux_hidden_restore_index;
   // Backend-neutral state emitted for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
 

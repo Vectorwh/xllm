@@ -72,6 +72,7 @@ from xllm.python.model_executor.forward_context import (
     record_layer_event,
     wait_for_layer_load,
 )
+from xllm.python.model_executor.model_output import ModelOutput
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
@@ -1295,7 +1296,7 @@ class Glm52DecoderLayer(nn.Module):
 
 
 class Glm52Model(nn.Module):
-    # DFlash consumes captured target states in the original packed row order.
+    # Speculative verification consumes captures in the original packed order.
     restores_aux_hidden_under_cp = True
 
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
@@ -1334,10 +1335,11 @@ class Glm52Model(nn.Module):
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | ModelOutput:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
-        cp_context = get_forward_context().cp_context
+        context = get_forward_context()
+        cp_context = context.cp_context
         if cp_context is not None:
             hidden = cp_shard_rows(hidden, cp_context)
             positions = cp_shard_positions(positions, cp_context).contiguous()
@@ -1352,8 +1354,13 @@ class Glm52Model(nn.Module):
         hidden, _ = self.norm(hidden, residual)
         if cp_context is not None:
             if aux_hidden_buffer is not None:
-                # Merge target output and DFlash captures with the same row
-                # permutation in one collective, including padded/empty ranks.
+                if getattr(context.metadata, "keep_cp_aux_in_gather_order", False):
+                    # Only the draft KV writer consumes the padded CP layout.
+                    return ModelOutput(
+                        hidden_states=cp_merge_rows(hidden, cp_context),
+                        aux_hidden_states=distributed.all_gather(aux_hidden_buffer, 0, cp_context.cp_size, "cp"),
+                        aux_hidden_restore_index=cp_context.restore_index,
+                    )
                 width = hidden.shape[-1]
                 merged = cp_merge_rows(torch.cat((hidden, aux_hidden_buffer), dim=-1), cp_context)
                 hidden = merged[..., :width]

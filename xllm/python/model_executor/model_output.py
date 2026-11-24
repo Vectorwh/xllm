@@ -49,3 +49,5 @@ class ModelOutput:
     residual: torch.Tensor | None = None
     aux_hidden_states: torch.Tensor | None = None
     mtp_topk_indices: torch.Tensor | None = None
+    # Maps packed token rows to padded CP gather rows in aux_hidden_states.
+    aux_hidden_restore_index: torch.Tensor | None = None

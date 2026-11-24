@@ -127,6 +127,7 @@ class PyAttentionMetadataView final {
   bool is_chunked_prefill() const;
   bool is_mixed() const;
   bool is_spec_verify() const;
+  bool keep_cp_aux_in_gather_order() const;
   bool use_dflash_proposal_attention() const;
   bool is_dummy() const;
   // Rows per logical sequence of a NON-expanded spec-verify batch (1 = plain
@@ -169,6 +170,7 @@ class PyAttentionMetadataView final {
   torch::Tensor dsa_c128_cos_sin_;
   int64_t dsa_graph_block_table_cols_ = 0;
   bool dsa_graph_mode_ = false;
+  bool keep_cp_aux_in_gather_order_ = false;
 };
 
 }  // namespace xllm

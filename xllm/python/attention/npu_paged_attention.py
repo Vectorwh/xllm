@@ -1370,8 +1370,10 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         """RMSNorm/RoPE outputs → packed [int8 nope | bf16 rope | fp32 scale].
 
         Padding-row semantics: the BF16 write path uses
-        ``xllm_ops.reshape_paged_cache`` whose kernel skips ``slot_id < 0``
-        (see xllm/core/kernels/cuda/reshape_paged_cache.cu). This path uses
+        ``xllm_ops.reshape_paged_cache``, which delegates to the ATB cache
+        writer on NPU or the ACLNN cache writer on Ascend950. Both are expected
+        to skip negative slots (see ``ReshapePagedCacheSkipsNegativeSlots``).
+        This path uses
         ``kernels.scatter_nd_update``, which has no such skip. That is safe on
         NPU ACL-graph decode because ``GraphPersistentParam::update`` zeros
         the padded tail of both ``persistent_new_cache_slots_`` and

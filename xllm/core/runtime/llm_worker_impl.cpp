@@ -563,9 +563,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       }
       if (!input.input_params.meta.batch_forward_type.is_decode() &&
           !is_spec_draft_) {
-        // Target prefill: keep full embeddings (global-real under model-side
-        // CP).
+        // Target prefill passes all context rows to the draft KV writer.
         output.sample_output.embeddings = embeddings;
+        output.aux_hidden_restore_index =
+            std::move(model_output.aux_hidden_restore_index);
       } else if (sampling_params.selected_token_idxes.defined()) {
         if (options_.cp_size() > 1 &&
             !model_output.aux_hidden_states.defined()) {

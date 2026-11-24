@@ -187,5 +187,9 @@ class EagerRunner(BaseRunner):
             else:
                 output = self.model(input_ids, positions, input_embedding)
         if isinstance(output, ModelOutput) and input_batch is not None:
+            if output.aux_hidden_restore_index is not None:
+                # The target rows are already packed, and aux padding is
+                # interleaved in the CP gather layout.
+                return output
             return self._slice_output(output, input_batch.num_tokens, num_reqs=input_batch.num_reqs)
         return output

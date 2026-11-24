@@ -19,6 +19,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace xllm::dflash_detail {
@@ -76,6 +77,34 @@ inline std::vector<int32_t> build_token_aligned_context_positions(
   CHECK_EQ(static_cast<int64_t>(positions.size()), num_context_tokens)
       << "DFlash token-aligned positions must match the context token count.";
   return positions;
+}
+
+inline std::pair<torch::Tensor, torch::Tensor> scatter_cp_context_metadata(
+    const torch::Tensor& positions,
+    const torch::Tensor& cache_slots,
+    const torch::Tensor& restore_index,
+    int64_t gather_rows) {
+  CHECK_EQ(positions.dim(), 1);
+  // Padded rows have a valid RoPE position and are skipped by the KV writer.
+  torch::Tensor ordered_positions =
+      torch::zeros({gather_rows}, positions.options());
+  torch::Tensor ordered_slots =
+      torch::full({gather_rows}, -1, cache_slots.options());
+  ordered_positions.index_copy_(/*dim=*/0, restore_index, positions);
+  ordered_slots.index_copy_(/*dim=*/0, restore_index, cache_slots);
+  return {std::move(ordered_positions), std::move(ordered_slots)};
+}
+
+inline torch::Tensor select_prefill_context_rows(
+    const torch::Tensor& embeddings,
+    const torch::Tensor& selected_token_idxes,
+    const torch::Tensor& restore_index) {
+  torch::Tensor selected_rows = selected_token_idxes.to(
+      torch::dtype(torch::kLong).device(embeddings.device()));
+  if (restore_index.defined()) {
+    selected_rows = restore_index.index_select(/*dim=*/0, selected_rows);
+  }
+  return embeddings.index_select(/*dim=*/0, selected_rows);
 }
 
 }  // namespace xllm::dflash_detail

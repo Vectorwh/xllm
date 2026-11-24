@@ -1388,6 +1388,37 @@ TEST_F(NpuXllmOpsTest, FusedInferAttentionPackedBidirectionalPrefill) {
   EXPECT_TRUE(torch::equal(actual.cpu(), expected));
 }
 
+TEST_F(NpuXllmOpsTest, ReshapePagedCacheSkipsNegativeSlots) {
+  py::gil_scoped_acquire gil;
+  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kValidSlot = 7;
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+  const torch::Tensor key_cpu =
+      torch::tensor({11, 23}).to(options).view({2, 1, 1}).repeat(
+          {1, 1, kHeadDim});
+  const torch::Tensor value_cpu = key_cpu + 5;
+  torch::Tensor key = key_cpu.to(torch::kPrivateUse1);
+  std::optional<torch::Tensor> value = value_cpu.to(torch::kPrivateUse1);
+  torch::Tensor expected_key =
+      torch::full({1, kBlockSize, 1, kHeadDim}, 3, options);
+  torch::Tensor expected_value = torch::full_like(expected_key, 4);
+  torch::Tensor key_cache = expected_key.to(torch::kPrivateUse1);
+  std::optional<torch::Tensor> value_cache =
+      expected_value.to(torch::kPrivateUse1);
+  const torch::Tensor slots =
+      torch::tensor({int64_t{-1}, kValidSlot}, torch::kInt)
+          .to(torch::kPrivateUse1);
+
+  xllm::kernel::npu::reshape_paged_cache(
+      key, value, key_cache, value_cache, slots);
+
+  expected_key[0][kValidSlot].copy_(key_cpu[1]);
+  expected_value[0][kValidSlot].copy_(value_cpu[1]);
+  EXPECT_TRUE(torch::equal(key_cache.cpu(), expected_key));
+  EXPECT_TRUE(torch::equal(value_cache->cpu(), expected_value));
+}
+
 TEST_F(NpuXllmOpsTest, Qwen35_27B_TP4_KvCacheCrosses128TokenBoundary) {
   py::gil_scoped_acquire gil;
   if (!is_ascend950_device()) {

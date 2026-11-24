@@ -680,6 +680,8 @@ struct ForwardOutput {
   // max number of top logprobs in the batch
   int64_t max_top_logprobs = 0;
   SampleOutput sample_output;
+  // Local DFlash2 prefill metadata consumed before RPC or SHM serialization.
+  torch::Tensor aux_hidden_restore_index;
   // The target sampler publishes masked logits before returning sampled tokens.
   // MTP validation uses these local flags to enforce filtering without applying
   // the same mask twice. Logits-only execution leaves both flags false.

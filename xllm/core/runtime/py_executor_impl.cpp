@@ -258,6 +258,7 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
     output.hidden_states = tensor("hidden_states");
     output.residual = tensor("residual");
     output.aux_hidden_states = tensor("aux_hidden_states");
+    output.aux_hidden_restore_index = tensor("aux_hidden_restore_index");
     py::object proposal = py_output.attr("draft_proposal");
     if (!proposal.is_none()) {
       torch::Tensor tokens = proposal.attr("token_ids").cast<torch::Tensor>();

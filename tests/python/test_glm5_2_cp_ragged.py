@@ -249,7 +249,13 @@ def test_cp_aux_hidden_is_merged_with_target_in_capture_order(q_lens: list[int])
             return torch.cat(peers, dim=0)
 
         with (
-            patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(cp_context=cp_context)),
+            patch.object(
+                glm5_2,
+                "get_forward_context",
+                return_value=SimpleNamespace(
+                    cp_context=cp_context, metadata=SimpleNamespace(keep_cp_aux_in_gather_order=False)
+                ),
+            ),
             patch.object(cp_utils.distributed, "all_gather", side_effect=all_gather, create=True),
             patch.object(glm5_2, "record_layer_event"),
         ):
@@ -258,6 +264,38 @@ def test_cp_aux_hidden_is_merged_with_target_in_capture_order(q_lens: list[int])
         assert model.restores_aux_hidden_under_cp is True
         torch.testing.assert_close(output, global_output)
         torch.testing.assert_close(aux, global_aux)
+
+
+def test_glm_dflash2_prefill_keeps_only_aux_hidden_in_gather_order() -> None:
+    contexts = _contexts([13, 5], 4, prefix=24)
+    context = contexts[0]
+    ids = torch.arange(10, 28)
+    hidden = (2 * ids + 3).float().unsqueeze(-1)
+    aux = torch.stack((2 * ids + 3, 2 * ids + 1), dim=-1).float()
+    model, _ = _make_model([])
+    model.aux_hidden_capture = glm5_2.AuxHiddenCapture((1, 0))
+    packed_aux = torch.cat([cp_utils.cp_shard_rows(aux, ctx) for ctx in contexts])
+    packed_hidden = torch.cat([cp_utils.cp_shard_rows(hidden, ctx) for ctx in contexts])
+
+    with (
+        patch.object(
+            glm5_2,
+            "get_forward_context",
+            return_value=SimpleNamespace(
+                cp_context=context, metadata=SimpleNamespace(keep_cp_aux_in_gather_order=True)
+            ),
+        ),
+        patch.object(cp_utils.distributed, "all_gather", side_effect=[packed_hidden, packed_aux], create=True),
+        patch.object(glm5_2, "record_layer_event"),
+    ):
+        output = model(ids, torch.arange(ids.numel()).int())
+    assert isinstance(output, glm5_2.ModelOutput)
+    torch.testing.assert_close(output.hidden_states, hidden, atol=0, rtol=0)
+    torch.testing.assert_close(output.aux_hidden_states, packed_aux, atol=0, rtol=0)
+    selected = torch.tensor([12, 17])
+    packed_selected = output.aux_hidden_restore_index[selected]
+    bootstrap = output.aux_hidden_states[packed_selected]
+    torch.testing.assert_close(bootstrap, aux[selected], atol=0, rtol=0)
 
 
 def test_indexer_padded_heads_have_neutral_nonzero_scale() -> None:

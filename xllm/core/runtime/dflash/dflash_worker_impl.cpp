@@ -858,18 +858,31 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
   Timer timer;
   ForwardInput processed_target_input;
   ForwardOutput output =
-      speculative_worker::run_worker_no_sync(*impl_,
-                                             input,
-                                             *prepare_stream_,
-                                             *compute_stream_,
-                                             &processed_target_input)
+      speculative_worker::run_worker_no_sync(
+          *impl_,
+          input,
+          *prepare_stream_,
+          *compute_stream_,
+          &processed_target_input,
+          /*options=*/{},
+          [this](ModelInputParams& params) {
+            params.keep_cp_aux_in_gather_order =
+                options_.cp_size() > 1 &&
+                params.meta.batch_forward_type.no_decode() &&
+                SpeculativeConfig::is_glm_moe_dsa_dflash2(
+                    impl_->context_.get_model_args().model_type(),
+                    options_.speculative_algorithm(),
+                    ModelConfig::get_instance().model_impl());
+          })
           .value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
   const torch::Tensor& embeddings = output.sample_output.embeddings;
+  torch::Tensor restore_index = std::move(output.aux_hidden_restore_index);
   if (embeddings.defined()) {
-    const int64_t num_context_tokens = embeddings.size(0);
+    const int64_t num_context_tokens =
+        restore_index.defined() ? restore_index.numel() : embeddings.size(0);
     const bool is_mrope_positions = dflash_detail::is_mrope_context_positions(
         processed_target_input.positions_host, num_context_tokens);
     if (is_mrope_positions) {
@@ -905,7 +918,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
     Slice<int32_t> positions = {
         processed_target_input.positions_host.data_ptr<int32_t>(),
         static_cast<size_t>(processed_target_input.positions_host.numel())};
-    CHECK_EQ(positions.size(), static_cast<size_t>(embeddings.size(0)))
+    CHECK_EQ(positions.size(), static_cast<size_t>(num_context_tokens))
         << "DFlash prefill hidden/position count mismatch.";
     torch::Tensor context_cache_slots =
         processed_target_input.input_params.attention.device.new_cache_slots;
@@ -921,12 +934,20 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
     CHECK_EQ(static_cast<size_t>(context_cache_slots.numel()), positions.size())
         << "DFlash prefill hidden/cache slot count mismatch.";
 
+    torch::Tensor context_positions = processed_target_input.positions;
+    if (restore_index.defined()) {
+      c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+      std::tie(context_positions, context_cache_slots) =
+          dflash_detail::scatter_cp_context_metadata(context_positions,
+                                                     context_cache_slots,
+                                                     restore_index,
+                                                     embeddings.size(0));
+    }
     timer.reset();
-    KvPushFailureIds failures =
-        write_context_kv(processed_target_input,
-                         embeddings,
-                         processed_target_input.positions,
-                         context_cache_slots);
+    KvPushFailureIds failures = write_context_kv(processed_target_input,
+                                                 embeddings,
+                                                 context_positions,
+                                                 context_cache_slots);
     output.failed_request_ids.insert(
         output.failed_request_ids.end(),
         std::make_move_iterator(failures.failed_request_ids.begin()),
@@ -940,26 +961,21 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
   }
 
   if (input.sampling_params.selected_token_idxes.defined()) {
+    const auto& embedding_ids = input.input_params.embedding.embedding_ids;
+    torch::Tensor bootstrap_embeddings = embeddings;
+    if (restore_index.defined() ||
+        embeddings.size(0) != static_cast<int64_t>(embedding_ids.size())) {
+      bootstrap_embeddings = dflash_detail::select_prefill_context_rows(
+          embeddings,
+          input.sampling_params.selected_token_idxes,
+          restore_index);
+    }
+    // Keep one target row per sampled request for local decode and PD handoff.
     embedding_cache_->write_prefill_target_context(
-        input.input_params.embedding.embedding_ids,
+        embedding_ids,
         input.input_params.embedding.request_ids,
         output.sample_output.next_tokens,
-        embeddings,
-        input.sampling_params.selected_token_idxes);
-    // PD handoff: the decode instance requires get_mtp_bootstrap_embedding()
-    // defined before it accepts the request (disagg_pd_scheduler). Compress the
-    // full prefill hidden to one row per sequence, as
-    // write_prefill_target_context stores it.
-    torch::Tensor bootstrap_embeddings = embeddings;
-    if (bootstrap_embeddings.size(0) !=
-        static_cast<int64_t>(
-            input.input_params.embedding.embedding_ids.size())) {
-      torch::Tensor bootstrap_idxes =
-          input.sampling_params.selected_token_idxes.to(
-              torch::dtype(torch::kLong).device(bootstrap_embeddings.device()));
-      bootstrap_embeddings =
-          bootstrap_embeddings.index_select(/*dim=*/0, bootstrap_idxes);
-    }
+        bootstrap_embeddings);
     output.sample_output.embeddings = bootstrap_embeddings.detach();
     clear_selected_embeddings(output);
   } else {

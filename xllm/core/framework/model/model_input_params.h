@@ -1319,6 +1319,8 @@ struct ModelInputParams {
   torch::Tensor linear_state_validity_mask_tensor;
 
   bool is_spec_verify = false;
+  // Set after input preparation for the local DFlash2 target prefill.
+  bool keep_cp_aux_in_gather_order = false;
   // Selects the DFlash-family (DFlash2/DSpark) proposal attention path for this
   // batch. Set only where that path is valid: DFlash2 requires the prelaunch
   // gate and a non-warmup batch, while DSpark sets it on every proposal. False

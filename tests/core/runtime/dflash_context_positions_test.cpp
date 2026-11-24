@@ -29,6 +29,27 @@ TEST(DFlashContextPositionsTest, TextPositionsPassThroughWithoutRebuild) {
   EXPECT_FALSE(dflash_detail::is_mrope_context_positions(positions, 3));
 }
 
+TEST(DFlashContextPositionsTest, CpGatherAlignsPaddedMetadataAndBootstrapRows) {
+  const torch::Tensor positions = torch::tensor({4, 5, 8}, torch::kInt);
+  const torch::Tensor slots = torch::tensor({31, 32, 73}, torch::kInt);
+  const torch::Tensor restore_index = torch::tensor({4, 1, 3}, torch::kLong);
+  const torch::Tensor embeddings =
+      torch::tensor({{-10, -11}, {50, 51}, {-20, -21}, {80, 81}, {40, 41}});
+
+  const auto [gather_positions, gather_slots] =
+      dflash_detail::scatter_cp_context_metadata(
+          positions, slots, restore_index, embeddings.size(0));
+  EXPECT_TRUE(torch::equal(gather_positions,
+                           torch::tensor({0, 5, 0, 8, 4}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(gather_slots,
+                           torch::tensor({-1, 32, -1, 73, 31}, torch::kInt)));
+
+  const torch::Tensor selected_tokens = torch::tensor({1, 2}, torch::kInt);
+  const torch::Tensor bootstrap = dflash_detail::select_prefill_context_rows(
+      embeddings, selected_tokens, restore_index);
+  EXPECT_TRUE(torch::equal(bootstrap, torch::tensor({{50, 51}, {80, 81}})));
+}
+
 TEST(DFlashContextPositionsTest, MropePositionsRequireThreeAlignedAxes) {
   const torch::Tensor positions = torch::zeros({3, 4}, torch::kInt);
 
