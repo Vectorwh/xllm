@@ -48,6 +48,7 @@ limitations under the License.
 #include "core/common/message.h"
 #include "core/common/types.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/service_config.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_codec.h"
 #include "core/framework/multimodal/mm_data.h"
@@ -126,8 +127,25 @@ class FakeTokenizer final : public Tokenizer {
 
   size_t vocab_size_calls() const { return vocab_size_calls_; }
 
+  // Non-empty, deterministic pieces so the builtin JSON-object grammar can be
+  // built for structured-output tests. Only spelling is synthetic.
+  std::string decode_token(int32_t id) const override {
+    if (id < 0) {
+      return {};
+    }
+    return std::string(1, static_cast<char>('a' + (id % 26)));
+  }
+
   std::unique_ptr<Tokenizer> clone() const override {
     return std::make_unique<FakeTokenizer>(*this);
+  }
+
+  bool get_constraint_vocab(std::vector<std::string>* pieces) const override {
+    pieces->assign(static_cast<size_t>(vocab_size_), std::string());
+    for (int32_t id = 0; id < vocab_size_; ++id) {
+      (*pieces)[id] = std::string(1, static_cast<char>(id));
+    }
+    return true;
   }
 
  private:
@@ -234,9 +252,15 @@ OutputCallback make_capture_callback(CallbackCapture* capture) {
 class VLMRequestFactoryTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    previous_backend_ =
+        ServiceConfig::get_instance().structured_output_backend();
     // Simulate the caller (service entry) having acquired a rate-limit slot.
     rate_limiter_.is_limited();
     ASSERT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+  }
+
+  void TearDown() override {
+    ServiceConfig::get_instance().structured_output_backend(previous_backend_);
   }
 
   std::unique_ptr<VLMRequestFactory> make_factory(int32_t vocab_size = 1000,
@@ -266,6 +290,7 @@ class VLMRequestFactoryTest : public ::testing::Test {
   ModelArgs model_args_;
   Options options_;
   RateLimiter rate_limiter_;
+  std::string previous_backend_;
 };
 
 // Pretokenized Service text must keep token identity and Decode routing even
@@ -426,6 +451,145 @@ TEST_F(VLMRequestFactoryTest,
   // On success the slot stays held; it is later released when the request is
   // completed/destroyed by the scheduler, not by the factory.
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(VLMRequestFactoryTest, AttachesBuiltinJsonObjectConstraint) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.max_tokens = 16;
+  sp.response_format = ResponseFormatType::JSON_OBJECT;
+
+  auto request = factory->create_request(/*prompt=*/"describe this",
+                                         /*mm_data=*/MMData{},
+                                         sp,
+                                         /*call=*/std::nullopt,
+                                         make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_TRUE(request->state().sampling_param.json_object);
+  EXPECT_NE(request->state().json_object_grammar, nullptr);
+  EXPECT_NE(request->state().constraint_machine, nullptr);
+  EXPECT_EQ(request->state().xgrammar_constraint, nullptr);
+}
+
+TEST_F(VLMRequestFactoryTest, RejectsJsonSchemaOnBuiltinBackend) {
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.max_tokens = 16;
+  sp.response_format = ResponseFormatType::JSON_SCHEMA;
+  sp.response_format_schema = R"({"type":"object"})";
+
+  auto request = factory->create_request(/*prompt=*/"describe this",
+                                         /*mm_data=*/MMData{},
+                                         sp,
+                                         /*call=*/std::nullopt,
+                                         make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->param(), "response_format");
+  EXPECT_NE(capture.status->message().find("structured_output_backend"),
+            std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+#if defined(USE_XGRAMMAR)
+// XGrammar cannot apply a grammar mask to beam search, sample requests,
+// ignore_eos or a custom stop-token set, so each must be rejected up front.
+TEST_F(VLMRequestFactoryTest, XGrammarRejectsUnsupportedRequestModes) {
+  ServiceConfig::get_instance().structured_output_backend("xgrammar");
+  auto factory = make_factory(/*vocab_size=*/256);
+  for (int32_t mode = 0; mode < 5; ++mode) {
+    RequestParams sp;
+    sp.max_tokens = 16;
+    sp.response_format = ResponseFormatType::REGEX;
+    sp.response_format_regex = mode == 0 ? "[" : "yes";
+    sp.beam_width = mode == 1 ? 2 : 0;
+    sp.is_sample_request = mode == 2;
+    sp.ignore_eos = mode == 3;
+    if (mode == 4) {
+      sp.stop_token_ids = std::vector<int32_t>{257};
+    }
+    CallbackCapture capture;
+    EXPECT_EQ(factory->create_request(/*prompt=*/"FAIL",
+                                      /*mm_data=*/MMData{},
+                                      sp,
+                                      /*call=*/std::nullopt,
+                                      make_capture_callback(&capture)),
+              nullptr);
+    ASSERT_TRUE(capture.status.has_value());
+    EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(capture.status->param(), "response_format");
+    // Pin the exact guard so a disabled xgrammar backend cannot make this
+    // test pass for the wrong reason.
+    const char* expected = mode == 0
+                               ? "Failed to initialize XGrammar constraint"
+                           : mode == 1 ? "beam search"
+                           : mode == 2 ? "sample requests"
+                           : mode == 3 ? "ignore_eos"
+                                       : "default stop token";
+    EXPECT_NE(capture.status->message().find(expected), std::string::npos)
+        << capture.status->message();
+    EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+    rate_limiter_.is_limited();
+  }
+  // Without a response_format the same modes stay supported.
+  RequestParams plain;
+  plain.max_tokens = 16;
+  plain.ignore_eos = true;
+  CallbackCapture capture;
+  EXPECT_NE(factory->create_request(/*prompt=*/"hello",
+                                    /*mm_data=*/MMData{},
+                                    plain,
+                                    /*call=*/std::nullopt,
+                                    make_capture_callback(&capture)),
+            nullptr);
+  EXPECT_FALSE(capture.called);
+}
+#endif
+
+// Eagle3 drafts with a reduced vocabulary; the target-vocabulary constraint
+// mask would abort the sampler on the draft logits, so the request must be
+// rejected before execution. The fixture keeps the default builtin backend,
+// pinning that the admission rule covers builtin json_object and not only
+// xgrammar formats.
+TEST_F(VLMRequestFactoryTest, RejectsConstraintWithUnsupportedSpeculative) {
+  auto factory = make_factory();
+  options_.num_speculative_tokens(2);
+  options_.speculative_algorithm("Eagle3");
+  RequestParams sp;
+  sp.max_tokens = 16;
+  sp.response_format = ResponseFormatType::JSON_OBJECT;
+
+  CallbackCapture capture;
+  EXPECT_EQ(factory->create_request(/*prompt=*/"x",
+                                    /*mm_data=*/MMData{},
+                                    sp,
+                                    /*call=*/std::nullopt,
+                                    make_capture_callback(&capture)),
+            nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->param(), "response_format");
+  EXPECT_NE(capture.status->message().find("speculative algorithm"),
+            std::string::npos);
+  EXPECT_NE(capture.status->message().find("response_format=json_object"),
+            std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+
+  // MTP drives the constraint channel and stays supported.
+  rate_limiter_.is_limited();
+  options_.speculative_algorithm("MTP");
+  CallbackCapture mtp_capture;
+  EXPECT_NE(factory->create_request(/*prompt=*/"x",
+                                    /*mm_data=*/MMData{},
+                                    sp,
+                                    /*call=*/std::nullopt,
+                                    make_capture_callback(&mtp_capture)),
+            nullptr);
+  EXPECT_FALSE(mtp_capture.called);
 }
 
 TEST_F(VLMRequestFactoryTest, MessageOverloadFailsWhenTemplateRejects) {

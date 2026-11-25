@@ -452,8 +452,10 @@ void validate_config(const std::string& model_type) {
         << "xgrammar_cache_max_memory_bytes must be >= 0 or -1 (unlimited)";
     const DistributedConfig& distributed_config =
         DistributedConfig::get_instance();
-    CHECK(model_config.backend() == "llm" && model_config.task() == "generate")
-        << "XGrammar requires backend=llm and task=generate";
+    CHECK(
+        (model_config.backend() == "llm" || model_config.backend() == "vlm") &&
+        model_config.task() == "generate")
+        << "XGrammar requires backend=llm or vlm and task=generate";
     CHECK(model_config.model_impl() == "native" ||
           ModelConfig::is_python_model_impl(model_config.model_impl()))
         << "XGrammar requires model_impl=native or python";

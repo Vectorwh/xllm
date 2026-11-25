@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "vlm_request_factory.h"
+#include "core/framework/request/vlm_request_factory.h"
 
 #include <glog/logging.h>
 
@@ -29,7 +29,9 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/common/message.h"
+#include "core/framework/chat_template/thinking_mode_resolver.h"
 #include "core/framework/chat_template/tool_call_arguments.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/multimodal_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
@@ -127,6 +129,8 @@ VLMRequestFactory::VLMRequestFactory(MultimodalProcessorBase* processor,
   CHECK(model_args_ != nullptr);
   CHECK(options_ != nullptr);
   CHECK(rate_limiter_ != nullptr);
+  structured_output_ = std::make_unique<StructuredOutputCompiler>(
+      *tokenizer_, *model_args_, *options_);
 }
 
 Status VLMRequestFactory::preprocess(PreparedMultimodalInput& input) const {
@@ -205,12 +209,35 @@ Status VLMRequestFactory::validate_multimodal_request(
   return {};
 }
 
+bool VLMRequestFactory::apply_json_object_grammar(
+    RequestState& req_state,
+    const RequestParams& sp,
+    std::optional<ChatTemplateGenerationMode> generation_mode,
+    const OutputCallback& callback) {
+  bool reasoning_enabled = false;
+  if (generation_mode == ChatTemplateGenerationMode::REASONING) {
+    reasoning_enabled = true;
+  } else if (generation_mode == ChatTemplateGenerationMode::CHAT) {
+    reasoning_enabled = false;
+  } else {
+    // Multimodal chat templates such as Qwen3-VL do not end the rendered
+    // prompt with a think marker, so the generation mode is unknown. Fall
+    // back to the request's thinking switch, mirroring the no-mode path.
+    reasoning_enabled = thinking_mode::is_enabled(
+        sp.chat_template_kwargs,
+        ModelConfig::get_instance().reasoning_parser());
+  }
+  return structured_output_->apply_json_object_grammar(
+      req_state, sp, reasoning_enabled, callback);
+}
+
 std::shared_ptr<Request> VLMRequestFactory::create_request(
     std::string prompt,
     MMData mm_data,
     const RequestParams& sp,
     std::optional<Call*> call,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<ChatTemplateGenerationMode> generation_mode) {
   // Guard the rate-limit slot acquired at the service entry. build_request
   // installs its own guard, so we dismiss ours before forwarding.
   xllm::ScopeGuard rate_limit_guard(
@@ -357,7 +384,8 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
                        std::move(mm_data),
                        sp,
                        call,
-                       std::move(callback));
+                       std::move(callback),
+                       generation_mode);
 }
 
 std::shared_ptr<Request> VLMRequestFactory::build_request(
@@ -366,12 +394,20 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
     MMData mm_data,
     const RequestParams& sp,
     std::optional<Call*> call,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<ChatTemplateGenerationMode> generation_mode) {
   // Guard the rate-limit slot acquired at the service entry. Any early
   // return below releases it; success path dismisses right before Request
   // takes ownership.
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
+
+  std::shared_ptr<const CompiledXGrammar> xgrammar_constraint;
+  GrammarSpec response_format_spec;
+  if (!structured_output_->build_response_format_constraint(
+          sp, callback, xgrammar_constraint, response_format_spec)) {
+    return nullptr;
+  }
 
   const int32_t max_context_len = model_args_->max_position_embeddings();
   int32_t prompt_token_limit = max_context_len;
@@ -405,6 +441,8 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   const size_t best_of = sp.best_of.value_or(sp.n);
 
   RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
+  sampling_param.json_object = structured_output_->uses_builtin_json_object(sp);
+  const bool json_object = sampling_param.json_object;
   // Model-aware complement to verify_params' 2000 cap: an oversized top-k
   // would throw inside the sampler and take the whole batch down with it.
   if (const auto error =
@@ -460,6 +498,14 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
   req_state.scheduler_param = sp.to_scheduler_param();
   req_state.timing = sp.timing;
+  if (json_object &&
+      !apply_json_object_grammar(req_state, sp, generation_mode, callback)) {
+    return nullptr;
+  }
+  structured_output_->attach_xgrammar_constraint(
+      req_state,
+      std::move(xgrammar_constraint),
+      std::move(response_format_spec));
 
   rate_limit_guard.dismiss();
   // add one sequence, rest will be added by scheduler
@@ -570,6 +616,7 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
   }
 
   std::optional<std::string> prompt;
+  std::optional<ChatTemplateGenerationMode> generation_mode;
   if (use_prompt_as_is) {
     // The request hands in a final prompt that is already assembled with
     // the chat template; reuse it as-is to avoid double assembly.
@@ -592,7 +639,15 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
       chat_template_kwargs["use_ctc"] =
           MultimodalConfig::get_instance().use_ctc();
     }
-    prompt = chat_template_->apply(messages, sp.tools, chat_template_kwargs);
+    // Render with the generation mode so structured-output constraints can
+    // pick the reasoning or plain grammar variant, mirroring the LLM path.
+    const std::optional<ChatTemplateRenderResult> render_result =
+        chat_template_->apply_with_generation_mode(
+            messages, sp.tools, chat_template_kwargs);
+    if (render_result.has_value()) {
+      prompt = render_result->prompt;
+      generation_mode = render_result->generation_mode;
+    }
   }
   if (!prompt.has_value()) {
     std::string error_message = "Failed to construct prompt from messages";
@@ -609,7 +664,8 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
                         std::move(mm_data),
                         sp,
                         call,
-                        std::move(callback));
+                        std::move(callback),
+                        generation_mode);
 }
 
 }  // namespace xllm

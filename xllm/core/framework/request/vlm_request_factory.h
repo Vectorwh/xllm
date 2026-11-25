@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/options.h"
 #include "common/rate_limiter.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/request/structured_output_compiler.h"
 #include "core/util/binary_payload.h"
 #include "framework/chat_template/chat_template.h"
 #include "framework/model/model_args.h"
@@ -47,11 +48,14 @@ class Tokenizer;
 // user input (a text prompt with multimodal data, or chat messages plus a
 // multimodal payload) and RequestParams. It encapsulates multimodal
 // preprocessing, prompt tokenization via the processor, chat-template
-// rendering, length validation, and sampling/stopping parameter assembly.
+// rendering, length validation, sampling/stopping parameter assembly, and
+// optional structured-output (JSON object / schema / regex / EBNF) constraints.
 //
 // The factory holds non-owning references to model configuration owned by
 // VLMMaster (processor, chat template, tokenizer, model args, options, rate
-// limiter); the owner must outlive the factory.
+// limiter); the owner must outlive the factory. Grammar compilers and caches
+// are model-scoped and owned here; sequences retain their immutable
+// compilation results.
 class VLMRequestFactory final {
  public:
   VLMRequestFactory(MultimodalProcessorBase* processor,
@@ -68,11 +72,13 @@ class VLMRequestFactory final {
   Status preprocess(PreparedMultimodalInput& input) const;
 
   // completion: a text prompt plus already-decoded multimodal data.
-  std::shared_ptr<Request> create_request(std::string prompt,
-                                          MMData mm_data,
-                                          const RequestParams& sp,
-                                          std::optional<Call*> call,
-                                          OutputCallback callback);
+  std::shared_ptr<Request> create_request(
+      std::string prompt,
+      MMData mm_data,
+      const RequestParams& sp,
+      std::optional<Call*> call,
+      OutputCallback callback,
+      std::optional<ChatTemplateGenerationMode> generation_mode = std::nullopt);
 
   // chat: decodes the multimodal payload and renders messages into a prompt,
   // then delegates to the completion overload above.
@@ -90,12 +96,14 @@ class VLMRequestFactory final {
                        BinaryPayload payload,
                        MMData& mm_data) const;
 
-  std::shared_ptr<Request> build_request(std::string prompt,
-                                         std::vector<int32_t> prompt_tokens,
-                                         MMData mm_data,
-                                         const RequestParams& sp,
-                                         std::optional<Call*> call,
-                                         OutputCallback callback);
+  std::shared_ptr<Request> build_request(
+      std::string prompt,
+      std::vector<int32_t> prompt_tokens,
+      MMData mm_data,
+      const RequestParams& sp,
+      std::optional<Call*> call,
+      OutputCallback callback,
+      std::optional<ChatTemplateGenerationMode> generation_mode);
 
   // Builds the stopping checker, encoding any stop sequences. Returns
   // std::nullopt after firing an error callback when a stop sequence fails to
@@ -106,12 +114,22 @@ class VLMRequestFactory final {
       int32_t max_context_len,
       const OutputCallback& callback);
 
+  // Attaches the JSON-object grammar to req_state when requested. Returns
+  // false after firing an error callback on failure.
+  bool apply_json_object_grammar(
+      RequestState& req_state,
+      const RequestParams& sp,
+      std::optional<ChatTemplateGenerationMode> generation_mode,
+      const OutputCallback& callback);
+
   MultimodalProcessorBase* processor_ = nullptr;
   ChatTemplate* chat_template_ = nullptr;
   const Tokenizer* tokenizer_ = nullptr;
   const ModelArgs* model_args_ = nullptr;
   const Options* options_ = nullptr;
   RateLimiter* rate_limiter_ = nullptr;
+
+  std::unique_ptr<StructuredOutputCompiler> structured_output_;
 };
 
 }  // namespace xllm

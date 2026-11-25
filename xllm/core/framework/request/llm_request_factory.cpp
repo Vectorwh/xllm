@@ -29,9 +29,6 @@ limitations under the License.
 #include "core/framework/chat_template/thinking_mode_resolver.h"
 #include "core/framework/chat_template/tool_call_arguments.h"
 #include "core/framework/config/model_config.h"
-#include "core/framework/config/service_config.h"
-#include "core/framework/constraint/builtin_json_machine.h"
-#include "core/framework/constraint/xgrammar_machine.h"
 #include "framework/request/request_state.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -57,43 +54,14 @@ LLMRequestFactory::LLMRequestFactory(const Tokenizer* tokenizer,
       options_(options),
       rate_limiter_(rate_limiter),
       task_type_(std::move(task_type)),
-      rpc_response_handler_(std::move(rpc_response_handler)),
-      enable_xgrammar_output_(ServiceConfig::get_instance().use_xgrammar()) {
+      rpc_response_handler_(std::move(rpc_response_handler)) {
   CHECK(tokenizer_ != nullptr);
   CHECK(chat_template_ != nullptr);
   CHECK(model_args_ != nullptr);
   CHECK(options_ != nullptr);
   CHECK(rate_limiter_ != nullptr);
-  if (enable_xgrammar_output_) {
-    std::string error;
-    xgrammar_compiler_ = XGrammarCompiler::create(
-        *tokenizer_,
-        *model_args_,
-        ServiceConfig::get_instance().xgrammar_cache_max_memory_bytes(),
-        error);
-    if (xgrammar_compiler_ == nullptr) {
-      LOG(ERROR) << "XGrammar initialization failed (" << error
-                 << "); structured output requests will be rejected";
-    }
-  }
-}
-
-std::shared_ptr<const JsonObjectGrammar>
-LLMRequestFactory::get_json_object_grammar(bool reasoning_enabled,
-                                           std::string& error) {
-  std::lock_guard<std::mutex> lock(json_object_grammar_mutex_);
-  std::shared_ptr<const JsonObjectGrammar>& grammar =
-      reasoning_enabled ? json_reasoning_grammar_ : json_object_grammar_;
-  if (grammar == nullptr) {
-    grammar =
-        JsonObjectGrammar::create_from_tokenizer(*tokenizer_,
-                                                 model_args_->eos_token_id(),
-                                                 model_args_->stop_token_ids(),
-                                                 model_args_->vocab_size(),
-                                                 reasoning_enabled,
-                                                 &error);
-  }
-  return grammar;
+  structured_output_ = std::make_unique<StructuredOutputCompiler>(
+      *tokenizer_, *model_args_, *options_);
 }
 
 std::optional<std::vector<int>> LLMRequestFactory::encode_and_validate_prompt(
@@ -178,10 +146,7 @@ RequestSamplingParam LLMRequestFactory::build_sampling_param(
   // Shared field mapping (and the best_of > n logprobs rule) lives on
   // RequestParams; layer the LLM-specific rules on top.
   RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
-  sampling_param.json_object =
-      ServiceConfig::get_instance().enable_json_object_output() &&
-      sp.response_format == ResponseFormatType::JSON_OBJECT &&
-      !enable_xgrammar_output_;
+  sampling_param.json_object = structured_output_->uses_builtin_json_object(sp);
   // Enforces the beam-search logprob requirements; see
   // RequestSamplingParam::enable_beam_search.
   sampling_param.enable_beam_search(sp.logprob_token_ids.empty() ? sp.beam_width
@@ -254,7 +219,6 @@ bool LLMRequestFactory::apply_json_object_grammar(
     const RequestParams& sp,
     std::optional<ChatTemplateGenerationMode> generation_mode,
     const OutputCallback& callback) {
-  std::string grammar_error;
   bool reasoning_enabled = false;
   if (generation_mode.has_value()) {
     if (generation_mode == ChatTemplateGenerationMode::UNKNOWN) {
@@ -273,84 +237,8 @@ bool LLMRequestFactory::apply_json_object_grammar(
         sp.chat_template_kwargs,
         ModelConfig::get_instance().reasoning_parser());
   }
-  req_state.json_object_grammar =
-      get_json_object_grammar(reasoning_enabled, grammar_error);
-  if (req_state.json_object_grammar == nullptr) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::INVALID_ARGUMENT,
-        "Failed to initialize json_object constraint: " + grammar_error,
-        sp.service_request_id,
-        sp.source_xservice_addr);
-    return false;
-  }
-  req_state.constraint_machine =
-      wrap_builtin_machine(req_state.json_object_grammar);
-  req_state.json_reasoning_enabled = reasoning_enabled;
-  return true;
-}
-
-std::shared_ptr<const CompiledXGrammar>
-LLMRequestFactory::compile_response_format(const RequestParams& sp,
-                                           GrammarSpec& spec,
-                                           std::string& error) {
-  if (sp.response_format == ResponseFormatType::NONE) {
-    return nullptr;
-  }
-  if (!enable_xgrammar_output_) {
-    if (sp.response_format != ResponseFormatType::JSON_OBJECT) {
-      error =
-          "json_schema and regex require structured_output_backend=xgrammar";
-    }
-    return nullptr;
-  }
-  if (xgrammar_compiler_ == nullptr) {
-    error =
-        "XGrammar requires a valid ByteLevel tokenizer and model vocabulary; "
-        "check initialization logs";
-    return nullptr;
-  }
-  if (sp.beam_width > 1 || sp.is_sample_request || sp.ignore_eos) {
-    error =
-        "XGrammar constraints require ordinary generation without beam search, "
-        "sample requests or ignore_eos";
-    return nullptr;
-  }
-  if (sp.stop_token_ids.has_value()) {
-    std::unordered_set<int32_t> model_stops = model_args_->stop_token_ids();
-    std::unordered_set<int32_t> request_stops(sp.stop_token_ids->begin(),
-                                              sp.stop_token_ids->end());
-    const int32_t eos_token_id = model_args_->eos_token_id();
-    if (eos_token_id >= 0) {
-      model_stops.insert(eos_token_id);
-      request_stops.insert(eos_token_id);
-    }
-    if (request_stops != model_stops) {
-      error =
-          "XGrammar constraints require the model's default stop token "
-          "IDs; overriding them is not supported";
-      return nullptr;
-    }
-  }
-  if (sp.response_format == ResponseFormatType::REGEX) {
-    spec.type = GrammarSpec::Type::REGEX;
-    spec.source = sp.response_format_regex;
-    return xgrammar_compiler_->compile_regex(spec.source, error);
-  }
-  if (sp.response_format == ResponseFormatType::EBNF) {
-    spec.type = GrammarSpec::Type::EBNF;
-    spec.source = sp.response_format_ebnf;
-    // compile_ebnf also probes the compiled grammar (empty-language
-    // rejection), so an unhealthy grammar fails as a request error here.
-    return xgrammar_compiler_->compile_ebnf(spec.source, error);
-  }
-  const bool json_object =
-      sp.response_format == ResponseFormatType::JSON_OBJECT;
-  spec.type = GrammarSpec::Type::JSON_SCHEMA;
-  spec.strict = !json_object && sp.response_format_strict;
-  spec.source =
-      json_object ? R"({"type":"object"})" : sp.response_format_schema;
-  return xgrammar_compiler_->compile_json_schema(
-      spec.source, spec.strict, error);
+  return structured_output_->apply_json_object_grammar(
+      req_state, sp, reasoning_enabled, callback);
 }
 
 std::shared_ptr<Request> LLMRequestFactory::create(
@@ -376,15 +264,10 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
 
-  std::string grammar_error;
+  std::shared_ptr<const CompiledXGrammar> xgrammar_constraint;
   GrammarSpec response_format_spec;
-  auto xgrammar_constraint =
-      compile_response_format(sp, response_format_spec, grammar_error);
-  if (!grammar_error.empty()) {
-    callback(
-        {Status::invalid_parameter(std::move(grammar_error), "response_format"),
-         sp.service_request_id,
-         sp.source_xservice_addr});
+  if (!structured_output_->build_response_format_constraint(
+          sp, callback, xgrammar_constraint, response_format_spec)) {
     return nullptr;
   }
 
@@ -529,28 +412,10 @@ std::shared_ptr<Request> LLMRequestFactory::create(
       !apply_json_object_grammar(req_state, sp, generation_mode, callback)) {
     return nullptr;
   }
-  req_state.xgrammar_constraint = std::move(xgrammar_constraint);
-  if (req_state.constraint_machine == nullptr) {
-    // The spec rides the machine so its snapshots identify the grammar
-    // cross-process: a decode worker rebuilds the exact source and replays
-    // the committed history (G9). It is the one compile_response_format
-    // built the grammar from, so the rebuilt grammar is equivalent by
-    // construction. The member keeps a copy for the PD scheduler's proto
-    // fill; passing that lvalue to the by-value sink is exactly one more
-    // copy into the machine's retained identity.
-    req_state.xgrammar_spec = std::move(response_format_spec);
-    req_state.constraint_machine = wrap_xgrammar_machine(
-        req_state.xgrammar_constraint, req_state.xgrammar_spec);
-    // A compiled xgrammar constraint without its machine means the build
-    // lacks USE_XGRAMMAR support; Sequence would dereference the null
-    // machine on its first grammar_id() read. Unreachable through
-    // compile_response_format today (it rejects non-JSON formats when the
-    // backend is off), but the invariant is cheaper to enforce here than
-    // to debug at the dereference site.
-    CHECK(req_state.xgrammar_constraint == nullptr ||
-          req_state.constraint_machine != nullptr)
-        << "an xgrammar constraint requires a build with USE_XGRAMMAR";
-  }
+  structured_output_->attach_xgrammar_constraint(
+      req_state,
+      std::move(xgrammar_constraint),
+      std::move(response_format_spec));
   req_state.sample_slots = sp.sample_slots;
   req_state.timing = sp.timing;
   if (sp.adapter_id.has_value()) {

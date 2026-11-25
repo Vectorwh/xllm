@@ -18,7 +18,6 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -26,8 +25,7 @@ limitations under the License.
 #include "common/message.h"
 #include "common/options.h"
 #include "common/rate_limiter.h"
-#include "core/framework/constraint/snapshot.h"
-#include "core/framework/sampling/xgrammar_constraint.h"
+#include "core/framework/request/structured_output_compiler.h"
 #include "framework/chat_template/chat_template.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
@@ -35,7 +33,6 @@ limitations under the License.
 #include "framework/request/request_params.h"
 #include "framework/request/request_state.h"
 #include "framework/request/stopping_checker.h"
-#include "framework/sampling/json_object_grammar.h"
 
 namespace xllm {
 
@@ -122,18 +119,6 @@ class LLMRequestFactory final {
       std::optional<ChatTemplateGenerationMode> generation_mode,
       const OutputCallback& callback);
 
-  // Compiles the per-request grammar; on success `spec` carries the exact
-  // source the grammar was built from, so snapshot receivers rebuild an
-  // equivalent grammar (G9).
-  std::shared_ptr<const CompiledXGrammar> compile_response_format(
-      const RequestParams& sp,
-      GrammarSpec& spec,
-      std::string& error);
-
-  std::shared_ptr<const JsonObjectGrammar> get_json_object_grammar(
-      bool reasoning_enabled,
-      std::string& error);
-
   const Tokenizer* tokenizer_ = nullptr;
   const ChatTemplate* chat_template_ = nullptr;
   const ModelArgs* model_args_ = nullptr;
@@ -142,11 +127,7 @@ class LLMRequestFactory final {
   std::string task_type_;
   RpcResponseHandler rpc_response_handler_;
 
-  const bool enable_xgrammar_output_;
-  std::unique_ptr<XGrammarCompiler> xgrammar_compiler_;
-  std::mutex json_object_grammar_mutex_;
-  std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;
-  std::shared_ptr<const JsonObjectGrammar> json_reasoning_grammar_;
+  std::unique_ptr<StructuredOutputCompiler> structured_output_;
 };
 
 }  // namespace xllm

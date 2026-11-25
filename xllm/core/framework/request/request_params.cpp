@@ -367,7 +367,8 @@ void normalize_schema_numbers(nlohmann::json& value) {
 
 template <typename ChatRequest>
 void init_from_chat_request(RequestParams& params, const ChatRequest& request) {
-  if constexpr (std::is_same_v<ChatRequest, proto::ChatRequest>) {
+  if constexpr (std::is_same_v<ChatRequest, proto::ChatRequest> ||
+                std::is_same_v<ChatRequest, proto::MMChatRequest>) {
     if (request.has_response_format()) {
       const std::string& type = request.response_format().type();
       if (type.empty() || type == "text") {

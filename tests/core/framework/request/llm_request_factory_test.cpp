@@ -66,6 +66,15 @@ class FakeTokenizer final : public Tokenizer {
     return static_cast<size_t>(vocab_size_);
   }
 
+  // Non-empty, deterministic pieces so the builtin JSON-object grammar can be
+  // built for structured-output tests. Only spelling is synthetic.
+  std::string decode_token(int32_t id) const override {
+    if (id < 0) {
+      return {};
+    }
+    return std::string(1, static_cast<char>('a' + (id % 26)));
+  }
+
   std::unique_ptr<Tokenizer> clone() const override {
     return std::make_unique<FakeTokenizer>(*this);
   }
@@ -318,6 +327,71 @@ TEST_F(LLMRequestFactoryTest, XGrammarEbnfHealthyPathAndRejections) {
 }
 
 #endif
+
+// Eagle3 drafts with a reduced vocabulary; the target-vocabulary constraint
+// mask would abort the sampler on the draft logits, so reject the request.
+TEST_F(LLMRequestFactoryTest, RejectsConstraintWithUnsupportedSpeculative) {
+  ServiceConfig::get_instance().structured_output_backend("xgrammar");
+  auto factory = make_factory(/*vocab_size=*/256,
+                              /*max_position=*/2048,
+                              /*task=*/"generate",
+                              /*model_vocab_size=*/288);
+  options_.num_speculative_tokens(2);
+  options_.speculative_algorithm("Eagle3");
+  RequestParams sp;
+  sp.max_tokens = 16;
+  sp.response_format = ResponseFormatType::REGEX;
+  sp.response_format_regex = "yes";
+
+  CallbackCapture capture;
+  EXPECT_EQ(make_request(*factory, sp, capture, "x"), nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->param(), "response_format");
+  EXPECT_NE(capture.status->message().find("speculative algorithm"),
+            std::string::npos);
+  EXPECT_NE(capture.status->message().find("response_format=regex"),
+            std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+
+  // MTP drives the constraint channel and stays supported.
+  rate_limiter_.is_limited();
+  options_.speculative_algorithm("MTP");
+  CallbackCapture mtp_capture;
+  EXPECT_NE(make_request(*factory, sp, mtp_capture, "x"), nullptr);
+  EXPECT_FALSE(mtp_capture.called);
+}
+
+// The admission rule runs before the backend split: builtin json_object also
+// rides the unified constraint channel (install_filter_bitmask), so Eagle3's
+// reduced-vocab draft mask must be rejected there too, not just for xgrammar
+// formats.
+TEST_F(LLMRequestFactoryTest,
+       RejectsBuiltinJsonObjectWithUnsupportedSpeculative) {
+  ServiceConfig::get_instance().structured_output_backend("builtin");
+  auto factory = make_factory();
+  options_.num_speculative_tokens(2);
+  options_.speculative_algorithm("Eagle3");
+  RequestParams sp;
+  sp.max_tokens = 16;
+  sp.response_format = ResponseFormatType::JSON_OBJECT;
+
+  CallbackCapture capture;
+  EXPECT_EQ(make_request(*factory, sp, capture, "x"), nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->param(), "response_format");
+  EXPECT_NE(capture.status->message().find("speculative algorithm"),
+            std::string::npos);
+  EXPECT_NE(capture.status->message().find("response_format=json_object"),
+            std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+
+  // MTP drives the constraint channel and keeps builtin json_object supported.
+  rate_limiter_.is_limited();
+  options_.speculative_algorithm("MTP");
+  CallbackCapture mtp_capture;
+  EXPECT_NE(make_request(*factory, sp, mtp_capture, "x"), nullptr);
+  EXPECT_FALSE(mtp_capture.called);
+}
 
 TEST_F(LLMRequestFactoryTest, RerankerRejectsLogprobTokenIdsBeforeEncoding) {
   auto factory = make_factory();

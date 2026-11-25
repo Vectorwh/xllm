@@ -25,11 +25,10 @@ namespace {
 // Only these speculative algorithms drive their per-position verify masks
 // from the unified constraint channel. Suffix-style proposers never read
 // json_object_states, so they would emit unconstrained drafts and targets.
-// Reuse SpeculativeConfig's centralized algorithm classification (MTP plus the
+// Delegate to SpeculativeConfig::drives_constraint_channel (MTP plus the
 // block-diffusion family) instead of re-listing the strings here.
 bool channel_supported_speculative(const std::string& algorithm) {
-  return SpeculativeConfig::is_mtp_algorithm(algorithm) ||
-         SpeculativeConfig::is_block_diffusion_algorithm(algorithm);
+  return SpeculativeConfig::drives_constraint_channel(algorithm);
 }
 }  // namespace
 

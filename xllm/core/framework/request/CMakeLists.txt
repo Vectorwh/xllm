@@ -30,6 +30,7 @@ cc_library(
     request_timing.h
     request_timing_proto.h
     llm_request_factory.h
+    structured_output_compiler.h
     vlm_request_factory.h
     rec_request_factory.h
     dit_request.h
@@ -56,6 +57,7 @@ cc_library(
     request.cpp
     request_base.cpp
     llm_request_factory.cpp
+    structured_output_compiler.cpp
     vlm_request_factory.cpp
     rec_request_factory.cpp
     dit_request.cpp

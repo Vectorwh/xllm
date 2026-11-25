@@ -438,7 +438,8 @@ VLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
   // Order replace_token's in-place token_ids rewrite after the async H2D that
   // fills token_ids on prepare_stream_.
   wait_input_ready_events(input, *compute_stream_);
-  return update_input_by_last_step_output(input);
+  return WorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
+      input);
 }
 
 }  // namespace xllm

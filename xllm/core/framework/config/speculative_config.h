@@ -123,6 +123,18 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
+  // Whether this speculative algorithm advances the unified constraint
+  // channel one position per draft token, which is what structured output
+  // requires. MTP and the block-diffusion drafters (DFlash/DFlash2/DSpark)
+  // do; Eagle3 uses a reduced draft vocabulary and suffix-style proposers
+  // never read the channel, so those stay rejected. Shared by the LLM and
+  // VLM request factories and the xgrammar startup gate so the admission
+  // rule cannot drift.
+  static bool drives_constraint_channel(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) ||
+           is_block_diffusion_algorithm(algorithm);
+  }
+
   // Qwen3.8-27B reports qwen3_5 as its target model_type.
   static bool is_qwen3_5_mtp_or_dflash2(std::string_view model_type,
                                         std::string_view algorithm) {

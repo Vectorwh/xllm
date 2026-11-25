@@ -151,6 +151,23 @@ message MediaSource {
   string modality = 5;
 }
 
+message JsonSchema {
+  optional string name = 1;
+  optional google.protobuf.Struct schema = 2;
+  optional bool strict = 3;
+}
+
+message ResponseFormat {
+  optional string type = 1;
+  optional JsonSchema json_schema = 2;
+  // xLLM extension: constrain the entire output text with an XGrammar regex.
+  optional string regex = 3;
+  // xLLM extension: constrain the entire output text with an XGrammar EBNF
+  // grammar. The root rule must be named "root"; the dialect matches the
+  // EBNF form XGrammar::Grammar::FromEBNF accepts (::=-style rules).
+  optional string ebnf = 4;
+}
+
 message AddressInfo {
   // the ip address of worker process.
   string address = 1;

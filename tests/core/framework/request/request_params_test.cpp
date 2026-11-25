@@ -129,6 +129,19 @@ TEST(RequestParamsTest, ParsesJsonObjectResponseFormat) {
   EXPECT_TRUE(params.response_format_error.empty());
 }
 
+TEST(RequestParamsTest, MultimodalChatParsesJsonObjectResponseFormat) {
+  ScopedJsonObjectOutput enabled(/*enabled=*/true);
+  proto::MMChatRequest request;
+  const auto status = google::protobuf::util::JsonStringToMessage(
+      R"({"response_format":{"type":"json_object"}})", &request);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+
+  RequestParams params(request, "", "");
+
+  EXPECT_EQ(params.response_format, ResponseFormatType::JSON_OBJECT);
+  EXPECT_TRUE(params.response_format_error.empty());
+}
+
 TEST(RequestParamsTest, IgnoresJsonObjectResponseFormatWhenDisabled) {
   ScopedJsonObjectOutput disabled(/*enabled=*/false);
   proto::ChatRequest request;
