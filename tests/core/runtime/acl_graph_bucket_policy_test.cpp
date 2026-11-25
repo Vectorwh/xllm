@@ -135,5 +135,45 @@ TEST(AclGraphBucketPolicyUnitTest, AppliesWarmupCapacityInLocalDpUnits) {
   EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(15, 16, 1, true));
 }
 
+TEST(AclGraphBucketPolicyUnitTest, RejectsEagerOnlyDecodeShapes) {
+  EXPECT_TRUE(npu::is_acl_graph_decode_shape_supported(61, 2048, 2048, 16, 16));
+  EXPECT_FALSE(npu::is_acl_graph_decode_shape_supported(1, 2048, 2048, 16, 16));
+  EXPECT_FALSE(
+      npu::is_acl_graph_decode_shape_supported(61, 2049, 2048, 16, 16));
+  EXPECT_FALSE(
+      npu::is_acl_graph_decode_shape_supported(61, 2048, 2048, 17, 16));
+}
+
+TEST(AclGraphBucketPolicyUnitTest, AdmitsTokenRowsInLocalSequenceUnits) {
+  // Twelve sequences are a warmup-only DP1 shape at a capacity of sixteen.
+  EXPECT_FALSE(npu::is_acl_graph_decode_token_capture_allowed(
+      /*max_local_num_tokens=*/12,
+      /*num_decoding_tokens=*/1,
+      /*configured_max_batch_size=*/16,
+      /*configured_local_batch_size_limit=*/16,
+      /*configured_dp_size=*/1,
+      /*is_graph_warmup=*/false));
+  EXPECT_TRUE(
+      npu::is_acl_graph_decode_token_capture_allowed(12, 1, 16, 16, 1, true));
+  // MTP uses four token rows per sequence; twelve rows are three sequences.
+  EXPECT_TRUE(
+      npu::is_acl_graph_decode_token_capture_allowed(12, 4, 7, 4, 2, false));
+  EXPECT_FALSE(
+      npu::is_acl_graph_decode_token_capture_allowed(3, 1, 20, 20, 2, false));
+  EXPECT_TRUE(
+      npu::is_acl_graph_decode_token_capture_allowed(3, 1, 20, 20, 2, true));
+}
+
+TEST(AclGraphBucketPolicyUnitTest, ClampsTokenCaptureCapacityBeforeConversion) {
+  EXPECT_TRUE(
+      npu::is_acl_graph_decode_token_capture_allowed(1, 1, -1, 0, -1, false));
+  EXPECT_FALSE(
+      npu::is_acl_graph_decode_token_capture_allowed(2, 1, -1, 0, -1, true));
+  EXPECT_FALSE(
+      npu::is_acl_graph_decode_token_capture_allowed(1, 0, 16, 16, 1, false));
+  EXPECT_FALSE(
+      npu::is_acl_graph_decode_token_capture_allowed(68, 4, 64, 16, 2, true));
+}
+
 }  // namespace
 }  // namespace xllm

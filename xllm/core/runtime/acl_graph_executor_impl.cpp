@@ -1394,14 +1394,18 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
       std::max<int32_t>(1,
                         ::xllm::ExecutionConfig::get_instance()
                             .acl_graph_decode_batch_size_limit()));
-  if (max_local_batch_size > decode_batch_size_limit) {
+  if (!is_acl_graph_decode_shape_supported(args_.n_layers(),
+                                           params_single.meta.kv_max_seq_len,
+                                           args_.max_position_embeddings(),
+                                           max_local_batch_size,
+                                           decode_batch_size_limit)) {
     LOG_FIRST_N(WARNING, 1)
-        << "Falling back to eager mode because decode local batch_size (max="
-        << max_local_batch_size << ", local=" << local_batch_size << ") > "
-        << decode_batch_size_limit
-        << "; ACL graph is disabled for this request size to avoid OOM. "
-        << "This message is logged only once. "
-        << "Monitor counter 'num_model_execution_total_eager' for frequency.";
+        << "Falling back to eager mode for unsupported ACL graph shape: "
+        << "n_layers=" << args_.n_layers()
+        << ", kv_max_seq_len=" << params_single.meta.kv_max_seq_len
+        << ", max_position_embeddings=" << args_.max_position_embeddings()
+        << ", max_local_batch_size=" << max_local_batch_size
+        << ", local_batch_size_limit=" << decode_batch_size_limit;
     COUNTER_INC(num_model_execution_total_eager);
     return run_eager();
   }
@@ -1418,24 +1422,26 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     return run_eager();
   }
 
-  // Check if conditions are suitable for graph execution (replay or capture)
-  const auto max_seq_len = args_.max_position_embeddings();
-  const bool seq_len_supported =
-      params_single.meta.kv_max_seq_len <= max_seq_len;
-
-  // Combined condition for graph capture support
-  // ACL graph executor only supports single tensor inputs (no micro-batching)
-  const bool capture_supported = seq_len_supported;
-
-  // Early return if conditions are not suitable for graph operations
-  if (!capture_supported) {
-    LOG_FIRST_N(WARNING, 1)
-        << "Falling back to eager mode because kv_max_seq_len ("
-        << params_single.meta.kv_max_seq_len << ") > max_seq_len ("
-        << max_seq_len << "). This message is logged only once. "
-        << "Monitor counter 'num_model_execution_total_eager' for frequency.";
-    COUNTER_INC(num_model_execution_total_eager);
-    return run_eager();
+  // Match the speculative target worker's DP/EP padding admission before
+  // replay. Other paths retain main's replay-before-capture admission order.
+  if (in_decoding_phase && options_.enable_graph() &&
+      options_.enable_speculative_decode() && !options_.is_draft_engine() &&
+      dp_token_nums.size() > 1 &&
+      ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding()) {
+    if (!is_acl_graph_decode_token_capture_allowed(
+            max_local_num_tokens,
+            static_cast<uint32_t>(options_.num_decoding_tokens()),
+            options_.max_seqs_per_batch(),
+            ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit(),
+            options_.dp_size(),
+            params_single.meta.is_graph_warmup)) {
+      LOG_FIRST_N(WARNING, 1) << "Falling back to eager mode to preserve "
+                                 "speculative DP/EP padding: "
+                              << "batch_size=" << max_local_batch_size
+                              << ", dp_size=" << options_.dp_size();
+      COUNTER_INC(num_model_execution_total_eager);
+      return run_eager();
+    }
   }
 
   int32_t slot_idx = 0;
@@ -1546,25 +1552,20 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   if (in_decoding_phase && ::xllm::ExecutionConfig::get_instance()
                                .enable_graph_mode_decode_no_padding()) {
-    const uint32_t dp_size =
-        static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()));
-    const uint32_t max_graph_batch_size =
-        acl_graph_max_global_batch_size(static_cast<uint32_t>(std::max<int32_t>(
-                                            1, options_.max_seqs_per_batch())),
-                                        decode_batch_size_limit,
-                                        dp_size);
-    if (!is_acl_graph_decode_capture_allowed(
-            max_local_batch_size,
-            max_graph_batch_size,
-            dp_size,
-            params_single.meta.is_graph_warmup,
-            static_cast<uint32_t>(options_.num_decoding_tokens()))) {
+    if (!is_acl_graph_decode_token_capture_allowed(
+            max_local_num_tokens,
+            static_cast<uint32_t>(options_.num_decoding_tokens()),
+            options_.max_seqs_per_batch(),
+            ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit(),
+            options_.dp_size(),
+            params_single.meta.is_graph_warmup)) {
       LOG_FIRST_N(WARNING, 1)
           << "Falling back to eager mode because no ACL graph was prewarmed "
              "for no-padding decode batch_size="
           << max_local_batch_size << " (local=" << local_batch_size
-          << ", max_graph_batch_size=" << max_graph_batch_size
-          << ", dp_size=" << dp_size
+          << ", configured_max_batch_size=" << options_.max_seqs_per_batch()
+          << ", local_batch_size_limit=" << decode_batch_size_limit
+          << ", dp_size=" << options_.dp_size()
           << "). Runtime capture is limited to graph warmup buckets to "
              "prevent unbounded graph memory growth. This message is logged "
              "only once. Monitor counter 'num_model_execution_total_eager' "

@@ -867,6 +867,14 @@ inline bool is_qwen3_5_mtp_model_type(std::string_view model_type) {
   return model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
 }
 
+// LightningIndexer consumes padded decode queries even on an empty DP shard.
+// These are target models. The current one-layer GLM MTP draft runs eager,
+// where the decoder uses its empty-query placeholder instead of graph q_cu.
+inline bool uses_lightning_indexer_padded_empty_decode(
+    std::string_view model_type) {
+  return model_type == "deepseek_v32" || model_type == "glm_moe_dsa";
+}
+
 inline bool is_glm5_next_target_model_type(std::string_view model_type) {
   return model_type == "glm5_3_flash" || model_type == "glm5_next";
 }

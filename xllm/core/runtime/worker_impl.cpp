@@ -83,6 +83,9 @@ limitations under the License.
 #include "core/distributed_runtime/master.h"
 #include "core/framework/model/mtp_utils.h"
 #include "core/framework/parallel_state/context_parallel_topology.h"
+#if defined(USE_NPU)
+#include "core/runtime/acl_graph_bucket_policy.h"
+#endif
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/draft_model_config.h"
 #include "core/runtime/prefill_layerwise_eligibility.h"
@@ -1320,13 +1323,36 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
   if (speculative_target_graph_decode) {
     const int32_t max_token_size =
         *std::max_element(token_sizes.begin(), token_sizes.end());
-    graph_token_size =
-        static_cast<int32_t>(runtime::get_decode_graph_token_bucket(
-            max_token_size,
-            ::xllm::ExecutionConfig::get_instance()
-                .enable_graph_mode_decode_no_padding(),
-            target_graph_capture_sizes_));
-    // Overflow stays in the original eager layout, never a zero-width graph.
+    const auto& execution_config = ExecutionConfig::get_instance();
+    const bool no_padding =
+        execution_config.enable_graph_mode_decode_no_padding();
+    const uint32_t query_width =
+        static_cast<uint32_t>(options_.num_decoding_tokens());
+    const uint32_t max_local_batch_size =
+        static_cast<uint32_t>(max_token_size) / query_width;
+    const uint32_t batch_limit = static_cast<uint32_t>(std::max<int32_t>(
+        1, execution_config.acl_graph_decode_batch_size_limit()));
+    // Eager fallback needs the original per-rank layout. Graph padding would
+    // make the expert gather indices describe query rows that were not run.
+    const ModelArgs& args = context_.get_model_args();
+    if (npu::is_acl_graph_decode_shape_supported(
+            args.n_layers(),
+            input_params.meta.kv_max_seq_len,
+            args.max_position_embeddings(),
+            max_local_batch_size,
+            batch_limit) &&
+        (!no_padding ||
+         npu::is_acl_graph_decode_token_capture_allowed(
+             static_cast<uint32_t>(max_token_size),
+             query_width,
+             options_.max_seqs_per_batch(),
+             execution_config.acl_graph_decode_batch_size_limit(),
+             options_.dp_size(),
+             input_params.meta.is_graph_warmup))) {
+      graph_token_size =
+          static_cast<int32_t>(runtime::get_decode_graph_token_bucket(
+              max_token_size, no_padding, target_graph_capture_sizes_));
+    }
     use_graph_padding = graph_token_size > 0 &&
                         std::any_of(token_sizes.begin(),
                                     token_sizes.end(),

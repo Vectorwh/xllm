@@ -215,9 +215,9 @@ struct PrefixRankGeometry {
 
 PrefixRankGeometry compute_prefix_rank_geometry(
     const std::vector<int32_t>& kv_cache_tokens_per_seq,
-    int32_t cp_size,
+    int32_t kv_split_size,
     int32_t block_size) {
-  CHECK_GT(cp_size, 0) << "cp_size must be positive";
+  CHECK_GT(kv_split_size, 0) << "kv_split_size must be positive";
   CHECK_GT(block_size, 0) << "block_size must be positive";
 
   const int64_t n = static_cast<int64_t>(kv_cache_tokens_per_seq.size());
@@ -226,8 +226,12 @@ PrefixRankGeometry compute_prefix_rank_geometry(
   geom.cache_len_in_rank.resize(n);
   geom.offset_in_rank.resize(n);
   for (int64_t i = 0; i < n; ++i) {
+    // Replicated KV also holds the partial block from a previous chunk.
     const int32_t per_rank_prefix_tokens =
-        (kv_cache_tokens_per_seq[i] / cp_size / block_size) * block_size;
+        kv_split_size == 1
+            ? kv_cache_tokens_per_seq[i]
+            : (kv_cache_tokens_per_seq[i] / kv_split_size / block_size) *
+                  block_size;
     geom.real_len_in_rank[i] = per_rank_prefix_tokens;
     geom.cache_len_in_rank[i] =
         per_rank_prefix_tokens == 0 ? 1 : per_rank_prefix_tokens;
@@ -262,16 +266,17 @@ torch::Tensor build_prefix_cache_slots(
   prefix_cache_slots.reserve(geometry.rank_block_size);
   auto block_table = block_tables.accessor<int32_t, 2>();
   for (int64_t sequence = 0; sequence < block_tables.size(0); ++sequence) {
-    const int32_t prefix_block_count =
-        geometry.real_len_in_rank[sequence] / block_size;
-    if (prefix_block_count == 0) {
+    const int32_t prefix_tokens = geometry.real_len_in_rank[sequence];
+    if (prefix_tokens == 0) {
       prefix_cache_slots.emplace_back(0);
       continue;
     }
-    CHECK_LE(prefix_block_count, block_tables.size(1));
-    for (int32_t block = 0; block < prefix_block_count; ++block) {
+    CHECK_LE(prefix_tokens, block_tables.size(1) * block_size);
+    for (int32_t token = 0; token < prefix_tokens; token += block_size) {
+      const int32_t block = token / block_size;
       const int32_t first_slot = block_table[sequence][block] * block_size;
-      for (int32_t offset = 0; offset < block_size; ++offset) {
+      const int32_t valid_tokens = std::min(block_size, prefix_tokens - token);
+      for (int32_t offset = 0; offset < valid_tokens; ++offset) {
         prefix_cache_slots.emplace_back(first_slot + offset);
       }
     }

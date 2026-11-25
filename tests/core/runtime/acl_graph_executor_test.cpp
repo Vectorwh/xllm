@@ -753,7 +753,13 @@ TEST_F(AclGraphExecutorTest, NoPaddingBucketCapturesOnlyForWarmup) {
       execution_config.acl_graph_decode_batch_size_limit();
   execution_config.enable_graph_mode_decode_no_padding(true);
   execution_config.acl_graph_decode_batch_size_limit(20);
-  options_.max_seqs_per_batch(20);
+  options_.max_seqs_per_batch(20)
+      .dp_size(2)
+      .enable_graph(true)
+      .enable_speculative_decode(true);
+  forward_input.input_params.parallel.dp_global_token_nums = {3, 2};
+  forward_input.input_params.parallel.raw_dp_global_token_nums = {3, 2};
+  forward_input.input_params.parallel.dp_is_decode = {1, 1};
 
   auto npu_executor = std::make_unique<BaseExecutorImpl>(
       model_.get(), model_args_, *device_, options_);
@@ -779,6 +785,32 @@ TEST_F(AclGraphExecutorTest, NoPaddingBucketCapturesOnlyForWarmup) {
                                               kv_caches_,
                                               {forward_input.input_params});
 
+  // Populate every replay slot with this warmup-only, uneven DP shape.
+  for (int32_t slot = 1; slot < expected_graph_slot_count(); ++slot) {
+    graph_executor->run(forward_input.token_ids,
+                        forward_input.positions,
+                        kv_caches_,
+                        forward_input.input_params);
+  }
+  EXPECT_GT(graph_executor->get_graph_count(), 0);
+  EXPECT_TRUE(simple_model->last_forward_enabled_graph());
+  forward_input.input_params.meta.is_graph_warmup = false;
+  const int64_t eager_before =
+      COUNTER_num_model_execution_total_eager.get_value();
+  const ModelOutput runtime_output =
+      graph_executor->run(forward_input.token_ids,
+                          forward_input.positions,
+                          kv_caches_,
+                          forward_input.input_params);
+  EXPECT_EQ(COUNTER_num_model_execution_total_eager.get_value(),
+            eager_before + 1);
+  EXPECT_FALSE(simple_model->last_forward_enabled_graph());
+  EXPECT_FALSE(simple_model->last_forward_had_attn_metadata());
+  EXPECT_TRUE(torch::allclose(eager_out.hidden_states,
+                              runtime_output.hidden_states,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+
   execution_config.enable_graph_mode_decode_no_padding(old_decode_no_padding);
   execution_config.acl_graph_decode_batch_size_limit(
       old_decode_batch_size_limit);
@@ -790,12 +822,75 @@ TEST_F(AclGraphExecutorTest, NoPaddingBucketCapturesOnlyForWarmup) {
                               graph_out.hidden_states,
                               /*rtol=*/1e-5,
                               /*atol=*/1e-6));
-  EXPECT_TRUE(simple_model->last_forward_enabled_graph());
   EXPECT_EQ(warmup_graph_out.hidden_states.size(0),
             batch_size * options_.num_decoding_tokens());
   EXPECT_EQ(warmup_graph_out.hidden_states.size(1), model_args_.hidden_size());
   EXPECT_TRUE(torch::allclose(eager_out.hidden_states,
                               warmup_graph_out.hidden_states,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+}
+
+TEST_F(AclGraphExecutorTest, ReplaysWarmupOnlySingleDpDecodeGraph) {
+  GraphConfigRestore restore;
+  constexpr uint32_t batch_size = 12;
+  ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding(true);
+  ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit(16);
+  options_.max_seqs_per_batch(16)
+      .dp_size(1)
+      .enable_graph(true)
+      .enable_speculative_decode(false);
+  sequences_.clear();
+  auto batch = std::make_unique<Batch>();
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    sequences_.emplace_back(i,
+                            std::vector<int32_t>{1, 3, 5, 7},
+                            input_embedding_,
+                            mm_data_,
+                            fake_decoder_,
+                            seq_params_);
+    auto& sequence = sequences_.back();
+    sequence.kv_state().add_blocks(BlockType::KV, block_manager_->allocate(2));
+    sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
+    sequence.append_token(100 + i);
+    batch->add(&sequence);
+  }
+  auto input = batch->prepare_forward_input(
+      options_.num_decoding_tokens(), 0, model_args_);
+  input = input.to(*device_, torch::kFloat32);
+  input.input_params.enable_graph = true;
+  auto graph_executor = std::make_unique<npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+  auto* simple_model = dynamic_cast<SimpleCausalLM*>(model_.get());
+  ASSERT_NE(simple_model, nullptr);
+
+  // A cold, non-admitted shape still runs eager instead of capturing a graph.
+  graph_executor->run(
+      input.token_ids, input.positions, kv_caches_, input.input_params);
+  EXPECT_EQ(graph_executor->get_graph_count(), 0);
+  EXPECT_FALSE(simple_model->last_forward_enabled_graph());
+
+  input.input_params.meta.is_graph_warmup = true;
+  for (int32_t slot = 0; slot < expected_graph_slot_count(); ++slot) {
+    graph_executor->run(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+  }
+  EXPECT_EQ(graph_executor->get_graph_count(), expected_graph_slot_count());
+  input.input_params.meta.is_graph_warmup = false;
+  input.token_ids.add_(1);
+  const int64_t calls_before_replay = simple_model->forward_call_count();
+  const int64_t eager_before =
+      COUNTER_num_model_execution_total_eager.get_value();
+  const ModelOutput actual = graph_executor->run(
+      input.token_ids, input.positions, kv_caches_, input.input_params);
+  EXPECT_EQ(simple_model->forward_call_count(), calls_before_replay);
+  EXPECT_EQ(COUNTER_num_model_execution_total_eager.get_value(), eager_before);
+  BaseExecutorImpl eager_executor(
+      model_.get(), model_args_, *device_, options_);
+  const ModelOutput expected = eager_executor.run(
+      input.token_ids, input.positions, kv_caches_, input.input_params);
+  EXPECT_TRUE(torch::allclose(expected.hidden_states,
+                              actual.hidden_states,
                               /*rtol=*/1e-5,
                               /*atol=*/1e-6));
 }

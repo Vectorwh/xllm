@@ -90,6 +90,10 @@ def _write_text_if_changed(path: Path, content: str) -> None:
 
 
 def _run_variant_worker(args: _VariantWorkerArgs) -> _VariantBuildResult:
+    # Spawned workers must register the backend even when PyTorch autoload is
+    # disabled. TileLang uses torch.npu availability for Ascend storage lowering.
+    import torch_npu  # noqa: F401
+
     mod = importlib.import_module(args.kernel_cls_module)
     kernel_cls = getattr(mod, args.kernel_cls_name)
 

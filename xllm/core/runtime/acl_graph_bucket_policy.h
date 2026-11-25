@@ -15,9 +15,21 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 namespace xllm::npu {
+
+// Worker padding and executor admission must describe the same query rows.
+inline bool is_acl_graph_decode_shape_supported(
+    int64_t num_layers,
+    int64_t kv_max_seq_len,
+    int64_t max_position_embeddings,
+    uint32_t max_local_batch_size,
+    uint32_t local_batch_size_limit) {
+  return num_layers != 1 && kv_max_seq_len <= max_position_embeddings &&
+         max_local_batch_size <= local_batch_size_limit;
+}
 
 inline bool is_acl_graph_compatibility_batch_size(uint64_t batch_size,
                                                   uint64_t max_batch_size) {
@@ -102,6 +114,34 @@ inline bool is_acl_graph_decode_capture_allowed(
   const uint32_t max_local_batch_size =
       (max_batch_size + dp_size - 1) / dp_size;
   return is_graph_warmup && batch_size <= max_local_batch_size;
+}
+
+// Convert token rows and configured capacities once for both worker padding
+// and executor admission. Keep replay ordering at the caller.
+inline bool is_acl_graph_decode_token_capture_allowed(
+    uint32_t max_local_num_tokens,
+    uint32_t num_decoding_tokens,
+    int32_t configured_max_batch_size,
+    int32_t configured_local_batch_size_limit,
+    int32_t configured_dp_size,
+    bool is_graph_warmup) {
+  if (num_decoding_tokens == 0) {
+    return false;
+  }
+  const uint32_t local_batch_size_limit = static_cast<uint32_t>(
+      std::max<int32_t>(1, configured_local_batch_size_limit));
+  const uint32_t dp_size =
+      static_cast<uint32_t>(std::max<int32_t>(1, configured_dp_size));
+  const uint32_t max_global_batch_size = acl_graph_max_global_batch_size(
+      static_cast<uint32_t>(std::max<int32_t>(1, configured_max_batch_size)),
+      local_batch_size_limit,
+      dp_size);
+  return is_acl_graph_decode_capture_allowed(
+      max_local_num_tokens / num_decoding_tokens,
+      max_global_batch_size,
+      dp_size,
+      is_graph_warmup,
+      num_decoding_tokens);
 }
 
 }  // namespace xllm::npu

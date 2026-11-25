@@ -65,7 +65,11 @@ def _store_fused_pool(
             mask=position >= 0,
             other=float("-inf"),
         ).to(tl.float32)
-        history_valid = (position >= 0) & (tl.abs(old_gate) != float("inf")) & (old_gate == old_gate)
+        # Scalar abs fails to lower in Triton Ascend 3.2.1; comparisons
+        # preserve the finite-value check without changing its semantics.
+        history_valid = (
+            (position >= 0) & (old_gate != float("inf")) & (old_gate != float("-inf")) & (old_gate == old_gate)
+        )
         complete = complete & tl.where(from_current, current_valid, history_valid)
     pool_id = tl.maximum(completion, 0) // RATE
     logical_block = pool_id // POOL_BLOCK_SIZE
@@ -266,9 +270,18 @@ def _store_fused_kpool_kernel(
         gates = tl.where(replace, tl.where(valid, current_gates, float("-inf"))[None, :], gates)
 
     offsets = tl.arange(0, BLOCK_Q)
-    positions = tl.load(positions_ptr + first_row + offsets, offsets < QUERY_LEN, other=-1).to(tl.int64)
-    valid = tl.load(tail_valid_ptr + first_row + offsets, offsets < QUERY_LEN, other=0).to(tl.int1)
-    end = tl.max(tl.where(valid & (positions >= 0), positions, -1), 0) + 1
+    # Like va, inspect the query end first: request positions are ordered and
+    # the last valid tile contains the final position. Only padding requires
+    # another tile. Keep UB bounded instead of reducing the whole query.
+    last_position = tl.full((), -1, tl.int64)
+    tile_end = QUERY_LEN
+    while (tile_end > 0) & (last_position < 0):
+        rows = tl.maximum(0, tile_end - BLOCK_Q) + offsets
+        positions = tl.load(positions_ptr + first_row + rows, rows < tile_end, other=-1).to(tl.int64)
+        tile_valid = tl.load(tail_valid_ptr + first_row + rows, rows < tile_end, other=0).to(tl.int1)
+        last_position = tl.max(tl.where(tile_valid & (positions >= 0), positions, -1), 0)
+        tile_end = tl.maximum(0, tile_end - BLOCK_Q)
+    end = last_position + 1
     remainder = end % RATE
     pool_start = end - remainder
     member = (tail_rows - pool_start % TAIL_CAPACITY + TAIL_CAPACITY) % TAIL_CAPACITY
@@ -363,7 +376,7 @@ def store_fused_kpool(
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
         BLOCK_TAIL=triton.next_power_of_2(tail_cache.shape[2]),
-        BLOCK_Q=triton.next_power_of_2(query_len),
+        BLOCK_Q=min(256, triton.next_power_of_2(query_len)),
         SMALL_QUERY=query_len <= 8,
         DISTINCT_TAIL_IO=tail_read_ids is not tail_write_ids,
     )

@@ -116,7 +116,7 @@ def test_cp_tnd_selection_preserves_per_query_causal_tails(
     assert torch.all(local[padding] == -1)
 
 
-@pytest.mark.parametrize("chunks", [(64,), (1, 2, 3, 4, 17, 37), (4096,), (3, 4093)])
+@pytest.mark.parametrize("chunks", [(64,), (1, 2, 3, 4, 17, 37), (4096,), (3, 4093), (16384,), (3, 16381)])
 @pytest.mark.parametrize("restore_prefix", [False, True])
 @torch.inference_mode()
 def test_fused_kpool_preserves_fp32_state(chunks: tuple[int, ...], restore_prefix: bool) -> None:
@@ -229,6 +229,67 @@ def _check_pooling(chunks: tuple[int, ...], restore_prefix: bool) -> None:
         if read_slot != write_slot:
             torch.testing.assert_close(tail[read_slot].cpu(), old_tail.cpu(), rtol=0, atol=0)
         read_slot = write_slot
+
+
+@pytest.mark.parametrize("valid_tokens", [0, 2])
+@torch.inference_mode()
+def test_long_fused_kpool_finds_end_before_padding(valid_tokens: int) -> None:
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    from xllm.python.kernels_npu.triton.kpool_compress import store_fused_kpool
+
+    torch.npu.set_device(0)
+    torch.manual_seed(42)
+    query_len, head_dim, rate = 1024, 128, 4
+    raw = torch.randn(query_len, head_dim, device="npu")
+    gates = torch.randn_like(raw)
+    positions = torch.arange(3, query_len + 3, device="npu")
+    valid = torch.arange(query_len, device="npu") < valid_tokens
+    positions.masked_fill_(~valid, -1)
+    ids = torch.tensor([1], dtype=torch.int32, device="npu")
+    table = ids[:, None].contiguous()
+    tail = torch.randn(2, 2, 9, head_dim, device="npu")
+    cache = torch.zeros(2, 257, 1, head_dim, dtype=torch.bfloat16, device="npu")
+    states = [
+        (
+            torch.randn(257, head_dim, dtype=torch.bfloat16, device="npu"),
+            torch.randn(2, rate, head_dim, device="npu"),
+        )
+    ]
+    expected_tail, expected_cache = tail.clone(), cache.clone()
+    _store_compressed_kpool_torch(
+        raw,
+        gates,
+        valid,
+        valid,
+        positions,
+        expected_cache,
+        expected_tail,
+        ids,
+        ids,
+        table,
+        [query_len],
+        torch.zeros(rate, head_dim, device="npu"),
+        rate,
+        fused_states=states,
+    )
+    store_fused_kpool(
+        raw,
+        gates,
+        valid,
+        valid,
+        positions,
+        cache,
+        tail,
+        ids,
+        ids,
+        table,
+        query_len,
+        rate,
+        states,
+    )
+    torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+    torch.testing.assert_close(tail, expected_tail, rtol=0, atol=0)
 
 
 @torch.inference_mode()

@@ -100,11 +100,13 @@ def update_compressed_kpool(
     whether the boundary pool can ever complete.
 
     ``raw_k``/``gate_scores``/``positions`` contain flattened, sequence-major
-    query rows. ``query_lens`` maps those rows back to logical requests; the
-    block table may either have one row per request or one repeated row per
-    query token (MTP verify). Read/write tail ids may differ for an out-of-place
-    prefix-cache restore. Pool completion always runs before tail writes so a
-    circular tail slot cannot overwrite a value still needed by this step.
+    query rows, with increasing real-token positions per request. Padding is
+    excluded by ``tail_valid_rows``. ``query_lens`` maps those rows back to
+    logical requests; the block table may either have one row per request or
+    one repeated row per query token (MTP verify). Read/write tail ids may differ
+    for an out-of-place prefix-cache restore. Pool completion always runs before
+    tail writes so a circular tail slot cannot overwrite a value still needed
+    by this step.
     """
     if rate <= 0:
         raise ValueError("kPool compression rate must be positive")

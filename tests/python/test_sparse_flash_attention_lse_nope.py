@@ -605,3 +605,68 @@ def test_nope_npugraph_capture_replay() -> None:
     torch.testing.assert_close(out0, eager[0], rtol=0.0, atol=0.0, equal_nan=True)
     torch.testing.assert_close(max0, eager[1], rtol=0.0, atol=0.0, equal_nan=True)
     torch.testing.assert_close(sum0, eager[2], rtol=0.0, atol=0.0, equal_nan=True)
+
+
+@pytest.mark.parametrize("rope_dim", [0, ROPE_DIM])
+@torch.inference_mode()
+def test_serving_sparse_attention_matches_causal_reference(rope_dim: int) -> None:
+    """Check the serving entry, including a replay with updated query rows."""
+    from xllm.python.kernels_npu.sparse_attention import sparse_flash_attention_out
+
+    artifact = os.environ.get("XLLM_EXPORT_PATH")
+    if not artifact:
+        pytest.skip("requires XLLM_EXPORT_PATH")
+    if not hasattr(torch.ops.xllm_ops, "sparse_flash_attention_lse"):
+        torch.ops.load_library(artifact)
+    torch.manual_seed(43)
+    tokens = 32
+    query = torch.randn(tokens, Q_HEADS, HEAD_DIM, device="npu", dtype=torch.bfloat16) * 0.1
+    cache = torch.randn(1, 128, 1, HEAD_DIM, device="npu", dtype=torch.bfloat16)
+    query_rope = torch.randn(tokens, Q_HEADS, rope_dim, device="npu", dtype=torch.bfloat16) * 0.1 if rope_dim else None
+    key_rope = torch.randn(1, 128, 1, rope_dim, device="npu", dtype=torch.bfloat16) if rope_dim else None
+    indices = torch.full((tokens, 1, 2048), -1, device="npu", dtype=torch.int32)
+    for row in range(tokens):
+        indices[row, 0, : row + 1] = torch.arange(row + 1, device="npu", dtype=torch.int32)
+    table = torch.zeros(1, 1, device="npu", dtype=torch.int32)
+    lengths = torch.tensor([tokens], device="npu", dtype=torch.int32)
+    output = torch.empty_like(query)
+    scale = (HEAD_DIM + rope_dim) ** -0.5
+
+    def run() -> torch.Tensor:
+        return sparse_flash_attention_out(
+            query,
+            cache,
+            cache,
+            indices,
+            table,
+            lengths,
+            lengths,
+            query_rope,
+            key_rope,
+            scale,
+            1,
+            "TND",
+            "PA_BSND",
+            3,
+            output,
+        )
+
+    def reference() -> torch.Tensor:
+        rows = []
+        for row in range(tokens):
+            scores = query[row].float() @ cache[0, : row + 1, 0].float().T
+            if query_rope is not None:
+                scores += query_rope[row].float() @ key_rope[0, : row + 1, 0].float().T
+            rows.append((scores * scale).softmax(-1) @ cache[0, : row + 1, 0].float())
+        return torch.stack(rows)
+
+    run()
+    torch.npu.synchronize()
+    torch.testing.assert_close(output.float(), reference(), rtol=BF16_RTOL, atol=BF16_ATOL)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        run()
+    query.mul_(0.5)
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(output.float(), reference(), rtol=BF16_RTOL, atol=BF16_ATOL)

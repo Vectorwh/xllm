@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 # Geometry of the existing xllm_ops stable-resident tensor contract.
@@ -24,6 +26,20 @@ RESIDENT_HEAD_DIM = 512
 RESIDENT_ROPE_DIM = 64
 SELECTION_CAPACITY = 2176
 SELECTION_BLOCKS = SELECTION_CAPACITY // RESIDENT_PAGE_SIZE
+
+
+def _sparse_flash_attention_op(
+    query_rope: torch.Tensor | None,
+    key_rope: torch.Tensor | None,
+    *,
+    return_softmax_lse: bool = False,
+) -> Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    # With torch-npu 2.9.0.post2 and the installed vendor SFA, RoPE is ignored
+    # and PA_BSND LSE uses the block size as the KV-head count. The explicit
+    # entry preserves both contracts.
+    if query_rope is not None or key_rope is not None or return_softmax_lse:
+        return torch.ops.xllm_ops.sparse_flash_attention_lse
+    return torch.ops.npu.npu_sparse_flash_attention
 
 
 def pool_key_indexer(
@@ -513,8 +529,7 @@ def sparse_flash_attention(
     Returns:
         Attention output with the shape and dtype of ``query``.
 
-    Both MLA flavours share this entry point and route through the CANN
-    ``npu_sparse_flash_attention`` op with ``attention_mode=2`` (MLA-absorb:
+    Both MLA flavours share this entry point with ``attention_mode=2`` (MLA-absorb:
     KV is a single shared tensor, the decoupled MLA contract). The RoPE part
     is carried out-of-band in ``query_rope``/``key_rope``:
 
@@ -524,18 +539,18 @@ def sparse_flash_attention(
       ``query_rope``/``key_rope``; the op applies it within the absorbed
       MLA contract.
 
-    The legacy custom ``xllm_ops::sparse_flash_attention`` op has been
-    removed; both flavours go through the CANN built-in op.
+    RoPE uses the explicit LSE-capable entry; NoPE without LSE uses the
+    built-in entry.
     """
     # attention_mode=2 = MLA-absorb: KV is a single shared latent tensor and
     # the rope part is carried out-of-band in query_rope/key_rope.
     attention_mode = 2
-    output, _, _ = torch.ops.npu.npu_sparse_flash_attention(
+    output, _, _ = _sparse_flash_attention_op(query_rope, key_rope)(
         query,
         key,
         value,
         sparse_indices,
-        scale_value,
+        scale_value=scale_value,
         block_table=block_table,
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
@@ -569,18 +584,16 @@ def sparse_flash_attention_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Attend to selected blocks and write the output into ``output``."""
-    # Route through the CANN npu op; the legacy xllm_ops::sparse_flash_attention_out
-    # op has been removed in favour of the CANN built-in op.
     # attention_mode=2 = MLA-absorb; the caller passes the decoupled RoPE via
     # query_rope/key_rope (None for NoPE models). The npu op returns a fresh
     # output tensor; copy it into the caller-provided ``output`` buffer to
     # preserve the _out in-place contract.
-    npu_out, _, _ = torch.ops.npu.npu_sparse_flash_attention(
+    npu_out, _, _ = _sparse_flash_attention_op(query_rope, key_rope)(
         query,
         key,
         value,
         sparse_indices,
-        scale_value,
+        scale_value=scale_value,
         block_table=block_table,
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
@@ -619,15 +632,16 @@ def sparse_flash_attention_lse(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Attend to selected blocks and optionally return softmax max/sum for LSE merge.
 
-    Routes through the CANN ``npu_sparse_flash_attention`` op
-    (``return_softmax_lse`` maps 1:1).
+    Selects the explicit RoPE/LSE contract when needed.
     """
-    output, softmax_max, softmax_sum = torch.ops.npu.npu_sparse_flash_attention(
+    output, softmax_max, softmax_sum = _sparse_flash_attention_op(
+        query_rope, key_rope, return_softmax_lse=return_softmax_lse
+    )(
         query,
         key,
         value,
         sparse_indices,
-        scale_value,
+        scale_value=scale_value,
         block_table=block_table,
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=actual_seq_lengths_kv,

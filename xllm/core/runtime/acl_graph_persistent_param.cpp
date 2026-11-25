@@ -1324,8 +1324,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
   // Empty shards may have either undefined or defined-but-empty lengths.
   const bool synthesize_empty_decode_q_cu =
       !has_q_cu && options_.enable_graph() &&
-      (args_.model_type() == "deepseek_v32" ||
-       args_.model_type() == "glm_moe_dsa") &&
+      uses_lightning_indexer_padded_empty_decode(args_.model_type()) &&
       is_empty_dp_graph_rank && is_decode && !is_hybrid_linear_attention_;
   const bool synthesize_empty_q_cu =
       synthesize_empty_hybrid_q_cu || synthesize_empty_decode_q_cu;

@@ -466,6 +466,52 @@ TEST(NpuCpPlanTest, HandlesUnsplitAndEmptyPrefixCacheSlots) {
                       int32_tensor({0}));
 }
 
+TEST(NpuCpPlanTest, TruncatesPartialBlockInShardedPrefix) {
+  CpPlanInput input;
+  input.q_seq_lens = {8};
+  input.position_ids = int32_tensor({300, 301, 302, 303, 304, 305, 306, 307});
+  input.prefix_token_counts = {300};
+  input.block_tables = int32_tensor({5, 6}).view({1, 2});
+  input.has_prefix_slots = true;
+
+  const NpuCpPlan plan = NpuCpPlan::build(input, cp2_rank0_config());
+  const CpAttentionMeta& attention = plan.attention_meta();
+  // Each rank retains floor(300 / 2 / 128) blocks, preserving sharded layout.
+  expect_tensor_equal(attention.prefix_cache_slots,
+                      torch::arange(640, 768, torch::kInt32));
+  // Logical KV lengths still follow absolute positions, not physical blocks.
+  expect_tensor_equal(attention.prev_key_cu_seq_lens, int32_tensor({302}));
+  expect_tensor_equal(attention.next_key_cu_seq_lens, int32_tensor({308}));
+}
+
+TEST(NpuCpPlanTest, PreservesPartialBlockInUnsplitPrefix) {
+  CpPlanInput input;
+  input.q_seq_lens = {8, 4};
+  input.position_ids =
+      int32_tensor({131, 132, 133, 134, 135, 136, 137, 138, 0, 1, 2, 3});
+  input.prefix_token_counts = {131, 0};
+  input.block_tables = int32_tensor({5, 8, 9, 10}).view({2, 2});
+  input.has_prefix_slots = true;
+
+  CpPlanConfig config = cp2_rank0_config();
+  config.kv_split_size = 1;
+  const NpuCpPlan plan = NpuCpPlan::build(input, config);
+  const CpAttentionMeta& attention = plan.attention_meta();
+
+  expect_tensor_equal(attention.prefix_cache_slots,
+                      torch::cat({torch::arange(640, 768, torch::kInt32),
+                                  int32_tensor({1024, 1025, 1026, 0})}));
+  const torch::Tensor prefix_indices = torch::arange(131, torch::kInt32);
+  expect_tensor_equal(
+      attention.prev_kv_gather_indices,
+      torch::cat({prefix_indices, int32_tensor({132, 133, 140})}));
+  expect_tensor_equal(
+      attention.next_kv_gather_indices,
+      torch::cat({prefix_indices, torch::arange(132, 144, torch::kInt32)}));
+  expect_tensor_equal(attention.prev_key_cu_seq_lens, int32_tensor({133, 134}));
+  expect_tensor_equal(attention.next_key_cu_seq_lens, int32_tensor({139, 143}));
+}
+
 TEST(NpuCpPlanTest, BuildsDynamicEpMetadata) {
   CpPlanConfig config = cp2_rank0_config();
   config.attention_tp_size = 2;
