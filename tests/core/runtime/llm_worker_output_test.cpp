@@ -300,6 +300,7 @@ TEST_P(LLMWorkerPushFailureTest, ForwardFailureCancelsAndDrainsStartedPush) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->failed_request_ids,
               (std::vector<std::string>{"request-a", "request-b"}));
+    EXPECT_TRUE(result->unsafe_request_ids.empty());
     EXPECT_FALSE(result->logits.defined());
     EXPECT_FALSE(result->sample_output.next_tokens.defined());
   }

@@ -70,11 +70,6 @@ class DisaggPDService : public proto::DisaggPDService {
                      proto::CancelRequestResponse* response,
                      ::google::protobuf::Closure* done) override;
 
-  void MarkKVUnsafe(::google::protobuf::RpcController* controller,
-                    const proto::MarkKVUnsafeRequest* request,
-                    proto::MarkKVUnsafeResponse* response,
-                    ::google::protobuf::Closure* done) override;
-
  protected:
   std::unique_ptr<DisaggPDServiceImpl> disagg_pd_service_impl_;
 

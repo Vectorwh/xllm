@@ -134,7 +134,8 @@ std::unordered_set<std::string> fail_json_object_requests(
 
 std::unordered_set<std::string> fail_kv_push_requests(
     const std::vector<Sequence*>& sequences,
-    const std::vector<std::string>& failed_request_ids) {
+    const std::vector<std::string>& failed_request_ids,
+    const std::vector<std::string>& unsafe_request_ids) {
   if (failed_request_ids.empty()) {
     return {};
   }
@@ -156,13 +157,32 @@ std::unordered_set<std::string> fail_kv_push_requests(
     matched_request_ids.insert(request_id);
   }
 
+  std::unordered_set<std::string> matched_unsafe_request_ids;
+  for (const std::string& request_id : unsafe_request_ids) {
+    if (matched_request_ids.find(request_id) == matched_request_ids.end()) {
+      LOG(ERROR) << "Unsafe KV cache push references a request that did not "
+                    "fail: "
+                 << request_id;
+      continue;
+    }
+    matched_unsafe_request_ids.insert(request_id);
+  }
+
   if (matched_request_ids.empty()) {
     return matched_request_ids;
   }
   for (Sequence* sequence : sequences) {
-    if (!sequence->cancelled() &&
-        matched_request_ids.find(sequence->request_id()) !=
-            matched_request_ids.end()) {
+    if (matched_request_ids.find(sequence->request_id()) ==
+        matched_request_ids.end()) {
+      continue;
+    }
+    // A cancelled request still releases its reservation, so record the unsafe
+    // flag before the cancellation guard below.
+    if (matched_unsafe_request_ids.find(sequence->request_id()) !=
+        matched_unsafe_request_ids.end()) {
+      sequence->mark_kv_push_unsafe();
+    }
+    if (!sequence->cancelled()) {
       sequence->fail(Status(StatusCode::UNAVAILABLE, "KV cache push failed"));
     }
   }
@@ -175,7 +195,9 @@ std::unordered_set<std::string> collect_failed_request_ids(
   std::unordered_set<std::string> failed_request_ids =
       fail_json_object_requests(sequences, raw_output.json_object_errors);
   const std::unordered_set<std::string> failed_kv_push_request_ids =
-      fail_kv_push_requests(sequences, raw_output.failed_request_ids);
+      fail_kv_push_requests(sequences,
+                            raw_output.failed_request_ids,
+                            raw_output.unsafe_request_ids);
   failed_request_ids.insert(failed_kv_push_request_ids.begin(),
                             failed_kv_push_request_ids.end());
   return failed_request_ids;

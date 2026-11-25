@@ -966,7 +966,8 @@ TEST(DFlash2PrelaunchTransferTest, NonSendingPushCompletionIsGraphCapturable) {
         completion, {}, "PUSH", role, parallel_args, device);
     marker.add_(1);
     graph.capture_end();
-    EXPECT_TRUE(failures.empty());
+    EXPECT_TRUE(failures.failed_request_ids.empty());
+    EXPECT_TRUE(failures.unsafe_request_ids.empty());
     marker.zero_();
     graph.replay();
     stream->synchronize();

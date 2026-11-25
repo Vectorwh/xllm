@@ -1466,11 +1466,14 @@ TEST(BatchTest, KvPushFailureDiscardsFailedMmEmbeddingWithoutRowShift) {
   raw_output.outputs[0].mm_embeddings = {torch::tensor({1.0f, 2.0f})};
   raw_output.outputs[1].mm_embeddings = {torch::tensor({3.0f, 4.0f})};
   raw_output.failed_request_ids = {failed.request_id()};
+  raw_output.unsafe_request_ids = {failed.request_id()};
   batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
 
   ASSERT_TRUE(failed.error_status().has_value());
   EXPECT_EQ(failed.error_status()->code(), StatusCode::UNAVAILABLE);
   EXPECT_EQ(failed.error_status()->message(), "KV cache push failed");
+  EXPECT_TRUE(failed.kv_push_unsafe());
+  EXPECT_FALSE(healthy.kv_push_unsafe());
   EXPECT_TRUE(healthy.finished());
   Tokenizer tokenizer;
   SequenceOutput output = healthy.generate_output(tokenizer);
@@ -1478,6 +1481,42 @@ TEST(BatchTest, KvPushFailureDiscardsFailedMmEmbeddingWithoutRowShift) {
   ASSERT_EQ(output.mm_embeddings->size(), 1u);
   EXPECT_TRUE(torch::equal(output.mm_embeddings->at(0).embedding,
                            raw_output.outputs[1].mm_embeddings[0]));
+}
+
+TEST(BatchTest, KvPushUnsafeMarksCancelledSequence) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4);
+  BlockManagerImpl manager(options);
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(1);
+
+  SequenceParams params;
+  params.seq_capacity = 8;
+  params.stopping_checker = &stopping_checker;
+  params.sampling_param = &sampling_param;
+  params.request_id = "req-cancelled";
+  IncrementalDecoder decoder("", 1, false, false);
+  Sequence sequence(/*index=*/0,
+                    /*prompt_token_ids=*/{10},
+                    torch::Tensor(),
+                    MMData(),
+                    std::move(decoder),
+                    params);
+  sequence.kv_state().add_blocks(BlockType::KV, manager.allocate(1));
+  Batch batch(&sequence);
+  (void)batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
+  sequence.set_cancel();
+
+  RawForwardOutput raw_output;
+  raw_output.outputs = {make_raw_sample_output(/*token_id=*/0, std::nullopt)};
+  raw_output.failed_request_ids = {sequence.request_id()};
+  raw_output.unsafe_request_ids = {sequence.request_id()};
+  batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
+
+  EXPECT_TRUE(sequence.kv_push_unsafe());
+  EXPECT_FALSE(sequence.error_status().has_value());
 }
 
 TEST(BatchTest, DecodeForwardInputConsumesMtpBootstrap) {
@@ -1954,6 +1993,7 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
                           /*dit_audio=*/{},
                           /*json_object_errors=*/{},
                           /*failed_request_ids=*/{},
+                          /*unsafe_request_ids=*/{},
                           &proto_output);
   RawForwardOutput raw_output;
   proto_to_forward_output(proto_output, raw_output);
@@ -2328,6 +2368,7 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
                           /*dit_audio=*/{},
                           errors,
                           /*failed_request_ids=*/{"request-a", "request-b"},
+                          /*unsafe_request_ids=*/{"request-a"},
                           &proto_output);
 
   RawForwardOutput round_trip;
@@ -2346,6 +2387,8 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
   ASSERT_EQ(round_trip.failed_request_ids.size(), 2u);
   EXPECT_EQ(round_trip.failed_request_ids[0], "request-a");
   EXPECT_EQ(round_trip.failed_request_ids[1], "request-b");
+  ASSERT_EQ(round_trip.unsafe_request_ids.size(), 1u);
+  EXPECT_EQ(round_trip.unsafe_request_ids[0], "request-a");
 }
 
 TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
@@ -2385,7 +2428,9 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                               undefined,
                                               errors,
                                               /*failed_request_ids=*/
-                                              {"request-a", "request-b"}));
+                                              {"request-a", "request-b"},
+                                              /*unsafe_request_ids=*/
+                                              {"request-a"}));
 
   RawForwardOutput round_trip;
   ASSERT_TRUE(
@@ -2404,6 +2449,8 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   ASSERT_EQ(round_trip.failed_request_ids.size(), 2u);
   EXPECT_EQ(round_trip.failed_request_ids[0], "request-a");
   EXPECT_EQ(round_trip.failed_request_ids[1], "request-b");
+  ASSERT_EQ(round_trip.unsafe_request_ids.size(), 1u);
+  EXPECT_EQ(round_trip.unsafe_request_ids[0], "request-a");
 }
 
 TEST(BatchTest, ForwardInputBlockCopyKernelFieldsMatchExpectedLayout) {

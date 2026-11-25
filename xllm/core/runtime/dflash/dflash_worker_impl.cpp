@@ -922,15 +922,19 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
         << "DFlash prefill hidden/cache slot count mismatch.";
 
     timer.reset();
-    std::vector<std::string> failed_request_ids =
+    KvPushFailureIds failures =
         write_context_kv(processed_target_input,
                          embeddings,
                          processed_target_input.positions,
                          context_cache_slots);
     output.failed_request_ids.insert(
         output.failed_request_ids.end(),
-        std::make_move_iterator(failed_request_ids.begin()),
-        std::make_move_iterator(failed_request_ids.end()));
+        std::make_move_iterator(failures.failed_request_ids.begin()),
+        std::make_move_iterator(failures.failed_request_ids.end()));
+    output.unsafe_request_ids.insert(
+        output.unsafe_request_ids.end(),
+        std::make_move_iterator(failures.unsafe_request_ids.begin()),
+        std::make_move_iterator(failures.unsafe_request_ids.end()));
     COUNTER_ADD(speculative_execution_latency_seconds_draft,
                 timer.elapsed_seconds());
   }
@@ -967,7 +971,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
     if (output.failed_request_ids.empty()) {
       return std::nullopt;
     }
-    return make_failed_output(std::move(output.failed_request_ids));
+    return make_failed_output(std::move(output.failed_request_ids),
+                              std::move(output.unsafe_request_ids));
   }
   return output;
 }
@@ -1798,12 +1803,15 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   // as rejections. Zero extra device sync — we're already on CPU.
   record_validate_metrics(
       val_output, did_prune ? per_seq_val_tokens : std::vector<int32_t>{});
-  std::vector<std::string> failed_request_ids =
-      write_target_context_to_cache(input, val_output);
+  KvPushFailureIds failures = write_target_context_to_cache(input, val_output);
   target_output.failed_request_ids.insert(
       target_output.failed_request_ids.end(),
-      std::make_move_iterator(failed_request_ids.begin()),
-      std::make_move_iterator(failed_request_ids.end()));
+      std::make_move_iterator(failures.failed_request_ids.begin()),
+      std::make_move_iterator(failures.failed_request_ids.end()));
+  target_output.unsafe_request_ids.insert(
+      target_output.unsafe_request_ids.end(),
+      std::make_move_iterator(failures.unsafe_request_ids.begin()),
+      std::make_move_iterator(failures.unsafe_request_ids.end()));
   if (has_json_states) {
     verify_json_accepted_tokens(
         input,
@@ -1815,7 +1823,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     if (target_output.failed_request_ids.empty()) {
       return std::nullopt;
     }
-    return make_failed_output(std::move(target_output.failed_request_ids));
+    return make_failed_output(std::move(target_output.failed_request_ids),
+                              std::move(target_output.unsafe_request_ids));
   }
   val_output.embeddings = torch::Tensor();
   target_output.sample_output = val_output;
@@ -2280,7 +2289,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   query_input.device_tensors_ready = true;
 }
 
-std::vector<std::string> DFlashWorkerImpl::write_context_kv(
+KvPushFailureIds DFlashWorkerImpl::write_context_kv(
     const ForwardInput& input,
     const torch::Tensor& context_hidden,
     const torch::Tensor& positions_device,
@@ -2383,7 +2392,7 @@ std::vector<std::string> DFlashWorkerImpl::write_context_kv(
 #endif
 }
 
-std::vector<std::string> DFlashWorkerImpl::write_target_context_to_cache(
+KvPushFailureIds DFlashWorkerImpl::write_target_context_to_cache(
     const ForwardInput& input,
     const SampleOutput& validate_output) {
   const torch::Tensor& accepted_embeddings = validate_output.embeddings;
@@ -2466,7 +2475,7 @@ std::vector<std::string> DFlashWorkerImpl::write_target_context_to_cache(
     CHECK(compute_stream_->wait_event(context_hidden_ready_event))
         << "failed to wait DFlash context hidden ready event";
   }
-  std::vector<std::string> failed_request_ids = write_context_kv(
+  KvPushFailureIds failures = write_context_kv(
       draft_input, context_hidden, positions_device, new_cache_slots_device);
   CHECK(!input.input_params.embedding.embedding_ids.empty())
       << "DFlash target context cache write requires embedding ids";
@@ -2476,7 +2485,7 @@ std::vector<std::string> DFlashWorkerImpl::write_target_context_to_cache(
       validate_output.next_tokens,
       validate_output.embeddings,
       options_.num_speculative_tokens());
-  return failed_request_ids;
+  return failures;
 }
 
 // -----------------------------------------------------------------------------

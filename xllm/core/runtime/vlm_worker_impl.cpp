@@ -257,7 +257,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
 #endif
   }
   auto finish_push = [&]() {
-    std::vector<std::string> failures =
+    KvPushFailureIds failures =
         finalize_kv_push_failures(kv_transfers,
                                   input.transfer_kv_infos,
                                   options_.kv_cache_transfer_mode(),
@@ -273,7 +273,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   if (empty_shard) {
     fail_aborted_push();
     ForwardOutput output;
-    output.failed_request_ids = finish_push();
+    KvPushFailureIds failures = finish_push();
+    output.failed_request_ids = std::move(failures.failed_request_ids);
+    output.unsafe_request_ids = std::move(failures.unsafe_request_ids);
     return output;
   }
 
@@ -283,10 +285,11 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
       input.token_ids, input.positions, kv_caches_, input.input_params);
   if (!model_output.hidden_states.defined()) {
     fail_aborted_push();
-    auto failures = finish_push();
+    KvPushFailureIds failures = finish_push();
 
-    if (!failures.empty()) {
-      return make_failed_output(std::move(failures));
+    if (!failures.failed_request_ids.empty()) {
+      return make_failed_output(std::move(failures.failed_request_ids),
+                                std::move(failures.unsafe_request_ids));
     }
     return std::nullopt;
   }
@@ -333,8 +336,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
       (void)ret;
     }
     auto failures = finish_push();
-    if (!failures.empty()) {
-      return make_failed_output(std::move(failures));
+    if (!failures.failed_request_ids.empty()) {
+      return make_failed_output(std::move(failures.failed_request_ids),
+                                std::move(failures.unsafe_request_ids));
     }
     return std::nullopt;
   }
@@ -397,7 +401,9 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     }
   }
 
-  output.failed_request_ids = finish_push();
+  KvPushFailureIds push_failures = finish_push();
+  output.failed_request_ids = std::move(push_failures.failed_request_ids);
+  output.unsafe_request_ids = std::move(push_failures.unsafe_request_ids);
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
     if (record_ready_event && enable_schedule_overlap()) {

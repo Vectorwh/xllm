@@ -140,6 +140,20 @@ inline bool is_aligned_for_cuda_zero_copy(const void* ptr) {
 // v12: DiT forward inputs store a length-prefixed list of LoRA adapter IDs.
 constexpr uint64_t kRawInputFormatTag = 0x584C4C4D0000000CULL;
 
+// The forward output payload is also a hard-coded field list with no length
+// self-description. Tag its head and carry the payload length so a reader
+// rejects a different layout instead of misparsing the tail. This only guards
+// hosts that share one SHM segment; the RPC proto carries the same fields
+// append-only.
+// v1: tagged output payload (format tag + payload length).
+// v2: unsafe_request_ids follows failed_request_ids.
+constexpr uint64_t kRawOutputFormatTag = 0x584C4C4F00000002ULL;
+
+struct RawOutputLayoutHeader final {
+  uint64_t format_tag = kRawOutputFormatTag;
+  uint64_t payload_bytes = 0;
+};
+
 struct RawInputLayoutHeader final {
   uint64_t format_tag = kRawInputFormatTag;
   uint64_t descriptor_bytes = 0;
@@ -2939,6 +2953,7 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
 
   size += calculate_json_object_errors_size(output.json_object_errors);
   size += get_string_vector_size(output.failed_request_ids);
+  size += get_string_vector_size(output.unsafe_request_ids);
 
   size += get_vector_size(output.expert_load_data);
   size += get_vector_size(output.src_seq_idxes);
@@ -3034,7 +3049,7 @@ void read_json_object_errors(const char*& buffer,
   }
 }
 
-void deserialize_raw_forward_output(const char* buffer,
+void deserialize_raw_forward_output(const char*& buffer,
                                     RawForwardOutput& output) {
   uint64_t outputs_count;
   read_data(buffer, outputs_count);
@@ -3045,6 +3060,7 @@ void deserialize_raw_forward_output(const char* buffer,
 
   read_json_object_errors(buffer, output.json_object_errors);
   read_string_vector(buffer, output.failed_request_ids);
+  read_string_vector(buffer, output.unsafe_request_ids);
 
   read_vector(buffer, output.expert_load_data);
   read_vector(buffer, output.src_seq_idxes);
@@ -3077,6 +3093,7 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
 
   write_json_object_errors(buffer, output.json_object_errors);
   write_string_vector(buffer, output.failed_request_ids);
+  write_string_vector(buffer, output.unsafe_request_ids);
 
   write_vector(buffer, output.expert_load_data);
   write_vector(buffer, output.src_seq_idxes);
@@ -3780,6 +3797,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const torch::Tensor& out_logprobs,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     const std::vector<std::string>& failed_request_ids,
+    const std::vector<std::string>& unsafe_request_ids,
     const std::vector<MMDict>& mm_dict_vec) {
   RawForwardOutput output;
   convert_tensor_to_raw_output(next_tokens,
@@ -3806,9 +3824,11 @@ bool ForwardSharedMemoryManager::raw_output_write(
   }
   output.json_object_errors = json_object_errors;
   output.failed_request_ids = failed_request_ids;
+  output.unsafe_request_ids = unsafe_request_ids;
   output.mm_dict_vec = mm_dict_vec;
   const uint64_t payload_size = calculate_raw_forward_output_size(output);
-  const uint64_t total_size = sizeof(ControlMetadata) + payload_size;
+  const uint64_t total_size =
+      sizeof(ControlMetadata) + sizeof(RawOutputLayoutHeader) + payload_size;
   if (unlikely(total_size > size())) {
     LOG(ERROR) << "raw output size overflow, total_size: " << total_size
                << ", shm size: " << size();
@@ -3816,6 +3836,8 @@ bool ForwardSharedMemoryManager::raw_output_write(
   }
 
   char* data_ptr = static_cast<char*>(base_address()) + sizeof(ControlMetadata);
+  write_data(data_ptr, kRawOutputFormatTag);
+  write_data(data_ptr, payload_size);
   char* payload_begin = data_ptr;
   serialize_raw_forward_output(output, data_ptr);
   CHECK_EQ(data_ptr, payload_begin + payload_size)
@@ -3850,9 +3872,23 @@ bool ForwardSharedMemoryManager::raw_output_read(
     std::this_thread::sleep_for(std::chrono::nanoseconds(kNumWaitNanoseconds));
   }
 
-  const char* data_ptr =
+  const char* cursor =
       static_cast<char*>(base_address()) + sizeof(ControlMetadata);
-  deserialize_raw_forward_output(data_ptr, output);
+  const uint64_t available = size() - sizeof(ControlMetadata);
+  CHECK_GE(available, sizeof(RawOutputLayoutHeader))
+      << "raw output layout header overflow";
+  RawOutputLayoutHeader layout;
+  read_data(cursor, layout.format_tag);
+  read_data(cursor, layout.payload_bytes);
+  CHECK_EQ(layout.format_tag, kRawOutputFormatTag)
+      << "incompatible raw output format; engine and workers must run the same "
+         "packed output schema";
+  CHECK_LE(layout.payload_bytes, available - sizeof(RawOutputLayoutHeader))
+      << "raw output payload overflow";
+  const char* payload_begin = cursor;
+  deserialize_raw_forward_output(cursor, output);
+  CHECK_EQ(static_cast<uint64_t>(cursor - payload_begin), layout.payload_bytes)
+      << "raw output payload size mismatch";
 
   return true;
 }

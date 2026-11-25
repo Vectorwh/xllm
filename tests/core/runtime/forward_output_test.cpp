@@ -26,23 +26,34 @@ namespace {
 
 TEST(ForwardOutputTest, NonDriverFailureIsReturnedWhenEplbIsDisabled) {
   std::optional<ForwardOutput> output = make_non_driver_forward_output(
-      ForwardOutput{}, {"request-a"}, /*eplb_enabled=*/false);
+      ForwardOutput{}, {"request-a"}, {}, /*eplb_enabled=*/false);
 
   ASSERT_TRUE(output.has_value());
   EXPECT_EQ(output->failed_request_ids,
             (std::vector<std::string>{"request-a"}));
 }
 
+TEST(ForwardOutputTest, NonDriverUnsafeFailureKeepsBothSets) {
+  std::optional<ForwardOutput> output = make_non_driver_forward_output(
+      ForwardOutput{}, {"request-a"}, {"request-a"}, /*eplb_enabled=*/false);
+
+  ASSERT_TRUE(output.has_value());
+  EXPECT_EQ(output->failed_request_ids,
+            (std::vector<std::string>{"request-a"}));
+  EXPECT_EQ(output->unsafe_request_ids,
+            (std::vector<std::string>{"request-a"}));
+}
+
 TEST(ForwardOutputTest, NonDriverSuccessRemainsEmptyWhenEplbIsDisabled) {
   std::optional<ForwardOutput> output = make_non_driver_forward_output(
-      ForwardOutput{}, {}, /*eplb_enabled=*/false);
+      ForwardOutput{}, {}, {}, /*eplb_enabled=*/false);
 
   EXPECT_FALSE(output.has_value());
 }
 
 TEST(ForwardOutputTest, NonDriverEplbOutputIsRetainedWithoutFailures) {
   std::optional<ForwardOutput> output = make_non_driver_forward_output(
-      ForwardOutput{}, {}, /*eplb_enabled=*/true);
+      ForwardOutput{}, {}, {}, /*eplb_enabled=*/true);
 
   ASSERT_TRUE(output.has_value());
   EXPECT_TRUE(output->failed_request_ids.empty());

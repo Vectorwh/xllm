@@ -80,6 +80,10 @@ enum class CacheAllocationMode : uint8_t {
 
 struct RequestFailureState final {
   std::optional<Status> status;
+  // The request's PUSH transfer ended without proof that the destination
+  // buffers stopped being written. Releasing its Decode reservation must lease
+  // the blocks instead of returning them to the pool.
+  bool kv_push_unsafe = false;
 };
 
 struct SequenceParams {
@@ -376,6 +380,12 @@ class Sequence final {
   FinishReason finish_reason() const { return finish_reason_; }
   const std::optional<Status>& error_status() const {
     return sequence_params_.request_failure_state->status;
+  }
+  bool kv_push_unsafe() const {
+    return sequence_params_.request_failure_state->kv_push_unsafe;
+  }
+  void mark_kv_push_unsafe() {
+    sequence_params_.request_failure_state->kv_push_unsafe = true;
   }
   // check finish status, use cached value if not invalidated
   bool finished() const;

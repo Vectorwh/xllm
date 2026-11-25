@@ -276,23 +276,18 @@ void DisaggPDServiceImpl::cancel_request(
   response->set_result(scheduler_->cancel_request(*request));
 }
 
-void DisaggPDServiceImpl::mark_kv_unsafe(
-    const proto::MarkKVUnsafeRequest* request,
-    proto::MarkKVUnsafeResponse* response) {
-  if (!scheduler_->supports_kv_unsafe_lease()) {
-    response->set_result(proto::MarkKVUnsafeResponse::NOT_SUPPORTED);
-    return;
-  }
-  const bool marked = scheduler_->mark_kv_unsafe(request->req_id());
-  response->set_result(marked ? proto::MarkKVUnsafeResponse::MARKED
-                              : proto::MarkKVUnsafeResponse::NOT_FOUND);
-}
-
 void DisaggPDServiceImpl::release_reservation(
     const proto::ReleaseReservationRequest* request,
     proto::ReleaseReservationResponse* response) {
-  const bool released = scheduler_->release_reservation(
-      request->req_id(), request->reservation_id());
+  bool unsafe_leased = false;
+  // Pass the raw intent; the scheduler applies the PD-OOC opt-out where the
+  // lease is created.
+  const bool released =
+      scheduler_->release_reservation(request->req_id(),
+                                      request->reservation_id(),
+                                      request->unsafe(),
+                                      &unsafe_leased);
+  response->set_unsafe_leased(unsafe_leased);
   response->set_result(released
                            ? proto::ReleaseReservationResponse::RELEASED
                            : proto::ReleaseReservationResponse::NOT_WAITING);

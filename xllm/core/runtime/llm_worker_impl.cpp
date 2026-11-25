@@ -253,6 +253,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   const std::vector<std::string> canonical_request_ids =
       canonical_transfer_request_ids(input.transfer_kv_infos);
   std::vector<std::string> failed_request_ids;
+  std::vector<std::string> unsafe_request_ids;
   bool kv_push_waited = false;
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU) || \
     defined(USE_MUSA)
@@ -343,7 +344,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
             context_.get_parallel_args().tp_cp_group_)) {
       LOG(ERROR) << "Failed to prepare prefill layerwise KV, batch_id="
                  << model_params.meta.batch_id;
-      return make_failed_output(model_params.embedding.request_ids);
+      return make_failed_output(model_params.embedding.request_ids, {});
     }
     model_params.parallel.layers_per_event = 1;
     model_params.parallel.layer_wise_load_synchronizer =
@@ -393,13 +394,15 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     if (kv_push_waited) {
       return;
     }
-    failed_request_ids =
+    KvPushFailureIds failures =
         finalize_kv_push_failures(kv_transfers,
                                   input.transfer_kv_infos,
                                   options_.kv_cache_transfer_mode(),
                                   options_.instance_role(),
                                   context_.get_parallel_args(),
                                   device_);
+    failed_request_ids = std::move(failures.failed_request_ids);
+    unsafe_request_ids = std::move(failures.unsafe_request_ids);
     kv_push_waited = true;
   };
   if (eplb_executor_ != nullptr) {
@@ -429,7 +432,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     fail_aborted_push();
     wait_kv_push();
     if (!failed_request_ids.empty()) {
-      return make_failed_output(std::move(failed_request_ids));
+      return make_failed_output(std::move(failed_request_ids),
+                                std::move(unsafe_request_ids));
     }
     return std::nullopt;
   }
@@ -503,6 +507,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         wait_kv_push();
         return make_non_driver_forward_output(ForwardOutput{},
                                               std::move(failed_request_ids),
+                                              std::move(unsafe_request_ids),
                                               /*eplb_enabled=*/false);
       }
       int ret = device_.synchronize_default_stream();
@@ -510,6 +515,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       wait_kv_push();
       return make_non_driver_forward_output(std::move(output),
                                             std::move(failed_request_ids),
+                                            std::move(unsafe_request_ids),
                                             eplb_executor_ != nullptr);
     }
 
@@ -598,6 +604,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     wait_kv_push();
     output.failed_request_ids = std::move(failed_request_ids);
+    output.unsafe_request_ids = std::move(unsafe_request_ids);
     output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
     if (enable_schedule_overlap() && record_ready_event) {
       output.ready_event = record_current_stream_event(device_);
@@ -611,6 +618,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 
   wait_kv_push();
   output.failed_request_ids = std::move(failed_request_ids);
+  output.unsafe_request_ids = std::move(unsafe_request_ids);
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   if (should_sync_default_stream) {

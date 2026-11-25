@@ -535,9 +535,10 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
     runtime_.eplb_executor->finish_eplb_step();
   }
   if (!model_output.hidden_states.defined()) {
-    std::vector<std::string> failed_request_ids = wait_kv_push();
-    if (!failed_request_ids.empty()) {
-      return make_failed_output(std::move(failed_request_ids));
+    KvPushFailureIds failures = wait_kv_push();
+    if (!failures.failed_request_ids.empty()) {
+      return make_failed_output(std::move(failures.failed_request_ids),
+                                std::move(failures.unsafe_request_ids));
     }
     return std::nullopt;
   }
@@ -558,10 +559,11 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
       !runtime_.worker.options_.enable_speculative_decode()) {
     auto ret = runtime_.stream->synchronize();
-    std::vector<std::string> failed_request_ids = wait_kv_push();
+    KvPushFailureIds failures = wait_kv_push();
     return make_non_driver_forward_output(
         std::move(output),
-        std::move(failed_request_ids),
+        std::move(failures.failed_request_ids),
+        std::move(failures.unsafe_request_ids),
         ::xllm::EPLBConfig::get_instance().enable_eplb());
   }
 
@@ -605,8 +607,9 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
 
   auto ret = runtime_.stream->synchronize();
 
-  std::vector<std::string> failed_request_ids = wait_kv_push();
-  output.failed_request_ids = std::move(failed_request_ids);
+  KvPushFailureIds push_failures = wait_kv_push();
+  output.failed_request_ids = std::move(push_failures.failed_request_ids);
+  output.unsafe_request_ids = std::move(push_failures.unsafe_request_ids);
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(

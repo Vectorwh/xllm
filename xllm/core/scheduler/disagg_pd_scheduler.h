@@ -140,17 +140,18 @@ class DisaggPDScheduler : public ContinuousScheduler {
       std::optional<uint64_t> confirmed_upstream_output_tokens = std::nullopt);
 
   // Only consumes a matching waiting reservation, never a running request.
+  // `unsafe` comes from the Prefill transfer result: when set, the
+  // reservation's target blocks are parked for a lease instead of returning to
+  // the pool. `unsafe_leased` reports whether such a lease was actually
+  // created.
   bool release_reservation(const std::string& req_id,
-                           const std::string& reservation_id);
-
-  // Marks the waiting reservation of `req_id` as written by a PUSH transfer
-  // that never proved the destination buffers were retired. The release that
-  // follows parks those blocks for a lease instead of returning them to the
-  // pool. Returns false when no waiting reservation matches.
-  bool mark_kv_unsafe(const std::string& req_id);
+                           const std::string& reservation_id,
+                           bool unsafe = false,
+                           bool* unsafe_leased = nullptr);
 
   // PD-OOC owns a different reservation lifecycle, so the unsafe-transfer
-  // lease is not wired into it.
+  // lease is not wired into it. lease_waiting_reservation_if_unsafe_locked
+  // consults this before creating a lease, so callers cannot bypass it.
   bool supports_kv_unsafe_lease() const { return !options_.enable_pd_ooc(); }
 
   // Only cancels Decode requests after KV restore/handoff, on the scheduler
@@ -241,14 +242,15 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // Caller holds received_request_map_mutex_. Deallocation stays outside it.
   std::shared_ptr<Request> take_waiting_request(const std::string& req_id);
   // Caller holds received_request_map_mutex_. Every exit that destroys a
-  // waiting reservation must route through this: a reservation marked unsafe
-  // is parked in kv_unsafe_leases_ and returns true; unmarked reservations
-  // return false and stay owned by the caller (release resets them, unlink
-  // only drops its reference).
+  // waiting reservation must route through this: an unsafe reservation is
+  // parked in kv_unsafe_leases_ and returns true; safe reservations return
+  // false and stay owned by the caller (release resets them, unlink only drops
+  // its reference).
   bool lease_waiting_reservation_if_unsafe_locked(
       const std::string& req_id,
       const std::shared_ptr<Request>& request,
-      absl::Time now);
+      absl::Time now,
+      bool unsafe);
   // Caller holds received_request_map_mutex_.
   void prune_cancelled_reservations(absl::Time now);
 
@@ -363,12 +365,6 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // A release can arrive before a timed-out AddNewRequests finishes on Decode.
   std::unordered_map<std::string, absl::Time> cancelled_reservations_;
   absl::Time next_cancellation_prune_ = absl::InfinitePast();
-  // reservation_key(req_id, reservation_id). Marks that arrive before the
-  // release; consumed by lease_waiting_reservation_if_unsafe_locked and
-  // cleared when the reservation is handed off. Tied to the reservation's
-  // lifetime on purpose: a wall-clock expiry could drop a mark before a
-  // delayed release and let the blocks return without a lease.
-  std::unordered_set<std::string> unsafe_reservations_;
   struct KvUnsafeLease {
     std::shared_ptr<Request> request;
     absl::Time deadline;

@@ -123,6 +123,9 @@ std::optional<ForwardOutput> DSparkWorkerImpl::step_decode(
     output->failed_request_ids.insert(output->failed_request_ids.end(),
                                       draft_block.failed_request_ids.begin(),
                                       draft_block.failed_request_ids.end());
+    output->unsafe_request_ids.insert(output->unsafe_request_ids.end(),
+                                      draft_block.unsafe_request_ids.begin(),
+                                      draft_block.unsafe_request_ids.end());
   }
   return output;
 }
@@ -271,6 +274,7 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::execute_draft_query(
     draft_block.confidence_probs = std::move(sampled.confidence_probs);
   }
   draft_block.failed_request_ids = std::move(draft_output->failed_request_ids);
+  draft_block.unsafe_request_ids = std::move(draft_output->unsafe_request_ids);
   draft_block.retained_inputs = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());

@@ -40,27 +40,35 @@ using namespace std::chrono_literals;
 
 class SimulatedAllGatherProcessGroup final : public ProcessGroup {
  public:
-  explicit SimulatedAllGatherProcessGroup(bool mismatched_request_count = false)
+  explicit SimulatedAllGatherProcessGroup(
+      bool mismatched_request_count = false,
+      int64_t remote_second_bitmap_value = 1)
       : ProcessGroup(/*rank=*/0,
                      /*world_size=*/2,
                      torch::Device(torch::kCPU)),
-        mismatched_request_count_(mismatched_request_count) {}
+        mismatched_request_count_(mismatched_request_count),
+        remote_second_bitmap_value_(remote_second_bitmap_value) {}
 
   torch::Tensor allgather_base_sync(const torch::Tensor& input) override {
     ++allgather_count_;
+    inputs.push_back(input.clone());
     torch::Tensor remote_payload = input.clone();
     if (mismatched_request_count_) {
       remote_payload[0].add_(1);
     } else if (allgather_count_ == 2 && remote_payload.numel() > 1) {
-      remote_payload[1].fill_(1);
+      remote_payload[1].fill_(remote_second_bitmap_value_);
     }
     return torch::cat({input, remote_payload});
   }
 
   size_t allgather_count() const { return allgather_count_; }
 
+  // Payloads passed to each collective, in call order.
+  std::vector<torch::Tensor> inputs;
+
  private:
   bool mismatched_request_count_;
+  int64_t remote_second_bitmap_value_;
   size_t allgather_count_ = 0;
 };
 
@@ -80,11 +88,76 @@ TEST(KVTransferFailureReductionTest, MergesFailureBitmapAcrossTpRanks) {
   ParallelArgs parallel_args = make_parallel_args(&tp_group);
   Device device(torch::Device(torch::kCPU));
 
-  EXPECT_EQ(
-      reduce_failed_request_ids(
-          {"request-a"}, {"request-a", "request-b"}, parallel_args, device),
-      (std::vector<std::string>{"request-a", "request-b"}));
+  const KvPushFailureIds failures = reduce_failed_request_ids(
+      {"request-a"}, {}, {"request-a", "request-b"}, parallel_args, device);
+  EXPECT_EQ(failures.failed_request_ids,
+            (std::vector<std::string>{"request-a", "request-b"}));
+  EXPECT_TRUE(failures.unsafe_request_ids.empty());
   EXPECT_EQ(tp_group.allgather_count(), 2u);
+}
+
+TEST(KVTransferFailureReductionTest, MergesUnsafeBitmapAcrossTpRanks) {
+  SimulatedAllGatherProcessGroup tp_group(
+      /*mismatched_request_count=*/false, /*remote_second_bitmap_value=*/3);
+  ParallelArgs parallel_args = make_parallel_args(&tp_group);
+  Device device(torch::Device(torch::kCPU));
+
+  const KvPushFailureIds failures =
+      reduce_failed_request_ids({"request-a", "request-b"},
+                                {"request-a"},
+                                {"request-a", "request-b"},
+                                parallel_args,
+                                device);
+  EXPECT_EQ(failures.failed_request_ids,
+            (std::vector<std::string>{"request-a", "request-b"}));
+  EXPECT_EQ(failures.unsafe_request_ids,
+            (std::vector<std::string>{"request-a", "request-b"}));
+  EXPECT_EQ(tp_group.allgather_count(), 2u);
+}
+
+TEST(KVTransferFailureReductionTest,
+     TreatsOutOfRangeRankBitmapAsFailedAndUnsafe) {
+  // The protocol only emits 0, 1 and 3; 2 (unsafe without failed) and values
+  // outside 0-3 cannot be trusted. Treat them as failed-and-unsafe instead of
+  // aborting the worker on the post-reduction invariant.
+  for (const int64_t invalid_bits : {2, 5}) {
+    SCOPED_TRACE(::testing::Message() << "invalid_bits=" << invalid_bits);
+    SimulatedAllGatherProcessGroup tp_group(
+        /*mismatched_request_count=*/false, invalid_bits);
+    ParallelArgs parallel_args = make_parallel_args(&tp_group);
+    Device device(torch::Device(torch::kCPU));
+
+    const KvPushFailureIds failures = reduce_failed_request_ids(
+        {"request-a"}, {}, {"request-a", "request-b"}, parallel_args, device);
+    EXPECT_EQ(failures.failed_request_ids,
+              (std::vector<std::string>{"request-a", "request-b"}));
+    EXPECT_EQ(failures.unsafe_request_ids,
+              (std::vector<std::string>{"request-b"}));
+  }
+}
+
+TEST(KVTransferFailureReductionTest, TpReductionFeedsCpReduction) {
+  // TP and CP form a mesh. The CP collective must carry the TP-reduced
+  // bitmap, otherwise a diagonal rank's unsafe report never reaches the
+  // driver. Simulate a TP peer that reports unsafe for request-b and a CP
+  // peer that has no local failure; the CP input must already contain the TP
+  // result.
+  SimulatedAllGatherProcessGroup tp_group(
+      /*mismatched_request_count=*/false, /*remote_second_bitmap_value=*/3);
+  SimulatedAllGatherProcessGroup cp_group(
+      /*mismatched_request_count=*/false, /*remote_second_bitmap_value=*/0);
+  ParallelArgs parallel_args = make_parallel_args(&tp_group);
+  parallel_args.cp_group_ = &cp_group;
+  Device device(torch::Device(torch::kCPU));
+
+  const KvPushFailureIds failures = reduce_failed_request_ids(
+      {"request-a"}, {}, {"request-a", "request-b"}, parallel_args, device);
+  ASSERT_EQ(cp_group.inputs.size(), 2u);
+  EXPECT_EQ(cp_group.inputs[1][1].item<int64_t>(), 3);
+  EXPECT_EQ(failures.failed_request_ids,
+            (std::vector<std::string>{"request-a", "request-b"}));
+  EXPECT_EQ(failures.unsafe_request_ids,
+            (std::vector<std::string>{"request-b"}));
 }
 
 TEST(KVTransferFailureReductionTest,
@@ -93,7 +166,10 @@ TEST(KVTransferFailureReductionTest,
   ParallelArgs parallel_args = make_parallel_args(&tp_group);
   Device device(torch::Device(torch::kCPU));
 
-  EXPECT_TRUE(reduce_failed_request_ids({}, {}, parallel_args, device).empty());
+  const KvPushFailureIds failures =
+      reduce_failed_request_ids({}, {}, {}, parallel_args, device);
+  EXPECT_TRUE(failures.failed_request_ids.empty());
+  EXPECT_TRUE(failures.unsafe_request_ids.empty());
   EXPECT_EQ(tp_group.allgather_count(), 1u);
 }
 
@@ -103,7 +179,9 @@ TEST(KVTransferFailureReductionTest, RejectsTpRankRequestCountMismatch) {
   Device device(torch::Device(torch::kCPU));
 
   EXPECT_DEATH(
-      { reduce_failed_request_ids({}, {"request-a"}, parallel_args, device); },
+      {
+        reduce_failed_request_ids({}, {}, {"request-a"}, parallel_args, device);
+      },
       "request count differs across reduction ranks");
 }
 
@@ -115,9 +193,10 @@ TEST(KVTransferFailureReductionTest, NonSendingRolesSkipEmptyCollectives) {
     Device device(torch::Device(torch::kCPU));
     KVTransferCompletion completion;
 
-    EXPECT_TRUE(finalize_kv_push_failures(
-                    completion, {}, "PUSH", role, parallel_args, device)
-                    .empty());
+    const KvPushFailureIds failures = finalize_kv_push_failures(
+        completion, {}, "PUSH", role, parallel_args, device);
+    EXPECT_TRUE(failures.failed_request_ids.empty());
+    EXPECT_TRUE(failures.unsafe_request_ids.empty());
     EXPECT_EQ(tp_group.allgather_count(), 0u);
   }
 }
@@ -129,11 +208,36 @@ TEST(KVTransferFailureReductionTest, SendingRolesValidateEmptyTransferSets) {
     Device device(torch::Device(torch::kCPU));
     KVTransferCompletion completion;
 
-    EXPECT_TRUE(finalize_kv_push_failures(
-                    completion, {}, "PUSH", role, parallel_args, device)
-                    .empty());
+    const KvPushFailureIds failures = finalize_kv_push_failures(
+        completion, {}, "PUSH", role, parallel_args, device);
+    EXPECT_TRUE(failures.failed_request_ids.empty());
+    EXPECT_TRUE(failures.unsafe_request_ids.empty());
     EXPECT_EQ(tp_group.allgather_count(), 1u);
   }
+}
+
+TEST(KVTransferFailureReductionTest, FinalizeReturnsUnsafeSubset) {
+  ParallelArgs parallel_args = make_parallel_args(/*tp_group=*/nullptr);
+  Device device(torch::Device(torch::kCPU));
+  KVTransferCompletion completion;
+  folly::Promise<std::vector<KVTransferTaskResult>> promise;
+  completion.add(promise.getSemiFuture(), {"request-a"});
+  promise.setValue(std::vector<KVTransferTaskResult>{
+      KVTransferTaskResult{{"request-a"}, KVTransferErrorCode::UNSAFE}});
+
+  TransferKVInfo transfer;
+  transfer.request_id = "request-a";
+  const KvPushFailureIds failures =
+      finalize_kv_push_failures(completion,
+                                {transfer},
+                                "PUSH",
+                                InstanceRole::PREFILL,
+                                parallel_args,
+                                device);
+  EXPECT_EQ(failures.failed_request_ids,
+            (std::vector<std::string>{"request-a"}));
+  EXPECT_EQ(failures.unsafe_request_ids,
+            (std::vector<std::string>{"request-a"}));
 }
 
 TEST(KVTransferFailureReductionTest, NonSendingRolesRejectOutgoingTransfers) {
@@ -172,6 +276,18 @@ TEST(KVTransferCompletionTest, ReturnsMergedFailedRequestIds) {
   EXPECT_EQ(
       completion.wait(),
       (std::unordered_set<std::string>{"request-a", "request-b", "request-c"}));
+}
+
+TEST(KVTransferCompletionTest, TracksUnsafeRequestIds) {
+  folly::Promise<std::vector<KVTransferTaskResult>> promise;
+  KVTransferCompletion completion;
+  completion.add(promise.getSemiFuture(), {"request-a"});
+  promise.setValue(std::vector<KVTransferTaskResult>{
+      KVTransferTaskResult{{"request-a"}, KVTransferErrorCode::UNSAFE}});
+
+  EXPECT_EQ(completion.wait(), (std::unordered_set<std::string>{"request-a"}));
+  EXPECT_EQ(completion.unsafe_request_ids(),
+            (std::unordered_set<std::string>{"request-a"}));
 }
 
 TEST(KVTransferCompletionTest, WaitsForEveryTransfer) {

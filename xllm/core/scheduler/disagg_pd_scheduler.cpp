@@ -154,7 +154,8 @@ void drain_dispatch_queue(
 
 void send_reservation_release(const std::string& req_id,
                               const std::string& reservation_id,
-                              const std::string& address) {
+                              const std::string& address,
+                              bool unsafe) {
   constexpr int32_t kMaxAttempts = 3;
   constexpr int32_t kTimeoutMs = 1000;
   constexpr int32_t kBackoffMs = 50;
@@ -173,6 +174,7 @@ void send_reservation_release(const std::string& req_id,
   proto::ReleaseReservationRequest req;
   req.set_req_id(req_id);
   req.set_reservation_id(reservation_id);
+  req.set_unsafe(unsafe);
   for (int32_t attempt = 1; attempt <= kMaxAttempts; ++attempt) {
     brpc::Controller cntl;
     proto::ReleaseReservationResponse resp;
@@ -180,22 +182,35 @@ void send_reservation_release(const std::string& req_id,
     if (!cntl.Failed() &&
         (resp.result() == proto::ReleaseReservationResponse::RELEASED ||
          resp.result() == proto::ReleaseReservationResponse::NOT_WAITING)) {
-      LOG(INFO) << "Decode reservation release, request_id=" << req_id
-                << ", peer=" << address << ", result=" << resp.result()
-                << ", attempt=" << attempt;
+      if (unsafe && !resp.unsafe_leased()) {
+        LOG(ERROR) << "Decode did not lease an unsafe reservation, "
+                   << "request_id=" << req_id << ", peer=" << address
+                   << ", result=" << resp.result()
+                   << "; blocks may be reused while the transfer is still "
+                      "writing";
+      } else {
+        LOG(INFO) << "Decode reservation release, request_id=" << req_id
+                  << ", peer=" << address << ", result=" << resp.result()
+                  << ", unsafe=" << unsafe
+                  << ", unsafe_leased=" << resp.unsafe_leased()
+                  << ", attempt=" << attempt;
+      }
       return;
     }
     LOG(WARNING) << "Decode reservation release retry, request_id=" << req_id
-                 << ", peer=" << address << ", attempt=" << attempt
-                 << ", result=" << resp.result()
+                 << ", peer=" << address << ", unsafe=" << unsafe
+                 << ", attempt=" << attempt << ", result=" << resp.result()
                  << ", rpc_error=" << cntl.ErrorText();
     if (attempt < kMaxAttempts) {
       absl::SleepFor(absl::Milliseconds(kBackoffMs));
     }
   }
+  // An undelivered release never runs Decode's release path, so the blocks
+  // are not reset or reused; the waiting reservation stays allocated until
+  // unlink reclaims it. That is a capacity leak, not a use-after-free.
   LOG(ERROR) << "Decode reservation release exhausted retries, request_id="
-             << req_id << ", peer=" << address
-             << "; reservation may remain allocated";
+             << req_id << ", peer=" << address << ", unsafe=" << unsafe
+             << "; Decode keeps the reservation until unlink";
 }
 
 }  // namespace
@@ -1224,13 +1239,25 @@ void DisaggPDScheduler::prefill_send_first_generation() {
 
 void DisaggPDScheduler::release_failed_request(
     const std::shared_ptr<Request>& request) {
+  // Two terminal paths (batch output and terminal collection) can call this
+  // for the same request. Serialize the gate with the channel erase: the first
+  // caller takes the address and sends the release; later callers see it empty.
+  std::string address;
+  bool unsafe = false;
   {
     std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
     req_to_channel_map_.erase(request->request_id());
+    unsafe = request->kv_push_unsafe();
+    address = std::move(request->state().decode_rpc_address);
+    request->state().decode_rpc_address.clear();
   }
-  std::string address = std::move(request->state().decode_rpc_address);
-  request->state().decode_rpc_address.clear();
   if (address.empty()) {
+    if (unsafe) {
+      LOG(WARNING) << "Unsafe KV push release skipped: the Decode address was "
+                   << "already consumed by another terminal path or the "
+                   << "request was never accepted, request_id="
+                   << request->request_id();
+    }
     return;
   }
   const std::string req_id = request->request_id();
@@ -1238,7 +1265,7 @@ void DisaggPDScheduler::release_failed_request(
   if (reservation_id.empty()) {
     LOG(ERROR)
         << "Cannot release Decode reservation without identity, request_id="
-        << req_id << ", peer=" << address;
+        << req_id << ", peer=" << address << ", unsafe=" << unsafe;
     return;
   }
 
@@ -1248,9 +1275,10 @@ void DisaggPDScheduler::release_failed_request(
   // and this failed request cannot enter a later batch or FirstGeneration.
   // Capture values only: neither Request nor the scheduler's cached raw stub
   // is needed by retries. The pool drains these tasks during destruction.
-  reservation_release_threadpool_.schedule([req_id, reservation_id, address] {
-    send_reservation_release(req_id, reservation_id, address);
-  });
+  reservation_release_threadpool_.schedule(
+      [req_id, reservation_id, address, unsafe] {
+        send_reservation_release(req_id, reservation_id, address, unsafe);
+      });
 }
 
 bool DisaggPDScheduler::reject_queued_request(
@@ -1341,7 +1369,12 @@ bool DisaggPDScheduler::is_cancelled_reservation(const Request& request) {
 }
 
 bool DisaggPDScheduler::release_reservation(const std::string& req_id,
-                                            const std::string& reservation_id) {
+                                            const std::string& reservation_id,
+                                            bool unsafe,
+                                            bool* unsafe_leased) {
+  if (unsafe_leased != nullptr) {
+    *unsafe_leased = false;
+  }
   if (req_id.empty() || reservation_id.empty()) {
     return false;
   }
@@ -1359,16 +1392,25 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
     auto it = received_request_map_.find(req_id);
     if (it == received_request_map_.end() ||
         it->second->state().pd_reservation_id != reservation_id) {
+      if (unsafe) {
+        LOG(WARNING) << "Unsafe release has no matching waiting reservation, "
+                     << "request_id=" << req_id
+                     << ", reservation_id=" << reservation_id;
+      }
       return false;
     }
     request = take_waiting_request(req_id);
     decode_cancellation_entries_.erase(req_id);
-    leased = lease_waiting_reservation_if_unsafe_locked(req_id, request, now);
+    leased = lease_waiting_reservation_if_unsafe_locked(
+        req_id, request, now, unsafe);
   }
   // Deallocation stays outside the lock, as in the clean path.
   if (request != nullptr && !leased) {
     request->reset();
     request->end_inflight();
+  }
+  if (unsafe_leased != nullptr) {
+    *unsafe_leased = leased;
   }
   return true;
 }
@@ -1376,16 +1418,14 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
 bool DisaggPDScheduler::lease_waiting_reservation_if_unsafe_locked(
     const std::string& req_id,
     const std::shared_ptr<Request>& request,
-    absl::Time now) {
-  if (request == nullptr) {
-    return true;
-  }
-  const auto unsafe_it = unsafe_reservations_.find(
-      reservation_key(req_id, request->state().pd_reservation_id));
-  if (unsafe_it == unsafe_reservations_.end()) {
+    absl::Time now,
+    bool unsafe) {
+  // PD-OOC has no lease expiry loop, so a lease there would hold blocks
+  // forever. Keep that opt-out at the only place that creates leases; callers
+  // pass the raw unsafe intent and cannot bypass it.
+  if (request == nullptr || !unsafe || !supports_kv_unsafe_lease()) {
     return false;
   }
-  unsafe_reservations_.erase(unsafe_it);
   // The sender could not prove it stopped writing these buffers. Park the
   // request (and with it every target block) until the lease expires instead
   // of returning the blocks to the pool for immediate reuse.
@@ -1399,29 +1439,6 @@ bool DisaggPDScheduler::lease_waiting_reservation_if_unsafe_locked(
                << "request_id=" << req_id
                << ", reservation_id=" << request->state().pd_reservation_id
                << ", release_at=" << lease_deadline;
-  return true;
-}
-
-bool DisaggPDScheduler::mark_kv_unsafe(const std::string& req_id) {
-  if (req_id.empty()) {
-    return false;
-  }
-  std::lock_guard<std::mutex> lock(received_request_map_mutex_);
-  const absl::Time now = absl::Now();
-  prune_cancelled_reservations(now);
-  const auto it = received_request_map_.find(req_id);
-  if (it == received_request_map_.end()) {
-    // The reservation is already gone: the blocks were returned before the
-    // sender proved retirement, so the hardware hazard can no longer be
-    // contained on this side. No tombstone: a mark only ever protects the
-    // reservation its transfer was writing to, and PUSH allocation precedes
-    // every transfer, so a matching waiting reservation always exists.
-    LOG(ERROR) << "Unsafe KV transfer mark has no waiting reservation, "
-               << "request_id=" << req_id;
-    return false;
-  }
-  unsafe_reservations_.insert(
-      reservation_key(req_id, it->second->state().pd_reservation_id));
   return true;
 }
 
@@ -1568,12 +1585,6 @@ bool DisaggPDScheduler::decode_recv_first_generation(
       return false;
     }
     request = take_waiting_request(req_id);
-    // The reservation is handed off, so no later release can consume an
-    // unsafe mark for it; drop the mark with the reservation.
-    if (request != nullptr) {
-      unsafe_reservations_.erase(
-          reservation_key(req_id, request->state().pd_reservation_id));
-    }
   }
 
   auto& sequences = request->sequences();
@@ -2021,12 +2032,18 @@ bool DisaggPDScheduler::unlink_instance(
         if (request_it != received_request_map_.end()) {
           auto request = std::move(request_it->second);
           received_request_map_.erase(request_it);
-          // Unlink is another waiting-reservation exit and must honour an
-          // unsafe mark exactly like release_reservation does. Unlike a
-          // release, an unmarked reservation is only dropped here: unlink
-          // never resets the request, it releases ownership.
+          // The Prefill instance is gone, so no release can tell us whether
+          // its PUSH transfers retired; lease every waiting reservation of
+          // that instance instead of reusing blocks a dying writer may still
+          // reach. PULL waiting reservations have no writer yet (Decode pulls
+          // only after FirstGeneration consumes them), so the mode gate keeps
+          // them out of the lease. The lease helper applies the PD-OOC opt-out
+          // itself.
           (void)lease_waiting_reservation_if_unsafe_locked(
-              req_id, request, now);
+              req_id,
+              request,
+              now,
+              /*unsafe=*/options_.kv_cache_transfer_mode() == "PUSH");
         }
         request_to_instance_map_.erase(req_id);
         decode_cancellation_entries_.erase(req_id);

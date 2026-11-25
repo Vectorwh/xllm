@@ -894,7 +894,8 @@ void WorkerImpl::update_last_step_output(
   } else {
     if (!::xllm::EPLBConfig::get_instance().enable_eplb() &&
         last_step_output_.json_object_errors.empty() &&
-        last_step_output_.failed_request_ids.empty()) {
+        last_step_output_.failed_request_ids.empty() &&
+        last_step_output_.unsafe_request_ids.empty()) {
       last_step_request_ids_.clear();
       last_step_sample_sequence_ids_.clear();
     }
@@ -2116,7 +2117,8 @@ ForwardOutput WorkerImpl::get_last_step_result() {
   if (last_step_output_valid_ ||
       ::xllm::EPLBConfig::get_instance().enable_eplb() ||
       !last_step_output_.json_object_errors.empty() ||
-      !last_step_output_.failed_request_ids.empty()) {
+      !last_step_output_.failed_request_ids.empty() ||
+      !last_step_output_.unsafe_request_ids.empty()) {
     output = last_step_output_;
   }
   is_recorded_ = false;

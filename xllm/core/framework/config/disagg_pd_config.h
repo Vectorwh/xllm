@@ -71,7 +71,7 @@ class DisaggPDConfig final {
   // long instead of returning them to the pool immediately. Covers the window
   // in which the sender may still write those buffers; after it expires the
   // residual hardware hazard is accepted.
-  PROPERTY(int32_t, kv_unsafe_lease_seconds) = 120;
+  PROPERTY(int32_t, kv_unsafe_lease_seconds) = 60;
 
   PROPERTY(int32_t, transfer_listen_port) = 26000;
 

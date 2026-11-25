@@ -497,8 +497,13 @@ class DelayedReservationService final : public proto::DisaggPDService {
                         proto::ReleaseReservationResponse* response,
                         google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    const bool released = scheduler_->release_reservation(
-        request->req_id(), request->reservation_id());
+    bool unsafe_leased = false;
+    const bool released =
+        scheduler_->release_reservation(request->req_id(),
+                                        request->reservation_id(),
+                                        request->unsafe(),
+                                        &unsafe_leased);
+    response->set_unsafe_leased(unsafe_leased);
     response->set_result(released
                              ? proto::ReleaseReservationResponse::RELEASED
                              : proto::ReleaseReservationResponse::NOT_WAITING);
@@ -520,6 +525,8 @@ class ReservationService final : public proto::DisaggPDService {
   Failure failure = Failure::NONE;
   std::atomic<int32_t> calls{0};
   std::atomic<int32_t> released{0};
+  std::atomic<int32_t> unsafe_calls{0};
+  std::atomic<int32_t> unsafe_leased_calls{0};
 
   void ReleaseReservation(google::protobuf::RpcController* controller,
                           const proto::ReleaseReservationRequest* request,
@@ -534,9 +541,20 @@ class ReservationService final : public proto::DisaggPDService {
     if (failure == Failure::TRANSPORT) {
       controller->SetFailed("injected transport error");
     } else {
-      const bool freed = scheduler_->release_reservation(
-          request->req_id(), request->reservation_id());
+      if (request->unsafe()) {
+        ++unsafe_calls;
+      }
+      bool unsafe_leased = false;
+      const bool freed =
+          scheduler_->release_reservation(request->req_id(),
+                                          request->reservation_id(),
+                                          request->unsafe(),
+                                          &unsafe_leased);
       released += freed ? 1 : 0;
+      if (unsafe_leased) {
+        ++unsafe_leased_calls;
+      }
+      response->set_unsafe_leased(unsafe_leased);
       response->set_result(
           freed ? proto::ReleaseReservationResponse::RELEASED
                 : proto::ReleaseReservationResponse::NOT_WAITING);
@@ -2269,6 +2287,81 @@ TEST(DisaggPDSchedulerTest, LocalFailureReturnsDecodeReservation) {
   server.Join();
 }
 
+TEST(DisaggPDSchedulerTest, UnsafeLocalFailureLeasesDecodeReservation) {
+  FakeEngine decode_engine(/*num_blocks=*/16,
+                           /*block_size=*/2,
+                           /*num_speculative_tokens=*/1);
+  // Leasing is off for PD-OOC; this end-to-end unsafe release needs the
+  // non-OOC lifecycle.
+  auto decode_options = make_mtp_decode_options();
+  decode_options.enable_pd_ooc(false);
+  // The non-OOC lifecycle starts real services, which need XServiceClient;
+  // this case only needs the fake reservation server below.
+  TestDisaggPDScheduler decode(&decode_engine,
+                               decode_options,
+                               /*start_services=*/false);
+  auto remote = make_request({1, 2, 3, 4, 5, 6, 7, 8});
+  ASSERT_EQ(decode.try_admit(remote), DecodeAdmissionResult::ADMITTED);
+  remote->state().pd_reservation_id = "reservation";
+  ASSERT_TRUE(decode.decode_schedule(remote, "prefill"));
+  BlockManager* embedding = remote->sequences()[0]
+                                ->kv_state()
+                                .blocks(BlockType::EMBEDDING)[0]
+                                .manager();
+  ASSERT_EQ(embedding->num_used_blocks(), 1u);
+
+  ReservationService service(&decode);
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+
+  FakeEngine prefill_engine(/*num_blocks=*/2, /*block_size=*/2);
+  TestDisaggPDScheduler prefill(&prefill_engine, make_options());
+  auto local = make_request({1, 2, 3, 4, 5, 6, 7, 8});
+  TransferKVInfo info;
+  info.request_id = local->request_id();
+  info.remote_instance_info.rpc_address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  local->state().pd_reservation_id = "reservation";
+  local->state().decode_rpc_address = info.remote_instance_info.rpc_address;
+  local->sequences()[0]->kv_state().set_transfer_kv_info(std::move(info));
+  local->state().output_func = [](const RequestOutput&) { return true; };
+  local->sequences()[0]->mark_kv_push_unsafe();
+
+  const int32_t previous_lease_seconds =
+      DisaggPDConfig::get_instance().kv_unsafe_lease_seconds();
+  DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(1);
+  ScopeGuard restore_lease([previous_lease_seconds] {
+    DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(
+        previous_lease_seconds);
+  });
+
+  prefill.admit_prefill(local);
+  auto batch = prefill.prepare();
+  EXPECT_TRUE(batch[0].empty());
+  prefill.wait_notifications();
+
+  EXPECT_EQ(service.calls, 1);
+  EXPECT_EQ(service.unsafe_calls, 1);
+  EXPECT_EQ(service.unsafe_leased_calls, 1);
+  EXPECT_TRUE(decode.reservations_empty());
+  EXPECT_EQ(embedding->num_used_blocks(), 1u);
+  decode.report_queues();
+  auto* leases =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_kv_lease", "0"});
+  ASSERT_NE(leases, nullptr);
+  EXPECT_DOUBLE_EQ(leases->get_value(), 1.0);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  decode.release_expired_kv_leases_for_test();
+  EXPECT_EQ(embedding->num_used_blocks(), 0u);
+  decode.report_queues();
+  EXPECT_DOUBLE_EQ(leases->get_value(), 0.0);
+
+  server.Stop(0);
+  server.Join();
+}
+
 TEST(DisaggPDSchedulerTest, CancelledPrefillReturnsDecodeReservation) {
   for (const bool running : {false, true}) {
     SCOPED_TRACE(running);
@@ -2636,8 +2729,16 @@ TEST_F(ReservationTest, ReleaseNeverConsumesAnotherReservation) {
             (std::vector<size_t>{0, 0}));
 }
 
-TEST_F(ReservationTest, UnsafeMarkLeasesReleasedBlocksUntilExpiry) {
-  auto request = reserve();
+TEST_F(ReservationTest, UnsafeReleaseLeasesBlocksUntilExpiry) {
+  // Leasing is deliberately off for PD-OOC, so this case needs the non-OOC
+  // lifecycle the change targets.
+  auto options = make_mtp_decode_options();
+  options.enable_pd_ooc(false);
+  TestDisaggPDScheduler decode(&engine_, options, /*start_services=*/false);
+  auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8}, "req");
+  request->state().pd_reservation_id = "reservation";
+  ASSERT_EQ(decode.try_admit(request), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode.decode_schedule(request, "prefill"));
   BlockManager* embedding = request->sequences()[0]
                                 ->kv_state()
                                 .blocks(BlockType::EMBEDDING)[0]
@@ -2652,26 +2753,58 @@ TEST_F(ReservationTest, UnsafeMarkLeasesReleasedBlocksUntilExpiry) {
     DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(
         previous_lease_seconds);
   });
-  ASSERT_TRUE(decode_.mark_kv_unsafe("req"));
-  ASSERT_TRUE(decode_.release_reservation("req", "reservation"));
+  bool unsafe_leased = false;
+  ASSERT_TRUE(decode.release_reservation("req",
+                                         "reservation",
+                                         /*unsafe=*/true,
+                                         &unsafe_leased));
+  EXPECT_TRUE(unsafe_leased);
   // The reservation is consumed, but its target blocks stay leased.
-  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_TRUE(decode.reservations_empty());
   EXPECT_EQ(embedding->num_used_blocks(), 1u);
-  decode_.report_queues();
+  decode.report_queues();
   auto* leases =
       MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_kv_lease", "0"});
   ASSERT_NE(leases, nullptr);
   EXPECT_DOUBLE_EQ(leases->get_value(), 1.0);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-  decode_.release_expired_kv_leases_for_test();
+  decode.release_expired_kv_leases_for_test();
   EXPECT_EQ(embedding->num_used_blocks(), 0u);
-  decode_.report_queues();
+  decode.report_queues();
   EXPECT_DOUBLE_EQ(leases->get_value(), 0.0);
 }
 
-TEST_F(ReservationTest, UnsafeMarkLeasesBlocksOnUnlink) {
+TEST_F(ReservationTest, OocUnsafeReleaseDropsWithoutLease) {
+  // PD-OOC has no lease expiry loop; the scheduler itself must keep the
+  // plain drop even when a caller passes unsafe=true directly.
+  ASSERT_FALSE(decode_.supports_kv_unsafe_lease());
   auto request = reserve();
+  BlockManager* embedding = request->sequences()[0]
+                                ->kv_state()
+                                .blocks(BlockType::EMBEDDING)[0]
+                                .manager();
+  ASSERT_EQ(embedding->num_used_blocks(), 1u);
+  bool unsafe_leased = true;
+  ASSERT_TRUE(decode_.release_reservation("req",
+                                          "reservation",
+                                          /*unsafe=*/true,
+                                          &unsafe_leased));
+  EXPECT_FALSE(unsafe_leased);
+  EXPECT_TRUE(decode_.reservations_empty());
+  EXPECT_EQ(embedding->num_used_blocks(), 0u);
+}
+
+TEST_F(ReservationTest, UnlinkLeasesAllWaitingReservations) {
+  // The fixture enables PD-OOC, which deliberately never leases. Use the
+  // non-OOC lifecycle this change targets.
+  auto options = make_mtp_decode_options();
+  options.enable_pd_ooc(false);
+  TestDisaggPDScheduler decode(&engine_, options, /*start_services=*/false);
+  auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8}, "req");
+  request->state().pd_reservation_id = "reservation";
+  ASSERT_EQ(decode.try_admit(request), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode.decode_schedule(request, "prefill"));
   BlockManager* embedding = request->sequences()[0]
                                 ->kv_state()
                                 .blocks(BlockType::EMBEDDING)[0]
@@ -2684,14 +2817,42 @@ TEST_F(ReservationTest, UnsafeMarkLeasesBlocksOnUnlink) {
     DisaggPDConfig::get_instance().kv_unsafe_lease_seconds(
         previous_lease_seconds);
   });
-  ASSERT_TRUE(decode_.mark_kv_unsafe("req"));
-  // Unlink is a second waiting-reservation exit and must not bypass the mark.
-  ASSERT_TRUE(decode_.unlink_instance("prefill", {}, {}, {}, 1, 1));
-  EXPECT_TRUE(decode_.reservations_empty());
+  // Without per-request marks, unlink conservatively leases every waiting
+  // reservation of the removed Prefill instance.
+  ASSERT_TRUE(decode.unlink_instance("prefill", {}, {}, {}, 1, 1));
+  EXPECT_TRUE(decode.reservations_empty());
   EXPECT_EQ(embedding->num_used_blocks(), 1u);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-  decode_.release_expired_kv_leases_for_test();
+  decode.release_expired_kv_leases_for_test();
+  EXPECT_EQ(embedding->num_used_blocks(), 0u);
+}
+
+TEST_F(ReservationTest, PullUnlinkDropsWaitingReservationWithoutLease) {
+  // PULL waiting reservations have no writer yet (Decode pulls only after
+  // FirstGeneration consumes them), so unlink must not park their blocks.
+  auto options = make_mtp_decode_options();
+  options.enable_pd_ooc(false).kv_cache_transfer_mode("PULL");
+  TestDisaggPDScheduler decode(&engine_, options, /*start_services=*/false);
+  auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8}, "req");
+  request->state().pd_reservation_id = "reservation";
+  ASSERT_EQ(decode.try_admit(request), DecodeAdmissionResult::ADMITTED);
+  ASSERT_TRUE(decode.decode_schedule(request, "prefill"));
+  BlockManager* embedding = request->sequences()[0]
+                                ->kv_state()
+                                .blocks(BlockType::EMBEDDING)[0]
+                                .manager();
+  ASSERT_EQ(embedding->num_used_blocks(), 1u);
+  ASSERT_TRUE(decode.unlink_instance("prefill", {}, {}, {}, 1, 1));
+  EXPECT_TRUE(decode.reservations_empty());
+  decode.report_queues();
+  auto* leases =
+      MULTI_GAUGE_scheduler_queue_requests.get_stats({"pd_kv_lease", "0"});
+  ASSERT_NE(leases, nullptr);
+  EXPECT_DOUBLE_EQ(leases->get_value(), 0.0);
+  // No lease holds the blocks; dropping the test's own reference returns them
+  // to the pool immediately.
+  request.reset();
   EXPECT_EQ(embedding->num_used_blocks(), 0u);
 }
 

@@ -196,6 +196,7 @@ class WorkerService : public proto::DistributeWorker {
             torch::Tensor& out_logprobs,
             std::vector<JsonObjectOutputError>& json_object_errors,
             std::vector<std::string>& failed_request_ids,
+            std::vector<std::string>& unsafe_request_ids,
             std::vector<MMDict>& mm_dict_vec);
   std::vector<SpeculativeTokenStats> record_speculative_metrics_from_output(
       const torch::Tensor& next_tokens,

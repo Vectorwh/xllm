@@ -420,6 +420,9 @@ message ForwardOutput {
   DiTForwardOutput dit_forward_output = 8;
   repeated JsonObjectOutputError json_object_errors = 9;
   repeated string failed_request_ids = 10;
+  // Subset of failed_request_ids whose PUSH transfer could not prove that the
+  // destination buffers stopped being written.
+  repeated string unsafe_request_ids = 13;
 }
 
 // master create Collective service

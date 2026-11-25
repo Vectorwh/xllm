@@ -44,7 +44,7 @@ DEFINE_string(kv_cache_transfer_mode,
               "The mode of kv cache transfer(e.g. PUSH, PULL).");
 
 DEFINE_int32(kv_unsafe_lease_seconds,
-             120,
+             60,
              "How long a Decode instance keeps the target blocks of a request "
              "whose PUSH transfer ended without a retirement proof before "
              "returning them to the pool.");

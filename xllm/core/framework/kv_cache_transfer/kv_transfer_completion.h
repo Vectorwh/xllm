@@ -36,8 +36,16 @@ struct TransferKVInfo;
 std::vector<std::string> canonical_transfer_request_ids(
     const std::vector<TransferKVInfo>& transfer_kv_infos);
 
-std::vector<std::string> reduce_failed_request_ids(
+// Failed PUSH requests and the subset whose destination buffers could not be
+// proven retired. Both are reduced across the TP/CP rank groups.
+struct KvPushFailureIds {
+  std::vector<std::string> failed_request_ids;
+  std::vector<std::string> unsafe_request_ids;
+};
+
+KvPushFailureIds reduce_failed_request_ids(
     const std::unordered_set<std::string>& local_failed_request_ids,
+    const std::unordered_set<std::string>& local_unsafe_request_ids,
     const std::vector<std::string>& canonical_request_ids,
     const ParallelArgs& parallel_args,
     const Device& device);
@@ -95,13 +103,13 @@ class KVTransferCompletion final {
   bool waited_ = false;
 };
 
-// Waits for the owned PUSH transfers, reports every request whose transfer
-// did not retire safely to its Decode peer, and returns the failed request IDs
+// Waits for the owned PUSH transfers and returns the failed request IDs plus
+// the subset whose destination buffers could not be proven retired, both
 // reduced across ranks. The instance role is identical across ranks; an empty
-// local transfer list is not a safe gate. The report RPC completes before this
-// call returns, so Decode has parked the affected target blocks before the
-// caller's failure output lets the scheduler release those reservations.
-std::vector<std::string> finalize_kv_push_failures(
+// local transfer list is not a safe gate. The caller forwards the unsafe subset
+// through ForwardOutput; the scheduler then carries it on the release RPC, so
+// Decode leases those reservations instead of reusing their blocks immediately.
+KvPushFailureIds finalize_kv_push_failures(
     KVTransferCompletion& kv_transfers,
     const std::vector<TransferKVInfo>& transfer_kv_infos,
     const std::string& kv_cache_transfer_mode,

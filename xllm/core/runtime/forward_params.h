@@ -687,6 +687,10 @@ struct ForwardOutput {
   bool filter_mask_applied_to_logits = false;
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<std::string> failed_request_ids;
+  // Requests whose PUSH transfer ended without proof that the destination
+  // buffers stopped being written. Always a subset of failed_request_ids; the
+  // scheduler leases their Decode blocks when it releases the reservation.
+  std::vector<std::string> unsafe_request_ids;
   // Keep no-sync input tensor handles alive until downstream consumers finish
   // using outputs on the same compute stream. Composite workers append child
   // outputs' retained inputs here. Local runtime handles; not in proto/shm.
@@ -723,18 +727,23 @@ struct ForwardOutput {
 };
 
 inline ForwardOutput make_failed_output(
-    std::vector<std::string> failed_request_ids) {
+    std::vector<std::string> failed_request_ids,
+    std::vector<std::string> unsafe_request_ids) {
   ForwardOutput output;
   output.failed_request_ids = std::move(failed_request_ids);
+  output.unsafe_request_ids = std::move(unsafe_request_ids);
   return output;
 }
 
 inline std::optional<ForwardOutput> make_non_driver_forward_output(
     ForwardOutput output,
     std::vector<std::string> failed_request_ids,
+    std::vector<std::string> unsafe_request_ids,
     bool eplb_enabled) {
   output.failed_request_ids = std::move(failed_request_ids);
-  if (eplb_enabled || !output.failed_request_ids.empty()) {
+  output.unsafe_request_ids = std::move(unsafe_request_ids);
+  if (eplb_enabled || !output.failed_request_ids.empty() ||
+      !output.unsafe_request_ids.empty()) {
     return output;
   }
   return std::nullopt;
@@ -776,6 +785,7 @@ struct RawForwardOutput {
   std::vector<MMDict> mm_dict_vec;
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<std::string> failed_request_ids;
+  std::vector<std::string> unsafe_request_ids;
   std::vector<int64_t> expert_load_data;
   int64_t prepared_token = -1;
   // beam search kernel output

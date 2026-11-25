@@ -68,6 +68,7 @@ void forward_output_to_proto(
     const std::vector<torch::Tensor>& dit_audio,
     const std::vector<JsonObjectOutputError>& json_object_errors,
     const std::vector<std::string>& failed_request_ids,
+    const std::vector<std::string>& unsafe_request_ids,
     proto::ForwardOutput* pb_forward_output,
     const std::vector<MMDict>& mm_dict_vec = {});
 

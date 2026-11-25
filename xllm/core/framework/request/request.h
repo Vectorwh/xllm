@@ -93,6 +93,11 @@ class Request : public RequestBase {
 
   std::optional<Status> error_status() const;
 
+  // Whether this request's PUSH transfer could not prove that the destination
+  // buffers stopped being written. Set from the batch output before the
+  // scheduler releases the Decode reservation.
+  bool kv_push_unsafe() const { return failure_state_->kv_push_unsafe; }
+
   RequestOutput generate_output(const Tokenizer& tokenizer,
                                 ThreadPool* thread_pool = nullptr);
 

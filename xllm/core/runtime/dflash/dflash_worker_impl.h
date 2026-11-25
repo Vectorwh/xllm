@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/framework/speculative/dflash_async_input_builder.h"
 #include "core/framework/speculative/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
+#include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "framework/model/model_args.h"
 #include "framework/sampling/draft_proposal.h"
 #include "runtime/draft_model_spec_worker_impl.h"
@@ -140,6 +141,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
     // No-sync draft inputs must outlive validation's stream sync.
     std::vector<std::shared_ptr<ForwardInput>> retained_inputs;
     std::vector<std::string> failed_request_ids;
+    std::vector<std::string> unsafe_request_ids;
   };
 
   // virtual: DSpark overrides the draft sampling (parallel block sample ->
@@ -301,13 +303,13 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl {
       ForwardInput& input,
       const std::vector<EmbeddingCache::DecodeState>& last_states) const;
 
-  std::vector<std::string> write_context_kv(
+  KvPushFailureIds write_context_kv(
       const ForwardInput& input,
       const torch::Tensor& context_hidden,
       const torch::Tensor& positions_device,
       const torch::Tensor& new_cache_slots_device);
 
-  std::vector<std::string> write_target_context_to_cache(
+  KvPushFailureIds write_target_context_to_cache(
       const ForwardInput& input,
       const SampleOutput& validate_output);
 
