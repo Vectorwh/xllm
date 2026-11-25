@@ -37,10 +37,22 @@ limitations under the License.
 #include "framework/tokenizer/tokenizer.h"
 #include "util/scope_guard.h"
 #include "util/timer.h"
+#include "util/utils.h"
 
 namespace xllm {
 
 namespace {
+
+bool has_valid_pretokenized_text(const std::vector<int32_t>& token_ids,
+                                 const Tokenizer& tokenizer) {
+  // Reject a negative first token before FastTokenizer materializes its vocab.
+  if (token_ids.empty() || token_ids.front() < 0) {
+    return false;
+  }
+  const int64_t vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+  return vocab_size > 0 &&
+         !util::find_out_of_vocab_token(token_ids, vocab_size).has_value();
+}
 
 // Extracts the final prompt from a single message, concatenating its text
 // contents in order and skipping non-text (image/video/audio) contents.
@@ -306,13 +318,8 @@ std::shared_ptr<Request> VLMRequestFactory::create_request(
   } else if (sp.prompt_tokens) {
     // Tokens are authoritative only for text. Media must carry typed spans or
     // pass through the processor so its mRoPE and embedding metadata agree.
-    if (mm_data.valid() || sp.prompt_tokens->empty() ||
-        std::any_of(sp.prompt_tokens->begin(),
-                    sp.prompt_tokens->end(),
-                    [this](int32_t token) {
-                      return token < 0 || static_cast<size_t>(token) >=
-                                              tokenizer_->vocab_size();
-                    })) {
+    if (mm_data.valid() ||
+        !has_valid_pretokenized_text(*sp.prompt_tokens, *tokenizer_)) {
       CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                           "Invalid pretokenized VLM text input",
                           sp.service_request_id,

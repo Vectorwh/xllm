@@ -68,6 +68,8 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+constexpr int32_t kPretokenizedTextVocabSize = 1000;
+
 constexpr char kTinyPngDataUrl[] =
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQIHWP4z8AAAAMB"
@@ -94,9 +96,8 @@ void expect_input_stage_failures(const InputMetricsSnapshot& before,
       before.processor_failures + processor);
 }
 
-// Deterministic tokenizer used for factory tests. It only participates in stop
-// sequence encoding here; encoding fails for any text containing "FAIL" so the
-// stop-sequence error path can be exercised independently.
+// Deterministic tokenizer used for factory tests. It counts vocabulary lookups
+// and fails to encode text containing "FAIL" to exercise stop-sequence errors.
 class FakeTokenizer final : public Tokenizer {
  public:
   explicit FakeTokenizer(int32_t vocab_size) : vocab_size_(vocab_size) {}
@@ -119,8 +120,11 @@ class FakeTokenizer final : public Tokenizer {
   }
 
   size_t vocab_size() const override {
+    ++vocab_size_calls_;
     return static_cast<size_t>(vocab_size_);
   }
+
+  size_t vocab_size_calls() const { return vocab_size_calls_; }
 
   std::unique_ptr<Tokenizer> clone() const override {
     return std::make_unique<FakeTokenizer>(*this);
@@ -128,6 +132,7 @@ class FakeTokenizer final : public Tokenizer {
 
  private:
   int32_t vocab_size_ = 1000;
+  mutable size_t vocab_size_calls_ = 0;
 };
 
 // Fake multimodal processor that lets tests drive process_prompt success and
@@ -266,37 +271,55 @@ class VLMRequestFactoryTest : public ::testing::Test {
 // Pretokenized Service text must keep token identity and Decode routing even
 // when local prompt processing would fail. Media still uses typed validation.
 TEST_F(VLMRequestFactoryTest, PreservesServiceTextTokensWithoutProcessing) {
-  auto factory = make_factory();
+  auto factory =
+      make_factory(kPretokenizedTextVocabSize, /*max_position=*/32768);
   processor_->set_process_prompt_succeed(false);
   proto::ChatRequest wire;
-  wire.add_token_ids(7);
-  wire.add_token_ids(8);
+  // Long Service text must not rebuild the vocabulary for every input token.
+  constexpr int32_t kPromptTokenCount = 10032;
+  wire.mutable_token_ids()->Resize(kPromptTokenCount, 7);
+  wire.set_token_ids(kPromptTokenCount - 1, kPretokenizedTextVocabSize - 1);
   wire.mutable_routing()->set_decode_name("decode");
   RequestParams params(wire, "", "");
   params.prompt_tokens.emplace(wire.token_ids().begin(),
                                wire.token_ids().end());
   params.max_tokens = 4;
+  const size_t vocab_lookups_before = tokenizer_->vocab_size_calls();
   auto request = factory->create_request(
       "", MMData{}, params, std::nullopt, [](const RequestOutput&) {
         return true;
       });
   ASSERT_NE(request, nullptr);
-  EXPECT_EQ(request->state().prompt_tokens, (std::vector<int32_t>{7, 8}));
+  EXPECT_EQ(request->state().prompt_tokens, *params.prompt_tokens);
   EXPECT_EQ(request->state().decode_address, "decode");
+  EXPECT_LE(tokenizer_->vocab_size_calls() - vocab_lookups_before, 1u);
 }
 
-TEST_F(VLMRequestFactoryTest, RejectsInvalidPretokenizedText) {
-  auto factory = make_factory();
+TEST_F(VLMRequestFactoryTest, RejectsNegativeFirstTokenWithoutVocabLookup) {
+  auto factory = make_factory(kPretokenizedTextVocabSize);
   RequestParams params;
-  params.prompt_tokens = std::vector<int32_t>{-1};
-  bool failed = false;
+  params.prompt_tokens = std::vector<int32_t>{-1, 7};
+  CallbackCapture capture;
+  const size_t vocab_lookups_before = tokenizer_->vocab_size_calls();
   auto request = factory->create_request(
-      "", MMData{}, params, std::nullopt, [&](const RequestOutput& output) {
-        failed = output.status && !output.status->ok();
-        return true;
-      });
+      "", MMData{}, params, std::nullopt, make_capture_callback(&capture));
   EXPECT_EQ(request, nullptr);
-  EXPECT_TRUE(failed);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(tokenizer_->vocab_size_calls(), vocab_lookups_before);
+}
+
+TEST_F(VLMRequestFactoryTest, RejectsTokenEqualToVocabSizeAfterValidPrefix) {
+  auto factory = make_factory(kPretokenizedTextVocabSize);
+  RequestParams params;
+  params.prompt_tokens = std::vector<int32_t>{kPretokenizedTextVocabSize - 1,
+                                              kPretokenizedTextVocabSize};
+  CallbackCapture capture;
+  auto request = factory->create_request(
+      "", MMData{}, params, std::nullopt, make_capture_callback(&capture));
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
 }
 
 TEST_F(VLMRequestFactoryTest,
