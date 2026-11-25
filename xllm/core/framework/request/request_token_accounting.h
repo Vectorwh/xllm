@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -37,8 +38,11 @@ struct RequestTokenCounts final {
 // Request-lifetime accounting: preemption/retry must not reset this ledger.
 class RequestTokenAccounting final {
  public:
-  uint64_t admit(uint64_t input_tokens) {
+  uint64_t admit(uint64_t input_tokens, bool* first_admission = nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (first_admission != nullptr) {
+      *first_admission = !counts_.enabled;
+    }
     if (counts_.enabled) {
       return 0;
     }
@@ -57,10 +61,11 @@ class RequestTokenAccounting final {
       return;
     }
     counts_.enabled = true;
+    forwarded_stream_ = stream;
     if (stream) {
       // Context-only baseline, not a confirmed Prefill commit or counted
       // output.
-      output_tokens_[0] = 1;
+      output_tokens_[0] = kPrefillHandoffTokens;
     }
   }
 
@@ -95,9 +100,37 @@ class RequestTokenAccounting final {
     return counts_;
   }
 
+  // This is proof from Prefill's response accounting, not its imported byte
+  // context. It affects only full-length observation, not local Token/s.
+  // FirstGeneration transports one token for sequence 0. A different count
+  // cannot confirm that context baseline; callers must report the mismatch.
+  bool confirm_upstream_output(uint64_t tokens) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!forwarded_stream_) {
+      return true;
+    }
+    if (tokens != kPrefillHandoffTokens) {
+      return false;
+    }
+    upstream_output_tokens_ = tokens;
+    return true;
+  }
+
+  std::optional<uint64_t> confirmed_output_tokens() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!counts_.enabled ||
+        (forwarded_stream_ && !upstream_output_tokens_.has_value())) {
+      return std::nullopt;
+    }
+    return counts_.output_tokens + upstream_output_tokens_.value_or(0);
+  }
+
  private:
+  static constexpr uint64_t kPrefillHandoffTokens = 1;
   mutable std::mutex mutex_;
   RequestTokenCounts counts_;
+  bool forwarded_stream_ = false;
+  std::optional<uint64_t> upstream_output_tokens_;
   // Sample-slot outputs use caller-supplied sample_id, not a dense sequence id.
   std::unordered_map<size_t, uint64_t> output_tokens_;
 };

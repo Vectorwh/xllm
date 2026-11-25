@@ -113,7 +113,9 @@ class WorkerPrefetchSession final
   void schedule_batch();
   void run_batch();
   void finish(brpc::StreamId id, bool failed);
-  void report_ready();  // Requires mutex_.
+  // Requires mutex_; returns a default-path snapshot to export after unlock.
+  std::optional<PrefetchSessionReport> report_ready();
+  void report_metrics(const std::optional<PrefetchSessionReport>& report) const;
   void report_stats() const;
   void log_stats(const PrefetchSessionReport& report) const;
 

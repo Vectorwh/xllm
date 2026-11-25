@@ -1709,6 +1709,7 @@ void SchedulerPolicy::report_metrics(const SchedulerState& state,
   GAUGE_SET(num_waiting_requests,
             state.prefill_queue.size() + state.decode_restore_waiting.size());
   GAUGE_SET(num_preempted_requests, num_preempted_requests);
+  COUNTER_ADD(scheduler_preempted_requests_total, num_preempted_requests);
   GAUGE_SET(num_running_sequences, state.running_sequences.size());
   report_kv_cache_metrics(*state.kv_cache_manager);
 }

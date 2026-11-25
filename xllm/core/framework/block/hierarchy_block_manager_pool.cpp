@@ -56,8 +56,8 @@ int64_t prefetch_duration_from_ms(double duration_ms) {
   return static_cast<int64_t>(duration_us);
 }
 
-// Called only from the existing statistics-enabled finalization path. Tokens
-// are the published reusable prefix, not Worker GET volume.
+// Recorded independently of diagnostics. Tokens are the published reusable
+// prefix, not Worker GET volume.
 void record_store_prefetch_master_metrics(size_t prompt_tokens,
                                           size_t host_hit_tokens,
                                           size_t target_tokens,
@@ -1227,8 +1227,7 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
         base_tokens,
         summary,
         sequence->host_kv_state().blocks(BlockType::LINEAR));
-    if (util::store_prefetch_stats_enabled() &&
-        !storage_request_ptr->units.empty()) {
+    if (!storage_request_ptr->units.empty()) {
       const size_t fetched_tokens =
           publish ? final_tokens - std::min(final_tokens, base_tokens) : 0;
       request->record_store_prefetch(fetched_tokens, summary.latency_ms);
@@ -1238,13 +1237,15 @@ void HierarchyBlockManagerPool::prefetch_from_storage(
                                            fetched_tokens,
                                            summary.latency_ms,
                                            summary.stop_reason);
-      log_prefetch_summary(*request,
-                           *sequence,
-                           dp_rank,
-                           base_tokens,
-                           target_tokens,
-                           fetched_tokens,
-                           summary);
+      if (util::store_prefetch_stats_enabled()) {
+        log_prefetch_summary(*request,
+                             *sequence,
+                             dp_rank,
+                             base_tokens,
+                             target_tokens,
+                             fetched_tokens,
+                             summary);
+      }
     }
     finalize_prefetch(
         sequence, host_block_managers_[dp_rank].get(), final_tokens, publish);

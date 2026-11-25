@@ -38,14 +38,36 @@ namespace {
 TEST(RequestTokenAccountingTest, AdmissionAndCommitsAreIdempotent) {
   RequestTokenAccounting accounting;
   EXPECT_EQ(accounting.commit({{0, 5}}), 0u);
-  EXPECT_EQ(accounting.admit(/*input_tokens=*/17), 17u);
-  EXPECT_EQ(accounting.admit(/*input_tokens=*/17), 0u);
+  bool first_admission = false;
+  EXPECT_EQ(accounting.admit(/*input_tokens=*/17, &first_admission), 17u);
+  EXPECT_TRUE(first_admission);
+  EXPECT_EQ(accounting.admit(/*input_tokens=*/17, &first_admission), 0u);
+  EXPECT_FALSE(first_admission);
   EXPECT_EQ(accounting.commit({{0, 2}, {1, 3}}), 5u);
   EXPECT_EQ(accounting.commit({{0, 5}, {1, 3}}), 3u);
   EXPECT_EQ(accounting.commit({{0, 5}, {1, 2}}), 0u);
   EXPECT_EQ(accounting.commit({{0, 9}}), 4u);
   EXPECT_EQ(accounting.snapshot().output_tokens, 12u);
   EXPECT_EQ(accounting.snapshot().input_tokens, 17u);
+  EXPECT_EQ(accounting.confirmed_output_tokens(), 12u);
+
+  RequestTokenAccounting forwarded;
+  forwarded.forward(/*stream=*/true);
+  EXPECT_FALSE(forwarded.confirmed_output_tokens().has_value());
+  EXPECT_EQ(forwarded.commit({{0, 5}}), 4u);
+  EXPECT_FALSE(forwarded.confirm_upstream_output(/*tokens=*/0));
+  EXPECT_FALSE(forwarded.confirmed_output_tokens().has_value());
+  EXPECT_FALSE(forwarded.confirm_upstream_output(/*tokens=*/2));
+  EXPECT_FALSE(forwarded.confirmed_output_tokens().has_value());
+  EXPECT_TRUE(forwarded.confirm_upstream_output(/*tokens=*/1));
+  EXPECT_EQ(forwarded.confirmed_output_tokens(), 5u);
+  EXPECT_EQ(forwarded.snapshot().output_tokens, 4u);
+
+  RequestTokenAccounting empty;
+  EXPECT_EQ(empty.admit(/*input_tokens=*/0, &first_admission), 0u);
+  EXPECT_TRUE(first_admission);
+  EXPECT_EQ(empty.admit(/*input_tokens=*/0, &first_admission), 0u);
+  EXPECT_FALSE(first_admission);
 }
 
 TEST(RequestTokenAccountingTest, ConcurrentCommitCountsOnce) {

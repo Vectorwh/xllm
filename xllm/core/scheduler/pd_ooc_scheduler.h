@@ -20,6 +20,7 @@ limitations under the License.
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -65,10 +66,7 @@ class PDOOCScheduler : public DisaggPDScheduler {
   // decode-1: for decode recveive new request from prefill
   bool decode_schedule(std::shared_ptr<Request>& request,
                        const std::string& prefill_instance_name) override;
-  // decode-2: for decode receive first token from prefill
-  // bool decode_recv_first_generation(...);
-
-  // decode-2b: for decode receive multiple tokens from prefill
+  // Online first-token handoffs and offline migrations use MultiGenerations.
   bool decode_recv_multi_generations(
       const std::string& req_id,
       const std::vector<proto::RemoteToken>& migration_tokens,
@@ -79,7 +77,8 @@ class PDOOCScheduler : public DisaggPDScheduler {
       std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      const proto::RequestPhaseTiming* phase_timing = nullptr);
+      const proto::RequestPhaseTiming* phase_timing = nullptr,
+      std::optional<uint64_t> confirmed_upstream_output_tokens = std::nullopt);
 
   void prefill_step(const absl::Duration& timeout);
 

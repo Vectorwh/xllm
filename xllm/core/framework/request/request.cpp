@@ -66,6 +66,11 @@ OptionalLogField optional_field(std::string_view label,
   return OptionalLogField(label, value);
 }
 
+int64_t clamped_token_count(uint64_t tokens) {
+  return static_cast<int64_t>(std::min<uint64_t>(
+      tokens, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+}
+
 bool complete(const RequestTimingSample& sample) {
   // Constructed snapshots, including wire imports, can bypass span().
   // Revalidate complete samples at the recorder boundary.
@@ -235,9 +240,13 @@ Request::Request(const std::string& request_id,
     state_.timing = std::make_shared<RequestTiming>();
   }
   create_sequences_group();
+  if (rate_limiter != nullptr) {
+    begin_inflight();
+  }
 }
 
 Request::~Request() {
+  end_inflight();
   if (!VLOG_IS_ON(1)) {
     return;
   }
@@ -308,11 +317,25 @@ void Request::reset() {
 }
 
 void Request::record_token_admission() {
-  if (offline() || state_.is_graph_warmup) {
+  if (state_.is_graph_warmup) {
     return;
   }
-  const uint64_t delta = request_tokens_.admit(state_.prompt_tokens.size());
+  if (offline()) {
+    if (!offline_input_length_observed_.exchange(true,
+                                                 std::memory_order_relaxed)) {
+      HISTOGRAM_OBSERVE(num_prompt_tokens_per_request,
+                        clamped_token_count(state_.prompt_tokens.size()));
+    }
+    return;
+  }
+  bool first_admission = false;
+  const uint64_t delta =
+      request_tokens_.admit(state_.prompt_tokens.size(), &first_admission);
   COUNTER_ADD(request_input_tokens_total, delta);
+  if (first_admission) {
+    HISTOGRAM_OBSERVE(num_prompt_tokens_per_request,
+                      clamped_token_count(delta));
+  }
   if (delta > 0) {
     VLOG(1) << "record_type: request_tokens, request_id: " << request_id_
             << ", event: admission, input_delta: " << delta
@@ -324,8 +347,38 @@ void Request::enable_forwarded_token_output() {
   request_tokens_.forward(state_.stream);
 }
 
+void Request::confirm_upstream_output(uint64_t tokens) {
+  if (!request_tokens_.confirm_upstream_output(tokens)) {
+    LOG(WARNING) << "Invalid Prefill token confirmation for single-token PD "
+                    "handoff, request_id: "
+                 << request_id_ << ", confirmed_output_tokens: " << tokens;
+  }
+}
+
+void Request::begin_inflight() {
+  if (offline() || state_.is_graph_warmup) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(inflight_metrics_mutex_);
+  if (!inflight_started_ && !inflight_ended_) {
+    inflight_started_ = true;
+    COUNTER_engine_inflight_requests << 1;
+  }
+}
+
+void Request::end_inflight() {
+  std::lock_guard<std::mutex> lock(inflight_metrics_mutex_);
+  if (!inflight_ended_) {
+    inflight_ended_ = true;
+    if (inflight_started_) {
+      COUNTER_engine_inflight_requests << -1;
+    }
+  }
+}
+
 void Request::record_token_output(const RequestOutput& output, bool submitted) {
-  if (!request_tokens_.enabled()) {
+  const bool offline_lengths = offline() && !state_.is_graph_warmup;
+  if (!request_tokens_.enabled() && !offline_lengths) {
     return;
   }
   if (output.cancelled || (output.status.has_value() && !output.status->ok()) ||
@@ -341,6 +394,49 @@ void Request::record_token_output(const RequestOutput& output, bool submitted) {
       return;
     }
   }
+  if (offline_lengths) {
+    // Offline generation contributes request lengths, not online Token/s.
+    // A streaming terminal may contain no deltas or usage; non-streaming
+    // snapshots contain the complete selected candidates.
+    const bool terminal_success =
+        terminal_outcome_.load(std::memory_order_relaxed) ==
+        RequestTerminalOutcome::SUCCESS;
+    if (!output.finished || !terminal_success || !submitted ||
+        output.finished_on_prefill_instance ||
+        output_length_observed_.load(std::memory_order_relaxed) ||
+        (per_sequence_submission &&
+         !std::all_of(output.outputs.begin(),
+                      output.outputs.end(),
+                      [](const SequenceOutput& sequence) {
+                        return sequence.token_submission_confirmed;
+                      }))) {
+      return;
+    }
+    uint64_t tokens = 0;
+    if (state_.stream) {
+      if (output.usage.has_value()) {
+        if (output.usage->num_generated_tokens < 0) {
+          return;
+        }
+        tokens = static_cast<uint64_t>(output.usage->num_generated_tokens);
+      } else {
+        // Successful terminal generation has stopped. Match final usage's
+        // sequence totals, excluding uncommitted overlap placeholders.
+        for (const auto& sequence : sequences()) {
+          tokens += sequence->num_committed_generated_tokens();
+        }
+      }
+    } else {
+      for (const SequenceOutput& sequence : output.outputs) {
+        tokens += sequence.generated_token_count;
+      }
+    }
+    if (!output_length_observed_.exchange(true, std::memory_order_relaxed)) {
+      HISTOGRAM_OBSERVE(num_generated_tokens_per_request,
+                        clamped_token_count(tokens));
+    }
+    return;
+  }
   // HTTP streaming acknowledges each sequence separately. A later write may
   // return false without invalidating earlier confirmed deltas.
   token_progress_buf_.clear();
@@ -354,6 +450,33 @@ void Request::record_token_output(const RequestOutput& output, bool submitted) {
   }
   const uint64_t delta = request_tokens_.commit(token_progress_buf_);
   COUNTER_ADD(request_output_tokens_total, delta);
+  // Final dispatch follows terminal ownership and earlier serialized deltas.
+  // Sample after accounting, never from the still-advancing Sequence state.
+  const bool terminal_success =
+      terminal_outcome_.load(std::memory_order_relaxed) ==
+      RequestTerminalOutcome::SUCCESS;
+  if (output.finished && terminal_success && submitted &&
+      !output.finished_on_prefill_instance &&
+      !output_length_observed_.load(std::memory_order_relaxed)) {
+    const std::optional<uint64_t> tokens = confirmed_output_tokens();
+    const bool all_confirmed =
+        !per_sequence_submission ||
+        std::all_of(output.outputs.begin(),
+                    output.outputs.end(),
+                    [](const SequenceOutput& sequence) {
+                      return sequence.token_submission_confirmed;
+                    });
+    const bool complete_stream_length =
+        !state_.stream ||
+        (tokens.has_value() && output.usage.has_value() &&
+         output.usage->num_generated_tokens >= 0 &&
+         *tokens == static_cast<uint64_t>(output.usage->num_generated_tokens));
+    if (tokens.has_value() && all_confirmed && complete_stream_length &&
+        !output_length_observed_.exchange(true, std::memory_order_relaxed)) {
+      HISTOGRAM_OBSERVE(num_generated_tokens_per_request,
+                        clamped_token_count(*tokens));
+    }
+  }
   if (delta > 0) {
     VLOG(10) << "record_type: request_tokens, request_id: " << request_id_
              << ", event: submission, input_delta: 0, output_delta: " << delta;
@@ -467,12 +590,15 @@ double Request::end_to_end_latency_seconds() const {
 RequestTerminalOutcome Request::claim_terminal_outcome(
     const std::optional<Status>& status) {
   RequestTerminalOutcome outcome = RequestTerminalOutcome::NONE;
+  StatusCode terminal_code = StatusCode::OK;
   if (status.has_value() && !status->ok()) {
-    outcome = status->code() == StatusCode::CANCELLED
+    terminal_code = status->code();
+    outcome = terminal_code == StatusCode::CANCELLED
                   ? RequestTerminalOutcome::CANCELLED
                   : RequestTerminalOutcome::FAILURE;
   } else if (cancelled()) {
     outcome = RequestTerminalOutcome::CANCELLED;
+    terminal_code = StatusCode::CANCELLED;
   } else if (finished()) {
     outcome = RequestTerminalOutcome::SUCCESS;
   }
@@ -484,10 +610,12 @@ RequestTerminalOutcome Request::claim_terminal_outcome(
           expected, outcome, std::memory_order_relaxed)) {
     return RequestTerminalOutcome::NONE;
   }
+  if (!offline() && !state_.is_graph_warmup) {
+    record_request_status(terminal_code);
+  }
+  end_inflight();
   if (outcome != RequestTerminalOutcome::SUCCESS) {
-    record_timing_failure(outcome == RequestTerminalOutcome::CANCELLED
-                              ? Status(StatusCode::CANCELLED)
-                              : status.value());
+    record_timing_failure(Status(terminal_code));
   }
   return outcome;
 }

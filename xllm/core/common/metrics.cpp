@@ -22,7 +22,38 @@ limitations under the License.
 #include <mutex>
 #include <string>
 
+#include "core/common/types.h"
+
 namespace xllm {
+
+bvar::Adder<int64_t> COUNTER_engine_inflight_requests(
+    "engine_inflight_requests");
+
+void record_request_status(StatusCode code) {
+  switch (code) {
+    case StatusCode::OK:
+      COUNTER_INC(request_status_total_ok);
+      break;
+    case StatusCode::CANCELLED:
+      COUNTER_INC(request_status_total_cancelled);
+      break;
+    case StatusCode::UNKNOWN:
+      COUNTER_INC(request_status_total_unknown);
+      break;
+    case StatusCode::INVALID_ARGUMENT:
+      COUNTER_INC(request_status_total_invalid_argument);
+      break;
+    case StatusCode::DEADLINE_EXCEEDED:
+      COUNTER_INC(request_status_total_deadline_exceeded);
+      break;
+    case StatusCode::RESOURCE_EXHAUSTED:
+      COUNTER_INC(request_status_total_resource_exhausted);
+      break;
+    default:
+      COUNTER_INC(request_status_total_unknown);
+      break;
+  }
+}
 
 void set_multi_gauge_value(
     bvar::MultiDimension<bvar::Status<double>>& metric,
@@ -160,6 +191,11 @@ DEFINE_COUNTER(store_prefetch_worker_requested_blocks_total,
                "Logical blocks requested in executed GET batches");
 DEFINE_COUNTER(store_prefetch_worker_hit_blocks_total,
                "Logical block GET hits, not reusable prefix tokens");
+DEFINE_HISTOGRAM(store_prefetch_worker_hit_blocks_per_session,
+                 "Logical GET hits per closed Worker session, including zero");
+DEFINE_HISTOGRAM(
+    store_prefetch_worker_block_hit_rate_basis_points,
+    "Per-session GET block hit rate in basis points; nonempty GETs");
 // Successfully read physical bytes, including unusable tails. Integers retain
 // small increments at TiB-scale totals through all bvar serialization paths.
 bvar::Adder<uint64_t> COUNTER_store_prefetch_worker_read_bytes_total(
@@ -327,6 +363,8 @@ DEFINE_GAUGE(num_running_requests, "Number of running requests in scheduler");
 DEFINE_GAUGE(num_waiting_requests, "Number of waiting requests in scheduler");
 DEFINE_GAUGE(num_preempted_requests,
              "Number of preempted requests in scheduler");
+DEFINE_COUNTER(scheduler_preempted_requests_total,
+               "Scheduling preemption events, including repeated preemptions");
 DEFINE_GAUGE(num_offline_decode_preempt_offline_requests,
              "Number of offline decode preempt offline requests in scheduler");
 DEFINE_GAUGE(num_online_decode_preempt_online_requests,

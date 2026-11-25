@@ -318,6 +318,9 @@ message DisaggGenerationsRequest {
   // Cumulative end-to-end latency measured by the source at handoff.
   optional double upstream_elapsed_seconds = 21;
   RequestPhaseTiming phase_timing = 22;
+  // Present only when the source has confirmed its output submission.
+  // Unlike the first-token byte context, this proves Prefill's counted token.
+  optional uint64 confirmed_upstream_output_tokens = 23;
   // Required for metadata-only VLM Decode; zero is a valid explicit delta.
   optional int32 mrope_position_delta = 25;
 }

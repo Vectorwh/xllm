@@ -29,6 +29,12 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+const char* probe_status_name(const PrefetchSessionReport& report) {
+  return report.failed ? "skipped"
+                       : (report.probed_present_units.has_value() ? "complete"
+                                                                  : "invalid");
+}
+
 void add_store_prefetch_tier_counter(
     bvar::MultiDimension<bvar::Adder<uint64_t>>& metric,
     const char* tier,
@@ -39,15 +45,16 @@ void add_store_prefetch_tier_counter(
   }
 }
 
-int64_t prefetch_duration_us(uint64_t duration_us) {
+int64_t prefetch_metric_value(uint64_t value) {
   return static_cast<int64_t>(std::min(
-      duration_us, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+      value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
 }
 
 // One immutable snapshot per closed session, including failed sessions' reads.
 // Stage latencies are session sums; total excludes post-close metadata probing.
 void record_store_prefetch_worker_metrics(const PrefetchSessionReport& report,
-                                          size_t requested_units) {
+                                          size_t requested_units,
+                                          bool diagnostics_enabled) {
   const PrefetchWorkerStats& stats = report.stats;
   MULTI_COUNTER_ADD(store_prefetch_worker_sessions_total,
                     report.failed ? "failed" : "completed",
@@ -58,6 +65,29 @@ void record_store_prefetch_worker_metrics(const PrefetchSessionReport& report,
   COUNTER_ADD(store_prefetch_worker_requested_blocks_total,
               stats.requested_blocks);
   COUNTER_ADD(store_prefetch_worker_hit_blocks_total, stats.hit_blocks);
+  HISTOGRAM_OBSERVE(store_prefetch_worker_hit_blocks_per_session,
+                    prefetch_metric_value(stats.hit_blocks));
+  if (stats.requested_blocks > 0) {
+    const int64_t rate_basis_points = static_cast<int64_t>(
+        static_cast<long double>(stats.hit_blocks) * 10000.0L /
+        static_cast<long double>(stats.requested_blocks));
+    HISTOGRAM_OBSERVE(store_prefetch_worker_block_hit_rate_basis_points,
+                      rate_basis_points);
+  }
+  COUNTER_ADD(store_prefetch_worker_batches_total, stats.batches);
+  const std::array<std::pair<const char*, uint64_t>, 3> base_durations = {{
+      {"queue_wait", stats.queue_wait_us},
+      {"get", stats.get_us},
+      {"total", stats.total_us},
+  }};
+  for (const auto& [stage, duration] : base_durations) {
+    MULTI_HISTOGRAM_OBSERVE(store_prefetch_worker_latency_microseconds,
+                            stage,
+                            prefetch_metric_value(duration));
+  }
+  if (!diagnostics_enabled) {
+    return;
+  }
   COUNTER_ADD(store_prefetch_worker_read_bytes_total, stats.get.read_bytes);
   add_store_prefetch_tier_counter(
       MULTI_COUNTER_store_prefetch_worker_read_tier_objects_total,
@@ -75,23 +105,16 @@ void record_store_prefetch_worker_metrics(const PrefetchSessionReport& report,
       MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total,
       "disk",
       stats.get.disk_bytes);
-  COUNTER_ADD(store_prefetch_worker_batches_total, stats.batches);
-  const std::array<std::pair<const char*, uint64_t>, 5> durations = {{
-      {"queue_wait", stats.queue_wait_us},
-      {"get", stats.get_us},
+  const std::array<std::pair<const char*, uint64_t>, 2> durations = {{
       {"tier_query", stats.get.tier_query_us},
       {"control_wait", stats.control_wait_us},
-      {"total", stats.total_us},
   }};
   for (const auto& [stage, duration] : durations) {
     MULTI_HISTOGRAM_OBSERVE(store_prefetch_worker_latency_microseconds,
                             stage,
-                            prefetch_duration_us(duration));
+                            prefetch_metric_value(duration));
   }
-  const char* probe_status =
-      report.failed
-          ? "skipped"
-          : (report.probed_present_units.has_value() ? "complete" : "invalid");
+  const char* probe_status = probe_status_name(report);
   MULTI_COUNTER_ADD(
       store_prefetch_worker_probe_sessions_total, probe_status, 1);
   if (!report.failed) {
@@ -227,17 +250,21 @@ void WorkerPrefetchSession::on_failed(brpc::StreamId id,
 
 void WorkerPrefetchSession::on_closed(brpc::StreamId /*id*/) {
   std::shared_ptr<WorkerPrefetchSession> self = shared_from_this();
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!finished_) {
-    finished_ = true;
-    failed_ = true;
-    stats_.total_us = static_cast<uint64_t>(timer_.elapsed_microseconds());
+  std::optional<PrefetchSessionReport> report;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!finished_) {
+      finished_ = true;
+      failed_ = true;
+      stats_.total_us = static_cast<uint64_t>(timer_.elapsed_microseconds());
+    }
+    state_ = State::CLOSED;
+    stream_closed_ = true;
+    report = report_ready();
+    keepalive_.reset();
+    closed_.notify_all();
   }
-  state_ = State::CLOSED;
-  stream_closed_ = true;
-  report_ready();
-  keepalive_.reset();
-  closed_.notify_all();
+  report_metrics(report);
 }
 
 uint64_t WorkerPrefetchSession::elapsed_us(
@@ -267,9 +294,7 @@ void WorkerPrefetchSession::run_batch() {
     }
     batch_running_ = true;
     batch_index = batch_index_;
-    if (stats_pool_ != nullptr) {
-      stats_.queue_wait_us += elapsed_us(batch_scheduled_at_);
-    }
+    stats_.queue_wait_us += elapsed_us(batch_scheduled_at_);
   }
   const size_t unit_begin = request_.batch_unit_begin(batch_index, batch_size_);
   const size_t unit_count = request_.batch_unit_count(batch_index, batch_size_);
@@ -326,41 +351,44 @@ void WorkerPrefetchSession::run_batch() {
     }
   }
   bool close_after_result = false;
+  bool session_finished = false;
+  std::optional<PrefetchSessionReport> report;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stats_pool_ != nullptr) {
-      ++stats_.batches;
-      stats_.executed_units += unit_count;
-      stats_.hit_units += static_cast<uint64_t>(std::count(
-          gated_hits.begin(),
-          gated_hits.begin() + static_cast<std::ptrdiff_t>(unit_count),
-          static_cast<uint8_t>(1)));
-      stats_.requested_blocks += batch_transfers.size();
-      if (valid_result) {
-        stats_.hit_blocks +=
-            static_cast<uint64_t>(std::count(transfer_hits.begin(),
-                                             transfer_hits.end(),
-                                             static_cast<uint8_t>(1)));
-      }
-      stats_.get.read_bytes += get_stats.read_bytes;
-      stats_.get.memory_objects += get_stats.memory_objects;
-      stats_.get.memory_bytes += get_stats.memory_bytes;
-      stats_.get.disk_objects += get_stats.disk_objects;
-      stats_.get.disk_bytes += get_stats.disk_bytes;
-      stats_.get.tier_query_us += get_stats.tier_query_us;
-      stats_.get_us += get_us;
-      stats_.probe_begin_unit =
-          PrefetchTailProbe::tail_begin(unit_begin, gated_hits, unit_count);
-      result_written_at_ = std::chrono::steady_clock::now();
+    ++stats_.batches;
+    stats_.executed_units += unit_count;
+    stats_.hit_units += static_cast<uint64_t>(
+        std::count(gated_hits.begin(),
+                   gated_hits.begin() + static_cast<std::ptrdiff_t>(unit_count),
+                   static_cast<uint8_t>(1)));
+    stats_.requested_blocks += batch_transfers.size();
+    if (valid_result) {
+      stats_.hit_blocks += static_cast<uint64_t>(std::count(
+          transfer_hits.begin(), transfer_hits.end(), static_cast<uint8_t>(1)));
     }
+    stats_.get.read_bytes += get_stats.read_bytes;
+    stats_.get.memory_objects += get_stats.memory_objects;
+    stats_.get.memory_bytes += get_stats.memory_bytes;
+    stats_.get.disk_objects += get_stats.disk_objects;
+    stats_.get.disk_bytes += get_stats.disk_bytes;
+    stats_.get.tier_query_us += get_stats.tier_query_us;
+    stats_.get_us += get_us;
+    stats_.probe_begin_unit =
+        PrefetchTailProbe::tail_begin(unit_begin, gated_hits, unit_count);
+    result_written_at_ = std::chrono::steady_clock::now();
     batch_running_ = false;
-    if (finished_) {
-      report_ready();
-      return;
+    session_finished = finished_;
+    if (session_finished) {
+      report = report_ready();
+    } else {
+      last_batch_gate_complete_ = gate_complete;
+      close_after_result = stop_after_batch_;
+      state_ = close_after_result ? State::COMPLETED : State::WAITING_DECISION;
     }
-    last_batch_gate_complete_ = gate_complete;
-    close_after_result = stop_after_batch_;
-    state_ = close_after_result ? State::COMPLETED : State::WAITING_DECISION;
+  }
+  if (session_finished) {
+    report_metrics(report);
+    return;
   }
   if (!valid_result) {
     finish(stream_id_, /*failed=*/true);
@@ -389,22 +417,40 @@ void WorkerPrefetchSession::finish(brpc::StreamId id, bool failed) {
     stats_.total_us = static_cast<uint64_t>(timer_.elapsed_microseconds());
   }
   callbacks_.close(id);
+  std::optional<PrefetchSessionReport> report;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stream_closed_ = true;
-    report_ready();
+    report = report_ready();
     closed_.notify_all();
   }
+  report_metrics(report);
 }
 
-void WorkerPrefetchSession::report_ready() {
-  if (stats_pool_ == nullptr || !stream_closed_ || batch_running_ ||
-      report_scheduled_) {
-    return;
+std::optional<PrefetchSessionReport> WorkerPrefetchSession::report_ready() {
+  if (!stream_closed_ || batch_running_ || report_scheduled_) {
+    return std::nullopt;
   }
   report_scheduled_ = true;
+  if (stats_pool_ == nullptr) {
+    PrefetchSessionReport report;
+    report.stats = stats_;
+    report.failed = failed_;
+    return report;
+  }
   std::shared_ptr<WorkerPrefetchSession> self = shared_from_this();
   stats_pool_->schedule([self = std::move(self)]() { self->report_stats(); });
+  return std::nullopt;
+}
+
+void WorkerPrefetchSession::report_metrics(
+    const std::optional<PrefetchSessionReport>& report) const {
+  if (report.has_value()) {
+    // The immutable close snapshot needs no Store query or diagnostic task.
+    // All callers release mutex_ before entering bvar's internal locks.
+    record_store_prefetch_worker_metrics(
+        *report, request_.unit_count(), /*diagnostics_enabled=*/false);
+  }
 }
 
 void WorkerPrefetchSession::report_stats() const {
@@ -428,7 +474,8 @@ void WorkerPrefetchSession::report_stats() const {
   // report_ready() schedules this once and only with the existing statistics
   // pool enabled. Export the same snapshot without another Store query, and
   // preserve both the default log sink and injected diagnostic callbacks.
-  record_store_prefetch_worker_metrics(report, request_.unit_count());
+  record_store_prefetch_worker_metrics(
+      report, request_.unit_count(), /*diagnostics_enabled=*/true);
   if (callbacks_.report != nullptr) {
     callbacks_.report(report);
   } else {
@@ -442,10 +489,7 @@ void WorkerPrefetchSession::log_stats(
   const double get_seconds = static_cast<double>(stats.get_us) / 1e6;
   const double get_bw =
       get_seconds > 0 ? bytes_to_gib(stats.get.read_bytes) / get_seconds : 0;
-  const char* probe_status =
-      report.failed
-          ? "skipped"
-          : (report.probed_present_units.has_value() ? "complete" : "invalid");
+  const char* probe_status = probe_status_name(report);
   LOG(INFO) << std::fixed << std::setprecision(2)
             << "[StorePrefetch][Worker] request_id: " << request_.request_id
             << ", worker_rank: " << worker_rank_

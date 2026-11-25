@@ -62,18 +62,22 @@ TEST(MultimodalMetricsTest, ExportsFixedDimensionNames) {
   MULTI_COUNTER_mm_cache_lookups_total.dump(&dumper, &options);
 
   const auto& values = dumper.values();
-  EXPECT_EQ(values.count("mm_input_stage_failures_total_stage_transfer"), 1u);
-  EXPECT_EQ(values.count("mm_input_stage_failures_total_stage_processor"), 1u);
-  EXPECT_EQ(values.count("mm_input_items_total_modality_image_representation_"
-                         "raw_result_success"),
+  EXPECT_EQ(values.count("mm_input_stage_failures_total{stage=\"transfer\"}"),
             1u);
-  EXPECT_EQ(values.count("mm_input_items_total_modality_unknown_representation_"
-                         "unknown_result_failed"),
+  EXPECT_EQ(values.count("mm_input_stage_failures_total{stage=\"processor\"}"),
             1u);
-  EXPECT_EQ(values.count("mm_cache_lookups_total_cache_processor_outcome_miss"),
+  EXPECT_EQ(values.count("mm_input_items_total{modality=\"image\","
+                         "representation=\"raw\",result=\"success\"}"),
             1u);
-  EXPECT_EQ(values.count("mm_cache_lookups_total_cache_encoder_outcome_hit"),
+  EXPECT_EQ(values.count("mm_input_items_total{modality=\"unknown\","
+                         "representation=\"unknown\",result=\"failed\"}"),
             1u);
+  EXPECT_EQ(values.count(
+                "mm_cache_lookups_total{cache=\"processor\",outcome=\"miss\"}"),
+            1u);
+  EXPECT_EQ(
+      values.count("mm_cache_lookups_total{cache=\"encoder\",outcome=\"hit\"}"),
+      1u);
 }
 
 TEST(MultimodalMetricsTest, ExposesExistingStageCountDenominators) {
@@ -146,10 +150,11 @@ TEST(DiTMetricsTest, ExportsRequestCountsAndFixedInputStages) {
   MULTI_COUNTER_dit_input_stage_failures_total.dump(&dumper, &options);
   for (const char* stage : {"media_decode", "tensor_deserialize"}) {
     const std::string count_name =
-        std::string("dit_input_stage_host_latency_microseconds_count_stage_") +
-        stage;
+        std::string(
+            "dit_input_stage_host_latency_microseconds_count{stage=\"") +
+        stage + "\"}";
     const std::string failure_name =
-        std::string("dit_input_stage_failures_total_stage_") + stage;
+        std::string("dit_input_stage_failures_total{stage=\"") + stage + "\"}";
     ASSERT_EQ(dumper.values().count(count_name), 1u);
     EXPECT_EQ(
         dumper.values().at(count_name),
@@ -188,11 +193,12 @@ TEST(StorePrefetchMetricsTest, ExportsExactBytesIncludingSmallTiBIncrements) {
     MULTI_COUNTER_store_prefetch_worker_read_tier_bytes_total.dump(&dumper,
                                                                    &options);
     EXPECT_EQ(dumper.values().at(total_name), std::to_string(total));
+    EXPECT_EQ(
+        dumper.values().at(
+            "store_prefetch_worker_read_tier_bytes_total{tier=\"memory\"}"),
+        std::to_string(memory));
     EXPECT_EQ(dumper.values().at(
-                  "store_prefetch_worker_read_tier_bytes_total_tier_memory"),
-              std::to_string(memory));
-    EXPECT_EQ(dumper.values().at(
-                  "store_prefetch_worker_read_tier_bytes_total_tier_disk"),
+                  "store_prefetch_worker_read_tier_bytes_total{tier=\"disk\"}"),
               std::to_string(disk));
   }
 }

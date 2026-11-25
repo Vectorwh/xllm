@@ -42,7 +42,6 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
 #include "framework/request/sequence.h"
-#include "pd_ooc_scheduler.h"
 #include "runtime/xservice_client.h"
 #include "scheduler/continuous_scheduler.h"
 #include "util/env_var.h"
@@ -611,6 +610,7 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
             prefill_queue_->size() + decode_queue_->size());
 
   GAUGE_ADD(num_preempted_requests, num_preempted_requests);
+  COUNTER_ADD(scheduler_preempted_requests_total, num_preempted_requests);
   GAUGE_ADD(num_offline_decode_preempt_offline_requests,
             num_offline_decode_preempt_offline_requests);
   GAUGE_ADD(num_online_decode_preempt_online_requests,
@@ -1739,15 +1739,21 @@ void PDOOCScheduler::prefill_send_first_generation() {
       proto::Status resp;
       brpc::Controller cntl;
       // Cumulative upstream wall time includes response delivery and queuing.
+      const std::optional<uint64_t> confirmed_tokens =
+          request->confirmed_output_tokens();
+      if (confirmed_tokens.has_value()) {
+        gen->set_confirmed_upstream_output_tokens(*confirmed_tokens);
+      }
       gen->set_upstream_elapsed_seconds(request->end_to_end_latency_seconds());
       request_timing_to_proto(request->state().timing->snapshot(),
                               gen->mutable_phase_timing());
-      stub->FirstGeneration(&cntl, &gens, &resp, nullptr);
+      stub->MultiGenerations(&cntl, &gens, &resp, nullptr);
 
       if (cntl.Failed() || !resp.ok()) {
         LOG(ERROR) << "Failed to send first generation, " << cntl.ErrorText()
                    << ", status: " << resp.ok();
       }
+      request->end_inflight();
       {
         std::lock_guard<std::mutex> lock(remote_requests_map_mutex_);
         remote_requests_map_.erase(request->request_id());
@@ -1790,6 +1796,7 @@ bool PDOOCScheduler::decode_schedule(std::shared_ptr<Request>& request,
       request->reset();
       return false;
     }
+    request->begin_inflight();
     received_request_map_[request->request_id()] = request;
     reservation_waiting_requests_.store(received_request_map_.size(),
                                         std::memory_order_relaxed);
@@ -1817,7 +1824,8 @@ bool PDOOCScheduler::decode_recv_multi_generations(
     std::vector<KVTransferMapping> source_mappings,
     int32_t src_dp_size,
     int32_t src_dp_rank,
-    const proto::RequestPhaseTiming* phase_timing) {
+    const proto::RequestPhaseTiming* phase_timing,
+    std::optional<uint64_t> confirmed_upstream_output_tokens) {
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
   {
@@ -1833,6 +1841,9 @@ bool PDOOCScheduler::decode_recv_multi_generations(
                                         std::memory_order_relaxed);
   }
   request->state().timing->restore_pd(request_timing_from_proto(phase_timing));
+  if (confirmed_upstream_output_tokens.has_value()) {
+    request->confirm_upstream_output(*confirmed_upstream_output_tokens);
+  }
   kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
   ScopeGuard prepare_guard([this] {
     kv_preparing_requests_.fetch_sub(1, std::memory_order_relaxed);
@@ -2331,6 +2342,7 @@ void PDOOCScheduler::prefill_send_multi_generations() {
         LOG(ERROR) << "Failed to send multi generations, " << cntl.ErrorText()
                    << ", status: " << resp.ok();
       }
+      request->end_inflight();
       {
         std::lock_guard<std::mutex> lock(remote_requests_map_mutex_);
         remote_requests_map_.erase(request->request_id());

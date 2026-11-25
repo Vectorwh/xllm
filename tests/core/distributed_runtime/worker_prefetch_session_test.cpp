@@ -379,31 +379,52 @@ TEST(WorkerPrefetchSessionTest, ShutdownWaitsForConcurrentStreamClosure) {
 }
 
 TEST(WorkerPrefetchSessionTest, RemoteCloseDuringGetRetainsStatistics) {
-  std::promise<void> entered;
-  std::promise<void> release;
-  const std::shared_future<void> released = release.get_future().share();
-  SessionHarness harness([&entered, released](Slice<BlockTransferInfo>& blocks,
-                                              StoreGetStats* stats) {
-    entered.set_value();
-    released.wait();
-    stats->read_bytes = 400;
-    return std::vector<uint8_t>(blocks.size(), /*value=*/1);
-  });
-  harness.start();
-  const std::future_status started =
-      entered.get_future().wait_for(std::chrono::seconds(5));
-  harness.remote_close();
-  release.set_value();
-  harness.drain();
-  EXPECT_EQ(started, std::future_status::ready);
-  ASSERT_EQ(harness.reports.size(), 1U);
-  EXPECT_TRUE(harness.reports.front().failed);
-  EXPECT_EQ(harness.reports.front().stats.get.read_bytes, 400U);
-  EXPECT_EQ(harness.reports.front().stats.executed_units, 4U);
-  EXPECT_EQ(harness.get_calls, 1);
-  EXPECT_EQ(harness.close_calls, 1);
-  EXPECT_EQ(harness.probe_calls, 0);
-  EXPECT_TRUE(harness.writes.empty());
+  for (const bool enabled : {false, true}) {
+    SCOPED_TRACE(enabled);
+    const double failed_before =
+        MULTI_COUNTER_VALUE(store_prefetch_worker_sessions_total, "failed");
+    const double executed_before =
+        COUNTER_VALUE(store_prefetch_worker_executed_units_total);
+    std::promise<void> entered;
+    std::promise<void> release;
+    const std::shared_future<void> released = release.get_future().share();
+    SessionHarness harness(
+        [&entered, released](Slice<BlockTransferInfo>& blocks,
+                             StoreGetStats* stats) {
+          entered.set_value();
+          released.wait();
+          if (stats != nullptr) {
+            stats->read_bytes = 400;
+          }
+          return std::vector<uint8_t>(blocks.size(), /*value=*/1);
+        },
+        /*stats_enabled=*/enabled);
+    harness.start();
+    const std::future_status started =
+        entered.get_future().wait_for(std::chrono::seconds(5));
+    harness.remote_close();
+    release.set_value();
+    harness.drain();
+    EXPECT_EQ(started, std::future_status::ready);
+    if (enabled) {
+      ASSERT_EQ(harness.reports.size(), 1U);
+      EXPECT_TRUE(harness.reports.front().failed);
+      EXPECT_EQ(harness.reports.front().stats.get.read_bytes, 400U);
+      EXPECT_EQ(harness.reports.front().stats.executed_units, 4U);
+    } else {
+      EXPECT_TRUE(harness.reports.empty());
+    }
+    harness.session->on_closed(/*id=*/1);
+    EXPECT_EQ(
+        MULTI_COUNTER_VALUE(store_prefetch_worker_sessions_total, "failed"),
+        failed_before + 1);
+    EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_executed_units_total),
+              executed_before + 4);
+    EXPECT_EQ(harness.get_calls, 1);
+    EXPECT_EQ(harness.close_calls, 1);
+    EXPECT_EQ(harness.probe_calls, 0);
+    EXPECT_TRUE(harness.writes.empty());
+  }
 }
 
 TEST(WorkerPrefetchSessionTest, RemoteCloseBeforeWriteReportsFailureOnce) {
@@ -532,7 +553,7 @@ TEST(WorkerPrefetchSessionTest, StopDuringGetCompletesAfterWritingResult) {
   EXPECT_EQ(harness.probe_ids, std::vector<int32_t>({4}));
 }
 
-TEST(WorkerPrefetchSessionTest, ExportsOnlyEnabledStatsWithoutReportCallback) {
+TEST(WorkerPrefetchSessionTest, ExportsBasicMetricsWithoutDiagnostics) {
   for (const bool enabled : {false, true}) {
     SCOPED_TRACE(enabled);
     const uint64_t bytes_before =
@@ -542,11 +563,24 @@ TEST(WorkerPrefetchSessionTest, ExportsOnlyEnabledStatsWithoutReportCallback) {
             {"total"});
     ASSERT_NE(latency, nullptr);
     const int64_t samples_before = latency->count();
-    SessionHarness harness(/*get=*/nullptr,
-                           /*stats_enabled=*/enabled,
-                           /*before_close=*/nullptr,
-                           /*before_write=*/nullptr,
-                           /*capture_report=*/!enabled);
+    const int64_t blocks_samples_before =
+        HISTOGRAM_store_prefetch_worker_hit_blocks_per_session.count();
+    const int64_t rate_samples_before =
+        HISTOGRAM_store_prefetch_worker_block_hit_rate_basis_points.count();
+    const double blocks_before =
+        COUNTER_VALUE(store_prefetch_worker_hit_blocks_total);
+    SessionHarness harness(
+        [enabled](Slice<BlockTransferInfo>& blocks, StoreGetStats* stats) {
+          EXPECT_EQ(stats != nullptr, enabled);
+          if (stats != nullptr) {
+            stats->read_bytes = blocks.size() * 100;
+          }
+          return std::vector<uint8_t>(blocks.size(), enabled ? 1 : 0);
+        },
+        /*stats_enabled=*/enabled,
+        /*before_close=*/nullptr,
+        /*before_write=*/nullptr,
+        /*capture_report=*/!enabled);
     harness.start();
     const bool wrote = harness.wait_writes(/*count=*/1);
     EXPECT_EQ(harness.control(PrefetchControl::STOP), 0);
@@ -557,7 +591,14 @@ TEST(WorkerPrefetchSessionTest, ExportsOnlyEnabledStatsWithoutReportCallback) {
     EXPECT_EQ(harness.probe_calls, enabled ? 1 : 0);
     EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_read_bytes_total),
               bytes_before + (enabled ? 400 : 0));
-    EXPECT_EQ(latency->count(), samples_before + (enabled ? 1 : 0));
+    EXPECT_EQ(latency->count(), samples_before + 1);
+    EXPECT_EQ(COUNTER_VALUE(store_prefetch_worker_hit_blocks_total),
+              blocks_before + (enabled ? 4 : 0));
+    EXPECT_EQ(HISTOGRAM_store_prefetch_worker_hit_blocks_per_session.count(),
+              blocks_samples_before + 1);
+    EXPECT_EQ(
+        HISTOGRAM_store_prefetch_worker_block_hit_rate_basis_points.count(),
+        rate_samples_before + 1);
   }
 }
 

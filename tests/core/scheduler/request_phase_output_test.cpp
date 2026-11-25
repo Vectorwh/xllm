@@ -153,10 +153,21 @@ TEST(RequestPhaseOutputTest,
                                        /*disable_log_stats=*/true,
                                        [](std::shared_ptr<Request>) {});
       auto request = make_request(/*max_tokens=*/1);
+      const double ok_before = COUNTER_VALUE(request_status_total_ok);
+      const int64_t inflight_before =
+          COUNTER_engine_inflight_requests.get_value();
+      const int64_t output_samples_before =
+          HISTOGRAM_num_generated_tokens_per_request.count();
+      request->begin_inflight();
+      request->begin_inflight();
+      request->record_token_admission();
+      EXPECT_EQ(COUNTER_engine_inflight_requests.get_value(),
+                inflight_before + 1);
       commit_token(*request, /*token=*/65, /*milliseconds=*/30);
       ASSERT_TRUE(request->finished());
       std::vector<RequestOutput> received;
       request->state().output_func = [&received](const RequestOutput& output) {
+        output.log_request_status();
         received.emplace_back(output);
         return true;
       };
@@ -172,6 +183,21 @@ TEST(RequestPhaseOutputTest,
       EXPECT_EQ(received.front().finished_on_prefill_instance, !terminal);
       EXPECT_EQ(received.front().finished, terminal);
       EXPECT_EQ(request->has_terminal_outcome(), terminal);
+      EXPECT_EQ(COUNTER_VALUE(request_status_total_ok),
+                ok_before + (terminal ? 1 : 0));
+      EXPECT_EQ(HISTOGRAM_num_generated_tokens_per_request.count(),
+                output_samples_before + (terminal ? 1 : 0));
+      EXPECT_EQ(COUNTER_engine_inflight_requests.get_value(),
+                inflight_before + (terminal ? 0 : 1));
+      if (terminal) {
+        processor.process_completed_request(request);
+        processor.wait_completion();
+      }
+      EXPECT_EQ(COUNTER_VALUE(request_status_total_ok),
+                ok_before + (terminal ? 1 : 0));
+      request->end_inflight();
+      request->end_inflight();
+      EXPECT_EQ(COUNTER_engine_inflight_requests.get_value(), inflight_before);
       ASSERT_EQ(received.front().outputs.size(), 1u);
       EXPECT_EQ(received.front().outputs.front().text, "A");
     }
@@ -179,6 +205,8 @@ TEST(RequestPhaseOutputTest,
 }
 
 TEST(RequestPhaseOutputTest, TerminalCompletionDoesNotOvertakeBatchedStream) {
+  const int64_t samples_before =
+      HISTOGRAM_num_generated_tokens_per_request.count();
   PhaseTokenizer tokenizer;
   std::promise<void> stream_started;
   std::future<void> started = stream_started.get_future();
@@ -196,6 +224,7 @@ TEST(RequestPhaseOutputTest, TerminalCompletionDoesNotOvertakeBatchedStream) {
                               /*stream=*/true,
                               /*overlap=*/false,
                               "service-phase-output");
+  request->record_token_admission();
   commit_token(*request, /*token=*/65, /*milliseconds=*/30);
   request->state().outputs_func =
       [&](const std::vector<RequestOutput>& outputs) {
@@ -224,9 +253,103 @@ TEST(RequestPhaseOutputTest, TerminalCompletionDoesNotOvertakeBatchedStream) {
   processor.wait_completion();
   EXPECT_EQ(terminal.wait_for(std::chrono::seconds(5)),
             std::future_status::ready);
+  EXPECT_EQ(request->confirmed_output_tokens(), 1u);
+  EXPECT_EQ(HISTOGRAM_num_generated_tokens_per_request.count(),
+            samples_before + 1);
+}
+
+TEST(RequestPhaseOutputTest, ConcurrentOfflineTerminalLengthPublishesOnce) {
+  for (const bool stream : {false, true}) {
+    SCOPED_TRACE(std::string("stream:") + std::to_string(stream));
+    auto request = make_request(/*max_tokens=*/2, stream, /*overlap=*/true);
+    request->state().scheduler_param.offline = true;
+    request->record_token_admission();
+    commit_token(*request, /*token=*/65, /*milliseconds=*/30);
+    commit_token(*request, /*token=*/66, /*milliseconds=*/50);
+    request->sequences().front()->append_token(Token(-1));
+    ASSERT_TRUE(request->finished());
+    ASSERT_FALSE(request->confirmed_output_tokens().has_value());
+    ASSERT_EQ(request->claim_terminal_outcome(std::nullopt),
+              RequestTerminalOutcome::SUCCESS);
+
+    RequestOutput output;
+    output.finished = true;
+    if (!stream) {
+      output.outputs.resize(1);
+      output.outputs.front().generated_token_count = 2;
+    }
+    // Streaming completion may carry neither deltas nor usage.
+    ASSERT_FALSE(output.usage.has_value());
+    const int64_t samples = HISTOGRAM_num_generated_tokens_per_request.count();
+    const double output_tokens = COUNTER_VALUE(request_output_tokens_total);
+    std::promise<void> release;
+    std::shared_future<void> ready = release.get_future().share();
+    std::vector<std::thread> callbacks;
+    callbacks.reserve(8);
+    for (int32_t index = 0; index < 8; ++index) {
+      callbacks.emplace_back([&request, &output, ready] {
+        ready.wait();
+        request->record_token_output(output, /*submitted=*/true);
+      });
+    }
+    release.set_value();
+    for (auto& callback : callbacks) {
+      callback.join();
+    }
+    EXPECT_EQ(HISTOGRAM_num_generated_tokens_per_request.count(), samples + 1);
+    EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total), output_tokens);
+  }
 }
 
 TEST(RequestPhaseOutputTest, LocalMetricsPrecedeResponseAndPublishOnce) {
+  for (const bool stream : {false, true}) {
+    SCOPED_TRACE(std::string("offline:") + std::to_string(stream));
+    PhaseTokenizer tokenizer;
+    AsyncResponseProcessor processor(&tokenizer,
+                                     std::nullopt,
+                                     /*enable_service_routing=*/false,
+                                     /*disable_log_stats=*/true,
+                                     [](std::shared_ptr<Request>) {});
+    auto request = make_request(/*max_tokens=*/2, stream, /*overlap=*/true);
+    request->state().scheduler_param.offline = true;
+    const int64_t input_samples =
+        HISTOGRAM_num_prompt_tokens_per_request.count();
+    const int64_t output_samples =
+        HISTOGRAM_num_generated_tokens_per_request.count();
+    const double input_tokens = COUNTER_VALUE(request_input_tokens_total);
+    const double output_tokens = COUNTER_VALUE(request_output_tokens_total);
+    const double ok_count = COUNTER_VALUE(request_status_total_ok);
+    const int64_t inflight = COUNTER_engine_inflight_requests.get_value();
+    request->begin_inflight();
+    request->record_token_admission();
+    request->reset();
+    request->record_token_admission();
+    request->sequences().front()->kv_state().set_kv_cache_tokens_num(
+        request->state().prompt_tokens.size());
+    EXPECT_EQ(HISTOGRAM_num_prompt_tokens_per_request.count(),
+              input_samples + 1);
+    EXPECT_FALSE(request->token_accounting_enabled());
+    commit_token(*request, /*token=*/65, /*milliseconds=*/30);
+    if (stream) {
+      processor.process_stream_request(request);
+      processor.wait_completion();
+      EXPECT_EQ(HISTOGRAM_num_generated_tokens_per_request.count(),
+                output_samples);
+    }
+    commit_token(*request, /*token=*/66, /*milliseconds=*/50);
+    request->sequences().front()->append_token(Token(-1));
+    ASSERT_TRUE(request->finished());
+    processor.process_completed_request(request);
+    processor.wait_completion();
+    processor.process_completed_request(request);
+    processor.wait_completion();
+    EXPECT_EQ(HISTOGRAM_num_generated_tokens_per_request.count(),
+              output_samples + 1);
+    EXPECT_EQ(COUNTER_VALUE(request_input_tokens_total), input_tokens);
+    EXPECT_EQ(COUNTER_VALUE(request_output_tokens_total), output_tokens);
+    EXPECT_EQ(COUNTER_VALUE(request_status_total_ok), ok_count);
+    EXPECT_EQ(COUNTER_engine_inflight_requests.get_value(), inflight);
+  }
   for (const bool stream : {false, true}) {
     for (const int32_t tokens : {1, 2}) {
       SCOPED_TRACE(std::to_string(tokens) + ":" + std::to_string(stream));
@@ -405,6 +528,21 @@ TEST(RequestPhaseOutputTest, ExcludedOutputsDoNotPublish) {
     }
     request->record_server_first_token(at_ms(160));
     request->sequences().front()->finish();
+    if (scenario == 7) {
+      const int64_t input_samples =
+          HISTOGRAM_num_prompt_tokens_per_request.count();
+      const int64_t output_samples =
+          HISTOGRAM_num_generated_tokens_per_request.count();
+      request->record_token_admission();
+      PhaseTokenizer tokenizer;
+      const RequestOutput output = request->generate_output(tokenizer);
+      ASSERT_EQ(request->claim_terminal_outcome(output.status),
+                RequestTerminalOutcome::SUCCESS);
+      request->record_token_output(output, /*submitted=*/true);
+      EXPECT_EQ(HISTOGRAM_num_prompt_tokens_per_request.count(), input_samples);
+      EXPECT_EQ(HISTOGRAM_num_generated_tokens_per_request.count(),
+                output_samples);
+    }
     request->update_timing_after_execution(/*generation_terminal=*/scenario !=
                                            10);
     EXPECT_EQ(local_counts(), before);
@@ -413,6 +551,13 @@ TEST(RequestPhaseOutputTest, ExcludedOutputsDoNotPublish) {
     publish_concurrently(request, /*terminal=*/scenario != 10);
     request->set_cancel();
     EXPECT_EQ(skipped.get_value(), skipped_before + (scenario == 7 ? 0 : 1));
+    if (scenario == 1 || scenario == 4 || scenario == 10) {
+      EXPECT_EQ(request->claim_terminal_outcome(std::nullopt),
+                RequestTerminalOutcome::CANCELLED);
+    } else if (scenario == 3) {
+      EXPECT_EQ(request->claim_terminal_outcome(request->error_status()),
+                RequestTerminalOutcome::FAILURE);
+    }
   }
   // Rejected admission need not finish a Sequence to count a failed sample.
   auto rejected = make_request();
@@ -531,33 +676,34 @@ TEST(RequestPhaseOutputTest,
     const auto contains = [&text](const std::string& line) {
       EXPECT_NE(text.find(line), std::string::npos) << line;
     };
-    contains("xllm_request_phase_skipped_total_phase_queue_reason_failed " +
-             std::to_string(expected_failed) + "\n");
+    contains(
+        "xllm_request_phase_skipped_total{phase=\"queue\",reason=\"failed\"} " +
+        std::to_string(expected_failed) + "\n");
     for (size_t index = 0; index < phases.size(); ++index) {
       const std::string local =
           "xllm_request_" + phases[index] + "_microseconds";
       const std::string pd =
           "xllm_pd_request_" + pd_phases[index] + "_microseconds";
-      const std::string role = index < 2 ? "_role_prefill" : "_role_decode";
+      const std::string role = index < 2 ? "prefill" : "decode";
       for (const std::string& suffix : {"_latency", "_count"}) {
         contains("# TYPE " + local + suffix + " gauge\n");
-        contains("# TYPE " + pd + suffix + role + " gauge\n");
+        contains("# TYPE " + pd + suffix + " gauge\n");
       }
       contains("# TYPE " + local + "_latency_99 gauge\n");
-      contains("# TYPE " + pd + "_latency" + role + "_quantile_99 gauge\n");
+      contains(pd + "_latency{role=\"" + role + "\",quantile=\"99\"} ");
       contains(local + "_count " + std::to_string(metrics[index]) + "\n");
-      contains(pd + "_count" + role + " " + std::to_string(pd_metrics[index]) +
-               "\n");
+      contains(pd + "_count{role=\"" + role + "\"} " +
+               std::to_string(pd_metrics[index]) + "\n");
       EXPECT_EQ(text.find(local + "_bucket"), std::string::npos);
       EXPECT_EQ(text.find(pd + "_bucket"), std::string::npos);
     }
     contains("# TYPE rpc_server_t3_export_summary summary\n");
     contains("rpc_server_t3_export_summary_count 2\n");
-    const std::string metadata =
-        "# TYPE t3_export_labeled_gauge_role_decode gauge\n";
+    const std::string metadata = "# TYPE t3_export_labeled_gauge gauge\n";
     contains(metadata);
     EXPECT_EQ(text.find(metadata), text.rfind(metadata));
-    contains("t3_export_labeled_gauge_role_decode 2");
+    contains("t3_export_labeled_gauge{role=\"decode\"} 2\n");
+    contains("t3_export_labeled_gauge{role=\"prefill\"} 1\n");
     EXPECT_EQ(local_counts(), metrics);
     EXPECT_EQ(pd_counts(), pd_metrics);
   }

@@ -99,6 +99,7 @@ bool AsyncResponseProcessor::prepare_completed_output(
                       request, output->status, end_2_end_latency_seconds)) {
     return false;
   }
+  output->terminal_status_recorded = terminal;
   if (!terminal && output->status.has_value() && output->status->ok()) {
     output->finished_on_prefill_instance = true;
     // Completing P is a phase boundary, even when max_tokens=1 made its
@@ -126,6 +127,7 @@ void AsyncResponseProcessor::process_failed_request(
     output.service_request_id = request->service_request_id();
     output.target_xservice_addr = request->source_xservice_addr();
     output.status = status;
+    output.terminal_status_recorded = true;
     auto send_output = [request, output = std::move(output)]() {
       request->state().output_func(output);
     };

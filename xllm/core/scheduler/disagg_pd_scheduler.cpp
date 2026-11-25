@@ -1168,6 +1168,11 @@ void DisaggPDScheduler::prefill_send_first_generation() {
 
       // Finish the Prefill response before Decode can produce later tokens.
       response_processor_->wait_completion();
+      const std::optional<uint64_t> confirmed_tokens =
+          request->confirmed_output_tokens();
+      if (confirmed_tokens.has_value()) {
+        gen->set_confirmed_upstream_output_tokens(*confirmed_tokens);
+      }
 
       // TODO: Async call later
       proto::Status resp;
@@ -1201,6 +1206,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       // Never subtract clocks across hosts.
       request->state().timing->mark_pd_handoff_accepted();
       request->record_server_first_token();
+      request->end_inflight();
 
       // The handoff succeeded, so the Decode instance owns the reservation.
       request->state().decode_rpc_address.clear();
@@ -1361,6 +1367,7 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
   // Deallocation stays outside the lock, as in the clean path.
   if (request != nullptr && !leased) {
     request->reset();
+    request->end_inflight();
   }
   return true;
 }
@@ -1514,6 +1521,7 @@ bool DisaggPDScheduler::decode_schedule(
       request->reset();
       return false;
     }
+    request->begin_inflight();
     received_request_map_[request->request_id()] = request;
     decode_cancellation_entries_[request->request_id()] = {
         request, /*ready=*/false, /*cancel_requested=*/false};
@@ -1546,7 +1554,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     torch::Tensor mtp_bootstrap_embedding,
     int32_t num_cached_tokens,
     const proto::RequestPhaseTiming* phase_timing,
-    std::optional<int32_t> mrope_position_delta) {
+    std::optional<int32_t> mrope_position_delta,
+    std::optional<uint64_t> confirmed_upstream_output_tokens) {
   Timer receive_timer;
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
@@ -1567,6 +1576,9 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
 
   auto& sequences = request->sequences();
+  if (confirmed_upstream_output_tokens.has_value()) {
+    request->confirm_upstream_output(*confirmed_upstream_output_tokens);
+  }
   request->state().timing->restore_pd(request_timing_from_proto(phase_timing));
   kv_preparing_requests_.fetch_add(1, std::memory_order_relaxed);
   ScopeGuard prepare_guard([this] {

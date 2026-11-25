@@ -494,6 +494,9 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         gen.has_phase_timing() ? &gen.phase_timing() : nullptr,
         gen.has_mrope_position_delta()
             ? std::optional<int32_t>(gen.mrope_position_delta())
+            : std::nullopt,
+        gen.has_confirmed_upstream_output_tokens()
+            ? std::optional<uint64_t>(gen.confirmed_upstream_output_tokens())
             : std::nullopt);
     if (!success) {
       response->set_ok(false);

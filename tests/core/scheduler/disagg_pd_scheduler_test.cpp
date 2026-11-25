@@ -36,6 +36,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -377,6 +378,9 @@ class TestDisaggPDScheduler final
 
 class FirstGenerationOrderService final : public proto::DisaggPDService {
  public:
+  explicit FirstGenerationOrderService(bool expect_multi_generations = false)
+      : expect_multi_generations_(expect_multi_generations) {}
+
   std::future<void> received() { return received_.get_future(); }
   std::function<void(const proto::DisaggGenerationsRequests&)> on_handoff_;
 
@@ -384,6 +388,22 @@ class FirstGenerationOrderService final : public proto::DisaggPDService {
                        const proto::DisaggGenerationsRequests* request,
                        proto::Status* response,
                        google::protobuf::Closure* done) override {
+    EXPECT_FALSE(expect_multi_generations_);
+    receive_handoff(request, response, done);
+  }
+
+  void MultiGenerations(google::protobuf::RpcController* /*controller*/,
+                        const proto::DisaggGenerationsRequests* request,
+                        proto::Status* response,
+                        google::protobuf::Closure* done) override {
+    EXPECT_TRUE(expect_multi_generations_);
+    receive_handoff(request, response, done);
+  }
+
+ private:
+  void receive_handoff(const proto::DisaggGenerationsRequests* request,
+                       proto::Status* response,
+                       google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     if (received_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
       received_.set_value();
@@ -394,7 +414,7 @@ class FirstGenerationOrderService final : public proto::DisaggPDService {
     response->set_ok(true);
   }
 
- private:
+  const bool expect_multi_generations_;
   std::atomic<int32_t> received_count_{0};
   std::promise<void> received_;
 };
@@ -3176,7 +3196,9 @@ void check_prefill_response_completes_before_decode_handoff(
   auto previous_perf_model = perf_model::get_perf_model();
   ScopeGuard restore_perf_model(
       [&] { perf_model::set_perf_model(previous_perf_model); });
-  FirstGenerationOrderService service;
+  FirstGenerationOrderService service(
+      /*expect_multi_generations=*/std::is_base_of_v<PDOOCScheduler,
+                                                     Scheduler>);
   auto received = service.received();
   brpc::Server server;
   ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
@@ -3205,6 +3227,8 @@ void check_prefill_response_completes_before_decode_handoff(
       [prefill_text_withheld](const proto::DisaggGenerationsRequests& gens) {
         ASSERT_EQ(gens.multi_gens_size(), 1);
         ASSERT_EQ(gens.multi_gens(0).tokens_size(), 1);
+        ASSERT_TRUE(gens.multi_gens(0).has_confirmed_upstream_output_tokens());
+        EXPECT_EQ(gens.multi_gens(0).confirmed_upstream_output_tokens(), 1u);
         EXPECT_EQ(gens.multi_gens(0).tokens(0).prefill_text_withheld(),
                   prefill_text_withheld);
       };
@@ -3255,7 +3279,8 @@ void check_prefill_response_completes_before_decode_handoff(
     return ForwardOutput{};
   };
   // Seed admission to isolate response ordering from discovery and KV RPCs.
-  // step() drives the real output processor and FirstGeneration handoff.
+  // step() drives the real output processor and the scheduler's handoff RPC.
+  request->record_token_admission();
   prefill.admit_prefill(request, &stub);
   prefill.step(absl::ZeroDuration());
   const bool output_started =
@@ -3307,7 +3332,7 @@ TEST(PDOOCSchedulerTest, BatchHandoffDoesNotWaitForLaterResponses) {
   auto previous_perf_model = perf_model::get_perf_model();
   ScopeGuard restore_perf_model(
       [&] { perf_model::set_perf_model(previous_perf_model); });
-  FirstGenerationOrderService service;
+  FirstGenerationOrderService service(/*expect_multi_generations=*/true);
   auto received = service.received();
   brpc::Server server;
   ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
@@ -3400,7 +3425,7 @@ TEST(PDOOCSchedulerTest, BlockedResponseDoesNotDelayAnotherReadyHandoff) {
   auto previous_perf_model = perf_model::get_perf_model();
   ScopeGuard restore_perf_model(
       [&] { perf_model::set_perf_model(previous_perf_model); });
-  FirstGenerationOrderService service;
+  FirstGenerationOrderService service(/*expect_multi_generations=*/true);
   brpc::Server server;
   ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
   ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);

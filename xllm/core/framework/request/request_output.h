@@ -147,6 +147,9 @@ struct RequestOutput {
   // must run synchronously on the same thread; the payload stays read-only.
   // Custom callbacks use their bool return instead. Internal, not on the wire.
   mutable bool token_submission_tracked = false;
+  // The owning Request already counted its one terminal outcome. Front-door
+  // failures without a Request continue to use log_request_status().
+  bool terminal_status_recorded = false;
 };
 
 // Borrow the response so HTTP receipts survive the OutputFunc adapter without

@@ -355,6 +355,7 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
   }
 
   // Input counts admission, including requests that later fail or cancel.
+  request->begin_inflight();
   request->record_token_admission();
   // Accepted into the scheduler's waiting domain, before asynchronous KV
   // prefetch. Rejected admission is not a QUEUED event.

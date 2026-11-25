@@ -35,7 +35,13 @@ namespace xllm {
 
 using bvar::Adder;
 
+// Pure observation, independent of the ingress RateLimiter's capacity slots.
+extern bvar::Adder<int64_t> COUNTER_engine_inflight_requests;
+
+enum class StatusCode : uint8_t;
 struct RequestTimingSnapshot;
+
+void record_request_status(StatusCode code);
 
 // Observe once at first output and generation completion, before response work.
 // Only complete local single-output samples enter these latency recorders.
@@ -393,6 +399,8 @@ DECLARE_COUNTER(store_prefetch_worker_executed_units_total);
 DECLARE_COUNTER(store_prefetch_worker_hit_units_total);
 DECLARE_COUNTER(store_prefetch_worker_requested_blocks_total);
 DECLARE_COUNTER(store_prefetch_worker_hit_blocks_total);
+DECLARE_HISTOGRAM(store_prefetch_worker_hit_blocks_per_session);
+DECLARE_HISTOGRAM(store_prefetch_worker_block_hit_rate_basis_points);
 extern bvar::Adder<uint64_t> COUNTER_store_prefetch_worker_read_bytes_total;
 // Integer counts avoid MultiDimension's default six-significant-digit
 // floating-point serialization rounding Store object/byte totals.
@@ -463,6 +471,7 @@ DECLARE_MULTI_GAUGE(scheduler_waiting_requests);
 DECLARE_GAUGE(num_running_requests);
 DECLARE_GAUGE(num_waiting_requests);
 DECLARE_GAUGE(num_preempted_requests);
+DECLARE_COUNTER(scheduler_preempted_requests_total);
 DECLARE_GAUGE(num_offline_decode_preempt_offline_requests);
 DECLARE_GAUGE(num_online_decode_preempt_online_requests);
 DECLARE_GAUGE(num_online_prefill_preempt_offline_requests);

@@ -19,6 +19,7 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -71,11 +72,22 @@ class Request : public RequestBase {
   // Called after reserving ingress capacity, before publishing the request.
   void record_token_admission();
 
-  // Response dispatch serializes callbacks and accounting for each Request.
+  // A local accepted Request includes preprocessing, waiting and KV restore.
+  // Handoff, terminal cleanup and destruction release the same slot once.
+  void begin_inflight();
+  void end_inflight();
+
+  // Online dispatch serializes callbacks and token accounting per Request.
+  // Offline terminal callbacks may concurrently claim the length sample.
   void record_token_output(const RequestOutput& output, bool submitted);
 
   // Only for Decode reconstructing an admitted PD request; no new input charge.
   void enable_forwarded_token_output();
+
+  std::optional<uint64_t> confirmed_output_tokens() const {
+    return request_tokens_.confirmed_output_tokens();
+  }
+  void confirm_upstream_output(uint64_t tokens);
 
   bool token_accounting_enabled() const { return request_tokens_.enabled(); }
 
@@ -239,8 +251,7 @@ class Request : public RequestBase {
   // Negative when the request never entered a batch.
   double queue_to_batch_latency_ms() const;
 
-  // Recorded by Mooncake Store prefetch admission when
-  // XLLM_STORE_PREFETCH_STATS is enabled.
+  // Recorded by Mooncake Store prefetch admission independently of diagnostics.
   void record_store_prefetch(size_t tokens, double latency_ms) {
     store_prefetch_tokens_ = tokens;
     store_prefetch_latency_ms_ = latency_ms;
@@ -250,6 +261,12 @@ class Request : public RequestBase {
   // Caller holds timing_metrics_mutex_; each phase records or skips once.
   void observe_terminal_timing_locked(const char* exclusion);
   RequestTokenAccounting request_tokens_;
+  std::mutex inflight_metrics_mutex_;
+  bool inflight_started_ = false;
+  bool inflight_ended_ = false;
+  std::atomic<bool> offline_input_length_observed_{false};
+  // Claims a sample only; does not publish Request state between callbacks.
+  std::atomic<bool> output_length_observed_{false};
   // Reuse capacity across the serialized response deltas of this request.
   std::vector<OutputTokenProgress> token_progress_buf_;
   RequestState state_;

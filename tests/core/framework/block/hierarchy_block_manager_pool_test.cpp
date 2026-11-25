@@ -2201,14 +2201,13 @@ TEST(HierarchyBlockManagerPoolTest,
   EXPECT_FALSE(sequence->kv_state().has_any_blocks());
   EXPECT_EQ(sequence->host_kv_state().num_blocks(BlockType::KV), 8u);
   EXPECT_EQ(sequence->kv_cache_tokens_num(), 1024u);
-  const int64_t expected_samples = util::store_prefetch_stats_enabled() ? 1 : 0;
   EXPECT_EQ(COUNTER_VALUE(store_prefetch_master_fetched_tokens_total),
-            fetched_before + expected_samples * 1024);
+            fetched_before + 1024);
   EXPECT_EQ(
       MULTI_COUNTER_VALUE(store_prefetch_master_sessions_total, "complete"),
-      sessions_before + expected_samples);
+      sessions_before + 1);
   EXPECT_EQ(HISTOGRAM_store_prefetch_master_latency_microseconds.count(),
-            samples_before + expected_samples);
+            samples_before + 1);
   pool.deallocate(sequence);
 }
 

@@ -62,7 +62,11 @@ void PDOOCServiceImpl::decode_recv_multi_generations(
         std::move(source_mappings),
         multi_gen.dp_size(),
         multi_gen.dp_rank(),
-        multi_gen.has_phase_timing() ? &multi_gen.phase_timing() : nullptr);
+        multi_gen.has_phase_timing() ? &multi_gen.phase_timing() : nullptr,
+        multi_gen.has_confirmed_upstream_output_tokens()
+            ? std::optional<uint64_t>(
+                  multi_gen.confirmed_upstream_output_tokens())
+            : std::nullopt);
 
     if (!success) {
       overall_success = false;
