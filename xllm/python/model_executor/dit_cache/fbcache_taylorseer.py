@@ -91,11 +91,9 @@ class FBCacheTaylorSeer(DitCachePolicy):
         return hidden, encoder
 
     def can_use_cache(self, first_hidden_residual: torch.Tensor | None) -> bool:
-        if self.current_step <= self.warmup_steps or self.residual_diff_threshold <= 0.0:
-            return False
-        prev = self.buffers.get("first_hidden_states_residual")
-        if prev is None:
-            return False
+        enabled = self.current_step > self.warmup_steps and self.residual_diff_threshold > 0.0
+        prev = self.buffers.get("first_hidden_states_residual") if enabled else None
+        # A missing/disabled cache on any SP rank rejects reuse for the group.
         return self.is_similar(prev, first_hidden_residual, self.residual_diff_threshold)
 
 

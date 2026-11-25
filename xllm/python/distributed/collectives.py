@@ -1087,6 +1087,14 @@ def named_group(group_name: str, device: torch.device | str) -> ProcessGroup | N
     return _groups.get((group_name, str(torch.device(device))))
 
 
+def named_group_device(group_name: str) -> torch.device | None:
+    """Resolve a unique registered group device without requiring a tensor."""
+    devices = [device for name, device in _groups if name == group_name]
+    if len(devices) > 1:
+        raise RuntimeError(f"{group_name} is registered on multiple devices; a unique cache group is required")
+    return torch.device(devices[0]) if devices else None
+
+
 def named_group_rank(group_name: str, device: torch.device | str) -> int:
     """Rank inside the named group for ``device`` (0 when the group is absent)."""
     group = named_group(group_name, device)
@@ -1313,6 +1321,7 @@ __all__ = [
     "dp_all_true",
     "gather_dp_execution_tokens",
     "named_group",
+    "named_group_device",
     "named_group_rank",
     "named_group_size",
     "gather",

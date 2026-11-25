@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/quant_args.h"
 #include "core/framework/state_dict/state_dict.h"
+#include "core/util/module_utils.h"
 
 namespace xllm {
 
@@ -55,21 +56,7 @@ class CausalVLMImpl : public CausalVLM {
     torch::NoGradGuard no_grad;
     model_->to(device);
     if (device.is_cpu()) {
-      // Rewrite parameter/buffer storage so the device blocks are released
-      // instead of lingering in the caching allocator (same trick as
-      // joyo_v2::force_module_storage_to_cpu in pipeline_joyo_v2.h).
-      auto move_one = [](torch::Tensor& tensor) {
-        if (!tensor.defined() || tensor.device().is_cpu()) {
-          return;
-        }
-        tensor.set_data(tensor.to(torch::kCPU).contiguous());
-      };
-      for (auto& kv : model_->named_parameters(/*recurse=*/true)) {
-        move_one(kv.value());
-      }
-      for (auto& kv : model_->named_buffers(/*recurse=*/true)) {
-        move_one(kv.value());
-      }
+      force_module_storage_to_cpu(*model_);
     }
   }
 

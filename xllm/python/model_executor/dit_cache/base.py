@@ -101,35 +101,46 @@ class DitCachePolicy:
 
     # ---- helpers shared by FBCache / FBCacheTaylorSeer ----------------------
 
-    def _all_reduce_sum(self, tensor: torch.Tensor) -> None:
-        group = collectives.named_group(self.sp_group, tensor.device)
-        if group is None or group.size() <= 1:
-            return
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-
     def is_similar(self, lhs: torch.Tensor | None, rhs: torch.Tensor | None, threshold: float) -> bool:
-        """Symmetry-checked similarity (all-reduced over SP), as in C++."""
-        if lhs is None or rhs is None:
+        """Use a shared validity/threshold decision before comparing SP shards."""
+        device = collectives.named_group_device(self.sp_group) if self.sp_group is not None else None
+        if device is None:
+            device = lhs.device if lhs is not None else rhs.device if rhs is not None else torch.device("cpu")
+        valid = (
+            lhs is not None
+            and rhs is not None
+            and lhs.shape == rhs.shape
+            and lhs.device == rhs.device
+            and lhs.dtype == rhs.dtype
+        )
+        group = collectives.named_group(self.sp_group, device)
+        distributed = group is not None and group.size() > 1
+        # Even a rank with no tensor joins this fixed-size control reduction.
+        # MIN makes any invalid shard reject reuse; differing thresholds use
+        # the strictest value and select the same comparison on every rank.
+        control = torch.tensor([float(valid), threshold], dtype=torch.float32, device=device)
+        if distributed:
+            dist.all_reduce(control, op=dist.ReduceOp.MIN, group=group)
+        if not bool(control[0].item()):
             return False
-        if tuple(lhs.shape) != tuple(rhs.shape):
-            return False
+        threshold = float(control[1].item())
         if threshold <= 0.0:
-            return bool(torch.allclose(lhs, rhs))
+            close = torch.tensor(float(torch.allclose(lhs, rhs)), dtype=torch.float32, device=device)
+            if distributed:
+                dist.all_reduce(close, op=dist.ReduceOp.MIN, group=group)
+            return bool(close.item())
 
-        # SP shards the sequence, so a local mean would let ranks disagree.
-        # All-reduce raw sums + count for an identical global decision. The
-        # collective is symmetric only because the early returns above fire
-        # identically on every rank.
+        # SP shards may have different sizes: reduce sums and count, not means.
         sum_abs_diff = (lhs - rhs).abs().to(torch.float32).sum()
         sum_abs_lhs = lhs.abs().to(torch.float32).sum()
         count = torch.full((), float(lhs.numel()), dtype=torch.float32, device=lhs.device)
-        stats = torch.stack([sum_abs_diff, sum_abs_lhs, count])
-        self._all_reduce_sum(stats)
-        sum_abs_diff, sum_abs_lhs, count = stats[0], stats[1], stats[2]
-
-        mean_diff = sum_abs_diff / count
-        mean_lhs = sum_abs_lhs / count
-        rel = mean_diff / (mean_lhs + 1e-6)
+        stats = torch.stack([sum_abs_diff, sum_abs_lhs, count]).to(device)
+        if distributed:
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=group)
+        sum_abs_diff, sum_abs_lhs, count = stats.unbind()
+        if count.item() == 0:
+            return False
+        rel = (sum_abs_diff / count) / (sum_abs_lhs / count + 1e-6)
         return bool((rel < threshold).item())
 
     # ---- hook methods (subclasses override) ---------------------------------
@@ -156,6 +167,7 @@ class DiTCache:
     """
 
     def __init__(self, policy_cls: type, sp_group: str | None, options: dict[str, Any] | None) -> None:
+        options = dict(options or {})
         self._uncond = policy_cls(sp_group, options)  # use_cfg == False
         self._cond = policy_cls(sp_group, options)  # use_cfg == True
         self._current_cfg = False

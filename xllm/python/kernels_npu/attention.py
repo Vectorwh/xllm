@@ -151,6 +151,14 @@ def joint_diffusion_attention(
         scale = head_dim**-0.5
     num_heads = query.size(2)
     mask_is_bool = attn_mask is None or attn_mask.dtype == torch.bool
+    if attn_mask is not None:
+        if attn_mask.device != query.device:
+            raise ValueError("joint diffusion attention mask must be on the query device")
+        # The public mask follows SDPA broadcasting: [..., query, key].
+        target = (query.size(0), num_heads, query.size(1), key.size(1))
+        if torch.broadcast_shapes(tuple(attn_mask.shape), target) != target:
+            raise ValueError(f"attention mask {tuple(attn_mask.shape)} cannot broadcast to {target}")
+        attn_mask = attn_mask.contiguous()
 
     if query.device.type == "npu" and mask_is_bool:
         if _HAS_MINDIESD:
@@ -173,8 +181,17 @@ def joint_diffusion_attention(
                     op_type="fused_attn_score",
                     layout="BSND",
                 )
-            except ImportError:
-                pass
+            except ImportError as error:
+                raise RuntimeError(
+                    "mindiesd is installed but its diffusion attention dependencies could not be imported"
+                ) from error
+            except (RuntimeError, NotImplementedError) as error:
+                raise RuntimeError(
+                    "mindiesd joint diffusion attention failed: "
+                    f"query={tuple(query.shape)}, key={tuple(key.shape)}, "
+                    f"mask={None if attn_mask is None else (tuple(attn_mask.shape), attn_mask.dtype)}; "
+                    "boolean masks use True=attend; backend execution was not retried"
+                ) from error
 
         import torch_npu
 
@@ -205,6 +222,7 @@ def joint_diffusion_attention(
         attn_mask=attn_mask,
         dropout_p=0.0,
         is_causal=False,
+        scale=scale,
     )
     return output.transpose(1, 2).contiguous()
 

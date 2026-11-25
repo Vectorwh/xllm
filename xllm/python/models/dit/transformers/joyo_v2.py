@@ -755,18 +755,29 @@ class JoyOV2TransformerBlock(nn.Module):
         ulysses_sp: bool = False,
         attn_seqlens: torch.Tensor | None = None,
         token_sample_ids: torch.Tensor | None = None,
+        audio_timestep_emb: torch.Tensor | None = None,
+        modulation_sample_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale_msa = gate_msa = shift_msa = None
         scale_mlp = gate_mlp = shift_mlp = None
         modulated = False
         if self.modulation and timestep_emb is not None:
             mods = self.mod(timestep_emb)
+            if audio_timestep_emb is not None:
+                if modulation_sample_ids is None:
+                    raise ValueError("audio timestep modulation requires per-token modulation sample ids")
+                audio_mods = self.mod(audio_timestep_emb)
+                mods = [torch.cat([video, audio], dim=0) for video, audio in zip(mods, audio_mods)]
             scale_msa, gate_msa, shift_msa, scale_mlp, gate_mlp, shift_mlp = mods
             modulated = True
 
         s = x.size(1)
 
         def expand(t: torch.Tensor) -> torch.Tensor:
+            if modulation_sample_ids is not None:
+                if modulation_sample_ids.numel() != s:
+                    raise ValueError(f"modulation_sample_ids {modulation_sample_ids.numel()} != seq {s}")
+                return t.index_select(0, modulation_sample_ids).unsqueeze(0)
             if token_sample_ids is not None:
                 if token_sample_ids.numel() != s:
                     raise ValueError(f"token_sample_ids {token_sample_ids.numel()} != seq {s}")
@@ -974,12 +985,19 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
         timestep: torch.Tensor,  # [N]
         rope_meta: PackedRopeMeta,
         audio_hidden_states: torch.Tensor | None = None,  # [A, latent_channels]
+        audio_timestep: torch.Tensor | None = None,  # [N], defaults to video timestep
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         device = hidden_states.device
         dtype = hidden_states.dtype
 
         t_emb = timestep_embedding(timestep * 1000.0, 256).to(dtype)
         timestep_emb = self.time_embedder_linear_2(F.silu(self.time_embedder_linear_1(t_emb)))
+        audio_timestep_emb = timestep_emb
+        if audio_hidden_states is not None and audio_timestep is not None:
+            if audio_timestep.shape != timestep.shape:
+                raise ValueError("audio and video timestep shapes must match")
+            audio_t_emb = timestep_embedding(audio_timestep * 1000.0, 256).to(dtype)
+            audio_timestep_emb = self.time_embedder_linear_2(F.silu(self.time_embedder_linear_1(audio_t_emb)))
 
         pixel_emb = self.x_embedder(hidden_states)
         text_emb = self.context_embedder_proj(self.context_embedder_norm(text_embeddings))
@@ -1005,7 +1023,7 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
             audio_freqs = self.compute_freqs_cis(rope_meta.audio.position_id)
             x = audio_emb.unsqueeze(0)
             for block in self.audio_refiner:
-                x = block(x, timestep_emb, audio_freqs, rope_meta.audio.seqlens)
+                x = block(x, audio_timestep_emb, audio_freqs, rope_meta.audio.seqlens)
             audio_emb = x.squeeze(0)
 
         # Pack [text | pixel | audio] per sample.
@@ -1041,6 +1059,22 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
         sp_size = collectives.named_group_size(self.sp_group, device) if self.sp_group is not None else 1
         mix_seqlens = rope_meta.mix.seqlens
         mix_attn_seqlens = mix_seqlens
+        audio_mix_emb = None
+        modulation_ids = None
+        if audio_emb is not None and audio_timestep is not None:
+            audio_mix_emb = audio_timestep_emb
+            # Text/video tokens select [0, N); audio tokens select [N, 2N).
+            modulation_ids = torch.cat(
+                [
+                    torch.cat(
+                        [
+                            torch.full((text_lens[i] + pix_per,), i, dtype=torch.int64, device=device),
+                            torch.full((audio_lens[i],), n + i, dtype=torch.int64, device=device),
+                        ]
+                    )
+                    for i in range(n)
+                ]
+            )
         if sp_size > 1:
             # The mix pad must also lengthen the LAST sample's attn seqlens so
             # varlen SDPA keeps CFG samples isolated; freqs are padded (not
@@ -1055,11 +1089,11 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
                 mix_attn_seqlens = attn_lens.to(torch.int32).to(device)
                 mix_freqs = F.pad(mix_freqs, (0, 0, 0, pad), mode="constant", value=0)
 
+            sp_inputs = {"x": (x, 1), "sample_ids": (sample_ids.unsqueeze(0), 1)}
+            if modulation_ids is not None:
+                sp_inputs["modulation_ids"] = (modulation_ids.unsqueeze(0), 1)
             sp_outputs = self.sequence_parallel_forward(
-                {
-                    "x": (x, 1),
-                    "sample_ids": (sample_ids.unsqueeze(0), 1),
-                },
+                sp_inputs,
                 lambda local: {
                     "x": (
                         self._run_mix_layers(
@@ -1069,6 +1103,8 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
                             mix_attn_seqlens,
                             mix_freqs,
                             local["sample_ids"].squeeze(0),
+                            audio_mix_emb,
+                            local["modulation_ids"].squeeze(0) if "modulation_ids" in local else None,
                         ),
                         1,
                     )
@@ -1076,7 +1112,9 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
             )
             x = sp_outputs["x"][0]
         else:
-            x = self._run_mix_layers(x, timestep_emb, mix_seqlens, mix_attn_seqlens, mix_freqs, None)
+            x = self._run_mix_layers(
+                x, timestep_emb, mix_seqlens, mix_attn_seqlens, mix_freqs, None, audio_mix_emb, modulation_ids
+            )
 
         # Slice each sample's pixel / audio tail back out of the mix output.
         pix_outs = []
@@ -1107,6 +1145,8 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
         mix_attn_seqlens: torch.Tensor,
         mix_freqs: torch.Tensor,
         token_sample_ids: torch.Tensor | None,
+        audio_timestep_emb: torch.Tensor | None = None,
+        modulation_sample_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ulysses = token_sample_ids is not None
         for block in self.transformer_blocks:
@@ -1118,6 +1158,8 @@ class JoyOV2Transformer3DModel(DiTComponentBase, SequenceParallelMixin):
                 ulysses_sp=ulysses,
                 attn_seqlens=mix_attn_seqlens,
                 token_sample_ids=token_sample_ids,
+                audio_timestep_emb=audio_timestep_emb,
+                modulation_sample_ids=modulation_sample_ids,
             )
         return x
 

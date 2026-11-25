@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model_context.h"
@@ -58,6 +59,15 @@ class __attribute__((visibility("hidden"))) PyDiTModel : public DiTModel {
   const torch::TensorOptions& options() const override { return options_; }
 
   void load_model(std::unique_ptr<DiTModelLoader> loader) override;
+
+  bool load_lora_model(const LoRAConfig& /*config*/,
+                       const std::vector<LoRARequest>& requests) override {
+    if (requests.empty()) {
+      return true;
+    }
+    LOG(WARNING) << "LoRA loading is not supported by the Python DiT backend.";
+    return false;
+  }
 
  private:
   void register_python_process_groups();

@@ -49,29 +49,6 @@ class RMSNorm(nn.Module):
         return kernels.fused_add_rms_norm(x, residual, self.weight, self.eps)
 
 
-class WanRMSNorm(nn.Module):
-    """Weight-only RMSNorm over the last dim, computed in fp32 (Wan DiT).
-
-    Matches the DiT per-head Q/K norm: normalizes in fp32 and keeps the scale
-    weight in fp32, delegating to the fused ``rms_norm_fp32`` kernel so NPU
-    uses ``npu_rms_norm`` (bit-exact with the eager reference).
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        dtype: torch.dtype | None = None,
-        device: torch.device | str | None = None,
-    ) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.empty(dim, dtype=dtype, device=device), requires_grad=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return kernels.rms_norm_fp32(x, self.weight, self.eps)
-
-
 class GemmaRMSNorm(nn.Module):
     """Gemma-style RMSNorm used by Qwen3.5.
 
