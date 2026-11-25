@@ -29,12 +29,11 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/framework/config/model_config.h"
 #include "core/framework/dit_cache/dit_cache_config.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/parallel_state/parallel_args.h"
-#include "models/dit/transformers/transformer_joyo_v2.h"
+#include "core/util/utils.h"
 #include "models/dit/vlm_encoder_proxy.h"
 #include "models/py_model_helper.h"
 
@@ -113,19 +112,30 @@ void clear_python_object(py::object& object) {
   object = py::object();
 }
 
-}  // namespace
-
-// Exposes the form-B text encoder proxy to the embedded interpreter.
-PYBIND11_EMBEDDED_MODULE(xllm_dit, m) {
+// Register only when the proxy is used, with the caller holding the GIL.
+// Static embedded-module registration aborts when xllm_export is dlopened
+// into an interpreter that is already running.
+void ensure_xllm_dit_module() {
+  py::dict modules = py::module_::import("sys").attr("modules");
+  const py::str module_name("xllm_dit");
+  if (modules.contains(module_name)) {
+    return;
+  }
+  py::object module_object =
+      py::module_::import("types").attr("ModuleType")(module_name);
+  py::module_ module = py::reinterpret_borrow<py::module_>(module_object);
   py::class_<VlmTextEncoderProxy, std::shared_ptr<VlmTextEncoderProxy>>(
-      m, "VlmTextEncoderProxy")
+      module, "VlmTextEncoderProxy")
       .def("encode_joyo_prompts",
            &VlmTextEncoderProxy::encode_joyo_prompts,
            py::arg("prompts"))
       .def("set_on_device",
            &VlmTextEncoderProxy::set_on_device,
            py::arg("on_device"));
+  modules[module_name] = module;
 }
+
+}  // namespace
 
 PyDiTModel::PyDiTModel(const DiTModelContext& context)
     : context_(context),
@@ -134,6 +144,9 @@ PyDiTModel::PyDiTModel(const DiTModelContext& context)
       device_(options_.device()),
       dtype_(dtype_to_string(options_)),
       model_type_(context.model_type()) {
+  CHECK(context_.get_dit_config().selected_policy == PolicyType::None)
+      << "The Python Joyo V2 backend does not support DiT cache policies; "
+         "use --dit_cache_policy None.";
   ensure_python_interpreter();
 
   // Named subgroups must exist before the python pipeline resolves its
@@ -216,10 +229,13 @@ void PyDiTModel::build_text_encoder_proxy() {
   // config.json dtype, exactly like JoyOV2Pipeline does.
   const ModelContext source_vlm_context =
       context_.get_model_context("text_encoder");
-  const torch::TensorOptions te_options =
-      joyo_v2::resolve_component_tensor_options(
-          source_vlm_context.get_tensor_options(),
-          source_vlm_context.get_model_args().dtype());
+  torch::TensorOptions te_options = source_vlm_context.get_tensor_options();
+  const std::string& encoder_dtype =
+      source_vlm_context.get_model_args().dtype();
+  if (!encoder_dtype.empty()) {
+    te_options =
+        te_options.dtype(util::parse_dtype(encoder_dtype, te_options.device()));
+  }
   ModelContext vlm_context(vlm_parallel_args,
                            source_vlm_context.get_model_args(),
                            source_vlm_context.get_quant_args(),
@@ -250,55 +266,6 @@ void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
   config_dict["dit_cfg_group"] = py::str("dit_cfg");
   config_dict["dit_sp_group"] = py::str("dit_sp");
   config_dict["dit_vae_group"] = py::str("dit_vae");
-
-  // Forward the configured DiT cache policy (and its numeric options) into the
-  // python executor, so the python pipeline takes the same reuse decisions as
-  // the native C++ one (--dit_cache_policy). Only the selected policy's option
-  // struct is populated; serialize exactly those fields and let the python
-  // policies fall back to the same defaults as dit_cache_config.h for the rest.
-  const DiTCacheConfig& dit_config = context_.get_dit_config();
-  std::string cache_policy = "None";
-  py::dict cache_options;
-  switch (dit_config.selected_policy) {
-    case PolicyType::FBCache:
-      cache_policy = "FBCache";
-      cache_options["warmup_steps"] = dit_config.fbcache.warmup_steps;
-      cache_options["residual_diff_threshold"] =
-          dit_config.fbcache.residual_diff_threshold;
-      break;
-    case PolicyType::TaylorSeer:
-      cache_policy = "TaylorSeer";
-      cache_options["warmup_steps"] = dit_config.taylorseer.warmup_steps;
-      cache_options["n_derivatives"] = dit_config.taylorseer.n_derivatives;
-      cache_options["skip_interval_steps"] =
-          dit_config.taylorseer.skip_interval_steps;
-      break;
-    case PolicyType::FBCacheTaylorSeer:
-      cache_policy = "FBCacheTaylorSeer";
-      cache_options["warmup_steps"] = dit_config.fbcachetaylorseer.warmup_steps;
-      cache_options["residual_diff_threshold"] =
-          dit_config.fbcachetaylorseer.residual_diff_threshold;
-      cache_options["n_derivatives"] =
-          dit_config.fbcachetaylorseer.n_derivatives;
-      break;
-    case PolicyType::ResidualCache:
-      cache_policy = "ResidualCache";
-      cache_options["start_steps"] =
-          dit_config.residual_cache.dit_cache_start_steps;
-      cache_options["end_steps"] =
-          dit_config.residual_cache.dit_cache_end_steps;
-      cache_options["start_blocks"] =
-          dit_config.residual_cache.dit_cache_start_blocks;
-      cache_options["end_blocks"] =
-          dit_config.residual_cache.dit_cache_end_blocks;
-      cache_options["skip_interval_steps"] =
-          dit_config.residual_cache.skip_interval_steps;
-      break;
-    case PolicyType::None:
-      break;
-  }
-  config_dict["dit_cache_policy"] = py::str(cache_policy);
-  config_dict["dit_cache_options"] = cache_options;
 
   py::dict components;
   for (const char* component : kPythonComponents) {
@@ -344,9 +311,8 @@ void PyDiTModel::load_model(std::unique_ptr<DiTModelLoader> loader) {
   }
 
   if (text_encoder_proxy_ != nullptr && loader->has_component("text_encoder")) {
-    // Import the embedded module first so the proxy's python type exists
-    // before py::cast registers it into the config dict.
-    py::module_::import("xllm_dit");
+    // Register the proxy type lazily before casting it into the config dict.
+    ensure_xllm_dit_module();
     text_encoder_loader_ = loader->take_component_loader("text_encoder");
     // Prefer the top-level JoyOV2 tokenizer component when present.
     std::shared_ptr<Tokenizer> tokenizer;

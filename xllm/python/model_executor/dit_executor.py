@@ -28,7 +28,6 @@ import inspect
 
 import torch
 
-from xllm.python.model_executor.dit_cache import create_cache_hooks
 from xllm.python.models.dit import get_component_class
 from xllm.python.models.dit.pipelines import get_pipeline_class
 
@@ -52,14 +51,11 @@ class DiTPipelineExecutor:
     """Assemble, load and run a Python DiT pipeline."""
 
     def __init__(self, config: dict) -> None:
+        if config.get("dit_cache_policy") not in (None, "", "None"):
+            raise ValueError("The Python Joyo V2 backend does not support dit_cache_policy; use None.")
         self.config = config
         self.device = torch.device(config["device"])
         self.dtype = self._resolve_dtype(config.get("dtype"))
-        self.cache_hooks = create_cache_hooks(
-            config.get("dit_cache_policy"),
-            sp_group=config.get("dit_sp_group"),
-            options=config.get("dit_cache_options"),
-        )
         # Publish the resolved values so components and the pipeline read the
         # same device/dtype without re-parsing the C++ strings.
         config["device"] = self.device
@@ -115,7 +111,7 @@ class DiTPipelineExecutor:
         ``{"tensors": [...], "audio_tensors": [...]}``; the C++ shell accepts
         both shapes.
         """
-        return self.pipeline(request, cache_hooks=self.cache_hooks)
+        return self.pipeline(request)
 
     # ---- internals ----------------------------------------------------------
 

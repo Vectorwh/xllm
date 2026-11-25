@@ -32,11 +32,6 @@ reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
 
 _HAS_MINDIESD = find_spec("mindiesd") is not None
-_TRANSPOSE_BATCHMATMUL = getattr(
-    torch.ops.npu,
-    "npu_transpose_batchmatmul",
-    None,
-)
 
 
 def vision_fusion_attention(

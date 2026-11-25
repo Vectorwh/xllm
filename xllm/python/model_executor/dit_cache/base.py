@@ -16,9 +16,9 @@
 
 Cache hooks are acceleration policies attached at block/step boundaries —
 replaceable strategy plugins, not model structure (mirroring mindiesd's
-standalone ``cache_agent``). The transformer's forward accepts a hooks object
-with the four callbacks below; the executor resolves the configured policy
-here and passes it into the pipeline.
+standalone ``cache_agent``). A consuming transformer must call the four hook
+points below explicitly. The Python Joyo V2 pipeline does not integrate these
+hooks and rejects non-None policies instead of silently ignoring them.
 
 The strategy plugins themselves (FBCache, TaylorSeer, FBCacheTaylorSeer,
 ResidualCache) live as sibling modules and register themselves through

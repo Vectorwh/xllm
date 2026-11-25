@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from .conftest import load_source_module
 def _cache_sp_worker(rank: int, rendezvous: str) -> None:
     root = Path(__file__).parents[2]
     collectives = load_source_module(root / "xllm/python/distributed/collectives.py", "_xllm_collectives_under_test")
+    # The package stub must expose the real collectives before importing cache.
+    sys.modules["xllm.python.distributed"].collectives = collectives
     cache = load_source_module(root / "xllm/python/model_executor/dit_cache/base.py", "_xllm_dit_cache_under_test")
     cache.collectives = collectives
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=15))

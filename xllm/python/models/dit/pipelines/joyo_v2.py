@@ -248,7 +248,7 @@ class JoyOV2Pipeline(DiffusionPipeline):
 
     # ---- entry point ---------------------------------------------------------
 
-    def __call__(self, request: dict, cache_hooks: object = None) -> dict:
+    def __call__(self, request: dict) -> dict:
         gp = request["generation_params"]
         height = int(gp.get("height") or 0) or 288
         width = int(gp.get("width") or 0) or 512
