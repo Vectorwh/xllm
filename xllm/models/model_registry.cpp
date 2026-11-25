@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_args.h"
+#include "core/platform/mlu/mlu_model_cp.h"
 #include "core/platform/platform.h"
 #include "core/util/dit_model_discovery.h"
 #include "llm/py_causal_lm.h"
@@ -210,19 +211,13 @@ bool is_npu_model_cp_capable(const std::string& resolved_name) {
 }
 
 bool is_mlu_model_cp_capable(const std::string& resolved_name) {
-  static const std::unordered_set<std::string> kCpCapableModels = {
-      "deepseek_v41",
-      "deepseek_v4",
-      "glm5_next",
-      "glm_moe_dsa",
-  };
   static std::once_flag once;
   std::call_once(once, []() {
-    for (const std::string& name : kCpCapableModels) {
+    for (const auto& [name, capability] : mlu::model_cp_capabilities()) {
       ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::MODEL);
     }
   });
-  return kCpCapableModels.contains(resolved_name);
+  return mlu::model_cp_capabilities().contains(resolved_name);
 }
 
 ModelRegistry* ModelRegistry::get_instance() {

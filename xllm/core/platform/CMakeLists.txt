@@ -19,6 +19,7 @@ cc_library(
     sleepable_allocator.h
     batch_memcpy.h
     layer_synchronizer.h
+    mlu/mlu_model_cp.h
     $<$<BOOL:${USE_MLU}>:mlu/mlu_batch_memcpy.h>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_host_memory.h>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.h>

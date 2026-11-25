@@ -45,6 +45,7 @@ cc_library(
     deepseek_v4/deepseek_v4_attention.h
     deepseek_v4/deepseek_v4_decoder_layer.h
     hyper_connection.h
+    glm5_next/glm5_next_vision.h
     glm5_next/glm5_next_decoder_layer.h
     glm5_next/glm5_next_kda.h
     glm5_next/glm5_next_kpool_indexer.h
@@ -93,6 +94,7 @@ cc_library(
     deepseek_v4/deepseek_v4_attention.cpp
     deepseek_v4/deepseek_v4_decoder_layer.cpp
     hyper_connection.cpp
+    glm5_next/glm5_next_vision.cpp
     glm5_next/glm5_next_decoder_layer.cpp
     glm5_next/glm5_next_kda.cpp
     glm5_next/glm5_next_kda_pcp.cpp

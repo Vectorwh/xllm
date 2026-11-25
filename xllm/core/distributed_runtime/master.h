@@ -114,6 +114,10 @@ class Master {
   std::thread idle_thread_;
 };
 
+std::optional<std::string> validate_vlm_speculative_pd_transfer_mode(
+    const Options& options,
+    const std::string& model_type);
+
 std::optional<std::string> validate_model_cp(const Options& options,
                                              EngineType engine_type,
                                              const std::string& model_type,

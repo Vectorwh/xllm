@@ -112,6 +112,8 @@ limitations under the License.
 #include "models/llm/mlu/glm52.h"             // IWYU pragma: keep
 #include "models/llm/mlu/joyai_llm_flash.h"   // IWYU pragma: keep
 #include "models/vlm/mlu/deepseek_v41_vlm.h"  // IWYU pragma: keep
+#include "vlm/glm5_next_vlm.h"                // IWYU pragma: keep
+#include "vlm/mlu/glm5_next.h"                // IWYU pragma: keep
 #include "vlm/oxygen_vlm.h"                   // IWYU pragma: keep
 #include "vlm/qwen2_5_vl.h"                   // IWYU pragma: keep
 #include "vlm/qwen2_vl.h"                     // IWYU pragma: keep

@@ -272,6 +272,10 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
       engram_step.use_cp_context(*cp_context);
       local_tokens = layer::mlu_v4_cp::shard_rows(tokens, *cp_context);
       positions = cp_context->local_positions;
+      VLOG(1) << "DeepSeek-V4.1 PCP active: cp_size=" << cp_size_
+              << ", cp_rank=" << cp_group_->rank()
+              << ", global_tokens=" << tokens.numel()
+              << ", local_tokens=" << local_tokens.numel();
     }
     torch::Tensor inputs_embeds = input.embedding.input_embedding;
     if (inputs_embeds.defined() && cp_context) {

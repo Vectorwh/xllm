@@ -102,6 +102,21 @@ TEST(MMDataEncoderHandoffTest, RestoresIndependentModalityMasksInChunk) {
                            torch::tensor({false, false, true}, torch::kBool)));
 }
 
+TEST(MMDataEncoderHandoffTest, RejectsScheduledMaskBeyondEmbeddingRows) {
+  MMDataItem image(MMType::IMAGE);
+  auto& state = image.mutable_state();
+  state.mutable_token_pos() = {0, 2};
+  state.mutable_mm_token_num() = 1;
+  state.mutable_mm_token_mask() = torch::tensor({true, true});
+  state.mutable_seq_index() = 0;
+  state.mutable_schedule_data().end_pos = 2;
+  ASSERT_TRUE(image.add("image|embedding", torch::ones({1, 2})));
+
+  EncoderEmbeddingGatherVisitor gather(
+      /*num_computed_tokens=*/{0}, /*num_scheduled_tokens=*/{2});
+  EXPECT_FALSE(gather.visit(image));
+}
+
 TEST(MMDataEncoderHandoffTest, GathersImagesAcrossSequenceWindows) {
   MMDataItem first(MMType::IMAGE);
   auto& first_state = first.mutable_state();

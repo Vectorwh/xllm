@@ -580,8 +580,9 @@ void validate_config(const std::string& model_type) {
     LOG(FATAL) << "MLU requires block_size 1 or 16.";
   }
   if (disagg_pd_config.enable_disagg_pd()) {
-    if (model_config.backend() != "llm") {
-      LOG(FATAL) << "MLU disaggregated PD only supports backend=llm.";
+    if (model_config.backend() != "llm" && model_config.backend() != "vlm") {
+      LOG(FATAL) << "MLU disaggregated PD requires backend=llm or "
+                    "backend=vlm.";
     }
     disagg_pd_config.normalize_mlu(kv_cache_config, scheduler_config);
   }

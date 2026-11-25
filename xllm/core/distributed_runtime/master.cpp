@@ -31,6 +31,7 @@ limitations under the License.
 #include <thread>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "common/metrics.h"
 #include "common/types.h"
@@ -50,6 +51,7 @@ limitations under the License.
 #include "framework/parallel_state/npu_rank_table_env.h"
 #endif
 #include "core/platform/device_name_utils.h"
+#include "core/platform/mlu/mlu_model_cp.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
@@ -75,6 +77,30 @@ DECLARE_bool(graceful_quit_on_sighup);
 
 namespace xllm {
 namespace {
+
+enum class VlmPdTransferSupport { UNSUPPORTED, PUSH_ONLY, PUSH_OR_PULL };
+
+VlmPdTransferSupport vlm_speculative_pd_transfer_support(
+    const std::string& model_type,
+    std::string_view algorithm) {
+  if (SpeculativeConfig::is_qwen3_5_mtp_or_dflash2(model_type, algorithm)) {
+    return Platform::is_mlu() ? VlmPdTransferSupport::PUSH_ONLY
+                              : VlmPdTransferSupport::PUSH_OR_PULL;
+  }
+  if (Platform::is_mlu() && model_type == "glm5_next" &&
+      SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+    return VlmPdTransferSupport::PUSH_ONLY;
+  }
+  if (SpeculativeConfig::is_glm5_next_dflash2(model_type, algorithm) ||
+      SpeculativeConfig::is_deepseek_v41_dspark(model_type, algorithm) ||
+      SpeculativeConfig::is_qwen3_5_dspark(model_type, algorithm) ||
+      SpeculativeConfig::is_qwen3_5_python_dflash(
+          model_type, algorithm, ModelConfig::get_instance().model_impl()) ||
+      SpeculativeConfig::is_qwen3_vl_eagle3(model_type, algorithm)) {
+    return VlmPdTransferSupport::PUSH_OR_PULL;
+  }
+  return VlmPdTransferSupport::UNSUPPORTED;
+}
 
 void apply_runtime_kv_cache_options(const Options& source,
                                     runtime::Options& destination) {
@@ -130,6 +156,24 @@ void validate_layerwise_split_size_startup_config(const Options& options,
 
 }  // namespace
 
+std::optional<std::string> validate_vlm_speculative_pd_transfer_mode(
+    const Options& options,
+    const std::string& model_type) {
+  if (!options.enable_disagg_pd() ||
+      options.kv_cache_transfer_mode() == "PUSH") {
+    return std::nullopt;
+  }
+  // Native PULL assumes matching SSM checkpoint strides on prefill and decode.
+  const std::string& algorithm = options.speculative_algorithm();
+  if (vlm_speculative_pd_transfer_support(model_type, algorithm) ==
+      VlmPdTransferSupport::PUSH_ONLY) {
+    return "MLU " + model_type + " VLM " + algorithm +
+           " with disaggregated PD requires "
+           "kv_cache_transfer_mode=PUSH";
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> validate_model_cp(const Options& options,
                                              EngineType engine_type,
                                              const std::string& model_type,
@@ -145,13 +189,13 @@ std::optional<std::string> validate_model_cp(const Options& options,
   if (Platform::is_mlu()) {
     const bool is_vlm =
         engine_type == EngineType::VLM || engine_type == EngineType::VLMSSM;
-    if (is_vlm && (!util::is_deepseek_v41_model_type(model_type) ||
-                   ModelConfig::is_python_model_impl(options.model_impl()))) {
-      return "MLU VLM CP supports only native DeepSeek-V4.1";
+    if (is_vlm && !mlu::supports_vlm_cp(model_type)) {
+      return "MLU VLM CP does not support model_type=" + model_type +
+             " with engine_type=" + engine_type.to_string();
     }
     if (!is_vlm && engine_type != EngineType::LLM &&
         engine_type != EngineType::SSM) {
-      return "MLU CP supports only LLM or native DeepSeek-V4.1 VLM generation";
+      return "MLU CP supports only LLM or supported VLM generation";
     }
     if (options.task_type() != "generate") {
       return "MLU CP supports only the generate task";
@@ -819,33 +863,25 @@ Master::Master(const Options& options, EngineType type)
     engine_ = std::move(engine);
   } else if (type == EngineType::SSM || type == EngineType::VLMSSM) {
     if (type == EngineType::VLMSSM) {
-      const std::string vlm_spec_model_type =
+      const std::string model_type =
           util::get_model_type(options_.model_path(), options_.backend());
+      const std::string& algorithm = options_.speculative_algorithm();
       const bool supports_pd =
-          SpeculativeConfig::is_glm5_next_dflash2(
-              vlm_spec_model_type, options_.speculative_algorithm()) ||
-          SpeculativeConfig::is_deepseek_v41_dspark(
-              vlm_spec_model_type, options_.speculative_algorithm()) ||
-          SpeculativeConfig::is_qwen3_5_mtp_or_dflash2(
-              vlm_spec_model_type, options_.speculative_algorithm()) ||
-          SpeculativeConfig::is_qwen3_5_dspark(
-              vlm_spec_model_type, options_.speculative_algorithm()) ||
-          SpeculativeConfig::is_qwen3_5_python_dflash(
-              vlm_spec_model_type,
-              options_.speculative_algorithm(),
-              ModelConfig::get_instance().model_impl()) ||
-          SpeculativeConfig::is_qwen3_vl_eagle3(
-              vlm_spec_model_type, options_.speculative_algorithm());
+          vlm_speculative_pd_transfer_support(model_type, algorithm) !=
+          VlmPdTransferSupport::UNSUPPORTED;
       CHECK(!options_.enable_disagg_pd() || supports_pd)
-          << "VLM speculative decoding with disaggregated PD requires "
-             "glm5_next + DFlash2, deepseek_v41 + DSpark, qwen3_5 + "
-             "MTP/DFlash2/DSpark/DFlash(Python), or qwen3_vl + Eagle3";
+          << "VLM speculative PD does not support model_type=" << model_type
+          << ", speculative_algorithm=" << algorithm
+          << ", platform=" << Platform::type_str();
+      const auto transfer_mode_error =
+          validate_vlm_speculative_pd_transfer_mode(options_, model_type);
+      CHECK(!transfer_mode_error.has_value()) << transfer_mode_error.value();
       CHECK(!options_.enable_pd_ooc())
           << "VLM speculative decoding does not support PD OOC";
       CHECK(!options_.enable_service_routing() || supports_pd)
-          << "VLM speculative decoding with service routing requires "
-             "glm5_next + DFlash2, deepseek_v41 + DSpark, qwen3_5 + "
-             "MTP/DFlash2/DSpark/DFlash(Python), or qwen3_vl + Eagle3";
+          << "VLM speculative service routing does not support model_type="
+          << model_type << ", speculative_algorithm=" << algorithm
+          << ", platform=" << Platform::type_str();
       CHECK(!options_.enable_adaptive_speculative_decode())
           << "VLM speculative decoding does not support adaptive speculative "
              "decode";

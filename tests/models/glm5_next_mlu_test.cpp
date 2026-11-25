@@ -18,10 +18,17 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "core/framework/model/causal_vlm.h"
+#include "core/platform/device.h"
 #include "core/platform/layer_synchronizer.h"
+#include "core/platform/platform.h"
 #include "models/llm/mlu/glm5_next.h"
+#include "models/vlm/mlu/glm5_next.h"
 
 namespace xllm::mlu::model {
 namespace {
@@ -215,6 +222,248 @@ TEST(Glm5NextMluMetadataTest,
   auto verify = make_input(BatchForwardType::CHUNKED_PREFILL);
   attach_cached_metadata(verify);
   expect_caller_preserved(verify);
+}
+
+ModelArgs small_vlm_args() {
+  ModelArgs args;
+  args.model_type("glm5_next")
+      .n_layers(0)
+      .hidden_size(4)
+      .vocab_size(8)
+      .hc_mult(1)
+      .linear_num_key_heads(1)
+      .mm_num_hidden_layers(1)
+      .mm_hidden_size(8)
+      .mm_num_attention_heads(2)
+      .mm_num_channels(1)
+      .mm_patch_size(2)
+      .mm_temporal_patch_size(2)
+      .mm_spatial_merge_size(2)
+      .mm_image_merge_size(2)
+      .mm_projection_dim(4)
+      .mm_projector_hidden_size(8)
+      .mm_intermediate_size(12)
+      .mm_hidden_act("silu")
+      .mm_layer_norm_eps(1e-5);
+  return args;
+}
+
+torch::Tensor vision_test_weight(const std::string& name,
+                                 const torch::Tensor& parameter,
+                                 int64_t index) {
+  torch::Tensor weight =
+      (torch::sin(torch::arange(parameter.numel(), torch::kFloat32) * 0.37 +
+                  static_cast<double>(index)) *
+       0.02)
+          .reshape(parameter.sizes());
+  if (name.find("norm") != std::string::npos && name.ends_with("weight")) {
+    weight = torch::ones_like(weight) + weight;
+  }
+  return weight;
+}
+
+void expect_vision_reference(const torch::Tensor& output) {
+  // CPU BF16 reference with per-frame FP32 attention, fused residual RMSNorm,
+  // and SiLU rounded to BF16 before the gated multiply.
+  const torch::Tensor expected = torch::tensor(
+      {{3.892928e-07f, -2.179295e-07f, 4.237518e-08f, 1.341105e-07f},
+       {6.817281e-07f, -3.706664e-07f, 5.331822e-08f, 2.663583e-07f},
+       {1.296401e-06f, -7.376075e-07f, 1.639128e-07f, 4.153699e-07f},
+       {2.922025e-08f, -1.29221e-08f, -3.536115e-09f, 1.97906e-08f},
+       {9.834766e-07f, -5.289912e-07f, 6.286427e-08f, 4.04194e-07f},
+       {6.109476e-07f, -3.46452e-07f, 7.683411e-08f, 1.946464e-07f},
+       {4.190952e-07f, -2.346933e-07f, 4.400499e-08f, 1.47149e-07f},
+       {1.296401e-06f, -7.227063e-07f, 1.369044e-07f, 4.544854e-07f},
+       {4.121102e-08f, -1.967419e-08f, -2.153683e-09f, 2.386514e-08f},
+       {9.909272e-07f, -5.327165e-07f, 6.239861e-08f, 4.079193e-07f},
+       {8.940697e-07f, -5.140901e-07f, 1.257285e-07f, 2.682209e-07f},
+       {2.868474e-07f, -1.620501e-07f, 3.352761e-08f, 9.546056e-08f}});
+  const torch::Tensor actual = output.to(torch::kCPU, torch::kFloat32);
+  ASSERT_EQ(actual.sizes(), expected.sizes());
+  EXPECT_TRUE(torch::isfinite(actual).all().item<bool>());
+  const float relative_error =
+      ((actual - expected).norm() / expected.norm()).item<float>();
+  const float cosine =
+      torch::cosine_similarity(actual.flatten(), expected.flatten(), 0)
+          .item<float>();
+  LOG(INFO) << "Vision BF16 relative L2 error=" << relative_error
+            << ", cosine similarity=" << cosine;
+  EXPECT_LT(relative_error, 0.03) << actual;
+  EXPECT_GT(cosine, 0.995);
+}
+
+TEST(Glm5NextVisionTest, VisionPreservesImageAndTemporalBoundaries) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "Requires an MLU device.";
+  }
+  Device device(torch::Device("mlu:0"));
+  device.set_device();
+  ModelArgs args = small_vlm_args();
+  args.mm_hidden_size(128).mm_num_attention_heads(2).mm_intermediate_size(192);
+  const auto options =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device.unwrap());
+  const ParallelArgs parallel(/*rank=*/0,
+                              /*world_size=*/1,
+                              /*process_group=*/nullptr);
+  layer::Glm5NextVision vision(
+      ModelContext(parallel, args, QuantArgs(), options));
+  torch::NoGradGuard no_grad;
+  std::unordered_map<std::string, torch::Tensor> weights;
+  int64_t index = 0;
+  for (const auto& parameter : vision->named_parameters()) {
+    weights.emplace(
+        parameter.key(),
+        vision_test_weight(parameter.key(), parameter.value(), index++));
+  }
+  vision->load_state_dict(StateDict(std::move(weights)));
+  vision->verify_loaded_weights();
+  const torch::Tensor pixels =
+      torch::sin(torch::arange(48 * 8, torch::kFloat32) / 13)
+          .reshape({48, 8})
+          .to(options);
+  const torch::Tensor grid = torch::tensor({{1, 4, 4}, {2, 4, 4}});
+  const torch::Tensor together = vision(pixels, grid);
+  ASSERT_EQ(together.size(0), 12);
+  ASSERT_EQ(together.size(1), 4);
+  expect_vision_reference(together);
+  const auto metadata = vision->prepare_metadata(grid);
+  EXPECT_TRUE(
+      torch::equal(vision->forward_prepared(pixels, metadata), together));
+  EXPECT_TRUE(torch::equal(vision->forward_prepared(pixels * 2, metadata),
+                           vision(pixels * 2, grid)));
+
+  const torch::Tensor first =
+      vision(pixels.narrow(0, 0, 16), torch::tensor({{1, 4, 4}}));
+  const torch::Tensor video =
+      vision(pixels.narrow(0, 16, 32), torch::tensor({{2, 4, 4}}));
+  const torch::Tensor last =
+      vision(pixels.narrow(0, 32, 16), torch::tensor({{1, 4, 4}}));
+  EXPECT_TRUE(torch::allclose(together.narrow(0, 0, 4), first));
+  EXPECT_TRUE(torch::allclose(together.narrow(0, 4, 8), video));
+  EXPECT_TRUE(torch::allclose(video.narrow(0, 4, 4), last));
+
+  ModelArgs encoder_args = args;
+  encoder_args.encoder_embedding_mode(true);
+  Glm5NextForConditionalGeneration encoder(
+      ModelContext(parallel, encoder_args, QuantArgs(), options));
+  index = 0;
+  for (const auto& parameter : encoder->named_parameters()) {
+    parameter.value().copy_(
+        vision_test_weight(parameter.key(), parameter.value(), index++));
+  }
+  ModelInputParams params;
+  params.multimodal.mm_data =
+      MMBatchData(MMType::VIDEO,
+                  {{"pixel_values_videos", pixels.narrow(0, 16, 32)},
+                   {"video_grid_thw", torch::tensor({{2, 4, 4}})}});
+  const MMDict encoded = encoder->get_multimodal_embeddings(params);
+  const auto& clips =
+      std::get<std::vector<torch::Tensor>>(encoded.at("video|embedding"));
+  ASSERT_EQ(clips.size(), 1);
+  EXPECT_TRUE(torch::allclose(clips[0], video));
+}
+
+TEST(Glm5NextVisionTest, MluPackedWeightsAndPreparedMetadataMatchReference) {
+  if (Platform::device_count() == 0) {
+    GTEST_SKIP() << "Requires an MLU device.";
+  }
+  Device device(torch::Device("mlu:0"));
+  device.set_device();
+  ModelArgs args = small_vlm_args();
+  args.mm_hidden_size(128).mm_num_attention_heads(2).mm_intermediate_size(192);
+  const ParallelArgs parallel(/*rank=*/0,
+                              /*world_size=*/1,
+                              /*process_group=*/nullptr);
+  const auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+  layer::Glm5NextVision model(ModelContext(
+      parallel, args, QuantArgs(), options.device(device.unwrap())));
+  torch::NoGradGuard no_grad;
+  int64_t index = 0;
+  for (const auto& parameter : model->named_parameters()) {
+    const torch::Tensor weight =
+        vision_test_weight(parameter.key(), parameter.value(), index++);
+    // Gate and up weights may arrive in different checkpoint shards.
+    model->load_state_dict(StateDict({{parameter.key(), weight}}));
+  }
+  model->verify_loaded_weights();
+  const torch::Tensor grid = torch::tensor({{1, 4, 4}, {2, 4, 4}});
+  const auto metadata = model->prepare_metadata(grid.to(device.unwrap()));
+  const torch::Tensor pixels =
+      torch::sin(torch::arange(48 * 8, torch::kFloat32) / 13)
+          .reshape({48, 8})
+          .to(options.device(device.unwrap()));
+  expect_vision_reference(model->forward_prepared(pixels, metadata));
+}
+
+class Glm5NextVlmTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    group_ = std::make_unique<ProcessGroup>(
+        /*rank=*/0, /*world_size=*/1, torch::Device(torch::kCPU));
+    ParallelArgs parallel(/*rank=*/0, /*world_size=*/1, group_.get());
+    parallel.tp_group_ = group_.get();
+    model_ = Glm5NextForConditionalGeneration(
+        ModelContext(parallel,
+                     small_vlm_args(),
+                     QuantArgs(),
+                     torch::TensorOptions().dtype(torch::kFloat32)));
+    model_->get_word_embedding()->load_state_dict(StateDict(
+        {{"weight", torch::arange(32, torch::kFloat32).reshape({8, 4})}}));
+  }
+  std::unique_ptr<ProcessGroup> group_;
+  Glm5NextForConditionalGeneration model_{nullptr};
+};
+
+TEST_F(Glm5NextVlmTest, MergesCachedImageAndVideoFeaturesAtTheirMasks) {
+  const torch::Tensor tokens = torch::tensor({1, 2, 3, 4}, torch::kInt32);
+  ModelInputParams params;
+  const torch::Tensor text =
+      model_->get_input_embeddings(tokens, params).clone();
+  const torch::Tensor image = torch::full({1, 4}, 2.0);
+  const torch::Tensor video = torch::full({1, 4}, 3.0);
+  params.multimodal.mm_data =
+      MMBatchData(MMType::IMAGE | MMType::VIDEO,
+                  {{"image|embedding", image},
+                   {"image|mask", torch::tensor({false, true, false, false})},
+                   {"video|embedding", video},
+                   {"video|mask", torch::tensor({false, false, false, true})}});
+  const torch::Tensor merged = model_->get_input_embeddings(tokens, params);
+  EXPECT_TRUE(torch::equal(merged[0], text[0]));
+  EXPECT_TRUE(torch::equal(merged[2], text[2]));
+  EXPECT_TRUE(torch::equal(merged[1], image[0]));
+  EXPECT_TRUE(torch::equal(merged[3], video[0]));
+}
+
+TEST_F(Glm5NextVlmTest, ExposesHybridGraphMetadataThroughCausalVlm) {
+  CausalVLMImpl<Glm5NextForConditionalGeneration> vlm(
+      model_, torch::TensorOptions().dtype(torch::kFloat32));
+  EXPECT_TRUE(vlm.is_hybrid_linear_attention());
+  EXPECT_TRUE(vlm.requires_graph_forward_metadata());
+  const auto state = vlm.create_graph_forward_metadata_state();
+  ASSERT_NE(state, nullptr);
+  EXPECT_NE(dynamic_cast<Glm5NextGraphMetadataState*>(state.get()), nullptr);
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.meta.num_sequences = 1;
+  params.meta.q_max_seq_len = 1;
+  params.meta.kv_max_seq_len = 1;
+  // Exercise metadata forwarding before device graph capture on CPU.
+  params.attention.device.block_tables = torch::tensor({{0, 1}}, torch::kInt32);
+  params.embedding.linear_state_ids = {0};
+  params.embedding.linear_state_indices = torch::tensor({0}, torch::kInt32);
+  params.attention.device.q_seq_lens = torch::tensor({0, 1}, torch::kInt32);
+  params.attention.device.kv_seq_lens = torch::tensor({0, 1}, torch::kInt32);
+  params.attention.host.q_seq_lens = {0, 1};
+  params.attention.host.kv_seq_lens = {0, 1};
+  const torch::Tensor positions = torch::tensor({0}, torch::kInt32);
+  vlm.prepare_graph_forward_metadata(state.get(), positions, params);
+  ASSERT_NE(params.attn_metadata, nullptr);
+  EXPECT_TRUE(params.attn_metadata->kpool_batch_metadata != nullptr);
+  const auto metadata = params.attn_metadata;
+  params.attention.device.kv_seq_lens = torch::tensor({0, 2}, torch::kInt32);
+  vlm.prepare_graph_forward_metadata(state.get(), positions, params);
+  EXPECT_EQ(params.attn_metadata, metadata);
+  EXPECT_EQ(params.attn_metadata->kv_seq_lens[0].item<int32_t>(), 2);
 }
 
 }  // namespace

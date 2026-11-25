@@ -109,6 +109,10 @@ inline std::optional<layer::glm5_next_pcp::Context> prepare_context(
       /*build_chunk_indices=*/false);
   hidden_states = layer::glm5_next_pcp::shard_rows(hidden_states, context);
   positions = layer::glm5_next_pcp::shard_rows(positions, context);
+  VLOG(1) << "GLM5-Next PCP active: cp_size=" << cp_size
+          << ", cp_rank=" << cp_rank
+          << ", global_tokens=" << context.geometry.total_tokens
+          << ", local_tokens=" << positions.size(0);
   return context;
 }
 

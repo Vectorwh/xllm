@@ -72,7 +72,7 @@ TEST(MluCpCapabilityTest, AcceptsOrthogonalDeepseekV4TargetAndSuffix) {
           .has_value());
 }
 
-TEST(MluCpCapabilityTest, ValidatesNativeDeepseekV41VlmCp) {
+TEST(MluCpCapabilityTest, ValidatesDeepseekV41VlmCp) {
   constexpr int32_t kWorldSize = 8;
   Options options = make_cp_options(kWorldSize);
   options.backend("vlm")
@@ -86,15 +86,79 @@ TEST(MluCpCapabilityTest, ValidatesNativeDeepseekV41VlmCp) {
                      .has_value());
     EXPECT_TRUE(
         validate_model_cp(options, type, "qwen3_vl", kWorldSize).has_value());
-    options.model_impl("python");
-    EXPECT_TRUE(validate_model_cp(options, type, "deepseek_v41", kWorldSize)
-                    .has_value());
-    options.model_impl("native");
   }
   options.ep_size(4);
   EXPECT_TRUE(
       validate_model_cp(options, EngineType::VLM, "deepseek_v41", kWorldSize)
           .has_value());
+}
+
+TEST(MluCpCapabilityTest, AcceptsGlm5NextVlmCp) {
+  constexpr int32_t kWorldSize = 8;
+  Options options = make_cp_options(kWorldSize);
+  options.backend("vlm")
+      .model_impl("native")
+      .instance_role(InstanceRole::DEFAULT)
+      .num_speculative_tokens(0);
+  EXPECT_FALSE(
+      validate_model_cp(options, EngineType::VLM, "glm5_next", kWorldSize)
+          .has_value());
+  options.instance_role(InstanceRole::PREFILL).enable_disagg_pd(true);
+  EXPECT_FALSE(
+      validate_model_cp(options, EngineType::VLM, "glm5_next", kWorldSize)
+          .has_value());
+}
+
+TEST(MluCpCapabilityTest, AcceptsGlm5NextVlmSpeculativeCp) {
+  constexpr int32_t kWorldSize = 8;
+  Options options = make_cp_options(kWorldSize);
+  options.backend("vlm");
+  options.speculative_algorithm("MTP").num_speculative_tokens(2);
+  EXPECT_FALSE(
+      validate_model_cp(options, EngineType::VLMSSM, "glm5_next", kWorldSize)
+          .has_value());
+  options.speculative_algorithm("DFlash2").num_speculative_tokens(7);
+  EXPECT_FALSE(
+      validate_model_cp(options, EngineType::VLMSSM, "glm5_next", kWorldSize)
+          .has_value());
+  options.speculative_algorithm("DSpark");
+  EXPECT_FALSE(
+      validate_model_cp(options, EngineType::VLMSSM, "glm5_next", kWorldSize)
+          .has_value());
+}
+
+TEST(MluCpCapabilityTest, RequiresPushForDisaggregatedGlm5NextVlmMtp) {
+  Options options;
+  options.speculative_algorithm("MTP")
+      .enable_disagg_pd(true)
+      .kv_cache_transfer_mode("PULL");
+  EXPECT_TRUE(validate_vlm_speculative_pd_transfer_mode(options, "glm5_next")
+                  .has_value());
+  options.kv_cache_transfer_mode("PUSH");
+  EXPECT_FALSE(validate_vlm_speculative_pd_transfer_mode(options, "glm5_next")
+                   .has_value());
+  options.enable_disagg_pd(false)
+      .enable_service_routing(true)
+      .kv_cache_transfer_mode("PULL");
+  EXPECT_FALSE(validate_vlm_speculative_pd_transfer_mode(options, "glm5_next")
+                   .has_value());
+}
+
+TEST(MluCpCapabilityTest, ValidatesQwenVlmSpeculativePdTransferMode) {
+  Options options;
+  options.enable_disagg_pd(true);
+  for (const char* algorithm : {"MTP", "DFlash2"}) {
+    SCOPED_TRACE(algorithm);
+    options.speculative_algorithm(algorithm).kv_cache_transfer_mode("PULL");
+    EXPECT_TRUE(validate_vlm_speculative_pd_transfer_mode(options, "qwen3_5")
+                    .has_value());
+    options.kv_cache_transfer_mode("PUSH");
+    EXPECT_FALSE(validate_vlm_speculative_pd_transfer_mode(options, "qwen3_5")
+                     .has_value());
+  }
+  options.speculative_algorithm("Eagle3").kv_cache_transfer_mode("PULL");
+  EXPECT_FALSE(validate_vlm_speculative_pd_transfer_mode(options, "qwen3_vl")
+                   .has_value());
 }
 
 TEST(MluCpCapabilityTest, SupportsGlmPcpDcpAndRejectsLegacyDraftTargets) {

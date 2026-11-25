@@ -358,6 +358,9 @@ struct ModelArgs {
   // Vision model's mm_projection_dim
   PROPERTY(int64_t, mm_projection_dim) = 0;
 
+  PROPERTY(bool, mm_attention_bias) = true;
+  PROPERTY(float, mm_swiglu_limit) = 10.0f;
+
   // Vision model's mm_projector_hidden_size
   PROPERTY(int64_t, mm_projector_hidden_size) = 0;
 

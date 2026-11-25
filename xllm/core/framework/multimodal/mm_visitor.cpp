@@ -342,6 +342,10 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
                << key;
     return false;
   }
+  if (emb_start < 0 || emb_end < emb_start || emb_end > embedding.size(0)) {
+    LOG(ERROR) << "Scheduled mask selects embedding rows outside " << key;
+    return false;
+  }
   const auto update_mask = [&](torch::Tensor& mask) {
     if (!mask.defined()) {
       mask = torch::zeros({total_scheduled_tokens_},
@@ -358,8 +362,8 @@ bool EncoderEmbeddingGatherVisitor::visit(MMDataItem& item) {
   } else if (item.type() == MMType::AUDIO) {
     update_mask(audio_mask_);
   }
-  datas_[key].push_back(
-      embedding.slice(/*dim*/ 0, /*start*/ emb_start, /*end*/ emb_end));
+  datas_[key].emplace_back(
+      embedding.narrow(/*dim=*/0, emb_start, emb_end - emb_start));
   return true;
 }
 

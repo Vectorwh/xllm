@@ -14,19 +14,7 @@ limitations under the License.
 ==============================================================================*/
 #pragma once
 
-// Multimodal-processor registration for glm5_next served as a VLM via
-// --backend=vlm --model_impl=python (PyCausalLM + the pure-torch
-// xllm.python.models.glm5_next_vl.Glm5NextVLModel).
-//
-// glm5_next has no C++ VLM model object (the language model and the GlmOcr
-// vision tower both live in Python). The framework still requires a
-// multimodal processor to satisfy VLMMaster's create_multimodal_processor
-// CHECK, so this header registers one that:
-//   1. Expands the text prompt with GLM-family image placeholders via
-//      GLM4VPromptProcessor (token conventions: image_start_token_id /
-//      image_end_token_id / image_token_id — identical to GLM-next's config,
-//      and token count per image = grid_thw.prod() / merge_size**2, matching
-//      the GlmOcr ViT's spatial-merge output count).
+// Shared multimodal preprocessing for native MLU and Python GLM5-Next VLMs.
 
 #include "models/model_registry.h"
 #include "processors/glm4v_prompt_processor.h"

@@ -41,6 +41,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/prefix_cache/block_hasher.h"
 #include "core/runtime/forward_shared_memory_manager.h"
 #include "framework/kv_cache/kv_cache_estimation.h"
@@ -174,6 +175,11 @@ bool VLMEngine::init_model(MasterStatus master_status) {
   CHECK(tokenizer_ != nullptr);
 
   args_ = model_loader->model_args();
+  if (options_.num_speculative_tokens() > 0 &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+      is_glm5_next_target_model(args_)) {
+    args_.num_speculative_tokens(options_.num_speculative_tokens());
+  }
   const LinearAttentionPolicy linear_policy =
       ModelRegistry::get_linear_attention_policy(args_.model_type());
   const std::optional<std::string> linear_kv_split_error =
@@ -196,12 +202,14 @@ bool VLMEngine::init_model(MasterStatus master_status) {
   head_dim_ = args_.head_dim();
   dtype_ = util::parse_dtype(args_.dtype(), options_.devices()[0]);
   if (has_linear_attention_layers(args_)) {
+    const int64_t head_tp_size =
+        linear_head_tp_size(linear_policy, world_size, options_.cp_size());
     const int64_t linear_n_k_heads = args_.linear_num_key_heads();
     const int64_t linear_n_v_heads = args_.linear_num_value_heads();
     n_local_linear_k_heads_ =
-        std::max<int64_t>(1, linear_n_k_heads / world_size);
+        std::max<int64_t>(1, linear_n_k_heads / head_tp_size);
     n_local_linear_v_heads_ =
-        std::max<int64_t>(1, linear_n_v_heads / world_size);
+        std::max<int64_t>(1, linear_n_v_heads / head_tp_size);
   }
 
   // key + value for all layers
@@ -394,7 +402,14 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
         << ") must be a multiple of block_size (" << block_size << ").";
   }
 
-  const KVCacheShape kv_cache_shape(kv_cache_cap, args_, dp_local_tp_size_);
+  const KVCacheShape kv_cache_shape(
+      kv_cache_cap,
+      args_,
+      dp_local_tp_size_,
+      linear_head_tp_size(
+          ModelRegistry::get_linear_attention_policy(args_.model_type()),
+          dp_local_tp_size_,
+          options_.cp_size()));
   const int32_t kv_split_size_eff =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
   const std::optional<std::string> host_cache_error =
