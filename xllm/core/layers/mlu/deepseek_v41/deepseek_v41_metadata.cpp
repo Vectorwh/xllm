@@ -90,7 +90,8 @@ void prepare_compress_metadata(Csa2Context& shared,
                                        begins[seq] / ratio;
     }
   }
-  const int64_t metadata_size = 4 * (static_cast<int64_t>(batch) + 1);
+  const int64_t metadata_size =
+      4 * (static_cast<int64_t>(batch) + 1) + positions.numel() + 2 * batch + 1;
   prepare_buffer(shared.compression_metadata, {metadata_size}, ints);
   // Do not overwrite host storage from a previous asynchronous upload.
   // The pinned allocator retains each staging allocation until its copy ends.
@@ -107,6 +108,12 @@ void prepare_compress_metadata(Csa2Context& shared,
   };
   pack(shared.query_prefix, prefix);
   pack(shared.chunk_begins, begins);
+  const int64_t swa_columns = input.multi_block_tables.empty()
+                                  ? 0
+                                  : input.multi_block_tables.front().size(1);
+  CHECK_LE(swa_columns, kernel::mlu::bangc::kDeepseekV41MaxSwaColumns);
+  pack(shared.swa_columns,
+       {static_cast<int32_t>(std::max<int64_t>(1, swa_columns))});
   pack(shared.num_valid_input_rows, {prefix.back()});
   for (int32_t ratio : {1, 2}) {
     auto& out = shared.compressed[ratio - 1];
@@ -120,6 +127,22 @@ void prepare_compress_metadata(Csa2Context& shared,
     prepare_buffer(out.outputs.slots, {capacity}, ints);
     prepare_buffer(out.outputs.num_valid_rows, {1}, ints);
   }
+  std::vector<int32_t> requests(positions.numel(), 0);
+  std::array<std::vector<int32_t>, 2> history;
+  for (auto& lengths : history) {
+    lengths.resize(batch);
+  }
+  for (int32_t seq = 0; seq < batch; ++seq) {
+    std::fill(requests.begin() + prefix[seq],
+              requests.begin() + prefix[seq + 1],
+              seq);
+    const int32_t end = begins[seq] + (prefix[seq + 1] - prefix[seq]);
+    history[0][seq] = end;
+    history[1][seq] = end / 2;
+  }
+  pack(shared.query_requests, requests);
+  pack(shared.index_history[0], history[0]);
+  pack(shared.index_history[1], history[1]);
   CHECK_EQ(offset, metadata_size);
   shared.compression_metadata.copy_(staging, /*non_blocking=*/true);
 }
@@ -132,9 +155,10 @@ void prepare_block_tables(Csa2Context& shared,
   CHECK_GE(kv_seq_len_capacity, 0);
   // Window-only drafts export SWA alone; history-bearing models share one KV
   // table across all compression ratios.
-  CHECK(!input.multi_block_tables.empty() &&
+  CHECK((batch == 0 || !input.multi_block_tables.empty()) &&
         input.multi_block_tables.size() <= 2)
-      << "V4.1 expects logical [SWA, KV] block tables (SWA only for drafts).";
+      << "V4.1 expects logical [SWA, KV] block tables (SWA only for drafts); "
+         "only an empty batch may omit them.";
   for (const auto& table : input.multi_block_tables) {
     CHECK_EQ(table.dim(), 2);
     CHECK_GE(table.size(0), shared.num_sequences);
@@ -145,8 +169,17 @@ void prepare_block_tables(Csa2Context& shared,
   if (kv_seq_len_capacity == 0) {
     tables.clear();
     tables.reserve(input.multi_block_tables.size());
-    for (const auto& table : input.multi_block_tables) {
-      tables.emplace_back(table.to(device, torch::kInt32).contiguous());
+    for (size_t group = 0; group < input.multi_block_tables.size(); ++group) {
+      auto rows = input.multi_block_tables[group].to(device, torch::kInt32);
+      if (rows.size(0) < batch) {
+        auto padded = torch::zeros({batch, rows.size(1)}, rows.options());
+        padded.narrow(0, 0, rows.size(0)).copy_(rows);
+        rows = std::move(padded);
+      } else if (group == 1) {
+        // Score selection addresses KV pages with the logical table width.
+        rows = rows.contiguous();
+      }
+      tables.emplace_back(std::move(rows));
     }
     shared.swa_block_table = tables.empty() ? torch::Tensor() : tables[0];
     return;
@@ -185,7 +218,7 @@ void prepare_block_tables(Csa2Context& shared,
   }
   if (!tables.empty()) {
     shared.swa_block_table = tables[0].slice(
-        /*dim=*/1, /*start=*/0, /*end=*/input.multi_block_tables[0].size(1));
+        1, 0, std::max<int64_t>(1, input.multi_block_tables[0].size(1)));
     // Captured compression uses the expanded table without a logical wrap.
     // All pages it can access must lie in that absolute-page extent.
     for (int32_t seq = 0; seq < shared.num_sequences; ++seq) {
@@ -204,6 +237,32 @@ bool uses_decode_attention(const ModelInputParams& input) {
          input.use_dflash_proposal_attention;
 }
 
+void prepare_selection(Csa2Context& shared,
+                       int64_t rows,
+                       int64_t batch,
+                       bool has_candidates,
+                       kernel::mlu::bangc::ScoreSelectPhase phase,
+                       const torch::TensorOptions& options) {
+  if (shared.packed_topk.defined()) {
+    CHECK_EQ(shared.packed_topk.size(0), rows);
+    return;
+  }
+  namespace bangc = kernel::mlu::bangc;
+  using Mode = bangc::ScoreSelectMode;
+  const torch::DeviceGuard guard(options.device());
+  const auto ints = options.dtype(torch::kInt32);
+  shared.packed_topk = torch::empty({rows, 512}, ints);
+  int64_t bytes = bangc::score_select_workspace(rows, batch, Mode::NONE, phase);
+  if (has_candidates) {
+    shared.packed_candidates = torch::empty({rows, 2048}, ints);
+    for (Mode mode : {Mode::SOURCE, Mode::FILTER}) {
+      bytes = std::max(bytes,
+                       bangc::score_select_workspace(rows, batch, mode, phase));
+    }
+  }
+  shared.select_workspace = torch::empty({bytes}, options.dtype(torch::kUInt8));
+}
+
 void prepare_workspace(Csa2Context& shared,
                        const ModelInputParams& input,
                        const ModelArgs& args,
@@ -212,18 +271,14 @@ void prepare_workspace(Csa2Context& shared,
   if (!uses_decode_attention(input)) {
     return;
   }
-  const bool compressed = std::any_of(args.compress_ratios().begin(),
-                                      args.compress_ratios().end(),
-                                      [](int32_t ratio) { return ratio > 0; });
-  const int64_t capacity =
-      args.window_size() + (input.use_dflash_proposal_attention
-                                ? args.dspark_block_size()
-                                : (compressed ? args.index_topk() : 0));
-  prepare_buffer(shared.selected_kv,
-                 {query_capacity * capacity, 1, 1, args.head_dim()},
-                 options);
-  prepare_buffer(
-      shared.selected_lengths, {query_capacity}, options.dtype(torch::kInt32));
+  if (input.enable_graph && !args.index_source_layer_ids().empty()) {
+    prepare_selection(shared,
+                      query_capacity,
+                      input.meta.num_sequences,
+                      args.candidate_source_layer_id() >= 0,
+                      kernel::mlu::bangc::ScoreSelectPhase::DECODE,
+                      options);
+  }
 }
 
 void prepare_metadata(Csa2Context& shared,

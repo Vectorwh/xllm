@@ -77,8 +77,7 @@ Inputs make_inputs(int64_t mx, int64_t mk) {
   data.cache =
       data.cache_storage.slice(/*dim=*/0, /*start=*/128, blocks * 128 + 128)
           .view({blocks, 1, 128, 128});
-  data.head_storage = torch::full(
-      {mx + 2, 32}, -23.0, bf16.device(device).dtype(torch::kFloat32));
+  data.head_storage = torch::full({mx + 2, 32}, -23.0, bf16.device(device));
   data.head = data.head_storage.slice(/*dim=*/0, /*start=*/1, mx + 1);
   return data;
 }
@@ -122,7 +121,6 @@ std::pair<torch::Tensor, torch::Tensor> reference(const Inputs& data,
     key = rounded(key).to(torch::kFloat32);
     gamma = gamma.to(torch::kFloat32);
   }
-  head /= 64;
   key = key * torch::rsqrt(key.square().mean(-1, true) + 1e-20) * gamma;
   if (staged) {
     key = rounded(key);
@@ -159,8 +157,7 @@ std::pair<torch::Tensor, torch::Tensor> torch_reference(const Inputs& data,
                                                         int64_t lx,
                                                         int64_t lk) {
   const torch::Tensor head =
-      torch::matmul(data.x.slice(0, 0, lx), data.wp.t()).to(torch::kFloat32) /
-      64;
+      torch::matmul(data.x.slice(0, 0, lx), data.wp.t()).to(torch::kFloat32);
   torch::Tensor key = torch::matmul(data.latent.slice(0, 0, lk), data.wk.t())
                           .to(torch::kFloat32);
   key = (key * torch::rsqrt(key.square().mean(-1, true) + 1e-20) *

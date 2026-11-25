@@ -1,0 +1,3336 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#pragma bang walign(16)
+#include <bang.h>
+
+#include <cstdlib>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_index_score_select/compute_map16.h"
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_dsa_index_score_select/index_score_select.h"
+
+namespace xllm::kernel::mlu::bangc::score_select {
+namespace {
+
+#define CARVE_FROM(cur, type, name, count)   \
+  type* name = reinterpret_cast<type*>(cur); \
+  cur += (((count) * sizeof(type)) + 63) / 64 * 64
+
+constexpr int32_t kMaxPositionSentinel = 1 << 24;
+constexpr int kSegTokCap = kPartCap;  // 1024
+constexpr int kUWin = 16384;
+constexpr float kUnionTileCost = 20.0f;
+constexpr float kQueryTileCost = 4.4f;
+
+__mlu_func__ int32_t FloatToKey(float f) {
+  int32_t b = *reinterpret_cast<int32_t*>(&f);
+  if ((b & 0x7fffffff) == 0) return 0;
+  return b < 0 ? (b ^ 0x7fffffff) : b;
+}
+
+__mlu_func__ float KeyToFloat(int32_t k) {
+  int32_t b = k < 0 ? (k ^ 0x7fffffff) : k;
+  return *reinterpret_cast<float*>(&b);
+}
+
+struct Pool {
+  float* val;
+  int32_t* idx;
+  int cnt;
+  float tf;
+  int k;
+  int cap;
+};
+
+struct Scratch {
+  float* m0;
+  float* m1;
+  float* m2;
+  float* iota;
+};
+
+__mlu_func__ void PoolCompact(Pool& p, const Scratch& s) {
+  __sync();
+  const int n = p.cnt;
+  __bang_argmin(s.m1, p.val, n);
+  __bang_argmax(s.m2, p.val, n);
+  __sync_compute();
+  int64_t lo = FloatToKey(s.m1[0]);
+  int64_t hi = static_cast<int64_t>(FloatToKey(s.m2[0])) + 1;
+  bool exact_count = false;
+  while (hi - lo > 1) {
+    int64_t mid = lo + (hi - lo) / 2;
+    float t = KeyToFloat(static_cast<int32_t>(mid));
+    __bang_ge_scalar(s.m0, p.val, t, n);
+    const int count = static_cast<int>(__bang_count(s.m0, n));
+    if (count >= p.k) {
+      lo = mid;
+      if (count == p.k) {
+        exact_count = true;
+        break;
+      }
+    } else {
+      hi = mid;
+    }
+  }
+  const float thr = KeyToFloat(static_cast<int32_t>(lo));
+  if (!exact_count) {
+    __bang_gt_scalar(s.m0, p.val, thr, n);
+    const int greater = static_cast<int>(__bang_count(s.m0, n));
+    const int need = p.k - greater;
+    __bang_eq_scalar(s.m1, p.val, thr, n);
+    __bang_filter(s.m2, s.iota, s.m1, n);
+    __sync_compute();
+    const float last_tie = s.m2[need - 1];
+    __bang_le_scalar(s.m2, s.iota, last_tie, n);
+    __bang_mul(s.m1, s.m1, s.m2, n);
+    __bang_add(s.m0, s.m0, s.m1, n);
+  }
+  __bang_filter(s.m1, p.val, s.m0, n);
+  __sync_compute();
+  __bang_move(p.val, s.m1, p.k * sizeof(float));
+  __sync_move();
+  __bang_filter(
+      reinterpret_cast<float*>(s.m1), reinterpret_cast<float*>(p.idx), s.m0, n);
+  __sync_compute();
+  __bang_move(p.idx, s.m1, p.k * sizeof(int32_t));
+  __sync();
+  p.cnt = p.k;
+  p.tf = thr;
+}
+
+__mlu_func__ void PoolOffer(Pool& p,
+                            const float* score,
+                            const int32_t* ids,
+                            const float* reach,
+                            int n,
+                            float* mask,
+                            const Scratch& s) {
+  __bang_gt_scalar(mask, score, p.tf, n);
+  if (reach != nullptr) __bang_mul(mask, mask, reach, n);
+  if (p.cnt + n <= p.cap) {
+    const int c =
+        static_cast<int>(__bang_filter(p.val + p.cnt, score, mask, n));
+    if (c > 0) {
+      __bang_filter(reinterpret_cast<float*>(p.idx + p.cnt),
+                    reinterpret_cast<const float*>(ids),
+                    mask,
+                    n);
+      p.cnt += c;
+    }
+    return;
+  }
+  int c = static_cast<int>(__bang_count(mask, n));
+  if (c == 0) return;
+  if (p.cnt + c > p.cap) {
+    PoolCompact(p, s);
+    __bang_gt_scalar(mask, score, p.tf, n);
+    if (reach != nullptr) __bang_mul(mask, mask, reach, n);
+    c = static_cast<int>(__bang_count(mask, n));
+    if (c == 0) return;
+  }
+  __bang_filter(p.val + p.cnt, score, mask, n);
+  __bang_filter(reinterpret_cast<float*>(p.idx + p.cnt),
+                reinterpret_cast<const float*>(ids),
+                mask,
+                n);
+  p.cnt += c;
+}
+
+__mlu_func__ void MakeIotaF(float* p, int n) {
+  for (int i = 0; i < 64; ++i) p[i] = static_cast<float>(i);
+  __sync();
+  for (int len = 64; len < n; len *= 2) {
+    __bang_add_scalar(p + len, p, static_cast<float>(len), len);
+  }
+  __sync_compute();
+}
+
+__mlu_func__ void MakeIotaI(int32_t* p, int n) {
+  for (int i = 0; i < 64; ++i) p[i] = i;
+  __sync();
+  for (int len = 64; len < n; len *= 2) {
+    __bang_add_scalar(p + len, p, len, len);
+  }
+  __sync_compute();
+}
+
+__mlu_func__ void RowSums(float* dst, const float* src, int rows, int width) {
+  for (int r = 0; r < rows; ++r) {
+    dst[r] = __bang_sum(src + static_cast<int64_t>(r) * width, width);
+  }
+}
+
+__mlu_func__ int32_t ReadableCount(int32_t qpos, int32_t hist_len, int ratio) {
+  if (hist_len <= 0 || qpos < 0) return 0;
+  const int64_t qp1 = static_cast<int64_t>(qpos) + 1;
+  if (qp1 < ratio) return 0;
+  const int64_t by_pos = (ratio == 2) ? (qp1 >> 1) : qp1;
+  return by_pos < hist_len ? static_cast<int32_t>(by_pos) : hist_len;
+}
+
+__mlu_func__ int64_t CoreLo(int64_t total, int core, int cores) {
+  return total * core / cores;
+}
+
+__mlu_func__ int CoreOf(int64_t i, int64_t total, int cores) {
+  int c = static_cast<int>(i * cores / total);
+  while (c + 1 < cores && CoreLo(total, c + 1, cores) <= i) ++c;
+  while (c > 0 && CoreLo(total, c, cores) > i) --c;
+  return c;
+}
+
+template <int TQ>
+struct PagedSegBufs {
+  bfloat16_t* kbf;
+  float* kf32;
+  float* ob;
+  float* acc;
+  float* wv;
+  float* w_f32;
+  bfloat16_t* w_bf16;
+  int32_t* ids;
+  int32_t* iota_i;
+  float* iota_f256;
+  float* tfm;
+  float* rowc;
+  float* bm;
+  int32_t* blk_ids;
+  int32_t* blk_iota;
+  int32_t* page_tmp;
+  float* tok_val;
+  int32_t* tok_idx;
+  float* sc_iota;
+  bfloat16_t* wram;
+  PagedSchedHeader* hdr_nram;
+  PagedSeg* seg_nram;
+  PagedPiece* piece_nram;
+};
+
+template <int TQ>
+__mlu_func__ void LoadQueriesToWram(const bfloat16_t* query,
+                                    const bfloat16_t* weights,
+                                    const PagedSeg& seg,
+                                    int logits_dtype,
+                                    const PagedSegBufs<TQ>& m) {
+  const int nq = seg.nq;
+  if (nq <= 0) return;
+  bool contig = true;
+  for (int q = 1; q < nq; ++q) {
+    if (seg.rows[q] != seg.rows[0] + q) {
+      contig = false;
+      break;
+    }
+  }
+
+  if (contig) {
+    const int64_t r0 = static_cast<int64_t>(seg.rows[0]);
+    LoadQueriesMap16(m.wram, query + r0 * kHeads * kDim, nq, GDRAM2WRAM);
+    __memcpy_async(m.w_bf16,
+                   weights + r0 * kHeads,
+                   nq * kHeads * sizeof(bfloat16_t),
+                   GDRAM2NRAM);
+    __sync_io();
+  } else {
+    for (int q = 0; q < nq; ++q) {
+      const int64_t rq = static_cast<int64_t>(seg.rows[q]);
+      __memcpy_async(m.kbf + q * kHeads * kDim,
+                     query + rq * kHeads * kDim,
+                     kHeads * kDim * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+      __memcpy_async(m.w_bf16 + q * kHeads,
+                     weights + rq * kHeads,
+                     kHeads * sizeof(bfloat16_t),
+                     GDRAM2NRAM);
+    }
+    __sync_io();
+    LoadQueriesMap16(m.wram, m.kbf, nq, NRAM2WRAM);
+    __sync_move();
+  }
+
+  if (logits_dtype == kLogitsFp32) {
+    __bang_bfloat162float(m.wv, m.w_bf16, nq * kHeads);
+    __sync_compute();
+  }
+}
+
+template <int TQ>
+__mlu_func__ void PagedDensePiece(const PagedParams& params,
+                                  const PagedSegBufs<TQ>& m,
+                                  const PagedSeg& seg,
+                                  const PagedPiece& piece) {
+  const auto& page = params.page;
+  constexpr int N = kTileSlots;
+  const int b = seg.b;
+  const int nq = seg.nq;
+  const int seg_max_n = seg.max_n;
+  const int seg_min_n = seg.min_n;
+  const int tile_lo = piece.tile_lo;
+  const int tile_hi = piece.tile_hi;
+  const int na = tile_hi - tile_lo;
+  const bool is_final = piece.is_final != 0;
+  const bool source = params.mode == kSource;
+
+  const bfloat16_t* query = static_cast<const bfloat16_t*>(params.query);
+  const bfloat16_t* weights = static_cast<const bfloat16_t*>(params.weights);
+  const bfloat16_t* paged_k = static_cast<const bfloat16_t*>(params.paged_k);
+  const int32_t* table_b =
+      params.paged_block_table + static_cast<int64_t>(b) * params.max_pages;
+
+  LoadQueriesToWram<TQ>(query, weights, seg, params.logits_dtype, m);
+
+  Pool tok[TQ];
+  for (int q = 0; q < nq; ++q) {
+    tok[q] = Pool{m.tok_val + q * kSegTokCap,
+                  m.tok_idx + q * kSegTokCap,
+                  0,
+                  -INFINITY,
+                  kTopk,
+                  kSegTokCap};
+  }
+  Scratch tok_scratch{
+      m.ob, m.ob + kSegTokCap, m.ob + 2 * kSegTokCap, m.sc_iota};
+
+  float* core_bval_base = nullptr;
+  int32_t* core_bidx_base = nullptr;
+  float* blk_tfm = m.w_f32;  // [32 * TQ], dead after LoadQueriesToWram
+  int blk_cnt[TQ];
+  float blk_tf[TQ];
+  int newest[TQ];
+  int min_newest = 1 << 30;
+  int max_newest = -1;
+  bool blk_tfm_init = false;
+  if (source) {
+    const int64_t core_off =
+        static_cast<int64_t>(taskId) * 16 * kPagedBlkPoolCap;
+    core_bval_base = reinterpret_cast<float*>(params.workspace +
+                                              params.plan.core_blk_val_offset) +
+                     core_off;
+    core_bidx_base = reinterpret_cast<int32_t*>(
+                         params.workspace + params.plan.core_blk_idx_offset) +
+                     core_off;
+    for (int q = 0; q < nq; ++q) {
+      blk_cnt[q] = 0;
+      blk_tf[q] = -INFINITY;
+      const int nw = (seg.n_read[q] > 0) ? ((seg.n_read[q] - 1) >> 3) : -1;
+      newest[q] = nw;
+      if (nw >= 0) {
+        if (nw < min_newest) min_newest = nw;
+        if (nw > max_newest) max_newest = nw;
+      }
+    }
+  }
+
+  const int piece_max_n = (tile_hi * N) < seg_max_n ? (tile_hi * N) : seg_max_n;
+  const int max_piece_pages =
+      (piece_max_n + page.rows - 1) >> (page.block_shift + 3);
+  int cache_base = -1;
+  int cache_end = -1;
+
+  bfloat16_t* kbf0 = m.kbf;
+  bfloat16_t* kbf1 = reinterpret_cast<bfloat16_t*>(m.kf32);
+  float* qk_nram = m.kf32 + 16384;
+
+  int tf_nco = 0;
+  if (na > 0) {
+    LoadPagedDenseTile(params.page,
+                       paged_k,
+                       table_b,
+                       seg_max_n,
+                       max_piece_pages,
+                       tile_lo * N,
+                       kbf0,
+                       m.page_tmp,
+                       &cache_base,
+                       &cache_end);
+    __sync();
+  }
+
+  for (int i = 0; i < na; ++i) {
+    const int t = tile_lo + i;
+    const int c0 = t * N;
+    const int n = (seg_max_n - c0) < N ? (seg_max_n - c0) : N;
+    const int nco = (n + 63) / 64 * 64;
+
+    if (i + 1 < na) {
+      LoadPagedDenseTile(params.page,
+                         paged_k,
+                         table_b,
+                         seg_max_n,
+                         max_piece_pages,
+                         (t + 1) * N,
+                         ((i + 1) & 1) ? kbf1 : kbf0,
+                         m.page_tmp,
+                         &cache_base,
+                         &cache_end);
+    }
+
+    ScoreTileMap16<TQ>(m.acc,
+                       qk_nram,
+                       m.wram,
+                       (i & 1) ? kbf1 : kbf0,
+                       m.wv,
+                       m.w_bf16,
+                       nq,
+                       nco,
+                       params.logits_dtype);
+
+    // ---- Token Top-512 selection ----
+    const bool full_tok = (n == N) && (c0 + nco <= seg_min_n);
+    const int len = nq * nco;
+    float* reach = m.acc + TQ * N;
+    float* sel = m.acc + 2 * TQ * N;
+    __bang_add_scalar(m.ids, m.iota_i, c0, N);
+    if (nco != tf_nco) {
+      for (int q = 0; q < nq; ++q) {
+        __bang_write_value(m.tfm + q * nco, nco, tok[q].tf);
+      }
+      tf_nco = nco;
+    }
+    if (!full_tok) {
+      for (int q = 0; q < nq; ++q) {
+        const int rem = seg.n_read[q] - c0;
+        __bang_lt_scalar(
+            reach + q * nco, m.iota_f256, static_cast<float>(rem), nco);
+      }
+    }
+    __bang_gt(sel, m.acc, m.tfm, len);
+    if (!full_tok) __bang_mul(sel, sel, reach, len);
+    if (__bang_count(sel, len) > 0) {
+      RowSums(m.rowc, sel, nq, nco);
+      for (int q = 0; q < nq; ++q) {
+        int c = static_cast<int>(m.rowc[q]);
+        if (c == 0) continue;
+        Pool& p = tok[q];
+        float* score_q = m.acc + q * nco;
+        float* sel_q = sel + q * nco;
+        if (p.cnt + c > p.cap) {
+          PoolCompact(p, tok_scratch);
+          __bang_write_value(m.tfm + q * nco, nco, p.tf);
+          __bang_gt_scalar(sel_q, score_q, p.tf, nco);
+          if (!full_tok) __bang_mul(sel_q, sel_q, reach + q * nco, nco);
+          c = static_cast<int>(__bang_count(sel_q, nco));
+          if (c == 0) continue;
+        }
+        __bang_filter(p.val + p.cnt, score_q, sel_q, nco);
+        __bang_filter(reinterpret_cast<float*>(p.idx + p.cnt),
+                      reinterpret_cast<const float*>(m.ids),
+                      sel_q,
+                      nco);
+        p.cnt += c;
+      }
+    }
+
+    // ---- SOURCE Streaming Block Top-2048 selection ----
+    if (source) {
+      const int nb_co = nco / kBlockSize;  // 8, 16, 24, or 32
+      const int rows_blk = nq * nb_co;
+      const int b0 = c0 / kBlockSize;
+      float* tb = m.acc + TQ * N;
+      __bang_transpose(tb, m.acc, rows_blk, kBlockSize);
+      __bang_maximum(m.bm, tb, tb + rows_blk, rows_blk);
+      for (int j = 2; j < kBlockSize; ++j) {
+        __bang_maximum(m.bm, m.bm, tb + j * rows_blk, rows_blk);
+      }
+      if (b0 <= max_newest && b0 + nb_co > min_newest) {
+        __sync_compute();
+        for (int q = 0; q < nq; ++q) {
+          const int nw = newest[q];
+          if (nw >= b0 && nw < b0 + nb_co) {
+            m.bm[q * nb_co + (nw - b0)] = INFINITY;
+          }
+        }
+        __sync();
+      }
+
+      float* pool_v_nram = m.ob;                                       // [4096]
+      int32_t* pool_i_nram = reinterpret_cast<int32_t*>(m.ob + 4096);  // [4096]
+      Scratch blk_scratch{m.ob + 8192, m.ob + 12288, m.acc + 8192, m.sc_iota};
+
+      if (nb_co == 32) {
+        if (!blk_tfm_init) {
+          for (int q = 0; q < nq; ++q) {
+            __bang_write_value(blk_tfm + q * 32, 32, blk_tf[q]);
+          }
+          blk_tfm_init = true;
+        }
+        float* b_reach_all = m.acc + TQ * N;       // [nq * 32]
+        float* b_sel_all = b_reach_all + TQ * 32;  // [nq * 32]
+        if (!full_tok) {
+          for (int q = 0; q < nq; ++q) {
+            const int max_rel = newest[q] + 1 - b0;
+            const int valid_b =
+                max_rel <= 0 ? 0 : (max_rel > 32 ? 32 : max_rel);
+            __bang_lt_scalar(b_reach_all + q * 32,
+                             m.iota_f256,
+                             static_cast<float>(valid_b),
+                             32);
+          }
+        }
+        __bang_gt(b_sel_all, m.bm, blk_tfm, rows_blk);
+        if (!full_tok) __bang_mul(b_sel_all, b_sel_all, b_reach_all, rows_blk);
+        if (__bang_count(b_sel_all, rows_blk) > 0) {
+          __bang_add_scalar(m.blk_ids, m.blk_iota, b0, 64);
+          float* b_filt_all = b_sel_all + TQ * 32;  // [TQ * 32]
+          int32_t* b_fidx_all =
+              reinterpret_cast<int32_t*>(b_filt_all + TQ * 32);
+          bool wrote_async = false;
+          for (int q = 0; q < nq; ++q) {
+            float* bm_q = m.bm + q * 32;
+            float* bsel_q = b_sel_all + q * 32;
+            int cb = static_cast<int>(__bang_count(bsel_q, 32));
+            if (cb == 0) continue;
+
+            float* gv = core_bval_base + q * kPagedBlkPoolCap;
+            int32_t* gi = core_bidx_base + q * kPagedBlkPoolCap;
+            if (blk_cnt[q] + cb > kPagedBlkPoolCap) {
+              if (wrote_async) {
+                __sync_io();
+                wrote_async = false;
+              }
+              __memcpy(pool_v_nram, gv, blk_cnt[q] * sizeof(float), GDRAM2NRAM);
+              __memcpy(
+                  pool_i_nram, gi, blk_cnt[q] * sizeof(int32_t), GDRAM2NRAM);
+              __sync();
+              Pool bp{pool_v_nram,
+                      pool_i_nram,
+                      blk_cnt[q],
+                      blk_tf[q],
+                      kBlocks,
+                      kPagedBlkPoolCap};
+              PoolCompact(bp, blk_scratch);
+              __memcpy(gv, pool_v_nram, kBlocks * sizeof(float), NRAM2GDRAM);
+              __memcpy(gi, pool_i_nram, kBlocks * sizeof(int32_t), NRAM2GDRAM);
+              __sync();
+              blk_cnt[q] = kBlocks;
+              blk_tf[q] = bp.tf;
+              __bang_write_value(blk_tfm + q * 32, 32, blk_tf[q]);
+
+              __bang_gt_scalar(bsel_q, bm_q, blk_tf[q], 32);
+              if (!full_tok) {
+                __bang_mul(bsel_q, bsel_q, b_reach_all + q * 32, 32);
+              }
+              cb = static_cast<int>(__bang_count(bsel_q, 32));
+              if (cb == 0) continue;
+            }
+            float* fv_q = b_filt_all + q * 32;
+            int32_t* fi_q = b_fidx_all + q * 32;
+            __bang_filter(fv_q, bm_q, bsel_q, 32);
+            __bang_filter(reinterpret_cast<float*>(fi_q),
+                          reinterpret_cast<const float*>(m.blk_ids),
+                          bsel_q,
+                          32);
+            __sync_compute();
+            __memcpy_async(
+                gv + blk_cnt[q], fv_q, cb * sizeof(float), NRAM2GDRAM);
+            __memcpy_async(
+                gi + blk_cnt[q], fi_q, cb * sizeof(int32_t), NRAM2GDRAM);
+            wrote_async = true;
+            blk_cnt[q] += cb;
+          }
+          if (wrote_async) __sync_io();
+        }
+      } else {
+        __bang_add_scalar(m.blk_ids, m.blk_iota, b0, 64);
+        float* b_score_pad = m.acc + TQ * N;    // [64]
+        float* b_mask = b_score_pad + 64;       // [64]
+        float* b_reach = b_score_pad + 128;     // [64]
+        float* b_filt_val = b_score_pad + 192;  // [64]
+        int32_t* b_filt_idx = reinterpret_cast<int32_t*>(b_score_pad + 256);
+
+        for (int q = 0; q < nq; ++q) {
+          const int max_rel = newest[q] + 1 - b0;
+          const int valid_b =
+              max_rel <= 0 ? 0 : (max_rel > nb_co ? nb_co : max_rel);
+          if (valid_b <= 0) continue;
+
+          __bang_write_value(b_score_pad, 64, -INFINITY);
+          __sync_compute();
+          __memcpy(b_score_pad,
+                   m.bm + q * nb_co,
+                   valid_b * sizeof(float),
+                   NRAM2NRAM);
+          __sync();
+          __bang_lt_scalar(
+              b_reach, m.iota_f256, static_cast<float>(valid_b), 64);
+          __bang_gt_scalar(b_mask, b_score_pad, blk_tf[q], 64);
+          __bang_mul(b_mask, b_mask, b_reach, 64);
+          int cb = static_cast<int>(__bang_count(b_mask, 64));
+          if (cb == 0) continue;
+
+          float* gv = core_bval_base + q * kPagedBlkPoolCap;
+          int32_t* gi = core_bidx_base + q * kPagedBlkPoolCap;
+
+          if (blk_cnt[q] + cb > kPagedBlkPoolCap) {
+            __memcpy(pool_v_nram, gv, blk_cnt[q] * sizeof(float), GDRAM2NRAM);
+            __memcpy(pool_i_nram, gi, blk_cnt[q] * sizeof(int32_t), GDRAM2NRAM);
+            __sync();
+            Pool bp{pool_v_nram,
+                    pool_i_nram,
+                    blk_cnt[q],
+                    blk_tf[q],
+                    kBlocks,
+                    kPagedBlkPoolCap};
+            PoolCompact(bp, blk_scratch);
+            __memcpy(gv, pool_v_nram, kBlocks * sizeof(float), NRAM2GDRAM);
+            __memcpy(gi, pool_i_nram, kBlocks * sizeof(int32_t), NRAM2GDRAM);
+            __sync();
+            blk_cnt[q] = kBlocks;
+            blk_tf[q] = bp.tf;
+            if (blk_tfm_init) {
+              __bang_write_value(blk_tfm + q * 32, 32, blk_tf[q]);
+            }
+
+            __bang_gt_scalar(b_mask, b_score_pad, blk_tf[q], 64);
+            __bang_mul(b_mask, b_mask, b_reach, 64);
+            cb = static_cast<int>(__bang_count(b_mask, 64));
+            if (cb == 0) continue;
+          }
+          __bang_filter(b_filt_val, b_score_pad, b_mask, 64);
+          __bang_filter(reinterpret_cast<float*>(b_filt_idx),
+                        reinterpret_cast<const float*>(m.blk_ids),
+                        b_mask,
+                        64);
+          __sync_compute();
+          __memcpy(gv + blk_cnt[q], b_filt_val, cb * sizeof(float), NRAM2GDRAM);
+          __memcpy(
+              gi + blk_cnt[q], b_filt_idx, cb * sizeof(int32_t), NRAM2GDRAM);
+          __sync_io();
+          blk_cnt[q] += cb;
+        }
+      }
+    }
+    __sync();
+  }
+  __sync();
+
+  int32_t* out32 = reinterpret_cast<int32_t*>(m.kf32);
+  for (int q = 0; q < nq; ++q) {
+    if (tok[q].cnt > kTopk) PoolCompact(tok[q], tok_scratch);
+    const int cnt = tok[q].cnt;
+    if (is_final) {
+      __bang_write_value(out32, kTopk, -1);
+      __sync_compute();
+      if (cnt > 0) {
+        __memcpy(out32 + (kTopk - cnt),
+                 tok[q].idx,
+                 cnt * sizeof(int32_t),
+                 NRAM2NRAM);
+        __sync();
+      }
+      __memcpy(params.topk_indices + static_cast<int64_t>(seg.rows[q]) * kTopk,
+               out32,
+               kTopk * sizeof(int32_t),
+               NRAM2GDRAM);
+      __sync_io();
+    } else {
+      const int64_t item =
+          (static_cast<int64_t>(piece.slot_idx) * 16 + q) * kTopk;
+      float* pv = reinterpret_cast<float*>(params.workspace +
+                                           params.plan.tok_part_val_offset) +
+                  item;
+      int32_t* pi = reinterpret_cast<int32_t*>(
+                        params.workspace + params.plan.tok_part_idx_offset) +
+                    item;
+      if (cnt < kTopk) {
+        __bang_write_value(tok[q].val + cnt, kTopk - cnt, -INFINITY);
+        __bang_write_value(tok[q].idx + cnt, kTopk - cnt, -1);
+        __sync_compute();
+      }
+      __memcpy(pv, tok[q].val, kTopk * sizeof(float), NRAM2GDRAM);
+      __memcpy(pi, tok[q].idx, kTopk * sizeof(int32_t), NRAM2GDRAM);
+      __sync_io();
+    }
+  }
+
+  if (source) {
+    float* pool_v_nram = m.ob;
+    int32_t* pool_i_nram = reinterpret_cast<int32_t*>(m.ob + 4096);
+    Scratch blk_scratch{m.ob + 8192, m.ob + 12288, m.acc, m.sc_iota};
+    for (int q = 0; q < nq; ++q) {
+      int cnt = blk_cnt[q];
+      if (cnt > 0) {
+        __memcpy(pool_v_nram,
+                 core_bval_base + q * kPagedBlkPoolCap,
+                 cnt * sizeof(float),
+                 GDRAM2NRAM);
+        __memcpy(pool_i_nram,
+                 core_bidx_base + q * kPagedBlkPoolCap,
+                 cnt * sizeof(int32_t),
+                 GDRAM2NRAM);
+        __sync();
+      }
+      if (cnt > kBlocks) {
+        Pool bp{pool_v_nram,
+                pool_i_nram,
+                cnt,
+                blk_tf[q],
+                kBlocks,
+                kPagedBlkPoolCap};
+        PoolCompact(bp, blk_scratch);
+        cnt = kBlocks;
+      }
+      if (is_final) {
+        __bang_write_value(out32, kBlocks, -1);
+        __sync_compute();
+        if (cnt > 0) {
+          __memcpy(out32, pool_i_nram, cnt * sizeof(int32_t), NRAM2NRAM);
+          __sync();
+        }
+        __memcpy(params.candidate_ids_out +
+                     static_cast<int64_t>(seg.rows[q]) * kBlocks,
+                 out32,
+                 kBlocks * sizeof(int32_t),
+                 NRAM2GDRAM);
+        __sync_io();
+      } else {
+        const int64_t bitem =
+            (static_cast<int64_t>(piece.slot_idx) * 16 + q) * kBlocks;
+        float* bpv = reinterpret_cast<float*>(params.workspace +
+                                              params.plan.blk_part_val_offset) +
+                     bitem;
+        int32_t* bpi = reinterpret_cast<int32_t*>(
+                           params.workspace + params.plan.blk_part_idx_offset) +
+                       bitem;
+        if (cnt < kBlocks) {
+          __bang_write_value(pool_v_nram + cnt, kBlocks - cnt, -INFINITY);
+          __bang_write_value(pool_i_nram + cnt, kBlocks - cnt, -1);
+          __sync_compute();
+        }
+        __memcpy(bpv, pool_v_nram, kBlocks * sizeof(float), NRAM2GDRAM);
+        __memcpy(bpi, pool_i_nram, kBlocks * sizeof(int32_t), NRAM2GDRAM);
+        __sync_io();
+      }
+    }
+  }
+  __sync();
+}
+
+// =============================================================================
+// FILTER Helpers: Reachability-first candidate sort, union, and coalesced
+// 64-bit K load
+// =============================================================================
+
+__mlu_func__ void RadixPass(int32_t* dst,
+                            const int32_t* src,
+                            int bit,
+                            int n,
+                            int32_t* rm1,
+                            float* fm0,
+                            float* fm1) {
+  __bang_band_scalar(rm1, src, 1 << bit, n);
+  __bang_int322float(fm1, rm1, n, 0);
+  __bang_eq_scalar(fm0, fm1, 0.0f, n);
+  const int c0 =
+      static_cast<int>(__bang_filter(reinterpret_cast<float*>(dst),
+                                     reinterpret_cast<const float*>(src),
+                                     fm0,
+                                     n));
+  __bang_filter(reinterpret_cast<float*>(dst + c0),
+                reinterpret_cast<const float*>(src),
+                fm1,
+                n);
+}
+
+__mlu_func__ bool CopyMonotonic(float* out,
+                                const float* src,
+                                int n,
+                                float* mask) {
+  if (n == 1) {
+    __bang_move(out, src, sizeof(float));
+    __sync_move();
+    return true;
+  }
+  __bang_gt(mask, src + 1, src, n - 1);
+  if (static_cast<int>(__bang_count(mask, n - 1)) == n - 1) {
+    __bang_move(out, src, n * sizeof(float));
+    __sync_move();
+    return true;
+  }
+  __bang_lt(mask, src + 1, src, n - 1);
+  if (static_cast<int>(__bang_count(mask, n - 1)) == n - 1) {
+    __memcpy(out,
+             src + n - 1,
+             sizeof(float),
+             NRAM2NRAM,
+             sizeof(float),
+             -static_cast<int32_t>(sizeof(float)),
+             n - 1);
+    __sync();
+    return true;
+  }
+  return false;
+}
+
+// Filter candidate_ids[0..2047] strictly by 0 <= blk < n_reach_blocks BEFORE
+// any page-table or K access, then sort ascending & deduplicate.
+__mlu_func__ int SortReachableCandidates(const int32_t* cand_g,
+                                         int n_reach_blocks,
+                                         int32_t* xa,
+                                         int32_t* xb,
+                                         float* idf,
+                                         float* xf,
+                                         float* keepf,
+                                         int32_t* rm1,
+                                         float* fm0,
+                                         float* fm1,
+                                         float* out_f) {
+  if (n_reach_blocks <= 0) return 0;
+  __memcpy(xa, cand_g, kBlocks * sizeof(int32_t), GDRAM2NRAM);
+  __sync();
+  __bang_int322float(idf, xa, kBlocks, 0);
+  __bang_ge_scalar(fm0, idf, 0.0f, kBlocks);
+  __bang_lt_scalar(fm1, idf, static_cast<float>(n_reach_blocks), kBlocks);
+  __bang_mul(fm0, fm0, fm1, kBlocks);
+  const int n1 = static_cast<int>(__bang_filter(xf, idf, fm0, kBlocks));
+  if (n1 == 0) return 0;
+  if (CopyMonotonic(out_f, xf, n1, fm0)) return n1;
+  int nbits = 1;
+  while ((1 << nbits) < n_reach_blocks) ++nbits;
+  __bang_float2int32(xa, xf, n1, 0);
+  int32_t* src = xa;
+  int32_t* dst = xb;
+  for (int bit = 0; bit < nbits; ++bit) {
+    RadixPass(dst, src, bit, n1, rm1, fm0, fm1);
+    int32_t* t = src;
+    src = dst;
+    dst = t;
+  }
+  __bang_int322float(xf, src, n1, 0);
+  __sync_compute();
+  keepf[0] = 1.0f;
+  __sync();
+  if (n1 > 1) __bang_ne(keepf + 1, xf + 1, xf, n1 - 1);
+  const int nu = static_cast<int>(__bang_filter(out_f, xf, keepf, n1));
+  __sync_compute();
+  return nu;
+}
+
+__mlu_func__ void ExpandMembership(float* memb,
+                                   const int32_t* bits_i,
+                                   const int32_t* qbit,
+                                   int nbp,
+                                   float* tmp) {
+  constexpr int Q = 16;
+  int32_t* bi = reinterpret_cast<int32_t*>(tmp);             // [nbp]
+  int32_t* r1 = reinterpret_cast<int32_t*>(tmp + 64);        // [Q][nbp]
+  int32_t* r2 = reinterpret_cast<int32_t*>(tmp + 64 + 512);  // [nbp][Q]
+  float* mf = tmp + 64 + 1024;                               // [nbp][Q]
+  float* mt = tmp + 64 + 1536;                               // [Q][nbp]
+  float* ex = tmp + 2176;                                    // [8][Q * nbp]
+  __memcpy(bi, bits_i, nbp * sizeof(int32_t), NRAM2NRAM);
+  __sync();
+  __bang_write_value(r1, Q * nbp, 0);
+  __bang_cycle_add(r1, r1, bi, Q * nbp, nbp);
+  __bang_transpose(r2, r1, Q, nbp);
+  __bang_cycle_band(r2, r2, qbit, Q * nbp, Q);
+  __bang_int322float(mf, r2, Q * nbp, 0);
+  __bang_gt_scalar(mf, mf, 0.5f, Q * nbp);
+  __bang_transpose(mt, mf, nbp, Q);
+  __bang_write_value(ex, kBlockSize * Q * nbp, 0.0f);
+  __bang_cycle_add(ex, ex, mt, kBlockSize * Q * nbp, Q * nbp);
+  __bang_transpose(memb, ex, kBlockSize, Q * nbp);
+}
+
+struct PagedUnionTileBufs {
+  int32_t* slot_ring;  // [3][N] logical slot IDs
+  int32_t* bits_ring;  // [3][32] int32 membership bitmasks
+  int32_t* ub_tmp;     // [64]
+  int32_t* qbit;       // [16]
+  int32_t* page_tmp;   // [64]
+  uint32_t* p_boff;    // [32]
+  uint64_t* k_boff;    // [32]
+  float* ub_f;         // [64]
+  float* rows8;        // [256]
+  float* slot_f;       // [256]
+  float* pat64;        // [64]
+};
+
+// Strictly reads ONLY page-table entries of reachable union blocks,
+// and copies ONLY slots readable by at least one query holding that block.
+__mlu_func__ void LoadPagedUnionTile(const PageLayout& page,
+                                     const bfloat16_t* paged_k,
+                                     const int32_t* table_b,
+                                     const PagedSeg& seg,
+                                     const int32_t* uid_g,
+                                     const int32_t* ubit_g,
+                                     int total_blocks,
+                                     int tile,
+                                     int ring,
+                                     const PagedUnionTileBufs& u,
+                                     bfloat16_t* kbf) {
+  constexpr int N = kTileSlots;
+  constexpr int BPT = N / kBlockSize;  // 32
+  constexpr uint32_t kBlockBytes = kBlockSize * kDim * sizeof(bfloat16_t);
+  constexpr int32_t kPadBlk = (1 << 23) / kBlockSize;
+  const int b_off = tile * BPT;
+  const int nb = (total_blocks - b_off) < BPT ? (total_blocks - b_off) : BPT;
+  const int n = nb * kBlockSize;
+  const int nco = (n + 63) / 64 * 64;
+
+  int32_t* bits_dst = u.bits_ring + ring * BPT;
+  int32_t* slot_dst = u.slot_ring + ring * N;
+
+  __memcpy_async(u.ub_tmp, uid_g + b_off, nb * sizeof(int32_t), GDRAM2NRAM);
+  __memcpy_async(bits_dst, ubit_g + b_off, nb * sizeof(int32_t), GDRAM2NRAM);
+  __sync_io();
+
+  for (int j = 0; j < nb; ++j) {
+    u.p_boff[j] = static_cast<uint32_t>((u.ub_tmp[j] >> page.block_shift) << 2);
+  }
+  if (nb < BPT) {
+    for (int j = nb; j < BPT; ++j) {
+      u.ub_tmp[j] = kPadBlk;
+      bits_dst[j] = 0;
+    }
+  }
+  __sync();
+
+  // Hardware vector gather of all nb reachable page-table entries, overlapped
+  // with vectorized slot_ring expansion and per-block readable width check.
+  __gather_async(u.page_tmp,
+                 table_b,
+                 u.p_boff,
+                 sizeof(int32_t),
+                 GDRAM2NRAM,
+                 sizeof(int32_t),
+                 nb);
+
+  __bang_int322float(u.ub_f, u.ub_tmp, 64, 0);
+  __bang_mul_scalar(u.ub_f, u.ub_f, static_cast<float>(kBlockSize), 64);
+  __bang_write_value(u.rows8, kBlockSize * BPT, 0.0f);
+  __bang_cycle_add(u.rows8, u.rows8, u.ub_f, kBlockSize * BPT, BPT);
+  __bang_transpose(u.slot_f, u.rows8, kBlockSize, BPT);
+  __bang_cycle_add(u.slot_f, u.slot_f, u.pat64, N, 64);
+  __bang_float2int32(slot_dst, u.slot_f, N, 0);
+
+  int valid_w[32];
+  for (int j = 0; j < nb; ++j) {
+    const int32_t s0 = u.ub_tmp[j] * kBlockSize;
+    if (s0 + kBlockSize <= seg.min_n) {
+      valid_w[j] = kBlockSize;
+    } else {
+      const int32_t bm = bits_dst[j];
+      int32_t mx = 0;
+      for (int q = 0; q < seg.nq; ++q) {
+        if ((bm & (1 << q)) && seg.n_read[q] > mx) mx = seg.n_read[q];
+      }
+      int w = mx - s0;
+      if (w > kBlockSize) w = kBlockSize;
+      valid_w[j] = w;
+    }
+  }
+  __sync_io();
+
+  for (int j = 0; j < nb; ++j) {
+    const uint64_t blk_idx =
+        (static_cast<uint64_t>(static_cast<uint32_t>(u.page_tmp[j]))
+         << page.block_shift) |
+        static_cast<uint64_t>(u.ub_tmp[j] & page.block_mask);
+    u.k_boff[j] = blk_idx << 11;
+  }
+  __sync();
+
+  int j = 0;
+  while (j < nb) {
+    if (valid_w[j] == kBlockSize) {
+      const int j0 = j;
+      ++j;
+      while (j < nb && valid_w[j] == kBlockSize) ++j;
+      __gather_async(kbf + (j0 * kBlockSize) * kDim,
+                     paged_k,
+                     u.k_boff + j0,
+                     kBlockBytes,
+                     GDRAM2NRAM,
+                     kBlockBytes,
+                     j - j0);
+    } else {
+      const int w = valid_w[j];
+      const int64_t phys_page = static_cast<int64_t>(u.page_tmp[j]);
+      const int32_t blk = u.ub_tmp[j];
+      const bfloat16_t* k_src =
+          paged_k +
+          (phys_page * page.rows + (blk & page.block_mask) * kBlockSize) * kDim;
+      bfloat16_t* k_dst = kbf + (j * kBlockSize) * kDim;
+      if (w > 0) {
+        __memcpy_async(k_dst, k_src, w * kDim * sizeof(bfloat16_t), GDRAM2NRAM);
+      }
+      __bang_write_value(k_dst + w * kDim,
+                         (kBlockSize - w) * kDim,
+                         static_cast<bfloat16_t>(0));
+      ++j;
+    }
+  }
+  if (nco > n) {
+    __bang_write_value(
+        kbf + n * kDim, (nco - n) * kDim, static_cast<bfloat16_t>(0));
+  }
+}
+
+template <int TQ>
+__mlu_func__ void PagedFilterSegmentPiece(const PagedParams& params,
+                                          const PagedSegBufs<TQ>& m,
+                                          const PagedUnionTileBufs& u,
+                                          const PagedSeg& seg,
+                                          const PagedPiece& piece) {
+  constexpr int N = kTileSlots;
+  constexpr int BPT = N / kBlockSize;
+  const int b = seg.b;
+  const int nq = seg.nq;
+  const int tile_lo = piece.tile_lo;
+  const int tile_hi = piece.tile_hi;
+  const int na = tile_hi - tile_lo;
+  const bool is_final = piece.is_final != 0;
+
+  const bfloat16_t* query = static_cast<const bfloat16_t*>(params.query);
+  const bfloat16_t* weights = static_cast<const bfloat16_t*>(params.weights);
+  const bfloat16_t* paged_k = static_cast<const bfloat16_t*>(params.paged_k);
+  const int32_t* table_b =
+      params.paged_block_table + static_cast<int64_t>(b) * params.max_pages;
+
+  const uint8_t* seg_u =
+      params.workspace + params.plan.union_offset +
+      static_cast<int64_t>(piece.seg_idx) * PagedUnionSegBytes();
+  __memcpy(u.page_tmp, seg_u, 2 * sizeof(int32_t), GDRAM2NRAM);
+  __sync_io();
+  const int total_blocks = u.page_tmp[0];
+  const int32_t* uid_g = reinterpret_cast<const int32_t*>(seg_u + 64);
+  const int32_t* ubit_g = uid_g + kPagedUnionCap;
+
+  LoadQueriesToWram<TQ>(query, weights, seg, params.logits_dtype, m);
+
+  Pool tok[TQ];
+  for (int q = 0; q < nq; ++q) {
+    tok[q] = Pool{m.tok_val + q * kSegTokCap,
+                  m.tok_idx + q * kSegTokCap,
+                  0,
+                  -INFINITY,
+                  kTopk,
+                  kSegTokCap};
+  }
+  Scratch tok_scratch{
+      m.ob, m.ob + kSegTokCap, m.ob + 2 * kSegTokCap, m.sc_iota};
+
+  bfloat16_t* kbf0 = m.kbf;
+  bfloat16_t* kbf1 = reinterpret_cast<bfloat16_t*>(m.kf32);
+  float* qk_nram = m.kf32 + 16384;
+
+  int tf_nco = 0;
+  if (na > 0) {
+    LoadPagedUnionTile(params.page,
+                       paged_k,
+                       table_b,
+                       seg,
+                       uid_g,
+                       ubit_g,
+                       total_blocks,
+                       tile_lo,
+                       0,
+                       u,
+                       kbf0);
+    __sync();
+  }
+
+  for (int i = 0; i < na; ++i) {
+    const int tile = tile_lo + i;
+    const int nb =
+        (total_blocks - tile * BPT) < BPT ? (total_blocks - tile * BPT) : BPT;
+    const int n = nb * kBlockSize;
+    const int nco = (n + 63) / 64 * 64;
+
+    if (i + 1 < na) {
+      LoadPagedUnionTile(params.page,
+                         paged_k,
+                         table_b,
+                         seg,
+                         uid_g,
+                         ubit_g,
+                         total_blocks,
+                         tile + 1,
+                         (i + 1) % 3,
+                         u,
+                         ((i + 1) & 1) ? kbf1 : kbf0);
+    }
+
+    ScoreTileMap16<TQ>(m.acc,
+                       qk_nram,
+                       m.wram,
+                       (i & 1) ? kbf1 : kbf0,
+                       m.wv,
+                       m.w_bf16,
+                       nq,
+                       nco,
+                       params.logits_dtype);
+
+    const int ring = i % 3;
+    const int32_t* ids = u.slot_ring + ring * N;
+    const int len = nq * nco;
+    float* reach = m.acc + 16 * N;
+    float* sel = m.acc + 32 * N;
+    float* slot_f = m.ob;  // [N]
+
+    __bang_int322float(slot_f, ids, nco, 0);
+    ExpandMembership(
+        reach, u.bits_ring + ring * BPT, u.qbit, nco / kBlockSize, m.ob + 8192);
+    for (int q = 0; q < nq; ++q) {
+      __bang_lt_scalar(
+          sel + q * nco, slot_f, static_cast<float>(seg.n_read[q]), nco);
+    }
+    __bang_mul(reach, reach, sel, len);
+
+    if (nco != tf_nco) {
+      for (int q = 0; q < nq; ++q) {
+        __bang_write_value(m.tfm + q * nco, nco, tok[q].tf);
+      }
+      tf_nco = nco;
+    }
+    __bang_gt(sel, m.acc, m.tfm, len);
+    __bang_mul(sel, sel, reach, len);
+    if (__bang_count(sel, len) > 0) {
+      RowSums(m.rowc, sel, nq, nco);
+      for (int q = 0; q < nq; ++q) {
+        int c = static_cast<int>(m.rowc[q]);
+        if (c == 0) continue;
+        Pool& p = tok[q];
+        float* score_q = m.acc + q * nco;
+        float* sel_q = sel + q * nco;
+        if (p.cnt + c > p.cap) {
+          PoolCompact(p, tok_scratch);
+          __bang_write_value(m.tfm + q * nco, nco, p.tf);
+          __bang_gt_scalar(sel_q, score_q, p.tf, nco);
+          __bang_mul(sel_q, sel_q, reach + q * nco, nco);
+          c = static_cast<int>(__bang_count(sel_q, nco));
+          if (c == 0) continue;
+        }
+        __bang_filter(p.val + p.cnt, score_q, sel_q, nco);
+        __bang_filter(reinterpret_cast<float*>(p.idx + p.cnt),
+                      reinterpret_cast<const float*>(ids),
+                      sel_q,
+                      nco);
+        p.cnt += c;
+      }
+    }
+    __sync();
+  }
+  __sync();
+
+  int32_t* out32 = reinterpret_cast<int32_t*>(m.kf32);
+  for (int q = 0; q < nq; ++q) {
+    if (tok[q].cnt > kTopk) PoolCompact(tok[q], tok_scratch);
+    const int cnt = tok[q].cnt;
+    if (is_final) {
+      __bang_write_value(out32, kTopk, -1);
+      __sync_compute();
+      if (cnt > 0) {
+        __memcpy(out32 + (kTopk - cnt),
+                 tok[q].idx,
+                 cnt * sizeof(int32_t),
+                 NRAM2NRAM);
+        __sync();
+      }
+      __memcpy(params.topk_indices + static_cast<int64_t>(seg.rows[q]) * kTopk,
+               out32,
+               kTopk * sizeof(int32_t),
+               NRAM2GDRAM);
+      __sync_io();
+    } else {
+      const int64_t item =
+          (static_cast<int64_t>(piece.slot_idx) * 16 + q) * kTopk;
+      float* pv = reinterpret_cast<float*>(params.workspace +
+                                           params.plan.tok_part_val_offset) +
+                  item;
+      int32_t* pi = reinterpret_cast<int32_t*>(
+                        params.workspace + params.plan.tok_part_idx_offset) +
+                    item;
+      if (cnt < kTopk) {
+        __bang_write_value(tok[q].val + cnt, kTopk - cnt, -INFINITY);
+        __bang_write_value(tok[q].idx + cnt, kTopk - cnt, -1);
+        __sync_compute();
+      }
+      __memcpy(pv, tok[q].val, kTopk * sizeof(float), NRAM2GDRAM);
+      __memcpy(pi, tok[q].idx, kTopk * sizeof(int32_t), NRAM2GDRAM);
+      __sync_io();
+    }
+  }
+  __sync();
+}
+
+// Helper on 1 core: partition active segments across `plan.cores` into
+// contiguous per-core `PagedPiece` slices and `PagedSplitSeg` descriptors.
+__mlu_func__ void BuildTilePieces(int num_segs,
+                                  const int32_t* seg_tiles_cache,
+                                  const PagedSeg* segs_g,
+                                  PagedSeg* seg_tmp_nram,
+                                  int cache_cap,
+                                  int64_t total_tiles,
+                                  int cores,
+                                  int do_split,
+                                  PagedSchedHeader* hdr_stage,
+                                  PagedPiece* piece_stage,
+                                  int piece_stage_cap,
+                                  PagedPiece* pieces_g,
+                                  PagedSplitSeg* split_stage,
+                                  PagedSplitSeg* split_g) {
+  hdr_stage->num_segs = num_segs;
+  hdr_stage->total_tiles = static_cast<int32_t>(total_tiles);
+  for (int c = 0; c < kPagedMaxCores; ++c) {
+    hdr_stage->core_piece_begin[c] = 0;
+    hdr_stage->core_piece_end[c] = 0;
+  }
+
+  if (num_segs <= 0 || total_tiles <= 0) {
+    hdr_stage->num_pieces = 0;
+    hdr_stage->num_split_segs = 0;
+    return;
+  }
+
+  auto get_nt = [&](int s) -> int32_t {
+    if (s < cache_cap) return seg_tiles_cache[s];
+    __memcpy(seg_tmp_nram, segs_g + s, sizeof(PagedSeg), GDRAM2NRAM);
+    __sync_io();
+    return seg_tmp_nram->num_tiles;
+  };
+
+  int p_written = 0;
+  int p_buf = 0;
+  auto push_piece = [&](int32_t seg_idx,
+                        int32_t part_idx,
+                        int32_t t_lo,
+                        int32_t t_hi,
+                        int32_t is_final,
+                        int32_t slot_idx) {
+    PagedPiece& dst = piece_stage[p_buf++];
+    dst.seg_idx = seg_idx;
+    dst.part_idx = part_idx;
+    dst.tile_lo = t_lo;
+    dst.tile_hi = t_hi;
+    dst.is_final = is_final;
+    dst.slot_idx = slot_idx;
+    dst.pad0 = 0;
+    dst.pad1 = 0;
+    if (p_buf == piece_stage_cap) {
+      __sync();
+      __memcpy(pieces_g + p_written,
+               piece_stage,
+               p_buf * sizeof(PagedPiece),
+               NRAM2GDRAM);
+      __sync_io();
+      p_written += p_buf;
+      p_buf = 0;
+    }
+  };
+  auto flush_pieces = [&]() {
+    if (p_buf > 0) {
+      __sync();
+      __memcpy(pieces_g + p_written,
+               piece_stage,
+               p_buf * sizeof(PagedPiece),
+               NRAM2GDRAM);
+      __sync_io();
+      p_written += p_buf;
+      p_buf = 0;
+    }
+  };
+
+  if (!do_split) {
+    for (int c = 0; c < cores; ++c) {
+      hdr_stage->core_piece_begin[c] = p_written + p_buf;
+      for (int s = c; s < num_segs; s += cores) {
+        const int32_t nt = get_nt(s);
+        if (nt <= 0) continue;
+        push_piece(s, 0, 0, nt, 1, -1);
+      }
+      hdr_stage->core_piece_end[c] = p_written + p_buf;
+    }
+    flush_pieces();
+    hdr_stage->num_pieces = p_written;
+    hdr_stage->num_split_segs = 0;
+    return;
+  }
+
+  const int eff_cores =
+      total_tiles < cores ? static_cast<int>(total_tiles) : cores;
+  int cur_core = -1;
+  int num_splits = 0;
+  int next_slot = 0;
+  int64_t pre = 0;
+
+  for (int s = 0; s < num_segs; ++s) {
+    const int32_t nt = get_nt(s);
+    if (nt <= 0) continue;
+    const int c_first = CoreOf(pre, total_tiles, eff_cores);
+    const int c_last = CoreOf(pre + nt - 1, total_tiles, eff_cores);
+    const int parts = c_last - c_first + 1;
+    int first_slot = -1;
+    if (parts > 1) {
+      first_slot = next_slot;
+      PagedSplitSeg& sp = split_stage[num_splits++];
+      sp.seg_idx = s;
+      sp.first_slot = first_slot;
+      sp.num_parts = parts;
+      sp.pad0 = 0;
+      next_slot += parts;
+    }
+    for (int c = c_first; c <= c_last; ++c) {
+      if (c != cur_core) {
+        if (cur_core >= 0) {
+          hdr_stage->core_piece_end[cur_core] = p_written + p_buf;
+        }
+        for (int empty_c = cur_core + 1; empty_c < c; ++empty_c) {
+          hdr_stage->core_piece_begin[empty_c] = p_written + p_buf;
+          hdr_stage->core_piece_end[empty_c] = p_written + p_buf;
+        }
+        hdr_stage->core_piece_begin[c] = p_written + p_buf;
+        cur_core = c;
+      }
+      const int64_t c_lo = CoreLo(total_tiles, c, eff_cores);
+      const int64_t c_hi = CoreLo(total_tiles, c + 1, eff_cores);
+      const int32_t t_lo =
+          static_cast<int32_t>((c_lo > pre ? c_lo : pre) - pre);
+      const int32_t t_hi =
+          static_cast<int32_t>(((c_hi < (pre + nt)) ? c_hi : (pre + nt)) - pre);
+      const int p_idx = c - c_first;
+      push_piece(s,
+                 p_idx,
+                 t_lo,
+                 t_hi,
+                 parts == 1 ? 1 : 0,
+                 parts == 1 ? -1 : (first_slot + p_idx));
+    }
+    pre += nt;
+  }
+  if (cur_core >= 0) {
+    hdr_stage->core_piece_end[cur_core] = p_written + p_buf;
+  }
+  flush_pieces();
+  if (num_splits > 0) {
+    __sync();
+    __memcpy(
+        split_g, split_stage, num_splits * sizeof(PagedSplitSeg), NRAM2GDRAM);
+    __sync_io();
+  }
+  hdr_stage->num_pieces = p_written;
+  hdr_stage->num_split_segs = num_splits;
+  hdr_stage->num_perq_segs = 0;
+}
+
+template <int TQ>
+__mlu_func__ void CarveSegBufs(int8_t* nram,
+                               bfloat16_t* wram,
+                               PagedSegBufs<TQ>* out,
+                               bool init_iota = true) {
+  constexpr int N = kTileSlots;
+  int8_t* cur = nram;
+  CARVE_FROM(cur, bfloat16_t, kbf, N * kDim);
+  CARVE_FROM(cur, float, kf32, N* kDim);
+  CARVE_FROM(cur, float, ob, N * 64);
+  CARVE_FROM(cur, float, acc, N * 64);
+  CARVE_FROM(cur, int32_t, ids, N);
+  CARVE_FROM(cur, int32_t, iota_i, N);
+  CARVE_FROM(cur, float, iota_f256, N);
+  CARVE_FROM(cur, float, rowc, 64);
+  CARVE_FROM(cur, int32_t, blk_ids, 64);
+  CARVE_FROM(cur, int32_t, blk_iota, 64);
+  CARVE_FROM(cur, int32_t, page_tmp, 64);
+  CARVE_FROM(cur, float, sc_iota, kPagedBlkPoolCap);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_nram, 1);
+  CARVE_FROM(cur, PagedSeg, seg_nram, 1);
+  CARVE_FROM(cur, PagedPiece, piece_nram, 1);
+  CARVE_FROM(cur, float, wv, kHeads* TQ);
+  CARVE_FROM(cur, float, w_f32, kHeads* TQ);
+  CARVE_FROM(cur, bfloat16_t, w_bf16, kHeads * TQ);
+  CARVE_FROM(cur, float, tfm, TQ* N);
+  CARVE_FROM(cur, float, bm, TQ* N / kBlockSize);
+  CARVE_FROM(cur, float, tok_val, TQ* kSegTokCap);
+  CARVE_FROM(cur, int32_t, tok_idx, TQ* kSegTokCap);
+  if (init_iota) {
+    MakeIotaI(iota_i, N);
+    MakeIotaI(blk_iota, 64);
+    MakeIotaF(iota_f256, N);
+    MakeIotaF(sc_iota, kPagedBlkPoolCap);
+  }
+  *out = PagedSegBufs<TQ>{kbf,      kf32,     ob,        acc,     wv,
+                          w_f32,    w_bf16,   ids,       iota_i,  iota_f256,
+                          tfm,      rowc,     bm,        blk_ids, blk_iota,
+                          page_tmp, tok_val,  tok_idx,   sc_iota, wram,
+                          hdr_nram, seg_nram, piece_nram};
+}
+
+__mlu_func__ void LoadSortedBlockPagesPrefill(const PageLayout& page,
+                                              const int32_t* table_b,
+                                              const int32_t* ub_src,
+                                              int cnt,
+                                              int32_t* out_pages,
+                                              float* work_f,
+                                              const float* sc_iota) {
+  if (cnt <= 0) return;
+  int32_t* ub_pad_i = reinterpret_cast<int32_t*>(work_f);
+  int32_t* lp_i = ub_pad_i + kBlocks;
+  float* lp_f = work_f + 2 * kBlocks;
+  float* lp_prev_f = lp_f + kBlocks;
+  float* chg_f = lp_prev_f + kBlocks;
+  float* uniq_lp_f = chg_f + kBlocks;
+  uint32_t* boff_u = reinterpret_cast<uint32_t*>(uniq_lp_f + kBlocks);
+  int32_t* uniq_phys = reinterpret_cast<int32_t*>(boff_u + kBlocks);
+  int32_t* out_aligned = uniq_phys + kBlocks;
+  int32_t* phys_lut = out_aligned + kBlocks;  // [4096]
+
+  const int32_t lp_min = ub_src[0] >> page.block_shift;
+  const int32_t lp_max = ub_src[cnt - 1] >> page.block_shift;
+  const int span_pages = lp_max - lp_min + 1;
+  const int cnt64 = (cnt + 63) / 64 * 64;
+
+  if (span_pages == 1) {
+    __memcpy(uniq_phys, table_b + lp_min, sizeof(int32_t), GDRAM2NRAM);
+    __sync_io();
+    __bang_write_value(out_aligned, cnt64, uniq_phys[0]);
+    __sync_compute();
+    __memcpy(out_pages, out_aligned, cnt * sizeof(int32_t), NRAM2NRAM);
+    __sync_move();
+    return;
+  }
+
+  __memcpy(ub_pad_i, ub_src, cnt * sizeof(int32_t), NRAM2NRAM);
+  const int32_t last_ub = ub_src[cnt - 1];
+  for (int j = cnt; j < cnt64; ++j) ub_pad_i[j] = last_ub;
+  __sync();
+
+  __bang_band_scalar(lp_i, ub_pad_i, ~page.block_mask, cnt64);
+  __bang_int322float(lp_f, lp_i, cnt64, 0);
+  __bang_mul_scalar(lp_f, lp_f, page.inverse_blocks, cnt64);
+  __sync_compute();
+
+  if (span_pages > 4096) {
+    __bang_mul_scalar(lp_prev_f, lp_f, 4.0f, cnt64);
+    __bang_float2int32(reinterpret_cast<int32_t*>(boff_u), lp_prev_f, cnt64, 0);
+    __sync_compute();
+    __gather(out_pages,
+             table_b,
+             boff_u,
+             sizeof(int32_t),
+             GDRAM2NRAM,
+             sizeof(int32_t),
+             cnt);
+    __sync_io();
+    return;
+  }
+
+  lp_prev_f[0] = lp_f[0] - 1.0f;
+  if (cnt > 1) {
+    __memcpy(lp_prev_f + 1, lp_f, (cnt - 1) * sizeof(float), NRAM2NRAM);
+  }
+  for (int j = cnt; j < cnt64; ++j) lp_prev_f[j] = lp_f[j];
+  __sync();
+
+  __bang_ne(chg_f, lp_f, lp_prev_f, cnt64);
+  const int u_pages =
+      static_cast<int>(__bang_filter(uniq_lp_f, lp_f, chg_f, cnt64));
+
+  uint32_t* blk_lut_boff = reinterpret_cast<uint32_t*>(ub_pad_i);
+  __bang_sub_scalar(lp_prev_f, lp_f, static_cast<float>(lp_min), cnt64);
+  __bang_mul_scalar(lp_prev_f, lp_prev_f, 4.0f, cnt64);
+  __bang_float2int32(
+      reinterpret_cast<int32_t*>(blk_lut_boff), lp_prev_f, cnt64, 0);
+
+  if (u_pages == span_pages) {
+    __memcpy(
+        phys_lut, table_b + lp_min, span_pages * sizeof(int32_t), GDRAM2NRAM);
+    __sync();
+    __gather(out_pages,
+             phys_lut,
+             blk_lut_boff,
+             sizeof(int32_t),
+             NRAM2NRAM,
+             sizeof(int32_t),
+             cnt);
+    __sync_move();
+    return;
+  }
+
+  const int up64 = (u_pages + 63) / 64 * 64;
+  int32_t* uniq_lp_i = out_aligned;
+  for (int j = u_pages; j < up64; ++j) {
+    uniq_lp_f[j] = 0.0f;
+    lp_prev_f[j] = 1.0f;
+  }
+  lp_prev_f[u_pages - 1] = uniq_lp_f[u_pages - 1] + 1.0f;
+  if (u_pages > 1) {
+    __memcpy(
+        lp_prev_f, uniq_lp_f + 1, (u_pages - 1) * sizeof(float), NRAM2NRAM);
+  }
+  __sync();
+  __bang_float2int32(uniq_lp_i, uniq_lp_f, up64, 0);
+  __bang_sub(chg_f, lp_prev_f, uniq_lp_f, up64);
+  __bang_ne_scalar(chg_f, chg_f, 1.0f, up64);
+  const int n_breaks = static_cast<int>(__bang_count(chg_f, up64));
+
+  if (n_breaks <= 80 && 2 * u_pages >= 3 * (n_breaks + 1)) {
+    if (n_breaks > 0) {
+      const int nb64 = (n_breaks + 63) / 64 * 64;
+      __bang_filter(lp_prev_f, const_cast<float*>(sc_iota), chg_f, up64);
+      __sync_compute();
+      for (int j = n_breaks; j < nb64; ++j) lp_prev_f[j] = 0.0f;
+      __sync();
+      __bang_float2int32(lp_i, lp_prev_f, nb64, 0);
+      __sync_compute();
+    }
+    int r_start = 0;
+    for (int k = 0; k <= n_breaks; ++k) {
+      const int r_end = (k < n_breaks) ? (lp_i[k] + 1) : u_pages;
+      const int32_t lp0 = uniq_lp_i[r_start];
+      const int r_len = r_end - r_start;
+      __memcpy_async(phys_lut + (lp0 - lp_min),
+                     table_b + lp0,
+                     r_len * sizeof(int32_t),
+                     GDRAM2NRAM);
+      if ((k & 15) == 15) __sync_io();
+      r_start = r_end;
+    }
+    __sync_io();
+    __gather(out_pages,
+             phys_lut,
+             blk_lut_boff,
+             sizeof(int32_t),
+             NRAM2NRAM,
+             sizeof(int32_t),
+             cnt);
+    __sync_move();
+    return;
+  }
+
+  __bang_mul_scalar(chg_f, uniq_lp_f, 4.0f, up64);
+  __bang_float2int32(reinterpret_cast<int32_t*>(boff_u), chg_f, up64, 0);
+  __sync_compute();
+
+  __gather_async(uniq_phys,
+                 table_b,
+                 boff_u,
+                 sizeof(int32_t),
+                 GDRAM2NRAM,
+                 sizeof(int32_t),
+                 u_pages);
+  uint32_t* lut_boff = reinterpret_cast<uint32_t*>(lp_i);
+  __bang_sub_scalar(chg_f, uniq_lp_f, static_cast<float>(lp_min), up64);
+  __bang_mul_scalar(chg_f, chg_f, 4.0f, up64);
+  __bang_float2int32(reinterpret_cast<int32_t*>(lut_boff), chg_f, up64, 0);
+  __sync();
+
+  __scatter(phys_lut,
+            uniq_phys,
+            lut_boff,
+            sizeof(int32_t),
+            NRAM2NRAM,
+            sizeof(int32_t),
+            u_pages);
+  __sync_move();
+  __gather(out_pages,
+           phys_lut,
+           blk_lut_boff,
+           sizeof(int32_t),
+           NRAM2NRAM,
+           sizeof(int32_t),
+           cnt);
+  __sync_move();
+}
+
+}  // namespace
+
+// =============================================================================
+// Global Kernels for Rank-3 Whole-Batch Paged Prefill / Prefill CP
+// =============================================================================
+
+// Collaborative -1 fill when Bcap == 0 (where V must be 0) without touching
+// workspace or any input tensor.
+__mlu_global__ void PagedFillNegOneKernel(PagedParams params) {
+  if (__is_mpu()) return;
+  __nram__ int32_t neg_ones[kBlocks];
+  const int64_t r_lo = CoreLo(params.nq, taskId, taskDim);
+  const int64_t r_hi = CoreLo(params.nq, taskId + 1, taskDim);
+  if (r_lo >= r_hi) return;
+  const int neg_len = (params.mode == kSource) ? kBlocks : kTopk;
+  __bang_write_value(neg_ones, neg_len, -1);
+  __sync_compute();
+  for (int64_t r = r_lo; r < r_hi; ++r) {
+    __memcpy_async(params.topk_indices + r * kTopk,
+                   neg_ones,
+                   kTopk * sizeof(int32_t),
+                   NRAM2GDRAM);
+    if (params.mode == kSource) {
+      __memcpy_async(params.candidate_ids_out + r * kBlocks,
+                     neg_ones,
+                     kBlocks * sizeof(int32_t),
+                     NRAM2GDRAM);
+    }
+  }
+  __sync_io();
+}
+
+// Parallel across all 32 IPUs: reads device `num_valid_input_rows[0]`, fills
+// tail [V, Ncap) with -1 without reading tail metadata, vector-computes per-row
+// readable count `row_n[r]` for [0, V) while reading `history_lengths[b]` ONLY
+// for referenced request slots, and fills -1 for any row with `row_n[r] == 0`.
+__mlu_global__ void PagedRowPrepKernel(PagedParams params) {
+  if (__is_mpu()) return;
+  constexpr int kChunk = 4096;
+  __nram__ int8_t nram_buf[320 * 1024];
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, int32_t, qp_i32, kChunk);
+  CARVE_FROM(cur, int32_t, qb_i32, kChunk);
+  CARVE_FROM(cur, int32_t, hl_cache, kChunk);
+  CARVE_FROM(cur, int32_t, hl_seen, kChunk);
+  CARVE_FROM(cur, int32_t, tmp_i32, kChunk);
+  CARVE_FROM(cur, int32_t, odd_i32, kChunk);
+  CARVE_FROM(cur, int32_t, even_i32, kChunk);
+  CARVE_FROM(cur, int32_t, n_out_i, kChunk);
+  CARVE_FROM(cur, float, nf, kChunk);
+  CARVE_FROM(cur, float, hl_f, kChunk);
+  CARVE_FROM(cur, float, zero_f, kChunk);
+  CARVE_FROM(cur, float, mask_f, kChunk);
+  CARVE_FROM(cur, float, bound_f, kChunk);
+  CARVE_FROM(cur, float, iota_f, kChunk);
+  CARVE_FROM(cur, float, chg_f, kChunk);
+  CARVE_FROM(cur, int32_t, chg_i, kChunk);
+  CARVE_FROM(cur, float, qbf, kChunk);
+  CARVE_FROM(cur, float, qbf_next, kChunk);
+  CARVE_FROM(cur, int32_t, neg_ones, kBlocks);
+  CARVE_FROM(cur, int32_t, scalar_tmp, 16);
+
+  __memcpy(
+      scalar_tmp, params.num_valid_input_rows, sizeof(int32_t), GDRAM2NRAM);
+  __sync_io();
+  int64_t v_rows = scalar_tmp[0];
+  if (v_rows < 0 || params.batch <= 0) v_rows = 0;
+  if (v_rows > params.nq) v_rows = params.nq;
+
+  const int neg_len = (params.mode == kSource) ? kBlocks : kTopk;
+  bool neg_ready = false;
+
+  if (v_rows < params.nq) {
+    const int64_t tail_cnt = params.nq - v_rows;
+    const int64_t t_lo = v_rows + CoreLo(tail_cnt, taskId, taskDim);
+    const int64_t t_hi = v_rows + CoreLo(tail_cnt, taskId + 1, taskDim);
+    if (t_lo < t_hi) {
+      __bang_write_value(neg_ones, neg_len, -1);
+      __sync_compute();
+      neg_ready = true;
+      for (int64_t r = t_lo; r < t_hi; ++r) {
+        __memcpy_async(params.topk_indices + r * kTopk,
+                       neg_ones,
+                       kTopk * sizeof(int32_t),
+                       NRAM2GDRAM);
+        if (params.mode == kSource) {
+          __memcpy_async(params.candidate_ids_out + r * kBlocks,
+                         neg_ones,
+                         kBlocks * sizeof(int32_t),
+                         NRAM2GDRAM);
+        }
+      }
+      __sync_io();
+    }
+  }
+
+  const int64_t r_lo = CoreLo(v_rows, taskId, taskDim);
+  const int64_t r_hi = CoreLo(v_rows, taskId + 1, taskDim);
+  if (r_lo >= r_hi) return;
+
+  MakeIotaF(iota_f, kChunk);
+  __bang_write_value(zero_f, kChunk, 0.0f);
+  const bool cached_hl = (params.batch > 0 && params.batch <= kChunk);
+  if (cached_hl) {
+    __bang_write_value(hl_seen, kChunk, 0);
+  }
+  __sync_compute();
+
+  int32_t* plan_scratch = reinterpret_cast<int32_t*>(
+      params.workspace + params.plan.plan_scratch_offset);
+  int32_t* row_n_g = plan_scratch + params.nq;
+
+  for (int64_t r0 = r_lo; r0 < r_hi; r0 += kChunk) {
+    const int m = (r_hi - r0) < kChunk ? static_cast<int>(r_hi - r0) : kChunk;
+    const int mr = (m + 63) / 64 * 64;
+
+    __memcpy_async(
+        qp_i32, params.query_positions + r0, m * sizeof(int32_t), GDRAM2NRAM);
+    __memcpy_async(qb_i32,
+                   params.query_batch_indices + r0,
+                   m * sizeof(int32_t),
+                   GDRAM2NRAM);
+    __sync_io();
+
+    for (int i = m; i < mr; ++i) {
+      qb_i32[i] = qb_i32[m - 1];
+      qp_i32[i] = -1;
+      tmp_i32[i] = 0;
+    }
+    __sync();
+
+    int n_chg = 0;
+    if (m > 1) {
+      __bang_int322float(qbf, qb_i32, mr, 0);
+      __sync_compute();
+      __memcpy(qbf_next, qbf + 1, (m - 1) * sizeof(float), NRAM2NRAM);
+      qbf_next[m - 1] = qbf[m - 1];
+      __sync();
+      __bang_ne(mask_f, qbf_next, qbf, mr);
+      if (mr > m) {
+        __bang_lt_scalar(bound_f, iota_f, static_cast<float>(m - 1), mr);
+        __bang_mul(mask_f, mask_f, bound_f, mr);
+      }
+      n_chg = static_cast<int>(__bang_filter(chg_f, iota_f, mask_f, mr));
+      if (n_chg > 0) {
+        const int ncr = (n_chg + 63) / 64 * 64;
+        __bang_float2int32(chg_i, chg_f, ncr, 0);
+        __sync_compute();
+      }
+    }
+
+    int ls = 0;
+    for (int k = 0; k <= n_chg; ++k) {
+      const int le = (k < n_chg) ? (chg_i[k] + 1) : m;
+      const int32_t b = qb_i32[ls];
+      int32_t hl_val = 0;
+      if (cached_hl) {
+        if (hl_seen[b] == 0) {
+          __memcpy(scalar_tmp,
+                   params.history_lengths + b,
+                   sizeof(int32_t),
+                   GDRAM2NRAM);
+          __sync_io();
+          hl_cache[b] = scalar_tmp[0];
+          hl_seen[b] = 1;
+        }
+        hl_val = hl_cache[b];
+      } else {
+        __memcpy(scalar_tmp,
+                 params.history_lengths + b,
+                 sizeof(int32_t),
+                 GDRAM2NRAM);
+        __sync_io();
+        hl_val = scalar_tmp[0];
+      }
+      const int rlen = le - ls;
+      if (rlen >= 128) {
+        const int vec_len = rlen & ~63;
+        __bang_write_value(tmp_i32 + ls, vec_len, hl_val);
+        __sync_compute();
+        for (int i = ls + vec_len; i < le; ++i) tmp_i32[i] = hl_val;
+      } else {
+        for (int i = ls; i < le; ++i) tmp_i32[i] = hl_val;
+      }
+      ls = le;
+    }
+    __sync();
+
+    __bang_int322float(hl_f, tmp_i32, mr, 0);
+    __bang_add_scalar(tmp_i32, qp_i32, 1, mr);
+    if (params.ratio == 2) {
+      __bang_band_scalar(odd_i32, tmp_i32, 1, mr);
+      __bang_sub(even_i32, tmp_i32, odd_i32, mr);
+      __bang_int322float(nf, even_i32, mr, 0);
+      __bang_mul_scalar(nf, nf, 0.5f, mr);
+    } else {
+      __bang_int322float(nf, tmp_i32, mr, 0);
+    }
+    __bang_maximum(hl_f, hl_f, zero_f, mr);
+    __bang_minimum(nf, nf, hl_f, mr);
+    __bang_maximum(nf, nf, zero_f, mr);
+    __bang_float2int32(n_out_i, nf, mr, 0);
+    __sync_compute();
+    __memcpy(row_n_g + r0, n_out_i, m * sizeof(int32_t), NRAM2GDRAM);
+
+    __bang_eq_scalar(mask_f, nf, 0.0f, mr);
+    __bang_lt_scalar(bound_f, iota_f, static_cast<float>(m), mr);
+    __bang_mul(mask_f, mask_f, bound_f, mr);
+    const int n_empty =
+        static_cast<int>(__bang_filter(chg_f, iota_f, mask_f, mr));
+    if (n_empty > 0) {
+      if (!neg_ready) {
+        __bang_write_value(neg_ones, neg_len, -1);
+        neg_ready = true;
+      }
+      const int ner = (n_empty + 63) / 64 * 64;
+      __bang_float2int32(chg_i, chg_f, ner, 0);
+      __sync_compute();
+      for (int k = 0; k < n_empty; ++k) {
+        const int64_t r = r0 + chg_i[k];
+        __memcpy(params.topk_indices + r * kTopk,
+                 neg_ones,
+                 kTopk * sizeof(int32_t),
+                 NRAM2GDRAM);
+        if (params.mode == kSource) {
+          __memcpy(params.candidate_ids_out + r * kBlocks,
+                   neg_ones,
+                   kBlocks * sizeof(int32_t),
+                   NRAM2GDRAM);
+        }
+      }
+    }
+    __sync_io();
+  }
+  __sync();
+}
+
+// Helper for PagedBuildSchedKernel: flushes staged segments from NRAM to GDRAM.
+__mlu_func__ void FlushPrefillSegStage(PagedSeg* segs_g,
+                                       PagedSeg* seg_stage,
+                                       int num_segs,
+                                       int* seg_buf_cnt) {
+  const int cnt = *seg_buf_cnt;
+  if (cnt > 0) {
+    __sync();
+    __memcpy(segs_g + (num_segs - cnt),
+             seg_stage,
+             cnt * sizeof(PagedSeg),
+             NRAM2GDRAM);
+    __sync_io();
+    __bang_write_value(reinterpret_cast<int32_t*>(seg_stage), 64 * 48, 0);
+    __sync_compute();
+    *seg_buf_cnt = 0;
+  }
+}
+
+__mlu_func__ void EmitPrefillAccSeg(int b,
+                                    const int32_t* acc_rows,
+                                    const int32_t* acc_n,
+                                    int* acc_len_ptr,
+                                    PagedSeg* segs_g,
+                                    PagedSeg* seg_stage,
+                                    int32_t* seg_tiles_cache,
+                                    int* num_segs_ptr,
+                                    int* seg_buf_cnt_ptr,
+                                    int64_t* total_tiles_ptr) {
+  constexpr int kSegStageCap = 64;
+  constexpr int kSegTilesCacheCap = 4096;
+  const int acc_len = *acc_len_ptr;
+  if (acc_len <= 0) return;
+  const int buf_idx = (*seg_buf_cnt_ptr)++;
+  PagedSeg& sg = seg_stage[buf_idx];
+  sg.b = b;
+  sg.nq = acc_len;
+  int32_t mx = acc_n[0];
+  int32_t mn = acc_n[0];
+  const int seg_id = *num_segs_ptr;
+  for (int q = 0; q < acc_len; ++q) {
+    sg.rows[q] = acc_rows[q];
+    sg.n_read[q] = acc_n[q];
+    if (acc_n[q] > mx) mx = acc_n[q];
+    if (acc_n[q] < mn) mn = acc_n[q];
+  }
+  const int32_t nt = (mx + kTileSlots - 1) >> 8;
+  sg.max_n = mx;
+  sg.min_n = mn;
+  sg.num_tiles = nt;
+  if (seg_id < kSegTilesCacheCap) {
+    seg_tiles_cache[seg_id] = nt;
+  }
+  *total_tiles_ptr += nt;
+  *num_segs_ptr = seg_id + 1;
+  if (*seg_buf_cnt_ptr == kSegStageCap) {
+    FlushPrefillSegStage(segs_g, seg_stage, *num_segs_ptr, seg_buf_cnt_ptr);
+  }
+  *acc_len_ptr = 0;
+}
+
+__mlu_func__ void EmitPrefillChunkRows(int b,
+                                       int c_valid,
+                                       int tq,
+                                       const int32_t* filt_row_i,
+                                       const int32_t* filt_rn_i,
+                                       int32_t* acc_rows,
+                                       int32_t* acc_n,
+                                       int* acc_len_ptr,
+                                       float* qbf,
+                                       float* qbf_shift,
+                                       float* diff_f,
+                                       int32_t* qb_i32,
+                                       int32_t* rn_i32,
+                                       PagedSeg* segs_g,
+                                       PagedSeg* seg_stage,
+                                       int32_t* seg_tiles_cache,
+                                       int* num_segs_ptr,
+                                       int* seg_buf_cnt_ptr,
+                                       int64_t* total_tiles_ptr) {
+  constexpr int kSegStageCap = 64;
+  constexpr int kSegTilesCacheCap = 4096;
+  int idx = 0;
+  int acc_len = *acc_len_ptr;
+  if (acc_len > 0) {
+    const int need = tq - acc_len;
+    const int take = (c_valid < need) ? c_valid : need;
+    for (int i = 0; i < take; ++i) {
+      acc_rows[acc_len] = filt_row_i[i];
+      acc_n[acc_len] = filt_rn_i[i];
+      ++acc_len;
+    }
+    idx += take;
+    *acc_len_ptr = acc_len;
+    if (acc_len == tq) {
+      EmitPrefillAccSeg(b,
+                        acc_rows,
+                        acc_n,
+                        acc_len_ptr,
+                        segs_g,
+                        seg_stage,
+                        seg_tiles_cache,
+                        num_segs_ptr,
+                        seg_buf_cnt_ptr,
+                        total_tiles_ptr);
+      acc_len = 0;
+    }
+  }
+  if (tq == 16 && (c_valid - idx) >= 16) {
+    const int nf = (c_valid - idx) >> 4;
+    const int nf64 = (nf + 63) / 64 * 64;
+    const int src_elems = nf * 16;
+    const int src_r64 = (src_elems + 63) / 64 * 64;
+    __bang_write_value(qbf, nf64 * 16, 0.0f);
+    __bang_write_value(rn_i32, src_r64, 0);
+    __sync_compute();
+    __memcpy(rn_i32, filt_rn_i + idx, src_elems * sizeof(int32_t), NRAM2NRAM);
+    __sync_move();
+    __bang_int322float(qbf, rn_i32, src_r64, 0);
+    __bang_transpose(qbf_shift, qbf, nf64, 16);
+    __bang_maximum(diff_f, qbf_shift, qbf_shift + 8 * nf64, 8 * nf64);
+    __bang_maximum(diff_f, diff_f, diff_f + 4 * nf64, 4 * nf64);
+    __bang_maximum(diff_f, diff_f, diff_f + 2 * nf64, 2 * nf64);
+    __bang_maximum(diff_f, diff_f, diff_f + nf64, nf64);
+    __bang_float2int32(qb_i32, diff_f, nf64, 0);
+
+    __bang_minimum(qbf_shift, qbf_shift, qbf_shift + 8 * nf64, 8 * nf64);
+    __bang_minimum(qbf_shift, qbf_shift, qbf_shift + 4 * nf64, 4 * nf64);
+    __bang_minimum(qbf_shift, qbf_shift, qbf_shift + 2 * nf64, 2 * nf64);
+    __bang_minimum(qbf_shift, qbf_shift, qbf_shift + nf64, nf64);
+    __bang_float2int32(rn_i32, qbf_shift, nf64, 0);
+    __sync_compute();
+
+    int s0 = 0;
+    while (s0 < nf) {
+      const int seg_buf_cnt = *seg_buf_cnt_ptr;
+      const int room = kSegStageCap - seg_buf_cnt;
+      const int batch_cnt = (nf - s0) < room ? (nf - s0) : room;
+      if (batch_cnt == 1) {
+        __memcpy_async(seg_stage[seg_buf_cnt].rows,
+                       filt_row_i + idx + s0 * 16,
+                       16 * sizeof(int32_t),
+                       NRAM2NRAM);
+        __memcpy_async(seg_stage[seg_buf_cnt].n_read,
+                       filt_rn_i + idx + s0 * 16,
+                       16 * sizeof(int32_t),
+                       NRAM2NRAM);
+      } else {
+        __memcpy_async(seg_stage[seg_buf_cnt].rows,
+                       filt_row_i + idx + s0 * 16,
+                       16 * sizeof(int32_t),
+                       NRAM2NRAM,
+                       sizeof(PagedSeg),
+                       16 * sizeof(int32_t),
+                       batch_cnt - 1);
+        __memcpy_async(seg_stage[seg_buf_cnt].n_read,
+                       filt_rn_i + idx + s0 * 16,
+                       16 * sizeof(int32_t),
+                       NRAM2NRAM,
+                       sizeof(PagedSeg),
+                       16 * sizeof(int32_t),
+                       batch_cnt - 1);
+      }
+      const int base_seg = *num_segs_ptr;
+      int64_t tiles_acc = *total_tiles_ptr;
+      for (int k = 0; k < batch_cnt; ++k) {
+        PagedSeg& sg = seg_stage[seg_buf_cnt + k];
+        const int32_t mx = qb_i32[s0 + k];
+        const int32_t mn = rn_i32[s0 + k];
+        const int32_t nt = (mx + kTileSlots - 1) >> 8;
+        const int seg_id = base_seg + k;
+        sg.b = b;
+        sg.nq = 16;
+        sg.max_n = mx;
+        sg.min_n = mn;
+        sg.num_tiles = nt;
+        if (seg_id < kSegTilesCacheCap) {
+          seg_tiles_cache[seg_id] = nt;
+        }
+        tiles_acc += nt;
+      }
+      __sync_move();
+      *total_tiles_ptr = tiles_acc;
+      *num_segs_ptr = base_seg + batch_cnt;
+      *seg_buf_cnt_ptr = seg_buf_cnt + batch_cnt;
+      s0 += batch_cnt;
+      if (*seg_buf_cnt_ptr == kSegStageCap) {
+        FlushPrefillSegStage(segs_g, seg_stage, *num_segs_ptr, seg_buf_cnt_ptr);
+      }
+    }
+    idx += src_elems;
+  }
+  for (; idx < c_valid; ++idx) {
+    acc_rows[acc_len] = filt_row_i[idx];
+    acc_n[acc_len] = filt_rn_i[idx];
+    ++acc_len;
+    if (acc_len == tq) {
+      *acc_len_ptr = acc_len;
+      EmitPrefillAccSeg(b,
+                        acc_rows,
+                        acc_n,
+                        acc_len_ptr,
+                        segs_g,
+                        seg_stage,
+                        seg_tiles_cache,
+                        num_segs_ptr,
+                        seg_buf_cnt_ptr,
+                        total_tiles_ptr);
+      acc_len = 0;
+    }
+  }
+  *acc_len_ptr = acc_len;
+}
+
+// Single-core segment & schedule builder: groups non-empty query rows by batch
+// b (preserving original row indices for CP front+back and permuted batches)
+// and partitions tiles evenly across `plan.cores`.
+__mlu_global__ void PagedBuildSchedKernel(PagedParams params) {
+  if (__is_mpu() || taskId != 0) return;
+  constexpr int kChunk = 4096;
+  constexpr int kMaxRuns = 512;
+  constexpr int kMaxFastBatch = 1024;
+  constexpr int kSegStageCap = 64;
+  constexpr int kPieceStageCap = 256;
+  constexpr int kSegTilesCacheCap = 4096;
+
+  __nram__ int8_t nram_buf[416 * 1024];
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, int32_t, qb_i32, kChunk);
+  CARVE_FROM(cur, int32_t, rn_i32, kChunk);
+  CARVE_FROM(cur, float, qbf, kChunk);
+  CARVE_FROM(cur, float, qbf_shift, kChunk);
+  CARVE_FROM(cur, float, rnf, kChunk);
+  CARVE_FROM(cur, float, diff_f, kChunk);
+  CARVE_FROM(cur, float, mask_f, kChunk);
+  CARVE_FROM(cur, float, iota_f, kChunk);
+  CARVE_FROM(cur, float, row_f, kChunk);
+  CARVE_FROM(cur, float, filt_row_f, kChunk);
+  CARVE_FROM(cur, float, filt_rn_f, kChunk);
+  CARVE_FROM(cur, int32_t, filt_row_i, kChunk + 64);
+  CARVE_FROM(cur, int32_t, filt_rn_i, kChunk + 64);
+  CARVE_FROM(cur, int32_t, run_b, kMaxRuns);
+  CARVE_FROM(cur, int32_t, run_s, kMaxRuns);
+  CARVE_FROM(cur, int32_t, run_e, kMaxRuns);
+  CARVE_FROM(cur, int32_t, run_next, kMaxRuns);
+  CARVE_FROM(cur, int32_t, head_run, kMaxFastBatch);
+  CARVE_FROM(cur, int32_t, tail_run, kMaxFastBatch);
+  CARVE_FROM(cur, int32_t, seg_tiles_cache, kSegTilesCacheCap);
+  CARVE_FROM(cur, PagedSeg, seg_stage, kSegStageCap);
+  CARVE_FROM(cur, PagedSeg, seg_tmp_nram, 1);
+  CARVE_FROM(cur, PagedPiece, piece_stage, kPieceStageCap);
+  CARVE_FROM(cur, PagedSplitSeg, split_stage, kPagedMaxSplitSegs);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_stage, 1);
+  CARVE_FROM(cur, int32_t, scalar_tmp, 16);
+  CARVE_FROM(cur, int32_t, acc_rows, 16);
+  CARVE_FROM(cur, int32_t, acc_n, 16);
+
+  MakeIotaF(iota_f, kChunk);
+
+  int32_t* plan_scratch = reinterpret_cast<int32_t*>(
+      params.workspace + params.plan.plan_scratch_offset);
+  const int32_t* row_n_g = plan_scratch + params.nq;
+  PagedSeg* segs_g =
+      reinterpret_cast<PagedSeg*>(params.workspace + params.plan.seg_offset);
+  PagedPiece* pieces_g = reinterpret_cast<PagedPiece*>(
+      params.workspace + params.plan.piece_offset);
+  PagedSplitSeg* split_g = reinterpret_cast<PagedSplitSeg*>(
+      params.workspace + params.plan.split_seg_offset);
+  PagedSchedHeader* hdr_g = reinterpret_cast<PagedSchedHeader*>(
+      params.workspace + params.plan.header_offset);
+
+  const int tq = params.plan.tq;
+  int num_segs = 0;
+  int seg_buf_cnt = 0;
+  int64_t total_tiles = 0;
+  int acc_len = 0;
+
+  __bang_write_value(
+      reinterpret_cast<int32_t*>(seg_stage), kSegStageCap * 48, 0);
+  __sync_compute();
+
+  __memcpy(
+      scalar_tmp, params.num_valid_input_rows, sizeof(int32_t), GDRAM2NRAM);
+  __sync_io();
+  int64_t v_rows = scalar_tmp[0];
+  if (v_rows < 0 || params.batch <= 0) v_rows = 0;
+  if (v_rows > params.nq) v_rows = params.nq;
+
+  // Attempt fast run-compressed grouping first when batch <= kMaxFastBatch.
+  bool fast_ok = (params.batch <= kMaxFastBatch);
+  int num_runs = 0;
+  if (v_rows > 0 && fast_ok) {
+    for (int64_t r0 = 0; r0 < v_rows && fast_ok; r0 += kChunk) {
+      const int m =
+          (v_rows - r0) < kChunk ? static_cast<int>(v_rows - r0) : kChunk;
+      const int mr = (m + 63) / 64 * 64;
+      __memcpy(qb_i32,
+               params.query_batch_indices + r0,
+               m * sizeof(int32_t),
+               GDRAM2NRAM);
+      __sync_io();
+      for (int i = m; i < mr; ++i) qb_i32[i] = qb_i32[m - 1];
+      __sync();
+
+      int n_chg = 0;
+      if (m > 1) {
+        __bang_int322float(qbf, qb_i32, mr, 0);
+        __sync_compute();
+        __bang_write_value(qbf_shift, mr, 0.0f);
+        __sync_compute();
+        __memcpy(qbf_shift, qbf + 1, (m - 1) * sizeof(float), NRAM2NRAM);
+        __sync();
+        __bang_ne(diff_f, qbf_shift, qbf, mr);
+        __bang_lt_scalar(mask_f, iota_f, static_cast<float>(m - 1), mr);
+        __bang_mul(diff_f, diff_f, mask_f, mr);
+        n_chg = static_cast<int>(__bang_filter(filt_row_f, iota_f, diff_f, mr));
+        if (n_chg > 0) {
+          const int ncr = (n_chg + 63) / 64 * 64;
+          __bang_float2int32(filt_row_i, filt_row_f, ncr, 0);
+          __sync_compute();
+        }
+      }
+      int local_s = 0;
+      for (int k = 0; k <= n_chg; ++k) {
+        const int local_e = (k < n_chg) ? (filt_row_i[k] + 1) : m;
+        const int b = qb_i32[local_s];
+        const int32_t gs = static_cast<int32_t>(r0 + local_s);
+        const int32_t ge = static_cast<int32_t>(r0 + local_e);
+        if (num_runs > 0 && run_b[num_runs - 1] == b &&
+            run_e[num_runs - 1] == gs) {
+          run_e[num_runs - 1] = ge;
+        } else {
+          if (num_runs >= kMaxRuns) {
+            fast_ok = false;
+            break;
+          }
+          run_b[num_runs] = b;
+          run_s[num_runs] = gs;
+          run_e[num_runs] = ge;
+          run_next[num_runs] = -1;
+          ++num_runs;
+        }
+        local_s = local_e;
+      }
+    }
+  }
+
+  if (v_rows <= 0) {
+    // No valid rows: emit zero segments without touching any query/request
+    // metadata.
+  } else if (fast_ok) {
+    const int nb = static_cast<int>(params.batch);
+    for (int b = 0; b < nb; ++b) {
+      head_run[b] = -1;
+      tail_run[b] = -1;
+    }
+    for (int ri = 0; ri < num_runs; ++ri) {
+      const int b = run_b[ri];
+      if (head_run[b] < 0) {
+        head_run[b] = ri;
+        tail_run[b] = ri;
+      } else {
+        run_next[tail_run[b]] = ri;
+        tail_run[b] = ri;
+      }
+    }
+    for (int b = 0; b < nb; ++b) {
+      int ri = head_run[b];
+      if (ri < 0) continue;
+      acc_len = 0;
+      while (ri >= 0) {
+        const int32_t rs = run_s[ri];
+        const int32_t re = run_e[ri];
+        for (int32_t p = rs; p < re; p += kChunk) {
+          const int m = (re - p) < kChunk ? (re - p) : kChunk;
+          const int mr = (m + 63) / 64 * 64;
+          __memcpy(rn_i32, row_n_g + p, m * sizeof(int32_t), GDRAM2NRAM);
+          __sync_io();
+          for (int i = m; i < mr; ++i) rn_i32[i] = 0;
+          __sync();
+
+          __bang_int322float(rnf, rn_i32, mr, 0);
+          __bang_gt_scalar(diff_f, rnf, 0.0f, mr);
+          __bang_lt_scalar(mask_f, iota_f, static_cast<float>(m), mr);
+          __bang_mul(diff_f, diff_f, mask_f, mr);
+          const int c_valid =
+              static_cast<int>(__bang_filter(filt_rn_f, rnf, diff_f, mr));
+          if (c_valid > 0) {
+            const int cvr = (c_valid + 63) / 64 * 64;
+            __bang_add_scalar(row_f, iota_f, static_cast<float>(p), mr);
+            __bang_filter(filt_row_f, row_f, diff_f, mr);
+            __bang_float2int32(filt_rn_i, filt_rn_f, cvr, 0);
+            __bang_float2int32(filt_row_i, filt_row_f, cvr, 0);
+            __sync_compute();
+            EmitPrefillChunkRows(b,
+                                 c_valid,
+                                 tq,
+                                 filt_row_i,
+                                 filt_rn_i,
+                                 acc_rows,
+                                 acc_n,
+                                 &acc_len,
+                                 qbf,
+                                 qbf_shift,
+                                 diff_f,
+                                 qb_i32,
+                                 rn_i32,
+                                 segs_g,
+                                 seg_stage,
+                                 seg_tiles_cache,
+                                 &num_segs,
+                                 &seg_buf_cnt,
+                                 &total_tiles);
+          }
+        }
+        ri = run_next[ri];
+      }
+      if (acc_len > 0) {
+        EmitPrefillAccSeg(b,
+                          acc_rows,
+                          acc_n,
+                          &acc_len,
+                          segs_g,
+                          seg_stage,
+                          seg_tiles_cache,
+                          &num_segs,
+                          &seg_buf_cnt,
+                          &total_tiles);
+      }
+    }
+  } else {
+    // General two-pass stable bucket fallback in workspace `plan_scratch`.
+    int32_t* sorted_rows_g = plan_scratch + 2 * params.nq;
+    int32_t* sorted_n_g = plan_scratch + 3 * params.nq;
+    int32_t* counts_g = plan_scratch + 4 * params.nq;
+    int32_t* offsets_g = counts_g + (params.batch + 1);
+
+    __bang_write_value(qb_i32, kChunk, 0);
+    __sync_compute();
+    for (int64_t b0 = 0; b0 <= params.batch; b0 += kChunk) {
+      const int m = (params.batch + 1 - b0) < kChunk
+                        ? static_cast<int>(params.batch + 1 - b0)
+                        : kChunk;
+      __memcpy(counts_g + b0, qb_i32, m * sizeof(int32_t), NRAM2GDRAM);
+    }
+    __sync();
+
+    for (int64_t r0 = 0; r0 < v_rows; r0 += kChunk) {
+      const int m =
+          (v_rows - r0) < kChunk ? static_cast<int>(v_rows - r0) : kChunk;
+      __memcpy(qb_i32,
+               params.query_batch_indices + r0,
+               m * sizeof(int32_t),
+               GDRAM2NRAM);
+      __memcpy(rn_i32, row_n_g + r0, m * sizeof(int32_t), GDRAM2NRAM);
+      __sync_io();
+      for (int i = 0; i < m; ++i) {
+        if (rn_i32[i] > 0) {
+          counts_g[qb_i32[i]] += 1;
+        }
+      }
+    }
+
+    int32_t running = 0;
+    for (int64_t b = 0; b < params.batch; ++b) {
+      const int32_t c = counts_g[b];
+      offsets_g[b] = running;
+      running += c;
+    }
+    offsets_g[params.batch] = running;
+
+    for (int64_t r0 = 0; r0 < v_rows; r0 += kChunk) {
+      const int m =
+          (v_rows - r0) < kChunk ? static_cast<int>(v_rows - r0) : kChunk;
+      __memcpy(qb_i32,
+               params.query_batch_indices + r0,
+               m * sizeof(int32_t),
+               GDRAM2NRAM);
+      __memcpy(rn_i32, row_n_g + r0, m * sizeof(int32_t), GDRAM2NRAM);
+      __sync_io();
+      for (int i = 0; i < m; ++i) {
+        if (rn_i32[i] > 0) {
+          const int b = qb_i32[i];
+          const int32_t dst = offsets_g[b]++;
+          sorted_rows_g[dst] = static_cast<int32_t>(r0 + i);
+          sorted_n_g[dst] = rn_i32[i];
+        }
+      }
+    }
+
+    int32_t start = 0;
+    for (int64_t b = 0; b < params.batch; ++b) {
+      const int32_t cnt_b = counts_g[b];
+      if (cnt_b <= 0) continue;
+      acc_len = 0;
+      for (int32_t off = 0; off < cnt_b; off += kChunk) {
+        const int m = (cnt_b - off) < kChunk ? (cnt_b - off) : kChunk;
+        __memcpy(filt_row_i,
+                 sorted_rows_g + start + off,
+                 m * sizeof(int32_t),
+                 GDRAM2NRAM);
+        __memcpy(filt_rn_i,
+                 sorted_n_g + start + off,
+                 m * sizeof(int32_t),
+                 GDRAM2NRAM);
+        __sync_io();
+        EmitPrefillChunkRows(static_cast<int>(b),
+                             m,
+                             tq,
+                             filt_row_i,
+                             filt_rn_i,
+                             acc_rows,
+                             acc_n,
+                             &acc_len,
+                             qbf,
+                             qbf_shift,
+                             diff_f,
+                             qb_i32,
+                             rn_i32,
+                             segs_g,
+                             seg_stage,
+                             seg_tiles_cache,
+                             &num_segs,
+                             &seg_buf_cnt,
+                             &total_tiles);
+      }
+      if (acc_len > 0) {
+        EmitPrefillAccSeg(static_cast<int>(b),
+                          acc_rows,
+                          acc_n,
+                          &acc_len,
+                          segs_g,
+                          seg_stage,
+                          seg_tiles_cache,
+                          &num_segs,
+                          &seg_buf_cnt,
+                          &total_tiles);
+      }
+      start += cnt_b;
+    }
+  }
+
+  FlushPrefillSegStage(segs_g, seg_stage, num_segs, &seg_buf_cnt);
+  __sync();
+
+  if (params.mode != kFilter) {
+    BuildTilePieces(num_segs,
+                    seg_tiles_cache,
+                    segs_g,
+                    seg_tmp_nram,
+                    kSegTilesCacheCap,
+                    total_tiles,
+                    params.plan.cores,
+                    params.plan.do_split,
+                    hdr_stage,
+                    piece_stage,
+                    kPieceStageCap,
+                    pieces_g,
+                    split_stage,
+                    split_g);
+  } else {
+    hdr_stage->num_segs = num_segs;
+    hdr_stage->num_pieces = 0;
+    hdr_stage->num_split_segs = 0;
+    hdr_stage->total_tiles = 0;
+    hdr_stage->num_perq_segs = 0;
+    for (int c = 0; c < kPagedMaxCores; ++c) {
+      hdr_stage->core_piece_begin[c] = 0;
+      hdr_stage->core_piece_end[c] = 0;
+    }
+  }
+
+  __sync();
+  __memcpy(hdr_g, hdr_stage, sizeof(PagedSchedHeader), NRAM2GDRAM);
+  __sync();
+}
+
+__mlu_global__ void PagedScoreKernel(PagedParams params) {
+  if (__is_mpu()) return;
+  if (taskId >= kPagedMaxCores) return;
+
+  __nram__ int8_t nram_buf[496 * 1024];
+  __wram__ bfloat16_t wram_buf[kMap16WramBytes / sizeof(bfloat16_t)];
+
+  const PagedSchedHeader* hdr_g = reinterpret_cast<const PagedSchedHeader*>(
+      params.workspace + params.plan.header_offset);
+  const PagedSeg* segs_g = reinterpret_cast<const PagedSeg*>(
+      params.workspace + params.plan.seg_offset);
+  const PagedPiece* pieces_g = reinterpret_cast<const PagedPiece*>(
+      params.workspace + params.plan.piece_offset);
+
+  PagedSegBufs<16> m16;
+  PagedSegBufs<8> m8;
+  CarveSegBufs<16>(nram_buf, wram_buf, &m16, true);
+  CarveSegBufs<8>(nram_buf, wram_buf, &m8, false);
+  __memcpy(m16.hdr_nram, hdr_g, sizeof(PagedSchedHeader), GDRAM2NRAM);
+  __sync_io();
+  const int p_begin = m16.hdr_nram->core_piece_begin[taskId];
+  const int p_end = m16.hdr_nram->core_piece_end[taskId];
+  for (int p = p_begin; p < p_end; ++p) {
+    __memcpy(m16.piece_nram, pieces_g + p, sizeof(PagedPiece), GDRAM2NRAM);
+    __sync_io();
+    __memcpy(m16.seg_nram,
+             segs_g + m16.piece_nram->seg_idx,
+             sizeof(PagedSeg),
+             GDRAM2NRAM);
+    __sync_io();
+    if (m16.seg_nram->nq <= 8) {
+      PagedDensePiece<8>(params, m8, *m16.seg_nram, *m16.piece_nram);
+    } else {
+      PagedDensePiece<16>(params, m16, *m16.seg_nram, *m16.piece_nram);
+    }
+  }
+}
+
+__mlu_global__ void PagedFinalizeKernel(PagedParams params) {
+  if (__is_mpu()) return;
+  constexpr int kMergeCap = 4096;
+  __nram__ int8_t nram_buf[256 * 1024];
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, float, pool_val, kMergeCap);
+  CARVE_FROM(cur, int32_t, pool_idx, kMergeCap);
+  CARVE_FROM(cur, float, m0, kMergeCap);
+  CARVE_FROM(cur, float, m1, kMergeCap);
+  CARVE_FROM(cur, float, m2, kMergeCap);
+  CARVE_FROM(cur, float, iota, kMergeCap);
+  CARVE_FROM(cur, float, chunk_val, kBlocks);
+  CARVE_FROM(cur, int32_t, chunk_idx, kBlocks);
+  CARVE_FROM(cur, float, idx_f, kBlocks);
+  CARVE_FROM(cur, float, valid_m, kBlocks);
+  CARVE_FROM(cur, float, mask_buf, kBlocks);
+  CARVE_FROM(cur, int32_t, out32, kBlocks);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_nram, 1);
+  CARVE_FROM(cur, PagedSplitSeg, splits_nram, kPagedMaxSplitSegs);
+  CARVE_FROM(cur, PagedSeg, seg_nram, 1);
+
+  const PagedSchedHeader* hdr_g = reinterpret_cast<const PagedSchedHeader*>(
+      params.workspace + params.plan.header_offset);
+  __memcpy(hdr_nram, hdr_g, sizeof(PagedSchedHeader), GDRAM2NRAM);
+  __sync_io();
+  const int num_splits = hdr_nram->num_split_segs;
+  if (num_splits <= 0) return;
+
+  const PagedSplitSeg* splits_g = reinterpret_cast<const PagedSplitSeg*>(
+      params.workspace + params.plan.split_seg_offset);
+  __memcpy(
+      splits_nram, splits_g, num_splits * sizeof(PagedSplitSeg), GDRAM2NRAM);
+  __sync_io();
+
+  MakeIotaF(iota, kMergeCap);
+  Scratch scratch{m0, m1, m2, iota};
+
+  const PagedSeg* segs_g = reinterpret_cast<const PagedSeg*>(
+      params.workspace + params.plan.seg_offset);
+  const float* tok_pv_g = reinterpret_cast<const float*>(
+      params.workspace + params.plan.tok_part_val_offset);
+  const int32_t* tok_pi_g = reinterpret_cast<const int32_t*>(
+      params.workspace + params.plan.tok_part_idx_offset);
+  const float* blk_pv_g =
+      (params.mode == kSource)
+          ? reinterpret_cast<const float*>(params.workspace +
+                                           params.plan.blk_part_val_offset)
+          : nullptr;
+  const int32_t* blk_pi_g =
+      (params.mode == kSource)
+          ? reinterpret_cast<const int32_t*>(params.workspace +
+                                             params.plan.blk_part_idx_offset)
+          : nullptr;
+
+  const int total_items = num_splits * 16;
+  for (int item = taskId; item < total_items; item += taskDim) {
+    const int sp_idx = item >> 4;
+    const int q = item & 15;
+    const int seg_idx = splits_nram[sp_idx].seg_idx;
+    const int first_slot = splits_nram[sp_idx].first_slot;
+    const int num_parts = splits_nram[sp_idx].num_parts;
+
+    __memcpy(seg_nram, segs_g + seg_idx, sizeof(PagedSeg), GDRAM2NRAM);
+    __sync_io();
+    if (q >= seg_nram->nq) continue;
+    const int64_t orig_row = seg_nram->rows[q];
+
+    Pool tok_p{pool_val, pool_idx, 0, -INFINITY, kTopk, kMergeCap};
+    for (int p_idx = 0; p_idx < num_parts; ++p_idx) {
+      const int64_t off =
+          (static_cast<int64_t>(first_slot + p_idx) * 16 + q) * kTopk;
+      __memcpy(chunk_val, tok_pv_g + off, kTopk * sizeof(float), GDRAM2NRAM);
+      __memcpy(chunk_idx, tok_pi_g + off, kTopk * sizeof(int32_t), GDRAM2NRAM);
+      __sync_io();
+      __bang_int322float(idx_f, chunk_idx, kTopk, 0);
+      __bang_ge_scalar(valid_m, idx_f, 0.0f, kTopk);
+      PoolOffer(tok_p, chunk_val, chunk_idx, valid_m, kTopk, mask_buf, scratch);
+    }
+    if (tok_p.cnt > kTopk) PoolCompact(tok_p, scratch);
+    __bang_write_value(out32, kTopk, -1);
+    __sync_compute();
+    if (tok_p.cnt > 0) {
+      __memcpy(out32 + (kTopk - tok_p.cnt),
+               tok_p.idx,
+               tok_p.cnt * sizeof(int32_t),
+               NRAM2NRAM);
+      __sync();
+    }
+    __memcpy(params.topk_indices + orig_row * kTopk,
+             out32,
+             kTopk * sizeof(int32_t),
+             NRAM2GDRAM);
+    __sync_io();
+
+    if (params.mode == kSource) {
+      Pool blk_p{pool_val, pool_idx, 0, -INFINITY, kBlocks, kMergeCap};
+      for (int p_idx = 0; p_idx < num_parts; ++p_idx) {
+        const int64_t boff =
+            (static_cast<int64_t>(first_slot + p_idx) * 16 + q) * kBlocks;
+        __memcpy(
+            chunk_val, blk_pv_g + boff, kBlocks * sizeof(float), GDRAM2NRAM);
+        __memcpy(
+            chunk_idx, blk_pi_g + boff, kBlocks * sizeof(int32_t), GDRAM2NRAM);
+        __sync_io();
+        __bang_int322float(idx_f, chunk_idx, kBlocks, 0);
+        __bang_ge_scalar(valid_m, idx_f, 0.0f, kBlocks);
+        PoolOffer(
+            blk_p, chunk_val, chunk_idx, valid_m, kBlocks, mask_buf, scratch);
+      }
+      if (blk_p.cnt > kBlocks) PoolCompact(blk_p, scratch);
+      __bang_write_value(out32, kBlocks, -1);
+      __sync_compute();
+      if (blk_p.cnt > 0) {
+        __memcpy(out32, blk_p.idx, blk_p.cnt * sizeof(int32_t), NRAM2NRAM);
+        __sync();
+      }
+      __memcpy(params.candidate_ids_out + orig_row * kBlocks,
+               out32,
+               kBlocks * sizeof(int32_t),
+               NRAM2GDRAM);
+      __sync_io();
+    }
+    __sync();
+  }
+}
+
+// FILTER Stage 1 (when funion == 1): reachability-first candidate filter +
+// union per segment via direct window bitmap scatter (no per-query radix sort
+// needed). Never accesses paged_block_table or paged_k.
+__mlu_global__ void PagedFilterUnionKernel(PagedParams params) {
+  if (__is_mpu()) return;
+  constexpr int TQ = 16;
+  constexpr int BPT = kTileSlots / kBlockSize;
+
+  __nram__ int8_t nram_buf[496 * 1024];
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, float, lists, TQ* kBlocks);
+  CARVE_FROM(cur, int32_t, xa, kBlocks);
+  CARVE_FROM(cur, float, fm0, kBlocks);
+  CARVE_FROM(cur, float, fm1, kBlocks);
+  CARVE_FROM(cur, uint32_t, soff, kBlocks);
+  CARVE_FROM(cur, float, ones, kBlocks);
+  CARVE_FROM(cur, float, flag, kUWin);
+  CARVE_FROM(cur, float, bits, kUWin);
+  CARVE_FROM(cur, float, iotaw, kUWin);
+  CARVE_FROM(cur, float, outid_f, kUWin);
+  CARVE_FROM(cur, float, outbit_f, kUWin);
+  CARVE_FROM(cur, int32_t, neg_ones, kTopk);
+  CARVE_FROM(cur, int32_t, hdr_u, 16);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_nram, 1);
+  CARVE_FROM(cur, PagedSeg, seg_nram, 1);
+
+  const PagedSchedHeader* hdr_g = reinterpret_cast<const PagedSchedHeader*>(
+      params.workspace + params.plan.header_offset);
+  __memcpy(hdr_nram, hdr_g, sizeof(PagedSchedHeader), GDRAM2NRAM);
+  __sync_io();
+  const int num_segs = hdr_nram->num_segs;
+  if (num_segs <= 0) return;
+
+  MakeIotaF(iotaw, kUWin);
+  __bang_write_value(ones, kBlocks, 1.0f);
+  __bang_write_value(neg_ones, kTopk, -1);
+  __sync_compute();
+
+  const PagedSeg* segs_g = reinterpret_cast<const PagedSeg*>(
+      params.workspace + params.plan.seg_offset);
+
+  for (int s = taskId; s < num_segs; s += taskDim) {
+    __memcpy(seg_nram, segs_g + s, sizeof(PagedSeg), GDRAM2NRAM);
+    __sync_io();
+    const int nq = seg_nram->nq;
+    int nl[TQ];
+    int rem[TQ];
+    int rem_total = 0;
+    float perq_tiles = 0.0f;
+    int max_reach_blk = 0;
+    float* idf = bits;  // [kBlocks], dead before bitmap scatter
+
+    for (int q = 0; q < nq; ++q) {
+      const int n_reach_blocks =
+          (seg_nram->n_read[q] + kBlockSize - 1) / kBlockSize;
+      if (n_reach_blocks > max_reach_blk) max_reach_blk = n_reach_blocks;
+      if (n_reach_blocks <= 0) {
+        nl[q] = 0;
+        rem[q] = 0;
+        continue;
+      }
+      __memcpy(xa,
+               params.candidate_ids +
+                   static_cast<int64_t>(seg_nram->rows[q]) * kBlocks,
+               kBlocks * sizeof(int32_t),
+               GDRAM2NRAM);
+      __sync_io();
+      __bang_int322float(idf, xa, kBlocks, 0);
+      __bang_ge_scalar(fm0, idf, 0.0f, kBlocks);
+      __bang_lt_scalar(fm1, idf, static_cast<float>(n_reach_blocks), kBlocks);
+      __bang_mul(fm0, fm0, fm1, kBlocks);
+      nl[q] = static_cast<int>(
+          __bang_filter(lists + q * kBlocks, idf, fm0, kBlocks));
+      __sync_compute();
+      rem[q] = nl[q];
+      rem_total += nl[q];
+      perq_tiles += static_cast<float>((nl[q] + BPT - 1) / BPT);
+    }
+
+    uint8_t* seg_u = params.workspace + params.plan.union_offset +
+                     static_cast<int64_t>(s) * PagedUnionSegBytes();
+    int32_t* uid_g = reinterpret_cast<int32_t*>(seg_u + 64);
+    int32_t* ubit_g = uid_g + kPagedUnionCap;
+
+    if (perq_tiles == 0.0f) {
+      for (int q = 0; q < nq; ++q) {
+        __memcpy(params.topk_indices +
+                     static_cast<int64_t>(seg_nram->rows[q]) * kTopk,
+                 neg_ones,
+                 kTopk * sizeof(int32_t),
+                 NRAM2GDRAM);
+      }
+      hdr_u[0] = 0;
+      hdr_u[1] = -1;
+      __sync();
+      __memcpy(seg_u, hdr_u, 2 * sizeof(int32_t), NRAM2GDRAM);
+      __sync_io();
+      continue;
+    }
+
+    if (max_reach_blk <= kUWin) {
+      const int win_len = (max_reach_blk + 63) / 64 * 64;
+      __bang_write_value(bits, win_len, 0.0f);
+      for (int q = 0; q < nq; ++q) {
+        const int cnt = nl[q];
+        if (cnt <= 0) continue;
+        const int cnt64 = (cnt + 63) / 64 * 64;
+        const float* lq = lists + q * kBlocks;
+        __bang_mul_scalar(fm1, lq, static_cast<float>(sizeof(float)), cnt);
+        __bang_float2int32(reinterpret_cast<int32_t*>(soff), fm1, cnt64, 0);
+        __bang_write_value(flag, win_len, 0.0f);
+        __sync_compute();
+        __scatter(
+            flag, ones, soff, sizeof(float), NRAM2NRAM, sizeof(float), cnt);
+        __sync_move();
+        __bang_mul_scalar(flag, flag, static_cast<float>(1 << q), win_len);
+        __bang_add(bits, bits, flag, win_len);
+      }
+      __bang_gt_scalar(flag, bits, 0.5f, win_len);
+      const int nw =
+          static_cast<int>(__bang_filter(outid_f, iotaw, flag, win_len));
+      const float union_tiles = static_cast<float>((nw + BPT - 1) / BPT);
+      if (nw > 0 && nw <= kPagedUnionCap &&
+          union_tiles * kUnionTileCost < perq_tiles * kQueryTileCost) {
+        __bang_filter(outbit_f, bits, flag, win_len);
+        const int nwr = (nw + 63) / 64 * 64;
+        int32_t* outid_i = reinterpret_cast<int32_t*>(flag);
+        int32_t* outbit_i = reinterpret_cast<int32_t*>(bits);
+        __bang_float2int32(outid_i, outid_f, nwr, 0);
+        __bang_float2int32(outbit_i, outbit_f, nwr, 0);
+        __sync_compute();
+        __memcpy(uid_g, outid_i, nw * sizeof(int32_t), NRAM2GDRAM);
+        __memcpy(ubit_g, outbit_i, nw * sizeof(int32_t), NRAM2GDRAM);
+        __sync_io();
+        hdr_u[0] = nw;
+        hdr_u[1] = 1;
+      } else {
+        hdr_u[0] = 0;
+        hdr_u[1] = 0;
+      }
+    } else {
+      int total = 0;
+      bool overflow = false;
+      for (int w0 = 0; w0 < max_reach_blk && rem_total > 0; w0 += kUWin) {
+        const int span =
+            (max_reach_blk - w0) < kUWin ? (max_reach_blk - w0) : kUWin;
+        const int win_len = (span + 63) / 64 * 64;
+        __bang_write_value(bits, win_len, 0.0f);
+        bool any_in_win = false;
+        for (int q = 0; q < nq; ++q) {
+          if (rem[q] <= 0) continue;
+          const int nq_len = nl[q];
+          const float* lq = lists + q * kBlocks;
+          __bang_ge_scalar(fm0, lq, static_cast<float>(w0), nq_len);
+          __bang_lt_scalar(fm1, lq, static_cast<float>(w0 + span), nq_len);
+          __bang_mul(fm0, fm0, fm1, nq_len);
+          const int cnt = static_cast<int>(__bang_filter(fm1, lq, fm0, nq_len));
+          if (cnt == 0) continue;
+          any_in_win = true;
+          rem[q] -= cnt;
+          rem_total -= cnt;
+          const int cnt64 = (cnt + 63) / 64 * 64;
+          __bang_sub_scalar(fm1, fm1, static_cast<float>(w0), cnt);
+          __bang_mul_scalar(fm1, fm1, static_cast<float>(sizeof(float)), cnt);
+          __bang_float2int32(reinterpret_cast<int32_t*>(soff), fm1, cnt64, 0);
+          __bang_write_value(flag, win_len, 0.0f);
+          __sync_compute();
+          __scatter(
+              flag, ones, soff, sizeof(float), NRAM2NRAM, sizeof(float), cnt);
+          __sync_move();
+          __bang_mul_scalar(flag, flag, static_cast<float>(1 << q), win_len);
+          __bang_add(bits, bits, flag, win_len);
+        }
+        if (!any_in_win) continue;
+        __bang_gt_scalar(flag, bits, 0.5f, win_len);
+        const int nw =
+            static_cast<int>(__bang_filter(outid_f, iotaw, flag, win_len));
+        const float next_tiles =
+            static_cast<float>((total + nw + BPT - 1) / BPT);
+        if (total + nw > kPagedUnionCap ||
+            next_tiles * kUnionTileCost >= perq_tiles * kQueryTileCost) {
+          overflow = true;
+          break;
+        }
+        __bang_filter(outbit_f, bits, flag, win_len);
+        __bang_add_scalar(outid_f, outid_f, static_cast<float>(w0), nw);
+        const int nwr = (nw + 63) / 64 * 64;
+        int32_t* outid_i = reinterpret_cast<int32_t*>(flag);
+        int32_t* outbit_i = reinterpret_cast<int32_t*>(bits);
+        __bang_float2int32(outid_i, outid_f, nwr, 0);
+        __bang_float2int32(outbit_i, outbit_f, nwr, 0);
+        __sync_compute();
+        __memcpy(uid_g + total, outid_i, nw * sizeof(int32_t), NRAM2GDRAM);
+        __memcpy(ubit_g + total, outbit_i, nw * sizeof(int32_t), NRAM2GDRAM);
+        __sync_io();
+        total += nw;
+      }
+      if (overflow) {
+        hdr_u[0] = 0;
+        hdr_u[1] = 0;
+      } else {
+        const float union_tiles = static_cast<float>((total + BPT - 1) / BPT);
+        hdr_u[0] = total;
+        hdr_u[1] = (total > 0 &&
+                    union_tiles * kUnionTileCost < perq_tiles * kQueryTileCost)
+                       ? 1
+                       : 0;
+      }
+    }
+    __sync();
+    __memcpy(seg_u, hdr_u, 2 * sizeof(int32_t), NRAM2GDRAM);
+    __sync_io();
+  }
+  __sync();
+}
+
+// FILTER Stage 2 (1 core): partitions active union segments (hdr_u[1] == 1)
+// across `plan.cores`.
+__mlu_global__ void PagedFilterPlanSplitKernel(PagedParams params) {
+  if (__is_mpu() || taskId != 0) return;
+  constexpr int kSegTilesCacheCap = 4096;
+  constexpr int kPieceStageCap = 256;
+  constexpr int kHuBatch = 256;
+
+  __nram__ int8_t nram_buf[96 * 1024];
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, int32_t, seg_tiles_cache, kSegTilesCacheCap);
+  CARVE_FROM(cur, PagedPiece, piece_stage, kPieceStageCap);
+  CARVE_FROM(cur, PagedSplitSeg, split_stage, kPagedMaxSplitSegs);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_stage, 1);
+  CARVE_FROM(cur, PagedSeg, seg_tmp_nram, 1);
+  CARVE_FROM(cur, int32_t, hu_stage, 2 * kHuBatch);
+  CARVE_FROM(cur, int32_t, perq_stage, kHuBatch);
+
+  PagedSchedHeader* hdr_g = reinterpret_cast<PagedSchedHeader*>(
+      params.workspace + params.plan.header_offset);
+  __memcpy(hdr_stage, hdr_g, sizeof(PagedSchedHeader), GDRAM2NRAM);
+  __sync_io();
+  const int num_segs = hdr_stage->num_segs;
+  if (num_segs <= 0) return;
+
+  PagedSeg* segs_g =
+      reinterpret_cast<PagedSeg*>(params.workspace + params.plan.seg_offset);
+  PagedPiece* pieces_g = reinterpret_cast<PagedPiece*>(
+      params.workspace + params.plan.piece_offset);
+  PagedSplitSeg* split_g = reinterpret_cast<PagedSplitSeg*>(
+      params.workspace + params.plan.split_seg_offset);
+  int32_t* perq_segs_g =
+      reinterpret_cast<int32_t*>(params.workspace + params.plan.row_seg_offset);
+
+  constexpr int BPT = kTileSlots / kBlockSize;
+  int64_t total_union_tiles = 0;
+  int num_perq_segs = 0;
+  for (int s0 = 0; s0 < num_segs; s0 += kHuBatch) {
+    const int cnt = (num_segs - s0) < kHuBatch ? (num_segs - s0) : kHuBatch;
+    for (int j = 0; j < cnt; ++j) {
+      const int32_t* hu_g = reinterpret_cast<const int32_t*>(
+          params.workspace + params.plan.union_offset +
+          static_cast<int64_t>(s0 + j) * PagedUnionSegBytes());
+      __memcpy_async(hu_stage + 2 * j, hu_g, 2 * sizeof(int32_t), GDRAM2NRAM);
+    }
+    __sync_io();
+    int perq_cnt = 0;
+    for (int j = 0; j < cnt; ++j) {
+      const int s = s0 + j;
+      const int32_t ub_cnt = hu_stage[2 * j];
+      const int32_t u_mode = hu_stage[2 * j + 1];
+      if (u_mode == 0) {
+        perq_stage[perq_cnt++] = s;
+      }
+      const int32_t nt =
+          (u_mode == 1 && ub_cnt > 0) ? ((ub_cnt + BPT - 1) / BPT) : 0;
+      if (s < kSegTilesCacheCap) {
+        seg_tiles_cache[s] = nt;
+      } else {
+        __memcpy(seg_tmp_nram, segs_g + s, sizeof(PagedSeg), GDRAM2NRAM);
+        __sync_io();
+        seg_tmp_nram->num_tiles = nt;
+        __sync();
+        __memcpy(segs_g + s, seg_tmp_nram, sizeof(PagedSeg), NRAM2GDRAM);
+        __sync_io();
+      }
+      total_union_tiles += nt;
+    }
+    if (perq_cnt > 0) {
+      __sync();
+      __memcpy(perq_segs_g + num_perq_segs,
+               perq_stage,
+               perq_cnt * sizeof(int32_t),
+               NRAM2GDRAM);
+      __sync_io();
+      num_perq_segs += perq_cnt;
+    }
+  }
+
+  BuildTilePieces(num_segs,
+                  seg_tiles_cache,
+                  segs_g,
+                  seg_tmp_nram,
+                  kSegTilesCacheCap,
+                  total_union_tiles,
+                  params.plan.cores,
+                  params.plan.do_split,
+                  hdr_stage,
+                  piece_stage,
+                  kPieceStageCap,
+                  pieces_g,
+                  split_stage,
+                  split_g);
+  hdr_stage->num_perq_segs = num_perq_segs;
+  __sync();
+  __memcpy(hdr_g, hdr_stage, sizeof(PagedSchedHeader), NRAM2GDRAM);
+  __sync();
+}
+
+// FILTER Stage 3a: scores union segments (`hdr_u[1] == 1`).
+__mlu_global__ void PagedFilterUnionScoreKernel(PagedParams params) {
+  if (__is_mpu()) return;
+  if (taskId >= kPagedMaxCores) return;
+
+  __nram__ int8_t nram_buf[496 * 1024];
+  __wram__ bfloat16_t wram_buf[kMap16WramBytes / sizeof(bfloat16_t)];
+
+  constexpr int N = kTileSlots;
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, bfloat16_t, kbf, N * kDim);
+  CARVE_FROM(cur, float, kf32, N* kDim);
+  CARVE_FROM(cur, float, ob, N * 64);
+  CARVE_FROM(cur, float, acc, N * 64);
+  CARVE_FROM(cur, float, wv, kHeads * 16);
+  CARVE_FROM(cur, float, w_f32, kHeads * 16);
+  CARVE_FROM(cur, bfloat16_t, w_bf16, kHeads * 16);
+  CARVE_FROM(cur, float, tfm, 16 * N);
+  CARVE_FROM(cur, float, rowc, 64);
+  CARVE_FROM(cur, float, tok_val, 16 * kSegTokCap);
+  CARVE_FROM(cur, int32_t, tok_idx, 16 * kSegTokCap);
+  CARVE_FROM(cur, float, sc_iota, kSegTokCap);
+  CARVE_FROM(cur, int32_t, slot_ring, 3 * N);
+  CARVE_FROM(cur, int32_t, bits_ring, 3 * 32);
+  CARVE_FROM(cur, int32_t, ub_tmp, 64);
+  CARVE_FROM(cur, int32_t, qbit, 16);
+  CARVE_FROM(cur, int32_t, page_tmp, 64);
+  CARVE_FROM(cur, uint32_t, p_boff, 32);
+  CARVE_FROM(cur, uint64_t, k_boff, 32);
+  CARVE_FROM(cur, float, ub_f, 64);
+  CARVE_FROM(cur, float, rows8, N);
+  CARVE_FROM(cur, float, slot_f, N);
+  CARVE_FROM(cur, float, pat64, 64);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_nram, 1);
+  CARVE_FROM(cur, PagedSeg, seg_nram, 1);
+  CARVE_FROM(cur, PagedPiece, piece_nram, 1);
+
+  const PagedSchedHeader* hdr_g = reinterpret_cast<const PagedSchedHeader*>(
+      params.workspace + params.plan.header_offset);
+  __memcpy(hdr_nram, hdr_g, sizeof(PagedSchedHeader), GDRAM2NRAM);
+  __sync_io();
+  const int p_begin = hdr_nram->core_piece_begin[taskId];
+  const int p_end = hdr_nram->core_piece_end[taskId];
+  if (p_begin >= p_end) return;
+
+  MakeIotaF(sc_iota, kSegTokCap);
+  for (int q = 0; q < 16; ++q) qbit[q] = 1 << q;
+  for (int i = 0; i < 64; ++i) pat64[i] = static_cast<float>(i & 7);
+  __sync();
+
+  PagedSegBufs<16> m16{kbf,      kf32,     ob,        acc,     wv,
+                       w_f32,    w_bf16,   nullptr,   nullptr, nullptr,
+                       tfm,      rowc,     nullptr,   nullptr, nullptr,
+                       page_tmp, tok_val,  tok_idx,   sc_iota, wram_buf,
+                       hdr_nram, seg_nram, piece_nram};
+  PagedSegBufs<8> m8{kbf,     kf32,     ob,       acc,      wv,        w_f32,
+                     w_bf16,  nullptr,  nullptr,  nullptr,  tfm,       rowc,
+                     nullptr, nullptr,  nullptr,  page_tmp, tok_val,   tok_idx,
+                     sc_iota, wram_buf, hdr_nram, seg_nram, piece_nram};
+  PagedUnionTileBufs u{slot_ring,
+                       bits_ring,
+                       ub_tmp,
+                       qbit,
+                       page_tmp,
+                       p_boff,
+                       k_boff,
+                       ub_f,
+                       rows8,
+                       slot_f,
+                       pat64};
+
+  const PagedSeg* segs_g = reinterpret_cast<const PagedSeg*>(
+      params.workspace + params.plan.seg_offset);
+  const PagedPiece* pieces_g = reinterpret_cast<const PagedPiece*>(
+      params.workspace + params.plan.piece_offset);
+
+  for (int p = p_begin; p < p_end; ++p) {
+    __memcpy(piece_nram, pieces_g + p, sizeof(PagedPiece), GDRAM2NRAM);
+    __sync_io();
+    __memcpy(
+        seg_nram, segs_g + piece_nram->seg_idx, sizeof(PagedSeg), GDRAM2NRAM);
+    __sync_io();
+    if (seg_nram->nq <= 8) {
+      PagedFilterSegmentPiece<8>(params, m8, u, *seg_nram, *piece_nram);
+    } else {
+      PagedFilterSegmentPiece<16>(params, m16, u, *seg_nram, *piece_nram);
+    }
+  }
+}
+
+// FILTER per-query kernel: handles queries when `funion == 0` or when
+// `PagedFilterUnionKernel` routed a segment to per-query scoring (`hdr_u[1] ==
+// 0`). Strictly filters `0 <= blk < ceil(n_u / 8)` BEFORE touching
+// `paged_block_table` or `paged_k`, and coalesces adjacent blocks inside the
+// same physical page.
+__mlu_global__ void PagedFilterQueryKernel(PagedParams params) {
+  const auto& page = params.page;
+  if (__is_mpu()) return;
+  constexpr int kFTokCap = 2048;
+  constexpr int BPT = kTileSlots / kBlockSize;  // 32
+
+  __nram__ int8_t nram_buf[480 * 1024];
+  __wram__ bfloat16_t wram_k[kMap16WramBytes / sizeof(bfloat16_t)];
+  int8_t* cur = nram_buf;
+  CARVE_FROM(cur, bfloat16_t, kbf, 2 * kTileSlots * kDim);
+  CARVE_FROM(cur, float, k_f32, kTileSlots* kDim);
+  CARVE_FROM(cur, float, qk, 2 * kTileSlots * kHeads);
+  CARVE_FROM(cur, int32_t, slot_all_i, kBlocks* kBlockSize);
+  CARVE_FROM(cur, float, ub_f, kBlocks);
+  CARVE_FROM(cur, int32_t, ub_i, kBlocks);
+  CARVE_FROM(cur, int32_t, page_all, kBlocks);
+  CARVE_FROM(cur, uint64_t, k_boff64_all, kBlocks);
+  CARVE_FROM(cur, float, reach_ring, 2 * kTileSlots);
+  CARVE_FROM(cur, float, iota_f256, kTileSlots);
+  CARVE_FROM(cur, float, pat64, 64);
+  CARVE_FROM(cur, float, pool_mask, kTileSlots);
+  CARVE_FROM(cur, float, score, kTileSlots);
+  CARVE_FROM(cur, float, w_f32, kHeads);
+  CARVE_FROM(cur, bfloat16_t, w_bf16, kHeads);
+  CARVE_FROM(cur, int32_t, page_tmp, 64);
+  CARVE_FROM(cur, float, tok_val, kFTokCap);
+  CARVE_FROM(cur, int32_t, tok_idx, kFTokCap);
+  CARVE_FROM(cur, float, sc_iota, kFTokCap);
+  CARVE_FROM(cur, int32_t, out32, kTopk);
+  CARVE_FROM(cur, int32_t, neg_ones, kTopk);
+  CARVE_FROM(cur, PagedSchedHeader, hdr_nram, 1);
+  CARVE_FROM(cur, PagedSeg, seg_nram, 1);
+
+  int num_perq_segs = 0;
+  int64_t v_rows = params.nq;
+  __bang_write_value(neg_ones, kTopk, -1);
+  if (params.plan.funion) {
+    const PagedSchedHeader* hdr_g = reinterpret_cast<const PagedSchedHeader*>(
+        params.workspace + params.plan.header_offset);
+    __memcpy(hdr_nram, hdr_g, sizeof(PagedSchedHeader), GDRAM2NRAM);
+    __sync_io();
+    num_perq_segs = hdr_nram->num_perq_segs;
+    if (num_perq_segs <= 0) return;
+  } else {
+    __memcpy(
+        page_tmp, params.num_valid_input_rows, sizeof(int32_t), GDRAM2NRAM);
+    __sync_io();
+    __sync_compute();
+    v_rows = page_tmp[0];
+    if (v_rows < 0 || params.batch <= 0) v_rows = 0;
+    if (v_rows > params.nq) v_rows = params.nq;
+    if (v_rows < params.nq) {
+      const int64_t tail_cnt = params.nq - v_rows;
+      const int64_t t_lo = v_rows + CoreLo(tail_cnt, taskId, taskDim);
+      const int64_t t_hi = v_rows + CoreLo(tail_cnt, taskId + 1, taskDim);
+      for (int64_t r = t_lo; r < t_hi; ++r) {
+        __memcpy_async(params.topk_indices + r * kTopk,
+                       neg_ones,
+                       kTopk * sizeof(int32_t),
+                       NRAM2GDRAM);
+      }
+      __sync_io();
+    }
+    if (v_rows <= 0) return;
+  }
+
+  MakeIotaF(iota_f256, kTileSlots);
+  MakeIotaF(sc_iota, kFTokCap);
+  for (int i = 0; i < 64; ++i) pat64[i] = static_cast<float>(i & 7);
+  __sync();
+  Scratch scratch{k_f32, k_f32 + kFTokCap, k_f32 + 2 * kFTokCap, sc_iota};
+
+  int32_t* xa = reinterpret_cast<int32_t*>(qk);
+  int32_t* xb = xa + kBlocks;
+  float* idf = reinterpret_cast<float*>(xb + kBlocks);
+  float* xf = idf + kBlocks;
+  float* keepf = xf + kBlocks;
+  int32_t* rm1 = reinterpret_cast<int32_t*>(k_f32);
+  float* fm0 = k_f32 + kBlocks;
+  float* fm1 = fm0 + kBlocks;
+  uint32_t* k_boff32_all = reinterpret_cast<uint32_t*>(k_boff64_all);
+  const bool use_u32_boff = (params.paged_rows < (int64_t{1} << 24));
+
+  const bfloat16_t* query = static_cast<const bfloat16_t*>(params.query);
+  const bfloat16_t* weights = static_cast<const bfloat16_t*>(params.weights);
+  const bfloat16_t* paged_k = static_cast<const bfloat16_t*>(params.paged_k);
+  const int32_t* perq_segs_g =
+      params.plan.funion ? reinterpret_cast<const int32_t*>(
+                               params.workspace + params.plan.row_seg_offset)
+                         : nullptr;
+  const PagedSeg* segs_g = params.plan.funion
+                               ? reinterpret_cast<const PagedSeg*>(
+                                     params.workspace + params.plan.seg_offset)
+                               : nullptr;
+
+  auto load_q_tile = [&](int n_u, int nu, int t) -> bool {
+    constexpr uint32_t kBlockBytes = kBlockSize * kDim * sizeof(bfloat16_t);
+    const int st = t & 1;
+    const int b_off = t * BPT;
+    const int nb = (nu - b_off) < BPT ? (nu - b_off) : BPT;
+    const int n = nb * kBlockSize;
+    const int nco = (n + 63) / 64 * 64;
+    bfloat16_t* kb = kbf + st * kTileSlots * kDim;
+    float* rd = reach_ring + st * kTileSlots;
+
+    const int last_s0 = ub_i[b_off + nb - 1] * kBlockSize;
+    const int last_w =
+        (n_u - last_s0) < kBlockSize ? (n_u - last_s0) : kBlockSize;
+    const int valid_slots = (nb - 1) * kBlockSize + last_w;
+    const bool full_reach = (valid_slots == nco);
+    if (!full_reach) {
+      __bang_lt_scalar(rd, iota_f256, static_cast<float>(valid_slots), nco);
+    }
+
+    const int nfull = (last_w == kBlockSize) ? nb : (nb - 1);
+    if (nfull > 0) {
+      if (use_u32_boff) {
+        __gather_async(kb,
+                       paged_k,
+                       k_boff32_all + b_off,
+                       kBlockBytes,
+                       GDRAM2NRAM,
+                       kBlockBytes,
+                       nfull);
+      } else {
+        __gather_async(kb,
+                       paged_k,
+                       k_boff64_all + b_off,
+                       kBlockBytes,
+                       GDRAM2NRAM,
+                       kBlockBytes,
+                       nfull);
+      }
+    }
+    if (nfull < nb) {
+      const int j_last = nb - 1;
+      const int64_t phys_page = static_cast<int64_t>(page_all[b_off + j_last]);
+      const int32_t blk_last = ub_i[b_off + j_last];
+      const bfloat16_t* k_src =
+          paged_k +
+          (phys_page * page.rows + (blk_last & page.block_mask) * kBlockSize) *
+              kDim;
+      bfloat16_t* k_dst = kb + (j_last * kBlockSize) * kDim;
+      if (last_w > 0) {
+        __memcpy_async(
+            k_dst, k_src, last_w * kDim * sizeof(bfloat16_t), GDRAM2NRAM);
+      }
+      __bang_write_value(k_dst + last_w * kDim,
+                         (kBlockSize - last_w) * kDim,
+                         static_cast<bfloat16_t>(0));
+    }
+    if (nco > n) {
+      __bang_write_value(
+          kb + n * kDim, (nco - n) * kDim, static_cast<bfloat16_t>(0));
+    }
+    return full_reach;
+  };
+
+  const int64_t iter_end =
+      params.plan.funion ? (static_cast<int64_t>(num_perq_segs) * 16) : v_rows;
+  int64_t cached_seg_slot = -1;
+  int cached_b = -1;
+  int32_t cached_hlen = 0;
+  for (int64_t it = taskId; it < iter_end; it += taskDim) {
+    int64_t u = it;
+    int b = 0;
+    int32_t n_u = 0;
+    if (params.plan.funion) {
+      const int64_t seg_slot = it >> 4;
+      const int q = static_cast<int>(it & 15);
+      if (seg_slot != cached_seg_slot) {
+        __memcpy(page_tmp, perq_segs_g + seg_slot, sizeof(int32_t), GDRAM2NRAM);
+        __sync_io();
+        __memcpy(seg_nram, segs_g + page_tmp[0], sizeof(PagedSeg), GDRAM2NRAM);
+        __sync_io();
+        cached_seg_slot = seg_slot;
+      }
+      if (q >= seg_nram->nq) continue;
+      u = seg_nram->rows[q];
+      b = seg_nram->b;
+      n_u = seg_nram->n_read[q];
+    } else {
+      __memcpy_async(page_tmp,
+                     params.query_batch_indices + u,
+                     sizeof(int32_t),
+                     GDRAM2NRAM);
+      __memcpy_async(page_tmp + 1,
+                     params.query_positions + u,
+                     sizeof(int32_t),
+                     GDRAM2NRAM);
+      __sync_io();
+      b = page_tmp[0];
+      const int32_t qpos = page_tmp[1];
+      if (b != cached_b) {
+        __memcpy(page_tmp + 2,
+                 params.history_lengths + b,
+                 sizeof(int32_t),
+                 GDRAM2NRAM);
+        __sync_io();
+        cached_hlen = page_tmp[2];
+        cached_b = b;
+      }
+      n_u = ReadableCount(qpos, cached_hlen, params.ratio);
+    }
+    if (n_u <= 0) {
+      __memcpy_async(params.topk_indices + u * kTopk,
+                     neg_ones,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+      continue;
+    }
+
+    __sync();
+    // Prefetch query directly to WRAM and weights to NRAM while filtering &
+    // sorting candidates.
+    LoadQueriesMap16(wram_k, query + u * kHeads * kDim, 1, GDRAM2WRAM);
+    __memcpy_async(
+        w_bf16, weights + u * kHeads, kHeads * sizeof(bfloat16_t), GDRAM2NRAM);
+
+    const int n_reach_blocks = (n_u + kBlockSize - 1) / kBlockSize;
+    const int nu = SortReachableCandidates(params.candidate_ids + u * kBlocks,
+                                           n_reach_blocks,
+                                           xa,
+                                           xb,
+                                           idf,
+                                           xf,
+                                           keepf,
+                                           rm1,
+                                           fm0,
+                                           fm1,
+                                           ub_f);
+    if (nu <= 0) {
+      __sync_io();
+      __memcpy_async(params.topk_indices + u * kTopk,
+                     neg_ones,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+      continue;
+    }
+    const int nu64 = (nu + 63) / 64 * 64;
+    if (nu64 > nu) {
+      for (int j = nu; j < nu64; ++j) {
+        ub_f[j] = static_cast<float>(kMaxPositionSentinel / kBlockSize);
+      }
+      __sync();
+    }
+    // Wait for query & weights DMA (landed during SortReachableCandidates)
+    __sync_io();
+
+    __bang_float2int32(ub_i, ub_f, nu64, 0);
+    __sync_compute();
+    const int32_t* table_b =
+        params.paged_block_table + static_cast<int64_t>(b) * params.max_pages;
+    const int span_p =
+        (ub_i[nu - 1] >> page.block_shift) - (ub_i[0] >> page.block_shift) + 1;
+    if (nu > 256 && span_p <= 4096 && nu >= 2 * span_p) {
+      LoadSortedBlockPagesPrefill(
+          params.page, table_b, ub_i, nu, page_all, k_f32, sc_iota);
+    } else {
+      uint32_t* p_boff = reinterpret_cast<uint32_t*>(qk);
+      __bang_band_scalar(xa, ub_i, ~page.block_mask, nu64);
+      __bang_int322float(xf, xa, nu64, 0);
+      __bang_mul_scalar(xf, xf, 4.0f * page.inverse_blocks, nu64);
+      __bang_float2int32(reinterpret_cast<int32_t*>(p_boff), xf, nu64, 0);
+      __sync_compute();
+      __gather_async(page_all,
+                     table_b,
+                     p_boff,
+                     sizeof(int32_t),
+                     GDRAM2NRAM,
+                     sizeof(int32_t),
+                     nu);
+    }
+
+    if (params.logits_dtype == kLogitsFp32) {
+      __bang_bfloat162float(w_f32, w_bf16, kHeads);
+    }
+
+    // Overlap slot_all_i[0 .. nu64 * 8 - 1] expansion with GDRAM page_all
+    // gather!
+    float* rows8 = k_f32;
+    float* slot_f = k_f32 + kBlocks * kBlockSize;
+    __bang_mul_scalar(xf, ub_f, static_cast<float>(kBlockSize), nu64);
+    __bang_write_value(rows8, kBlockSize * nu64, 0.0f);
+    __bang_cycle_add(rows8, rows8, xf, kBlockSize * nu64, nu64);
+    __bang_transpose(slot_f, rows8, kBlockSize, nu64);
+    __bang_cycle_add(slot_f, slot_f, pat64, kBlockSize * nu64, 64);
+    __bang_float2int32(slot_all_i, slot_f, kBlockSize * nu64, 0);
+    __sync_io();
+
+    // Precompute all nu block byte offsets once per query, eliminating the
+    // per-tile scalar loop and per-tile __sync() inside load_q_tile!
+    if (use_u32_boff) {
+      __bang_mul_scalar(xa, page_all, page.bytes, nu64);
+      __bang_band_scalar(xb, ub_i, page.block_mask, nu64);
+      __bang_mul_scalar(xb, xb, 2048, nu64);
+      __bang_add(reinterpret_cast<int32_t*>(k_boff32_all), xa, xb, nu64);
+    } else {
+      for (int j = 0; j < nu; ++j) {
+        const uint64_t blk_idx =
+            (static_cast<uint64_t>(static_cast<uint32_t>(page_all[j]))
+             << page.block_shift) |
+            static_cast<uint64_t>(ub_i[j] & page.block_mask);
+        k_boff64_all[j] = blk_idx << 11;
+      }
+    }
+    __sync();
+
+    Pool tok{tok_val, tok_idx, 0, -INFINITY, kTopk, kFTokCap};
+    const int nt = (nu + BPT - 1) / BPT;
+
+    bool full_ring[2] = {false, false};
+    full_ring[0] = load_q_tile(n_u, nu, 0);
+    __sync();
+    for (int t = 0; t < nt; ++t) {
+      if (t + 1 < nt) {
+        full_ring[(t + 1) & 1] = load_q_tile(n_u, nu, t + 1);
+      }
+      const int st = t & 1;
+      const int nb = (nu - t * BPT) < BPT ? (nu - t * BPT) : BPT;
+      const int nco = (nb * kBlockSize + 63) / 64 * 64;
+      const bfloat16_t* kb = kbf + st * kTileSlots * kDim;
+      ScoreTileMap16<1>(
+          score, qk, wram_k, kb, w_f32, w_bf16, 1, nco, params.logits_dtype);
+      PoolOffer(tok,
+                score,
+                slot_all_i + t * kTileSlots,
+                full_ring[st] ? nullptr : (reach_ring + st * kTileSlots),
+                nco,
+                pool_mask,
+                scratch);
+      __sync();
+    }
+
+    if (tok.cnt > kTopk) PoolCompact(tok, scratch);
+    const int cnt = tok.cnt;
+    if (cnt == kTopk) {
+      __memcpy_async(params.topk_indices + u * kTopk,
+                     tok.idx,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+    } else if (cnt <= 0) {
+      __memcpy_async(params.topk_indices + u * kTopk,
+                     neg_ones,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+    } else {
+      __memcpy(out32, neg_ones, (kTopk - cnt) * sizeof(int32_t), NRAM2NRAM);
+      __memcpy(
+          out32 + (kTopk - cnt), tok.idx, cnt * sizeof(int32_t), NRAM2NRAM);
+      __sync();
+      __memcpy_async(params.topk_indices + u * kTopk,
+                     out32,
+                     kTopk * sizeof(int32_t),
+                     NRAM2GDRAM);
+    }
+  }
+  __sync();
+}
+
+#undef CARVE_FROM
+
+int64_t PagedWorkspaceBytes(int64_t nq,
+                            int64_t batch,
+                            int mode,
+                            int cores,
+                            int sched_override,
+                            int logits_dtype) {
+  (void)logits_dtype;
+  if (nq <= 0 || batch <= 0) return 4096;
+  return MakePagedPlan(nq, batch, mode, cores, sched_override).bytes;
+}
+
+void LaunchPagedPrefillIndexScoreSelect(cnrtQueue_t queue,
+                                        const PagedParams& params,
+                                        int clusters,
+                                        int cores) {
+  if (params.nq <= 0) return;
+  cnrtDim3_t dim_all{
+      static_cast<unsigned>(cores), static_cast<unsigned>(clusters), 1};
+  cnrtDim3_t dim_one{static_cast<unsigned>(cores), 1, 1};
+
+  if (params.batch <= 0) {
+    PagedFillNegOneKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+    return;
+  }
+
+  if (params.mode == kFilter) {
+    if (!params.plan.funion) {
+      PagedFilterQueryKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+      return;
+    }
+    PagedRowPrepKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+    PagedBuildSchedKernel<<<dim_one, cnrtFuncTypeUnion1, queue>>>(params);
+    PagedFilterUnionKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+    PagedFilterPlanSplitKernel<<<dim_one, cnrtFuncTypeUnion1, queue>>>(params);
+    PagedFilterQueryKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+    PagedFilterUnionScoreKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+    if (params.plan.do_split) {
+      PagedFinalizeKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+    }
+    return;
+  }
+
+  PagedRowPrepKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+  PagedBuildSchedKernel<<<dim_one, cnrtFuncTypeUnion1, queue>>>(params);
+  PagedScoreKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+  if (params.plan.do_split) {
+    PagedFinalizeKernel<<<dim_all, cnrtFuncTypeUnion1, queue>>>(params);
+  }
+}
+
+}  // namespace xllm::kernel::mlu::bangc::score_select

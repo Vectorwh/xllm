@@ -363,8 +363,9 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
                        "state_mask");
   }
   if (dynamic_multi_block_tables_) {
-    // Only eager callbacks read these tables; captured segments read their
-    // fixed-width selection outputs instead.
+    // Model metadata preparation copies the live request rows into stable graph
+    // storage.
+    params_.execution_batch = params.execution_batch;
     params_.multi_block_tables = params.multi_block_tables;
   } else {
     CHECK_EQ(params_.multi_block_tables.size(),

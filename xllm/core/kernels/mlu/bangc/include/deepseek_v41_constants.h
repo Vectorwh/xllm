@@ -24,6 +24,9 @@ namespace xllm::kernel::mlu::bangc {
 // from ModelArgs.
 inline constexpr int32_t kDeepseekV41MluKVBlockSize = 128;
 
+inline constexpr int32_t kDeepseekV41MaxSwaColumns = 8192;
+inline constexpr int32_t kDeepseekV41MaxDraftWidth = 5;
+
 inline constexpr bool supports_dsa_qb_width(int64_t width) {
   return width == 4096 || width == 8192 || width == 16384 || width == 32768;
 }

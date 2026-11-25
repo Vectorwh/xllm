@@ -373,8 +373,6 @@ __mlu_func__ void head_phase(const Params& p,
   pool += kHeadTile * 128 * 4;
   bfloat16_t* nbf = reinterpret_cast<bfloat16_t*>(pool);
   pool += kHeadTile * 128 * 2;
-  float* nres = reinterpret_cast<float*>(pool);
-  pool += kHeadTile * 128 * 4;
   float* nzero = reinterpret_cast<float*>(pool);
 
   const int32_t hr = p.head_rows;
@@ -418,25 +416,23 @@ __mlu_func__ void head_phase(const Params& p,
         load_head_rows(nx[cur ^ 1], p, tn * hr, next);
       }
     }
-    float* head = p.head + static_cast<int64_t>(r0) * kHeads;
+    uint16_t* head = p.head + static_cast<int64_t>(r0) * kHeads;
     if (valid > 0) {
       conv_bf16(nout, nx[cur], wram_pool, kHalf, 2 * valid, 64);
       // Row 2i holds x[i, :2560] against both halves and row 2i+1 holds
       // x[i, 2560:]; the useful sums are out[i, c] + out[i, 96 + c], c < 32.
       __bang_add(nsum, nout, nout + 96, valid * 128);
       __bang_float2bfloat16_rn(nbf, nsum, valid * 128);
-      __bang_bfloat162float(nres, nbf, valid * 128);
-      __bang_mul_scalar(nres, nres, 0.015625f, valid * 128);
     }
     __sync_io_move_compute(false, false, true, true, false, false);
     if (valid > 0) {
       __memcpy_async(
-          head, nres, kHeads * 4, NRAM2GDRAM, kHeads * 4, 128 * 4, valid - 1);
+          head, nbf, kHeads * 2, NRAM2GDRAM, kHeads * 2, 128 * 2, valid - 1);
     }
     if (rows > valid) {
       __memcpy_async(head + static_cast<int64_t>(valid) * kHeads,
                      nzero,
-                     (rows - valid) * kHeads * 4,
+                     (rows - valid) * kHeads * 2,
                      NRAM2GDRAM);
     }
   }
@@ -445,7 +441,7 @@ __mlu_func__ void head_phase(const Params& p,
 
 // Split-K head task: block b = task / 4 (head_rows rows), K slice j =
 // task % 4. Each core convolves its slice, the cluster sums the 4 FP32
-// partials through SRAM after one barrier, then each core rounds, scales
+// partials through SRAM after one barrier, then each core rounds
 // and stores a quarter of the rows.
 __mlu_func__ void head_split_k(const Params& p, int32_t task, int32_t live) {
   const int32_t b = task >> 2;
@@ -496,11 +492,11 @@ __mlu_func__ void head_split_k(const Params& p, int32_t task, int32_t live) {
   __sync_move();
   __sync_cluster();
   // Rows [j * q, j * q + n) of the block: sum the 4 slices in FP32, round to
-  // BF16, scale by 1/64.
+  // BF16.
   const int32_t q = (valid + 3) / 4;
   const int32_t first = j * q;
   const int32_t n = imax(0, imin(q, valid - first));
-  float* head = p.head + static_cast<int64_t>(r0) * kHeads;
+  uint16_t* head = p.head + static_cast<int64_t>(r0) * kHeads;
   if (n > 0) {
     __memcpy(nsum,
              sram_part + first * kHeads,
@@ -514,18 +510,16 @@ __mlu_func__ void head_split_k(const Params& p, int32_t task, int32_t live) {
     __bang_add(nsum + 2 * e, nsum + 2 * e, nsum + 3 * e, e);
     __bang_add(nsum, nsum, nsum + 2 * e, e);
     __bang_float2bfloat16_rn(nbf, nsum, e);
-    __bang_bfloat162float(nsum, nbf, e);
-    __bang_mul_scalar(nsum, nsum, 0.015625f, e);
     __sync_compute();
     __memcpy(
-        head + static_cast<int64_t>(first) * kHeads, nsum, e * 4, NRAM2GDRAM);
+        head + static_cast<int64_t>(first) * kHeads, nbf, e * 2, NRAM2GDRAM);
   }
   if (j == 0 && rows > valid) {
     __bang_write_value(nzero, kHeadSplitRows * kHeads, 0.0f);
     __sync_compute();
     __memcpy(head + static_cast<int64_t>(valid) * kHeads,
              nzero,
-             (rows - valid) * kHeads * 4,
+             (rows - valid) * kHeads * 2,
              NRAM2GDRAM);
   }
 }
@@ -712,7 +706,7 @@ __mlu_func__ void head_phase_fm(const Params& p,
       __bang_add(acc, acc, part, kHeads * kHeadFmTile);
     }
     if (c == 7) {
-      // The previous tile's store (IO0) has read tr.
+      // The previous tile's store (IO0) has read hb.
       __sync_io0_io1_move_compute<true,
                                   false,
                                   false,
@@ -723,12 +717,10 @@ __mlu_func__ void head_phase_fm(const Params& p,
                                   true>();
       __bang_transpose(tr, acc, kHeads, kHeadFmTile);
       __bang_float2bfloat16_rn(hb, tr, valid * kHeads);
-      __bang_bfloat162float(tr, hb, valid * kHeads);
-      __bang_mul_scalar(tr, tr, 0.015625f, valid * kHeads);
       __sync_io_move_compute(false, false, true, true, false, false);
       __memcpy_async(p.head + static_cast<int64_t>(t) * hr * kHeads,
-                     tr,
-                     valid * kHeads * 4,
+                     hb,
+                     valid * kHeads * 2,
                      NRAM2GDRAM);
     }
   }
@@ -741,7 +733,7 @@ __mlu_func__ void head_phase_fm(const Params& p,
     if (rows > valid) {
       __memcpy_async(p.head + static_cast<int64_t>((r0 + valid)) * kHeads,
                      nzero,
-                     (rows - valid) * kHeads * 4,
+                     (rows - valid) * kHeads * 2,
                      NRAM2GDRAM);
     }
   }
@@ -1252,7 +1244,7 @@ __mlu_func__ void key_phase_fm(const Params& p,
   auto htile = [&](int32_t hs) { return taskId + (hs >> 3) * taskDim; };
   auto xbuf = [&](int32_t hs) { return wram_pool + (hs & 3) * kXWramBytes; };
   // Conv of head chunk hs (x and wp chunk moved and waited for); the 8th
-  // chunk of a tile finishes it: transpose, BF16, /64, store on IO0.
+  // chunk of a tile finishes it: transpose, BF16, store on IO0.
   auto conv_h = [&](int32_t hs) {
     const int32_t c = hs & 7;
     conv_bf16(c == 0 ? acc : part, wpb, xbuf(hs), kXChunk, kHeads, kHeadFmTile);
@@ -1262,7 +1254,7 @@ __mlu_func__ void key_phase_fm(const Params& p,
     if (c == 7) {
       const int32_t ht = htile(hs);
       const int32_t hv = head_valid(p, ht, num_valid_input_rows);
-      // The previous head store (IO0) has read tr.
+      // Drain the previous IO0 store before reusing output scratch.
       __sync_io0_io1_move_compute<true,
                                   false,
                                   false,
@@ -1273,13 +1265,13 @@ __mlu_func__ void key_phase_fm(const Params& p,
                                   true>();
       __bang_transpose(tr, acc, kHeads, kHeadFmTile);
       __bang_float2bfloat16_rn(hb, tr, hv * kHeads);
-      __bang_bfloat162float(tr, hb, hv * kHeads);
-      __bang_mul_scalar(tr, tr, 0.015625f, hv * kHeads);
       __sync_io_move_compute(false, false, true, true, false, false);
       __memcpy_async(p.head + static_cast<int64_t>(ht) * p.head_rows * kHeads,
-                     tr,
-                     hv * kHeads * 4,
+                     hb,
+                     hv * kHeads * 2,
                      NRAM2GDRAM);
+      // hb aliases the RoPE and metadata scratch used by the next key tile.
+      __sync_io();
     }
   };
   int32_t hpassed = 0;  // steps released by passed barriers (2 per barrier)
@@ -1625,7 +1617,7 @@ __mlu_func__ void key_phase_fm(const Params& p,
         __memcpy_async(
             p.head + static_cast<int64_t>((h * p.head_rows + hv)) * kHeads,
             part,
-            (rows - hv) * kHeads * 4,
+            (rows - hv) * kHeads * 2,
             NRAM2GDRAM);
       }
     }

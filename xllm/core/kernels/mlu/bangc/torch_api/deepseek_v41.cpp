@@ -446,8 +446,10 @@ torch::Tensor fused_indexer_k(const OptTensor& x,
   CHECK_EQ(cache.scalar_type(), torch::kBFloat16);
   CHECK(cache.is_contiguous());
   CHECK_EQ(cache.size(3), indexer_k::kHeadDim);
-  CHECK((cache.size(1) == 1 && cache.size(2) == indexer_k::kBlockSize) ||
-        (cache.size(2) == 1 && cache.size(1) == indexer_k::kBlockSize));
+  CHECK(cache.size(1) == 1 || cache.size(2) == 1);
+  const int64_t page_rows = cache.size(1) * cache.size(2);
+  CHECK(page_rows == kDeepseekV41MluKVBlockSize ||
+        page_rows == kDeepseekV41MluKVBlockSize / 2);
   if (present(x)) {
     check_rows(*x, device, indexer_k::kHidden, torch::kBFloat16);
   }
@@ -458,7 +460,7 @@ torch::Tensor fused_indexer_k(const OptTensor& x,
   const int64_t cap_k = present(latent) ? latent->size(0) : 0;
   CHECK_LT(cap_x, int64_t{1} << 31);
   CHECK_LT(cap_k, int64_t{1} << 31);
-  check_contiguous(head, device, {cap_x, indexer_k::kHeads}, torch::kFloat32);
+  check_contiguous(head, device, {cap_x, indexer_k::kHeads}, torch::kBFloat16);
   indexer_k::Params params{};
   const int32_t* num_valid_input_rows_ptr =
       valid_row_count_ptr(num_valid_input_rows, device);
@@ -473,7 +475,7 @@ torch::Tensor fused_indexer_k(const OptTensor& x,
     params.x = x->data_ptr();
     params.x_stride = x->stride(0);
     params.wp = weights_proj->data_ptr();
-    params.head = head.data_ptr<float>();
+    params.head = static_cast<uint16_t*>(head.data_ptr());
     params.num_valid_input_rows = num_valid_input_rows_ptr;
     params.cap_x = static_cast<int32_t>(cap_x);
   }
@@ -520,61 +522,6 @@ torch::Tensor fused_indexer_k(const OptTensor& x,
              cnrtSuccess);
   }
   return head;
-}
-
-void deepseek_v41_decode_gather(const torch::Tensor& swa,
-                                const torch::Tensor& compressed,
-                                const torch::Tensor& current,
-                                const torch::Tensor& swa_table,
-                                const torch::Tensor& compressed_table,
-                                const torch::Tensor& topk,
-                                int64_t position,
-                                int32_t window,
-                                int32_t compressed_physical_dim,
-                                torch::Tensor output,
-                                torch::Tensor length) {
-  CHECK(detail::check_tensor(swa, torch::kBFloat16))
-      << "swa must be contiguous BF16 on MLU";
-  const torch::Device device = swa.device();
-  CHECK(detail::check_tensor(compressed, torch::kBFloat16, device))
-      << "compressed must be contiguous BF16 on the same device as swa";
-  CHECK(detail::check_tensor(current, torch::kBFloat16, device))
-      << "current must be contiguous BF16 on the same device as swa";
-  CHECK(detail::check_tensor(swa_table, torch::kInt32, device))
-      << "swa_table must be contiguous int32 on the same device as swa";
-  CHECK(detail::check_tensor(compressed_table, torch::kInt32, device))
-      << "compressed_table must be contiguous int32 on the same device as swa";
-  CHECK(detail::check_tensor(topk, torch::kInt64, device))
-      << "topk must be contiguous int64 on the same device as swa";
-  CHECK(detail::check_tensor(output, torch::kBFloat16, device))
-      << "output must be contiguous BF16 on the same device as swa";
-  CHECK(detail::check_tensor(length, torch::kInt32, device))
-      << "length must be contiguous int32 on the same device as swa";
-  CHECK_EQ(swa.size(-1), 512);
-  CHECK_EQ(current.numel(), 512);
-  CHECK_EQ(length.numel(), 1);
-  CHECK_GT(compressed_physical_dim, 0)
-      << "compressed_physical_dim is block_size / compress_ratio";
-  CHECK_GE(output.numel(),
-           (std::min<int64_t>(position + 1, window) + topk.numel()) * 512);
-  deepseek_v41_gather_launch(torch_mlu::getCurMLUStream(),
-                             swa.data_ptr(),
-                             compressed.data_ptr(),
-                             current.data_ptr(),
-                             swa_table.data_ptr<int32_t>(),
-                             compressed_table.data_ptr<int32_t>(),
-                             topk.data_ptr<int64_t>(),
-                             topk.numel(),
-                             position,
-                             window,
-                             swa_table.numel(),
-                             compressed_physical_dim,
-                             output.data_ptr(),
-                             length.data_ptr<int32_t>());
-  // Check submission errors only: launches remain asynchronous. Device
-  // execution failures surface at the caller's stream/graph synchronization
-  // boundary.
-  CHECK_EQ(cnrtGetLastError(), cnrtSuccess);
 }
 
 void fused_compress_kv_cache(

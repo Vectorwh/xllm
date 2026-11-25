@@ -69,6 +69,26 @@ torch::Tensor fused_indexer_q(const torch::Tensor& qr,
                               const torch::Tensor& positions,
                               const torch::Tensor& rope);
 
+enum class ScoreSelectMode : int32_t { NONE, SOURCE, FILTER };
+enum class ScoreSelectPhase : int32_t { PREFILL, DECODE };
+
+struct ScoreSelectInputs {
+  torch::Tensor query, weights, cache, positions, requests, valid_rows;
+  torch::Tensor table, history, candidates;
+};
+
+int64_t score_select_workspace(int64_t rows,
+                               int64_t batch,
+                               ScoreSelectMode mode,
+                               ScoreSelectPhase phase);
+void fused_dsa_index_score_select(const ScoreSelectInputs& inputs,
+                                  int32_t ratio,
+                                  ScoreSelectMode mode,
+                                  ScoreSelectPhase phase,
+                                  torch::Tensor topk,
+                                  torch::Tensor candidates_out,
+                                  torch::Tensor workspace);
+
 // Fixed BF16 projections (5120 -> 32 and 512 -> 128), RMSNorm eps=1e-20,
 // and tail-64 interleaved FP32 RoPE. Branch capacities may differ or be zero.
 // Valid row counts are optional device INT32 [1] tensors. A missing count uses
@@ -91,18 +111,31 @@ torch::Tensor fused_indexer_k(
     const std::optional<torch::Tensor>& num_valid_compressed_rows =
         std::nullopt);
 
-// One decode row: map pages, gather live sparse KV, and publish the SWA token.
-void deepseek_v41_decode_gather(const torch::Tensor& swa,
-                                const torch::Tensor& compressed,
-                                const torch::Tensor& current,
-                                const torch::Tensor& swa_table,
-                                const torch::Tensor& compressed_table,
-                                const torch::Tensor& topk,
-                                int64_t position,
-                                int32_t window,
-                                int32_t compressed_physical_dim,
-                                torch::Tensor output,
-                                torch::Tensor length);
+enum class PagedAttentionStage { PREFILL, DECODE, DRAFT, VERIFY };
+
+struct PagedAttentionMetadata {
+  torch::Tensor swa_table;
+  torch::Tensor swa_columns;
+  torch::Tensor compressed_table;
+  torch::Tensor topk;
+  torch::Tensor requests;
+  torch::Tensor positions;
+  torch::Tensor prefix;
+  torch::Tensor begins;
+  torch::Tensor valid_rows;
+};
+
+// Returns raw BF16 PV rows; the output projection owns inverse RoPE.
+torch::Tensor fused_paged_sparsed_attention(
+    PagedAttentionStage stage,
+    const torch::Tensor& q,
+    const torch::Tensor& current,
+    const torch::Tensor& swa,
+    const torch::Tensor& compressed,
+    const torch::Tensor& sink,
+    const PagedAttentionMetadata& metadata,
+    int32_t ratio,
+    int32_t window = 128);
 
 struct CompressKvMetadata {
   torch::Tensor query_start_loc;

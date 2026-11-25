@@ -77,6 +77,8 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
       {"compressor.wkv.weight", wkv},
       {"compressor.wgate.weight", wkv},
       {"compressor.norm.weight", torch::ones({512}, options)},
+      {"indexer.wq_b.weight", torch::zeros({32 * 128, 1280}, options)},
+      {"indexer.weights_proj.weight", torch::ones({32, 5120}, options)},
       {"indexer.wk.weight", torch::full({128, 512}, 0.125, options)},
       {"indexer.k_norm.weight", torch::ones({128}, options)},
   });
@@ -98,8 +100,12 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
         .compress_ratios({ratio, ratio})
         .kv_source_layer_ids({0})
         .index_head_dim(128)
-        .index_topk(2)
+        .index_n_heads(32)
+        .index_topk(512)
         .num_speculative_tokens(5);
+    if (ratio > 0) {
+      args.index_source_layer_ids({0});
+    }
     const ModelContext context(parallel, args, QuantArgs(), options);
     std::vector<DeepseekV41Attention> layers;
     layers.reserve(2);
@@ -111,8 +117,9 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
       layers.back()->load_state_dict(weights);
       DeepSeekV4KVCacheTensors tensors;
       tensors.swa_cache = torch::full({2, 128, 1, 512}, 0.25, options);
-      tensors.key_cache = torch::full({12, 128, 1, 512}, 0.5, options);
-      tensors.index_cache = torch::full({12, 128, 1, 128}, -1, options);
+      const int32_t page_rows = 128 / std::max(1, ratio);
+      tensors.key_cache = torch::full({12, page_rows, 1, 512}, 0.5, options);
+      tensors.index_cache = torch::full({12, page_rows, 1, 128}, -1, options);
       tensors.compress_kv_state =
           torch::full({2, 32, 512}, 0.25, options.dtype(torch::kFloat32));
       tensors.compress_score_state =
@@ -157,23 +164,9 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
       deepseek_v41::prepare_metadata(
           reference_shared, input, positions, /*num_sequences=*/2);
       deepseek_v41::prepare_workspace(cp_shared, input, args, total, options);
-      CHECK(!cp_shared.selected_kv.defined());
+      cp_shared.query_requests =
+          cp_shared.query_requests.index_select(0, cp->local_row_indices);
       cp_shared.num_valid_input_rows.fill_(local_hidden.size(0));
-      cp_shared.topk.resize(4);
-      reference_shared.topk.resize(2);
-      const auto make_topk = [&](int64_t rows) {
-        return ratio == 0
-                   ? torch::empty({rows, 0}, options.dtype(torch::kInt64))
-                   : torch::tensor({0, 1}, options.dtype(torch::kInt64))
-                         .repeat({rows, 1});
-      };
-      for (int32_t seq = 0; seq < 2; ++seq) {
-        reference_shared.topk[seq] = make_topk(lengths[seq]);
-        cp_shared.topk[seq * 2] =
-            make_topk(cp->geometry.front_seq_lens_by_rank[group.rank()][seq]);
-        cp_shared.topk[seq * 2 + 1] =
-            make_topk(cp->geometry.back_seq_lens_by_rank[group.rank()][seq]);
-      }
       for (int32_t id = 0; id < 2; ++id) {
         const auto expected = layers[id]->forward(
             hidden, positions, rope, reference_caches, input, reference_shared);
@@ -184,6 +177,11 @@ void verify_cp_attention(ProcessGroup& group, const torch::Device& device) {
                                                 input,
                                                 cp_shared,
                                                 &*cp);
+        if (ratio > 0) {
+          CHECK(torch::equal(
+              cp_shared.packed_topk,
+              mlu_v4_cp::shard_rows(reference_shared.packed_topk, *cp)));
+        }
         CHECK(torch::allclose(
             actual, mlu_v4_cp::shard_rows(expected, *cp), 0.01, 0.01))
             << "CP query mapping failed: rank=" << group.rank()

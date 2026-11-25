@@ -1,0 +1,686 @@
+/* Copyright 2026 The xLLM Authors. Licensed under Apache-2.0; see LICENSE. */
+// DeepSeek V4.1 prefill paged sparse attention, raw BF16 512-ch output
+// (mtp_592).
+//
+// Each IPU processes query rows i = taskId + k * taskDim. For query i (64
+// heads) the visible record list is the SWA window max(0,p-127)..p (old ring
+// for t<b, current KV for t>=b) followed by the valid compressed Top-K records
+// in input order (multiplicity kept). Records are processed in 128-row tiles
+// (the whole SWA window is one tile) with an online softmax shared by all
+// records; the sink logit enters the denominator exactly once in the epilogue.
+// Normalized attention across all 512 channels is rounded once to BF16 and
+// written directly to output.
+//
+// Pipeline (per IPU):
+//   IO0  : Q (GDRAM->WRAM filter layout), Top-K row, KV tiles
+//          (ping-pong NRAM buffers; one queue, ordered by edge placement)
+//   IO1  : contiguous full-512 output stores
+//   Move : KV^T NRAM->WRAM (ping-pong)
+//   Compute: QK, softmax, PV, epilogue, Top-K offset compaction
+// Cross-queue ordering uses __sync_io0_io1_move_compute dependency edges.
+#include <bang.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_paged_sparsed_attention/launch.h"
+
+namespace xllm::kernel::mlu::bangc::paged_attention {
+namespace {
+
+constexpr int32_t kTile = 128;
+constexpr int32_t kAlign = 32;
+constexpr int32_t kRowBytes = kDim * 2;
+constexpr int32_t kCtabNram =
+    kMaxCompressedColumns;  // Full 8192-col NRAM table cache (32 KB)
+constexpr float kLog2e = 1.4426950408889634f;
+// Lazy rescale threshold (log2 domain): unnormalized probabilities <= 2^kTau.
+constexpr float kTau = 8.0f;
+
+constexpr int32_t kNramPoolBytes = 491520;
+__nram__ __attribute__((aligned(128))) int8_t nram_pool[kNramPoolBytes];
+
+#define kv_n_at(b) \
+  (reinterpret_cast<bfloat16_t*>(nram_pool + (b) * (kTile * kRowBytes)))
+#define o_n (reinterpret_cast<float*>(nram_pool + 262144))
+#define s_n (reinterpret_cast<float*>(nram_pool + 393216))
+#define ctab_n (reinterpret_cast<int32_t*>(nram_pool + 425984))
+#define off_n_at(s) \
+  (reinterpret_cast<uint64_t*>(nram_pool + 458752 + (s) * (kMaxTopk * 8)))
+#define topk_n_at(s) \
+  (reinterpret_cast<int32_t*>(nram_pool + 466944 + (s) * (kMaxTopk * 4)))
+
+__nram__ __attribute__((aligned(128))) float m_n[128];
+__nram__ __attribute__((aligned(128))) float mt_n[kHeads];
+__nram__ __attribute__((aligned(128))) float l_n[128];
+__nram__ __attribute__((aligned(128))) float ps_n[kHeads];
+__nram__ __attribute__((aligned(128))) float tmp_n[128];
+__nram__ __attribute__((aligned(128))) float red_n[64];
+__nram__ __attribute__((aligned(128))) float sink_n[kHeads];
+__nram__ __attribute__((aligned(128))) int32_t stab_n[kMaxSwaPreloadColumns];
+// Per-core query metadata (rows taskId + k*taskDim), preloaded in chunks, and
+// per-request metadata; avoids scalar GDRAM loads on the per-query path.
+constexpr int32_t kMetaChunk = 512;
+constexpr int32_t kReqNram = 512;
+__nram__ __attribute__((aligned(128))) int32_t qreq_n[kMetaChunk];
+__nram__ __attribute__((aligned(128))) int32_t qpos_n[kMetaChunk];
+__nram__ __attribute__((aligned(128))) int32_t rbeg_n[kReqNram];
+__nram__ __attribute__((aligned(128))) int32_t roff_n[kReqNram + 1];
+__nram__ __attribute__((aligned(128))) int32_t vq_n[4];
+
+// BF16 probabilities live inside s_n: p [row, head] in place at the front
+// (float->bf16 conversion allows dst <= src), p^T [head, row] in the back half.
+#define p_n (reinterpret_cast<bfloat16_t*>(s_n))
+#define pt_n (reinterpret_cast<bfloat16_t*>(s_n + kTile * kHeads / 2))
+// Zero buffer view inside o_n for padding-row stores.
+#define obf_n (reinterpret_cast<bfloat16_t*>(o_n))
+
+// mtp_592 WRAM matrices are striped over 16 lanes spaced WRAM/16 (32 KB)
+// apart: a matrix of S bytes occupies S/16 bytes of the lane-0 address range
+// starting at its base, so every base must lie within the first 32 KB.
+constexpr int32_t kWramLaneBytes = 512 * 1024 / 16;
+constexpr int32_t kQLaneBytes = kHeads * kDim * 2 / 16;  // 4 KB
+constexpr int32_t kKvLaneBytes = kTile * kDim * 2 / 16;  // 8 KB
+constexpr int32_t kOnesLaneBytes =
+    (32 * 1024) / 16;  // 2 KB (512 x 64B walign16)
+static_assert(2 * kQLaneBytes + 2 * kKvLaneBytes + kOnesLaneBytes <=
+                  kWramLaneBytes,
+              "WRAM lane budget");
+__wram__ __attribute__((aligned(128))) int8_t wram_buf[512 * 1024];
+#define q_w_at(s) (reinterpret_cast<bfloat16_t*>(wram_buf + (s) * kQLaneBytes))
+#define kv_w_at(b)                                            \
+  (reinterpret_cast<bfloat16_t*>(wram_buf + 2 * kQLaneBytes + \
+                                 (b) * kKvLaneBytes))
+#define ones_w \
+  (reinterpret_cast<float*>(wram_buf + 2 * kQLaneBytes + 2 * kKvLaneBytes))
+// ---- cross-queue dependency edges -------------------------------------------
+// consumers wait for all earlier work of the producers.
+__mlu_func__ void edge_io0_to_move_compute() {
+  __sync_io0_io1_move_compute<true,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              true,
+                              true>();
+}
+__mlu_func__ void edge_move_compute_to_io0() {
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              true,
+                              true,
+                              true,
+                              false,
+                              false,
+                              false>();
+}
+__mlu_func__ void edge_move_compute_to_io1() {
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              true,
+                              true,
+                              false,
+                              true,
+                              false,
+                              false>();
+}
+__mlu_func__ void edge_compute_to_io1() {
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              false,
+                              true,
+                              false,
+                              false>();
+}
+__mlu_func__ void edge_compute_to_move() {
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              false,
+                              false,
+                              true,
+                              false>();
+}
+__mlu_func__ void edge_move_to_compute() {
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              true,
+                              false,
+                              false,
+                              false,
+                              false,
+                              true>();
+}
+__mlu_func__ void edge_io1_to_compute() {
+  __sync_io0_io1_move_compute<false,
+                              true,
+                              false,
+                              false,
+                              false,
+                              false,
+                              false,
+                              true>();
+}
+
+struct Query {
+  int32_t i;
+  int32_t request;
+  int32_t pos;
+  int32_t begin;
+  int64_t offset;
+  int32_t lo;
+  int32_t swa_tiles;
+  int32_t nc;
+  int32_t tiles;
+  int32_t slot;
+};
+
+__mlu_func__ int32_t tile_rows(const Query& qs, int32_t t) {
+  if (t < qs.swa_tiles) {
+    const int32_t s = qs.lo + t * kTile;
+    const int32_t e = (s + kTile < qs.pos + 1) ? s + kTile : qs.pos + 1;
+    return e - s;
+  }
+  const int32_t first = (t - qs.swa_tiles) * kTile;
+  return (qs.nc - first < kTile) ? qs.nc - first : kTile;
+}
+
+// Light metadata (scalar GDRAM reads; table rows reloaded on request change).
+__mlu_func__ void prepare_light(const Params& prm,
+                                Query& qs,
+                                int32_t i,
+                                int32_t live_end,
+                                int32_t slot,
+                                int32_t& cached_request) {
+  qs.i = i;
+  qs.slot = slot;
+  if (prm.request_ids == nullptr) {
+    // Find the owning request even when zero-count draft slots repeat offsets.
+    int32_t lo = 0;
+    int32_t hi = prm.requests;
+    while (lo < hi) {
+      const int32_t mid = lo + (hi - lo) / 2;
+      if (prm.kv_prefix[mid + 1] <= i) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    qs.request = lo;
+    qs.pos = prm.begins[lo] + i - prm.kv_prefix[lo];
+  } else {
+    // Chunk of this core's rows: k = (i - taskId) / taskDim.
+    const uint32_t u_tid = static_cast<uint32_t>(taskId);
+    const uint32_t u_tdim = static_cast<uint32_t>(taskDim);
+    const int32_t k = static_cast<int32_t>(
+        static_cast<uint32_t>(i - static_cast<int32_t>(u_tid)) / u_tdim);
+    const int32_t kk = static_cast<int32_t>(static_cast<uint32_t>(k) %
+                                            static_cast<uint32_t>(kMetaChunk));
+    if (kk == 0) {
+      const int32_t remaining = static_cast<int32_t>(
+          (static_cast<uint32_t>(live_end - i) + u_tdim - 1U) / u_tdim);
+      const int32_t n = remaining < kMetaChunk ? remaining : kMetaChunk;
+      const int32_t stride = static_cast<int32_t>(u_tdim * sizeof(int32_t));
+      __memcpy(qreq_n,
+               prm.request_ids + i,
+               sizeof(int32_t),
+               GDRAM2NRAM,
+               sizeof(int32_t),
+               stride,
+               n - 1);
+      __memcpy(qpos_n,
+               prm.positions + i,
+               sizeof(int32_t),
+               GDRAM2NRAM,
+               sizeof(int32_t),
+               stride,
+               n - 1);
+    }
+    qs.request = qreq_n[kk];
+    qs.pos = qpos_n[kk];
+  }
+  if (qs.request != cached_request) {
+    if (prm.swa_columns <= kMaxSwaPreloadColumns) {
+      __memcpy(
+          stab_n,
+          prm.swa_table + static_cast<int64_t>(qs.request) * prm.swa_row_stride,
+          prm.swa_columns * sizeof(int32_t),
+          GDRAM2NRAM);
+    }
+    if (prm.ratio > 0 && prm.kcap > 0 && prm.compressed_columns > 0 &&
+        prm.compressed_columns <= kCtabNram) {
+      __memcpy(ctab_n,
+               prm.compressed_table +
+                   static_cast<int64_t>(qs.request) * prm.compressed_row_stride,
+               prm.compressed_columns * sizeof(int32_t),
+               GDRAM2NRAM);
+    }
+    cached_request = qs.request;
+  }
+  if (prm.requests <= kReqNram) {
+    qs.begin = rbeg_n[qs.request];
+    qs.offset = roff_n[qs.request];
+  } else {
+    qs.begin = prm.begins[qs.request];
+    qs.offset = prm.kv_prefix[qs.request];
+  }
+  qs.lo = qs.pos - (prm.window - 1) > 0 ? qs.pos - (prm.window - 1) : 0;
+  if (prm.draft) {
+    qs.lo = qs.begin > prm.window ? qs.begin - prm.window : 0;
+    qs.pos = qs.begin + prm.kv_prefix[qs.request + 1] - qs.offset - 1;
+  }
+  qs.swa_tiles = (qs.pos - qs.lo + 1 + kTile - 1) / kTile;
+  qs.nc = 0;
+  qs.tiles = qs.swa_tiles;
+}
+
+// Compressed record offsets (requires topk_n loaded). Input order and record
+// multiplicity are kept; -1 (and out-of-table) entries are dropped.
+// Native 64-bit integer shift/or vector path (exact up to 2^32 physical pages).
+__mlu_func__ void prepare_compressed(const Params& prm, Query& qs) {
+  int32_t nc = 0;
+  uint64_t* off = off_n_at(qs.slot);
+  if (prm.ratio > 0 && prm.kcap > 0 && prm.compressed_columns > 0) {
+    const int32_t* table_row =
+        prm.compressed_table +
+        static_cast<int64_t>(qs.request) * prm.compressed_row_stride;
+    const bool table_in_nram = prm.compressed_columns <= kCtabNram;
+    float* jf = s_n;
+    float* mk = s_n + kMaxTopk;
+    float* jc = s_n + 2 * kMaxTopk;
+    float* tf = s_n + 3 * kMaxTopk;
+    const int32_t k = prm.kcap;
+    __bang_int322float(jf, topk_n_at(qs.slot), k, 0);
+    __bang_ge_scalar(mk, jf, 0.0f, k);
+    __bang_lt_scalar(
+        tf,
+        jf,
+        static_cast<float>(prm.compressed_columns << prm.compressed_page_shift),
+        k);
+    __bang_mul(mk, mk, tf, k);
+    nc = static_cast<int32_t>(__bang_filter(jc, jf, mk, k));
+    if (nc > 0) {
+      uint32_t* ju = reinterpret_cast<uint32_t*>(s_n + 3 * kMaxTopk);
+      uint32_t* po = reinterpret_cast<uint32_t*>(s_n + 4 * kMaxTopk);
+      uint32_t* wi = reinterpret_cast<uint32_t*>(s_n + 5 * kMaxTopk);
+      uint32_t* tb = reinterpret_cast<uint32_t*>(s_n + 6 * kMaxTopk);
+      uint64_t* wi64 = reinterpret_cast<uint64_t*>(s_n);
+      __bang_float2uint32(ju, jc, nc, 0);
+      __bang_srl(po, ju, prm.compressed_page_shift, nc);
+      __bang_sll(po, po, 2, nc);
+      __bang_band_scalar(
+          wi,
+          ju,
+          static_cast<uint32_t>((1 << prm.compressed_page_shift) - 1),
+          nc);
+      __bang_sll(wi, wi, 10, nc);
+      if (table_in_nram) {
+        edge_compute_to_move();
+        __gather_async(tb,
+                       reinterpret_cast<const uint32_t*>(ctab_n),
+                       po,
+                       sizeof(uint32_t),
+                       NRAM2NRAM,
+                       sizeof(uint32_t),
+                       nc);
+        edge_move_to_compute();
+      } else {
+        __sync_compute();
+        __gather(tb,
+                 reinterpret_cast<const uint32_t*>(table_row),
+                 po,
+                 sizeof(uint32_t),
+                 GDRAM2NRAM,
+                 sizeof(uint32_t),
+                 nc);
+        __sync_io();
+      }
+      __bang_uint322uint64(off, tb, nc, 0, 0);
+      __bang_sll(off, off, prm.compressed_page_shift + 10, nc);
+      __bang_uint322uint64(wi64, wi, nc, 0, 0);
+      __bang_bor(off, off, wi64, nc);
+    }
+  }
+  qs.nc = nc;
+  qs.tiles = qs.swa_tiles + (nc + kTile - 1) / kTile;
+}
+
+// Issue the async load of tile t of query qs into kv_n_at(b) on IO0.
+__mlu_func__ void issue_tile(const Params& prm,
+                             const Query& qs,
+                             int32_t t,
+                             int32_t b) {
+  const bfloat16_t* current = reinterpret_cast<const bfloat16_t*>(prm.current);
+  const bfloat16_t* swa = reinterpret_cast<const bfloat16_t*>(prm.swa);
+  const int32_t rows = tile_rows(qs, t);
+  bfloat16_t* dst = kv_n_at(b);
+  if (t < qs.swa_tiles) {
+    const int32_t s = qs.lo + t * kTile;
+    const int32_t e = s + rows;
+    int32_t pos = s;
+    while (pos < e && pos < qs.begin) {
+      const int32_t page_end = (pos | (kPage - 1)) + 1;
+      int32_t seg_end = e < qs.begin ? e : qs.begin;
+      seg_end = seg_end < page_end ? seg_end : page_end;
+      const uint32_t col = static_cast<uint32_t>(pos >> 7) %
+                           static_cast<uint32_t>(prm.swa_columns);
+      const int32_t page =
+          prm.swa_columns <= kMaxSwaPreloadColumns
+              ? stab_n[col]
+              : prm.swa_table[static_cast<int64_t>(qs.request) *
+                                  prm.swa_row_stride +
+                              col];
+      const int64_t slot =
+          static_cast<int64_t>(page) * kPage + (pos & (kPage - 1));
+      __memcpy_io0_async(
+          dst, swa + slot * kDim, (seg_end - pos) * kRowBytes, GDRAM2NRAM);
+      dst += (seg_end - pos) * kDim;
+      pos = seg_end;
+    }
+    if (pos < e) {
+      const int64_t row = qs.offset + (pos - qs.begin);
+      __memcpy_io0_async(
+          dst, current + row * kDim, (e - pos) * kRowBytes, GDRAM2NRAM);
+    }
+
+  } else {
+    const bfloat16_t* comp =
+        reinterpret_cast<const bfloat16_t*>(prm.compressed);
+    const uint64_t* off = off_n_at(qs.slot) + (t - qs.swa_tiles) * kTile;
+    __gather_io0_async(dst, comp, off, kRowBytes, GDRAM2NRAM, kRowBytes, rows);
+  }
+  const int32_t tp =
+      static_cast<int32_t>((static_cast<uint32_t>(rows + kAlign - 1) /
+                            static_cast<uint32_t>(kAlign)) *
+                           kAlign);
+  if (rows < tp) {
+    // Padding rows up to 32-row alignment must be finite zeros: P=0 multiplies
+    // them in PV.
+    edge_move_to_compute();
+    __bang_write_value(
+        kv_n_at(b) + rows * kDim, (tp - rows) * kDim, (bfloat16_t)0.0f);
+  }
+}
+
+// Issue Q directly into the WRAM filter layout of query qs on IO0.
+template <int32_t Heads>
+__mlu_func__ void issue_query_inputs(const Params& prm,
+                                     const Query& qs,
+                                     int32_t buffer) {
+  const bfloat16_t* q = reinterpret_cast<const bfloat16_t*>(prm.q);
+  const auto* row = q + static_cast<int64_t>(qs.i) * Heads * kDim;
+  if constexpr (Heads == kHeads) {
+    __bang_reshape_filter_async(
+        q_w_at(qs.slot), row, Heads, 1, 1, kDim, GDRAM2WRAM);
+  } else {
+    __memcpy(kv_n_at(buffer), row, Heads * kRowBytes, GDRAM2NRAM);
+    __bang_load_matrix_async(q_w_at(qs.slot),
+                             kv_n_at(buffer),
+                             NRAM2WRAM,
+                             Heads,
+                             kDim,
+                             kRowBytes,
+                             false);
+    __sync_move();
+  }
+}
+
+template <int32_t Heads>
+__mlu_func__ void scale_rows_lt(float* rows, const float* factors) {
+  asm volatile(
+      "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+      "1, 1, %[m], 1, 1, 1, 1, %[co], "
+      ".mul.partial([%[part]]);\n\t"
+      :
+      : [dst] "r"(rows),
+        [src] "r"(factors),
+        [flt] "r"(ones_w),
+        [m] "i"(Heads),
+        [co] "i"(kDim),
+        [part] "r"(rows));
+}
+
+template <int32_t Heads>
+__mlu_global__ void prefill_attention_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (__is_mpu()) {
+    return;
+  }
+  bfloat16_t* output = reinterpret_cast<bfloat16_t*>(prm.output);
+  const int64_t q_elems = static_cast<int64_t>(Heads) * kDim;
+  __memcpy(vq_n, prm.num_valid_rows, sizeof(int32_t), GDRAM2NRAM);
+  const int32_t live_end = vq_n[0];
+  const float c2 = prm.scale * kLog2e;  // natural-scale score -> log2 domain
+
+  if (live_end > 0) {
+    __memcpy(sink_n, prm.sink, Heads * sizeof(float), GDRAM2NRAM);
+    if (prm.requests > 0 && prm.requests <= kReqNram) {
+      __memcpy(rbeg_n, prm.begins, prm.requests * sizeof(int32_t), GDRAM2NRAM);
+      __memcpy(
+          roff_n, prm.kv_prefix, prm.requests * sizeof(int32_t), GDRAM2NRAM);
+    }
+    __bang_write_value(s_n, kDim, 1.0f);
+    __bang_mul_scalar(sink_n, sink_n, kLog2e, Heads);
+    __sync_compute();
+    __bang_load_matrix_async(
+        ones_w, s_n, NRAM2WRAM, kDim, 1, sizeof(float), false);
+    __sync_move();
+
+    const bool has_comp =
+        prm.ratio > 0 && prm.kcap > 0 && prm.compressed_columns > 0;
+    int32_t cached_request = -1;
+    Query cur;
+    Query nxt;
+    int32_t buf = 0;  // ping-pong index of the tile being computed
+    bool has_prior_io1 = false;
+    int32_t i = taskId;
+    if (i < live_end) {
+      prepare_light(prm, cur, i, live_end, 0, cached_request);
+      issue_query_inputs<Heads>(prm, cur, 0);
+      if (has_comp) {
+        __memcpy_io0_async(topk_n_at(0),
+                           prm.topk + static_cast<int64_t>(cur.i) * prm.kcap,
+                           prm.kcap * sizeof(int32_t),
+                           GDRAM2NRAM);
+      }
+      __sync_io();
+      if (has_comp) {
+        prepare_compressed(prm, cur);
+      }
+      issue_tile(prm, cur, 0, 0);
+    }
+    for (; i < live_end; i += taskDim) {
+      const int32_t inext = i + taskDim;
+      const bool has_next = inext < live_end;
+      for (int32_t t = 0; t < cur.tiles; ++t) {
+        const int32_t b = buf;
+        const int32_t nb = buf ^ 1;
+        const int32_t rows = tile_rows(cur, t);
+        const int32_t tp =
+            static_cast<int32_t>((static_cast<uint32_t>(rows + kAlign - 1) /
+                                  static_cast<uint32_t>(kAlign)) *
+                                 kAlign);
+        // Tile t (and, at t == 0, this query's Q) visible to Move/Compute.
+        // Placed before the next IO0 issue so it does not wait for the
+        // prefetch.
+        edge_io0_to_move_compute();
+        edge_move_compute_to_io0();  // buffer nb and q_w of the next slot no
+                                     // longer read
+        if (t == 0 && has_next && has_comp) {
+          __memcpy_io0_async(topk_n_at(cur.slot ^ 1),
+                             prm.topk + static_cast<int64_t>(inext) * prm.kcap,
+                             prm.kcap * sizeof(int32_t),
+                             GDRAM2NRAM);
+        }
+        if (t == 0 && has_prior_io1) {
+          // Wait for previous query's IO1 output store from kv_n_at(nb) before
+          // IO0 loads or Compute zero-pads kv_n_at(nb).
+          __sync_io0_io1_move_compute<false,
+                                      true,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      true>();
+        }
+        if (t + 1 < cur.tiles) {
+          issue_tile(prm, cur, t + 1, nb);
+        } else if (has_next) {
+          prepare_light(
+              prm, nxt, inext, live_end, cur.slot ^ 1, cached_request);
+          issue_query_inputs<Heads>(prm, nxt, nb);
+          issue_tile(prm, nxt, 0, nb);
+        }
+        edge_compute_to_move();  // kv_w_at(b) no longer read by PV(t-2)
+        __bang_load_matrix_async(
+            kv_w_at(b), kv_n_at(b), NRAM2WRAM, tp, kDim, kRowBytes, true);
+
+        // S^T[row, head] = (KV[row,:] . Q[head,:]) * (scale * log2e)
+        asm volatile(
+            "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+            "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]);\n\t"
+            :
+            : [dst] "r"(s_n),
+              [src] "r"(kv_n_at(b)),
+              [flt] "r"(q_w_at(cur.slot)),
+              [ci] "i"(kDim),
+              [h] "r"(rows),
+              [co] "i"(Heads),
+              [opnd] "r"(c2));
+
+        __bang_maxpool(mt_n, s_n, Heads, rows, 1, rows, 1, 1, 1);
+        if (t == 0) {
+          __bang_move(m_n, mt_n, Heads * sizeof(float));
+        } else {
+          __bang_sub(tmp_n, mt_n, m_n, Heads);
+          __bang_maxpool(red_n, tmp_n, 1, Heads, 1, Heads, 1, 1, 1);
+          __sync_compute();
+
+          if (red_n[0] > kTau) {
+            __bang_maximum(mt_n, mt_n, m_n, Heads);
+            __bang_sub(tmp_n, m_n, mt_n, Heads);
+            __bang_pow2(tmp_n, tmp_n, Heads);
+            __bang_mul(l_n, l_n, tmp_n, Heads);
+            __bang_move(m_n, mt_n, Heads * sizeof(float));
+            scale_rows_lt<Heads>(o_n, tmp_n);
+          }
+        }
+        // P = 2^(S_log2 - m_head)
+        __bang_cycle_sub(s_n, s_n, m_n, rows * Heads, Heads);
+        __bang_pow2(s_n, s_n, rows * Heads);
+        __bang_sumpool(ps_n, s_n, Heads, rows, 1, rows, 1, 1, 1);
+
+        if (t == 0) {
+          __bang_move(l_n, ps_n, Heads * sizeof(float));
+        } else {
+          __bang_add(l_n, l_n, ps_n, Heads);
+        }
+        if (rows < tp) {
+          __bang_write_value(s_n + rows * Heads, (tp - rows) * Heads, 0.0f);
+        }
+        __bang_float2bfloat16(p_n, s_n, tp * Heads);
+        __bang_transpose(pt_n, p_n, tp, Heads);
+
+        edge_move_to_compute();  // kv_w_at(b) loaded; previous RoPE copies done
+        if (t == 0) {
+          __bang_conv(o_n, pt_n, kv_w_at(b), tp, Heads, 1, 1, 1, 1, 1, kDim);
+        } else {
+          __bang_conv_partial(
+              o_n, pt_n, kv_w_at(b), o_n, tp, Heads, 1, 1, 1, 1, 1, kDim);
+        }
+        buf = nb;
+      }
+
+      // ---- epilogue: sink in the denominator + fused LT scale & RN BF16 ----
+      __bang_sub(tmp_n, sink_n, m_n, Heads);
+      __bang_pow2(tmp_n, tmp_n, Heads);
+      __bang_add(tmp_n, tmp_n, l_n, Heads);
+      __bang_recip(tmp_n, tmp_n, Heads);
+      bfloat16_t* const ep_obf = kv_n_at(buf ^ 1);
+      asm volatile(
+          "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+          "1, 1, %[m], 1, 1, 1, 1, %[co], "
+          ".mul.partial([%[part]]), .cvt.dst.rn.bf16();\n\t"
+          :
+          : [dst] "r"(ep_obf),
+            [src] "r"(tmp_n),
+            [flt] "r"(ones_w),
+            [m] "i"(Heads),
+            [co] "i"(kDim),
+            [part] "r"(o_n));
+
+      const int64_t out_off = static_cast<int64_t>(i) * q_elems;
+      edge_compute_to_io1();
+      __memcpy_io1_async(
+          output + out_off, ep_obf, Heads * kRowBytes, NRAM2GDRAM);
+      has_prior_io1 = true;
+      if (has_next && has_comp) {
+        if (cur.tiles == 1) {
+          edge_io0_to_move_compute();
+        }
+        prepare_compressed(prm, nxt);
+      }
+      if (has_next) {
+        cur = nxt;
+      }
+    }
+  }
+  // Padding rows: explicit zeros.
+  const int32_t eff_live = live_end > 0 ? live_end : 0;
+  const uint32_t u_tid = static_cast<uint32_t>(taskId);
+  const uint32_t u_tdim = static_cast<uint32_t>(taskDim);
+  int32_t first_pad = static_cast<int32_t>(u_tid);
+  if (eff_live > first_pad) {
+    first_pad += static_cast<int32_t>(
+        ((static_cast<uint32_t>(eff_live - first_pad) + u_tdim - 1U) / u_tdim) *
+        u_tdim);
+  }
+  if (first_pad < prm.nq) {
+    __sync_io();
+    __bang_write_value(obf_n, Heads * kDim, (bfloat16_t)0.0f);
+    __sync_compute();
+    for (int32_t r = first_pad, p = 0; r < prm.nq;
+         r += static_cast<int32_t>(u_tdim), ++p) {
+      if ((p & 1) == 0) {
+        __memcpy_io0_async(output + static_cast<int64_t>(r) * q_elems,
+                           obf_n,
+                           Heads * kRowBytes,
+                           NRAM2GDRAM);
+      } else {
+        __memcpy_io1_async(output + static_cast<int64_t>(r) * q_elems,
+                           obf_n,
+                           Heads * kRowBytes,
+                           NRAM2GDRAM);
+      }
+    }
+  }
+  __sync_all_pipe();
+}
+
+}  // namespace
+
+cnrtRet_t launch_generic_attention(cnrtQueue_t queue, const Params& params) {
+  cnrtDim3_t dim = {32, 1, 1};
+  switch (params.heads) {
+    case 8:
+      prefill_attention_kernel<8><<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+      break;
+    case 16:
+      prefill_attention_kernel<16><<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+      break;
+    case 32:
+      prefill_attention_kernel<32><<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+      break;
+    case 64:
+      prefill_attention_kernel<64><<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+      break;
+    default:
+      return cnrtErrorArgsInvalid;
+  }
+  return cnrtGetLastError();
+}
+
+}  // namespace xllm::kernel::mlu::bangc::paged_attention

@@ -223,7 +223,7 @@ class DeepseekV41MluModelTest : public ::testing::Test {
 
   void set_cache_role(int32_t ratio) {
     if (ratio > 0) {
-      args_.index_n_heads(32);
+      args_.index_n_heads(32).index_topk(512);
     }
     args_.compress_ratios({ratio});
     args_.kv_source_layer_ids(ratio == 0 ? std::vector<int32_t>{}
@@ -254,6 +254,16 @@ class DeepseekV41MluModelTest : public ::testing::Test {
   ModelArgs args_;
   std::filesystem::path path_;
 };
+
+TEST_F(DeepseekV41MluModelTest, RejectsOversizedDraftAtConstruction) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  args_.model_type("deepseek_v41_dspark")
+      .dspark_num_layers(1)
+      .dspark_block_size(6)
+      .markov_rank(8);
+  EXPECT_DEATH(create_llm_model(make_context()),
+               "MLU DSpark supports 1 to 5 proposals per request, got 6");
+}
 
 TEST_F(DeepseekV41MluModelTest, LoadsQuantizedDraftFromShards) {
   torch::InferenceMode inference;
@@ -727,6 +737,15 @@ TEST_F(DeepseekV41MluModelTest, RejectsUnsupportedProjectionWidth) {
       "hidden_size.*5120");
 }
 
+TEST_F(DeepseekV41MluModelTest, RejectsUnsupportedIndexTopkAtConstruction) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  set_cache_role(/*ratio=*/1);
+  args_.index_topk(4);
+  EXPECT_DEATH(
+      { layer::DeepseekV41DecoderLayer layer(make_context(), /*layer_id=*/0); },
+      "index_topk.*512");
+}
+
 TEST_F(DeepseekV41MluModelTest, QueryProjectionUsesCheckpointQuantization) {
   torch::InferenceMode inference;
   const torch::DeviceGuard guard(options_.device());
@@ -751,7 +770,6 @@ TEST_F(DeepseekV41MluModelTest, QueryProjectionUsesCheckpointQuantization) {
   layer::Csa2Context shared;
   layer::deepseek_v41::prepare_metadata(
       shared, input, positions, /*num_sequences=*/1);
-  shared.topk.resize(1);
   DeepSeekV4KVCacheTensors tensors;
   tensors.swa_cache = torch::zeros({1, 128, 1, 512}, options_);
   std::vector<KVCache> caches;
@@ -807,7 +825,7 @@ TEST_P(DeepseekV41HashPlacementTest,
       .n_heads(8)
       .vocab_size(8)
       .window_size(16)
-      .index_topk(4)
+      .index_topk(512)
       .num_speculative_tokens(kWidth - 1)
       .max_position_embeddings(512)
       .layers_to_capture({0})
@@ -898,8 +916,8 @@ TEST_P(DeepseekV41HashPlacementTest,
   const auto make_cache = [&]() {
     DeepSeekV4KVCacheTensors tensors;
     tensors.swa_cache = torch::zeros({8, 128, 1, 512}, options_);
-    tensors.key_cache = torch::zeros_like(tensors.swa_cache);
-    tensors.index_cache = torch::zeros({8, 128, 1, 128}, options_);
+    tensors.key_cache = torch::zeros({8, 64, 1, 512}, options_);
+    tensors.index_cache = torch::zeros({8, 64, 1, 128}, options_);
     tensors.compress_kv_state =
         torch::zeros({8, 32, 512}, options_.dtype(torch::kFloat32));
     tensors.compress_score_state = torch::zeros_like(tensors.compress_kv_state);
@@ -978,6 +996,8 @@ TEST_P(DeepseekV41HashPlacementTest,
     flat.meta.num_sequences = count * kWidth;
     flat.meta.actual_num_sequences = count * kWidth;
     flat.meta.spec_verify_width = kWidth;
+    flat.execution_batch.num_reqs = count;
+    flat.execution_batch.query_start_loc = grouped.attention.host.q_seq_lens;
     flat.meta.q_max_seq_len = 1;
     // Device-generated verify tokens must override an otherwise plausible host
     // view.
@@ -1171,10 +1191,46 @@ TEST_P(DeepseekV41HashPlacementTest,
   }
 }
 
+TEST_F(DeepseekV41MluModelTest, VerifyGroupsBlockTablesByActualRequestWidth) {
+  torch::InferenceMode inference;
+  const torch::DeviceGuard guard(options_.device());
+  mlu::model::DeepseekV41Model model(make_context());
+  mlu::model::DeepseekV41GraphState graph;
+  ModelInputParams input;
+  input.meta.batch_forward_type = BatchForwardType::DECODE;
+  input.meta.spec_verify_width = 3;
+  input.meta.num_sequences = 8;
+  input.execution_batch.num_reqs = 3;
+  input.attention.host.kv_seq_lens = {0, 1, 3, 6, 10, 15, 21, 21, 21};
+  const auto positions = torch::arange(8, options_.dtype(torch::kInt64));
+  const auto pages =
+      torch::arange(8, options_.dtype(torch::kInt32)).view({8, 1});
+  input.multi_block_tables = {pages, pages + 8};
+
+  const auto check_rows = [&](const std::vector<int32_t>& prefix,
+                              const std::vector<int32_t>& expected) {
+    input.execution_batch.query_start_loc = prefix;
+    model->prepare_graph_forward_metadata(&graph, positions, input);
+    ASSERT_TRUE(graph.verify_input_.has_value());
+    const auto& tables = graph.verify_input_->multi_block_tables;
+    const auto rows = torch::tensor(expected, torch::kInt32).view({3, 1});
+    ASSERT_EQ(tables.size(), 2u);
+    EXPECT_TRUE(torch::equal(tables[0].cpu(), rows));
+    EXPECT_TRUE(torch::equal(tables[1].cpu(), rows + 8));
+  };
+  check_rows({0, 2, 4, 6}, {0, 2, 4});
+  ASSERT_TRUE(graph.verify_input_.has_value());
+  for (size_t group = 0; group < input.multi_block_tables.size(); ++group) {
+    EXPECT_EQ(graph.verify_input_->multi_block_tables.at(group).data_ptr(),
+              input.multi_block_tables[group].data_ptr());
+  }
+  check_rows({0, 2, 3, 6}, {0, 2, 3});
+}
+
 TEST_F(DeepseekV41MluModelTest, CpuBlockTablesSupportEagerPrefillAndDecode) {
   torch::InferenceMode inference;
   const torch::DeviceGuard guard(options_.device());
-  args_.n_heads(8).window_size(16).index_topk(4).num_speculative_tokens(5);
+  args_.n_heads(8).window_size(16).index_topk(512).num_speculative_tokens(5);
   for (int32_t ratio : {1, 2}) {
     SCOPED_TRACE(ratio);
     set_cache_role(ratio);
@@ -1189,8 +1245,8 @@ TEST_F(DeepseekV41MluModelTest, CpuBlockTablesSupportEagerPrefillAndDecode) {
     const auto make_cache = [&]() {
       DeepSeekV4KVCacheTensors tensors;
       tensors.swa_cache = torch::zeros({4, 128, 1, 512}, options_);
-      tensors.key_cache = torch::full_like(tensors.swa_cache, -7);
-      tensors.index_cache = torch::full({4, 128, 1, 128}, -7, options_);
+      tensors.key_cache = torch::full({4, 128 / ratio, 1, 512}, -7, options_);
+      tensors.index_cache = torch::full({4, 128 / ratio, 1, 128}, -7, options_);
       if (ratio == 2) {
         tensors.compress_kv_state =
             torch::zeros({4, 32, 512}, options_.dtype(torch::kFloat32));

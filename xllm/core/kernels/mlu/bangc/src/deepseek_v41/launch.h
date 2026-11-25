@@ -17,21 +17,6 @@ limitations under the License.
 #include <cnrt.h>
 
 #include <cstdint>
-void deepseek_v41_gather_launch(cnrtQueue_t queue,
-                                const void* swa,
-                                const void* compressed,
-                                const void* current,
-                                const int32_t* swa_table,
-                                const int32_t* comp_table,
-                                const int64_t* topk,
-                                int32_t count,
-                                int64_t position,
-                                int32_t window,
-                                int32_t swa_columns,
-                                int32_t comp_physical_dim,
-                                void* output,
-                                int32_t* length);
-
 namespace xllm::kernel::mlu::bangc::indexer_q {
 // Shared by the kernel tiling and wrapper row-count overflow guard.
 constexpr int32_t kRowsPerBlock = 48;

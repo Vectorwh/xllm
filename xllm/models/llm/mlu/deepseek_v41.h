@@ -168,15 +168,13 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     CHECK(input.meta.batch_forward_type.is_decode());
     graph_state_->verify_input_.reset();
     const ModelInputParams* grouped = &input;
-    if (input.meta.spec_verify_width > 1) {
+    if (has_verify_rows(input)) {
       graph_state_->verify_input_ = group_verify_input(input);
       grouped = &*graph_state_->verify_input_;
     }
     const auto& metadata = *grouped;
 
     if (!graph_state_->engram_) {
-      graph_state_->shared_.topk.resize(metadata.meta.num_sequences);
-      graph_state_->shared_.candidates.resize(metadata.meta.num_sequences);
       graph_state_->engram_ = engram_inputs_->create_graph_state(
           positions.numel(), positions.numel() / metadata.meta.num_sequences);
     }
@@ -185,11 +183,14 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
                                            model_args_,
                                            positions.numel(),
                                            options_);
-    layer::deepseek_v41::prepare_metadata(graph_state_->shared_,
-                                          metadata,
-                                          positions,
-                                          metadata.meta.actual_num_sequences,
-                                          input.graph.kv_seq_len_capacity);
+    layer::deepseek_v41::prepare_metadata(
+        graph_state_->shared_,
+        metadata,
+        positions,
+        metadata.meta.actual_num_sequences,
+        input.graph.kv_seq_len_capacity > 0
+            ? input.graph.kv_seq_len_capacity
+            : model_args_.max_position_embeddings());
     engram_inputs_->prepare_graph(*graph_state_->engram_, metadata);
   }
 
@@ -229,7 +230,7 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
     }
     const auto& prepared_input = dp_input ? *dp_input : raw_input;
     std::optional<ModelInputParams> grouped_input;
-    if (!raw_input.enable_graph && raw_input.meta.spec_verify_width > 1 &&
+    if (!raw_input.enable_graph && has_verify_rows(raw_input) &&
         prepared_input.meta.q_max_seq_len > 0 &&
         prepared_input.meta.num_sequences > 0) {
       grouped_input = group_verify_input(prepared_input);
@@ -301,11 +302,11 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
       layer::deepseek_v41::prepare_workspace(
           shared, input, model_args_, positions.numel(), options_);
       if (cp_context) {
+        shared.query_requests = shared.query_requests.index_select(
+            0, cp_context->local_row_indices);
         shared.num_valid_input_rows.fill_(positions.numel());
       }
     }
-    shared.topk.resize(input.meta.num_sequences * (cp_context ? 2 : 1));
-    shared.candidates.resize(input.meta.num_sequences * (cp_context ? 2 : 1));
     std::optional<layer::PendingMHC> pending;
     for (size_t id = 0; id < layers_.size(); ++id) {
       if (!input.synchronize_layer(id)) {
@@ -370,29 +371,60 @@ class DeepseekV41ModelImpl : public torch::nn::Module {
 
   // Generic verify expands each request into independent decode rows. V4.1
   // compression and Engram need the original contiguous request chunks.
+  static bool has_verify_rows(const ModelInputParams& input) {
+    return input.meta.spec_verify_width > 1 ||
+           (!input.use_dflash_proposal_attention &&
+            input.meta.batch_forward_type.is_decode() &&
+            input.meta.q_max_seq_len == 1 &&
+            input.execution_batch.num_reqs > 0 &&
+            input.execution_batch.num_tokens > input.execution_batch.num_reqs);
+  }
+
   static ModelInputParams group_verify_input(const ModelInputParams& input) {
     ModelInputParams grouped = input;
-    const int32_t width = input.meta.spec_verify_width;
-    CHECK_EQ(input.meta.num_sequences % width, 0);
-    CHECK_EQ(input.meta.actual_num_sequences % width, 0);
-    grouped.meta.num_sequences /= width;
-    grouped.meta.actual_num_sequences /= width;
-    grouped.meta.q_max_seq_len = width;
+    const auto& prefix = input.execution_batch.query_start_loc;
+    const int32_t real = input.execution_batch.num_reqs;
+    CHECK_EQ(prefix.size(), static_cast<size_t>(real) + 1);
+    CHECK_EQ(prefix.front(), 0);
+    CHECK_LE(prefix.back(), input.meta.num_sequences);
+    const int32_t padding = input.meta.num_sequences - prefix.back();
+    const int32_t width = std::max(1, input.meta.spec_verify_width);
+    grouped.meta.num_sequences = real + (padding + width - 1) / width;
+    grouped.meta.actual_num_sequences = real;
+    grouped.meta.q_max_seq_len = 1;
+    grouped.is_spec_verify = true;
     auto& host = grouped.attention.host;
-    host.q_seq_lens = {0};
+    host.q_seq_lens = prefix;
+    host.q_seq_lens.resize(grouped.meta.num_sequences + 1, prefix.back());
     host.kv_seq_lens = {0};
-    host.q_seq_lens.reserve(grouped.meta.num_sequences + 1);
-    host.kv_seq_lens.reserve(grouped.meta.num_sequences + 1);
-    for (int32_t seq = 0; seq < grouped.meta.num_sequences; ++seq) {
-      const int32_t last = (seq + 1) * width;
-      host.q_seq_lens.emplace_back(input.attention.host.q_seq_lens[last]);
-      host.kv_seq_lens.emplace_back(host.kv_seq_lens.back() +
-                                    input.attention.host.kv_seq_lens[last] -
-                                    input.attention.host.kv_seq_lens[last - 1]);
+    const int32_t first_width = real > 0 ? prefix[1] : 1;
+    bool uniform_width = true;
+    for (int32_t seq = 0; seq < real; ++seq) {
+      const int32_t first = prefix[seq];
+      const int32_t end = prefix[seq + 1];
+      CHECK_GT(end, first);
+      CHECK_LE(end - first, 6);
+      grouped.meta.q_max_seq_len =
+          std::max(grouped.meta.q_max_seq_len, end - first);
+      uniform_width = uniform_width && end - first == first_width;
+      host.kv_seq_lens.push_back(host.kv_seq_lens.back() +
+                                 input.attention.host.kv_seq_lens.at(end) -
+                                 input.attention.host.kv_seq_lens.at(end - 1));
     }
+    host.kv_seq_lens.resize(grouped.meta.num_sequences + 1,
+                            host.kv_seq_lens.back());
     host.q_cu_seq_lens = host.q_seq_lens;
+    if (uniform_width) {
+      for (auto& table : grouped.multi_block_tables) {
+        table = table.slice(/*dim=*/0, /*start=*/0, prefix.back(), first_width);
+      }
+      return grouped;
+    }
+    const std::vector<int64_t> first_rows(prefix.begin(), prefix.end() - 1);
+    auto indices = torch::tensor(first_rows, torch::kInt64);
     for (auto& table : grouped.multi_block_tables) {
-      table = table.slice(0, 0, table.size(0), width);
+      indices = indices.to(table.device());
+      table = table.index_select(/*dim=*/0, indices);
     }
     return grouped;
   }

@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model_loader.h"
+#include "core/kernels/mlu/bangc/include/deepseek_v41_constants.h"
 #include "core/layers/common/linear.h"
 #include "core/layers/common/rms_norm.h"
 #include "models/llm/dspark_markov_head.h"
@@ -44,6 +45,12 @@ class DeepseekV41DSparkModelImpl final : public DeepseekV41ModelImpl {
         markov_head_(context.get_tensor_options(),
                      context.get_model_args().markov_rank()) {
     const ModelArgs& args = context.get_model_args();
+    const int32_t draft_width = args.dspark_block_size();
+    using kernel::mlu::bangc::kDeepseekV41MaxDraftWidth;
+    CHECK(draft_width >= 1 && draft_width <= kDeepseekV41MaxDraftWidth)
+        << "DeepSeek-V4.1 MLU DSpark supports 1 to "
+        << kDeepseekV41MaxDraftWidth << " proposals per request, got "
+        << draft_width;
     const int64_t capture_count = args.dspark_num_layers();
     CHECK_GT(capture_count, 0)
         << "DeepSeek-V4.1 DSpark requires dspark_num_layers > 0.";

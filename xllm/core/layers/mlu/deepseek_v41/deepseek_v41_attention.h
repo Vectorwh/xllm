@@ -49,28 +49,6 @@ class DeepseekV41AttentionImpl final : public torch::nn::Module {
   torch::Tensor project_query(const torch::Tensor& qr,
                               const torch::Tensor& positions,
                               const torch::Tensor& rope);
-  void decode_attention(const torch::Tensor& q,
-                        const torch::Tensor& selected,
-                        const torch::Tensor& lengths,
-                        torch::Tensor output);
-  void forward_cached_attention(
-      const torch::Tensor& iw,
-      const torch::Tensor& q,
-      const torch::Tensor& kv,
-      const torch::Tensor& iq,
-      std::vector<KVCache>& caches,
-      const ModelInputParams& input,
-      Csa2Context& shared,
-      torch::Tensor output,
-      torch::Tensor selected,
-      torch::Tensor lengths,
-      const mlu_v4_cp::DeepseekV4CpContext* cp_context);
-  void compute_attention(const torch::Tensor& q,
-                         const torch::Tensor& window,
-                         const torch::Tensor& main,
-                         const torch::Tensor& indices,
-                         int64_t begin,
-                         torch::Tensor output);
   torch::Tensor project_output(const torch::Tensor& output,
                                const torch::Tensor& positions,
                                const torch::Tensor& rope);

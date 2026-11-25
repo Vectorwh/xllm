@@ -109,6 +109,22 @@ cc_test(
 )
 
 cc_test(
+  NAME fused_paged_sparsed_attention_test
+  RUN_SERIAL
+  SRCS fused_paged_sparsed_attention_test.cpp
+  DEPS xllm::mlu_ops torch torch_mlu cnrt glog::glog GTest::gtest_main
+  ENVIRONMENT "OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
+)
+
+cc_test(
+  NAME fused_dsa_index_score_select_test
+  RUN_SERIAL
+  SRCS fused_dsa_index_score_select_test.cpp
+  DEPS xllm::mlu_ops torch torch_mlu cnrt glog::glog GTest::gtest_main
+  ENVIRONMENT "OMP_NUM_THREADS=1;MKL_NUM_THREADS=1"
+)
+
+cc_test(
   NAME fused_indexer_k_mlu_test
   RUN_SERIAL
   SRCS fused_indexer_k_test.cpp

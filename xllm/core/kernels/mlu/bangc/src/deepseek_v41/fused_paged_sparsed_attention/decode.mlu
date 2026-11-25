@@ -1,0 +1,3012 @@
+/* Copyright 2026 The xLLM Authors. Licensed under Apache-2.0; see LICENSE. */
+// DeepSeek V4.1 decode paged sparse attention + SWA commit, raw BF16 512-ch
+// output, one launch (mtp_592).
+//
+// Task mapping: Union1, `groups` cluster jobs; job y handles live queries
+// i = y, y + groups, ... . For query i the visible record list is the SWA
+// window max(0,p-127)..p (old ring for t<b, current KV for t>=b) followed by
+// the valid compressed Top-K records in input order (multiplicity kept);
+// R <= 640 records. The QC IPUs serving a query (QC = 4: the cluster; QC = 2:
+// half a cluster, batches with > 8 queries) split the R records into fixed
+// 32-aligned chunks (split-KV); all 64 heads share every KV row.
+//
+// Per query and IPU k (chunk n_k rows, padded to Cp = roundup(n_k, 32)):
+//   S_k[Cp,64]   = KV_k . Q^T                      (conv, BF16 -> FP32)
+//   m_k          = rowmax(S_k)              -> SRAM, cluster barrier 1
+//   M            = max_j m_j
+//   P_k          = 2^((S_k - M) * scale*log2e),  l_k = rowsum(P_k) -> SRAM,
+//   barrier 2 L            = sum_j l_j + 2^(sink*log2e - M*scale*log2e)   (sink
+//   exactly once) O_k[64,512]  = P_k^T . KV_k                      (conv, BF16
+//   P, FP32 acc) -> SRAM, barrier 3 IPU k then sums O_j for heads [16k,16k+16),
+//   scales by 1/L in FP32, rounds once to BF16 across all 512 channels, and
+//   stores its heads directly.
+// SWA commit: each request has exactly one current row (host-validated);
+// its ring slot holds position begin-capacity, outside every visible window,
+// so the write never races with any read. Padding rows are zero-filled.
+#include <bang.h>
+#include <stdint.h>
+
+#include "kernels/mlu/bangc/src/deepseek_v41/fused_paged_sparsed_attention/launch.h"
+
+namespace xllm::kernel::mlu::bangc::paged_attention {
+namespace {
+
+constexpr int32_t kCores = 4;
+constexpr int32_t kRowBytes = kDim * 2;
+constexpr int32_t kAlign = 32;  // conv ci alignment (64 B of BF16)
+constexpr int32_t kCtabNram = 1024;
+constexpr int32_t kCtabWide = kMaxCompressedColumns;
+constexpr float kLog2e = 1.4426950408889634f;
+
+// Per-core NRAM pool layout for QC IPUs per query: [KV rows | O | S].
+//   QC = 4: <= 160 rows (32 SWA + 128 Top-K); O [64,512] FP32 holds the four
+//           16-head PV slices.
+//   QC = 2: <= 320 rows (64 SWA + 256 Top-K); O holds only the foreign 32-head
+//           PV slice (64 KB, also the 64 KB Q staging); the own slice is
+//           written into the idle KV region.
+// After PV the KV region (FP32 view) is reused: foreign O partials at 0,
+// QC=2 own partial, BF16 staging of the output.
+template <int32_t QC>
+struct Layout {
+  static constexpr int32_t kHpc = kHeads / QC;  // max heads per core (combine)
+  static constexpr int32_t kSl = kHpc * kDim;   // max combine slice (floats)
+  static constexpr int32_t kChunk =
+      QC == 4 ? 160 : 320;  // max padded rows per core
+  static constexpr int32_t kOBytes =
+      QC == 4 ? kHeads * kDim * 4 : kHeads * kDim * 2;
+  static constexpr int32_t kOOff = kChunk * kRowBytes;  // bytes
+  static constexpr int32_t kSOff = kOOff + kOBytes;     // bytes
+  static constexpr int32_t kBytes = kSOff + kChunk * kHeads * 4;
+  static constexpr int32_t kForeignOff = 0;           // floats in the KV region
+  static constexpr int32_t kOwnOff = (QC - 1) * kSl;  // QC = 2 only
+  static constexpr int32_t kObfOff = QC == 4 ? 3 * kSl : 2 * kSl;
+  static_assert(kChunk % kAlign == 0, "chunk alignment");
+  static_assert(kChunk >= kWindow / QC + (kMaxTopk + QC - 1) / QC,
+                "rows per core");
+  static_assert(kChunk * kDim / 2 >= kObfOff + kSl / 2,
+                "KV region reuse after PV");
+  static_assert(kChunk * kHeads >= 8 * kMaxTopk, "compaction scratch in S");
+};
+constexpr int32_t kPoolBytes = Layout<4>::kBytes > Layout<2>::kBytes
+                                   ? Layout<4>::kBytes
+                                   : Layout<2>::kBytes;
+constexpr int32_t kMaxChunk = Layout<2>::kChunk;  // 320
+
+__nram__ __attribute__((aligned(128))) int8_t pool_n[kPoolBytes];
+#define kv_n (reinterpret_cast<bfloat16_t*>(pool_n))
+__nram__ __attribute__((aligned(128))) float m_n[kHeads];
+__nram__ __attribute__((aligned(128))) float l_n[kHeads];
+__nram__ __attribute__((aligned(128))) float tmp_n[kHeads];
+__nram__ __attribute__((aligned(128))) float sink_n[kHeads];
+__nram__ __attribute__((aligned(128))) float all_n[kCores * kHeads];
+__nram__ __attribute__((aligned(128))) uint64_t off_n[kMaxTopk];
+__nram__ __attribute__((aligned(128))) int32_t topk_n[kMaxTopk];
+__nram__ __attribute__((aligned(128))) int32_t ctab_n[kCtabNram];
+__nram__ __attribute__((aligned(128))) int32_t stab_n[kMaxSwaPreloadColumns];
+// Per-query scalar: meta_n[0] = num_valid_rows (read-only after entry),
+// meta_n[16] = begins.
+__nram__ __attribute__((aligned(128))) int32_t meta_n[32];
+__nram__ __attribute__((aligned(128))) bfloat16_t m_bf_buf_n[kHeads];
+__nram__ __attribute__((aligned(128))) bfloat16_t cur_stage_n[kDim];
+
+#define kvf_n (reinterpret_cast<float*>(pool_n))
+
+// mtp_592 WRAM matrices are striped over 16 lanes spaced 32 KB apart: a matrix
+// of S bytes uses S/16 bytes of the lane-0 range, so bases stay in 32 KB.
+constexpr int32_t kWramLaneBytes = 512 * 1024 / 16;
+constexpr int32_t kQLaneBytes = kHeads * kDim * 2 / 16;      // 4 KB
+constexpr int32_t kKvLaneBytes = kMaxChunk * kDim * 2 / 16;  // 20 KB
+constexpr int32_t kOnesLaneBytes =
+    (32 * 1024) / 16;  // 2 KB (co = 512, ci = 1 FP32)
+constexpr int32_t kQc1Tile = 128;
+constexpr int32_t kQc1KvLaneBytes =
+    kQc1Tile * kDim * 2 / 16;  // 8 KB (128 rows transposed)
+static_assert(2 * kQLaneBytes + kKvLaneBytes + kOnesLaneBytes <= kWramLaneBytes,
+              "WRAM lane budget");
+static_assert(2 * kQLaneBytes + 2 * kQc1KvLaneBytes + kOnesLaneBytes <=
+                  kWramLaneBytes,
+              "QC1 WRAM lane budget");
+__wram__ __attribute__((aligned(128))) int8_t wram_buf[512 * 1024];
+#define q_w (reinterpret_cast<bfloat16_t*>(wram_buf))
+#define kv_w (reinterpret_cast<bfloat16_t*>(wram_buf + 2 * kQLaneBytes))
+#define ones_w \
+  (reinterpret_cast<float*>(wram_buf + 2 * kQLaneBytes + kKvLaneBytes))
+#define qc1_q_w(s) (reinterpret_cast<bfloat16_t*>(wram_buf + (s) * kQLaneBytes))
+#define qc1_kv_w(b)                                           \
+  (reinterpret_cast<bfloat16_t*>(wram_buf + 2 * kQLaneBytes + \
+                                 (b) * kQc1KvLaneBytes))
+#define qc1_kv_w_256 (qc1_kv_w(0))
+#define qc1_ones_w ones_w
+
+// Cluster exchange (Union1: one SRAM per job).
+__mlu_shared__ __attribute__((aligned(128))) float sm_m[kCores * kHeads];
+__mlu_shared__ __attribute__((aligned(128))) float sm_l[kCores * kHeads];
+__mlu_shared__ __attribute__((aligned(128))) float sm_o[kCores * kHeads * kDim];
+
+// Direct 2D GDRAM -> WRAM Q filter load into mtp_592's striped LT lanes (32 KB
+// lane stride, 4 output channels = 4096 B per LT lane; GH=16 uses lanes 0..3,
+// GH=32 lanes 0..7, GH=64 lanes 0..15).
+template <int32_t GH>
+__mlu_func__ void load_q_w_direct(bfloat16_t* dst_w,
+                                  const bfloat16_t* src_q,
+                                  bool split_io) {
+  static_assert(GH == 16 || GH == 32 || GH == 64,
+                "WRAM lane striping requires GH in {16,32,64}");
+  constexpr int32_t kLanes = GH / 4;
+  constexpr int32_t kHalfLanes = kLanes / 2;
+  constexpr int32_t kLaneChunkBytes = 4 * kRowBytes;  // 4096 B (4 heads/lane)
+  if (split_io) {
+    __memcpy_io0_async(dst_w,
+                       src_q,
+                       kLaneChunkBytes,
+                       GDRAM2WRAM,
+                       kWramLaneBytes,
+                       kLaneChunkBytes,
+                       kHalfLanes - 1);
+    bfloat16_t* const dst_w_hi = reinterpret_cast<bfloat16_t*>(
+        reinterpret_cast<int8_t*>(dst_w) + kHalfLanes * kWramLaneBytes);
+    __memcpy_io1_async(dst_w_hi,
+                       src_q + (GH / 2) * kDim,
+                       kLaneChunkBytes,
+                       GDRAM2WRAM,
+                       kWramLaneBytes,
+                       kLaneChunkBytes,
+                       kHalfLanes - 1);
+  } else {
+    __memcpy_io0_async(dst_w,
+                       src_q,
+                       kLaneChunkBytes,
+                       GDRAM2WRAM,
+                       kWramLaneBytes,
+                       kLaneChunkBytes,
+                       kLanes - 1);
+  }
+}
+
+// Direct single-instruction transpose-load of tp (32-aligned: 32/64/96/128) x
+// 512 BF16 rows from NRAM to WRAM filter layout, avoiding generic
+// __bang_load_matrix_async remainder bloat.
+__mlu_func__ void load_kv_w_tp_async(bfloat16_t* dst,
+                                     const bfloat16_t* src,
+                                     int32_t tp) {
+  const uint32_t n32 = static_cast<uint32_t>(tp) >> 5;
+  mlu2DTileRule_t h_desc(32, kRowBytes);
+  mlu2DTileRule_t w_desc(4, tp * 2, 8, kWramLaneBytes);
+  mlu3DTileRule_t dst_tile_desc(2, 8 * kWramLaneBytes, 8, 8 * tp, n32, 64);
+  mlu3DTileRule_t src_tile_desc(2, 64, 8, 128, n32, 32 * kRowBytes);
+  __bang_tiled_transpose_async(
+      dst, src, NRAM2WRAM, h_desc, w_desc, dst_tile_desc, src_tile_desc);
+}
+
+// Transpose-load `sub_rows` (32-aligned) x 512 BF16 rows from NRAM into the
+// [512, total_cp] WRAM filter layout starting at column `col_off` (32-aligned).
+// Enables pipelining lm_kv(SWA), lm_kv(TopK_0), and lm_kv(TopK_1) concurrently
+// with Top-K __gather and QK.
+__mlu_func__ void load_kv_w_slice_async(bfloat16_t* dst_base,
+                                        const bfloat16_t* src,
+                                        int32_t sub_rows,
+                                        int32_t total_cp,
+                                        int32_t col_off) {
+  const uint32_t n32 = static_cast<uint32_t>(sub_rows) >> 5;
+  mlu2DTileRule_t h_desc(32, kRowBytes);
+  mlu2DTileRule_t w_desc(4, total_cp * 2, 8, kWramLaneBytes);
+  mlu3DTileRule_t dst_tile_desc(
+      2, 8 * kWramLaneBytes, 8, 8 * total_cp, n32, 64);
+  mlu3DTileRule_t src_tile_desc(2, 64, 8, 128, n32, 32 * kRowBytes);
+  __bang_tiled_transpose_async(dst_base + col_off,
+                               src,
+                               NRAM2WRAM,
+                               h_desc,
+                               w_desc,
+                               dst_tile_desc,
+                               src_tile_desc);
+}
+
+// Transpose-load one 128-row half (half_idx=0 or 1) into the combined [512,
+// 256] WRAM filter layout.
+__mlu_func__ void load_kv_w_256_half_async(bfloat16_t* dst_base,
+                                           const bfloat16_t* src_128,
+                                           int32_t half_idx) {
+  mlu2DTileRule_t h_desc(32, kRowBytes);
+  mlu2DTileRule_t w_desc(4, 512, 8, 32768);
+  mlu3DTileRule_t dst_tile_desc(2, 8 * 32768, 8, 2048, 4, 64);
+  mlu3DTileRule_t src_tile_desc(2, 64, 8, 128, 4, 32 * kRowBytes);
+  __bang_tiled_transpose_async(dst_base + half_idx * 128,
+                               src_128,
+                               NRAM2WRAM,
+                               h_desc,
+                               w_desc,
+                               dst_tile_desc,
+                               src_tile_desc);
+}
+
+__mlu_func__ void cluster_barrier() { __sync_all_ipu_within_cluster(); }
+
+// dst[64] = per-head max / sum over the `rows` rows of src[rows, 64]: one
+// pooling op in the high-dimension form (H=1, W=rows, C=64, kw=rows).
+template <int32_t GH>
+__mlu_func__ void head_max_bf16(bfloat16_t* dst,
+                                const bfloat16_t* src,
+                                int32_t rows) {
+  __bang_maxpool(dst, src, GH, 1, rows, 1, rows, 1, 1);
+}
+template <int32_t GH>
+__mlu_func__ void head_sum_bf16(bfloat16_t* dst,
+                                const bfloat16_t* src,
+                                int32_t rows) {
+  __bang_sumpool(dst, src, GH, 1, rows, 1, rows, 1, 1);
+}
+
+template <int32_t GH>
+__mlu_func__ void head_max(float* dst, const float* src, int32_t rows) {
+  __bang_maxpool(dst, src, GH, 1, rows, 1, rows, 1, 1);
+}
+template <int32_t GH>
+__mlu_func__ void head_sum(float* dst, const float* src, int32_t rows) {
+  __bang_sumpool(dst, src, GH, 1, rows, 1, rows, 1, 1);
+}
+
+// Native Move-engine BF16 transpose [rows_m, GH] -> [GH, rows_m] (rows_m
+// 32-aligned, GH in {32,64}). Uses 32x32 BF16 (64B x 64B) full-line tiles
+// overlapped on Move with head_sum_bf16 on Compute.
+template <int32_t GH>
+__mlu_func__ void move_transpose_p_bf16(bfloat16_t* dst,
+                                        const bfloat16_t* src,
+                                        int32_t rows_m) {
+  static_assert(GH == 16 || GH == 32 || GH == 64,
+                "move_transpose_p_bf16 requires GH in {16,32,64}");
+  const uint32_t n32 = static_cast<uint32_t>(rows_m) >> 5;
+  constexpr uint32_t kColTiles =
+      GH >= 32 ? (static_cast<uint32_t>(GH) >> 5) : 1U;
+  mlu2DTileRule_t h_desc(32, GH * static_cast<int32_t>(sizeof(bfloat16_t)));
+  mlu2DTileRule_t w_desc(32, rows_m * static_cast<int32_t>(sizeof(bfloat16_t)));
+  mlu3DTileRule_t dst_tile_desc(
+      1,
+      0,
+      kColTiles,
+      32 * rows_m * static_cast<int32_t>(sizeof(bfloat16_t)),
+      n32,
+      32 * static_cast<int32_t>(sizeof(bfloat16_t)));
+  mlu3DTileRule_t src_tile_desc(
+      1,
+      0,
+      kColTiles,
+      32 * static_cast<int32_t>(sizeof(bfloat16_t)),
+      n32,
+      32 * GH * static_cast<int32_t>(sizeof(bfloat16_t)));
+  __bang_tiled_transpose_async(
+      dst, src, NRAM2NRAM, h_desc, w_desc, dst_tile_desc, src_tile_desc);
+}
+
+template <int32_t GH>
+__mlu_func__ void move_transpose_split_p_f32_to_bf16(bfloat16_t* dst,
+                                                     const float* src,
+                                                     int32_t rows_m) {
+  constexpr int32_t n0 = 32;
+  constexpr int32_t n1 = 8;
+  constexpr int32_t in3 = GH / n1;
+  constexpr int32_t is1 = GH * static_cast<int32_t>(sizeof(float));
+  constexpr int32_t is4 = n1 * is1;
+  const int32_t in4 = rows_m / n1;
+  const int32_t ds1 = rows_m * static_cast<int32_t>(sizeof(bfloat16_t));
+  const int32_t ds3 = n1 * ds1;
+  asm volatile(
+      "trans.tiling.async.nram.nram.b32 [%[dst_addr]], [%[src_addr]], "
+      "%[in0], %[in1], %[is1], 1, 0, %[in3], %[is3], %[in4], %[is4], 1, 0, "
+      "%[dn0], %[dn1], %[ds1], 1, 0, %[dn3], %[ds3], %[dn4], %[ds4], 1, 0, "
+      ".cvt.rn.bf16.f32();\n\t"
+      :
+      : [dst_addr] "r"(dst),
+        [src_addr] "r"(src),
+        [in0] "i"(n0),
+        [in1] "i"(n1),
+        [is1] "i"(is1),
+        [in3] "i"(in3),
+        [is3] "i"(n0),
+        [in4] "r"(in4),
+        [is4] "i"(is4),
+        [dn0] "i"(n0),
+        [dn1] "i"(n1),
+        [ds1] "r"(ds1),
+        [dn3] "i"(in3),
+        [ds3] "r"(ds3),
+        [dn4] "r"(in4),
+        [ds4] "i"(n1 * static_cast<int32_t>(sizeof(bfloat16_t))));
+}
+
+struct Query {
+  int32_t i;
+  int32_t request;
+  int32_t pos;
+  int32_t begin;
+  int64_t offset;
+  int32_t lo;
+  int32_t nswa;
+  int32_t nc;
+  int32_t swa_page_lo;
+  int32_t swa_page_hi;
+};
+
+// Wide-table (swa_columns > 256) O(1) page lookup for a single Decode query:
+// [lo, pos] has length <= 128, so it touches at most 2 consecutive logical
+// pages.
+__mlu_func__ void load_decode_wide_pages(const Params& prm,
+                                         int32_t req,
+                                         int32_t lo,
+                                         int32_t pos,
+                                         int32_t* page_lo,
+                                         int32_t* page_hi) {
+  const int32_t* const row =
+      prm.swa_table + static_cast<int64_t>(req) * prm.swa_row_stride;
+  const uint32_t swa_cols = static_cast<uint32_t>(prm.swa_columns);
+  const uint32_t p_lo = static_cast<uint32_t>(lo) >> 7;
+  const uint32_t p_hi = static_cast<uint32_t>(pos) >> 7;
+  const uint32_t col_lo = p_lo % swa_cols;
+  if (p_lo == p_hi) {
+    __memcpy_io1_async(stab_n, row + col_lo, sizeof(int32_t), GDRAM2NRAM);
+    __sync_io();
+    const int32_t pg = __load_nram(stab_n);
+    *page_lo = pg;
+    *page_hi = pg;
+  } else {
+    if (col_lo + 1U < swa_cols) {
+      __memcpy_io1_async(stab_n, row + col_lo, 2 * sizeof(int32_t), GDRAM2NRAM);
+    } else {
+      __memcpy_io1_async(stab_n, row + col_lo, sizeof(int32_t), GDRAM2NRAM);
+      __memcpy_io1_async(stab_n + 1, row, sizeof(int32_t), GDRAM2NRAM);
+    }
+    __sync_io();
+    *page_lo = __load_nram(stab_n);
+    *page_hi = __load_nram(stab_n + 1);
+  }
+}
+
+// Compressed record offsets of this core's Top-K slice topk_n[0, k) (requires
+// topk_n/ctab_n loaded). Input order and multiplicity kept; -1 and
+// out-of-table entries dropped. Unsigned 1-compare filter + nc==k fast path +
+// hardware fuse.nram.u32 + 32-bit (lo32, hi32) transpose (exact up to 2^32
+// pages).
+template <int32_t PageShift>
+__mlu_func__ int32_t compact_topk(const Params& prm,
+                                  const Query& qs,
+                                  int32_t k,
+                                  const int32_t* ctab_wide,
+                                  float* s_n) {
+  const int32_t* table_row =
+      prm.compressed_table +
+      static_cast<int64_t>(qs.request) * prm.compressed_row_stride;
+  float* const jf = s_n;
+  float* const mk = s_n + kMaxTopk;
+  float* const jc = s_n + 2 * kMaxTopk;
+  const uint32_t* const topk_u = reinterpret_cast<const uint32_t*>(topk_n);
+  const float max_comp_f =
+      static_cast<float>((prm.compressed_columns << PageShift));
+  __bang_uint322float(jf, topk_u, k, 0);
+  __bang_lt_scalar(mk, jf, max_comp_f, k);
+  const int32_t nc = static_cast<int32_t>(__bang_filter(jc, jf, mk, k));
+  if (nc > 0) {
+    const int32_t nc_pad =
+        static_cast<int32_t>((static_cast<uint32_t>(nc) + 31U) & ~31U);
+    uint32_t* const ju = reinterpret_cast<uint32_t*>(s_n + 3 * kMaxTopk);
+    uint32_t* const po = reinterpret_cast<uint32_t*>(s_n + 4 * kMaxTopk);
+    uint32_t* const wi = reinterpret_cast<uint32_t*>(s_n + 5 * kMaxTopk);
+    uint32_t* const tb = reinterpret_cast<uint32_t*>(s_n + 6 * kMaxTopk);
+    uint32_t* const lo_hi = reinterpret_cast<uint32_t*>(s_n);
+    uint32_t* const lo32 = lo_hi;
+    uint32_t* const hi32 = lo_hi + nc_pad;
+    const uint32_t* ju_src = topk_u;
+    if (nc < k) {
+      __bang_float2uint32(ju, jc, nc, 0);
+      ju_src = ju;
+    }
+    asm volatile(
+        "fuse.nram.u32 [%[dst]], %[n], [%[src]], .srl(%[shift]), .sll(2);\n\t"
+        :
+        :
+        [shift] "i"(PageShift), [dst] "r"(po), [n] "r"(nc), [src] "r"(ju_src));
+    if (prm.compressed_columns <= kCtabWide) {
+      const int32_t* const ctab_src =
+          prm.compressed_columns <= kCtabNram ? ctab_n : ctab_wide;
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      __gather_async(tb,
+                     reinterpret_cast<const uint32_t*>(ctab_src),
+                     po,
+                     sizeof(uint32_t),
+                     NRAM2NRAM,
+                     sizeof(uint32_t),
+                     nc);
+      asm volatile(
+          "fuse.nram.u32 [%[dst]], %[n], [%[src]], .and(%[mask]), .sll(10);\n\t"
+          :
+          : [mask] "i"((1U << PageShift) - 1),
+            [dst] "r"(wi),
+            [n] "r"(nc),
+            [src] "r"(ju_src));
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+    } else {
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  false,
+                                  false>();
+      __gather_io1_async(tb,
+                         reinterpret_cast<const uint32_t*>(table_row),
+                         po,
+                         sizeof(uint32_t),
+                         GDRAM2NRAM,
+                         sizeof(uint32_t),
+                         nc);
+      asm volatile(
+          "fuse.nram.u32 [%[dst]], %[n], [%[src]], .and(%[mask]), .sll(10);\n\t"
+          :
+          : [mask] "i"((1U << PageShift) - 1),
+            [dst] "r"(wi),
+            [n] "r"(nc),
+            [src] "r"(ju_src));
+      __sync_io0_io1_move_compute<false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+    }
+    asm volatile(
+        "fuse.nram.u32 [%[dst]], %[n], [%[tb]], .sll(%[shift]), "
+        ".or([%[wi]]);\n\t"
+        :
+        : [shift] "i"(PageShift + 10),
+          [dst] "r"(lo32),
+          [n] "r"(nc),
+          [tb] "r"(tb),
+          [wi] "r"(wi));
+    __bang_srl(hi32, tb, 22 - PageShift, nc);
+    __bang_transpose(reinterpret_cast<uint32_t*>(off_n), lo_hi, 2, nc_pad);
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                true,
+                                true,
+                                false,
+                                false>();
+  }
+  return nc;
+}
+
+__mlu_func__ int32_t compact_topk(const Params& prm,
+                                  const Query& qs,
+                                  int32_t k,
+                                  const int32_t* ctab_wide,
+                                  float* s_n) {
+  if (prm.compressed_page_shift == 6) {
+    return compact_topk<6>(prm, qs, k, ctab_wide, s_n);
+  }
+  return compact_topk<7>(prm, qs, k, ctab_wide, s_n);
+}
+
+// Async loads of SWA window rows [s0, s1) of query qs into kv_n: old ring pages
+// for t < begin (page segments), current KV for t >= begin. When kDualIo is
+// true (r==0, no compressed rows), split across IO0 and IO1 for 2x DMA
+// throughput.
+template <bool kDualIo, bool kWideSwa>
+__mlu_func__ void issue_swa(const Params& prm,
+                            const Query& qs,
+                            int32_t s0,
+                            int32_t s1) {
+  const bfloat16_t* current = reinterpret_cast<const bfloat16_t*>(prm.current);
+  const bfloat16_t* swa = reinterpret_cast<const bfloat16_t*>(prm.swa);
+  const uint32_t swa_cols = static_cast<uint32_t>(prm.swa_columns);
+  bfloat16_t* dst = kv_n;
+  int32_t t = qs.lo + s0;
+  const int32_t t_end = qs.lo + s1;
+  const int32_t old_end = t_end < qs.begin ? t_end : qs.begin;
+  int32_t seg_idx = 0;
+  while (t < t_end) {
+    if (t < qs.begin) {
+      const int32_t page_end = (t | (kPage - 1)) + 1;
+      const int32_t seg_end = old_end < page_end ? old_end : page_end;
+      const int32_t cnt = seg_end - t;
+      int32_t page;
+      if constexpr (kWideSwa) {
+        page = ((t >> 7) == (qs.lo >> 7)) ? qs.swa_page_lo : qs.swa_page_hi;
+      } else {
+        const uint32_t col =
+            swa_cols == 1U ? 0U : (static_cast<uint32_t>(t >> 7) % swa_cols);
+        page = __load_nram(stab_n + col);
+      }
+      const int64_t slot =
+          static_cast<int64_t>(page) * kPage + (t & (kPage - 1));
+      if (kDualIo && seg_idx == 0 && seg_end == old_end && cnt > 1) {
+        const int32_t h0 = (cnt + 1) >> 1;
+        __memcpy_io0_async(dst, swa + slot * kDim, h0 * kRowBytes, GDRAM2NRAM);
+        __memcpy_io1_async(dst + h0 * kDim,
+                           swa + (slot + h0) * kDim,
+                           (cnt - h0) * kRowBytes,
+                           GDRAM2NRAM);
+      } else if (kDualIo && (seg_idx & 1) != 0) {
+        __memcpy_io1_async(dst, swa + slot * kDim, cnt * kRowBytes, GDRAM2NRAM);
+      } else {
+        __memcpy_io0_async(dst, swa + slot * kDim, cnt * kRowBytes, GDRAM2NRAM);
+      }
+      dst += cnt * kDim;
+      t = seg_end;
+      ++seg_idx;
+    } else {
+      const int64_t row = qs.offset + (t - qs.begin);
+      if (kDualIo) {
+        __memcpy_io1_async(
+            dst, current + row * kDim, (t_end - t) * kRowBytes, GDRAM2NRAM);
+      } else {
+        __memcpy_io0_async(
+            dst, current + row * kDim, (t_end - t) * kRowBytes, GDRAM2NRAM);
+      }
+      dst += (t_end - t) * kDim;
+      t = t_end;
+    }
+  }
+}
+
+// One work item = (query, head group of GH heads) per group of QC IPUs
+// (QC = 4: the whole cluster; QC = 2: two items per cluster run concurrently,
+// batches with > 8 queries). Softmax is per head, so head groups of a query
+// are independent (no cross-cluster reduction): small batches spread one
+// query over 64/GH clusters, each loading only its GH heads of Q/sink and
+// computing/storing only those heads. Group g of cluster y serves items
+// slot + r * slots (slot = y*S + g, S = 4/QC); every group runs the cluster's
+// iteration count, idle iterations only take part in the three rendezvous.
+// Single QK conv helper for decode_body: direct BF16 for GH>=32 (64B/128B row
+// aligned), FP32 for GH==16.
+template <int32_t GH>
+__mlu_func__ void decode_qk_rows(bfloat16_t* dst_p,
+                                 float* dst_s,
+                                 const bfloat16_t* src_kv,
+                                 int32_t rows,
+                                 float c2) {
+  if (GH >= 32) {
+    asm volatile(
+        "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+        "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]), "
+        ".cvt.dst.rn.bf16();\n\t"
+        :
+        : [dst] "r"(dst_p),
+          [src] "r"(src_kv),
+          [flt] "r"(q_w),
+          [ci] "i"(kDim),
+          [h] "r"(rows),
+          [co] "i"(GH),
+          [opnd] "r"(c2));
+  } else {
+    asm volatile(
+        "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+        "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]);\n\t"
+        :
+        : [dst] "r"(dst_s),
+          [src] "r"(src_kv),
+          [flt] "r"(q_w),
+          [ci] "i"(kDim),
+          [h] "r"(rows),
+          [co] "i"(GH),
+          [opnd] "r"(c2));
+  }
+}
+
+template <int32_t QC,
+          int32_t GH,
+          bool kCompressed = true,
+          bool kWideSwa = false>
+__mlu_func__ void decode_body(const Params& prm,
+                              int32_t valid,
+                              bool preloaded) {
+  using L = Layout<QC>;
+  constexpr int32_t G = kHeads / GH;  // head groups per query
+  static_assert(GH % QC == 0 && GH * G == kHeads && (QC == 4 || GH == kHeads),
+                "head groups");
+  constexpr int32_t S = kCores / QC;  // groups per cluster
+  constexpr int32_t HPC = GH / QC;    // heads per core in the combine
+  constexpr int32_t SL = HPC * kDim;  // combine slice (floats)
+  constexpr int32_t kObfOff =
+      QC == 4 ? 3 * SL : 2 * SL;         // floats in the KV region
+  constexpr int32_t SWC = kWindow / QC;  // SWA window rows per core
+  static_assert(SWC % kAlign == 0 && SWC <= L::kChunk, "SWA chunk");
+  float* const o_n = reinterpret_cast<float*>(pool_n + L::kOOff);
+  float* const s_n = reinterpret_cast<float*>(pool_n + L::kSOff);
+  bfloat16_t* const p_n = reinterpret_cast<bfloat16_t*>(s_n);
+  bfloat16_t* const m_bf_n = m_bf_buf_n;
+  bfloat16_t* const q_n = reinterpret_cast<bfloat16_t*>(o_n);
+  bfloat16_t* const pt_n = kv_n;
+  const int32_t core = static_cast<int32_t>(coreId);
+  const int32_t lc = core % QC;  // core within the query group
+  const int32_t gb = core - lc;  // group's first core (SRAM slots)
+  const int32_t group = static_cast<int32_t>(taskIdY);
+  const int32_t groups = static_cast<int32_t>(taskDimY);
+  const int32_t gcore = group * kCores + core;
+  const int32_t ncores = groups * kCores;
+  const int32_t slot = group * S + core / QC;
+  const int32_t slots = groups * S;
+  const int32_t items = valid * G;
+  const int32_t iters =
+      items > group * S
+          ? static_cast<int32_t>(
+                static_cast<uint32_t>(items - group * S + slots - 1) /
+                static_cast<uint32_t>(slots))
+          : 0;
+  const float c2 = prm.scale * kLog2e;
+  const bfloat16_t* q = reinterpret_cast<const bfloat16_t*>(prm.q);
+  bfloat16_t* output = reinterpret_cast<bfloat16_t*>(prm.output);
+  bfloat16_t* swa = reinterpret_cast<bfloat16_t*>(prm.swa);
+  const bfloat16_t* current = reinterpret_cast<const bfloat16_t*>(prm.current);
+  const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+  const bool compressed = kCompressed && prm.ratio > 0 && prm.kcap > 0 &&
+                          prm.compressed_columns > 0;
+
+  // Record partition (fixed, data independent): core lc owns SWA window rows
+  // [SWC*lc, SWC*lc+SWC) and Top-K entries [e0, e1) = slice lc of
+  // ceil(kcap/QC).
+  const int32_t kslice = (prm.kcap + QC - 1) / QC;
+  const int32_t e0 = lc * kslice < prm.kcap ? lc * kslice : prm.kcap;
+  const int32_t e1 = e0 + kslice < prm.kcap ? e0 + kslice : prm.kcap;
+
+  const int32_t hb = static_cast<int32_t>(static_cast<uint32_t>(slot) %
+                                          static_cast<uint32_t>(G)) *
+                     GH;
+  // sink_n[0..63] and ones_w were preloaded in decode_entry_preload (Entry
+  // Round-Trip #1).
+
+  // Host-validated S=1 layout: live query i is request i (request_ids[i] == i).
+  bool init_done = false;
+  for (int32_t r = 0; r < iters; ++r) {
+    const int32_t w = slot + r * slots;
+    const int32_t i = static_cast<int32_t>(static_cast<uint32_t>(w) /
+                                           static_cast<uint32_t>(G));
+    if (w >= items) {  // idle group iteration: rendezvous only (2 barriers:
+                       // sm_m, sm_l+sm_o)
+      cluster_barrier();
+      cluster_barrier();
+      continue;
+    }
+    Query qs;
+    qs.i = i;
+    qs.request = i;
+
+    int32_t* const ctab_wide =
+        reinterpret_cast<int32_t*>(kv_n + (L::kChunk - 32) * kDim);
+    if (preloaded && r == 0) {
+      __bang_mul_scalar(sink_n, sink_n, kLog2e, kHeads);
+      if (QC == 2) {
+        __sync_move();  // ones_stage aliases Layout<2> s_n (already done during
+                        // entry RT)
+      }
+      init_done = true;
+      qs.pos = __load_nram(meta_n + 16);
+    } else {
+      if (r > 0) {
+        __sync_io();
+      }
+      // Dual-IO initial batch: direct 2D GDRAM->WRAM Q load + Top-K slice on
+      // IO0 concurrently with metadata, swa_table, current_kv[i] commit
+      // staging, and compressed_table (<=8192) on IO1.
+      const bool split_q_io =
+          (GH >= 32) && (!compressed || prm.compressed_columns <= 2048);
+      load_q_w_direct<GH>(
+          q_w, q + static_cast<int64_t>(i) * q_elems + hb * kDim, split_q_io);
+      if (compressed && e1 > e0) {
+        __memcpy_io0_async(topk_n,
+                           prm.topk + static_cast<int64_t>(i) * prm.kcap + e0,
+                           (e1 - e0) * sizeof(int32_t),
+                           GDRAM2NRAM);
+      }
+      if (r > 0) {
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    true,
+                                    false,
+                                    false>();
+      }
+      __memcpy_io1_async(
+          meta_n + 16, prm.begins + i, sizeof(int32_t), GDRAM2NRAM);
+      if constexpr (!kWideSwa) {
+        __memcpy_io1_async(
+            stab_n,
+            prm.swa_table + static_cast<int64_t>(i) * prm.swa_row_stride,
+            prm.swa_columns * sizeof(int32_t),
+            GDRAM2NRAM);
+      }
+      if (lc == 0 && hb == 0) {
+        __memcpy_io1_async(cur_stage_n,
+                           current + static_cast<int64_t>(i) * kDim,
+                           kRowBytes,
+                           GDRAM2NRAM);
+      }
+      if (compressed && e1 > e0 && prm.compressed_columns <= kCtabWide) {
+        int32_t* const ctab_dst =
+            prm.compressed_columns <= kCtabNram ? ctab_n : ctab_wide;
+        __memcpy_io1_async(ctab_dst,
+                           prm.compressed_table + static_cast<int64_t>(i) *
+                                                      prm.compressed_row_stride,
+                           prm.compressed_columns * sizeof(int32_t),
+                           GDRAM2NRAM);
+      }
+      if (!init_done) {
+        __bang_mul_scalar(sink_n, sink_n, kLog2e, kHeads);
+        if (QC == 2) {
+          __sync_move();  // ones_stage aliases Layout<2> s_n
+        }
+        init_done = true;
+      }
+      __sync_io();
+      qs.pos = __load_nram(meta_n + 16);
+    }
+    qs.begin = qs.pos;
+    qs.offset = i;
+    qs.lo = qs.pos - (kWindow - 1) > 0 ? qs.pos - (kWindow - 1) : 0;
+    qs.nswa = qs.pos - qs.lo + 1;
+    if constexpr (kWideSwa) {
+      load_decode_wide_pages(
+          prm, i, qs.lo, qs.pos, &qs.swa_page_lo, &qs.swa_page_hi);
+    }
+    if (lc == 0 && hb == 0) {
+      // SWA commit of request i (count == 1): ring slot of position begin holds
+      // position begin - capacity, outside every visible window, and pages are
+      // disjoint across requests, so no read of this launch can observe it.
+      int32_t commit_page;
+      if constexpr (kWideSwa) {
+        commit_page = qs.swa_page_hi;
+      } else {
+        const uint32_t swa_cols = static_cast<uint32_t>(prm.swa_columns);
+        const uint32_t col =
+            swa_cols == 1U ? 0U
+                           : (static_cast<uint32_t>(qs.begin >> 7) % swa_cols);
+        commit_page = __load_nram(stab_n + col);
+      }
+      const int64_t slot =
+          static_cast<int64_t>(commit_page) * kPage + (qs.begin & (kPage - 1));
+      __memcpy_io1_async(swa + slot * kDim, cur_stage_n, kRowBytes, NRAM2GDRAM);
+    }
+
+    // SWA part first (independent of the Top-K): DMA overlaps the compaction.
+    // For !kCompressed (r==0), split SWA across IO0+IO1 for 2x DMA throughput.
+    const int32_t s0 = lc * SWC < qs.nswa ? lc * SWC : qs.nswa;
+    const int32_t s1 = s0 + SWC < qs.nswa ? s0 + SWC : qs.nswa;
+    const int32_t ns = s1 - s0;
+    const int32_t nsp = (ns + kAlign - 1) / kAlign * kAlign;
+    if (ns > 0) {
+      issue_swa<!kCompressed, kWideSwa>(prm, qs, s0, s1);
+    }
+
+    int32_t nc = 0;
+    if (compressed && e1 > e0) {
+      nc = compact_topk(prm, qs, e1 - e0, ctab_wide, s_n);
+    }
+    qs.nc = nc;
+    const int32_t ncp = (nc + kAlign - 1) / kAlign * kAlign;
+    const int32_t cp = nsp + ncp;  // padded rows: [SWA | compressed]
+    if (ns < nsp) {
+      __bang_write_value(kv_n + ns * kDim, (nsp - ns) * kDim, (bfloat16_t)0.0f);
+    }
+    if (nc < ncp) {
+      __bang_write_value(
+          kv_n + (nsp + nc) * kDim, (ncp - nc) * kDim, (bfloat16_t)0.0f);
+    }
+    // Wait for SWA rows (IO0+IO1 when !kCompressed; IO0-only when kCompressed
+    // so IO1 commit never stalls).
+    if (!kCompressed) {
+      __sync_io0_io1_move_compute<true,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true,
+                                  true>();
+    } else {
+      __sync_io0_io1_move_compute<true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true,
+                                  true>();
+    }
+    const int32_t c0 = (nc >= 128)
+                           ? ((nc >> 1) & ~63)
+                           : 0;  // 64-aligned first Top-K stage (64/128)
+    const bfloat16_t* const comp =
+        reinterpret_cast<const bfloat16_t*>(prm.compressed);
+    if (nc > 0) {
+      // Launch first Top-K gather batch (c0 rows, or all nc if nc < 128) across
+      // IO0+IO1.
+      const int32_t first_n = c0 > 0 ? c0 : nc;
+      const int32_t n0 = (first_n + 1) >> 1;
+      __gather_io0_async(
+          kv_n + nsp * kDim, comp, off_n, kRowBytes, GDRAM2NRAM, kRowBytes, n0);
+      if (first_n > n0) {
+        __gather_io1_async(kv_n + (nsp + n0) * kDim,
+                           comp,
+                           off_n + n0,
+                           kRowBytes,
+                           GDRAM2NRAM,
+                           kRowBytes,
+                           first_n - n0);
+      }
+    }
+    // ---- phase 1: 3-stage overlapped lm_kv + QK across [SWA | TopK_0 |
+    // TopK_1] ---- Stage 0 (SWA): lm_kv(SWA) and QK(SWA) run immediately while
+    // Top-K gathers on IO0+IO1!
+    if (nsp > 0) {
+      if (ns < nsp) {
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    true,
+                                    false>();
+      }
+      if (ncp == 0) {
+        __bang_load_matrix_async(
+            kv_w, kv_n, NRAM2WRAM, nsp, kDim, kRowBytes, true);
+      } else {
+        load_kv_w_slice_async(kv_w, kv_n, nsp, cp, 0);
+      }
+      decode_qk_rows<GH>(p_n, s_n, kv_n, nsp, c2);
+    }
+
+    const int32_t tail_off = nsp + c0;
+    const int32_t tail_rows = ncp - c0;
+    // Defer the final Top-K NRAM->WRAM load past Barrier #1 whenever pt_n (at
+    // kv_n[0..cp*GH*2)) is disjoint from kv_n[tail_off..cp): eliminates the #1
+    // Move drain stall at sm_m/Barrier #1 and overlaps
+    // load_kv_w_slice_async(tail) 100% with Phase-2 Softmax + Compute
+    // transpose!
+    const bool defer_tail_lm =
+        (cp > 0) && (ncp > 0) &&
+        (tail_off * kRowBytes >=
+         cp * GH * static_cast<int32_t>(sizeof(bfloat16_t)));
+    if (cp > 0) {
+      if (ncp > 0) {
+        if (c0 > 0) {
+          // Stage 1 (TopK_0, c0 rows): sync Batch A -> immediately fire Batch B
+          // gather on IO0+IO1 so lm_kv(TopK_0) + QK(TopK_0) run in parallel
+          // with Batch B gather!
+          __sync_io0_io1_move_compute<true,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true,
+                                      true>();
+          const int32_t rem = nc - c0;
+          const int32_t r0 = (rem + 1) >> 1;
+          __gather_io0_async(kv_n + (nsp + c0) * kDim,
+                             comp,
+                             off_n + c0,
+                             kRowBytes,
+                             GDRAM2NRAM,
+                             kRowBytes,
+                             r0);
+          if (rem > r0) {
+            __gather_io1_async(kv_n + (nsp + c0 + r0) * kDim,
+                               comp,
+                               off_n + c0 + r0,
+                               kRowBytes,
+                               GDRAM2NRAM,
+                               kRowBytes,
+                               rem - r0);
+          }
+          load_kv_w_slice_async(kv_w, kv_n + nsp * kDim, c0, cp, nsp);
+          decode_qk_rows<GH>(
+              p_n + nsp * GH, s_n + nsp * GH, kv_n + nsp * kDim, c0, c2);
+        }
+        // Stage 2 (TopK_1, ncp - c0 rows): wait for final Top-K batch, finish
+        // QK (and lm_kv if not deferred).
+        __sync_io0_io1_move_compute<true,
+                                    true,
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                    true,
+                                    true>();
+        if (!defer_tail_lm) {
+          if (nc < ncp) {
+            __sync_io0_io1_move_compute<false,
+                                        false,
+                                        false,
+                                        true,
+                                        false,
+                                        false,
+                                        true,
+                                        false>();
+          }
+          load_kv_w_slice_async(
+              kv_w, kv_n + tail_off * kDim, tail_rows, cp, tail_off);
+        }
+        decode_qk_rows<GH>(p_n + tail_off * GH,
+                           s_n + tail_off * GH,
+                           kv_n + tail_off * kDim,
+                           tail_rows,
+                           c2);
+      }
+      if (GH >= 32) {
+        if (ns < nsp) {
+          __bang_write_value(
+              p_n + ns * GH, (nsp - ns) * GH, (bfloat16_t)(-INFINITY));
+        }
+        if (nc < ncp) {
+          __bang_write_value(
+              p_n + (nsp + nc) * GH, (ncp - nc) * GH, (bfloat16_t)(-INFINITY));
+        }
+        head_max_bf16<GH>(m_bf_n, p_n, cp);
+        __bang_bfloat162float(m_n, m_bf_n, GH);
+      } else {
+        if (ns < nsp) {
+          __bang_write_value(s_n + ns * GH, (nsp - ns) * GH, -INFINITY);
+        }
+        if (nc < ncp) {
+          __bang_write_value(s_n + (nsp + nc) * GH, (ncp - nc) * GH, -INFINITY);
+        }
+        head_max<GH>(m_n, s_n, cp);
+      }
+    } else {
+      __bang_write_value(m_n, GH, -INFINITY);
+    }
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                true,
+                                false>();
+
+    __memcpy_async(sm_m + core * kHeads, m_n, GH * sizeof(float), NRAM2SRAM);
+    __sync_move();
+    cluster_barrier();
+
+    // ---- phase 2+3 fused: global max, probabilities, local sums, transpose,
+    // PV (single barrier!) ----
+    int32_t holders = (1 << QC) - 1;
+    if (qs.nswa <= (QC - 1) * SWC) {
+      __memcpy(all_n + gb * kHeads,
+               sm_m + gb * kHeads,
+               QC * kHeads * sizeof(float),
+               SRAM2NRAM);
+      holders = 0;
+      for (int32_t j = 0; j < QC; ++j) {
+        holders |= all_n[(gb + j) * kHeads] > -INFINITY ? (1 << j) : 0;
+      }
+    } else {
+      __memcpy_async(all_n + gb * kHeads,
+                     sm_m + gb * kHeads,
+                     QC * kHeads * sizeof(float),
+                     SRAM2NRAM);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+    }
+    if (defer_tail_lm) {
+      // Launch deferred tail NRAM->WRAM immediately on Move so it runs 100%
+      // concurrently with global max + softmax + head_sum + Compute transpose
+      // on Compute!
+      load_kv_w_slice_async(
+          kv_w, kv_n + tail_off * kDim, tail_rows, cp, tail_off);
+    }
+    __bang_maximum(m_n, all_n + gb * kHeads, all_n + (gb + 1) * kHeads, GH);
+    for (int32_t j = 2; j < QC; ++j) {
+      __bang_maximum(m_n, m_n, all_n + (gb + j) * kHeads, GH);
+    }
+    bool sm_l_pending = false;
+    if (cp > 0) {
+      if (GH >= 32) {
+        __bang_float2bfloat16(m_bf_n, m_n, GH);
+        __bang_cycle_sub(p_n, p_n, m_bf_n, cp * GH, GH);
+        __bang_pow2(p_n, p_n, cp * GH);
+        if (ns < nsp) {
+          __bang_write_value(p_n + ns * GH, (nsp - ns) * GH, (bfloat16_t)0.0f);
+        }
+        if (nc < ncp) {
+          __bang_write_value(
+              p_n + (nsp + nc) * GH, (ncp - nc) * GH, (bfloat16_t)0.0f);
+        }
+        bfloat16_t* const ps_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+        if (defer_tail_lm) {
+          // Move is busy loading kv_w(tail): run head_sum + transpose on
+          // Compute in parallel! pt_n (0..cp*GH*2) is disjoint from
+          // kv_n[tail_off*kDim..).
+          head_sum_bf16<GH>(ps_bf_n, p_n, cp);
+          __bang_bfloat162float(l_n, ps_bf_n, GH);
+          __bang_transpose(pt_n, p_n, cp, GH);
+          // Wait for deferred lm_kv(tail) before PV starts; defer sm_l write
+          // until right after Move->Compute so Move never stalls waiting on
+          // Compute before PV launches!
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true>();
+          sm_l_pending = true;
+        } else {
+          // Native 32x32 BF16 Move transpose overlapped 100% with head_sum_bf16
+          // on Compute! kv_n (== pt_n) is already free because lm_kv drained
+          // before barrier 1.
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      true,
+                                      false>();
+          move_transpose_p_bf16<GH>(pt_n, p_n, cp);
+          head_sum_bf16<GH>(ps_bf_n, p_n, cp);
+          __bang_bfloat162float(l_n, ps_bf_n, GH);
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      true,
+                                      false>();
+          __memcpy_async(
+              sm_l + core * kHeads, l_n, GH * sizeof(float), NRAM2SRAM);
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true>();
+        }
+      } else {
+        __bang_cycle_sub(s_n, s_n, m_n, cp * GH, GH);
+        __bang_pow2(s_n, s_n, cp * GH);
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    true,
+                                    false>();
+        move_transpose_split_p_f32_to_bf16<GH>(pt_n, s_n, cp);
+        head_sum<GH>(l_n, s_n, cp);
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    true,
+                                    false>();
+        __memcpy_async(
+            sm_l + core * kHeads, l_n, GH * sizeof(float), NRAM2SRAM);
+        // Ensure Move transpose pt_n completed on Move FIFO before PV reads
+        // pt_n.
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                    true>();
+      }
+    } else {
+      __bang_write_value(l_n, GH, 0.0f);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      __memcpy_async(sm_l + core * kHeads, l_n, GH * sizeof(float), NRAM2SRAM);
+    }
+
+    float* const own_n = QC == 4 ? o_n + lc * SL : kvf_n + L::kOwnOff;
+    if (cp > 0) {
+      // PV per HPC-head slice, own slice last: non-blocking Compute->Move edge
+      // overlaps every foreign NRAM2SRAM slice write with the next slice's PV
+      // conv without scalar stalls!
+      for (int32_t step = 1; step <= QC; ++step) {
+        const int32_t j = (lc + step) % QC;
+        float* const dst = j == lc ? own_n : (QC == 4 ? o_n + j * SL : o_n);
+        __bang_conv(
+            dst, pt_n + j * HPC * cp, kv_w, cp, HPC, 1, 1, 1, 1, 1, kDim);
+        if (j != lc) {
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      true,
+                                      false>();
+          if (sm_l_pending) {
+            __memcpy_async(
+                sm_l + core * kHeads, l_n, GH * sizeof(float), NRAM2SRAM);
+            sm_l_pending = false;
+          }
+          __memcpy_async(sm_o + core * kHeads * kDim + j * SL,
+                         dst,
+                         SL * sizeof(float),
+                         NRAM2SRAM);
+        }
+      }
+    }
+    __sync_move();  // both sm_l and all foreign sm_o slices in SRAM before
+                    // single rendezvous
+    cluster_barrier();
+
+    // ---- combine heads [HPC*lc, HPC*lc+HPC): overlap global L + 1/L with
+    // foreign sm_o loads ---- 1) Load group's sm_l first (disjoint from
+    // pt_n/own_n); Compute waits only for sm_l.
+    __memcpy_async(all_n + gb * kHeads,
+                   sm_l + gb * kHeads,
+                   QC * kHeads * sizeof(float),
+                   SRAM2NRAM);
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                false,
+                                false,
+                                true>();
+    // 2) Move waits only for PV(own) to finish reading pt_n (== kvf_n) before
+    // loading foreign sm_o,
+    //    issued BEFORE L+1/L compute so foreign sm_o loads run concurrently
+    //    with L+1/L!
+    if (cp > 0) {
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+    }
+    // 3) Global denominator (sink once) on Compute concurrently with foreign
+    // sm_o SRAM2NRAM below!
+    __bang_sub(tmp_n, sink_n + hb, m_n, GH);
+    __bang_pow2(tmp_n, tmp_n, GH);
+    __bang_add(l_n, all_n + gb * kHeads, all_n + (gb + 1) * kHeads, GH);
+    for (int32_t j = 2; j < QC; ++j) {
+      __bang_add(l_n, l_n, all_n + (gb + j) * kHeads, GH);
+    }
+    __bang_add(l_n, l_n, tmp_n, GH);
+    __bang_recip(l_n, l_n, GH);
+    // 4) Pipeline foreign SRAM2NRAM loads with Compute o_add:
+    //    for QC==4 with cp>0 and 3 foreign slices, overlap add(f0) while f1 &
+    //    f2 load from SRAM!
+    int32_t nf = 0;
+    int32_t first_added = 0;
+    for (int32_t j = 0; j < QC; ++j) {
+      if (j != lc && (holders & (1 << j))) {
+        __memcpy_async(kvf_n + L::kForeignOff + nf * SL,
+                       sm_o + (gb + j) * kHeads * kDim + lc * SL,
+                       SL * sizeof(float),
+                       SRAM2NRAM);
+        if (QC == 4 && cp > 0 && nf == 0) {
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true>();
+          __bang_add(own_n, own_n, kvf_n + L::kForeignOff, SL);
+          first_added = 1;
+        }
+        ++nf;
+      }
+    }
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                true,
+                                false,
+                                false,
+                                false,
+                                false,
+                                true>();
+    float* acc = cp > 0 ? own_n : kvf_n + L::kForeignOff;
+    int32_t f = cp > 0 ? first_added : 1;
+    for (; f + 1 < nf; f += 2) {
+      __bang_fusion(FUSION_FAA,
+                    acc,
+                    acc,
+                    kvf_n + L::kForeignOff + f * SL,
+                    kvf_n + L::kForeignOff + (f + 1) * SL,
+                    SL,
+                    SL);
+    }
+    if (f < nf) {
+      __bang_add(acc, acc, kvf_n + L::kForeignOff + f * SL, SL);
+    }
+    bfloat16_t* obf = reinterpret_cast<bfloat16_t*>(kvf_n + kObfOff);
+    asm volatile(
+        "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+        "1, 1, %[m], 1, 1, 1, 1, %[co], "
+        ".mul.partial([%[part]]), .cvt.dst.rn.bf16();\n\t"
+        :
+        : [dst] "r"(obf),
+          [src] "r"(l_n + lc * HPC),
+          [flt] "r"(ones_w),
+          [m] "i"(HPC),
+          [co] "i"(kDim),
+          [part] "r"(acc));
+
+    const int64_t out_off =
+        static_cast<int64_t>(i) * q_elems + (hb + lc * HPC) * kDim;
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                true,
+                                false,
+                                false,
+                                false>();
+
+    __memcpy_io0_async(output + out_off, obf, SL * 2, NRAM2GDRAM);
+  }
+
+  // ---- padding rows: exact zeros ----
+  if (valid + gcore < prm.nq) {
+    __sync_io();
+    __bang_write_value(q_n, kHeads * kDim, (bfloat16_t)0.0f);
+    __sync_compute();
+    for (int32_t row = valid + gcore; row < prm.nq; row += ncores) {
+      __memcpy_io1_async(output + static_cast<int64_t>(row) * q_elems,
+                         q_n,
+                         kHeads * kRowBytes,
+                         NRAM2GDRAM);
+    }
+  }
+  __sync_all_pipe();
+}
+
+__mlu_func__ int32_t qc1_tile_rows(int32_t nswa, int32_t nc, int32_t t) {
+  if (t == 0) {
+    return nswa;
+  }
+  const int32_t rem = nc - (t - 1) * kQc1Tile;
+  return rem < kQc1Tile ? rem : kQc1Tile;
+}
+
+template <int32_t PageShift>
+__mlu_func__ int32_t compact_topk_qc1_ready(const Params& prm,
+                                            int32_t r,
+                                            int32_t k,
+                                            const int32_t* ctab_ready,
+                                            float* s_n) {
+  const int32_t* table_row =
+      prm.compressed_table +
+      static_cast<int64_t>(r) * prm.compressed_row_stride;
+  float* const jf = s_n;
+  float* const mk = s_n + kMaxTopk;
+  float* const jc = s_n + 2 * kMaxTopk;
+  const uint32_t* const topk_u = reinterpret_cast<const uint32_t*>(topk_n);
+  const float max_comp_f =
+      static_cast<float>((prm.compressed_columns << PageShift));
+  __bang_uint322float(jf, topk_u, k, 0);
+  __bang_lt_scalar(mk, jf, max_comp_f, k);
+  const int32_t nc = static_cast<int32_t>(__bang_filter(jc, jf, mk, k));
+  if (nc > 0) {
+    const int32_t nc_pad =
+        static_cast<int32_t>((static_cast<uint32_t>(nc) + 31U) & ~31U);
+    uint32_t* const ju = reinterpret_cast<uint32_t*>(s_n + 3 * kMaxTopk);
+    uint32_t* const po = reinterpret_cast<uint32_t*>(s_n + 4 * kMaxTopk);
+    uint32_t* const wi = reinterpret_cast<uint32_t*>(s_n + 5 * kMaxTopk);
+    uint32_t* const tb = reinterpret_cast<uint32_t*>(s_n + 6 * kMaxTopk);
+    uint32_t* const lo_hi = reinterpret_cast<uint32_t*>(s_n);
+    uint32_t* const lo32 = lo_hi;
+    uint32_t* const hi32 = lo_hi + nc_pad;
+    const uint32_t* ju_src = topk_u;
+    if (nc < k) {
+      __bang_float2uint32(ju, jc, nc, 0);
+      ju_src = ju;
+    }
+    asm volatile(
+        "fuse.nram.u32 [%[dst]], %[n], [%[src]], .srl(%[shift]), .sll(2);\n\t"
+        :
+        :
+        [shift] "i"(PageShift), [dst] "r"(po), [n] "r"(nc), [src] "r"(ju_src));
+    if (prm.compressed_columns <= kCtabWide) {
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      __gather_async(tb,
+                     reinterpret_cast<const uint32_t*>(ctab_ready),
+                     po,
+                     sizeof(uint32_t),
+                     NRAM2NRAM,
+                     sizeof(uint32_t),
+                     nc);
+      asm volatile(
+          "fuse.nram.u32 [%[dst]], %[n], [%[src]], .and(%[mask]), .sll(10);\n\t"
+          :
+          : [mask] "i"((1U << PageShift) - 1),
+            [dst] "r"(wi),
+            [n] "r"(nc),
+            [src] "r"(ju_src));
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+    } else {
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  false,
+                                  false>();
+      __gather_io1_async(tb,
+                         reinterpret_cast<const uint32_t*>(table_row),
+                         po,
+                         sizeof(uint32_t),
+                         GDRAM2NRAM,
+                         sizeof(uint32_t),
+                         nc);
+      asm volatile(
+          "fuse.nram.u32 [%[dst]], %[n], [%[src]], .and(%[mask]), .sll(10);\n\t"
+          :
+          : [mask] "i"((1U << PageShift) - 1),
+            [dst] "r"(wi),
+            [n] "r"(nc),
+            [src] "r"(ju_src));
+      __sync_io0_io1_move_compute<false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+    }
+    asm volatile(
+        "fuse.nram.u32 [%[dst]], %[n], [%[tb]], .sll(%[shift]), "
+        ".or([%[wi]]);\n\t"
+        :
+        : [shift] "i"(PageShift + 10),
+          [dst] "r"(lo32),
+          [n] "r"(nc),
+          [tb] "r"(tb),
+          [wi] "r"(wi));
+    __bang_srl(hi32, tb, 22 - PageShift, nc);
+    __bang_transpose(reinterpret_cast<uint32_t*>(off_n), lo_hi, 2, nc_pad);
+    __sync_io0_io1_move_compute<false,
+                                false,
+                                false,
+                                true,
+                                true,
+                                true,
+                                false,
+                                false>();
+  }
+  return nc;
+}
+
+__mlu_func__ int32_t compact_topk_qc1_ready(const Params& prm,
+                                            int32_t r,
+                                            int32_t k,
+                                            const int32_t* ctab_ready,
+                                            float* s_n) {
+  if (prm.compressed_page_shift == 6) {
+    return compact_topk_qc1_ready<6>(prm, r, k, ctab_ready, s_n);
+  }
+  return compact_topk_qc1_ready<7>(prm, r, k, ctab_ready, s_n);
+}
+
+// Per-IPU QC=1 Double-Buffered 128-Tile Online Softmax body for Decode ratio>0
+// (valid >= 17): Runs across all 32 IPUs (tid = taskIdY * 4 + coreId), zero
+// cluster barriers, zero SRAM reduction.
+template <bool kWideSwa>
+__mlu_func__ void decode_qc1_online_body(const Params& prm,
+                                         int32_t valid,
+                                         int32_t tid,
+                                         int32_t tdim,
+                                         bool preloaded) {
+  bfloat16_t* const qc1_kv0 = reinterpret_cast<bfloat16_t*>(pool_n);  // 128 KB
+  bfloat16_t* const qc1_kv1 =
+      reinterpret_cast<bfloat16_t*>(pool_n + 131072);              // 128 KB
+  float* const qc1_o = reinterpret_cast<float*>(pool_n + 262144);  // 128 KB
+  float* const qc1_s = reinterpret_cast<float*>(pool_n + 393216);  //  32 KB
+  bfloat16_t* const qc1_pt = reinterpret_cast<bfloat16_t*>(
+      pool_n + 425984);  //  32 KB ([64,256] in loop)
+  int32_t* const qc1_ctab_wide =
+      reinterpret_cast<int32_t*>(pool_n + 442368);  //  32 KB (pre-loop only)
+  float* const qc1_s32_fb =
+      reinterpret_cast<float*>(pool_n + 458752);  //  16 KB (cold fallback)
+  bfloat16_t* const qc1_p =
+      reinterpret_cast<bfloat16_t*>(qc1_s);  //  32 KB ([256,64] BF16)
+  static_assert(458752 + 32 * kHeads * 4 <= kPoolBytes,
+                "qc1 cold fallback fits in pool_n");
+  float* const mt_n = all_n;
+  float* const ps_n = all_n + kHeads;
+  float* const red_n = all_n + 2 * kHeads;
+  bfloat16_t* const m_bf_n = reinterpret_cast<bfloat16_t*>(all_n + 3 * kHeads);
+  constexpr float kTau = 1.0f;
+
+  const bfloat16_t* const q = reinterpret_cast<const bfloat16_t*>(prm.q);
+  const bfloat16_t* const current =
+      reinterpret_cast<const bfloat16_t*>(prm.current);
+  const bfloat16_t* const comp =
+      reinterpret_cast<const bfloat16_t*>(prm.compressed);
+  bfloat16_t* const swa = reinterpret_cast<bfloat16_t*>(prm.swa);
+  bfloat16_t* const output = reinterpret_cast<bfloat16_t*>(prm.output);
+  const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+  const float c2 = prm.scale * kLog2e;
+  const uint32_t swa_cols = static_cast<uint32_t>(prm.swa_columns);
+  int32_t* const ctab_buf =
+      prm.compressed_columns <= kCtabNram ? ctab_n : qc1_ctab_wide;
+  const bool split_q_io = prm.compressed_columns <= 2048;
+
+  if (tid < valid) {
+    if (!preloaded) {
+      const bfloat16_t* const q_row0 = q + static_cast<int64_t>(tid) * q_elems;
+      load_q_w_direct<kHeads>(qc1_q_w(0), q_row0, split_q_io);
+      __memcpy_io0_async(topk_n,
+                         prm.topk + static_cast<int64_t>(tid) * prm.kcap,
+                         prm.kcap * sizeof(int32_t),
+                         GDRAM2NRAM);
+      __memcpy_io1_async(
+          meta_n + 16, prm.begins + tid, sizeof(int32_t), GDRAM2NRAM);
+      if constexpr (!kWideSwa) {
+        __memcpy_io1_async(
+            stab_n,
+            prm.swa_table + static_cast<int64_t>(tid) * prm.swa_row_stride,
+            prm.swa_columns * sizeof(int32_t),
+            GDRAM2NRAM);
+      }
+      __memcpy_io1_async(cur_stage_n,
+                         current + static_cast<int64_t>(tid) * kDim,
+                         kRowBytes,
+                         GDRAM2NRAM);
+      if (prm.compressed_columns <= kCtabWide) {
+        __memcpy_io1_async(ctab_buf,
+                           prm.compressed_table + static_cast<int64_t>(tid) *
+                                                      prm.compressed_row_stride,
+                           prm.compressed_columns * sizeof(int32_t),
+                           GDRAM2NRAM);
+      }
+      __bang_mul_scalar(sink_n, sink_n, kLog2e, kHeads);
+      __sync_move();  // ones_stage aliases qc1_s (overlapped with Round-Trip
+                      // #1+#2 IO)
+      __sync_io();
+    } else {
+      __bang_mul_scalar(sink_n, sink_n, kLog2e, kHeads);
+      __sync_move();  // ones_stage aliases qc1_s (completed during fused entry
+                      // RT)
+    }
+
+    for (int32_t i = tid; i < valid; i += tdim) {
+      if (i > tid) {
+        const bfloat16_t* const q_row = q + static_cast<int64_t>(i) * q_elems;
+        __sync_io();
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    true,
+                                    false,
+                                    false>();
+        load_q_w_direct<kHeads>(qc1_q_w(0), q_row, split_q_io);
+        __memcpy_io0_async(topk_n,
+                           prm.topk + static_cast<int64_t>(i) * prm.kcap,
+                           prm.kcap * sizeof(int32_t),
+                           GDRAM2NRAM);
+        __memcpy_io1_async(
+            meta_n + 16, prm.begins + i, sizeof(int32_t), GDRAM2NRAM);
+        if constexpr (!kWideSwa) {
+          __memcpy_io1_async(
+              stab_n,
+              prm.swa_table + static_cast<int64_t>(i) * prm.swa_row_stride,
+              prm.swa_columns * sizeof(int32_t),
+              GDRAM2NRAM);
+        }
+        __memcpy_io1_async(cur_stage_n,
+                           current + static_cast<int64_t>(i) * kDim,
+                           kRowBytes,
+                           GDRAM2NRAM);
+        if (prm.compressed_columns <= kCtabWide) {
+          __memcpy_io1_async(
+              ctab_buf,
+              prm.compressed_table +
+                  static_cast<int64_t>(i) * prm.compressed_row_stride,
+              prm.compressed_columns * sizeof(int32_t),
+              GDRAM2NRAM);
+        }
+        __sync_io();
+      }
+
+      const int32_t pos = __load_nram(meta_n + 16);
+      const int32_t lo = pos - (kWindow - 1) > 0 ? pos - (kWindow - 1) : 0;
+      const int32_t nswa = pos - lo + 1;
+
+      __memcpy_async(
+          qc1_kv0 + (nswa - 1) * kDim, cur_stage_n, kRowBytes, NRAM2NRAM);
+
+      int32_t wide_page_lo = 0;
+      int32_t wide_page_hi = 0;
+      if constexpr (kWideSwa) {
+        load_decode_wide_pages(prm, i, lo, pos, &wide_page_lo, &wide_page_hi);
+      }
+
+      bfloat16_t* dst = qc1_kv0;
+      int32_t tr = lo;
+      while (tr < pos) {
+        const int32_t page_end = (tr | (kPage - 1)) + 1;
+        const int32_t seg_end = pos < page_end ? pos : page_end;
+        int32_t page;
+        if constexpr (kWideSwa) {
+          page = ((tr >> 7) == (lo >> 7)) ? wide_page_lo : wide_page_hi;
+        } else {
+          const uint32_t col =
+              swa_cols == 1U ? 0U : (static_cast<uint32_t>(tr >> 7) % swa_cols);
+          page = __load_nram(stab_n + col);
+        }
+        const int64_t slot =
+            static_cast<int64_t>(page) * kPage + (tr & (kPage - 1));
+        __memcpy_io0_async(
+            dst, swa + slot * kDim, (seg_end - tr) * kRowBytes, GDRAM2NRAM);
+        dst += (seg_end - tr) * kDim;
+        tr = seg_end;
+      }
+      int32_t commit_page;
+      if constexpr (kWideSwa) {
+        commit_page = wide_page_hi;
+      } else {
+        const uint32_t commit_col =
+            swa_cols == 1U ? 0U : (static_cast<uint32_t>(pos >> 7) % swa_cols);
+        commit_page = __load_nram(stab_n + commit_col);
+      }
+      const int64_t commit_slot =
+          static_cast<int64_t>(commit_page) * kPage + (pos & (kPage - 1));
+      __memcpy_io1_async(
+          swa + commit_slot * kDim, cur_stage_n, kRowBytes, NRAM2GDRAM);
+
+      const int32_t nc =
+          compact_topk_qc1_ready(prm, i, prm.kcap, ctab_buf, qc1_s);
+      const int32_t cur_tiles =
+          1 + static_cast<int32_t>((static_cast<uint32_t>(nc) + 127U) >> 7);
+      if (nc == 0 || prm.compressed_columns > kCtabWide) {
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                    true>();
+      }
+      // Depth-2 dual-IO: kick off compressed tile 1 into qc1_kv1 on IO1
+      // immediately so BOTH tile 0 (SWA on IO0) and tile 1 (compressed on IO1)
+      // are in flight concurrently!
+      if (cur_tiles >= 2) {
+        const int32_t t1_rows = qc1_tile_rows(nswa, nc, 1);
+        __gather_io1_async(
+            qc1_kv1, comp, off_n, kRowBytes, GDRAM2NRAM, kRowBytes, t1_rows);
+      }
+
+      int32_t buf = 0;
+      bool in_pair = false;
+      bool high_logit = false;
+      for (int32_t t = 0; t < cur_tiles; ++t) {
+        const int32_t b = buf;
+        const int32_t nb = buf ^ 1;
+        bfloat16_t* const kv_buf = b ? qc1_kv1 : qc1_kv0;
+        const int32_t rows = qc1_tile_rows(nswa, nc, t);
+        const int32_t tp =
+            static_cast<int32_t>((static_cast<uint32_t>(rows) + 31U) & ~31U);
+        const bool start_pair = (!in_pair) && (t > 0) && (t + 1 < cur_tiles) &&
+                                (rows == kQc1Tile) &&
+                                (qc1_tile_rows(nswa, nc, t + 1) == kQc1Tile);
+        const bool finish_pair = in_pair;
+        const bool need_t2 = (t + 2 < cur_tiles);
+
+        // Wait ONLY for the single IO channel feeding kv_buf (IO0 for b==0, IO1
+        // for b==1).
+        if (b == 0) {
+          __sync_io0_io1_move_compute<true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true,
+                                      true>();
+        } else {
+          __sync_io0_io1_move_compute<false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true,
+                                      true>();
+        }
+
+        if (start_pair) {
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      true,
+                                      false>();
+          load_kv_w_256_half_async(qc1_kv_w_256, kv_buf, 0);
+          asm volatile(
+              "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+              "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]), "
+              ".cvt.dst.rn.bf16();\n\t"
+              :
+              : [dst] "r"(qc1_p),
+                [src] "r"(kv_buf),
+                [flt] "r"(qc1_q_w(0)),
+                [ci] "i"(kDim),
+                [h] "i"(kQc1Tile),
+                [co] "i"(kHeads),
+                [opnd] "r"(c2));
+          if (need_t2) {
+            const int32_t t2_rows = qc1_tile_rows(nswa, nc, t + 2);
+            const uint64_t* t2_off = off_n + (t + 1) * kQc1Tile;
+            if (b == 0) {
+              __sync_io0_io1_move_compute<false,
+                                          false,
+                                          true,
+                                          true,
+                                          true,
+                                          false,
+                                          false,
+                                          false>();
+              __gather_io0_async(kv_buf,
+                                 comp,
+                                 t2_off,
+                                 kRowBytes,
+                                 GDRAM2NRAM,
+                                 kRowBytes,
+                                 t2_rows);
+            } else {
+              __sync_io0_io1_move_compute<false,
+                                          false,
+                                          true,
+                                          true,
+                                          false,
+                                          true,
+                                          false,
+                                          false>();
+              __gather_io1_async(kv_buf,
+                                 comp,
+                                 t2_off,
+                                 kRowBytes,
+                                 GDRAM2NRAM,
+                                 kRowBytes,
+                                 t2_rows);
+            }
+          }
+          in_pair = true;
+          buf = nb;
+          continue;
+        }
+
+        if (finish_pair) {
+          load_kv_w_256_half_async(qc1_kv_w_256, kv_buf, 1);
+          bfloat16_t* const p_hi = qc1_p + kQc1Tile * kHeads;
+          asm volatile(
+              "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+              "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]), "
+              ".cvt.dst.rn.bf16();\n\t"
+              :
+              : [dst] "r"(p_hi),
+                [src] "r"(kv_buf),
+                [flt] "r"(qc1_q_w(0)),
+                [ci] "i"(kDim),
+                [h] "i"(kQc1Tile),
+                [co] "i"(kHeads),
+                [opnd] "r"(c2));
+          if (need_t2) {
+            const int32_t t2_rows = qc1_tile_rows(nswa, nc, t + 2);
+            const uint64_t* t2_off = off_n + (t + 1) * kQc1Tile;
+            if (b == 0) {
+              __sync_io0_io1_move_compute<false,
+                                          false,
+                                          true,
+                                          true,
+                                          true,
+                                          false,
+                                          false,
+                                          false>();
+              __gather_io0_async(kv_buf,
+                                 comp,
+                                 t2_off,
+                                 kRowBytes,
+                                 GDRAM2NRAM,
+                                 kRowBytes,
+                                 t2_rows);
+            } else {
+              __sync_io0_io1_move_compute<false,
+                                          false,
+                                          true,
+                                          true,
+                                          false,
+                                          true,
+                                          false,
+                                          false>();
+              __gather_io1_async(kv_buf,
+                                 comp,
+                                 t2_off,
+                                 kRowBytes,
+                                 GDRAM2NRAM,
+                                 kRowBytes,
+                                 t2_rows);
+            }
+          }
+
+          bfloat16_t* const mt_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+          __bang_maxpool(mt_bf_n, qc1_p, kHeads, 16, 16, 16, 16, 1, 1);
+          __bang_bfloat162float(mt_n, mt_bf_n, kHeads);
+          __bang_sub(tmp_n, mt_n, m_n, kHeads);
+          __bang_argmax(red_n, tmp_n, kHeads);
+          __sync_compute();
+          const float max_delta = __load_nram(red_n);
+          if (__builtin_expect(max_delta > 16.0f || high_logit, 0)) {
+            high_logit = true;
+            __sync_all_pipe();
+            const int32_t first_comp = (t - 2) * kQc1Tile;
+            for (int32_t off = 0; off < 2 * kQc1Tile; off += 32) {
+              __gather(qc1_pt,
+                       comp,
+                       off_n + first_comp + off,
+                       kRowBytes,
+                       GDRAM2NRAM,
+                       kRowBytes,
+                       32);
+              __sync_io();
+              asm volatile(
+                  "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+                  "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]);\n\t"
+                  :
+                  : [dst] "r"(qc1_s32_fb),
+                    [src] "r"(qc1_pt),
+                    [flt] "r"(qc1_q_w(0)),
+                    [ci] "i"(kDim),
+                    [h] "i"(32),
+                    [co] "i"(kHeads),
+                    [opnd] "r"(c2));
+              if (off == 0) {
+                __bang_maxpool(mt_n, qc1_s32_fb, kHeads, 32, 1, 32, 1, 1, 1);
+              } else {
+                __bang_maxpool(tmp_n, qc1_s32_fb, kHeads, 32, 1, 32, 1, 1, 1);
+                __bang_maximum(mt_n, mt_n, tmp_n, kHeads);
+              }
+              __sync_compute();
+            }
+            __bang_sub(tmp_n, mt_n, m_n, kHeads);
+            __bang_argmax(red_n, tmp_n, kHeads);
+            __sync_compute();
+            if (__load_nram(red_n) > kTau) {
+              __bang_maximum(mt_n, mt_n, m_n, kHeads);
+              __bang_sub(tmp_n, m_n, mt_n, kHeads);
+              __bang_pow2(tmp_n, tmp_n, kHeads);
+              __bang_mul(l_n, l_n, tmp_n, kHeads);
+              __bang_move(m_n, mt_n, kHeads * sizeof(float));
+              __bang_float2bfloat16(m_bf_n, m_n, kHeads);
+              asm volatile(
+                  "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+                  "1, 1, %[m], 1, 1, 1, 1, %[co], "
+                  ".mul.partial([%[part]]);\n\t"
+                  :
+                  : [dst] "r"(qc1_o),
+                    [src] "r"(tmp_n),
+                    [flt] "r"(qc1_ones_w),
+                    [m] "i"(kHeads),
+                    [co] "i"(kDim),
+                    [part] "r"(qc1_o));
+            }
+            for (int32_t off = 0; off < 2 * kQc1Tile; off += 32) {
+              __gather(qc1_pt,
+                       comp,
+                       off_n + first_comp + off,
+                       kRowBytes,
+                       GDRAM2NRAM,
+                       kRowBytes,
+                       32);
+              __sync_io();
+              asm volatile(
+                  "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+                  "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]);\n\t"
+                  :
+                  : [dst] "r"(qc1_s32_fb),
+                    [src] "r"(qc1_pt),
+                    [flt] "r"(qc1_q_w(0)),
+                    [ci] "i"(kDim),
+                    [h] "i"(32),
+                    [co] "i"(kHeads),
+                    [opnd] "r"(c2));
+              __bang_cycle_sub(
+                  qc1_s32_fb, qc1_s32_fb, m_n, 32 * kHeads, kHeads);
+              __bang_pow2(qc1_s32_fb, qc1_s32_fb, 32 * kHeads);
+              __bang_sumpool(ps_n, qc1_s32_fb, kHeads, 32, 1, 32, 1, 1, 1);
+              __bang_add(l_n, l_n, ps_n, kHeads);
+              __bang_float2bfloat16(
+                  qc1_p + off * kHeads, qc1_s32_fb, 32 * kHeads);
+              __sync_compute();
+            }
+          } else {
+            if (max_delta > kTau) {
+              __bang_maximum(mt_n, mt_n, m_n, kHeads);
+              __bang_sub(tmp_n, m_n, mt_n, kHeads);
+              __bang_pow2(tmp_n, tmp_n, kHeads);
+              __bang_mul(l_n, l_n, tmp_n, kHeads);
+              __bang_move(m_n, mt_n, kHeads * sizeof(float));
+              __bang_float2bfloat16(m_bf_n, m_n, kHeads);
+              asm volatile(
+                  "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+                  "1, 1, %[m], 1, 1, 1, 1, %[co], "
+                  ".mul.partial([%[part]]);\n\t"
+                  :
+                  : [dst] "r"(qc1_o),
+                    [src] "r"(tmp_n),
+                    [flt] "r"(qc1_ones_w),
+                    [m] "i"(kHeads),
+                    [co] "i"(kDim),
+                    [part] "r"(qc1_o));
+            }
+            __bang_cycle_sub(
+                qc1_p, qc1_p, m_bf_n, 2 * kQc1Tile * kHeads, kHeads);
+            __bang_pow2(qc1_p, qc1_p, 2 * kQc1Tile * kHeads);
+            bfloat16_t* const ps_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+            __bang_sumpool(ps_bf_n, qc1_p, kHeads, 16, 16, 16, 16, 1, 1);
+            __bang_bfloat162float(ps_n, ps_bf_n, kHeads);
+            __bang_add(l_n, l_n, ps_n, kHeads);
+          }
+          __bang_transpose(qc1_pt, qc1_p, 2 * kQc1Tile, kHeads);
+          if (t + 1 == cur_tiles) {
+            __bang_sub(tmp_n, sink_n, m_n, kHeads);
+            __bang_pow2(tmp_n, tmp_n, kHeads);
+            __bang_add(tmp_n, tmp_n, l_n, kHeads);
+            __bang_recip(tmp_n, tmp_n, kHeads);
+          }
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      false,
+                                      false,
+                                      true>();
+          __bang_conv_partial(qc1_o,
+                              qc1_pt,
+                              qc1_kv_w_256,
+                              qc1_o,
+                              2 * kQc1Tile,
+                              kHeads,
+                              1,
+                              1,
+                              1,
+                              1,
+                              1,
+                              kDim);
+          in_pair = false;
+          buf = nb;
+          continue;
+        }
+
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    true,
+                                    false>();
+        if (rows < tp) {
+          __bang_write_value(
+              kv_buf + rows * kDim, (tp - rows) * kDim, (bfloat16_t)0.0f);
+          __sync_io0_io1_move_compute<false,
+                                      false,
+                                      false,
+                                      true,
+                                      false,
+                                      false,
+                                      true,
+                                      false>();
+        }
+        load_kv_w_tp_async(qc1_kv_w(b), kv_buf, tp);
+
+        asm volatile(
+            "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+            "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]), "
+            ".cvt.dst.rn.bf16();\n\t"
+            :
+            : [dst] "r"(qc1_p),
+              [src] "r"(kv_buf),
+              [flt] "r"(qc1_q_w(0)),
+              [ci] "i"(kDim),
+              [h] "r"(rows),
+              [co] "i"(kHeads),
+              [opnd] "r"(c2));
+
+        // Release kv_buf immediately after QK(t) so tile t+2 gathers on IO_{b}
+        // in parallel with Softmax(t) + Transpose(t) + PV(t)!
+        if (need_t2) {
+          const int32_t t2_rows = qc1_tile_rows(nswa, nc, t + 2);
+          const uint64_t* t2_off = off_n + (t + 1) * kQc1Tile;
+          if (b == 0) {
+            __sync_io0_io1_move_compute<false,
+                                        false,
+                                        true,
+                                        true,
+                                        true,
+                                        false,
+                                        false,
+                                        false>();
+            __gather_io0_async(kv_buf,
+                               comp,
+                               t2_off,
+                               kRowBytes,
+                               GDRAM2NRAM,
+                               kRowBytes,
+                               t2_rows);
+          } else {
+            __sync_io0_io1_move_compute<false,
+                                        false,
+                                        true,
+                                        true,
+                                        false,
+                                        true,
+                                        false,
+                                        false>();
+            __gather_io1_async(kv_buf,
+                               comp,
+                               t2_off,
+                               kRowBytes,
+                               GDRAM2NRAM,
+                               kRowBytes,
+                               t2_rows);
+          }
+        }
+
+        if (t == 0) {
+          __bang_maxpool(m_bf_n, qc1_p, kHeads, rows, 1, rows, 1, 1, 1);
+          __bang_bfloat162float(m_n, m_bf_n, kHeads);
+          __bang_cycle_sub(qc1_p, qc1_p, m_bf_n, rows * kHeads, kHeads);
+          __bang_pow2(qc1_p, qc1_p, rows * kHeads);
+          bfloat16_t* const ps_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+          __bang_sumpool(ps_bf_n, qc1_p, kHeads, rows, 1, rows, 1, 1, 1);
+          __bang_bfloat162float(l_n, ps_bf_n, kHeads);
+        } else {
+          bfloat16_t* const mt_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+          __bang_maxpool(mt_bf_n, qc1_p, kHeads, rows, 1, rows, 1, 1, 1);
+          __bang_bfloat162float(mt_n, mt_bf_n, kHeads);
+          __bang_sub(tmp_n, mt_n, m_n, kHeads);
+          __bang_argmax(red_n, tmp_n, kHeads);
+          __sync_compute();
+          const float max_delta = __load_nram(red_n);
+          if (__builtin_expect(max_delta > 16.0f || high_logit, 0)) {
+            high_logit = true;
+            asm volatile(
+                "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+                "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]);\n\t"
+                :
+                : [dst] "r"(qc1_s),
+                  [src] "r"(kv_buf),
+                  [flt] "r"(qc1_q_w(0)),
+                  [ci] "i"(kDim),
+                  [h] "r"(rows),
+                  [co] "i"(kHeads),
+                  [opnd] "r"(c2));
+            __bang_maxpool(mt_n, qc1_s, kHeads, rows, 1, rows, 1, 1, 1);
+            __bang_sub(tmp_n, mt_n, m_n, kHeads);
+            __bang_argmax(red_n, tmp_n, kHeads);
+            __sync_compute();
+            if (__load_nram(red_n) > kTau) {
+              __bang_maximum(mt_n, mt_n, m_n, kHeads);
+              __bang_sub(tmp_n, m_n, mt_n, kHeads);
+              __bang_pow2(tmp_n, tmp_n, kHeads);
+              __bang_mul(l_n, l_n, tmp_n, kHeads);
+              __bang_move(m_n, mt_n, kHeads * sizeof(float));
+              __bang_float2bfloat16(m_bf_n, m_n, kHeads);
+              asm volatile(
+                  "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+                  "1, 1, %[m], 1, 1, 1, 1, %[co], "
+                  ".mul.partial([%[part]]);\n\t"
+                  :
+                  : [dst] "r"(qc1_o),
+                    [src] "r"(tmp_n),
+                    [flt] "r"(qc1_ones_w),
+                    [m] "i"(kHeads),
+                    [co] "i"(kDim),
+                    [part] "r"(qc1_o));
+            }
+            __bang_cycle_sub(qc1_s, qc1_s, m_n, rows * kHeads, kHeads);
+            __bang_pow2(qc1_s, qc1_s, rows * kHeads);
+            __bang_sumpool(ps_n, qc1_s, kHeads, rows, 1, rows, 1, 1, 1);
+            __bang_add(l_n, l_n, ps_n, kHeads);
+            __bang_float2bfloat16(qc1_pt, qc1_s, rows * kHeads);
+            __bang_move(qc1_p, qc1_pt, rows * kHeads * sizeof(bfloat16_t));
+          } else {
+            if (max_delta > kTau) {
+              __bang_maximum(mt_n, mt_n, m_n, kHeads);
+              __bang_sub(tmp_n, m_n, mt_n, kHeads);
+              __bang_pow2(tmp_n, tmp_n, kHeads);
+              __bang_mul(l_n, l_n, tmp_n, kHeads);
+              __bang_move(m_n, mt_n, kHeads * sizeof(float));
+              __bang_float2bfloat16(m_bf_n, m_n, kHeads);
+              asm volatile(
+                  "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+                  "1, 1, %[m], 1, 1, 1, 1, %[co], "
+                  ".mul.partial([%[part]]);\n\t"
+                  :
+                  : [dst] "r"(qc1_o),
+                    [src] "r"(tmp_n),
+                    [flt] "r"(qc1_ones_w),
+                    [m] "i"(kHeads),
+                    [co] "i"(kDim),
+                    [part] "r"(qc1_o));
+            }
+            __bang_cycle_sub(qc1_p, qc1_p, m_bf_n, rows * kHeads, kHeads);
+            __bang_pow2(qc1_p, qc1_p, rows * kHeads);
+            bfloat16_t* const ps_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+            __bang_sumpool(ps_bf_n, qc1_p, kHeads, rows, 1, rows, 1, 1, 1);
+            __bang_bfloat162float(ps_n, ps_bf_n, kHeads);
+            __bang_add(l_n, l_n, ps_n, kHeads);
+          }
+        }
+        if (rows < tp) {
+          __bang_write_value(
+              qc1_p + rows * kHeads, (tp - rows) * kHeads, (bfloat16_t)0.0f);
+        }
+        __bang_transpose(qc1_pt, qc1_p, tp, kHeads);
+        if (t + 1 == cur_tiles) {
+          __bang_sub(tmp_n, sink_n, m_n, kHeads);
+          __bang_pow2(tmp_n, tmp_n, kHeads);
+          __bang_add(tmp_n, tmp_n, l_n, kHeads);
+          __bang_recip(tmp_n, tmp_n, kHeads);
+        }
+
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    true,
+                                    false,
+                                    false,
+                                    false,
+                                    false,
+                                    true>();
+        if (t == 0) {
+          __bang_conv(
+              qc1_o, qc1_pt, qc1_kv_w(b), tp, kHeads, 1, 1, 1, 1, 1, kDim);
+        } else {
+          __bang_conv_partial(qc1_o,
+                              qc1_pt,
+                              qc1_kv_w(b),
+                              qc1_o,
+                              tp,
+                              kHeads,
+                              1,
+                              1,
+                              1,
+                              1,
+                              1,
+                              kDim);
+        }
+        buf = nb;
+      }
+
+      bfloat16_t* const ep_obf = (buf ^ 1) ? qc1_kv1 : qc1_kv0;
+      asm volatile(
+          "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+          "1, 1, %[m], 1, 1, 1, 1, %[co], "
+          ".mul.partial([%[part]]), .cvt.dst.rn.bf16();\n\t"
+          :
+          : [dst] "r"(ep_obf),
+            [src] "r"(tmp_n),
+            [flt] "r"(qc1_ones_w),
+            [m] "i"(kHeads),
+            [co] "i"(kDim),
+            [part] "r"(qc1_o));
+
+      const int64_t out_off = static_cast<int64_t>(i) * q_elems;
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  true,
+                                  false,
+                                  false,
+                                  false>();
+      __memcpy_io0_async(
+          output + out_off, ep_obf, kHeads * kRowBytes, NRAM2GDRAM);
+    }
+  }
+
+  if (valid + tid < prm.nq) {
+    __sync_io();
+    __bang_write_value(qc1_kv0, kHeads * kDim, (bfloat16_t)0.0f);
+    __sync_compute();
+    for (int32_t row = valid + tid, p = 0; row < prm.nq; row += tdim, ++p) {
+      if ((p & 1) == 0) {
+        __memcpy_io0_async(output + static_cast<int64_t>(row) * q_elems,
+                           qc1_kv0,
+                           kHeads * kRowBytes,
+                           NRAM2GDRAM);
+      } else {
+        __memcpy_io1_async(output + static_cast<int64_t>(row) * q_elems,
+                           qc1_kv0,
+                           kHeads * kRowBytes,
+                           NRAM2GDRAM);
+      }
+    }
+  }
+  __sync_all_pipe();
+}
+
+// Per-IPU Zero-Barrier Head-Split body for Decode ratio==0 (valid >= 9):
+// G = 2 (valid 9..16, HPC = 32) and G = 1 (valid >= 17, HPC = 64).
+// Zero cluster barriers, zero SRAM exchange, Dual-IO SWA load, disjoint
+// current_kv staging, and swa_columns == 1 division-free fast path.
+template <int32_t G, bool kWideSwa>
+__mlu_func__ void decode_r0_headsplit_body(const Params& prm,
+                                           int32_t valid,
+                                           int32_t tid,
+                                           int32_t tdim,
+                                           bool preloaded) {
+  constexpr int32_t HPC = kHeads / G;
+  static_assert(HPC * G == kHeads && HPC % 16 == 0, "r0 headsplit alignment");
+  bfloat16_t* const r0_kv =
+      reinterpret_cast<bfloat16_t*>(pool_n);  // [128, 512] 128 KB
+  float* const r0_o =
+      reinterpret_cast<float*>(pool_n + 131072);  // [HPC, 512] <=128 KB
+  bfloat16_t* const r0_obf =
+      reinterpret_cast<bfloat16_t*>(pool_n + 262144);  // [HPC, 512] <=64 KB
+  float* const r0_s =
+      reinterpret_cast<float*>(pool_n + 327680);  // [128, HPC] <=32 KB
+  bfloat16_t* const r0_p =
+      reinterpret_cast<bfloat16_t*>(r0_s);  // [128, HPC] <=16 KB
+  bfloat16_t* const m_bf_n = m_bf_buf_n;
+  bfloat16_t* const r0_pt =
+      reinterpret_cast<bfloat16_t*>(pool_n + 360448);  // [HPC, 128] <=16 KB
+  bfloat16_t* const cur_n =
+      reinterpret_cast<bfloat16_t*>(all_n);  // [1, 512]    1 KB
+
+  const bfloat16_t* const q = reinterpret_cast<const bfloat16_t*>(prm.q);
+  const bfloat16_t* const current =
+      reinterpret_cast<const bfloat16_t*>(prm.current);
+  bfloat16_t* const swa = reinterpret_cast<bfloat16_t*>(prm.swa);
+  bfloat16_t* const output = reinterpret_cast<bfloat16_t*>(prm.output);
+  const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+  const float c2 = prm.scale * kLog2e;
+  const uint32_t swa_cols = static_cast<uint32_t>(prm.swa_columns);
+  const int32_t items = valid * G;
+
+  if (tid < items) {
+    if (!preloaded) {
+      const int32_t i0 = static_cast<int32_t>(static_cast<uint32_t>(tid) /
+                                              static_cast<uint32_t>(G));
+      const int32_t hg0 = static_cast<int32_t>(static_cast<uint32_t>(tid) %
+                                               static_cast<uint32_t>(G));
+      const int32_t hb0 = hg0 * HPC;
+      const bfloat16_t* const q_row0 =
+          q + static_cast<int64_t>(i0) * q_elems + hb0 * kDim;
+
+      load_q_w_direct<HPC>(q_w, q_row0, HPC >= 32);
+      __memcpy_io1_async(
+          meta_n + 16, prm.begins + i0, sizeof(int32_t), GDRAM2NRAM);
+      if constexpr (!kWideSwa) {
+        __memcpy_io1_async(
+            stab_n,
+            prm.swa_table + static_cast<int64_t>(i0) * prm.swa_row_stride,
+            prm.swa_columns * sizeof(int32_t),
+            GDRAM2NRAM);
+      }
+      __memcpy_io1_async(cur_n,
+                         current + static_cast<int64_t>(i0) * kDim,
+                         kRowBytes,
+                         GDRAM2NRAM);
+      __bang_mul_scalar(sink_n, sink_n, kLog2e, kHeads);
+      __sync_io();
+    } else {
+      __bang_mul_scalar(sink_n, sink_n, kLog2e, kHeads);
+    }
+
+    for (int32_t w = tid; w < items; w += tdim) {
+      const int32_t i = static_cast<int32_t>(static_cast<uint32_t>(w) /
+                                             static_cast<uint32_t>(G));
+      const int32_t hg = static_cast<int32_t>(static_cast<uint32_t>(w) %
+                                              static_cast<uint32_t>(G));
+      const int32_t hb = hg * HPC;
+      if (w > tid) {
+        const bfloat16_t* const q_row =
+            q + static_cast<int64_t>(i) * q_elems + hb * kDim;
+        __sync_io();
+        __sync_io0_io1_move_compute<false,
+                                    false,
+                                    false,
+                                    true,
+                                    false,
+                                    true,
+                                    false,
+                                    false>();
+        load_q_w_direct<HPC>(q_w, q_row, HPC >= 32);
+        __memcpy_io1_async(
+            meta_n + 16, prm.begins + i, sizeof(int32_t), GDRAM2NRAM);
+        if constexpr (!kWideSwa) {
+          __memcpy_io1_async(
+              stab_n,
+              prm.swa_table + static_cast<int64_t>(i) * prm.swa_row_stride,
+              prm.swa_columns * sizeof(int32_t),
+              GDRAM2NRAM);
+        }
+        __memcpy_io1_async(cur_n,
+                           current + static_cast<int64_t>(i) * kDim,
+                           kRowBytes,
+                           GDRAM2NRAM);
+        __sync_io();
+      }
+
+      const int32_t pos = __load_nram(meta_n + 16);
+      const int32_t lo = pos - (kWindow - 1) > 0 ? pos - (kWindow - 1) : 0;
+      const int32_t nswa = pos - lo + 1;
+      const int32_t tp =
+          static_cast<int32_t>((static_cast<uint32_t>(nswa) + 31U) & ~31U);
+
+      __memcpy_async(r0_kv + (nswa - 1) * kDim, cur_n, kRowBytes, NRAM2NRAM);
+
+      int32_t wide_page_lo = 0;
+      int32_t wide_page_hi = 0;
+      if constexpr (kWideSwa) {
+        load_decode_wide_pages(prm, i, lo, pos, &wide_page_lo, &wide_page_hi);
+      }
+
+      // Dual-IO SWA load of [lo, pos): split across IO0 and IO1 for 2x per-IPU
+      // DMA throughput.
+      const int32_t old_rows = pos - lo;
+      if (old_rows > 0) {
+        if (!kWideSwa && swa_cols == 1U) {
+          const int64_t page_base =
+              static_cast<int64_t>(__load_nram(stab_n)) * kPage;
+          const int32_t page_end = (lo | (kPage - 1)) + 1;
+          const int32_t seg1_end = pos < page_end ? pos : page_end;
+          const int32_t n1 = seg1_end - lo;
+          const int64_t slot1 = page_base + (lo & (kPage - 1));
+          if (seg1_end == pos) {
+            const int32_t h0 = (n1 + 1) >> 1;
+            __memcpy_io0_async(
+                r0_kv, swa + slot1 * kDim, h0 * kRowBytes, GDRAM2NRAM);
+            if (n1 > h0) {
+              __memcpy_io1_async(r0_kv + h0 * kDim,
+                                 swa + (slot1 + h0) * kDim,
+                                 (n1 - h0) * kRowBytes,
+                                 GDRAM2NRAM);
+            }
+          } else {
+            const int32_t n2 = pos - seg1_end;
+            __memcpy_io0_async(
+                r0_kv, swa + slot1 * kDim, n1 * kRowBytes, GDRAM2NRAM);
+            __memcpy_io1_async(r0_kv + n1 * kDim,
+                               swa + page_base * kDim,
+                               n2 * kRowBytes,
+                               GDRAM2NRAM);
+          }
+        } else {
+          bfloat16_t* dst = r0_kv;
+          int32_t t = lo;
+          int32_t seg_idx = 0;
+          while (t < pos) {
+            const int32_t page_end = (t | (kPage - 1)) + 1;
+            const int32_t seg_end = pos < page_end ? pos : page_end;
+            const int32_t cnt = seg_end - t;
+            int32_t page;
+            if constexpr (kWideSwa) {
+              page = ((t >> 7) == (lo >> 7)) ? wide_page_lo : wide_page_hi;
+            } else {
+              page = __load_nram(stab_n +
+                                 (static_cast<uint32_t>(t >> 7) % swa_cols));
+            }
+            const int64_t slot =
+                static_cast<int64_t>(page) * kPage + (t & (kPage - 1));
+            if (seg_idx == 0 && seg_end == pos && cnt > 1) {
+              const int32_t h0 = (cnt + 1) >> 1;
+              __memcpy_io0_async(
+                  dst, swa + slot * kDim, h0 * kRowBytes, GDRAM2NRAM);
+              __memcpy_io1_async(dst + h0 * kDim,
+                                 swa + (slot + h0) * kDim,
+                                 (cnt - h0) * kRowBytes,
+                                 GDRAM2NRAM);
+            } else if ((seg_idx & 1) == 0) {
+              __memcpy_io0_async(
+                  dst, swa + slot * kDim, cnt * kRowBytes, GDRAM2NRAM);
+            } else {
+              __memcpy_io1_async(
+                  dst, swa + slot * kDim, cnt * kRowBytes, GDRAM2NRAM);
+            }
+            dst += cnt * kDim;
+            t = seg_end;
+            ++seg_idx;
+          }
+        }
+      }
+      if (nswa < tp) {
+        __bang_write_value(
+            r0_kv + nswa * kDim, (tp - nswa) * kDim, (bfloat16_t)0.0f);
+      }
+
+      __sync_io0_io1_move_compute<true,
+                                  true,
+                                  true,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  true>();
+      if (hg == 0) {
+        int32_t commit_page;
+        if constexpr (kWideSwa) {
+          commit_page = wide_page_hi;
+        } else {
+          const uint32_t commit_col =
+              swa_cols == 1U ? 0U
+                             : (static_cast<uint32_t>(pos >> 7) % swa_cols);
+          commit_page = __load_nram(stab_n + commit_col);
+        }
+        const int64_t commit_slot =
+            static_cast<int64_t>(commit_page) * kPage + (pos & (kPage - 1));
+        __memcpy_io1_async(
+            swa + commit_slot * kDim, cur_n, kRowBytes, NRAM2GDRAM);
+      }
+      __bang_load_matrix_async(
+          kv_w, r0_kv, NRAM2WRAM, tp, kDim, kRowBytes, true);
+
+      static_assert(HPC == 32 || HPC == 64,
+                    "r0 headsplit uses Direct BF16 HPC=32/64");
+      asm volatile(
+          "conv.nram.rn.f32.bf16.bf16 [%[dst]], [%[src]], [%[flt]], "
+          "%[ci], %[h], 1, 1, 1, 1, 1, %[co], .mul.scalar(%[opnd]), "
+          ".cvt.dst.rn.bf16();\n\t"
+          :
+          : [dst] "r"(r0_p),
+            [src] "r"(r0_kv),
+            [flt] "r"(q_w),
+            [ci] "i"(kDim),
+            [h] "r"(nswa),
+            [co] "i"(HPC),
+            [opnd] "r"(c2));
+
+      __bang_maxpool(m_bf_n, r0_p, HPC, nswa, 1, nswa, 1, 1, 1);
+      __bang_bfloat162float(m_n, m_bf_n, HPC);
+      __bang_cycle_sub(r0_p, r0_p, m_bf_n, nswa * HPC, HPC);
+      __bang_pow2(r0_p, r0_p, nswa * HPC);
+      if (nswa < tp) {
+        __bang_write_value(
+            r0_p + nswa * HPC, (tp - nswa) * HPC, (bfloat16_t)0.0f);
+      }
+      bfloat16_t* const ps_bf_n = reinterpret_cast<bfloat16_t*>(tmp_n);
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  true,
+                                  false>();
+      move_transpose_p_bf16<HPC>(r0_pt, r0_p, tp);
+      __bang_sumpool(ps_bf_n, r0_p, HPC, nswa, 1, nswa, 1, 1, 1);
+      __bang_bfloat162float(l_n, ps_bf_n, HPC);
+
+      __bang_sub(tmp_n, sink_n + hb, m_n, HPC);
+      __bang_pow2(tmp_n, tmp_n, HPC);
+      __bang_add(l_n, l_n, tmp_n, HPC);
+      __bang_recip(l_n, l_n, HPC);
+
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  true,
+                                  false,
+                                  false,
+                                  false,
+                                  false,
+                                  true>();
+      __bang_conv(r0_o, r0_pt, kv_w, tp, HPC, 1, 1, 1, 1, 1, kDim);
+
+      asm volatile(
+          "conv.nram.rn.f32.f32.f32 [%[dst]], [%[src]], [%[flt]], "
+          "1, 1, %[m], 1, 1, 1, 1, %[co], "
+          ".mul.partial([%[part]]), .cvt.dst.rn.bf16();\n\t"
+          :
+          : [dst] "r"(r0_obf),
+            [src] "r"(l_n),
+            [flt] "r"(ones_w),
+            [m] "i"(HPC),
+            [co] "i"(kDim),
+            [part] "r"(r0_o));
+
+      const int64_t out_off = static_cast<int64_t>(i) * q_elems + hb * kDim;
+      __sync_io0_io1_move_compute<false,
+                                  false,
+                                  false,
+                                  true,
+                                  true,
+                                  false,
+                                  false,
+                                  false>();
+      __memcpy_io0_async(output + out_off, r0_obf, HPC * kRowBytes, NRAM2GDRAM);
+    }
+  }
+
+  if (valid + tid < prm.nq) {
+    __sync_io();
+    __bang_write_value(r0_kv, kHeads * kDim, (bfloat16_t)0.0f);
+    __sync_compute();
+    for (int32_t row = valid + tid; row < prm.nq; row += tdim) {
+      __memcpy_io1_async(output + static_cast<int64_t>(row) * q_elems,
+                         r0_kv,
+                         kHeads * kRowBytes,
+                         NRAM2GDRAM);
+    }
+  }
+  __sync_all_pipe();
+}
+
+__mlu_func__ void decode_zero_all(const Params& prm,
+                                  int32_t tid,
+                                  int32_t tdim) {
+  if (tid < prm.nq) {
+    bfloat16_t* const z_n = reinterpret_cast<bfloat16_t*>(pool_n);
+    bfloat16_t* const output = reinterpret_cast<bfloat16_t*>(prm.output);
+    const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+    __bang_write_value(z_n, kHeads * kDim, (bfloat16_t)0.0f);
+    __sync_compute();
+    for (int32_t row = tid, p = 0; row < prm.nq; row += tdim, ++p) {
+      if ((p & 1) == 0) {
+        __memcpy_io0_async(output + static_cast<int64_t>(row) * q_elems,
+                           z_n,
+                           kHeads * kRowBytes,
+                           NRAM2GDRAM);
+      } else {
+        __memcpy_io1_async(output + static_cast<int64_t>(row) * q_elems,
+                           z_n,
+                           kHeads * kRowBytes,
+                           NRAM2GDRAM);
+      }
+    }
+    __sync_all_pipe();
+  }
+}
+
+// Entry Round-Trip #1 fusion (fallback when speculative Round-Trip #2 is not
+// applicable).
+__mlu_func__ int32_t decode_entry_preload(const Params& prm) {
+  __memcpy_io0_async(meta_n, prm.num_valid_rows, sizeof(int32_t), GDRAM2NRAM);
+  __memcpy_io1_async(sink_n, prm.sink, kHeads * sizeof(float), GDRAM2NRAM);
+  float* const ones_stage = reinterpret_cast<float*>(pool_n + 393216);
+  __bang_write_value(ones_stage, kDim, 1.0f);
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              false,
+                              false,
+                              true,
+                              false>();
+  __bang_load_matrix_async(
+      ones_w, ones_stage, NRAM2WRAM, kDim, 1, sizeof(float), false);
+  __sync_io();
+  return __load_nram(meta_n);
+}
+
+// Speculative Entry Round-Trip #1 + #2 fusion for decode_body<QC, GH,
+// kCompressed>: Overlaps num_valid_rows (meta_n[0]) + sink[64] + ones_w with
+// first-item read-only loads (q_w, topk_n, begins->meta_n[16], stab_n,
+// cur_stage_n, ctab_n) guarded strictly by i0 < cap. Safe for valid <= 0 and
+// dynamic MLUGraph replay bucket drops (no page-ID deref or writes).
+template <int32_t QC, int32_t GH, bool kCompressed, bool kWideSwa>
+__mlu_func__ int32_t decode_entry_preload_body(const Params& prm) {
+  __memcpy_io0_async(meta_n, prm.num_valid_rows, sizeof(int32_t), GDRAM2NRAM);
+  __memcpy_io1_async(sink_n, prm.sink, kHeads * sizeof(float), GDRAM2NRAM);
+
+  constexpr int32_t S = kCores / QC;
+  constexpr int32_t G = kHeads / GH;
+  const int32_t core = static_cast<int32_t>(coreId);
+  const int32_t lc = core % QC;
+  const int32_t slot = static_cast<int32_t>(taskIdY) * S + core / QC;
+  const int32_t i0 = static_cast<int32_t>(static_cast<uint32_t>(slot) /
+                                          static_cast<uint32_t>(G));
+  const int32_t cap = prm.requests < prm.nq ? prm.requests : prm.nq;
+  if (i0 < cap) {
+    const int32_t hb = static_cast<int32_t>(static_cast<uint32_t>(slot) %
+                                            static_cast<uint32_t>(G)) *
+                       GH;
+    const bfloat16_t* const q = reinterpret_cast<const bfloat16_t*>(prm.q);
+    const bfloat16_t* const current =
+        reinterpret_cast<const bfloat16_t*>(prm.current);
+    const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+    const bool compressed = kCompressed && prm.ratio > 0 && prm.kcap > 0 &&
+                            prm.compressed_columns > 0;
+    const int32_t kslice = (prm.kcap + QC - 1) / QC;
+    const int32_t e0 = lc * kslice < prm.kcap ? lc * kslice : prm.kcap;
+    const int32_t e1 = e0 + kslice < prm.kcap ? e0 + kslice : prm.kcap;
+    using L = Layout<QC>;
+    const bool split_q_io =
+        (GH >= 32) && (!compressed || prm.compressed_columns <= 2048);
+    load_q_w_direct<GH>(
+        q_w, q + static_cast<int64_t>(i0) * q_elems + hb * kDim, split_q_io);
+    if (compressed && e1 > e0) {
+      __memcpy_io0_async(topk_n,
+                         prm.topk + static_cast<int64_t>(i0) * prm.kcap + e0,
+                         (e1 - e0) * sizeof(int32_t),
+                         GDRAM2NRAM);
+    }
+    __memcpy_io1_async(
+        meta_n + 16, prm.begins + i0, sizeof(int32_t), GDRAM2NRAM);
+    if constexpr (!kWideSwa) {
+      __memcpy_io1_async(
+          stab_n,
+          prm.swa_table + static_cast<int64_t>(i0) * prm.swa_row_stride,
+          prm.swa_columns * sizeof(int32_t),
+          GDRAM2NRAM);
+    }
+    if (lc == 0 && hb == 0) {
+      __memcpy_io1_async(cur_stage_n,
+                         current + static_cast<int64_t>(i0) * kDim,
+                         kRowBytes,
+                         GDRAM2NRAM);
+    }
+    if (compressed && e1 > e0 && prm.compressed_columns <= kCtabWide) {
+      int32_t* const ctab_wide =
+          reinterpret_cast<int32_t*>(kv_n + (L::kChunk - 32) * kDim);
+      int32_t* const ctab_dst =
+          prm.compressed_columns <= kCtabNram ? ctab_n : ctab_wide;
+      __memcpy_io1_async(ctab_dst,
+                         prm.compressed_table + static_cast<int64_t>(i0) *
+                                                    prm.compressed_row_stride,
+                         prm.compressed_columns * sizeof(int32_t),
+                         GDRAM2NRAM);
+    }
+  }
+
+  float* const ones_stage = reinterpret_cast<float*>(pool_n + 393216);
+  __bang_write_value(ones_stage, kDim, 1.0f);
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              false,
+                              false,
+                              true,
+                              false>();
+  __bang_load_matrix_async(
+      ones_w, ones_stage, NRAM2WRAM, kDim, 1, sizeof(float), false);
+  __sync_io();
+  return __load_nram(meta_n);
+}
+
+// Speculative Entry Round-Trip #1 + #2 fusion for decode_r0_headsplit_body<G>.
+template <int32_t G, bool kWideSwa>
+__mlu_func__ int32_t decode_entry_preload_r0(const Params& prm, int32_t tid) {
+  __memcpy_io0_async(meta_n, prm.num_valid_rows, sizeof(int32_t), GDRAM2NRAM);
+  __memcpy_io1_async(sink_n, prm.sink, kHeads * sizeof(float), GDRAM2NRAM);
+
+  constexpr int32_t HPC = kHeads / G;
+  const int32_t i0 = static_cast<int32_t>(static_cast<uint32_t>(tid) /
+                                          static_cast<uint32_t>(G));
+  const int32_t cap = prm.requests < prm.nq ? prm.requests : prm.nq;
+  if (i0 < cap) {
+    const int32_t hg0 = static_cast<int32_t>(static_cast<uint32_t>(tid) %
+                                             static_cast<uint32_t>(G));
+    const int32_t hb0 = hg0 * HPC;
+    const bfloat16_t* const q = reinterpret_cast<const bfloat16_t*>(prm.q);
+    const bfloat16_t* const current =
+        reinterpret_cast<const bfloat16_t*>(prm.current);
+    const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+    bfloat16_t* const cur_n = reinterpret_cast<bfloat16_t*>(all_n);
+    load_q_w_direct<HPC>(
+        q_w, q + static_cast<int64_t>(i0) * q_elems + hb0 * kDim, HPC >= 32);
+    __memcpy_io1_async(
+        meta_n + 16, prm.begins + i0, sizeof(int32_t), GDRAM2NRAM);
+    if constexpr (!kWideSwa) {
+      __memcpy_io1_async(
+          stab_n,
+          prm.swa_table + static_cast<int64_t>(i0) * prm.swa_row_stride,
+          prm.swa_columns * sizeof(int32_t),
+          GDRAM2NRAM);
+    }
+    __memcpy_io1_async(cur_n,
+                       current + static_cast<int64_t>(i0) * kDim,
+                       kRowBytes,
+                       GDRAM2NRAM);
+  }
+
+  float* const ones_stage = reinterpret_cast<float*>(pool_n + 393216);
+  __bang_write_value(ones_stage, kDim, 1.0f);
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              false,
+                              false,
+                              true,
+                              false>();
+  __bang_load_matrix_async(
+      ones_w, ones_stage, NRAM2WRAM, kDim, 1, sizeof(float), false);
+  __sync_io();
+  return __load_nram(meta_n);
+}
+
+// Speculative Entry Round-Trip #1 + #2 fusion for decode_qc1_online_body.
+template <bool kWideSwa>
+__mlu_func__ int32_t decode_entry_preload_qc1(const Params& prm, int32_t tid) {
+  __memcpy_io0_async(meta_n, prm.num_valid_rows, sizeof(int32_t), GDRAM2NRAM);
+  __memcpy_io1_async(sink_n, prm.sink, kHeads * sizeof(float), GDRAM2NRAM);
+
+  const int32_t cap = prm.requests < prm.nq ? prm.requests : prm.nq;
+  if (tid < cap) {
+    const bfloat16_t* const q = reinterpret_cast<const bfloat16_t*>(prm.q);
+    const bfloat16_t* const current =
+        reinterpret_cast<const bfloat16_t*>(prm.current);
+    const int64_t q_elems = static_cast<int64_t>(kHeads) * kDim;
+    int32_t* const qc1_ctab_wide = reinterpret_cast<int32_t*>(pool_n + 442368);
+    int32_t* const ctab_buf =
+        prm.compressed_columns <= kCtabNram ? ctab_n : qc1_ctab_wide;
+    const bool split_q_io = prm.compressed_columns <= 2048;
+    load_q_w_direct<kHeads>(
+        qc1_q_w(0), q + static_cast<int64_t>(tid) * q_elems, split_q_io);
+    __memcpy_io0_async(topk_n,
+                       prm.topk + static_cast<int64_t>(tid) * prm.kcap,
+                       prm.kcap * sizeof(int32_t),
+                       GDRAM2NRAM);
+    __memcpy_io1_async(
+        meta_n + 16, prm.begins + tid, sizeof(int32_t), GDRAM2NRAM);
+    if constexpr (!kWideSwa) {
+      __memcpy_io1_async(
+          stab_n,
+          prm.swa_table + static_cast<int64_t>(tid) * prm.swa_row_stride,
+          prm.swa_columns * sizeof(int32_t),
+          GDRAM2NRAM);
+    }
+    __memcpy_io1_async(cur_stage_n,
+                       current + static_cast<int64_t>(tid) * kDim,
+                       kRowBytes,
+                       GDRAM2NRAM);
+    if (prm.compressed_columns <= kCtabWide) {
+      __memcpy_io1_async(ctab_buf,
+                         prm.compressed_table + static_cast<int64_t>(tid) *
+                                                    prm.compressed_row_stride,
+                         prm.compressed_columns * sizeof(int32_t),
+                         GDRAM2NRAM);
+    }
+  }
+
+  float* const ones_stage = reinterpret_cast<float*>(pool_n + 393216);
+  __bang_write_value(ones_stage, kDim, 1.0f);
+  __sync_io0_io1_move_compute<false,
+                              false,
+                              false,
+                              true,
+                              false,
+                              false,
+                              true,
+                              false>();
+  __bang_load_matrix_async(
+      ones_w, ones_stage, NRAM2WRAM, kDim, 1, sizeof(float), false);
+  __sync_io();
+  return __load_nram(meta_n);
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_r0_g2_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const int32_t valid = decode_entry_preload_r0<2, kWideSwa>(prm, tid);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  decode_r0_headsplit_body<2, kWideSwa>(prm, valid, tid, tdim, true);
+}
+
+__mlu_global__ void decode_r0_g2_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_r0_g2_impl<true>(prm);
+  } else {
+    decode_r0_g2_impl<false>(prm);
+  }
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_r0_g1_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const int32_t valid = decode_entry_preload_r0<1, kWideSwa>(prm, tid);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  if (valid >= 17) {
+    decode_r0_headsplit_body<1, kWideSwa>(prm, valid, tid, tdim, true);
+  } else {
+    decode_r0_headsplit_body<2, kWideSwa>(prm, valid, tid, tdim, false);
+  }
+}
+
+__mlu_global__ void decode_r0_g1_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_r0_g1_impl<true>(prm);
+  } else {
+    decode_r0_g1_impl<false>(prm);
+  }
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_sparse_b2_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const int32_t valid = decode_entry_preload_body<4, 16, true, kWideSwa>(prm);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  decode_body<4, 16, true, kWideSwa>(prm, valid, true);
+}
+
+__mlu_global__ void decode_sparse_b2_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_sparse_b2_impl<true>(prm);
+  } else {
+    decode_sparse_b2_impl<false>(prm);
+  }
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_sparse_b4_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const int32_t valid = decode_entry_preload_body<4, 32, true, kWideSwa>(prm);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  if (valid >= 3) {
+    decode_body<4, 32, true, kWideSwa>(prm, valid, true);
+  } else {
+    decode_body<4, 16, true, kWideSwa>(prm, valid, false);
+  }
+}
+
+__mlu_global__ void decode_sparse_b4_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_sparse_b4_impl<true>(prm);
+  } else {
+    decode_sparse_b4_impl<false>(prm);
+  }
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_sparse_b8_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const int32_t valid =
+      decode_entry_preload_body<4, kHeads, true, kWideSwa>(prm);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  if (valid >= 5) {
+    decode_body<4, kHeads, true, kWideSwa>(prm, valid, true);
+  } else if (valid >= 3) {
+    decode_body<4, 32, true, kWideSwa>(prm, valid, false);
+  } else {
+    decode_body<4, 16, true, kWideSwa>(prm, valid, false);
+  }
+}
+
+__mlu_global__ void decode_sparse_b8_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_sparse_b8_impl<true>(prm);
+  } else {
+    decode_sparse_b8_impl<false>(prm);
+  }
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_sparse_b16_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const int32_t valid =
+      decode_entry_preload_body<2, kHeads, true, kWideSwa>(prm);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  if (valid > 8) {
+    decode_body<2, kHeads, true, kWideSwa>(prm, valid, true);
+  } else if (valid >= 5) {
+    decode_body<4, kHeads, true, kWideSwa>(prm, valid, false);
+  } else if (valid >= 3) {
+    decode_body<4, 32, true, kWideSwa>(prm, valid, false);
+  } else {
+    decode_body<4, 16, true, kWideSwa>(prm, valid, false);
+  }
+}
+
+__mlu_global__ void decode_sparse_b16_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_sparse_b16_impl<true>(prm);
+  } else {
+    decode_sparse_b16_impl<false>(prm);
+  }
+}
+
+template <bool kWideSwa>
+__mlu_func__ void decode_unified_impl(Params prm) {
+  if (__is_mpu()) {
+    return;
+  }
+
+  const int32_t tid =
+      static_cast<int32_t>(taskIdY) * kCores + static_cast<int32_t>(coreId);
+  const int32_t tdim = static_cast<int32_t>(taskDimY) * kCores;
+  const bool spec_qc1 = (prm.requests >= 17) && (prm.ratio > 0) &&
+                        (prm.kcap > 0) && (prm.compressed_columns > 0);
+  const int32_t valid = spec_qc1 ? decode_entry_preload_qc1<kWideSwa>(prm, tid)
+                                 : decode_entry_preload(prm);
+  if (valid <= 0) {
+    decode_zero_all(prm, tid, tdim);
+    return;
+  }
+  if (valid >= 17) {
+    decode_qc1_online_body<kWideSwa>(prm, valid, tid, tdim, spec_qc1);
+    return;
+  }
+  if (valid >= 5 && valid <= 8) {
+    decode_body<4, kHeads, true, kWideSwa>(prm, valid, false);
+  } else if (valid > 8) {
+    decode_body<2, kHeads, true, kWideSwa>(prm, valid, false);
+  } else if (valid >= 3) {
+    decode_body<4, 32, true, kWideSwa>(prm, valid, false);
+  } else {
+    decode_body<4, 16, true, kWideSwa>(prm, valid, false);
+  }
+}
+
+__mlu_global__ void decode_unified_kernel(Params prm) {
+  prm.swa_columns = *prm.logical_swa_columns;
+  if (prm.swa_columns > kMaxSwaPreloadColumns) {
+    decode_unified_impl<true>(prm);
+  } else {
+    decode_unified_impl<false>(prm);
+  }
+}
+
+}  // namespace
+
+cnrtRet_t launch_decode(cnrtQueue_t queue, const Params& params) {
+  if (params.nq <= 0) {
+    return cnrtSuccess;
+  }
+  const bool compressed =
+      params.ratio > 0 && params.kcap > 0 && params.compressed_columns > 0;
+  if (!compressed) {
+    if (params.requests <= 16) {
+      const int32_t need =
+          params.requests * 2 > params.nq ? params.requests * 2 : params.nq;
+      uint32_t clusters = static_cast<uint32_t>((need + kCores - 1) / kCores);
+      if (clusters < 1U) {
+        clusters = 1U;
+      } else if (clusters > 8U) {
+        clusters = 8U;
+      }
+      cnrtDim3_t dim = {static_cast<uint32_t>(kCores), clusters, 1};
+      decode_r0_g2_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+    } else {
+      cnrtDim3_t dim = {static_cast<uint32_t>(kCores), 8, 1};
+      decode_r0_g1_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+    }
+    return cnrtGetLastError();
+  }
+  if (params.requests <= 2) {
+    const uint32_t clusters =
+        (params.requests == 1 && params.nq <= 16) ? 4U : 8U;
+    cnrtDim3_t dim = {static_cast<uint32_t>(kCores), clusters, 1};
+    decode_sparse_b2_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+    return cnrtGetLastError();
+  }
+  if (params.requests <= 16) {
+    cnrtDim3_t dim = {static_cast<uint32_t>(kCores), 8, 1};
+    if (params.requests <= 4) {
+      decode_sparse_b4_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+      return cnrtGetLastError();
+    }
+    if (params.requests <= 8) {
+      decode_sparse_b8_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+      return cnrtGetLastError();
+    }
+    decode_sparse_b16_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+    return cnrtGetLastError();
+  }
+  cnrtDim3_t dim = {static_cast<uint32_t>(kCores), 8, 1};
+  decode_unified_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(params);
+  return cnrtGetLastError();
+}
+
+}  // namespace xllm::kernel::mlu::bangc::paged_attention

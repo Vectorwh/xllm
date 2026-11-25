@@ -16,15 +16,10 @@ limitations under the License.
 #include "layers/mlu/deepseek_v41/deepseek_v41_attention.h"
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
-#include <numeric>
 
-#include "framework/model/graph_eager_context.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/mlu/bangc/include/deepseek_v41.h"
 #include "kernels/mlu/bangc/include/deepseek_v41_constants.h"
-#include "kernels/mlu/mlu_ops_api.h"
 #include "kernels/ops_api.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_attention_utils.h"
 
@@ -33,27 +28,6 @@ namespace {
 using deepseek_v41::dense_projection;
 using deepseek_v41::norm;
 using deepseek_v41::rotate;
-using kernel::mlu::bangc::kDeepseekV41MluKVBlockSize;
-
-torch::Tensor slots(const torch::Tensor& table,
-                    int64_t seq,
-                    int64_t begin,
-                    int64_t end,
-                    int64_t block_size,
-                    bool ring,
-                    const torch::TensorOptions& options) {
-  torch::Tensor pos = torch::arange(begin, end, options.dtype(torch::kInt64));
-  torch::Tensor columns = torch::floor_divide(pos, block_size);
-  if (ring) {
-    columns = columns.remainder(table.size(1));
-  }
-  return table[seq]
-                 .to(options.device(), torch::kInt64)
-                 .index_select(0, columns) *
-             block_size +
-         pos.remainder(block_size);
-}
-
 torch::Tensor flat_cache(const torch::Tensor& cache) {
   return cache.view({-1, cache.size(-1)});
 }
@@ -284,7 +258,6 @@ torch::Tensor DeepseekV41AttentionImpl::forward(
   }
   torch::Tensor iq;
   torch::Tensor q = project_query(qr, pos, rope);
-  torch::Tensor output = torch::empty_like(q);
   if (index_source_) {
     iq = indexer_->project_query(qr, pos, rope);
   }
@@ -332,7 +305,9 @@ torch::Tensor DeepseekV41AttentionImpl::forward(
           metadata,
           pooling,
           cache.get_k_cache().view(
-              {-1, kDeepseekV41MluKVBlockSize / ratio_, 512}),
+              {-1,
+               kernel::mlu::bangc::kDeepseekV41MluKVBlockSize / ratio_,
+               512}),
           out.outputs,
           options);
       latent = out.outputs.latent;
@@ -349,331 +324,52 @@ torch::Tensor DeepseekV41AttentionImpl::forward(
                                    shared.num_valid_input_rows,
                                    num_valid_compressed_rows);
   }
-  torch::Tensor selected, lengths;
-  const int64_t capacity =
-      args_.window_size() + (input.use_dflash_proposal_attention
-                                 ? args_.dspark_block_size()
-                                 : (ratio_ > 0 ? args_.index_topk() : 0));
-  const bool decode = deepseek_v41::uses_decode_attention(input);
-  if (decode) {
-    CHECK(cp_context == nullptr);
-    CHECK(shared.selected_kv.defined());
-    CHECK(shared.selected_lengths.defined());
-    CHECK_EQ(shared.selected_lengths.numel(), q.size(0));
-    selected = shared.selected_kv.narrow(
-        /*dim=*/0, /*start=*/0, /*length=*/q.size(0) * capacity);
-    lengths = shared.selected_lengths;
+  if (ratio_ > 0 && index_source_) {
+    indexer_->select_indices(iq,
+                             iw,
+                             caches[source_].get_index_cache(),
+                             pos,
+                             shared.query_requests,
+                             deepseek_v41::uses_decode_attention(input),
+                             shared);
   }
-  auto cached_attention = [this,
-                           iw,
-                           q,
-                           kv,
-                           iq,
-                           output,
-                           selected,
-                           lengths,
-                           &caches,
-                           &input,
-                           &shared,
-                           cp_context](int64_t /*unused*/) {
-    forward_cached_attention(iw,
-                             q,
-                             kv,
-                             iq,
-                             caches,
-                             input,
-                             shared,
-                             output,
-                             selected,
-                             lengths,
-                             cp_context);
-  };
-  if (input.graph.eager_context != nullptr) {
-    input.graph.eager_context->run_eager(std::move(cached_attention));
-  } else {
-    cached_attention(0);
+  namespace bangc = kernel::mlu::bangc;
+  using Stage = bangc::PagedAttentionStage;
+  Stage stage = Stage::PREFILL;
+  if (input.use_dflash_proposal_attention) {
+    stage = Stage::DRAFT;
+  } else if (input.is_spec_verify || input.meta.spec_verify_width > 1 ||
+             (input.meta.batch_forward_type.is_decode() &&
+              input.meta.q_max_seq_len > 1)) {
+    stage = Stage::VERIFY;
+  } else if (input.meta.batch_forward_type.is_decode()) {
+    stage = Stage::DECODE;
   }
-  if (decode) {
-    decode_attention(q, selected, lengths, output);
+  bangc::PagedAttentionMetadata metadata;
+  metadata.swa_table = shared.swa_block_table;
+  metadata.swa_columns = shared.swa_columns;
+  metadata.requests = shared.query_requests;
+  metadata.positions = pos;
+  metadata.prefix = shared.query_prefix;
+  metadata.begins = shared.chunk_begins;
+  metadata.valid_rows = shared.num_valid_input_rows;
+  torch::Tensor compressed;
+  if (ratio_ > 0) {
+    compressed = flat_cache(caches[source_].get_k_cache());
+    metadata.compressed_table = shared.block_tables.at(1);
+    metadata.topk = shared.packed_topk;
   }
+  auto output = bangc::fused_paged_sparsed_attention(
+      stage,
+      q,
+      kv,
+      flat_cache(caches[layer_id_].get_swa_cache()),
+      compressed,
+      weights_.at("attn_sink"),
+      metadata,
+      ratio_,
+      args_.window_size());
   return project_output(output, pos, rope);
-}
-
-void DeepseekV41AttentionImpl::decode_attention(const torch::Tensor& q,
-                                                const torch::Tensor& selected,
-                                                const torch::Tensor& lengths,
-                                                torch::Tensor output) {
-  const int64_t dim = args_.head_dim();
-  const int64_t capacity = selected.size(0) / q.size(0);
-  auto table =
-      torch::arange(q.size(0) * capacity, options_.dtype(torch::kInt32))
-          .view({q.size(0), 1, capacity});
-  auto query = q.unsqueeze(1);
-  auto out = output.unsqueeze(1);
-  std::optional<torch::Tensor> lse;
-  kernel::mlu::batch_decode(query,
-                            selected,
-                            out,
-                            table,
-                            lengths,
-                            std::nullopt,
-                            lse,
-                            std::nullopt,
-                            std::nullopt,
-                            std::nullopt,
-                            std::nullopt,
-                            std::nullopt,
-                            std::nullopt,
-                            "half",
-                            capacity,
-                            -1,
-                            -1,
-                            1.0 / std::sqrt(dim),
-                            false,
-                            -1,
-                            std::nullopt,
-                            -1,
-                            weights_.at("attn_sink"));
-}
-
-void DeepseekV41AttentionImpl::forward_cached_attention(
-    const torch::Tensor& iw,
-    const torch::Tensor& q,
-    const torch::Tensor& kv,
-    const torch::Tensor& iq,
-    std::vector<KVCache>& caches,
-    const ModelInputParams& input,
-    Csa2Context& shared,
-    torch::Tensor output,
-    torch::Tensor selected,
-    torch::Tensor lengths,
-    const mlu_v4_cp::DeepseekV4CpContext* cp_context) {
-  const int64_t block = kDeepseekV41MluKVBlockSize;
-  const bool decode = deepseek_v41::uses_decode_attention(input);
-  if (decode) {
-    lengths.zero_();
-  } else {
-    output.zero_();
-  }
-  const auto& tables = shared.block_tables;
-  CHECK_GE(tables.size(), 1);
-  torch::Tensor swa = flat_cache(caches[layer_id_].get_swa_cache());
-  const auto& swa_table = shared.swa_block_table;
-  int64_t front_offset = 0;
-  int64_t back_offset = 0;
-  if (cp_context != nullptr) {
-    const auto& front =
-        cp_context->geometry.front_seq_lens_by_rank[cp_context->cp_rank];
-    back_offset = std::accumulate(front.begin(), front.end(), int64_t{0});
-  }
-  for (int32_t seq = 0; seq < shared.num_sequences; ++seq) {
-    const int64_t offset = shared.host_query_prefix[seq];
-    const int64_t count = shared.host_query_prefix[seq + 1] - offset;
-    if (count == 0) {
-      continue;
-    }
-    const bool single_decode = decode && count == 1;
-    const bool candidate_decode = single_decode &&
-                                  args_.candidate_source_layer_id() >= 0 &&
-                                  layer_id_ > args_.candidate_source_layer_id();
-    const int64_t begin = shared.host_chunk_begins[seq];
-    const int64_t end = begin + count;
-    const int64_t old_begin =
-        std::max<int64_t>(0,
-                          begin - args_.window_size() +
-                              (input.use_dflash_proposal_attention ? 0 : 1));
-    // Read the old ring before publishing a chunk that can wrap it.
-    torch::Tensor window;
-    if (!decode || input.use_dflash_proposal_attention) {
-      window = torch::cat(
-          {swa.index_select(
-               0,
-               slots(swa_table, seq, old_begin, begin, block, true, options_)),
-           kv.slice(0, offset, offset + count)},
-          0);
-    }
-    torch::Tensor main, keys;
-    if (ratio_ > 0) {
-      CHECK_GE(source_, 0);
-      CHECK_EQ(tables.size(), 2u);
-      const torch::Tensor& kv_table = tables[1];
-      torch::Tensor main_cache = flat_cache(caches[source_].get_k_cache());
-      torch::Tensor index_cache = flat_cache(caches[source_].get_index_cache());
-      torch::Tensor all_slots;
-      const bool paged_decode = single_decode && index_source_ && ratio_ == 2 &&
-                                !candidate_decode &&
-                                layer_id_ != args_.candidate_source_layer_id();
-      if (!single_decode ||
-          (index_source_ && !paged_decode && !candidate_decode)) {
-        const int64_t physical_dim = block / ratio_;
-        all_slots = slots(
-            kv_table, seq, 0, end / ratio_, physical_dim, false, options_);
-      }
-      if (!decode) {
-        main = main_cache.index_select(0, all_slots);
-      }
-      if (paged_decode) {
-        indexer_->select_decode_indices(iq[offset],
-                                        iw[offset],
-                                        caches[source_].get_index_cache(),
-                                        kv_table[seq],
-                                        end / ratio_,
-                                        seq,
-                                        shared);
-      } else if (index_source_ && candidate_decode) {
-        indexer_->select_candidate_indices(iq[offset],
-                                           iw[offset],
-                                           index_cache,
-                                           kv_table[seq],
-                                           end / ratio_,
-                                           seq,
-                                           shared);
-      } else if (index_source_) {
-        keys = index_cache.index_select(0, all_slots).to(torch::kFloat32);
-        if (cp_context == nullptr) {
-          indexer_->select_indices(iq.slice(0, offset, offset + count),
-                                   iw.slice(0, offset, offset + count),
-                                   keys,
-                                   begin,
-                                   seq,
-                                   shared);
-        }
-      }
-    }
-    if (input.use_dflash_proposal_attention) {
-      const int64_t capacity = selected.size(0) / q.size(0);
-      const int64_t visible = window.size(0);
-      selected.view({q.size(0), capacity, args_.head_dim()})
-          .slice(0, offset, offset + count)
-          .slice(1, 0, visible)
-          .copy_(
-              window.unsqueeze(0).expand({count, visible, args_.head_dim()}));
-      lengths.slice(0, offset, offset + count).fill_(visible);
-    } else if (cp_context != nullptr) {
-      const auto& geometry = cp_context->geometry;
-      const int32_t rank = cp_context->cp_rank;
-      const int64_t counts[2] = {geometry.front_seq_lens_by_rank[rank][seq],
-                                 geometry.back_seq_lens_by_rank[rank][seq]};
-      int64_t* local_offsets[2] = {&front_offset, &back_offset};
-      for (int32_t part = 0; part < 2; ++part) {
-        const int64_t rows = counts[part];
-        const int64_t local_offset = *local_offsets[part];
-        *local_offsets[part] += rows;
-        if (rows == 0) {
-          continue;
-        }
-        const int64_t segment_begin = shared.host_positions.const_data_ptr<
-            int64_t>()[geometry.rows_by_rank[rank][local_offset]];
-        const int32_t shared_seq = seq * 2 + part;
-        if (ratio_ > 0 && index_source_) {
-          indexer_->select_indices(
-              iq.slice(0, local_offset, local_offset + rows),
-              iw.slice(0, local_offset, local_offset + rows),
-              keys,
-              segment_begin,
-              shared_seq,
-              shared);
-        }
-        const int64_t segment_old_begin =
-            std::max<int64_t>(0, segment_begin - args_.window_size() + 1);
-        compute_attention(q.slice(0, local_offset, local_offset + rows),
-                          window.slice(0, segment_old_begin - old_begin),
-                          main,
-                          shared.topk.at(shared_seq),
-                          segment_begin,
-                          output.slice(0, local_offset, local_offset + rows));
-      }
-    } else if (decode) {
-      const int64_t capacity = selected.size(0) / q.size(0);
-      auto main_cache =
-          ratio_ > 0 ? flat_cache(caches[source_].get_k_cache()) : swa;
-      auto comp_table = tables[ratio_ > 0 ? 1 : 0][seq];
-      for (int64_t row = 0; row < count; ++row) {
-        auto topk = ratio_ > 0
-                        ? shared.topk.at(seq)[row].flatten()
-                        : torch::empty({0}, options_.dtype(torch::kInt64));
-        const int64_t query = offset + row;
-        kernel::mlu::bangc::deepseek_v41_decode_gather(
-            swa,
-            main_cache,
-            kv[query],
-            swa_table[seq],
-            comp_table,
-            topk,
-            begin + row,
-            args_.window_size(),
-            static_cast<int32_t>(ratio_ > 0 ? block / ratio_ : block),
-            selected.slice(0, query * capacity, (query + 1) * capacity),
-            lengths.slice(0, query, query + 1));
-      }
-    } else {
-      compute_attention(q.slice(0, offset, offset + count),
-                        window,
-                        main,
-                        shared.topk.at(seq),
-                        begin,
-                        output.slice(0, offset, offset + count));
-    }
-
-    if (!decode) {
-      const int64_t tail = std::min<int64_t>(count, swa_table.size(1) * block);
-      swa.index_copy_(
-          0,
-          slots(swa_table, seq, end - tail, end, block, true, options_),
-          kv.slice(0, offset + count - tail, offset + count));
-    }
-  }
-}
-
-void DeepseekV41AttentionImpl::compute_attention(const torch::Tensor& q,
-                                                 const torch::Tensor& window,
-                                                 const torch::Tensor& main,
-                                                 const torch::Tensor& indices,
-                                                 int64_t begin,
-                                                 torch::Tensor output) {
-  const int64_t count = q.size(0);
-  const int64_t dim = args_.head_dim();
-  const int64_t heads = args_.n_heads() / tp_size_;
-  const int64_t old_begin =
-      std::max<int64_t>(0, begin - args_.window_size() + 1);
-  const double neg_inf = -std::numeric_limits<double>::infinity();
-  // Bounded query tiles keep sparse gather memory independent of chunk length.
-  for (int64_t row = 0; row < count; row += 16) {
-    const int64_t rows = std::min<int64_t>(16, count - row);
-    torch::Tensor pos = torch::arange(
-        begin + row, begin + row + rows, options_.dtype(torch::kInt64));
-    torch::Tensor win_pos =
-        pos.unsqueeze(1) - args_.window_size() + 1 +
-        torch::arange(args_.window_size(), options_.dtype(torch::kInt64))
-            .unsqueeze(0);
-    torch::Tensor valid = win_pos.ge(0);
-    torch::Tensor selected =
-        window.index_select(0, (win_pos - old_begin).clamp_min(0).flatten())
-            .view({rows, args_.window_size(), dim});
-    if (ratio_ > 0 && main.size(0) > 0) {
-      torch::Tensor topk = indices.slice(0, row, row + rows);
-      torch::Tensor compressed =
-          main.index_select(0, topk.clamp_min(0).flatten())
-              .view({rows, topk.size(1), dim});
-      selected = torch::cat({selected, compressed}, 1);
-      valid = torch::cat({valid, topk.ge(0)}, 1);
-    }
-    torch::Tensor logits =
-        torch::bmm(q.slice(0, row, row + rows).to(torch::kFloat32),
-                   selected.to(torch::kFloat32).transpose(1, 2)) /
-        std::sqrt(dim);
-    logits.masked_fill_(~valid.unsqueeze(1), neg_inf);
-    torch::Tensor sink = weights_.at("attn_sink")
-                             .to(torch::kFloat32)
-                             .view({1, heads, 1})
-                             .expand({rows, heads, 1});
-    torch::Tensor probability = torch::cat({logits, sink}, -1)
-                                    .softmax(-1)
-                                    .slice(-1, 0, logits.size(-1));
-    output.slice(0, row, row + rows)
-        .copy_(torch::bmm(probability, selected.to(torch::kFloat32))
-                   .to(q.scalar_type()));
-  }
 }
 
 torch::Tensor DeepseekV41AttentionImpl::project_output(

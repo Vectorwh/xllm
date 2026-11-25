@@ -23,6 +23,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#include "kernels/mlu/bangc/include/deepseek_v41.h"
 #include "kernels/mlu/piecewise_graph.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_attention.h"
 #include "layers/mlu/deepseek_v41/deepseek_v41_attention_utils.h"
@@ -30,6 +31,20 @@ limitations under the License.
 
 namespace xllm::layer {
 namespace {
+
+TEST(DeepseekV41MetadataTest, IdlePrefillShardNeedsNoBlockTables) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  ModelInputParams input;
+  input.meta.batch_forward_type = BatchForwardType::PREFILL;
+  const auto positions = torch::zeros(
+      {1}, torch::TensorOptions().device(device).dtype(torch::kInt32));
+  Csa2Context shared;
+  deepseek_v41::prepare_metadata(shared, input, positions, /*num_sequences=*/0);
+  EXPECT_EQ(shared.num_valid_input_rows.item<int32_t>(), 0);
+  EXPECT_TRUE(shared.block_tables.empty());
+  EXPECT_FALSE(shared.swa_block_table.defined());
+}
 
 TEST(DeepseekV41MetadataTest,
      PositionsDefineChunksAndLogicalRingSurvivesCapacity) {
@@ -49,8 +64,9 @@ TEST(DeepseekV41MetadataTest,
   Csa2Context eager;
   deepseek_v41::prepare_metadata(eager, input, positions, /*num_sequences=*/3);
   ASSERT_EQ(eager.block_tables.size(), 2u);
-  EXPECT_TRUE(
-      torch::equal(eager.block_tables[1].cpu(), input.multi_block_tables[1]));
+  const auto expected_eager_kv = torch::cat(
+      {input.multi_block_tables[1], torch::zeros({1, 2}, torch::kInt32)}, 0);
+  EXPECT_TRUE(torch::equal(eager.block_tables[1].cpu(), expected_eager_kv));
   Csa2Context shared;
   deepseek_v41::prepare_metadata(shared,
                                  input,
@@ -104,6 +120,101 @@ TEST(DeepseekV41MetadataTest,
   EXPECT_TRUE(torch::equal(shared.block_tables[1].cpu(), expected_kv));
   EXPECT_EQ(shared.compressed[1].outputs.latent.data_ptr(), latent);
   EXPECT_EQ(shared.query_prefix.data_ptr(), prefix);
+}
+
+TEST(DeepseekV41MetadataTest, EagerPreparesStridedKvTableForScoreSelection) {
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  const auto ints = torch::TensorOptions().device(device).dtype(torch::kInt32);
+  const auto pages = torch::arange(8, ints).view({2, 4});
+  ModelInputParams input;
+  input.meta.num_sequences = 2;
+  input.attention.host.q_seq_lens = {0, 1, 2};
+  input.multi_block_tables = {pages, pages.narrow(/*dim=*/1, 1, 2)};
+  ASSERT_FALSE(input.multi_block_tables[1].is_contiguous());
+  Csa2Context shared;
+  deepseek_v41::prepare_metadata(
+      shared, input, torch::zeros({2}, ints), /*num_sequences=*/2);
+  const auto& kv = shared.block_tables.at(1);
+  EXPECT_TRUE(kv.is_contiguous());
+  EXPECT_TRUE(
+      torch::equal(kv.cpu(), torch::tensor({{1, 2}, {5, 6}}, torch::kInt32)));
+}
+
+TEST(DeepseekV41MetadataTest, CapturedDecodeTracksLiveSwaTableWidth) {
+  namespace bangc = kernel::mlu::bangc;
+  const torch::Device device(torch::kPrivateUse1, 0);
+  const torch::DeviceGuard guard(device);
+  const auto bf = torch::TensorOptions().device(device).dtype(torch::kBFloat16);
+  auto q = torch::zeros({1, 64, 512}, bf);
+  auto current = torch::ones({1, 512}, bf);
+  auto cache = torch::zeros({8 * 128, 512}, bf);
+  auto sink = torch::zeros({64}, bf.dtype(torch::kFloat32));
+  const auto positions = torch::zeros({1}, bf.dtype(torch::kInt32));
+  ModelInputParams input;
+  input.meta.num_sequences = 1;
+  input.meta.batch_forward_type = BatchForwardType::DECODE;
+  input.attention.host.q_seq_lens = {0, 1};
+  Csa2Context shared;
+  const auto prepare =
+      [&](int32_t columns, int32_t history_page, int32_t write_page) {
+        auto table = torch::full({1, columns}, -1, torch::kInt32);
+        table[0][columns - 2] = history_page;
+        table[0][columns - 1] = write_page;
+        input.multi_block_tables = {table};
+        const int32_t position = (columns - 1) * 128;
+        positions.fill_(position);
+        input.attention.host.kv_seq_lens = {0, position + 1};
+        deepseek_v41::prepare_metadata(shared, input, positions, 1, 1048576);
+      };
+  prepare(256, 2, 3);
+  bangc::PagedAttentionMetadata metadata;
+  metadata.swa_table = shared.swa_block_table;
+  metadata.swa_columns = shared.swa_columns;
+  metadata.prefix = shared.query_prefix;
+  metadata.begins = shared.chunk_begins;
+  metadata.valid_rows = shared.num_valid_input_rows;
+  torch_mlu::MLUGraph graph;
+  torch::Tensor output;
+  torch_mlu::synchronize();
+  {
+    torch_mlu::mlu::MLUStreamGuard stream(
+        torch_mlu::getStreamFromPool(false, 0));
+    graph.capture_begin();
+    output =
+        bangc::fused_paged_sparsed_attention(bangc::PagedAttentionStage::DECODE,
+                                             q,
+                                             current,
+                                             cache,
+                                             {},
+                                             sink,
+                                             metadata,
+                                             0);
+    graph.capture_end();
+  }
+  for (const int32_t columns : {257, 8192, 256}) {
+    SCOPED_TRACE(columns);
+    const int32_t history_page = columns % 3 + 1;
+    const int32_t write_page = history_page + 3;
+    prepare(columns, history_page, write_page);
+    ASSERT_EQ(shared.swa_block_table.data_ptr(), metadata.swa_table.data_ptr());
+    ASSERT_EQ(shared.swa_columns.data_ptr(), metadata.swa_columns.data_ptr());
+    cache.zero_();
+    cache.narrow(0, history_page * 128, 128).fill_(2);
+    auto expected_cache = cache.cpu();
+    expected_cache[write_page * 128].fill_(1);
+    graph.replay();
+    torch_mlu::synchronize();
+    // Zero Q and sink give each of 127 history rows, current KV and sink equal
+    // weight.
+    const double expected = (127.0 * 2.0 + 1.0) / 129.0;
+    EXPECT_TRUE(
+        torch::allclose(output.cpu().to(torch::kFloat32),
+                        torch::full({1, 64, 512}, expected, torch::kFloat32),
+                        0.008,
+                        0.0));
+    EXPECT_TRUE(torch::equal(cache.cpu(), expected_cache));
+  }
 }
 
 TEST(DeepseekV41MetadataTest, HostPositionsKeepQueuedUploadsIndependent) {
@@ -216,6 +327,7 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
       {"wo_b.weight", wo_b},
       {"attn_sink", torch::zeros({8}, options)},
   }));
+  const int32_t page_rows = 128 / std::max(1, ratio);
   const auto make_cache = [&]() {
     std::vector<KVCache> caches;
     caches.reserve(2);
@@ -229,14 +341,14 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
                               .to(options)
                               .contiguous();
       tensors.key_cache =
-          torch::arange(16 * 128, options.dtype(torch::kFloat32))
+          torch::arange(16 * page_rows, options.dtype(torch::kFloat32))
               .remainder(7)
               .div(8)
-              .view({16, 128, 1, 1})
-              .expand({16, 128, 1, 512})
+              .view({16, page_rows, 1, 1})
+              .expand({16, page_rows, 1, 512})
               .to(options)
               .contiguous();
-      tensors.index_cache = torch::zeros({16, 128, 1, 128}, options);
+      tensors.index_cache = torch::zeros({16, page_rows, 1, 128}, options);
       caches.emplace_back(tensors);
     }
     return caches;
@@ -276,8 +388,10 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
                            int64_t extent) {
     deepseek_v41::prepare_metadata(shared, params, positions, active, extent);
     deepseek_v41::prepare_workspace(shared, params, args, capacity, options);
-    shared.topk.resize(3);
-    shared.candidates.resize(3);
+    if (!shared.packed_topk.defined()) {
+      shared.packed_topk =
+          torch::empty({capacity, 4}, options.dtype(torch::kInt32));
+    }
     for (int32_t seq = 0; seq < 2; ++seq) {
       const int32_t rows = seq == 0 ? count : 3;
       auto topk = torch::tensor({-1, 0, 1, 2}, options.dtype(torch::kInt64))
@@ -291,7 +405,7 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
             ratio);
         topk.masked_fill_(topk >= lengths.unsqueeze(1), -1);
       }
-      shared.topk[seq] = topk;
+      shared.packed_topk.narrow(0, seq == 0 ? 0 : count, rows).copy_(topk);
     }
   };
   prepare(graph_shared, input, /*active=*/2, /*extent=*/1024);
@@ -302,7 +416,6 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
     prefill_input.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
     prefill_input.is_spec_verify = false;
     prepare(prefill_shared, prefill_input, /*active=*/2, /*extent=*/0);
-    EXPECT_FALSE(prefill_shared.selected_kv.defined());
     expected_prefill = attention
                            ->forward(hidden,
                                      positions,
@@ -337,7 +450,6 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
   EXPECT_TRUE(torch::equal(graph_caches[1].get_swa_cache(), before_capture));
   auto reference = torch::zeros({capacity, 5120}, torch::kFloat32);
   auto expected_cache = original_swa.clone();
-  auto expected_lengths = torch::zeros({capacity}, torch::kInt32);
   const auto main = original_main.cpu().view({-1, 512});
   const auto signs = hidden.cpu().select(1, 0).to(torch::kFloat32);
   const auto table = input.multi_block_tables[0].accessor<int32_t, 2>();
@@ -345,7 +457,8 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
     const int32_t offset = seq == 0 ? 0 : count;
     const int32_t start = seq == 0 ? begin : 1;
     const int32_t rows = seq == 0 ? count : 3;
-    const auto selections = graph_shared.topk[seq].cpu();
+    const auto selections =
+        graph_shared.packed_topk.narrow(0, offset, rows).cpu();
     for (int32_t row = 0; row < rows; ++row) {
       const int32_t position = start + row;
       const int32_t first =
@@ -365,12 +478,11 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
           if (logical < 0) {
             continue;
           }
-          sum += main[seq * 8 * 128 + logical][0].item<float>();
+          sum += main[seq * 8 * page_rows + logical][0].item<float>();
           ++length;
         }
       }
       reference[offset + row].slice(0, 0, 8).fill_(sum / (length + 1));
-      expected_lengths[offset + row].fill_(length);
       const int32_t target =
           table[seq][(position / 128) % 3] * 128 + position % 128;
       if (!proposal) {
@@ -387,28 +499,21 @@ TEST_P(DeepseekV41UnifiedAttentionTest,
     EXPECT_TRUE(torch::equal(prefill_caches[1].get_swa_cache(),
                              eager_caches[1].get_swa_cache()));
   }
-  EXPECT_TRUE(
-      torch::equal(eager_shared.selected_lengths.cpu(), expected_lengths));
   EXPECT_TRUE(torch::equal(
       eager_caches[1].get_swa_cache().cpu().view({-1, 512}), expected_cache));
   for (int32_t active : {2, 0, 2}) {
     SCOPED_TRACE(active);
     graph_caches[1].get_swa_cache().copy_(original_swa.view({6, 128, 1, 512}));
-    graph_shared.selected_lengths.fill_(-1);
-    graph_shared.selected_kv.fill_(std::numeric_limits<float>::quiet_NaN());
     prepare(graph_shared, input, active, /*extent=*/1024);
     graph.replay();
     torch_mlu::synchronize();
     EXPECT_TRUE(torch::isfinite(actual).all().item<bool>());
     if (active == 0) {
-      EXPECT_TRUE(graph_shared.selected_lengths.eq(0).all().item<bool>());
       EXPECT_TRUE(torch::equal(
           graph_caches[1].get_swa_cache().cpu().view({-1, 512}), original_swa));
       continue;
     }
     EXPECT_TRUE(torch::equal(actual, eager));
-    EXPECT_TRUE(
-        torch::equal(graph_shared.selected_lengths.cpu(), expected_lengths));
     EXPECT_TRUE(torch::equal(graph_caches[1].get_swa_cache(),
                              eager_caches[1].get_swa_cache()));
     EXPECT_TRUE(torch::equal(graph_caches[0].get_k_cache(), original_main));

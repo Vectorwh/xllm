@@ -89,8 +89,9 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
     attention->verify_loaded_weights();
     DeepSeekV4KVCacheTensors tensors;
     tensors.swa_cache = torch::zeros({2, 128, 1, 512}, options);
-    tensors.key_cache = torch::full({4, 128, 1, 512}, -7, options);
-    tensors.index_cache = torch::full({4, 128, 1, 128}, -7, options);
+    const int64_t page_rows = 128 / ratio;
+    tensors.key_cache = torch::full({4, page_rows, 1, 512}, -7, options);
+    tensors.index_cache = torch::full({4, page_rows, 1, 128}, -7, options);
     if (ratio == 2) {
       tensors.compress_kv_state =
           torch::full({2, 32, 512}, -7, options.dtype(torch::kFloat32));
@@ -99,8 +100,8 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
     }
     std::vector<KVCache> caches;
     caches.emplace_back(tensors);
-    auto expected_main = tensors.key_cache.cpu().view({512, 512});
-    auto expected_index = tensors.index_cache.cpu().view({512, 128});
+    auto expected_main = tensors.key_cache.cpu().view({-1, 512});
+    auto expected_index = tensors.index_cache.cpu().view({-1, 128});
     auto expected_state = torch::full({64, 512}, -7, cpu);
     auto expected_scores = torch::full_like(expected_state, -7);
     auto hidden = torch::zeros({2, 132, 5120}, cpu);
@@ -144,10 +145,8 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
       auto main_table = torch::tensor({3, 1, 2, 0}, torch::kInt32).view({2, 2});
       input.multi_block_tables = {swa_table, main_table};
       Csa2Context shared;
-      shared.topk.resize(2);
-      for (auto& topk : shared.topk) {
-        topk = torch::empty({count, 0}, options.dtype(torch::kInt64));
-      }
+      shared.packed_topk =
+          torch::empty({2 * count, 0}, options.dtype(torch::kInt32));
       auto positions =
           torch::arange(begin, end, options.dtype(torch::kInt64)).repeat({2});
       input = input.to(device);
@@ -184,8 +183,8 @@ TEST(DeepseekV41CompressorTest, RoundsBeforeNormAndPreservesFp32State) {
         auto main = rotate(latent.clone());
         for (int64_t logical = begin / ratio; logical < end / ratio;
              ++logical) {
-          const int64_t page = logical / 128 == 0 ? 3 - seq : 1 - seq;
-          const int64_t slot = page * 128 + logical % 128;
+          const int64_t page = logical / page_rows == 0 ? 3 - seq : 1 - seq;
+          const int64_t slot = page * page_rows + logical % page_rows;
           expected_main[slot].copy_(main[logical - begin / ratio]);
           expected_index[slot].copy_(keys[logical - begin / ratio]);
         }

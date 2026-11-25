@@ -36,20 +36,17 @@ struct Csa2Context {
   std::vector<int32_t> host_query_prefix;
   std::vector<int32_t> host_chunk_begins;
   torch::Tensor host_positions;
-  // Each defined entry has shape {query_rows, k}: one top-k list per query.
-  // A selection with no keys keeps the two-dimensional shape {query_rows, 0}.
-  std::vector<torch::Tensor> topk;
-  std::vector<torch::Tensor> candidates;
-  // Device INT32 logical [SWA, KV] tables shared by eager and captured kernels.
-  // Window-only drafts have only SWA. All compression ratios use the KV table.
+  torch::Tensor packed_topk;
+  torch::Tensor packed_candidates;
+  torch::Tensor select_workspace;
+  torch::Tensor query_requests;
+  std::array<torch::Tensor, 2> index_history;
+  // Logical [SWA, KV] tables. Window-only drafts have only SWA.
   std::vector<torch::Tensor> block_tables;
   // The logical SWA ring view retains the input width even when block_tables
   // stores an expanded absolute-page mapping for captured compression.
   torch::Tensor swa_block_table;
-  // Shared decode/verify scratch. Graph owners retain it across replays;
-  // ordinary forwards own it until all layers have consumed it.
-  torch::Tensor selected_kv;
-  torch::Tensor selected_lengths;
+  torch::Tensor swa_columns;
   // Stable device storage for the prefixes, chunk starts and input row count.
   // Each preparation uploads these views together from fresh pinned staging.
   torch::Tensor compression_metadata;
@@ -68,6 +65,13 @@ bool uses_decode_attention(const ModelInputParams& input);
 inline bool has_request_rows(const ModelInputParams& input) {
   return input.meta.q_max_seq_len > 0 && input.meta.num_sequences > 0;
 }
+
+void prepare_selection(Csa2Context& shared,
+                       int64_t rows,
+                       int64_t batch,
+                       bool has_candidates,
+                       kernel::mlu::bangc::ScoreSelectPhase phase,
+                       const torch::TensorOptions& options);
 
 void prepare_workspace(Csa2Context& shared,
                        const ModelInputParams& input,

@@ -77,7 +77,15 @@ list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES "${XLLM_FUSED_MHC_DECODE_SOURCE}")
 bang_add_library(xllm_mlu_fused_mhc_decode_kernel STATIC
   "${XLLM_FUSED_MHC_DECODE_SOURCE}"
   OPTIONS -Xbang-cnas -fno-soft-pipeline)
-foreach(bangc_target xllm_mlu_dflash2_conv_kernels
+set(XLLM_SCORE_SELECT_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek_v41/fused_dsa_index_score_select")
+set(XLLM_SCORE_SELECT_SOURCES
+  "${XLLM_SCORE_SELECT_DIR}/paged_prefill.mlu"
+  "${XLLM_SCORE_SELECT_DIR}/paged_decode.mlu")
+list(REMOVE_ITEM XLLM_BANGC_KERNEL_SOURCES ${XLLM_SCORE_SELECT_SOURCES})
+bang_add_library(xllm_mlu_score_select_kernel STATIC ${XLLM_SCORE_SELECT_SOURCES}
+  OPTIONS -Xbang-cnas -fno-soft-pipeline -mcmodel=large)
+foreach(bangc_target xllm_mlu_score_select_kernel xllm_mlu_dflash2_conv_kernels
     xllm_mlu_dcp_merge_kernel xllm_mlu_dcp_indexer_kernel
     xllm_mlu_fused_mhc_decode_kernel)
   target_include_directories(${bangc_target} PRIVATE
@@ -99,7 +107,7 @@ target_compile_definitions(xllm_mlu_ops PUBLIC
   "_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}")
 target_link_libraries(xllm_mlu_ops
   PUBLIC torch
-  PRIVATE xllm_mlu_dflash2_conv_kernels
+  PRIVATE xllm_mlu_score_select_kernel xllm_mlu_dflash2_conv_kernels
     xllm_mlu_dcp_merge_kernel xllm_mlu_dcp_indexer_kernel
     xllm_mlu_fused_mhc_decode_kernel torch_mlu glog::glog
     ${XLLM_BANGC_CNRT_LIBRARY})

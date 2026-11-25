@@ -34,7 +34,7 @@ constexpr int32_t kBlockSize = 128;
 struct Params {
   const void* x;
   const void* wp;
-  float* head;
+  uint16_t* head;
   const int32_t* num_valid_input_rows;
   int64_t x_stride;
   int32_t cap_x;

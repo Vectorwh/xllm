@@ -45,25 +45,12 @@ class DeepseekV41IndexerImpl final : public torch::nn::Module {
       const std::optional<torch::Tensor>& num_valid_input_rows = std::nullopt,
       const std::optional<torch::Tensor>& num_valid_compressed_rows =
           std::nullopt);
-  void select_candidate_indices(const torch::Tensor& iq,
-                                const torch::Tensor& iw,
-                                const torch::Tensor& cache,
-                                const torch::Tensor& table,
-                                int64_t length,
-                                int32_t seq,
-                                Csa2Context& shared);
-  void select_decode_indices(const torch::Tensor& iq,
-                             const torch::Tensor& iw,
-                             const torch::Tensor& cache,
-                             const torch::Tensor& table,
-                             int64_t length,
-                             int32_t seq,
-                             Csa2Context& shared);
-  void select_indices(const torch::Tensor& iq,
-                      const torch::Tensor& iw,
-                      const torch::Tensor& keys,
-                      int64_t begin,
-                      int32_t seq,
+  void select_indices(const torch::Tensor& query,
+                      const torch::Tensor& weights,
+                      const torch::Tensor& cache,
+                      const torch::Tensor& positions,
+                      const torch::Tensor& requests,
+                      bool decode,
                       Csa2Context& shared);
 
  private:
