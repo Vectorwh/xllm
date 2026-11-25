@@ -483,6 +483,16 @@ class MemoryVideoReader : public MemoryMediaReader {
   }
 
   bool handle_frame(AVFrame* f) override {
+    if (rgb_frame_ &&
+        (rgb_frame_->width != f->width || rgb_frame_->height != f->height)) {
+      LOG(ERROR) << "Video frame " << frames_.size() + 1 << " has dimensions "
+                 << f->width << "x" << f->height << ", expected "
+                 << rgb_frame_->width << "x" << rgb_frame_->height
+                 << " (width x height). All video frames must have the same "
+                    "dimensions.";
+      return false;
+    }
+
     // init colorspace converter once based on first frame
     if (!sws_ctx_) {
       sws_ctx_ = sws_getContext(f->width,
