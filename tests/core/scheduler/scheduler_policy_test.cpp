@@ -1013,11 +1013,44 @@ TEST_F(LoadAwareRoutingTest, PrefillScheduleUsesRoutingBeforeAllocation) {
   EXPECT_TRUE(second->sequences().front()->has_any_blocks());
 }
 
-TEST_F(LoadAwareRoutingTest, DisaggregatedModeKeepsLegacyRouting) {
-  options_.enable_disagg_pd(true);
+TEST_F(CacheAwareRoutingTest, DisaggregatedPrefillRoutesBeforeAllocation) {
+  options_.enable_disagg_pd(true).instance_role(InstanceRole::PREFILL);
+  pool_.hits = {0, 24};
   auto incoming = add_request();
-  EXPECT_TRUE(policy_.bind_prefill_dp(incoming, state_));
-  EXPECT_EQ(incoming->sequences().front()->dp_rank(), -1);
+  ScheduleBudget budget{
+      .remaining_token_budget = 1024,
+      .remaining_seq_budget = 16,
+      .latency_budget = std::numeric_limits<double>::max(),
+      .estimate_latency = 0,
+      .num_preempted_requests = 0,
+  };
+  std::vector<std::shared_ptr<Request>> finished;
+  RoutingTestPolicy policy(BatchMode{.enable_chunked_prefill = true}, options_);
+  policy.schedule(state_, budget, finished);
+  ASSERT_EQ(running_.size(), 1);
+  EXPECT_EQ(incoming->sequences().front()->dp_rank(), 1);
+  EXPECT_TRUE(incoming->sequences().front()->has_any_blocks());
+  EXPECT_GT(pool_.probe_calls, 0u);
+  EXPECT_EQ(load_.waiting()[1], 0u);
+  EXPECT_EQ(load_.running()[1], 1u);
+}
+
+TEST_F(CacheAwareRoutingTest, DisaggregatedNonPrefillKeepsLegacyRouting) {
+  options_.enable_disagg_pd(true);
+  pool_.hits = {0, 24};
+  const std::vector<std::optional<InstanceRole>> roles{
+      InstanceRole::DECODE, InstanceRole::DEFAULT, std::nullopt};
+  for (const auto& role : roles) {
+    options_.instance_role(role);
+    auto incoming = add_request();
+    EXPECT_TRUE(policy_.bind_prefill_dp(incoming, state_));
+    EXPECT_EQ(incoming->sequences().front()->dp_rank(), -1);
+    auto fixed = add_request(0);
+    policy_.mark_dp_running(fixed, state_);
+    EXPECT_EQ(load_.waiting()[0], 0u);
+    EXPECT_EQ(load_.running()[0], 0u);
+  }
+  EXPECT_EQ(pool_.probe_calls, 0u);
 }
 
 // dont not consider speculative decoding.

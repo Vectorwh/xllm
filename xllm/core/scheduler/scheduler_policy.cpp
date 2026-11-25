@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "async_response_processor.h"
 #include "common/metrics.h"
+#include "core/common/instance_role_util.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -209,7 +210,7 @@ SchedulerPolicy::SchedulerPolicy(const BatchMode& mode,
 
 bool SchedulerPolicy::supports_load_aware_routing(
     const SchedulerState& state) const {
-  return !state.options.enable_disagg_pd();
+  return !state.options.enable_disagg_pd() || is_pd_prefill_role(state.options);
 }
 
 void SchedulerPolicy::track_dp_request(const std::shared_ptr<Request>& request,

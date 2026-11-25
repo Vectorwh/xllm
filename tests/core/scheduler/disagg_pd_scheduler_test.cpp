@@ -1288,9 +1288,12 @@ TEST(DisaggPDSchedulerTest, PrefillTerminalTokenDoesNotHandoff) {
             };
         prefill.admit_prefill(request);
         ASSERT_FALSE(prefill.prepare()[0].empty());
+        EXPECT_EQ(prefill.get_dp_request_load().running()[0], 1u);
         finish_prefill(sequence);
         ASSERT_TRUE(request->finished());
         prefill.prefill_send_first_generation();
+        EXPECT_EQ(prefill.get_dp_request_load().waiting()[0], 0u);
+        EXPECT_EQ(prefill.get_dp_request_load().running()[0], 0u);
         prefill.wait_responses();
         EXPECT_EQ(callbacks.load(), 1);
         EXPECT_TRUE(request->has_terminal_outcome());
@@ -1365,6 +1368,7 @@ TEST(DisaggPDSchedulerTest, NonStreamHandoffFailureHasOneTerminalOutcome) {
     prefill.admit_prefill(request);
     auto batches = prefill.prepare();
     ASSERT_FALSE(batches[0].empty());
+    EXPECT_EQ(prefill.get_dp_request_load().running()[0], 1u);
     std::thread release_delivery;
     if (batch_response) {
       // Hold the real batch callback: a terminal response must not bypass it
@@ -1381,11 +1385,14 @@ TEST(DisaggPDSchedulerTest, NonStreamHandoffFailureHasOneTerminalOutcome) {
     }
     finish_prefill(request->sequences()[0].get());
     prefill.prefill_send_first_generation();
+    EXPECT_EQ(prefill.get_dp_request_load().waiting()[0], 0u);
+    EXPECT_EQ(prefill.get_dp_request_load().running()[0], 0u);
     prefill.prefill_completion().get();
     if (release_delivery.joinable()) {
       release_delivery.join();
     }
 
+    EXPECT_EQ(prefill.get_dp_request_load().running()[0], 0u);
     EXPECT_EQ(callbacks.load(), 2);
     EXPECT_TRUE(request->has_terminal_outcome());
     EXPECT_FALSE(prefill.has_channel(request->request_id()));
@@ -3283,6 +3290,10 @@ void check_prefill_response_completes_before_decode_handoff(
   request->record_token_admission();
   prefill.admit_prefill(request, &stub);
   prefill.step(absl::ZeroDuration());
+  if constexpr (std::is_same_v<Scheduler, TestDisaggPDScheduler>) {
+    EXPECT_EQ(prefill.get_dp_request_load().waiting()[0], 0u);
+    EXPECT_EQ(prefill.get_dp_request_load().running()[0], 0u);
+  }
   const bool output_started =
       started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
   EXPECT_TRUE(output_started);
