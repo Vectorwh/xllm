@@ -32,17 +32,46 @@ namespace xllm {
 struct ModelInputParams;
 class ProcessGroup;
 
-// A worker owns one instance and runs one prefill at a time. Every logical
-// layer retains private Host data. Layer 0 also retains its KV on Device for
-// prefix reuse; later layers share round-robin Device buffers. PUSH registers
-// Device slots; both local save and network writes must finish before reuse.
+class PrefillLayerwiseHostPool final {
+ public:
+  explicit PrefillLayerwiseHostPool(ProcessGroup* process_group);
+
+ private:
+  friend class PrefillLayerwiseKVCache;
+  class Mapping;
+  struct BatchState;
+
+  void initialize(const std::vector<KVCache>& device_caches,
+                  int64_t host_memory_bytes);
+  bool shared() const { return rank_count_ > 1; }
+  bool is_writer(int64_t layer) const;
+  bool enter(uint64_t batch_id,
+             const std::vector<int64_t>& read_blocks,
+             const std::vector<int64_t>& write_blocks,
+             bool valid);
+  bool read_complete(int64_t layer);
+  void leave();
+  void fail();
+
+  int32_t rank_count_ = 1;
+  int32_t local_rank_ = 0;
+  ProcessGroup* const process_group_;
+  std::vector<KVCache> caches_;
+  int64_t bytes_ = 0;
+  int64_t layers_ = 0;
+  int64_t blocks_ = 0;
+  std::shared_ptr<Mapping> mapping_;
+  BatchState* batch_ = nullptr;
+};
+
 class PrefillLayerwiseKVCache final : public LayerSynchronizer {
  public:
   PrefillLayerwiseKVCache(const KVCacheShape& shape,
                           const KVCacheCreateOptions& options,
                           int32_t num_buffers,
                           int64_t host_memory_bytes,
-                          std::vector<KVCache>& device_caches);
+                          std::vector<KVCache>& device_caches,
+                          ProcessGroup* host_group = nullptr);
   ~PrefillLayerwiseKVCache() override;
 
   // Validate all block ids before changing cache state. Blocks use the same
@@ -72,13 +101,17 @@ class PrefillLayerwiseKVCache final : public LayerSynchronizer {
   void abort() override;
   uint32_t size() const override;
 
-  // Complete Host mirror, indexed by logical layer; updated blocks are ready
-  // after finish(). Resident layer 0 skips H2D but still saves its writes.
-  std::vector<KVCache>& host_caches() { return host_caches_; }
+  const std::vector<KVCache>& host_caches() const { return host_pool_.caches_; }
   int64_t device_bytes() const { return device_bytes_; }
-  int64_t host_bytes() const { return host_bytes_; }
+  int64_t host_bytes() const { return host_pool_.bytes_; }
 
  private:
+  bool prepare(std::vector<int64_t> read_blocks,
+               std::vector<int64_t> write_blocks,
+               const Stream* compute_stream,
+               bool expect_push,
+               uint64_t batch_id,
+               bool metadata_valid);
   void require_usable() const;
   bool load_layer(int64_t layer_index);
   bool save_layer(int64_t layer_index);
@@ -86,14 +119,14 @@ class PrefillLayerwiseKVCache final : public LayerSynchronizer {
   bool push_layer_complete(int64_t layer_index);
   bool wait_push_completion(std::optional<int64_t> layer);
   void cancel_preparation();
+  void leave_host_batch();
   void drain();
 
   std::vector<KVCache>* device_caches_;
-  std::vector<KVCache> host_caches_;
+  PrefillLayerwiseHostPool host_pool_;
   int32_t num_buffers_;
   int64_t block_count_;
   int64_t device_bytes_ = 0;
-  int64_t host_bytes_ = 0;
   std::unique_ptr<BatchMemcpy> batch_memcpy_;
   std::unique_ptr<Stream> load_stream_;
   std::unique_ptr<Stream> save_stream_;
@@ -104,6 +137,8 @@ class PrefillLayerwiseKVCache final : public LayerSynchronizer {
   std::vector<int64_t> write_blocks_;
   int64_t current_layer_ = -1;
   int64_t next_load_layer_ = 0;
+  bool in_host_batch_ = false;
+  bool host_read_write_overlap_ = false;
   bool active_ = false;
   std::atomic<bool> failed_{false};
   std::mutex push_mutex_;

@@ -15,10 +15,22 @@ limitations under the License.
 
 #include "framework/kv_cache/prefill_layerwise_kv_cache.h"
 
+#include <fcntl.h>
 #include <folly/ScopeGuard.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <limits>
+#include <new>
+#include <sstream>
 #include <utility>
 
 #include "framework/kv_cache/kv_cache_utils.h"
@@ -26,13 +38,63 @@ limitations under the License.
 #include "framework/parallel_state/process_group.h"
 #include "platform/device.h"
 #if defined(USE_NPU)
+#include <c10/core/DeviceGuard.h>
+
 #include "platform/npu/npu_batch_memcpy.h"
+#include "platform/npu/npu_host_registration.h"
 #endif
 
 namespace xllm {
 namespace {
 
 constexpr int32_t kCopyStreamTimeoutMs = 60000;
+
+int64_t page_aligned_bytes(int64_t bytes) {
+  const int64_t page = host_page_size();
+  CHECK_LE(bytes, std::numeric_limits<int64_t>::max() - (page - 1));
+  return ((bytes + page - 1) / page) * page;
+}
+
+torch::Tensor gather_host_metadata(ProcessGroup& group,
+                                   const torch::Tensor& metadata) {
+  const torch::Tensor result =
+      group.allgather_base_sync(metadata.to(group.device()))
+          .to(torch::kCPU)
+          .contiguous();
+  CHECK_EQ(result.dim(), 2);
+  CHECK_EQ(result.size(0), group.world_size());
+  CHECK_EQ(result.size(1), metadata.numel());
+  return result;
+}
+
+class HostBatchLock final {
+ public:
+  explicit HostBatchLock(pthread_mutex_t& mutex) : mutex_(mutex) {
+    CHECK_EQ(pthread_mutex_lock(&mutex_), 0)
+        << "Prefill Host KV lock lost its owner";
+  }
+
+  ~HostBatchLock() { CHECK_EQ(pthread_mutex_unlock(&mutex_), 0); }
+
+  template <typename Ready>
+  bool wait(pthread_cond_t& condition, Ready ready) {
+    timespec deadline{};
+    PCHECK(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0);
+    deadline.tv_sec += kCopyStreamTimeoutMs / 1000;
+    while (!ready()) {
+      const int32_t error =
+          pthread_cond_timedwait(&condition, &mutex_, &deadline);
+      if (error == ETIMEDOUT) {
+        return ready();
+      }
+      CHECK_EQ(error, 0) << "Prefill Host KV wait lost the shared lock";
+    }
+    return true;
+  }
+
+ private:
+  pthread_mutex_t& mutex_;
+};
 
 torch::Tensor allocate_device_tensor(const std::vector<int64_t>& shape,
                                      torch::ScalarType dtype,
@@ -105,13 +167,364 @@ void normalize_blocks(std::vector<int64_t>* blocks) {
 
 }  // namespace
 
+struct PrefillLayerwiseHostPool::BatchState {
+  pthread_mutex_t mutex;
+  pthread_cond_t condition;
+  uint64_t batch_id = 0;
+  int64_t read_size = 0;
+  int64_t write_size = 0;
+  int32_t arrivals = 0;
+  int32_t remaining = 0;
+  bool rejected = false;
+  bool failed = false;
+};
+
+class PrefillLayerwiseHostPool::Mapping final {
+ public:
+  Mapping(int32_t descriptor, int64_t bytes, const torch::Device& device)
+      : descriptor_(descriptor), bytes_(bytes), device_(device) {
+    data_ = mmap(
+        nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor_, 0);
+    PCHECK(data_ != MAP_FAILED) << "Cannot map Prefill Host KV region";
+  }
+
+  ~Mapping() {
+#if defined(USE_NPU)
+    if (!pinned_.empty()) {
+      const c10::DeviceGuard guard(device_);
+      for (void* address : pinned_) {
+        CHECK_EQ(aclrtHostUnregister(address), ACL_SUCCESS)
+            << "Cannot unregister Prefill Host KV region";
+      }
+    }
+#endif
+    PCHECK(munmap(data_, bytes_) == 0);
+    close(descriptor_);
+  }
+
+  void* at(int64_t offset) const { return static_cast<char*>(data_) + offset; }
+
+  void pin(int64_t offset, int64_t bytes) {
+#if defined(USE_NPU)
+    if (!device_.is_cpu()) {
+      const c10::DeviceGuard guard(device_);
+      void* address = at(offset);
+      PCHECK(mlock(address, bytes) == 0) << "Cannot lock Prefill Host KV pages";
+      void* mapped = nullptr;
+      CHECK_EQ(
+          aclrtHostRegister(address, bytes, ACL_HOST_REGISTER_MAPPED, &mapped),
+          ACL_SUCCESS)
+          << "Cannot register Prefill Host KV pages, bytes=" << bytes;
+      pinned_.push_back(address);
+    }
+#else
+    static_cast<void>(offset);
+    static_cast<void>(bytes);
+#endif
+  }
+
+ private:
+  const int32_t descriptor_;
+  const int64_t bytes_;
+  const torch::Device device_;
+  void* data_ = nullptr;
+  std::vector<void*> pinned_;
+};
+
+PrefillLayerwiseHostPool::PrefillLayerwiseHostPool(ProcessGroup* process_group)
+    : process_group_(process_group) {}
+
+bool PrefillLayerwiseHostPool::is_writer(int64_t layer) const {
+  return layer % rank_count_ == local_rank_;
+}
+
+void PrefillLayerwiseHostPool::initialize(
+    const std::vector<KVCache>& device_caches,
+    int64_t host_memory_bytes) {
+  {
+    layers_ = static_cast<int64_t>(device_caches.size());
+    const torch::Tensor& first_key = device_caches.front().get_k_cache();
+    blocks_ = first_key.size(0);
+    const auto& device = first_key.device();
+    int32_t descriptor = -1;
+    int64_t control_bytes = 0;
+    bool owner = true;
+    int64_t host_data_bytes = 0;
+    if (process_group_ != nullptr) {
+      ProcessGroup& group = *process_group_;
+      std::ifstream boot_file("/proc/sys/kernel/random/boot_id");
+      std::string boot_id;
+      CHECK(std::getline(boot_file, boot_id) && !boot_id.empty());
+      struct stat pid_namespace{};
+      PCHECK(stat("/proc/self/ns/pid", &pid_namespace) == 0);
+      std::ostringstream layout;
+      for (const KVCache& cache : device_caches) {
+        for (const KVCacheTensor& entry : cache.get_cache_tensors()) {
+          const torch::Tensor& tensor = entry.tensor;
+          CHECK(tensor.is_contiguous());
+          host_data_bytes += page_aligned_bytes(tensor.nbytes());
+          layout << static_cast<int32_t>(entry.role) << ':'
+                 << static_cast<int32_t>(tensor.scalar_type()) << ':'
+                 << tensor.sizes() << ';';
+        }
+        layout << '|';
+      }
+      const int64_t host_tag =
+          static_cast<int64_t>(std::hash<std::string>{}(boot_id));
+      const int64_t namespace_tag = static_cast<int64_t>(pid_namespace.st_ino);
+      const int64_t layout_tag =
+          static_cast<int64_t>(std::hash<std::string>{}(layout.str()));
+      const auto integer = torch::TensorOptions().dtype(torch::kInt64);
+      const auto info = gather_host_metadata(
+          group,
+          torch::tensor({host_tag, namespace_tag, layout_tag, host_data_bytes},
+                        integer));
+      const auto ranks = info.accessor<int64_t, 2>();
+      int32_t leader = -1;
+      rank_count_ = 0;
+      for (int32_t index = 0; index < group.world_size(); ++index) {
+        if (ranks[index][0] != host_tag || ranks[index][1] != namespace_tag) {
+          continue;
+        }
+        CHECK(ranks[index][2] == layout_tag &&
+              ranks[index][3] == host_data_bytes)
+            << "Inconsistent Prefill Host KV layout on local rank " << index;
+        if (leader < 0) {
+          leader = index;
+        }
+        if (index == group.rank()) {
+          local_rank_ = rank_count_;
+        }
+        ++rank_count_;
+      }
+      CHECK_GE(leader, 0);
+      CHECK_GT(rank_count_, 0);
+      if (shared()) {
+        control_bytes = page_aligned_bytes(
+            sizeof(BatchState) +
+            (rank_count_ + layers_ + 2 * blocks_) * sizeof(int64_t));
+        CHECK_LE(host_data_bytes, host_memory_bytes);
+        owner = group.rank() == leader;
+      }
+      const int64_t mapping_bytes = control_bytes + host_data_bytes;
+      struct stat identity{};
+      if (shared() && owner) {
+        descriptor = memfd_create("xllm-prefill-host-kv", MFD_CLOEXEC);
+        PCHECK(descriptor >= 0) << "Cannot create shared Prefill Host KV";
+        PCHECK(ftruncate(descriptor, mapping_bytes) == 0);
+        PCHECK(fstat(descriptor, &identity) == 0);
+      }
+      const auto locations = gather_host_metadata(
+          group,
+          torch::tensor({static_cast<int64_t>(getpid()),
+                         static_cast<int64_t>(descriptor),
+                         static_cast<int64_t>(identity.st_dev),
+                         static_cast<int64_t>(identity.st_ino)},
+                        integer));
+      if (shared() && !owner) {
+        const auto leader_info = locations.accessor<int64_t, 2>()[leader];
+        const std::string path = "/proc/" + std::to_string(leader_info[0]) +
+                                 "/fd/" + std::to_string(leader_info[1]);
+        descriptor = open(path.c_str(), O_RDWR | O_CLOEXEC);
+        PCHECK(descriptor >= 0) << "Cannot open peer Prefill Host KV: " << path;
+        PCHECK(fstat(descriptor, &identity) == 0);
+        CHECK(static_cast<int64_t>(identity.st_dev) == leader_info[2] &&
+              static_cast<int64_t>(identity.st_ino) == leader_info[3] &&
+              identity.st_size == mapping_bytes)
+            << "Prefill Host KV descriptor does not match the local leader";
+      }
+    }
+    if (shared()) {
+      mapping_ = std::make_shared<Mapping>(
+          descriptor, control_bytes + host_data_bytes, device);
+      batch_ = static_cast<BatchState*>(mapping_->at(0));
+      if (owner) {
+        new (batch_) BatchState{};
+        pthread_mutexattr_t mutex_attributes;
+        pthread_condattr_t condition_attributes;
+        CHECK_EQ(pthread_mutexattr_init(&mutex_attributes), 0);
+        CHECK_EQ(pthread_condattr_init(&condition_attributes), 0);
+        CHECK_EQ(pthread_mutexattr_setpshared(&mutex_attributes,
+                                              PTHREAD_PROCESS_SHARED),
+                 0);
+        CHECK_EQ(pthread_mutexattr_setrobust(&mutex_attributes,
+                                             PTHREAD_MUTEX_ROBUST),
+                 0);
+        CHECK_EQ(pthread_condattr_setpshared(&condition_attributes,
+                                             PTHREAD_PROCESS_SHARED),
+                 0);
+        CHECK_EQ(
+            pthread_condattr_setclock(&condition_attributes, CLOCK_MONOTONIC),
+            0);
+        CHECK_EQ(pthread_mutex_init(&batch_->mutex, &mutex_attributes), 0);
+        CHECK_EQ(pthread_cond_init(&batch_->condition, &condition_attributes),
+                 0);
+        CHECK_EQ(pthread_mutexattr_destroy(&mutex_attributes), 0);
+        CHECK_EQ(pthread_condattr_destroy(&condition_attributes), 0);
+      }
+    }
+    const auto host_tensor = [&](const torch::Tensor& tensor) -> torch::Tensor {
+      if (!tensor.defined()) {
+        return {};
+      }
+      if (descriptor < 0) {
+        return allocate_host_tensor(tensor, &bytes_);
+      }
+      const int64_t size = page_aligned_bytes(tensor.nbytes());
+      const int64_t offset = control_bytes + bytes_;
+      mapping_->pin(offset, size);
+      bytes_ += size;
+      return torch::from_blob(
+          mapping_->at(offset),
+          tensor.sizes(),
+          [mapping = mapping_](void*) {},
+          tensor.options().device(torch::kCPU));
+    };
+    caches_.reserve(device_caches.size());
+    for (const KVCache& cache : device_caches) {
+      KVCacheTensors kv{host_tensor(cache.get_k_cache()),
+                        host_tensor(cache.get_v_cache())};
+      std::optional<torch::Tensor> scale = cache.get_indexer_cache_scale();
+      if (scale.has_value()) {
+        scale = host_tensor(*scale);
+      }
+      caches_.emplace_back(
+          make_cache(kv, host_tensor(cache.get_index_cache()), scale));
+      CHECK_LE(bytes_, host_memory_bytes)
+          << "Prefill layerwise Host cache exceeds its configured budget.";
+    }
+    if (process_group_ != nullptr) {
+      if (shared()) {
+        CHECK_EQ(bytes_, host_data_bytes);
+      }
+      gather_host_metadata(*process_group_, torch::ones({1}, torch::kInt64));
+    }
+  }
+  if (!shared()) {
+    return;
+  }
+  CHECK_LE(bytes_, host_memory_bytes);
+  CHECK_EQ(caches_.size(), device_caches.size());
+  for (size_t layer = 0; layer < caches_.size(); ++layer) {
+    const std::vector<KVCacheTensor> host = caches_[layer].get_cache_tensors();
+    const std::vector<KVCacheTensor> device =
+        device_caches[layer].get_cache_tensors();
+    CHECK_EQ(host.size(), device.size());
+    for (size_t role = 0; role < host.size(); ++role) {
+      CHECK(host[role].role == device[role].role &&
+            host[role].tensor.sizes() == device[role].tensor.sizes() &&
+            host[role].tensor.strides() == device[role].tensor.strides() &&
+            host[role].tensor.scalar_type() ==
+                device[role].tensor.scalar_type())
+          << "Inconsistent shared Prefill Host KV layout, layer=" << layer;
+    }
+  }
+}
+
+bool PrefillLayerwiseHostPool::enter(uint64_t batch_id,
+                                     const std::vector<int64_t>& read_blocks,
+                                     const std::vector<int64_t>& write_blocks,
+                                     bool valid) {
+  BatchState& state = *batch_;
+  auto* entered = static_cast<int64_t*>(mapping_->at(sizeof(BatchState)));
+  int64_t* readers = entered + rank_count_;
+  int64_t* batch_reads = readers + layers_;
+  int64_t* batch_writes = batch_reads + blocks_;
+  HostBatchLock lock(state.mutex);
+  if (!lock.wait(state.condition,
+                 [&] {
+                   return state.failed || state.remaining == 0 ||
+                          !entered[local_rank_];
+                 }) ||
+      state.failed) {
+    LOG(FATAL) << "Cannot enter shared Prefill Host KV batch, batch_id="
+               << batch_id << ", active_batch=" << state.batch_id
+               << ", rank=" << local_rank_ << ", remaining=" << state.remaining;
+  }
+  if (state.remaining == 0) {
+    state.batch_id = batch_id;
+    state.arrivals = 0;
+    state.remaining = rank_count_;
+    state.rejected = !valid;
+    if (valid) {
+      state.read_size = static_cast<int64_t>(read_blocks.size());
+      state.write_size = static_cast<int64_t>(write_blocks.size());
+      std::copy(read_blocks.begin(), read_blocks.end(), batch_reads);
+      std::copy(write_blocks.begin(), write_blocks.end(), batch_writes);
+    }
+    std::fill_n(entered, rank_count_, 0);
+    std::fill_n(readers, layers_, 0);
+  }
+  if (!state.rejected && (!valid || batch_id != state.batch_id ||
+                          !std::equal(read_blocks.begin(),
+                                      read_blocks.end(),
+                                      batch_reads,
+                                      batch_reads + state.read_size) ||
+                          !std::equal(write_blocks.begin(),
+                                      write_blocks.end(),
+                                      batch_writes,
+                                      batch_writes + state.write_size))) {
+    state.rejected = true;
+    LOG(ERROR) << "Rejected inconsistent shared Prefill Host KV plan, batch_id="
+               << batch_id << ", expected_batch=" << state.batch_id
+               << ", rank=" << local_rank_ << ", valid=" << valid;
+  }
+  entered[local_rank_] = 1;
+  if (++state.arrivals == rank_count_) {
+    CHECK_EQ(pthread_cond_broadcast(&state.condition), 0);
+  }
+  if (!lock.wait(
+          state.condition,
+          [&] { return state.failed || state.arrivals == rank_count_; }) ||
+      state.failed) {
+    LOG(FATAL) << "Shared Prefill Host KV batch lost its cohort, batch_id="
+               << state.batch_id << ", arrivals=" << state.arrivals;
+  }
+  return !state.rejected;
+}
+
+bool PrefillLayerwiseHostPool::read_complete(int64_t layer) {
+  BatchState& state = *batch_;
+  auto* readers =
+      static_cast<int64_t*>(mapping_->at(sizeof(BatchState))) + rank_count_;
+  HostBatchLock lock(state.mutex);
+  if (++readers[layer] == rank_count_) {
+    CHECK_EQ(pthread_cond_broadcast(&state.condition), 0);
+  }
+  if (is_writer(layer) && !lock.wait(state.condition, [&] {
+        return state.failed || readers[layer] == rank_count_;
+      })) {
+    LOG(ERROR) << "Timed out waiting for Prefill Host KV readers, batch_id="
+               << state.batch_id << ", layer=" << layer;
+    return false;
+  }
+  return !state.failed;
+}
+
+void PrefillLayerwiseHostPool::leave() {
+  HostBatchLock lock(batch_->mutex);
+  if (--batch_->remaining == 0) {
+    CHECK_EQ(pthread_cond_broadcast(&batch_->condition), 0);
+  }
+}
+
+void PrefillLayerwiseHostPool::fail() {
+  if (batch_ != nullptr) {
+    HostBatchLock lock(batch_->mutex);
+    batch_->failed = true;
+    CHECK_EQ(pthread_cond_broadcast(&batch_->condition), 0);
+  }
+}
+
 PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
     const KVCacheShape& shape,
     const KVCacheCreateOptions& options,
     int32_t num_buffers,
     int64_t host_memory_bytes,
-    std::vector<KVCache>& device_caches)
+    std::vector<KVCache>& device_caches,
+    ProcessGroup* host_group)
     : device_caches_(&device_caches),
+      host_pool_(host_group),
       num_buffers_(num_buffers),
       block_count_(shape.key_cache_shape().at(0)) {
   // These are startup allocation invariants, not request validation.
@@ -174,7 +587,6 @@ PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
   }
 
   device_caches.reserve(static_cast<size_t>(layers));
-  host_caches_.reserve(static_cast<size_t>(layers));
   for (int64_t layer = 0; layer < layers; ++layer) {
     const KVCache& slot = slots[static_cast<size_t>(
         prefill_layerwise_buffer_index(layer, num_buffers_))];
@@ -184,18 +596,8 @@ PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
     const std::optional<torch::Tensor> scale =
         has_index(layer) ? slot.get_indexer_cache_scale() : std::nullopt;
     device_caches.emplace_back(make_cache(device_kv, index, scale));
-    KVCacheTensors host_kv{
-        allocate_host_tensor(device_kv.key_cache, &host_bytes_),
-        allocate_host_tensor(device_kv.value_cache, &host_bytes_)};
-    std::optional<torch::Tensor> host_scale;
-    if (scale.has_value()) {
-      host_scale = allocate_host_tensor(*scale, &host_bytes_);
-    }
-    host_caches_.emplace_back(make_cache(
-        host_kv, allocate_host_tensor(index, &host_bytes_), host_scale));
-    CHECK_LE(host_bytes_, host_memory_bytes)
-        << "Prefill layerwise Host cache exceeds its configured budget.";
   }
+  host_pool_.initialize(device_caches, host_memory_bytes);
   load_ready_.resize(static_cast<size_t>(layers));
   save_ready_.resize(static_cast<size_t>(layers));
   push_completed_layers_.resize(static_cast<size_t>(layers), 0);
@@ -213,13 +615,22 @@ PrefillLayerwiseKVCache::PrefillLayerwiseKVCache(
   LOG(INFO) << "Prefill layerwise KV cache: layers=" << layers
             << ", resident_layer=0, shared_buffers=" << num_buffers_
             << ", device_bytes=" << device_bytes_
-            << ", host_bytes=" << host_bytes_ << ", PD PUSH source=Device";
+            << ", visible_host_bytes=" << host_bytes() << ", unique_host_bytes="
+            << (host_pool_.local_rank_ == 0 ? host_bytes() : 0)
+            << ", local_host_ranks=" << host_pool_.rank_count_
+            << ", PD PUSH source=Device";
 }
 
-PrefillLayerwiseKVCache::~PrefillLayerwiseKVCache() { drain(); }
+PrefillLayerwiseKVCache::~PrefillLayerwiseKVCache() {
+  if (in_host_batch_) {
+    host_pool_.fail();
+  }
+  drain();
+  leave_host_batch();
+}
 
 uint32_t PrefillLayerwiseKVCache::size() const {
-  return static_cast<uint32_t>(host_caches_.size());
+  return static_cast<uint32_t>(host_caches().size());
 }
 
 void PrefillLayerwiseKVCache::require_usable() const {
@@ -238,7 +649,8 @@ bool PrefillLayerwiseKVCache::begin(const ModelInputParams& params,
     LOG(ERROR) << "Prefill layerwise KV offload does not support beam-search "
                   "block copy, batch_id="
                << params.meta.batch_id;
-    return false;
+    return prepare(
+        {}, {}, compute_stream, expect_push, params.meta.batch_id, false);
   }
   std::vector<int64_t> read_blocks;
   std::vector<int64_t> write_blocks;
@@ -284,12 +696,13 @@ bool PrefillLayerwiseKVCache::begin(const ModelInputParams& params,
   if (!valid) {
     LOG(ERROR) << "Invalid prefill layerwise KV metadata, batch_id="
                << params.meta.batch_id;
-    return false;
   }
-  return begin(std::move(read_blocks),
-               std::move(write_blocks),
-               compute_stream,
-               expect_push);
+  return prepare(std::move(read_blocks),
+                 std::move(write_blocks),
+                 compute_stream,
+                 expect_push,
+                 params.meta.batch_id,
+                 valid);
 }
 
 bool PrefillLayerwiseKVCache::begin(const ModelInputParams& params,
@@ -332,6 +745,20 @@ bool PrefillLayerwiseKVCache::begin(std::vector<int64_t> read_blocks,
                                     std::vector<int64_t> write_blocks,
                                     const Stream* compute_stream,
                                     bool expect_push) {
+  return prepare(std::move(read_blocks),
+                 std::move(write_blocks),
+                 compute_stream,
+                 expect_push,
+                 /*batch_id=*/0,
+                 /*metadata_valid=*/true);
+}
+
+bool PrefillLayerwiseKVCache::prepare(std::vector<int64_t> read_blocks,
+                                      std::vector<int64_t> write_blocks,
+                                      const Stream* compute_stream,
+                                      bool expect_push,
+                                      uint64_t batch_id,
+                                      bool metadata_valid) {
   require_usable();
   normalize_blocks(&read_blocks);
   normalize_blocks(&write_blocks);
@@ -339,15 +766,42 @@ bool PrefillLayerwiseKVCache::begin(std::vector<int64_t> read_blocks,
     return blocks.empty() ||
            (blocks.front() >= 0 && blocks.back() < block_count_);
   };
-  if (active_ || !valid_blocks(read_blocks) || !valid_blocks(write_blocks) ||
-      (batch_memcpy_ != nullptr && compute_stream == nullptr)) {
+  const bool valid = metadata_valid && !active_ && valid_blocks(read_blocks) &&
+                     valid_blocks(write_blocks) &&
+                     (batch_memcpy_ == nullptr || compute_stream != nullptr);
+  if (!valid) {
     LOG(ERROR) << "Invalid prefill layerwise KV batch: active=" << active_
                << ", failed=" << failed_ << ", block_count=" << block_count_;
+  }
+  if (active_) {
+    if (host_pool_.shared()) {
+      host_pool_.fail();
+      LOG(FATAL) << "Concurrent Prefill KV batches on local rank "
+                 << host_pool_.local_rank_;
+    }
+    return false;
+  }
+  if (host_pool_.shared()) {
+    const bool accepted =
+        host_pool_.enter(batch_id, read_blocks, write_blocks, valid);
+    in_host_batch_ = true;
+    if (!accepted) {
+      leave_host_batch();
+      return false;
+    }
+  } else if (!valid) {
     return false;
   }
   compute_stream_ = compute_stream;
   read_blocks_ = std::move(read_blocks);
   write_blocks_ = std::move(write_blocks);
+  host_read_write_overlap_ =
+      host_pool_.shared() && size() > 1 &&
+      std::any_of(
+          read_blocks_.begin(), read_blocks_.end(), [this](int64_t block) {
+            return std::binary_search(
+                write_blocks_.begin(), write_blocks_.end(), block);
+          });
   current_layer_ = -1;
   next_load_layer_ = 1 + num_buffers_;
   std::fill(load_ready_.begin(), load_ready_.end(), nullptr);
@@ -413,7 +867,7 @@ bool PrefillLayerwiseKVCache::copy_layer(int64_t layer_index, bool load) {
   const std::vector<KVCacheTensor> device =
       (*device_caches_)[static_cast<size_t>(layer_index)].get_cache_tensors();
   const std::vector<KVCacheTensor> host =
-      host_caches_[static_cast<size_t>(layer_index)].get_cache_tensors();
+      host_caches()[static_cast<size_t>(layer_index)].get_cache_tensors();
   const std::vector<int64_t>& blocks = load ? read_blocks_ : write_blocks_;
   if (blocks.empty()) {
     return true;
@@ -471,10 +925,27 @@ bool PrefillLayerwiseKVCache::load_layer(int64_t layer_index) {
 }
 
 bool PrefillLayerwiseKVCache::save_layer(int64_t layer_index) {
+  if (layer_index > 0 && host_read_write_overlap_) {
+#if defined(USE_NPU)
+    if (batch_memcpy_ != nullptr) {
+      const StreamEventPtr& loaded =
+          load_ready_[static_cast<size_t>(layer_index)];
+      if (!loaded->synchronize(kCopyStreamTimeoutMs)) {
+        LOG(ERROR) << "Cannot confirm Prefill Host KV read, layer="
+                   << layer_index << ", local_rank=" << host_pool_.local_rank_;
+        return false;
+      }
+    }
+#endif
+    if (!host_pool_.read_complete(layer_index)) {
+      return false;
+    }
+  }
   if (batch_memcpy_ != nullptr) {
     save_stream_->wait_stream(*compute_stream_);
   }
-  if (!copy_layer(layer_index, /*load=*/false)) {
+  if (host_pool_.is_writer(layer_index) &&
+      !copy_layer(layer_index, /*load=*/false)) {
     return false;
   }
   if (batch_memcpy_ != nullptr) {
@@ -497,6 +968,14 @@ void PrefillLayerwiseKVCache::cancel_preparation() {
   }
   compute_stream_ = nullptr;
   active_ = false;
+  leave_host_batch();
+}
+
+void PrefillLayerwiseKVCache::leave_host_batch() {
+  if (in_host_batch_) {
+    host_pool_.leave();
+    in_host_batch_ = false;
+  }
 }
 
 void PrefillLayerwiseKVCache::drain() {
@@ -516,11 +995,18 @@ bool PrefillLayerwiseKVCache::finish() {
     abort();
     return false;
   }
-  const bool success = save_layer(current_layer_);
+  if (!save_layer(current_layer_)) {
+    abort();
+    return false;
+  }
   drain();
-  const bool pushed = success && wait_push_completion(std::nullopt);
+  const bool pushed = wait_push_completion(std::nullopt);
   active_ = false;
   failed_ = !pushed;
+  if (!pushed && in_host_batch_) {
+    host_pool_.fail();
+  }
+  leave_host_batch();
   return pushed;
 }
 
@@ -530,8 +1016,12 @@ void PrefillLayerwiseKVCache::abort() {
     failed_ = true;
   }
   push_cv_.notify_all();
+  if (in_host_batch_) {
+    host_pool_.fail();
+  }
   drain();
   active_ = false;
+  leave_host_batch();
 }
 
 void PrefillLayerwiseKVCache::notify_push_completion(

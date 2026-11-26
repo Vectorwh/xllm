@@ -6,6 +6,7 @@ cc_library(
   HDRS
     npu_layer_synchronizer.h
     npu_batch_memcpy.h
+    npu_host_registration.h
     device_capture_lock.h
     acl_graph_task_update_context.h
     npu_profiler.h

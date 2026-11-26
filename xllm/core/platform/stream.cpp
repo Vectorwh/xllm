@@ -21,6 +21,11 @@ limitations under the License.
 #include <memory>
 #include <ostream>
 
+#if defined(USE_NPU)
+extern "C" aclError aclrtSynchronizeEventWithTimeout(aclrtEvent event,
+                                                     int32_t timeout);
+#endif
+
 namespace xllm {
 
 namespace {
@@ -75,6 +80,18 @@ bool StreamEvent::synchronize() {
   return false;
 #endif
 }
+
+#if defined(USE_NPU)
+bool StreamEvent::synchronize(int32_t timeout_ms) {
+  const aclError ret = aclrtSynchronizeEventWithTimeout(npu_event_, timeout_ms);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "Failed to synchronize NPU event, timeout_ms=" << timeout_ms
+               << ", status=" << ret;
+    return false;
+  }
+  return true;
+}
+#endif
 
 Stream::Stream(const int32_t timeout)
     : stream_(get_stream_from_pool()), timeout_(timeout) {}

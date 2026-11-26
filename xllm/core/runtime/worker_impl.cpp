@@ -620,12 +620,18 @@ bool WorkerImpl::allocate_kv_cache_storage(
     CHECK(parallel_args_.world_size() == 1 ||
           parallel_args_.tp_cp_group_ != nullptr)
         << "Prefill layerwise KV preparation requires a TP x CP process group.";
+    ProcessGroup* host_group = parallel_args_.tp_cp_group_;
+    if (options_.enable_offline_inference() ||
+        parallel_args_.world_size() == 1) {
+      host_group = nullptr;
+    }
     prefill_layerwise_kv_cache_ = std::make_shared<PrefillLayerwiseKVCache>(
         kv_cache_shape,
         create_options,
         prefill_layerwise_num_buffers,
         cache_config.prefill_layerwise_host_memory_bytes(),
-        kv_caches_);
+        kv_caches_,
+        host_group);
   } else {
     allocate_kv_caches(kv_caches_, kv_cache_shape, create_options);
     init_hierarchy_kv_cache_transfer(kv_cache_shape, create_options);

@@ -32,17 +32,11 @@ limitations under the License.
 #include "framework/kv_cache/cache_layout_builder.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "util/utils.h"
+#if defined(USE_NPU)
+#include "platform/npu/npu_host_registration.h"
+#endif
 #if defined(USE_MLU)
 #include "platform/mlu/mlu_host_memory.h"
-#endif
-#if defined(USE_NPU)
-#include "acl/acl_rt.h"
-
-extern "C" aclError aclrtHostRegister(void* ptr,
-                                      uint64_t size,
-                                      aclrtHostRegisterType type,
-                                      void** dev_ptr);
-extern "C" aclError aclrtHostUnregister(void* ptr);
 #endif
 
 namespace xllm {

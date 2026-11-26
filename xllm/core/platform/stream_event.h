@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 
 #if defined(USE_NPU)
@@ -49,6 +50,9 @@ class StreamEvent final {
   // This is intentionally different from Stream::wait_event(), which only
   // installs a device-stream dependency and returns immediately on the host.
   bool synchronize();
+#if defined(USE_NPU)
+  bool synchronize(int32_t timeout_ms);
+#endif
 
   DISALLOW_COPY_AND_ASSIGN(StreamEvent);
 

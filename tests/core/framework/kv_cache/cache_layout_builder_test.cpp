@@ -69,6 +69,28 @@ class PreparationProcessGroup final : public ProcessGroup {
   int32_t allgather_count_ = 0;
 };
 
+class HostPoolProcessGroup final : public ProcessGroup {
+ public:
+  using Exchange = std::array<std::array<std::promise<torch::Tensor>, 3>, 2>;
+
+  HostPoolProcessGroup(int32_t rank, Exchange& exchange)
+      : ProcessGroup(rank, 2, torch::Device(torch::kCPU)),
+        exchange_(exchange) {}
+
+  torch::Tensor allgather_base_sync(const torch::Tensor& input) override {
+    const size_t phase = phase_++;
+    exchange_.at(rank()).at(phase).set_value(input);
+    const torch::Tensor peer =
+        exchange_.at(1 - rank()).at(phase).get_future().get();
+    return rank() == 0 ? torch::stack({input, peer})
+                       : torch::stack({peer, input});
+  }
+
+ private:
+  Exchange& exchange_;
+  size_t phase_ = 0;
+};
+
 TEST(CacheLayoutBuilderTest,
      PrefillPreparationRejectsEveryRankAndPreservesHostHistory) {
   proto::KVCacheShape proto_shape;
@@ -722,6 +744,122 @@ TEST(CacheLayoutBuilderTest, DescribesTokenMajorGqaHeads) {
   EXPECT_EQ(descriptor.spans[0].logical_stride_bytes, 6U * 4U * 4U);
   EXPECT_EQ(descriptor.spans[0].physical_stride_bytes, 2U * 4U * 4U);
   EXPECT_EQ(descriptor.spans[0].owner_tp_rank, 1);
+}
+
+TEST(CacheLayoutBuilderTest, PrefillHostPoolSharesHistoryAcrossBatches) {
+  proto::KVCacheShape proto_shape;
+  for (int64_t dim : {2, 2, 1, 8}) {
+    proto_shape.add_key_cache_shape(dim);
+    proto_shape.add_value_cache_shape(dim);
+  }
+  for (int64_t dim : {2, 2, 1, 4}) {
+    proto_shape.add_index_cache_shape(dim);
+  }
+  for (int64_t dim : {2, 2, 1, 1}) {
+    proto_shape.add_index_cache_scale_shape(dim);
+  }
+  const KVCacheShape shape = KVCacheShape::from_proto(proto_shape);
+  KVCacheCreateOptions options;
+  options.device(torch::Device(torch::kCPU))
+      .dtype(torch::kFloat32)
+      .num_layers(2)
+      .enable_lighting_indexer(true)
+      .enable_indexer_cache_quant(true);
+  HostPoolProcessGroup::Exchange exchange;
+  HostPoolProcessGroup first_group(0, exchange);
+  HostPoolProcessGroup second_group(1, exchange);
+  std::array<std::vector<KVCache>, 2> caches;
+  auto first_setup = std::async(std::launch::async, [&] {
+    return std::make_unique<PrefillLayerwiseKVCache>(
+        shape, options, 1, 1024 * 1024, caches[0], &first_group);
+  });
+  PrefillLayerwiseKVCache second(
+      shape, options, 1, 1024 * 1024, caches[1], &second_group);
+  const auto first_owner = first_setup.get();
+  PrefillLayerwiseKVCache& first = *first_owner;
+  ASSERT_NE(first.host_caches()[0].get_k_cache().data_ptr(),
+            second.host_caches()[0].get_k_cache().data_ptr());
+  for (const KVCacheTensor& tensor :
+       first.host_caches()[0].get_cache_tensors()) {
+    tensor.tensor[0].fill_(9);
+  }
+  for (const KVCacheTensor& tensor :
+       first.host_caches()[1].get_cache_tensors()) {
+    tensor.tensor[0].fill_(3);
+  }
+  EXPECT_TRUE(
+      second.host_caches()[0].get_k_cache()[0].eq(9).all().item<bool>());
+  ModelInputParams params;
+  params.meta.batch_id = 1;
+  params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  params.attention.host.block_tables = torch::tensor({{0}}, torch::kInt32);
+  params.attention.host.kv_seq_lens = {2};
+  params.attention.host.q_seq_lens = {1};
+  auto first_begin = std::async(std::launch::async, [&] {
+    return first.begin(params, /*block_size=*/2, /*compute_stream=*/nullptr);
+  });
+  ASSERT_TRUE(
+      second.begin(params, /*block_size=*/2, /*compute_stream=*/nullptr));
+  ASSERT_TRUE(first_begin.get());
+  ASSERT_TRUE(first.synchronize_layer(0));
+  ASSERT_TRUE(second.synchronize_layer(0));
+  for (size_t rank = 0; rank < caches.size(); ++rank) {
+    for (const KVCacheTensor& tensor : caches[rank][0].get_cache_tensors()) {
+      EXPECT_TRUE(tensor.tensor[0].eq(0).all().item<bool>());
+      tensor.tensor[0].fill_(rank + 1);
+    }
+  }
+  ASSERT_TRUE(first.synchronize_layer(1));
+  for (const KVCacheTensor& tensor :
+       first.host_caches()[0].get_cache_tensors()) {
+    EXPECT_TRUE(tensor.tensor[0].eq(1).all().item<bool>());
+  }
+  ASSERT_TRUE(second.synchronize_layer(1));
+  for (size_t rank = 0; rank < caches.size(); ++rank) {
+    for (const KVCacheTensor& tensor : caches[rank][1].get_cache_tensors()) {
+      EXPECT_TRUE(tensor.tensor[0].eq(3).all().item<bool>());
+      tensor.tensor[0][1].fill_(rank + 4);
+    }
+  }
+
+  auto writer_done =
+      std::async(std::launch::async, [&] { return second.finish(); });
+  EXPECT_EQ(writer_done.wait_for(std::chrono::milliseconds(100)),
+            std::future_status::timeout);
+  EXPECT_TRUE(first.finish());
+  ASSERT_TRUE(writer_done.get());
+  caches[0][1].get_k_cache()[0].fill_(8);
+  params.meta.batch_id = 2;
+  params.attention.host.q_seq_lens = {0};
+  auto rejected_begin = std::async(std::launch::async, [&] {
+    return first.begin(params, /*block_size=*/2, /*compute_stream=*/nullptr);
+  });
+  ModelInputParams mismatch = params;
+  mismatch.attention.host.block_tables = torch::tensor({{1}}, torch::kInt32);
+  EXPECT_FALSE(
+      second.begin(mismatch, /*block_size=*/2, /*compute_stream=*/nullptr));
+  EXPECT_FALSE(rejected_begin.get());
+  EXPECT_TRUE(caches[0][1].get_k_cache()[0].eq(8).all().item<bool>());
+
+  params.meta.batch_id = 3;
+  auto next = std::async(std::launch::async, [&] {
+    return first.begin(params, /*block_size=*/2, /*compute_stream=*/nullptr);
+  });
+  ASSERT_TRUE(
+      second.begin(params, /*block_size=*/2, /*compute_stream=*/nullptr));
+  ASSERT_TRUE(next.get());
+  for (int64_t layer = 0; layer < 2; ++layer) {
+    ASSERT_TRUE(first.synchronize_layer(layer));
+    ASSERT_TRUE(second.synchronize_layer(layer));
+  }
+  for (size_t rank = 0; rank < caches.size(); ++rank) {
+    for (const KVCacheTensor& tensor : caches[rank][1].get_cache_tensors()) {
+      EXPECT_TRUE(tensor.tensor[0][0].eq(3).all().item<bool>());
+      EXPECT_TRUE(tensor.tensor[0][1].eq(5).all().item<bool>());
+    }
+  }
+  EXPECT_TRUE(first.finish());
+  EXPECT_TRUE(second.finish());
 }
 
 TEST(CacheLayoutBuilderTest, SelectsStableOwnerForMqaReplicas) {
