@@ -180,7 +180,6 @@ class _StaticAttentionMetadata:
     block_table: torch.Tensor | None = None
     kv_seq_lens: torch.Tensor | None = None
     linear_state_indices: torch.Tensor | None = None
-    linear_state_checkpoint_indices: torch.Tensor | None = None
     num_accepted_tokens: torch.Tensor | None = None
     has_initial_state: torch.Tensor | None = None
     dp_execution_token_counts: tuple[int, ...] = ()
@@ -204,9 +203,6 @@ class _StaticAttentionMetadata:
     is_spec_verify: bool = False
     use_dflash_proposal_attention: bool = False
     is_dummy: bool = False
-    # Verify group width baked into this captured graph. 0 means the KDA
-    # path derives equal groups from the padded row count.
-    spec_group_width: int = 0
     local_slot_mapping: torch.Tensor | None = None
     kv_split_size: int = 1
     kv_split_rank: int = 0
@@ -519,22 +515,30 @@ class DecodeAclGraphRunner(BaseRunner):
             self._eplv2_reject_logged = True
         return False
 
+    def _uses_verify_graph(self, width: int, marked_verify: bool, local_expanded: bool) -> bool:
+        # A single-row verify can still read a speculative checkpoint. In DP
+        # the phase must agree with the empty rank, which has no expanded rows.
+        return width > 1 or marked_verify or (self.dp_size == 1 and local_expanded)
+
     def _shared_graph_plan(
         self,
         metadata: AttentionMetadata,
         batch_size: int,
         local_expanded: bool | None = None,
         packed_verify_width: int = 1,
+        *,
+        input_batch: InputBatch | None = None,
     ) -> tuple[bool, int, int | None]:
         """Return the graph layout every DP rank must capture.
 
-        ``(is_expanded, verify_width, admission_batch)``. ``admission_batch`` is
+        ``(is_verify, verify_width, admission_batch)``. ``admission_batch`` is
         ``None`` when active token counts are not whole verify groups. Under DP
         the width comes only from ``is_spec_verify`` and ``num_decoding_tokens``
         (or the configured draft query width / exported packed width), so an empty rank and a busy
         rank share one graph key. A local expanded layout that is not that
-        group-wide verify raises instead of capturing a private graph. Plain
-        decode stays width 1.
+        group-wide verify raises instead of capturing a private graph. On a
+        single DP rank, use the scheduled width of a live target verify batch
+        when available. Plain decode stays width 1.
         """
         if local_expanded is None:
             local_expanded = resolve_expanded_decode_metadata(metadata) is not None
@@ -573,6 +577,14 @@ class DecodeAclGraphRunner(BaseRunner):
                         f"measured={local_width}, num_decoding_tokens={self.num_decoding_tokens}"
                     )
                 verify_width = 1
+        elif (
+            spec_verify
+            and not self._is_spec_draft
+            and input_batch is not None
+            and not input_batch.is_dummy
+            and input_batch.num_scheduled_tokens
+        ):
+            verify_width = input_batch.num_scheduled_tokens[0]
         elif local_width > 1:
             verify_width = local_width
         elif packed_verify_width > 1:
@@ -581,7 +593,7 @@ class DecodeAclGraphRunner(BaseRunner):
             verify_width = self.num_decoding_tokens
         else:
             verify_width = 1
-        is_expanded = verify_width > 1
+        is_verify = self._uses_verify_graph(verify_width, marked_spec_verify, local_expanded)
         if self.dp_size > 1:
             if packed_plan:
                 # Fold the packed pack the way every rank does: the floored
@@ -615,7 +627,7 @@ class DecodeAclGraphRunner(BaseRunner):
                     admission_batch = max(active_counts) // self._draft_query_width
             elif batch_size % self._draft_query_width == 0:
                 admission_batch = batch_size // self._draft_query_width
-        return is_expanded, verify_width, admission_batch
+        return is_verify, verify_width, admission_batch
 
     def can_execute(self, inputs: ModelInput) -> bool:
         can_execute = False
@@ -1699,11 +1711,12 @@ class DecodeAclGraphRunner(BaseRunner):
         else:
             graph_token_rows = batch_size
         expanded_view = resolve_expanded_decode_metadata(metadata)
-        is_expanded, verify_width, admission_batch = self._shared_graph_plan(
+        is_verify, verify_width, admission_batch = self._shared_graph_plan(
             metadata,
             batch_size,
             local_expanded=expanded_view is not None,
             packed_verify_width=self._spec_verify_width(batch_size, metadata),
+            input_batch=input_batch,
         )
         padded_batch_size = self._padded_token_rows(graph_token_rows, verify_width)
         if padded_batch_size == 0:
@@ -1725,7 +1738,7 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         graph_key = self._graph_key(
             padded_batch_size,
-            is_expanded,
+            is_verify,
             input_embedding,
             kpool_query_lens,
             verify_width=verify_width,
@@ -2343,9 +2356,14 @@ class DecodeAclGraphRunner(BaseRunner):
             dtype=torch.bool,
             device=device,
         )
+        expanded_view = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
+        local_expanded = expanded_view is not None
+        is_verify = self._uses_verify_graph(
+            verify_width, bool(getattr(metadata, "is_spec_verify", False)), local_expanded
+        )
         entry.execution_contexts = {}
         if self.execution_metadata_builders:
-            graph_input_batch = self._build_padded_input_batch(entry, input_batch)
+            graph_input_batch = self._build_padded_input_batch(entry, input_batch, verify_width if is_verify else None)
             for builder in self.execution_metadata_builders:
                 metadata_type = builder.metadata_type
                 if metadata_type in entry.execution_contexts:
@@ -2456,10 +2474,8 @@ class DecodeAclGraphRunner(BaseRunner):
             ),
         )
         entry.static_metadata.q_cu_host_values = [0] * (padded_batch_size + 1)
-        expanded_view = resolve_expanded_decode_metadata(metadata, block_size=self.attention_backend.page_size)
-        local_expanded = expanded_view is not None
         group_expanded = verify_width > 1 or local_expanded
-        entry.static_metadata.is_spec_verify = group_expanded
+        entry.static_metadata.is_spec_verify = is_verify
         entry.static_metadata.use_dflash_proposal_attention = bool(
             getattr(metadata, "use_dflash_proposal_attention", False)
         )
@@ -2469,8 +2485,7 @@ class DecodeAclGraphRunner(BaseRunner):
         entry.static_metadata.kv_seq_lens = entry.kv_seq_lens_delta
         if group_expanded:
             # Spec-verify rows per logical sequence: the static q_cu holds
-            # GROUP boundaries [0, w, 2w, ...] so the in-graph KDA verify
-            # grouping derives the sequence count without host syncs.
+            # group boundaries [0, w, 2w, ...] for attention metadata consumers.
             # Derive the token-row count from the EXPANDED view (N*width),
             # not the top-level metadata.kv_seq_lens which stays at the logical
             # sequence count (N) for typed expanded verify — otherwise
@@ -2498,7 +2513,6 @@ class DecodeAclGraphRunner(BaseRunner):
                 entry.static_metadata.q_seq_lens = torch.full((n_groups,), w, dtype=torch.int32, device=device)
                 if self.supports_draft_to_target_overlap:
                     entry.static_metadata.q_seq_lens_host_values = [w] * n_groups
-                entry.static_metadata.spec_group_width = w
             entry.static_metadata.expanded_decode_metadata = ExpandedDecodeMetadata(
                 kv_seq_lens=entry.kv_seq_lens_delta,
                 block_table=entry.static_metadata.block_table,
@@ -2800,7 +2814,9 @@ class DecodeAclGraphRunner(BaseRunner):
         )
         self._fill_mega_moe_token_mask(entry, metadata, batch_size)
         if self.execution_metadata_builders:
-            graph_input_batch = self._build_padded_input_batch(entry, input_batch)
+            graph_input_batch = self._build_padded_input_batch(
+                entry, input_batch, verify_width if static_metadata.is_spec_verify else None
+            )
             for builder in self.execution_metadata_builders:
                 persistent_metadata = entry.execution_contexts.get(builder.metadata_type)
                 if persistent_metadata is None:
@@ -2815,6 +2831,7 @@ class DecodeAclGraphRunner(BaseRunner):
         self,
         entry: _DecodeGraphEntry,
         input_batch: InputBatch | None,
+        verify_width: int | None,
     ) -> InputBatch:
         if input_batch is None:
             raise RuntimeError("execution metadata builders require upstream InputBatch metadata")
@@ -2824,6 +2841,7 @@ class DecodeAclGraphRunner(BaseRunner):
             entry.static_input_ids,
             entry.static_positions,
             entry.is_padding,
+            spec_verify_width=verify_width,
         )
 
     @staticmethod

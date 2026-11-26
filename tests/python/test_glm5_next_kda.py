@@ -24,11 +24,9 @@ import torch.nn.functional as functional
 
 from xllm.python.attention.kda_linear_attention import (
     KdaLinearAttentionMixin,
-    _has_adjacent_state_indices,
     _take_leading_token_rows,
 )
 from xllm.python.layers.qlinear import QLinearWeightLoader
-from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import glm5_next
 from xllm.python.models.glm5_next import _KDA_IN_PROJ
 
@@ -76,31 +74,6 @@ def test_leading_token_rows_slice_tokens_when_heads_equal_bucket() -> None:
     assert tuple(_take_leading_token_rows(flat, 8, 6).shape) == (6,)
     assert _take_leading_token_rows(gate, 8, 8) is gate
     assert _take_leading_token_rows(None, 8, 6) is None
-
-
-def test_state_index_check_is_shared_only_within_one_forward(monkeypatch: pytest.MonkeyPatch) -> None:
-    indices = torch.tensor([2, 5, 7], dtype=torch.int32)
-    original_item = torch.Tensor.item
-    reads = 0
-
-    def item(tensor: torch.Tensor) -> object:
-        nonlocal reads
-        reads += 1
-        return original_item(tensor)
-
-    monkeypatch.setattr(torch.Tensor, "item", item)
-    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
-        assert not _has_adjacent_state_indices(indices)
-        assert not _has_adjacent_state_indices(indices)
-        indices[1] = indices[0]
-        assert _has_adjacent_state_indices(indices)
-    assert reads == 2
-
-    indices[1] = indices[0]
-    with forward_context(ForwardContext(None, torch.device("cpu"), None, [])):
-        assert _has_adjacent_state_indices(indices)
-        assert _has_adjacent_state_indices(indices)
-    assert reads == 3
 
 
 class _StateDict:

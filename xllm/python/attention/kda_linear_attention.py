@@ -18,19 +18,21 @@ from __future__ import annotations
 import functools
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
 from scripts.logger import logger
 from xllm.python.attention.backend import (
     AttentionMetadata,
-    build_speculative_ssm_state_indices,
     linear_state_checkpoint_stride,
     resolve_linear_state_io_indices,
 )
+from xllm.python.attention.kda_metadata import KdaMetadata, KdaSpecVerifyMetadata
+from xllm.python.kernels_npu.kda import KdaSafeGateParameters, recurrent_kda_verify
 from xllm.python.model_executor.forward_context import (
     get_execution_buffer,
+    get_execution_context,
     get_forward_context_or_none,
     in_acl_graph,
 )
@@ -70,20 +72,6 @@ def _get_host_q_cu_seq_lens(metadata, expected_num_seqs: int) -> list[int]:
     if q_cu_seq_lens.device.type != "cpu":
         raise RuntimeError("NPU KDA multi-sequence prefill requires host q_cu_seq_lens metadata")
     return [int(value) for value in q_cu_seq_lens.to(torch.int64).tolist()]
-
-
-def _has_adjacent_state_indices(indices: torch.Tensor) -> bool:
-    """Check immutable state-slot metadata once across the forward's layers."""
-    context = get_forward_context_or_none()
-    if context is None:
-        return bool((indices[1:] == indices[:-1]).any().item())
-    # State-slot metadata is read-only during a forward. The version also
-    # invalidates cached checks if a caller performs a tracked in-place write.
-    version = None if torch.is_inference(indices) else indices._version
-    key = (_has_adjacent_state_indices, indices, version)
-    if key not in context.layer_shared_cache:
-        context.layer_shared_cache[key] = bool((indices[1:] == indices[:-1]).any().item())
-    return cast(bool, context.layer_shared_cache[key])
 
 
 def _take_leading_token_rows(tensor: torch.Tensor | None, num_rows: int, keep_rows: int) -> torch.Tensor | None:
@@ -326,7 +314,7 @@ def kda_cp_prefill_eligible(cp_context: object, metadata: object, layer: object)
     if not (getattr(metadata, "is_prefill", False) or getattr(metadata, "is_chunked_prefill", False)):
         return False
     # Spec-verify chunked prefill relies on merged global-row inputs
-    # (_spec_verify_v3's B6 CP-safety proof); mixed batches are refused at
+    # (see the spec-verify CP tests); mixed batches are refused at
     # admission but stay excluded here defensively.
     if getattr(metadata, "is_spec_verify", False) or getattr(metadata, "is_mixed", False):
         return False
@@ -1431,59 +1419,100 @@ class KdaLinearAttentionMixin:
     """KDA linear-attention + MTP spec-verify state I/O, mixed into NpuPagedAttentionBackend."""
 
     _linear_state_checkpoint_stride: int | None
-    _prepared_ssm_state_indices: torch.Tensor | None
 
-    def _prepare_speculative_ssm_state_indices(
+    def _spec_verify(
         self,
-        metadata: AttentionMetadata,
-        *,
-        graph_mode: bool,
-    ) -> None:
-        """Build the speculative SSM checkpoint table once for the current batch."""
-        self._prepared_ssm_state_indices = None
-        accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
-        checkpoint_stride = self._linear_state_checkpoint_stride
-        if accepted_tokens is None or checkpoint_stride is None:
-            return
+        mixed_qkv: torch.Tensor,
+        raw_gate_proj: torch.Tensor,
+        beta_raw: torch.Tensor,
+        layer: Attention,
+        verify: KdaSpecVerifyMetadata,
+        conv_cache: torch.Tensor,
+        ssm_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the KDA forward for a speculative verify block."""
+        num_seqs = verify.slot_indices.numel()
+        num_rows = mixed_qkv.shape[2]
+        verify_rows = num_seqs * verify.verify_width
+        if num_seqs == 0 or mixed_qkv.shape[0] != 1 or num_rows != verify_rows + verify.tail_padding:
+            raise ValueError("KDA spec verify requires flattened, equal-width sequence blocks")
+        if verify.tail_padding:
+            mixed_qkv = mixed_qkv[:, :, :verify_rows]
+            raw_gate_proj = _take_leading_token_rows(raw_gate_proj, num_rows, verify_rows)
+            beta_raw = _take_leading_token_rows(beta_raw, num_rows, verify_rows)
 
-        state_indices = getattr(metadata, "linear_state_write_indices", None)
-        if state_indices is None:
-            state_indices = getattr(metadata, "linear_state_indices", None)
-        if state_indices is None:
-            return
+        conv_history = layer.conv_kernel_size - 1
+        if conv_cache.shape[1] < conv_history + verify.verify_width - 1:
+            raise RuntimeError("KDA conv checkpoint capacity is smaller than the verify width")
+        stride = self._linear_state_checkpoint_stride
+        if stride is None or stride < verify.verify_width:
+            raise RuntimeError("KDA SSM checkpoint capacity is smaller than the verify width")
+        indices = verify.ssm_state_indices
+        if indices.shape != (num_seqs, stride) or indices.device != mixed_qkv.device:
+            raise RuntimeError("KDA speculative checkpoint metadata does not match the current layer")
 
-        q_seq_lens = getattr(metadata, "q_seq_lens", None)
-        # ACL Graph expands state slots per token row, while q_seq_lens keeps
-        # the logical sequence grouping used by execute_linear's graph V3
-        # dispatch. Keep this derivation aligned with that grouping logic.
-        if graph_mode and q_seq_lens is not None:
-            num_seqs = int(q_seq_lens.numel())
-            group_width = int(getattr(metadata, "spec_group_width", 0))
-            if group_width > 1:
-                # An incomplete bucket tail has no recurrent state checkpoint.
-                state_indices = state_indices[: num_seqs * group_width]
-        else:
-            num_seqs = int(accepted_tokens.numel())
-        if num_seqs <= 0 or state_indices.numel() < num_seqs or state_indices.numel() % num_seqs:
-            raise RuntimeError(
-                "Speculative SSM state metadata is not grouped by logical sequence: "
-                f"slots={state_indices.numel()}, sequences={num_seqs}"
+        q, k, v = self._convolve_spec_verify_qkv(mixed_qkv, layer, verify, conv_cache)
+        forget_gate = layer.forget_gate
+        lower_bound = forget_gate.safe_gate_lower_bound
+        safe_gate = None
+        if lower_bound is not None and -5.0 <= lower_bound < 0.0:
+            safe_gate = KdaSafeGateParameters(
+                forget_gate.A_log.to(torch.float32).contiguous(),
+                forget_gate.dt_bias.to(torch.float32).contiguous(),
+                lower_bound,
             )
-        logical_state_indices = state_indices.reshape(num_seqs, -1)[:, 0]
-        prepared_indices = build_speculative_ssm_state_indices(
-            logical_state_indices,
-            checkpoint_stride,
+            gate = raw_gate_proj
+        else:
+            gate = forget_gate.gate_from_raw(raw_gate_proj)
+        core_out = recurrent_kda_verify(
+            q,
+            k,
+            v,
+            gate.reshape(q.shape).contiguous(),
+            beta_raw.reshape(-1, layer.num_heads_local).contiguous(),
+            ssm_cache,
+            verify.query_start_loc,
+            indices,
+            verify.num_accepted_tokens,
+            safe_gate=safe_gate,
         )
-        if graph_mode:
-            static_indices = getattr(metadata, "linear_state_checkpoint_indices", None)
-            if static_indices is None:
-                static_indices = torch.empty_like(prepared_indices)
-                metadata.linear_state_checkpoint_indices = static_indices
-            elif static_indices.shape != prepared_indices.shape:
-                raise RuntimeError("Speculative SSM checkpoint shape changed after graph allocation")
-            static_indices.copy_(prepared_indices)
-            prepared_indices = static_indices
-        self._prepared_ssm_state_indices = prepared_indices
+        core_out = core_out.view(1, verify_rows, layer.num_heads_local, layer.head_dim)
+        if verify.tail_padding:
+            tail = core_out.new_zeros((1, verify.tail_padding, *core_out.shape[2:]))
+            core_out = torch.cat((core_out, tail), dim=1)
+        return core_out
+
+    @staticmethod
+    def _convolve_spec_verify_qkv(
+        mixed_qkv: torch.Tensor,
+        layer: Attention,
+        verify: KdaSpecVerifyMetadata,
+        conv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from xllm.python import kernels
+
+        conv_input = mixed_qkv.transpose(1, 2).reshape(-1, layer.conv_dim).contiguous()
+        conv_out = kernels.causal_conv1d_update_v2(
+            conv_input,
+            # The native wrapper transposes [channels, width] to contiguous
+            # [width, channels]. Reuse the weight packed at model load so
+            # that transpose is a view instead of a device copy on every layer.
+            layer.conv_weight_t.transpose(0, 1),
+            conv_cache,
+            verify.slot_indices,
+            verify.query_start_loc,
+            verify.verify_width,
+            verify.num_accepted_tokens,
+            bias=None,
+            activation=layer.activation in ("silu", "swish"),
+        )
+        q, k, v = conv_out.split(layer.qkv_dim, dim=-1)
+        shape = (-1, layer.num_heads_local, layer.head_dim)
+        return (
+            q.reshape(shape).to(torch.bfloat16),
+            k.reshape(shape).to(torch.bfloat16),
+            v.reshape(shape).to(torch.bfloat16),
+        )
 
     def _causal_conv1d(
         self,
@@ -1558,11 +1587,19 @@ class KdaLinearAttentionMixin:
 
         fg = getattr(layer, "forget_gate", None)
         gate_lb = getattr(fg, "safe_gate_lower_bound", None) if fg is not None else None
+        kda_metadata = get_execution_context(KdaMetadata) if get_forward_context_or_none() is not None else None
+        verify = kda_metadata.spec_verify if kda_metadata is not None else None
+        if verify is not None:
+            if cp_context is not None:
+                raise RuntimeError("KDA spec verify requires CP rows to be merged before execution")
+            return self._spec_verify(mixed_qkv, raw_gate_proj, beta_raw, layer, verify, conv_cache, ssm_cache)
+        if getattr(metadata, "is_spec_verify", False):
+            if getattr(metadata, "is_dummy", False) and not in_acl_graph():
+                # Empty eager DP shards still execute the projections and collectives.
+                return mixed_qkv.new_zeros((batch_size, seq_len, num_heads_local, head_dim))
+            raise RuntimeError("KDA spec verify metadata was not prepared")
         read_idx, idx = resolve_linear_state_io_indices(metadata)
         is_prefill = metadata.is_prefill or metadata.is_chunked_prefill
-        is_spec_verify = getattr(metadata, "is_spec_verify", False)
-        if is_spec_verify and idx is None:
-            raise RuntimeError("KDA spec-verify requires linear-state slots")
         num_seqs = idx.shape[0] if idx is not None else batch_size
         if cp_context is not None:
             # The model layer hands cp_context over only after its own
@@ -1605,9 +1642,6 @@ class KdaLinearAttentionMixin:
             and batch_size == 1
             and num_seqs > 1
             and seq_len == num_seqs
-            # An expanded spec-verify batch keeps the [1, C, T] packing even
-            # though its per-row slot count equals T: the KDA verify grouping
-            # reads [B, C, rows_per_seq] from it (see the dispatch below).
             and getattr(metadata, "expanded_decode_metadata", None) is None
         )
         if flatten_graph_decode:
@@ -1637,146 +1671,10 @@ class KdaLinearAttentionMixin:
                 device=device,
             )
         else:
-            source_idx = idx
             if idx.dtype != torch.int64:
                 idx = idx.to(torch.int64)
             if read_idx is not None and read_idx.dtype != torch.int64:
                 read_idx = read_idx.to(torch.int64)
-            # MTP spec-verify expands one logical sequence into consecutive
-            # batch rows (bonus + drafted tokens, e.g. q_cu=[0,1,2,3,4] for
-            # two k=1 sequences, kv=[n,n+1,m,m+1] per row) while
-            # linear_state_indices stays per SEQUENCE (one slot id per
-            # sequence, e.g. [s1,s2] for the four rows above). Expand each
-            # sequence's slot across its contiguous row group, then merge the
-            # same-slot rows back into single sequences: the recurrent state
-            # must chain bonus -> draft inside one sequence, and the cache
-            # read/write needs one row per slot. Mapping rows to sequences by
-            # position instead (rows==seqs) silently drops the tail rows of
-            # every sequence past the first and corrupts the view/layout
-            # downstream.
-            q_cu_raw = metadata.q_cu_seq_lens
-            if in_graph and getattr(metadata, "expanded_decode_metadata", None) is not None and q_cu_raw is not None:
-                # Graph capture/replay of an expanded spec-verify batch. The
-                # static metadata keeps the PER-ROW layout the attention
-                # backends consume (q_cu/kv/block_table all per token row);
-                # the per-sequence group count rides on q_seq_lens (N
-                # entries of value spec_width). Pure shape math — no
-                # device->host syncs. Row slots arrive per-row and pairwise
-                # equal; take each group's row 0. A bucket tail shorter than
-                # spec_width is padding and stays out of the recurrent chain.
-                num_rows = int(mixed_qkv.shape[2])
-                q_seq_lens = getattr(metadata, "q_seq_lens", None)
-                n_groups = int(q_seq_lens.numel()) if q_seq_lens is not None else int(q_cu_raw.numel()) - 1
-                spec_width = int(getattr(metadata, "spec_group_width", 0) or 0)
-                full_rows = n_groups * spec_width if spec_width > 1 and n_groups > 0 else num_rows
-                uniform = num_seqs > 0 and n_groups > 0 and full_rows == num_rows and num_rows % n_groups == 0
-                padded_tail = num_seqs > 0 and n_groups > 0 and spec_width > 1 and 0 < full_rows < num_rows
-                if uniform or padded_tail:
-                    row_count = full_rows if padded_tail else num_rows
-                    group_width = spec_width if padded_tail else num_rows // n_groups
-                    if padded_tail and idx.numel() == num_rows:
-                        group_idx = idx[:row_count].view(n_groups, group_width)[:, 0].contiguous()
-                    elif idx.numel() == num_rows:
-                        group_idx = idx.view(n_groups, group_width)[:, 0].contiguous()
-                    else:
-                        group_idx = idx
-                    verify_qkv = mixed_qkv[:, :, :row_count] if padded_tail else mixed_qkv
-                    verify_gate = _take_leading_token_rows(raw_gate_proj, num_rows, row_count)
-                    verify_beta = _take_leading_token_rows(beta_raw, num_rows, row_count)
-                    verify_out = self._spec_verify_v3(
-                        verify_qkv,
-                        verify_gate,
-                        verify_beta,
-                        layer,
-                        group_idx,
-                        metadata,
-                        conv_cache,
-                        ssm_cache,
-                        recurrent_kda,
-                    )
-                    if not padded_tail or verify_out.shape[1] == num_rows:
-                        return verify_out
-                    tail = verify_out.new_zeros(
-                        (verify_out.shape[0], num_rows - verify_out.shape[1], *verify_out.shape[2:])
-                    )
-                    return torch.cat((verify_out, tail), dim=1)
-            q_rows = 0 if in_graph else (int(q_cu_raw.numel()) - 1 if q_cu_raw is not None else 0)
-            per_row_idx = None
-            per_row_cu = None
-            if q_rows == idx.numel() and idx.numel() > 1 and _has_adjacent_state_indices(source_idx):
-                # Defensive: indices already duplicated per row.
-                per_row_idx = idx
-                per_row_cu = q_cu_raw
-            elif q_rows > idx.numel() and q_rows % idx.numel() == 0:
-                # Spec-verify expansion (uniform rows per sequence = k+1).
-                per_row_idx = idx.repeat_interleave(q_rows // idx.numel())
-                per_row_cu = q_cu_raw
-            elif (
-                0 < q_rows < idx.numel()
-                and idx.numel() % q_rows == 0
-                and idx.numel() > 1
-                and _has_adjacent_state_indices(source_idx)
-            ):
-                # Chunked-typed spec verify: q_cu is sequence-scoped while
-                # linear_state_indices is per-row (one row per token).
-                # Normalize to the per-row view — every row is one token.
-                per_row_idx = idx
-                per_row_cu = torch.arange(idx.numel() + 1, dtype=torch.int64, device=idx.device)
-            elif q_rows > idx.numel():
-                raise RuntimeError(
-                    f"unaligned linear-state batch: {q_rows} rows vs {idx.numel()} sequences with non-uniform expansion"
-                )
-            if per_row_idx is not None:
-                row_lengths = (per_row_cu[1:] - per_row_cu[:-1]).tolist()
-                merged_lengths: list = []
-                merged_slots: list = []
-                for slot, length in zip(per_row_idx.tolist(), row_lengths):
-                    if merged_slots and slot == merged_slots[-1]:
-                        merged_lengths[-1] += length
-                    else:
-                        merged_slots.append(slot)
-                        merged_lengths.append(length)
-                if len(set(merged_lengths)) != 1:
-                    raise RuntimeError("KDA MTP verify requires uniform rows per sequence")
-                idx = torch.tensor(merged_slots, dtype=torch.int64, device=idx.device)
-                return self._spec_verify_v3(
-                    mixed_qkv,
-                    raw_gate_proj,
-                    beta_raw,
-                    layer,
-                    idx,
-                    metadata,
-                    conv_cache,
-                    ssm_cache,
-                    recurrent_kda,
-                )
-            if (
-                (not is_prefill or is_spec_verify)
-                and getattr(metadata, "num_accepted_tokens", None) is not None
-                and idx.numel() > 0
-                and mixed_qkv.dim() == 3
-                and mixed_qkv.shape[2] >= idx.numel()
-                and mixed_qkv.shape[2] % idx.numel() == 0
-                and (is_spec_verify or mixed_qkv.shape[2] > idx.numel())
-            ):
-                # A multi-token row group is the MTP/speculative V3 path even
-                # when legacy metadata does not mark it as spec verify. Plain
-                # width-one decode must remain on the regular recurrent path;
-                # ACL graphs still carry an all-ones accepted-token buffer, but
-                # that buffer alone does not make a request speculative.
-                return self._spec_verify_v3(
-                    mixed_qkv,
-                    raw_gate_proj,
-                    beta_raw,
-                    layer,
-                    idx,
-                    metadata,
-                    conv_cache,
-                    ssm_cache,
-                    recurrent_kda,
-                )
-            elif is_spec_verify:
-                raise RuntimeError("KDA spec-verify requires a non-empty uniform token block within the decoding width")
             ssm_checkpoint_stride = linear_state_checkpoint_stride(
                 conv_cache,
                 ssm_cache,

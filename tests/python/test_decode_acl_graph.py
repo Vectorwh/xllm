@@ -49,6 +49,7 @@ from xllm.python.model_executor.mtp_topk import MtpTopkReuse
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
     _CaptureAttentionMetadata,
+    _DecodeGraphEntry,
 )
 from xllm.python.model_executor.sampling_metadata import (
     ModelSamplingMetadata,
@@ -1027,14 +1028,113 @@ def test_dflash_proposal_mode_uses_a_distinct_graph_key() -> None:
     assert captured[0] != captured[1]
 
 
+@pytest.mark.parametrize("configured_width", [1, 4])
+def test_width_one_verify_uses_a_separate_graph_from_plain_decode(
+    monkeypatch: pytest.MonkeyPatch, configured_width: int
+) -> None:
+    from xllm.python.attention.kda_metadata import KdaMetadata, KdaMetadataBuilder
+
+    monkeypatch.setattr(torch, "npu", MagicMock(), raising=False)
+    monkeypatch.setattr(
+        import_module(DecodeAclGraphRunner.__module__), "device_capture_lock", lambda device: nullcontext()
+    )
+    runner = _runner(num_decoding_tokens=configured_width)
+    runner.attention_backend.prepare = MagicMock()
+    builder = KdaMetadataBuilder()
+    caches = [LayerCache(None, None, conv=torch.zeros(8, 5, 6), ssm=torch.zeros(32, 1, 2, 2))]
+    builder.bind_layer_caches(caches)
+    runner.bind_layer_caches(caches)
+    runner.bind_execution_metadata_builders((builder,))
+
+    batch, verify_metadata = _verify_batch_metadata(2, 1)
+    plain_metadata = SimpleNamespace(**vars(verify_metadata))
+    plain_metadata.is_spec_verify = False
+    plain_metadata.is_chunked_prefill = False
+    plain_metadata.expanded_decode_metadata = None
+
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        for metadata in (verify_metadata, plain_metadata):
+            assert runner.can_execute(ModelInput(batch.input_ids, batch.positions, metadata, input_batch=batch))
+            runner.execute(batch.input_ids, batch.positions, metadata, input_batch=batch)
+
+    verify_key = runner._graph_key(batch.num_tokens, True, None, verify_width=1)
+    plain_key = runner._graph_key(batch.num_tokens, False, None, verify_width=1)
+    verify = runner._graphs[verify_key].execution_contexts[KdaMetadata].spec_verify
+    assert verify is not None
+    assert verify.query_start_loc.tolist() == [0, 1, 2]
+    assert verify.slot_indices.tolist() == [1, 2]
+    assert runner._graphs[plain_key].execution_contexts[KdaMetadata].spec_verify is None
+
+
+def test_kda_graph_refreshes_request_metadata_in_place() -> None:
+    from xllm.python.attention.kda_metadata import KdaMetadata, KdaMetadataBuilder
+
+    width = 3
+    builder = KdaMetadataBuilder()
+    caches = [LayerCache(None, None, conv=torch.zeros(8, 4, 6), ssm=torch.zeros(32, 1, 2, 2))]
+    builder.bind_layer_caches(caches)
+    runner = _runner(num_decoding_tokens=width)
+    runner.bind_execution_metadata_builders((builder,))
+    runner.bind_layer_caches(caches)
+    batch, metadata = _verify_batch_metadata(2, width)
+    entry = runner._allocate_entry(8, batch.input_ids, batch.positions, metadata, batch, verify_width=width)
+    verify = entry.execution_contexts[KdaMetadata].spec_verify
+    assert verify is not None
+    assert verify.tail_padding == 2
+    assert verify.query_start_loc.tolist() == [0, 3, 6]
+    buffers = (verify.slot_indices, verify.num_accepted_tokens, verify.ssm_state_indices)
+    addresses = tuple(buffer.data_ptr() for buffer in buffers)
+
+    with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):
+        for slots, accepted in (([1, 2], [3, 2]), ([3], [2])):
+            batch, metadata = _verify_batch_metadata(len(slots), width)
+            metadata.linear_state_indices = torch.tensor(slots, dtype=torch.int32)
+            metadata.num_accepted_tokens = torch.tensor(accepted, dtype=torch.int32)
+            runner._fill_entry(
+                entry, batch.input_ids, batch.positions, metadata, batch.num_tokens, None, batch, verify_width=width
+            )
+            expected_slots = slots + [0] * (2 - len(slots))
+            assert verify.slot_indices.tolist() == expected_slots
+            assert verify.num_accepted_tokens.tolist() == accepted + [1] * (2 - len(slots))
+            assert verify.ssm_state_indices.tolist() == [list(range(slot * 4, slot * 4 + 4)) for slot in expected_slots]
+            assert (
+                tuple(
+                    buffer.data_ptr()
+                    for buffer in (verify.slot_indices, verify.num_accepted_tokens, verify.ssm_state_indices)
+                )
+                == addresses
+            )
+        batch = replace(
+            _query_batch(1, 1),
+            num_reqs=0,
+            num_scheduled_tokens=(),
+            num_computed_tokens=(),
+            query_start_loc=(0,),
+            is_prefilling=(),
+            is_dummy=True,
+        )
+        metadata = _aligned_dp_decode_metadata(1)
+        metadata.is_dummy = True
+        runner._fill_entry(
+            entry, batch.input_ids, batch.positions, metadata, batch.num_tokens, None, batch, verify_width=width
+        )
+        assert verify.slot_indices.tolist() == [0, 0]
+        assert verify.num_accepted_tokens.tolist() == [1, 1]
+        assert verify.ssm_state_indices.tolist() == [list(range(4))] * 2
+
+
 @pytest.mark.parametrize("verify_width", [1, 2])
 def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.MonkeyPatch, verify_width: int) -> None:
+    from xllm.python.attention.kda_metadata import KdaMetadata, KdaMetadataBuilder
+
     npu = MagicMock()
     monkeypatch.setattr(torch, "npu", npu, raising=False)
     monkeypatch.setattr(
         import_module(DecodeAclGraphRunner.__module__), "device_capture_lock", lambda device: nullcontext()
     )
+    builder = KdaMetadataBuilder()
     runner = _runner(num_decoding_tokens=verify_width)
+    runner.bind_execution_metadata_builders((builder,))
     batch, metadata = _verify_batch_metadata(4 // verify_width, verify_width)
     slots = torch.arange(1, 5, verify_width)
     metadata.linear_state_indices = slots
@@ -1042,23 +1142,20 @@ def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.Mon
     conv = torch.arange(8, dtype=torch.float32)
     ssm = torch.arange(8 * verify_width, dtype=torch.float32)
     initial_conv, initial_ssm = conv.clone(), ssm.clone()
-    runner.bind_layer_caches([LayerCache(None, None, conv=conv, ssm=ssm)])
+    caches = [LayerCache(None, None, conv=conv, ssm=ssm)]
+    builder.bind_layer_caches(caches)
+    runner.bind_layer_caches(caches)
     output = torch.empty(4, 1)
-    prepared = []
+    verify = None
 
-    def prepare(static: object, *, graph_mode: bool) -> None:
-        indices = static.linear_state_indices[::verify_width]
-        checkpoints = indices[:, None] * verify_width + torch.arange(verify_width)
-        if static.linear_state_checkpoint_indices is None:
-            static.linear_state_checkpoint_indices = torch.empty_like(checkpoints)
-        static.linear_state_checkpoint_indices.copy_(checkpoints)
-        prepared.append(static)
-
-    def advance(_entry: object = None) -> torch.Tensor:
-        static = prepared[-1]
-        indices = static.linear_state_indices[::verify_width]
-        checkpoints = static.linear_state_checkpoint_indices
-        accepted = static.num_accepted_tokens[: indices.numel()].long()
+    def advance(capture_entry: _DecodeGraphEntry | None = None) -> torch.Tensor:
+        nonlocal verify
+        if capture_entry is not None:
+            verify = capture_entry.execution_contexts[KdaMetadata].spec_verify
+        assert verify is not None
+        indices = verify.slot_indices.long()
+        checkpoints = verify.ssm_state_indices.long()
+        accepted = verify.num_accepted_tokens.long()
         values = ssm[checkpoints[torch.arange(indices.numel()), accepted - 1]] + 1
         conv.index_copy_(0, indices, conv[indices] + 1)
         ssm.index_copy_(0, checkpoints.flatten(), values.repeat_interleave(verify_width))
@@ -1068,7 +1165,7 @@ def test_capture_preserves_live_state_until_first_replay(monkeypatch: pytest.Mon
             torch.testing.assert_close(ssm[verify_width:], initial_ssm[verify_width:])
         return output
 
-    runner.attention_backend.prepare = prepare
+    runner.attention_backend.prepare = lambda *_args, **_kwargs: None
     monkeypatch.setattr(runner, "_forward_static", advance)
     npu.NPUGraph.return_value.replay.side_effect = advance
     with patch("xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata", create=True):

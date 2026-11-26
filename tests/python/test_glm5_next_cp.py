@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.attention.backend import linear_state_checkpoint_stride  # noqa: E402
+from xllm.python.attention.kda_metadata import KdaMetadata, KdaMetadataBuilder
 from xllm.python.attention.kv_shard_layout import (  # noqa: E402
     localize_pool_write_block_table,
     replicate_pool_write_block_table,
@@ -31,6 +32,8 @@ from xllm.python.attention.kv_shard_layout import (  # noqa: E402
 from xllm.python.layers import moe_parallel
 from xllm.python.layers.moe_parallel import TokenParallelLayout
 from xllm.python.model_executor import cp_utils
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
+from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.models import glm5_next
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.glm5_next_kpool import read_pools
@@ -1881,9 +1884,6 @@ def _kda_backend_with_cache(conv_cache: torch.Tensor, ssm_cache: torch.Tensor) -
     backend._kv_caches = [LayerCache(key=None, value=None, conv=conv_cache, ssm=ssm_cache)]
     backend._metadata = None
     backend._kda_verify_width = 1
-    # The spec-verify state prep reads this unconditionally; the
-    # object.__new__ construction above bypasses __init__, so initialize it
-    # here like a real backend would from the cache geometry.
     backend._linear_state_checkpoint_stride = linear_state_checkpoint_stride(conv_cache, ssm_cache)
     return backend
 
@@ -1925,7 +1925,7 @@ def _install_kda_reference_kernels(monkeypatch) -> None:
     module.
 
     Also stubs ``kernels.causal_conv1d_update_v2`` (used only by
-    ``_spec_verify_v3``'s framework-managed conv checkpoints) with an identity
+    ``_spec_verify``'s framework-managed conv checkpoints) with an identity
     passthrough, following ``test_glm53_linear_state_io.py``'s
     ``kda_test_environment`` convention: no CPU reference for that native op
     exists, and both the CP and non-CP sides of every comparison below go
@@ -2713,6 +2713,40 @@ def _spec_verify_metadata(num_seqs: int, rows_per_seq: int) -> SimpleNamespace:
     )
 
 
+def _spec_verify_context(
+    backend: NpuPagedAttentionBackend,
+    num_seqs: int,
+    width: int,
+    cp_context: cp_utils.CpContext | None = None,
+) -> ForwardContext:
+    metadata = _spec_verify_metadata(num_seqs, width)
+    backend._metadata = metadata
+    builder = KdaMetadataBuilder()
+    builder.bind_layer_caches(backend._kv_caches)
+    tokens = torch.zeros(num_seqs * width, dtype=torch.int32)
+    batch = InputBatch(
+        input_ids=tokens,
+        positions=tokens,
+        num_reqs=num_seqs,
+        num_tokens=tokens.numel(),
+        num_tokens_after_padding=tokens.numel(),
+        num_scheduled_tokens=(width,) * num_seqs,
+        num_computed_tokens=(),
+        query_start_loc=tuple(range(0, tokens.numel() + 1, width)),
+        is_prefilling=(False,) * num_seqs,
+        is_padding=None,
+        is_dummy=False,
+    )
+    return ForwardContext(
+        backend,
+        tokens.device,
+        metadata,
+        backend._kv_caches,
+        execution_contexts={KdaMetadata: builder.build(batch, metadata)},
+        cp_context=cp_context,
+    )
+
+
 def test_kda_cp_chunked_prefill_matches_noncp_nonchunked_baseline(monkeypatch, causal_conv1d_reference) -> None:
     """B2 (implement.md): >=2 consecutive chunked-prefill forward calls under
     cp_size=2 must produce the same final ``conv_cache``/``ssm_cache`` content
@@ -2789,14 +2823,14 @@ def test_kda_cp_chunked_prefill_matches_noncp_nonchunked_baseline(monkeypatch, c
 
 
 # ---------------------------------------------------------------------------
-# B6 (implement.md): _spec_verify_v3's ephemeral multi-slot scratch-buffer
-# mechanism under CP -- see
+# B6 (implement.md): _spec_verify's framework-owned checkpoint updates
+# under CP -- see
 # research/b6-spec-verify-v3-cp-safety.md for the full trace. This test
-# drives the real dispatch into ``_spec_verify_v3`` (num_seqs=2,
+# drives the real dispatch into ``_spec_verify`` (num_seqs=2,
 # rows_per_seq=2 -- DFlash2's own "bonus + 1 draft token" verify-block
 # shape) under cp_size=2, and asserts the resulting conv_cache/ssm_cache and
 # attention output exactly match a cp_size=1 baseline for the same 4-token
-# verify batch, proving the ephemeral pool's sequence-major-contiguous-block
+# verify batch, proving the checkpoint path's sequence-major-contiguous-block
 # assumption survives a real cp_merge_rows restore.
 # ---------------------------------------------------------------------------
 
@@ -2816,7 +2850,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     real ``AuxHiddenCapture.capture_layer`` call, per B1) writes a KDA
     checkpoint into slot 0. Step 2 (spec-verify, 1 sequence, 2 verify rows
     [5.0, 6.0] = bonus + 1 draft token, num_accepted_tokens=1) resumes slot
-    0's checkpoint through ``_spec_verify_v3``.
+    0's checkpoint through ``_spec_verify``.
     """
     del causal_conv1d_reference
     _install_kda_reference_kernels(monkeypatch)
@@ -2824,7 +2858,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     # ---- Baseline: plain cp_size=1, both steps, single shared cache slot. ----
     # Same framework-managed checkpoint layout as B6 above: conv capacity 2
     # (conv_state_len + 2 verify rows - 1) and stride-2 ssm rows per slot, so
-    # step 2's ``_spec_verify_v3`` has room for its 2-row verify block.
+    # step 2's ``_spec_verify`` has room for its 2-row verify block.
     conv_cache_baseline = torch.zeros(1, 2, 3, dtype=torch.float32)
     ssm_cache_baseline = torch.zeros(2, 1, 1, 1, dtype=torch.float32)
     backend_baseline = _kda_backend_with_cache(conv_cache_baseline, ssm_cache_baseline)
@@ -2845,14 +2879,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     # only captured layer, so the buffer equals the (untransformed) output.
     baseline_aux_hidden = baseline_prefill_output.reshape(-1, 1).clone()
 
-    backend_baseline._kda_verify_width = 2
-    backend_baseline._metadata = _spec_verify_metadata(1, 2)
-    backend_baseline._prepare_speculative_ssm_state_indices(backend_baseline._metadata, graph_mode=False)
-    with patch.object(
-        glm5_next,
-        "get_forward_context_or_none",
-        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
-    ):
+    with forward_context(_spec_verify_context(backend_baseline, 1, 2)):
         attention_baseline(
             torch.tensor([[[5.0], [6.0]]]),
             torch.tensor([[4, 5]], dtype=torch.int32),
@@ -2928,21 +2955,12 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     # owns global row 0 (bonus, real) + a padding row, rank 1 owns global
     # row 1 (draft, real) + a padding row. Gathered rank-major order is
     # therefore 4 rows: [rank0_real, rank0_pad, rank1_real, rank1_pad].
-    backend_cp._kda_verify_width = 2
-    backend_cp._metadata = _spec_verify_metadata(1, 2)
-    backend_cp._prepare_speculative_ssm_state_indices(backend_cp._metadata, graph_mode=False)
     gathered_mixed_qkv_v2 = torch.tensor([[5.0, 5.0, 5.0], [0.0, 0.0, 0.0], [6.0, 6.0, 6.0], [0.0, 0.0, 0.0]])
     gathered_g_raw_v2 = torch.tensor([[[5.0]], [[0.0]], [[6.0]], [[0.0]]])
     gathered_beta_v2 = torch.tensor([[5.0], [0.0], [6.0], [0.0]])  # raw pre-sigmoid beta (see _run_kda_cp_rank_chunk)
     gather_step2 = MagicMock(side_effect=[gathered_mixed_qkv_v2, gathered_g_raw_v2, gathered_beta_v2])
     monkeypatch.setattr(glm5_next.distributed, "all_gather", gather_step2, raising=False)
-    with patch.object(
-        glm5_next,
-        "get_forward_context_or_none",
-        return_value=SimpleNamespace(
-            layer_shared_cache={}, attention_backend=backend_cp, cp_context=_cp2_chunk_context(0)
-        ),
-    ):
+    with forward_context(_spec_verify_context(backend_cp, 1, 2, _cp2_chunk_context(0))):
         cp_verify_output = attention_cp_rank0(
             torch.tensor([[[5.0], [0.0]]]),
             torch.tensor([[4, 0]], dtype=torch.int32),
@@ -2958,7 +2976,7 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     # fixture (``_make_kda_attention_for_handoff_test``) uses
     # ``conv_kernel_size=2`` => ``conv_state_len=1``, a single-row conv
     # history. Because both the CP and non-CP baseline calls in this test
-    # route through the *identical* ``execute_linear``/``_spec_verify_v3``
+    # route through the *identical* ``execute_linear``/``_spec_verify``
     # production code once their inputs are merged back to global row order,
     # a bug injected into that shared code (e.g. dropping the conv-state
     # checkpoint write between step 1 and step 2) corrupts both sides
@@ -2983,8 +3001,8 @@ def test_kda_cp_dflash2_prefill_capture_then_spec_verify_matches_noncp_baseline(
     del cp_verify_output  # shape/content already covered by B6's dedicated test
 
 
-def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d_reference) -> None:
-    """B6: a real cp_size=2 dispatch into ``_spec_verify_v3`` (2 sequences,
+def test_kda_cp_spec_verify_matches_noncp_baseline(monkeypatch, causal_conv1d_reference) -> None:
+    """B6: a real cp_size=2 dispatch into ``_spec_verify`` (2 sequences,
     2 verify rows each -- DFlash2's bonus+1-draft-token shape) must produce
     the same final ``conv_cache``/``ssm_cache`` and the same rank-0-local
     attention output as a plain cp_size=1 baseline over the same 4-token
@@ -3012,15 +3030,8 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
     conv_cache_baseline = torch.zeros(2, 2, 3, dtype=torch.float32)
     ssm_cache_baseline = torch.zeros(4, 1, 1, 1, dtype=torch.float32)
     backend_baseline = _kda_backend_with_cache(conv_cache_baseline, ssm_cache_baseline)
-    backend_baseline._kda_verify_width = rows_per_seq
-    backend_baseline._metadata = _spec_verify_metadata(num_seqs, rows_per_seq)
-    backend_baseline._prepare_speculative_ssm_state_indices(backend_baseline._metadata, graph_mode=False)
     attention_baseline = _make_kda_attention_for_handoff_test()
-    with patch.object(
-        glm5_next,
-        "get_forward_context_or_none",
-        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_baseline, cp_context=None),
-    ):
+    with forward_context(_spec_verify_context(backend_baseline, num_seqs, rows_per_seq)):
         baseline_output = attention_baseline(
             torch.tensor([[[1.0], [2.0], [3.0], [4.0]]]),
             torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
@@ -3039,17 +3050,10 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
     conv_cache_rank0 = torch.zeros(2, 2, 3, dtype=torch.float32)
     ssm_cache_rank0 = torch.zeros(4, 1, 1, 1, dtype=torch.float32)
     backend_cp = _kda_backend_with_cache(conv_cache_rank0, ssm_cache_rank0)
-    backend_cp._kda_verify_width = rows_per_seq
-    backend_cp._metadata = _spec_verify_metadata(num_seqs, rows_per_seq)
-    backend_cp._prepare_speculative_ssm_state_indices(backend_cp._metadata, graph_mode=False)
     attention_cp = _make_kda_attention_for_handoff_test()
     cp_context = _cp2_context(0)
     monkeypatch.setattr(glm5_next.distributed, "all_gather", gather, raising=False)
-    with patch.object(
-        glm5_next,
-        "get_forward_context_or_none",
-        return_value=SimpleNamespace(layer_shared_cache={}, attention_backend=backend_cp, cp_context=cp_context),
-    ):
+    with forward_context(_spec_verify_context(backend_cp, num_seqs, rows_per_seq, cp_context)):
         cp_output = attention_cp(
             torch.tensor([[[1.0], [4.0]]]),
             torch.tensor([[0, 3]], dtype=torch.int32),
@@ -3058,8 +3062,7 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
 
     # Per design.md §2.2/R3, rank 0's post-verify cache is what a cp_size=1
     # continuation actually reads; it must exactly match the non-CP
-    # baseline's -- proving _spec_verify_v3's ephemeral-pool computation and
-    # final persistent write are unaffected by the CP shard/merge cycle.
+    # baseline's -- proving _spec_verify's computation and checkpoint updates are unaffected by the CP shard/merge cycle.
     torch.testing.assert_close(conv_cache_rank0, conv_cache_baseline_post)
     torch.testing.assert_close(ssm_cache_rank0, ssm_cache_baseline_post)
 
@@ -3084,7 +3087,7 @@ def test_kda_cp_spec_verify_v3_matches_noncp_baseline(monkeypatch, causal_conv1d
 # cycle depends on: (1) a CP-Prefill that captures the aux-hidden buffer
 # (the draft's input, per B1) and writes the KDA linear-state checkpoint,
 # immediately followed by (2) a CP spec-verify call that reads and extends
-# that exact checkpoint through the real ``_spec_verify_v3`` path (B6) --
+# that exact checkpoint through the real ``_spec_verify`` path (B6) --
 # both steps driven through the real (unmocked) ``Glm5NextKdaAttention``/
 # ``execute_linear``, with only the innermost NPU-only kernels replaced by
 # the same deterministic CPU references every other test in this file uses.

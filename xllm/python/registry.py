@@ -291,6 +291,7 @@ def _register_builtin_models() -> None:
         "glm5_next",
         "glm5_next_text",
         execution_metadata_builders=(
+            ("xllm.python.attention.kda_metadata", "KdaMetadataBuilder"),
             (
                 "xllm.python.layers.npu.glm5_next_metadata",
                 "Glm5NextEplv2MetadataBuilder",
@@ -302,6 +303,7 @@ def _register_builtin_models() -> None:
         "xllm.python.models.glm5_next_vl",
         "Glm5NextVLModel",
         "glm5_next_vl",
+        execution_metadata_builders=(("xllm.python.attention.kda_metadata", "KdaMetadataBuilder"),),
     )
     _register_model_path(
         "xllm.python.models.glm5_next_mtp",

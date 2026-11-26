@@ -326,9 +326,7 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         self._is_mla = is_mla
         self._uses_sparse_mla = False
         self._kda_verify_width = num_decoding_tokens
-        self._kda_validated_query_shape: tuple[int, int] | None = None
         self._linear_state_checkpoint_stride: int | None = None
-        self._prepared_ssm_state_indices: torch.Tensor | None = None
 
         self._kv_caches: list[LayerCache] = []
         self._offload_topk_width = offload_topk_width
@@ -553,8 +551,6 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
         ):
             self._prepare_xfia_decode(metadata, graph_mode=graph_mode)
             return
-        self._kda_validated_query_shape = None
-        self._prepare_speculative_ssm_state_indices(metadata, graph_mode=graph_mode)
         q_cu_host_values = getattr(metadata, "q_cu_host_values", None)
         if q_cu_host_values is None:
             # Runtime metadata exposes the same host copy under the public
@@ -1975,139 +1971,6 @@ class NpuPagedAttentionBackend(DsaKvOffloadMixin, KdaLinearAttentionMixin, Atten
             packed = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
             out[b, :kl] = packed
         return out
-
-    def _spec_verify_v3(
-        self,
-        mixed_qkv: torch.Tensor,
-        raw_gate_proj: torch.Tensor,
-        beta_raw: torch.Tensor,
-        layer: Attention,
-        idx: torch.Tensor,
-        metadata,
-        conv_cache,
-        ssm_cache,
-        recurrent_kda,
-    ) -> torch.Tensor:
-        """Run GLM5 speculative KDA on framework-owned checkpoint state."""
-        device = mixed_qkv.device
-        num_seqs = idx.shape[0]
-        if num_seqs == 0 or mixed_qkv.shape[0] != 1 or mixed_qkv.shape[2] % num_seqs:
-            raise ValueError("KDA spec-verify requires flattened, equal-width sequence blocks")
-        rows_per_seq = mixed_qkv.shape[2] // num_seqs
-        in_graph = in_acl_graph()
-        q_seq_lens_host = getattr(metadata, "q_seq_lens_host", None)
-        if (
-            not in_graph
-            and getattr(metadata, "is_spec_verify", False)
-            and q_seq_lens_host is not None
-            and q_seq_lens_host.numel() == num_seqs
-            and self._kda_validated_query_shape != (num_seqs, rows_per_seq)
-        ):
-            if any(length != rows_per_seq for length in q_seq_lens_host.tolist()):
-                raise ValueError("KDA spec-verify requires uniform query lengths")
-            self._kda_validated_query_shape = (num_seqs, rows_per_seq)
-        head_dim = layer.head_dim
-        nh = layer.num_heads_local
-        qkv_dim = layer.qkv_dim
-        conv_dim = layer.conv_dim
-        conv_state_len = layer.conv_kernel_size - 1
-        scale = 1.0 / (head_dim**0.5)
-        required_conv_state_len = conv_state_len + rows_per_seq - 1
-        if conv_cache.shape[1] < required_conv_state_len:
-            raise RuntimeError("KDA V3 conv checkpoint capacity is smaller than the verify width")
-
-        num_accepted_tokens = getattr(metadata, "num_accepted_tokens", None)
-        if num_accepted_tokens is None or num_accepted_tokens.numel() < num_seqs:
-            raise RuntimeError("KDA V3 requires one accepted-token count per logical sequence")
-        num_accepted_tokens = num_accepted_tokens[:num_seqs].to(torch.int32).contiguous()
-
-        qsl_key = (num_seqs, rows_per_seq, device)
-        qsl_cache = self.__dict__.setdefault("_kda_v3_query_start_locs", {})
-        qsl_buf = qsl_cache.get(qsl_key)
-        if qsl_buf is None:
-            qsl_buf = torch.arange(num_seqs + 1, dtype=torch.int32, device=device) * rows_per_seq
-            qsl_cache[qsl_key] = qsl_buf
-
-        idx32 = idx.to(torch.int32).contiguous()
-        conv_input = mixed_qkv.transpose(1, 2).reshape(-1, conv_dim).contiguous()
-        conv_out = kernels.causal_conv1d_update_v2(
-            conv_input,
-            # The native wrapper transposes [channels, width] to contiguous
-            # [width, channels]. Reuse the weight packed at model load so
-            # that transpose is a view instead of a device copy on every layer.
-            layer.conv_weight_t.transpose(0, 1),
-            conv_cache,
-            idx32,
-            qsl_buf,
-            rows_per_seq,
-            num_accepted_tokens,
-            bias=None,
-            activation=layer.activation in ("silu", "swish"),
-        )
-        c_split = conv_out.split(qkv_dim, dim=-1)
-        q = c_split[0].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        k = c_split[1].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        v = c_split[2].reshape(-1, nh, head_dim).to(torch.bfloat16)
-        fg = layer.forget_gate
-        gate_lb = fg.safe_gate_lower_bound
-        fuse_gate = gate_lb is not None and -5.0 <= gate_lb < 0.0
-        if fuse_gate:
-            gate_arg = raw_gate_proj.reshape(-1, nh, head_dim).contiguous()
-            gate_kwargs = dict(
-                A_log=fg.A_log.to(torch.float32).contiguous(),
-                dt_bias=fg.dt_bias.to(torch.float32).contiguous(),
-                use_gate_in_kernel=True,
-                safe_gate=True,
-                lower_bound=gate_lb,
-            )
-        else:
-            gate_arg = fg.gate_from_raw(raw_gate_proj).reshape(-1, nh, head_dim).contiguous()
-            gate_kwargs = dict(use_gate_in_kernel=False)
-        beta_raw_flat = beta_raw.reshape(-1, nh).contiguous()
-
-        checkpoint_stride = self._linear_state_checkpoint_stride
-        if checkpoint_stride is None:
-            raise RuntimeError("KDA V3 requires a bound linear-state checkpoint stride")
-        if checkpoint_stride < rows_per_seq:
-            raise RuntimeError("KDA V3 SSM checkpoint capacity is smaller than the verify width")
-        # The vLLM-Ascend recurrent_kda speculative ABI uses a 2-D
-        # [num_seqs, checkpoint_stride] slot table, not packed per-token
-        # indices. The kernel uses the true num_accepted_tokens value to read
-        # each sequence's initial state from checkpoint column
-        # num_accepted_tokens - 1, then writes this verify step's token states
-        # to columns [0, rows_per_seq).
-        # See vLLM-Ascend commit 23cfbd5ba, recurrent_kda_torch_adpt.h and
-        # op_kernel/recurrent_kda.h (StateMetadataOffset,
-        # ResolveInitialStateSlot, and StateSlotForToken).
-        ssm_state_indices = self._prepared_ssm_state_indices
-        if ssm_state_indices is None:
-            raise RuntimeError("KDA speculative checkpoint indices were not prepared")
-        if ssm_state_indices.shape != (num_seqs, checkpoint_stride) or ssm_state_indices.device != idx32.device:
-            raise RuntimeError(
-                "KDA speculative checkpoint metadata does not match the current layer: "
-                f"indices={tuple(ssm_state_indices.shape)}, sequences={num_seqs}, stride={checkpoint_stride}"
-            )
-        ret = recurrent_kda(
-            q,
-            k,
-            v,
-            gate_arg,
-            beta_raw_flat,
-            initial_state=ssm_cache,
-            cu_seqlens=qsl_buf,
-            ssm_state_indices=ssm_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            layout="TND",
-            scale=scale,
-            output_final_state=True,
-            inplace_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            state_v_first=True,
-            **gate_kwargs,
-        )
-        core_out = ret[0] if isinstance(ret, tuple) else ret
-        return core_out.view(1, num_seqs * rows_per_seq, nh, head_dim)
 
     def _mla_sparse(
         self,

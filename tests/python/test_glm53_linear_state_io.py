@@ -15,11 +15,16 @@
 import sys
 import types
 from collections.abc import Iterator
+from itertools import accumulate
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+
+from xllm.python.attention.kda_metadata import KdaMetadata, KdaMetadataBuilder
+from xllm.python.model_executor.forward_context import AclGraphExecutionState, ForwardContext, forward_context
+from xllm.python.model_executor.input_batch import InputBatch
 
 
 def _backend_for_linear_cache(
@@ -183,8 +188,48 @@ def test_execute_linear_without_state_indices(kda_test_environment: None) -> Non
     assert output.shape == (1, 1, 1, 2)
 
 
+def _verify_context(
+    backend: Any,
+    metadata: SimpleNamespace,
+    widths: tuple[int, ...],
+    *,
+    graph_mode: bool = False,
+) -> ForwardContext:
+    builder = KdaMetadataBuilder()
+    builder.bind_layer_caches(backend._kv_caches)
+    tokens = torch.zeros(sum(widths), dtype=torch.int32)
+    batch = InputBatch(
+        input_ids=tokens,
+        positions=tokens,
+        num_reqs=len(widths),
+        num_tokens=tokens.numel(),
+        num_tokens_after_padding=tokens.numel(),
+        num_scheduled_tokens=widths,
+        num_computed_tokens=(),
+        query_start_loc=tuple(accumulate(widths, initial=0)),
+        is_prefilling=(metadata.is_prefill,) * len(widths),
+        is_padding=None,
+        is_dummy=False,
+        graph_spec_verify_width=widths[0] if graph_mode else None,
+    )
+    if graph_mode:
+        kda = builder.allocate_persistent(batch, metadata)
+        builder.update_persistent(kda, batch, metadata)
+    else:
+        kda = builder.build(batch, metadata)
+    return ForwardContext(
+        backend,
+        tokens.device,
+        metadata,
+        backend._kv_caches,
+        execution_state=AclGraphExecutionState({}) if graph_mode else None,
+        execution_contexts={KdaMetadata: kda},
+    )
+
+
 def test_merged_spec_verify_uses_remapped_state_indices(
     kda_test_environment: list[dict],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conv_cache = torch.arange(4 * 3 * 6, dtype=torch.bfloat16).reshape(4, 3, 6)
     ssm_cache = torch.arange(16 * 1 * 2 * 2, dtype=torch.float32).reshape(16, 1, 2, 2)
@@ -205,12 +250,20 @@ def test_merged_spec_verify_uses_remapped_state_indices(
     )
     backend.prepare(metadata, graph_mode=False)
 
-    output = backend.execute_linear(
-        torch.ones(1, 6, 4, dtype=torch.bfloat16),
-        torch.ones(1, 4, 1, dtype=torch.float32),
-        _layer(),
-        raw_gate_proj=torch.zeros(1, 4, 1, 2, dtype=torch.float32),
-    )
+    def unexpected_host_read(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("KDA verify metadata should use request boundaries from InputBatch")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "tolist", unexpected_host_read)
+        patch.setattr(torch.Tensor, "item", unexpected_host_read)
+        context = _verify_context(backend, metadata, (2, 2))
+    with forward_context(context):
+        output = backend.execute_linear(
+            torch.ones(1, 6, 4, dtype=torch.bfloat16),
+            torch.ones(1, 4, 1, dtype=torch.float32),
+            _layer(),
+            raw_gate_proj=torch.zeros(1, 4, 1, 2, dtype=torch.float32),
+        )
 
     assert output.shape == (1, 4, 1, 2)
     assert len(kda_test_environment) == 1
@@ -334,8 +387,10 @@ def test_lower_bound_out_of_range_falls_back_to_python_gate(
     assert torch.allclose(call["gate"].reshape(-1), expected.reshape(-1))
 
 
-def test_chunked_spec_verify_fuses_gate_and_beta(
+@pytest.mark.parametrize("lower_bound", (-5.0, -6.0))
+def test_chunked_spec_verify_dispatches_gate_and_beta(
     kda_test_environment: list[dict],
+    lower_bound: float,
 ) -> None:
     conv_cache = torch.arange(4 * 3 * 6, dtype=torch.bfloat16).reshape(4, 3, 6)
     ssm_cache = torch.arange(16 * 1 * 2 * 2, dtype=torch.float32).reshape(16, 1, 2, 2)
@@ -355,36 +410,39 @@ def test_chunked_spec_verify_fuses_gate_and_beta(
         block_table=None,
     )
     backend.prepare(metadata, graph_mode=False)
+    raw_gate = torch.full((1, 4, 1, 2), 0.5, dtype=torch.float32)
+    layer = _layer(lower_bound=lower_bound)
 
-    backend.execute_linear(
-        torch.ones(1, 6, 4, dtype=torch.bfloat16),
-        torch.ones(1, 4, 1, dtype=torch.float32),
-        _layer(lower_bound=-5.0),
-        raw_gate_proj=torch.zeros(1, 4, 1, 2, dtype=torch.float32),
-    )
+    with forward_context(_verify_context(backend, metadata, (2, 2))):
+        backend.execute_linear(
+            torch.ones(1, 6, 4, dtype=torch.bfloat16),
+            torch.ones(1, 4, 1, dtype=torch.float32),
+            layer,
+            raw_gate_proj=raw_gate,
+        )
 
     assert len(kda_test_environment) == 1
     verify_call = kda_test_environment[0]
     assert verify_call["op"] == "recurrent"
-    assert verify_call["use_gate_in_kernel"] is True
+    fused = lower_bound == -5.0
+    assert verify_call["use_gate_in_kernel"] is fused
+    assert verify_call.get("lower_bound") == (lower_bound if fused else None)
     assert verify_call["use_beta_sigmoid_in_kernel"] is True
-    assert torch.equal(verify_call["gate"], torch.zeros(4, 1, 2))
+    expected_gate = raw_gate if fused else layer.forget_gate.gate_from_raw(raw_gate)
+    torch.testing.assert_close(verify_call["gate"], expected_gate.reshape(4, 1, 2))
     assert torch.equal(verify_call["beta"], torch.ones(4, 1))
 
 
 @pytest.mark.parametrize("in_graph", [False, True])
 @pytest.mark.parametrize("width", [2, 4])
 @pytest.mark.parametrize("chunked_verify", [False, True])
-def test_spec_verify_uses_v3_without_environment_flags(
+def test_spec_verify_uses_prepared_request_slots(
     kda_test_environment: list[dict],
     monkeypatch: pytest.MonkeyPatch,
     in_graph: bool,
     width: int,
     chunked_verify: bool,
 ) -> None:
-    from xllm.python.attention import kda_linear_attention
-
-    monkeypatch.setattr(kda_linear_attention, "in_acl_graph", lambda: in_graph)
     backend = _backend_for_linear_cache(torch.zeros(4, 2, 6), torch.zeros(4, 1, 2, 2), verify_width=4)
     slots = torch.tensor([1, 3], dtype=torch.int32)
     total_rows = 2 * width
@@ -407,21 +465,22 @@ def test_spec_verify_uses_v3_without_environment_flags(
     expected_output = torch.zeros(1, total_rows, 1, 2)
     verify_calls = []
 
-    def spec_verify_v3(*args: Any) -> torch.Tensor:
+    def spec_verify(*args: Any) -> torch.Tensor:
         verify_calls.append(args)
         return expected_output
 
-    monkeypatch.setattr(backend, "_spec_verify_v3", spec_verify_v3)
-    output = backend.execute_linear(
-        torch.ones(1, 6, total_rows, dtype=torch.bfloat16),
-        torch.ones(1, total_rows, 1),
-        _layer(),
-        raw_gate_proj=torch.zeros(1, total_rows, 1, 2),
-    )
+    monkeypatch.setattr(backend, "_spec_verify", spec_verify)
+    with forward_context(_verify_context(backend, backend._metadata, (width, width), graph_mode=in_graph)):
+        output = backend.execute_linear(
+            torch.ones(1, 6, total_rows, dtype=torch.bfloat16),
+            torch.ones(1, total_rows, 1),
+            _layer(),
+            raw_gate_proj=torch.zeros(1, total_rows, 1, 2),
+        )
 
     assert output is expected_output
     assert len(verify_calls) == 1
-    assert torch.equal(verify_calls[0][4], slots.to(torch.int64))
+    assert torch.equal(verify_calls[0][4].slot_indices, slots)
     assert not kda_test_environment
 
 
@@ -435,11 +494,15 @@ def test_spec_verify_rejects_nonuniform_widths(kda_test_environment: list[dict])
         linear_state_write_indices=None,
         is_prefill=False,
         is_chunked_prefill=False,
+        is_spec_verify=True,
         q_cu_seq_lens=torch.arange(6, dtype=torch.int32),
         expanded_decode_metadata=None,
     )
 
-    with pytest.raises(RuntimeError, match="uniform rows per sequence"):
+    with (
+        pytest.raises(RuntimeError, match="uniform rows per sequence"),
+        forward_context(_verify_context(backend, backend._metadata, (2, 3))),
+    ):
         backend.execute_linear(
             torch.ones(1, 6, 5, dtype=torch.bfloat16),
             torch.ones(1, 5, 1),
@@ -452,7 +515,56 @@ def test_spec_verify_rejects_nonuniform_widths(kda_test_environment: list[dict])
     assert torch.equal(ssm_cache, torch.ones_like(ssm_cache))
 
 
-def test_plain_decode_keeps_fused_gate_without_verify_state(kda_test_environment: list[dict]) -> None:
+def test_empty_eager_verify_rank_preserves_native_state(kda_test_environment: list[dict]) -> None:
+    from xllm.python.model_executor.runners.eager import EagerRunner
+
+    conv = torch.ones(4, 3, 6, dtype=torch.bfloat16)
+    ssm = torch.ones(8, 1, 2, 2)
+    backend = _backend_for_linear_cache(conv, ssm, verify_width=2)
+    builder = KdaMetadataBuilder()
+    builder.bind_layer_caches(backend._kv_caches)
+
+    class Model(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            rows = input_ids.numel()
+            return backend.execute_linear(
+                conv.new_ones((1, 6, rows)),
+                conv.new_ones((1, rows, 1)),
+                _layer(),
+                raw_gate_proj=conv.new_zeros((1, rows, 1, 2)),
+            )
+
+    runner = EagerRunner(Model(), backend, torch.device("cpu"))
+    runner.bind_layer_caches(backend._kv_caches)
+    runner.bind_execution_metadata_builders((builder,))
+    metadata = SimpleNamespace(
+        is_dummy=True,
+        is_spec_verify=True,
+        is_prefill=False,
+        is_chunked_prefill=True,
+        block_table=None,
+        q_cu_seq_lens=None,
+        kv_seq_lens=None,
+    )
+    tokens = torch.zeros(1, dtype=torch.int32)
+    request_layout = SimpleNamespace(
+        num_reqs=0,
+        num_tokens=1,
+        num_scheduled_tokens=(),
+        num_computed_tokens=(),
+        query_start_loc=(0,),
+        is_prefilling=(),
+    )
+    batch = InputBatch.from_runtime(tokens, tokens, request_layout, is_dummy=True)
+    output = runner.execute(tokens, tokens, metadata, input_batch=batch)
+
+    torch.testing.assert_close(output, conv.new_zeros((1, 1, 1, 2)))
+    assert not kda_test_environment
+    assert torch.all(conv == 1) and torch.all(ssm == 1)
+
+
+@pytest.mark.parametrize("width", (1, 2))
+def test_plain_decode_keeps_fused_gate_without_verify_state(kda_test_environment: list[dict], width: int) -> None:
     backend = _backend_for_linear_cache(torch.zeros(4, 2, 6, dtype=torch.bfloat16), torch.zeros(4, 1, 2, 2))
     backend._metadata = SimpleNamespace(
         linear_state_indices=torch.tensor([1, 3], dtype=torch.int32),
@@ -462,25 +574,28 @@ def test_plain_decode_keeps_fused_gate_without_verify_state(kda_test_environment
         is_prefill=False,
         is_chunked_prefill=False,
         is_spec_verify=False,
-        q_cu_seq_lens=torch.arange(3, dtype=torch.int32),
+        q_cu_seq_lens=torch.arange(3, dtype=torch.int32) * width,
         expanded_decode_metadata=None,
-        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32) if width == 1 else None,
     )
 
-    output = backend.execute_linear(
-        torch.ones(1, 6, 2, dtype=torch.bfloat16),
-        torch.ones(1, 2, 1),
-        _layer(),
-        raw_gate_proj=torch.zeros(1, 2, 1, 2),
-    )
+    tokens = 2 * width
+    with forward_context(_verify_context(backend, backend._metadata, (width, width))):
+        output = backend.execute_linear(
+            torch.ones(1, 6, tokens, dtype=torch.bfloat16),
+            torch.ones(1, tokens, 1),
+            _layer(),
+            raw_gate_proj=torch.zeros(1, tokens, 1, 2),
+        )
 
-    assert output.shape == (1, 2, 1, 2)
+    assert output.shape == (1, tokens, 1, 2)
     assert len(kda_test_environment) == 1
+    assert "ssm_state_indices" not in kda_test_environment[0]
     assert kda_test_environment[0]["op"] == "recurrent"
     assert kda_test_environment[0]["use_gate_in_kernel"] is True
     assert kda_test_environment[0]["use_beta_sigmoid_in_kernel"] is True
-    assert torch.equal(kda_test_environment[0]["beta"], torch.ones(2, 1))
-    assert [int(v) for v in kda_test_environment[0]["cu_seqlens"]] == [0, 1, 2]
+    assert torch.equal(kda_test_environment[0]["beta"], torch.ones(tokens, 1))
+    assert [int(v) for v in kda_test_environment[0]["cu_seqlens"]] == [0, width, tokens]
 
 
 def test_varlen_prefill_uses_one_native_convolution(
@@ -497,14 +612,16 @@ def test_varlen_prefill_uses_one_native_convolution(
         q_cu_seq_lens=torch.tensor([0, 1, 3, 5], dtype=torch.int32),
         q_cu_seq_lens_host_values=[1, 3, 5],
         expanded_decode_metadata=None,
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
     )
 
-    output = backend.execute_linear(
-        torch.arange(30, dtype=torch.bfloat16).reshape(1, 6, 5),
-        torch.ones(1, 5, 1),
-        _layer(),
-        raw_gate_proj=torch.zeros(1, 5, 1, 2),
-    )
+    with forward_context(_verify_context(backend, backend._metadata, (1, 2, 2))):
+        output = backend.execute_linear(
+            torch.arange(30, dtype=torch.bfloat16).reshape(1, 6, 5),
+            torch.ones(1, 5, 1),
+            _layer(),
+            raw_gate_proj=torch.zeros(1, 5, 1, 2),
+        )
 
     assert output.shape == (1, 5, 1, 2)
     assert len(causal_conv1d_reference) == 1
@@ -640,7 +757,7 @@ def _verify_metadata(
 
 @pytest.mark.parametrize("in_graph", [False, True])
 @pytest.mark.parametrize("widths", [(1, 2, 4), (2, 4, 4), (4, 4, 4), (1, 4, 4)])
-def test_v3_consecutive_widths_use_framework_ssm_checkpoints(
+def test_spec_verify_consecutive_widths_use_framework_ssm_checkpoints(
     kda_test_environment: list[dict],
     monkeypatch: pytest.MonkeyPatch,
     in_graph: bool,
@@ -648,16 +765,13 @@ def test_v3_consecutive_widths_use_framework_ssm_checkpoints(
 ) -> None:
     from fla_npu.ops import ascendc
 
-    from xllm.python.attention import kda_linear_attention, npu_paged_attention
-
-    monkeypatch.setattr(kda_linear_attention, "in_acl_graph", lambda: in_graph)
-    monkeypatch.setattr(npu_paged_attention, "in_acl_graph", lambda: in_graph)
     conv_cache = torch.zeros(4, 5, 6, dtype=torch.bfloat16)
-    ssm_cache = torch.zeros(16, 1, 2, 2)
+    checkpoint_stride = 4
+    ssm_cache = torch.zeros(4 * checkpoint_stride, 1, 2, 2)
     backend = _backend_for_linear_cache(conv_cache, ssm_cache, verify_width=4)
     slots = torch.tensor([3, 1])
     base_lengths = torch.tensor([16, 32])
-    base_indices = slots * 4
+    base_indices = slots * checkpoint_stride
     ssm_cache[base_indices] = torch.tensor([1.0, 3.0]).view(2, 1, 1, 1)
     expected_ssm = ssm_cache[base_indices].clone()
     previous_checkpoints = None
@@ -713,12 +827,13 @@ def test_v3_consecutive_widths_use_framework_ssm_checkpoints(
         metadata.num_accepted_tokens = accepted
         metadata.block_table = None
         backend.prepare(metadata, graph_mode=False)
-        output = backend.execute_linear(
-            torch.ones(1, 6, 2 * width, dtype=torch.bfloat16),
-            torch.ones(1, 2 * width, 1),
-            _layer(),
-            raw_gate_proj=torch.zeros(1, 2 * width, 1, 2),
-        )
+        with forward_context(_verify_context(backend, metadata, (width, width), graph_mode=in_graph)):
+            output = backend.execute_linear(
+                torch.ones(1, 6, 2 * width, dtype=torch.bfloat16),
+                torch.ones(1, 2 * width, 1),
+                _layer(),
+                raw_gate_proj=torch.zeros(1, 2 * width, 1, 2),
+            )
 
         assert output.shape == (1, 2 * width, 1, 2)
         checkpoint_indices = base_indices[:, None] + torch.arange(width)
@@ -757,13 +872,16 @@ def test_spec_conv_treats_reserved_padding_slot_as_valid(monkeypatch: pytest.Mon
     assert captured_pad_slot_ids == [-1]
 
 
-def test_v3_rejects_width_above_capacity_before_mutation(kda_test_environment: list[dict]) -> None:
+def test_spec_verify_rejects_width_above_capacity_before_mutation(kda_test_environment: list[dict]) -> None:
     conv_cache = torch.ones(4, 2, 6, dtype=torch.bfloat16)
     ssm_cache = torch.ones(4, 1, 2, 2)
     backend = _backend_for_linear_cache(conv_cache, ssm_cache, verify_width=4)
     backend._metadata = _verify_metadata(torch.tensor([1, 3]), torch.tensor([16, 32]), 5)
 
-    with pytest.raises(RuntimeError, match="conv checkpoint capacity"):
+    with (
+        pytest.raises(RuntimeError, match="conv checkpoint capacity"),
+        forward_context(_verify_context(backend, backend._metadata, (5, 5))),
+    ):
         backend.execute_linear(
             torch.ones(1, 6, 10, dtype=torch.bfloat16),
             torch.ones(1, 10, 1),

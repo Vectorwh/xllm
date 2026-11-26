@@ -103,8 +103,8 @@ class EagerRunner(BaseRunner):
         )
         # B6 (research/b6-spec-verify-v3-cp-safety.md) confirmed the
         # model-level aux-hidden-buffer CP restore -- and, for glm5_next's
-        # KDA layers specifically, the ephemeral _spec_verify_v3 scratch-pool
-        # mechanism DFlash2's target-verify path uses -- are both CP-safe.
+        # KDA layers specifically, the sequence-major checkpoint updates
+        # DFlash2's target-verify path uses -- are both CP-safe.
         # Gate on the model's explicit CP aux-restore capability rather
         # than capture configuration: only a model that merges the aux
         # buffer back to global row order feeds a draft token-aligned rows.
