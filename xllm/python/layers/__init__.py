@@ -19,7 +19,7 @@ models whose native fusion boundaries differ by device keep their lowering in
 ``layers/<device>/`` and select it once when the model is constructed.
 """
 
-from xllm.python.layers.attention import Attention, joint_diffusion_attention
+from xllm.python.layers.attention import Attention
 from xllm.python.layers.embedding import HiddenParallelEmbedding
 from xllm.python.layers.fused_moe import FusedMoE
 from xllm.python.layers.gated_mlp import GatedMLP
@@ -33,7 +33,6 @@ from xllm.python.layers.rotary_embedding import (
 
 __all__ = [
     "Attention",
-    "joint_diffusion_attention",
     "FusedMoE",
     "GatedMLP",
     "RMSNorm",

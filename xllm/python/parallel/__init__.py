@@ -26,8 +26,7 @@ primitives live in ``xllm.python.distributed.collectives``.
 
 from __future__ import annotations
 
-from .cfg_parallel import CFGParallelMixin
 from .sequence_parallel import SequenceParallelMixin
 from .vae_parallel import VaeParallelMixin
 
-__all__ = ["CFGParallelMixin", "SequenceParallelMixin", "VaeParallelMixin"]
+__all__ = ["SequenceParallelMixin", "VaeParallelMixin"]

@@ -388,16 +388,31 @@ def _run_glm53_dp_cp_ep_collectives(global_rank: int, rendezvous_path: str) -> N
             dist.destroy_process_group()
 
 
-def test_parallel_groups_share_one_multitenant_tcp_store(monkeypatch):
+@pytest.mark.parametrize(
+    "api,timeout",
+    [("legacy", None), ("legacy", timedelta(minutes=30)), ("dit", timedelta(minutes=30))],
+)
+def test_parallel_groups_share_one_multitenant_tcp_store(
+    monkeypatch: pytest.MonkeyPatch, api: str, timeout: timedelta | None
+) -> None:
     base_store, tcp_store, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=0)
 
-    collectives.init_process_group("tp", "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 2, 0)
-    collectives.init_process_group("moe_tp", "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 2, 0)
+    if api == "dit":
+        collectives.init_group("dit_sp", "127.0.0.1", 46001, [[0, 1]], 0, "cuda:0", 0, 2, timeout=timeout)
+        collectives.init_group("dit_vae", "127.0.0.1", 46001, [[0, 1]], 0, "cuda:0", 0, 2, timeout=timeout)
+    else:
+        options = {} if timeout is None else {"timeout": timeout}
+        collectives.init_process_group("tp", "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 2, 0, **options)
+        collectives.init_process_group("moe_tp", "127.0.0.1", 46001, 0, 2, "cuda:0", 0, 2, 0, **options)
 
     tcp_store.assert_called_once()
     assert tcp_store.call_args.args[:4] == ("127.0.0.1", 46001, 2, True)
     assert tcp_store.call_args.kwargs["wait_for_workers"] is False
     assert tcp_store.call_args.kwargs["multi_tenant"] is True
+    expected_timeout = timedelta(minutes=5) if timeout is None else timeout
+    assert tcp_store.call_args.args[4] == expected_timeout
+    assert init_world.call_args.kwargs["timeout"] == expected_timeout
+    assert all(call.kwargs["timeout"] == expected_timeout for call in new_group.call_args_list)
 
     # Every parallel group is a subgroup of one world, so the world rendezvous
     # happens once no matter how many groups the caller asks for.

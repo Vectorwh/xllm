@@ -24,9 +24,12 @@ limitations under the License.
 #include "xllm_atb_layers/models/base/param/mapping.h"
 #endif
 
+#include <cstdint>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace xllm {
 

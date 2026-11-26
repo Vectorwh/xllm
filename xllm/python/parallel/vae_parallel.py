@@ -59,7 +59,6 @@ class VaeParallelMixin:
         if not self.vae_parallel_enabled(local_patch.device):
             return local_patch
 
-        size = self._size(local_patch.device)
         rank = self._rank(local_patch.device)
         prefix_numel = 1
         for dim in range(local_patch.dim() - 1):

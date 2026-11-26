@@ -1203,11 +1203,6 @@ TORCH_LIBRARY(xllm_ops, m) {
   m.def(
       "engram_int8_lookup_cpu(Tensor weight, Tensor scale, Tensor ids, "
       "Tensor(a!) output) -> ()");
-  // MindIE-SD laser attention (aclnnLaserAttention), dense non-causal flash
-  // attention tuned for Wan-style DiT. q/k/v in BNSD layout, equal seq len.
-  m.def(
-      "laser_attention(Tensor q, Tensor k, Tensor v, float scale, int "
-      "head_num) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
@@ -1293,7 +1288,6 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("sparse_flash_attention_lse",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention_lse));
   m.impl("sfa_dcp_remap_out", TORCH_FN(xllm::sfa_dcp_remap_out_npu));
-  m.impl("laser_attention", TORCH_FN(xllm::kernel::npu::laser_attention));
 }
 
 // build_cp_context is pure host index math with no Tensor input, so the

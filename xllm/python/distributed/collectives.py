@@ -75,7 +75,13 @@ def _backend_for(device: torch.device) -> str:
     return "hccl"
 
 
-def _shared_store(host: str, port: int, global_rank: int, global_world_size: int) -> dist.Store:
+def _shared_store(
+    host: str,
+    port: int,
+    global_rank: int,
+    global_world_size: int,
+    timeout: timedelta = timedelta(minutes=5),
+) -> dist.Store:
     store_key = (host, port)
     store = _stores.get(store_key)
     if store is None:
@@ -84,7 +90,7 @@ def _shared_store(host: str, port: int, global_rank: int, global_world_size: int
             port,
             global_world_size,
             global_rank == 0,
-            timedelta(minutes=30),
+            timeout,
             wait_for_workers=False,
             multi_tenant=True,
         )
@@ -113,6 +119,7 @@ def _ensure_world(
     device: torch.device,
     global_rank: int,
     global_world_size: int,
+    timeout: timedelta = timedelta(minutes=5),
 ) -> None:
     """Initialize the default process group covering every rank.
 
@@ -123,13 +130,13 @@ def _ensure_world(
     global _world_initialized, _world_topology, _world_rank, _world_endpoint
     if _world_initialized:
         return
-    store = _shared_store(host, port, global_rank, global_world_size)
+    store = _shared_store(host, port, global_rank, global_world_size, timeout)
     dist.init_process_group(
         backend=_backend_for(device),
         store=store,
         rank=global_rank,
         world_size=global_world_size,
-        timeout=timedelta(minutes=30),
+        timeout=timeout,
     )
     _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
     _world_rank = global_rank
@@ -237,6 +244,7 @@ def init_process_group(
     group_stride: int | None = None,
     group_ranks: Sequence[Sequence[int]] | None = None,
     backend: str | None = None,
+    timeout: timedelta = timedelta(minutes=5),
 ) -> ProcessGroup:
     """Create a parallel group from explicit memberships or the legacy layout.
 
@@ -249,6 +257,8 @@ def init_process_group(
     (default unchanged). The node-local Engram sharing group passes ``"gloo"``
     because its object collectives are not available on HCCL; a cached group
     created with a different backend is rejected rather than silently reused.
+    ``timeout`` applies to the store, world rendezvous and new subgroups; the
+    shared default remains five minutes.
     """
     if group_name not in _GROUP_NAMES:
         raise ValueError(f"unsupported parallel group: {group_name}")
@@ -287,13 +297,13 @@ def init_process_group(
             )
         return group
 
-    _ensure_world(host, port, device_obj, global_rank, global_world_size)
+    _ensure_world(host, port, device_obj, global_rank, global_world_size, timeout)
     effective_backend = backend if backend is not None else _backend_for(device_obj)
 
     own = None
     own_ranks = None
     for index, ranks in enumerate(memberships):
-        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=30), backend=effective_backend)
+        candidate = dist.new_group(ranks=ranks, timeout=timeout, backend=effective_backend)
         if global_rank in ranks:
             own = candidate
             own_index = index
@@ -346,6 +356,7 @@ def init_group(
     device: str,
     global_rank: int,
     global_world_size: int,
+    timeout: timedelta = timedelta(minutes=5),
 ) -> ProcessGroup:
     """Register named subgroups with an explicit rank layout.
 
@@ -354,6 +365,8 @@ def init_group(
     (mirroring the C++ ``ParallelArgs`` layout computed by the DiT rank
     generator). ``new_group`` is collective over the whole world, so every rank
     creates all of them and only its own group is kept under ``group_name``.
+    Callers can explicitly extend ``timeout`` for a longer rendezvous without
+    changing the default for other Python backends.
     """
     device_obj = torch.device(device)
     group_key = (group_name, str(device_obj))
@@ -365,13 +378,13 @@ def init_group(
             )
         return group
 
-    _ensure_world(host, port, device_obj, global_rank, global_world_size)
+    _ensure_world(host, port, device_obj, global_rank, global_world_size, timeout)
     backend = _backend_for(device_obj)
 
     own = None
     own_ranks = None
     for ranks in group_ranks:
-        candidate = dist.new_group(ranks=ranks, timeout=timedelta(minutes=30), backend=backend)
+        candidate = dist.new_group(ranks=ranks, timeout=timeout, backend=backend)
         if global_rank in ranks:
             if own is not None:
                 raise RuntimeError(f"{group_name} layouts overlap: {global_rank} appears in more than one group")

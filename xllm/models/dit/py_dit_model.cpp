@@ -187,6 +187,9 @@ void PyDiTModel::register_python_process_groups() {
   CHECK_GT(parallel_args_.python_rendezvous_port_, 0);
   py::object init_group =
       py::module_::import("xllm.python.distributed").attr("init_group");
+  // DiT ranks can reach Python registration at different times during loading.
+  py::object group_timeout = py::module_::import("datetime")
+                                 .attr("timedelta")(py::arg("minutes") = 30);
 
   for (const auto& [group_name, layout] : to_register) {
     // Rank of this process inside the group that contains it.
@@ -208,7 +211,8 @@ void PyDiTModel::register_python_process_groups() {
                rank_in_group,
                device_str,
                global_rank,
-               global_world_size);
+               global_world_size,
+               py::arg("timeout") = group_timeout);
   }
 }
 

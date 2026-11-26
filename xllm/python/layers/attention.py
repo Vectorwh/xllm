@@ -23,7 +23,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from xllm.python import kernels
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
     wait_for_layer_load,
@@ -67,18 +66,3 @@ class Attention(nn.Module):
         if isinstance(self.attention_window, int) and not backend.supports_anchor_context_window:
             raise NotImplementedError(f"{type(backend).__name__} does not support anchor_context_window")
         return backend.execute(q, k, v, self)
-
-
-def joint_diffusion_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attn_mask: torch.Tensor | None = None,
-    scale: float | None = None,
-) -> torch.Tensor:
-    """Hardware-agnostic non-causal joint attention for diffusion models.
-
-    Delegates to the active platform's fused kernel (``npu_fusion_attention``
-    on NPU) and falls back to eager ``scaled_dot_product_attention``.
-    """
-    return kernels.joint_diffusion_attention(query, key, value, attn_mask, scale)
