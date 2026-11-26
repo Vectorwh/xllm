@@ -62,6 +62,9 @@ class VlmTextEncoderProxy {
   std::vector<torch::Tensor> encode_joyo_prompts(
       const std::vector<std::string>& prompts) {
     CHECK(tokenizer_ != nullptr) << "Qwen3-VL tokenizer is not loaded";
+    CHECK(encoder_on_device_)
+        << "JoyOV2 text encoder is offloaded; call set_on_device(true) "
+           "before encoding prompts";
     std::vector<torch::Tensor> embeds;
     embeds.reserve(prompts.size());
     for (const std::string& prompt : prompts) {
